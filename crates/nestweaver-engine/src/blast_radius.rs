@@ -228,6 +228,10 @@ pub struct BlastRadiusResult {
     /// Machine-readable reasons the analysis was incomplete or degraded.
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// Repositories whose edge semantics cannot be trusted by this resolver.
+    /// Kept separate from `coverage.stale_repos`, which means behind-git-HEAD.
+    #[serde(default)]
+    pub resolver_stale_repos: Vec<String>,
     /// The gate verdict, derived from `status` + `risk_level`. Never emits
     /// `RiskFlagged` from a degraded run (that would be an over-approximation);
     /// a degraded run is `DegradedUnknown` so a consumer treats it as unknown.
@@ -384,6 +388,7 @@ pub fn analyze_blast_radius(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     db_path: Option<&Path>,
 ) -> Result<BlastRadiusResult> {
+    let changed_files = crate::changed_files::require_changed_paths(changed_files)?;
     let target_repo = options.target_repo.as_deref();
     let max_depth = options.max_depth;
     let include_data_edges = options.include_data_edges;
@@ -392,6 +397,15 @@ pub fn analyze_blast_radius(
     // not. A failed/partial query must NOT be reported as "nothing affected".
     let mut status = AnalysisStatus::Complete;
     let mut notifications: Vec<Notification> = Vec::new();
+    let resolver_stale_repos = crate::resolver_generation::incompatible_repos_for_store(store)?;
+    if !resolver_stale_repos.is_empty() {
+        status = status.max(AnalysisStatus::Degraded);
+        notifications.push(Notification {
+            level: NotificationLevel::Error,
+            message: crate::resolver_generation::incompatibility_message(&resolver_stale_repos),
+            descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
+        });
+    }
 
     // Resolve repo_uid -> display name (repo URL when available, else the uid)
     // for org-wide impact reporting. Fetched up front so the changed-file loop
@@ -432,7 +446,7 @@ pub fn analyze_blast_radius(
     let mut files_ok: usize = 0;
     let mut files_errored: usize = 0;
 
-    for file in changed_files {
+    for file in &changed_files {
         let file_str = file.to_string_lossy();
         // In a unified multi-repo graph, scope resolution to the repo under
         // review so identical relative paths don't conflate across repos.
@@ -1089,6 +1103,7 @@ pub fn analyze_blast_radius(
         org_wide,
         status,
         notifications,
+        resolver_stale_repos,
         gate_state,
         coverage,
         blind_spots,
@@ -1341,13 +1356,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_diff_on_empty_store_is_not_degraded() {
-        // No changed files → nothing to assess → the empty-index guard must not
-        // fire (an empty diff is a legitimate clean no-op, not a degraded run).
+    fn empty_changed_file_input_is_rejected_before_analysis() {
         let store = GraphStore::in_memory().expect("in_memory store");
-        let result = analyze_blast_radius(&store, &[], &opts(None, 3, false), None, None).unwrap();
-        assert_eq!(result.status, AnalysisStatus::Complete);
-        assert_eq!(result.gate_state, GateState::Ok);
+        let error = analyze_blast_radius(&store, &[], &opts(None, 3, false), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one"), "{error}");
     }
 
     #[test]

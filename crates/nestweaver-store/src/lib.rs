@@ -15,11 +15,13 @@ pub mod search;
 pub mod tantivy_index;
 pub mod traverse;
 pub mod write;
+pub mod write_lease;
 pub mod zstd;
 
 pub use db::{
     EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
-    EmbeddingSnapshotState, GraphStore, IndexPublicationLease, PublicationIdentity,
+    EmbeddingSnapshotState, GraphStore, GraphStoreAccessMode, IndexPublicationLease,
+    PublicationIdentity,
 };
 pub use error::{
     CancelReason, CorruptionKind, EngineCorruption, StoreError, classify_engine_corruption,
@@ -64,6 +66,11 @@ pub use write::{
     InstanceUidRemap, InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult,
     MutationDisposition, MutationFailure, MutationOutcome, ProjectMutationDisposition,
     PurgeInstanceResult,
+};
+pub use write_lease::{
+    DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
+    acquire_db_write_lease, acquire_db_write_lease_under_namespace, canonical_db_path,
+    write_lease_path, write_lease_state,
 };
 
 #[cfg(test)]

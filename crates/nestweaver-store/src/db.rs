@@ -266,6 +266,7 @@ impl Drop for IndexPublicationLease<'_> {
 /// given that Connection<'a> borrows &'a Database.
 pub struct GraphStore {
     pub(crate) db: lbug::Database,
+    access_mode: GraphStoreAccessMode,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
     /// Algorithm and scope fingerprint for the scores currently held in
     /// `pagerank_cache`. It is persisted with the scores so a loader cannot
@@ -357,10 +358,21 @@ pub struct GraphStore {
     /// LadybugDB (which has no float-array column type). Loaded on open,
     /// saved on mutation via `flush_embedding_index`.
     pub(crate) embedding_index: Mutex<crate::search::EmbeddingIndex>,
+    /// Why the database-owned semantic identity could not be verified at
+    /// open. Graph traversal and lexical search remain usable, but every
+    /// semantic read/write must fail closed until metadata is repaired.
+    embedding_identity_error: Mutex<Option<String>>,
     /// LRU cache for PPR result vectors keyed by a hash of
     /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
+}
+
+/// Capability fixed by the constructor that opened a [`GraphStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphStoreAccessMode {
+    ReadWrite,
+    ReadOnly,
 }
 
 /// Persistent identity of one NestWeaver brain and its current publication
@@ -979,6 +991,7 @@ impl GraphStore {
         let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -998,6 +1011,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1032,6 +1046,7 @@ impl GraphStore {
         let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1051,6 +1066,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1069,6 +1085,7 @@ impl GraphStore {
         let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1088,6 +1105,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1148,6 +1166,7 @@ impl GraphStore {
         }
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadOnly,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1167,6 +1186,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1212,6 +1232,7 @@ impl GraphStore {
             .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1231,6 +1252,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(crate::search::EmbeddingIndex::new()),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1246,6 +1268,16 @@ impl GraphStore {
     /// only after the in-memory cache is reloaded from the sidecar.
     pub fn pagerank_generation(&self) -> u64 {
         self.pagerank_generation.load(Ordering::Acquire)
+    }
+
+    /// Access capability derived from the constructor; callers cannot upgrade
+    /// a read-only handle with a boolean argument.
+    pub fn access_mode(&self) -> GraphStoreAccessMode {
+        self.access_mode
+    }
+
+    pub fn is_read_write(&self) -> bool {
+        self.access_mode == GraphStoreAccessMode::ReadWrite
     }
 
     /// True if the caller's observed generation is older than the current
@@ -2031,21 +2063,26 @@ impl GraphStore {
     /// Hand the embedding index the model id recorded in the database's
     /// embedding metadata, so `add_embedding_with_force` can refuse a
     /// same-dimension write from a different model. Read once here — never
-    /// per-add — and kept current by `set_embedding_metadata`. Absent or
-    /// unreadable metadata means unknown: the model guard stays off and the
-    /// dimension guard alone applies.
+    /// per-add — and kept current by `set_embedding_metadata`. A successfully
+    /// queried absent row means unconfigured. Any read/decode/validation error
+    /// records a degraded semantic identity and disables every semantic
+    /// operation while leaving graph and lexical reads available.
     fn load_recorded_embedding_model_into_index(&self) {
+        let mut identity_errors = Vec::new();
         let recorded = match self.get_embedding_metadata() {
             Ok(recorded) => recorded.map(|(model_id, _)| model_id),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read embedding metadata; the recorded-model write guard is \
-                     disabled for this store: {e}"
-                );
+            Err(error) => {
+                identity_errors.push(format!("read embedding metadata: {error}"));
                 None
             }
         };
-        let pipeline = self.get_embedding_pipeline().ok().flatten();
+        let pipeline = match self.get_embedding_pipeline() {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                identity_errors.push(format!("read embedding pipeline: {error}"));
+                None
+            }
+        };
         let pipeline_fingerprint = pipeline
             .as_ref()
             .and_then(|pipeline| pipeline.fingerprint().ok());
@@ -2082,13 +2119,60 @@ impl GraphStore {
             if let Err(error) = index.replay_journal_v2(&journal, &identity, &pipeline) {
                 tracing::warn!(%error, "embedding journal is invalid; semantic search is unavailable until a full re-embed");
                 index.clear();
+                identity_errors.push(format!("replay embedding journal: {error}"));
             }
         }
-        index.set_recorded_model_id(recorded);
-        index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
-        if let Some(pipeline) = pipeline {
-            index.set_similarity(pipeline.similarity);
+        if identity_errors.is_empty() {
+            *self
+                .embedding_identity_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            index.set_recorded_model_id(recorded);
+            index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
+            if let Some(pipeline) = pipeline {
+                index.set_similarity(pipeline.similarity);
+            }
+        } else {
+            let message = format!(
+                "embedding identity is unreadable: {}; repair or re-embed from verified database metadata before semantic search or embedding writes",
+                identity_errors.join("; ")
+            );
+            tracing::warn!(%message, "semantic subsystem is degraded");
+            *self
+                .embedding_identity_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(message);
+            index.clear();
+            index.set_recorded_model_id(None);
+            index.set_recorded_pipeline_fingerprint(None);
         }
+    }
+
+    /// Current semantic-identity degradation, if metadata could not be read or
+    /// validated. This is intentionally separate from store-open health so a
+    /// daemon can continue serving graph traversal and lexical search.
+    pub fn embedding_identity_error(&self) -> Option<String> {
+        self.embedding_identity_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Fail a semantic operation under unverified database identity.
+    pub fn require_verified_embedding_identity(&self) -> Result<(), StoreError> {
+        match self.embedding_identity_error() {
+            Some(detail) => Err(StoreError::EmbeddingIdentityUnreadable { detail }),
+            None => Ok(()),
+        }
+    }
+
+    /// Mark the semantic identity verified after a valid metadata pipeline has
+    /// been durably written and the in-memory guards have been synchronized.
+    pub(crate) fn clear_embedding_identity_error(&self) {
+        *self
+            .embedding_identity_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// Compute the legacy JSON sidecar path for a given database path.
@@ -2148,6 +2232,9 @@ impl GraphStore {
     /// [`add_embedding_with_force`]: GraphStore::add_embedding_with_force
     #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut idx = self
             .embedding_index
             .lock()
@@ -2167,6 +2254,9 @@ impl GraphStore {
         model_id: &str,
         force: bool,
     ) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut idx = self
             .embedding_index
             .lock()
@@ -2182,6 +2272,9 @@ impl GraphStore {
         pipeline: &nestweaver_schema::EmbeddingPipelineV2,
         force: bool,
     ) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut index = self
             .embedding_index
             .lock()
@@ -2212,6 +2305,7 @@ impl GraphStore {
     /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         let mut idx = self
             .embedding_index
             .lock()
@@ -2229,6 +2323,22 @@ impl GraphStore {
                         .to_string(),
                 )
             })?;
+            let persisted_fingerprint = pipeline.fingerprint().map_err(|error| {
+                StoreError::Query(format!(
+                    "fingerprint persisted embedding pipeline before flush: {error}"
+                ))
+            })?;
+            let producer_fingerprint = idx.recorded_pipeline_fingerprint().ok_or_else(|| {
+                StoreError::Query(
+                    "embedding index producer pipeline is unverified; refusing to persist vectors"
+                        .to_string(),
+                )
+            })?;
+            if producer_fingerprint != persisted_fingerprint.as_str() {
+                return Err(StoreError::Query(format!(
+                    "embedding index producer pipeline fingerprint {producer_fingerprint} does not match persisted database fingerprint {persisted_fingerprint}; refusing to persist vectors under stale metadata"
+                )));
+            }
             let db_path = self
                 .db_path
                 .as_ref()
@@ -2309,6 +2419,7 @@ impl GraphStore {
     /// Fold the append journal into a complete sibling-safe base snapshot.
     /// Backup/cutover paths use this to package one self-contained artifact.
     pub fn compact_embedding_index(&self) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         let mut index = self
             .embedding_index
             .lock()
@@ -2354,6 +2465,7 @@ impl GraphStore {
         &self,
         destination: &Path,
     ) -> Result<EmbeddingSnapshotLease<'_>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -2683,6 +2795,7 @@ impl GraphStore {
         limit: usize,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -2699,6 +2812,7 @@ impl GraphStore {
         limit: usize,
         uid_prefix: Option<&str>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -3709,6 +3823,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructors_fix_the_store_access_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.lbug");
+        let created = GraphStore::create(&path).unwrap();
+        assert_eq!(created.access_mode(), GraphStoreAccessMode::ReadWrite);
+        drop(created);
+        let read_only = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(read_only.access_mode(), GraphStoreAccessMode::ReadOnly);
+        drop(read_only);
+        assert_eq!(
+            GraphStore::open(&path).unwrap().access_mode(),
+            GraphStoreAccessMode::ReadWrite
+        );
+        assert_eq!(
+            GraphStore::in_memory().unwrap().access_mode(),
+            GraphStoreAccessMode::ReadWrite
+        );
+    }
+
+    #[test]
     fn publication_identity_is_created_once_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.lbug");
@@ -4579,6 +4713,211 @@ mod tests {
             reopened.try_vector_search(&[1.0, 0.0], 1),
             Err(StoreError::EmbeddingArtifactCorrupt)
         ));
+    }
+
+    #[test]
+    fn unreadable_embedding_identity_degrades_only_semantic_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("verified-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:old-space", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        assert!(embedding_path.is_file());
+
+        // Model an interrupted/manual metadata edit at the durable boundary.
+        // Reopening must not reinterpret this row as an unconfigured semantic
+        // space, because that would permit vectors from an unrelated model.
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String("embedding".to_string())),
+                ("value", lbug::Value::String("{not-json".to_string())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        drop(store);
+
+        let degraded = GraphStore::open(&db_path).unwrap();
+        let identity_error = degraded
+            .embedding_identity_error()
+            .expect("malformed durable metadata must be a typed degradation");
+        assert!(identity_error.contains("embedding identity is unreadable"));
+        assert!(degraded.get_embedding_metadata().is_err());
+        assert!(!degraded.add_embedding("symbol:rejected", vec![1.0, 0.0]));
+        assert!(!degraded.add_embedding_with_force(
+            "symbol:force-cannot-bypass",
+            vec![1.0, 0.0],
+            "replacement-model",
+            true,
+        ));
+        assert!(degraded.try_vector_search(&[1.0, 0.0], 1).is_err());
+        assert!(degraded.flush_embedding_index().is_err());
+
+        // Graph/lexical capability remains available while semantic identity
+        // awaits explicit repair.
+        assert!(
+            degraded
+                .hybrid_search(
+                    "no-match",
+                    None,
+                    None,
+                    10,
+                    &crate::ranking::SeedResolutionConfig::default(),
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            degraded
+                .reset_embedding_space_for_identity_repair()
+                .unwrap(),
+            1
+        );
+        assert_eq!(degraded.embedding_identity_error(), None);
+        assert_eq!(degraded.get_embedding_pipeline().unwrap(), None);
+        assert_eq!(degraded.embedding_count(), 0);
+        assert!(!embedding_path.exists());
+
+        degraded
+            .set_embedding_metadata("verified-replacement", 2)
+            .unwrap();
+        assert!(degraded.add_embedding("symbol:accepted-after-explicit-repair", vec![1.0, 0.0],));
+        drop(degraded);
+
+        let repaired = GraphStore::open(&db_path).unwrap();
+        repaired.require_verified_embedding_identity().unwrap();
+        assert_eq!(
+            repaired.get_embedding_pipeline().unwrap().unwrap().model_id,
+            "verified-replacement"
+        );
+    }
+
+    #[test]
+    fn forced_pipeline_switch_publishes_a_complete_base_that_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pipeline-switch.lbug");
+        let first = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let second = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-b", 2);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_pipeline(&first).unwrap();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:old-space",
+            vec![1.0, 0.0],
+            &first,
+            false,
+        ));
+        store.flush_embedding_index().unwrap();
+
+        store.reset_embedding_force_guard();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:new-space",
+            vec![0.0, 1.0],
+            &second,
+            true,
+        ));
+        assert!(!store.has_embedding("symbol:old-space"));
+        store.set_embedding_pipeline(&second).unwrap();
+        store.flush_embedding_index().unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(second));
+        assert!(reopened.has_embedding("symbol:new-space"));
+        assert!(
+            !reopened.has_embedding("symbol:old-space"),
+            "the old semantic space must not reappear after publication"
+        );
+    }
+
+    #[test]
+    fn flush_refuses_vectors_whose_producer_differs_from_database_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pipeline-mismatch.lbug");
+        let first = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let second = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-b", 2);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_pipeline(&first).unwrap();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:old-space",
+            vec![1.0, 0.0],
+            &first,
+            false,
+        ));
+        store.flush_embedding_index().unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        let original_base = std::fs::read(&sidecar).unwrap();
+
+        store.reset_embedding_force_guard();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:new-space",
+            vec![0.0, 1.0],
+            &second,
+            true,
+        ));
+        let error = store
+            .flush_embedding_index()
+            .expect_err("stale database metadata must block vector persistence");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match persisted database fingerprint"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            original_base,
+            "a rejected flush must leave the authoritative base untouched"
+        );
+        drop(store);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(first));
+        assert!(reopened.has_embedding("symbol:old-space"));
+        assert!(!reopened.has_embedding("symbol:new-space"));
+    }
+
+    #[test]
+    fn read_only_identity_repair_refuses_before_touching_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("read-only-repair.lbug");
+        let pipeline = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let writer = GraphStore::open_or_create(&db_path).unwrap();
+        writer.set_embedding_pipeline(&pipeline).unwrap();
+        assert!(writer.add_embedding_with_pipeline(
+            "symbol:preserved",
+            vec![1.0, 0.0],
+            &pipeline,
+            false,
+        ));
+        writer.flush_embedding_index().unwrap();
+        let sidecar = writer.embedding_sidecar_path().unwrap();
+        let original_base = std::fs::read(&sidecar).unwrap();
+        drop(writer);
+
+        let read_only = GraphStore::open_read_only(&db_path).unwrap();
+        let error = read_only
+            .reset_embedding_space_for_identity_repair()
+            .expect_err("a read-only handle must not repair semantic identity");
+        assert!(error.to_string().contains("requires a read-write store"));
+        assert_eq!(std::fs::read(&sidecar).unwrap(), original_base);
+        assert_eq!(
+            read_only.get_embedding_pipeline().unwrap(),
+            Some(pipeline.clone())
+        );
+        assert!(read_only.has_embedding("symbol:preserved"));
+        drop(read_only);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(pipeline));
+        assert!(reopened.has_embedding("symbol:preserved"));
     }
 
     #[test]

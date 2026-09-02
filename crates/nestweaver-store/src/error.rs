@@ -174,6 +174,14 @@ pub enum StoreError {
     /// empty graph.
     #[error("PageRank unavailable during dirty index publication")]
     RankingUnavailable,
+    /// Persisted embedding metadata exists but cannot be parsed or validated.
+    ///
+    /// This must remain distinct from an ordinary query failure: semantic
+    /// callers are allowed to tolerate model/network availability failures,
+    /// but must never turn an unverified database identity into a successful
+    /// lexical-only answer.
+    #[error("embedding identity is unreadable: {detail}")]
+    EmbeddingIdentityUnreadable { detail: String },
     #[error("not found")]
     NotFound,
     #[error("presentation limit {limit} exceeds maximum {max}")]
@@ -216,6 +224,7 @@ impl StoreError {
                     || lower.contains("constraint")
             }
             StoreError::Corruption(_)
+            | StoreError::EmbeddingIdentityUnreadable { .. }
             | StoreError::NotFound
             | StoreError::RankingUnavailable
             | StoreError::PresentationLimitExceeded { .. }

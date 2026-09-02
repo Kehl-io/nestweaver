@@ -43,6 +43,8 @@ pub struct ChangeImpact {
     #[serde(default)]
     pub notifications: Vec<Notification>,
     #[serde(default)]
+    pub resolver_stale_repos: Vec<String>,
+    #[serde(default)]
     pub gate_state: GateState,
 }
 
@@ -343,14 +345,25 @@ pub fn detect_changes_impact(
     changed_files: &[String],
     max_depth: u32,
 ) -> Result<ChangeImpact> {
+    let changed_files = crate::changed_files::require_changed_files(changed_files)?;
+
     // Step 1: collect all symbols in changed files.
     let mut affected_symbols = Vec::new();
     let mut affected_uids: HashSet<String> = HashSet::new();
     let mut status = AnalysisStatus::Complete;
     let mut notifications = Vec::new();
     let mut unassessed = Vec::new();
+    let resolver_stale_repos = crate::resolver_generation::incompatible_repos_for_store(store)?;
+    if !resolver_stale_repos.is_empty() {
+        status = status.max(AnalysisStatus::Degraded);
+        notifications.push(Notification {
+            level: NotificationLevel::Error,
+            message: crate::resolver_generation::incompatibility_message(&resolver_stale_repos),
+            descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
+        });
+    }
 
-    for file_path in changed_files {
+    for file_path in &changed_files {
         let syms = match store.symbols_in_file(file_path) {
             Ok(syms) => syms,
             Err(e) => {
@@ -402,6 +415,7 @@ pub fn detect_changes_impact(
             blast_radius: 0,
             status,
             notifications,
+            resolver_stale_repos,
             gate_state,
         });
     }
@@ -518,6 +532,7 @@ pub fn detect_changes_impact(
         blast_radius,
         status,
         notifications,
+        resolver_stale_repos,
         gate_state,
     })
 }

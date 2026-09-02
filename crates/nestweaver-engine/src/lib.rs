@@ -349,6 +349,7 @@ pub mod brain_docgraph;
 pub mod brain_memory;
 pub mod brainignore;
 pub mod bridges;
+pub mod changed_files;
 pub mod circuit_breaker;
 pub mod cluster_dispatch;
 pub mod clustering;
@@ -539,15 +540,19 @@ pub use investigate::{
     load_bundle, load_bundle_store, save_bundle_store,
 };
 pub use manifest::{
-    ManifestInfo, load_manifest_cache, load_manifest_cache_for_db, manifest_cache_path,
-    parse_manifest, save_manifest_cache, save_manifest_cache_for_db,
+    GraphMutationPublicationDisposition, GraphMutationPublicationGuard,
+    GraphMutationPublicationOutcome, GraphMutationPublicationWarning, ManifestInfo,
+    begin_graph_mutation_publication, finalize_committed_graph_mutation, load_manifest_cache,
+    load_manifest_cache_for_db, manifest_cache_path, parse_manifest, save_manifest_cache,
+    save_manifest_cache_for_db,
 };
 pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,
 };
 pub use project::{
-    ProjectMaterializationResult, detect_implicit_projects, detect_implicit_projects_with_mode,
+    ImplicitProjectDetectionResult, ProjectMaterializationResult, detect_implicit_projects,
+    detect_implicit_projects_with_mode, detect_implicit_projects_with_publication,
     materialize_projects, materialize_projects_with_lease,
 };
 pub use publication::*;

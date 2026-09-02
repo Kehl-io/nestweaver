@@ -11,7 +11,9 @@ pub mod uid;
 pub mod version;
 
 pub use confidence::{Language, MatchType, confidence_score};
-pub use edges::{ALL_SYMBOL_EDGE_TYPES, CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge};
+pub use edges::{
+    ALL_EDGE_TYPES, ALL_SYMBOL_EDGE_TYPES, CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge,
+};
 pub use embedding::{
     EMBEDDING_PIPELINE_SCHEMA_VERSION, EmbeddingBackend, EmbeddingPipelineV2, EmbeddingPoolingMode,
     EmbeddingQuantization, EmbeddingSimilarity, EmbeddingTruncation,

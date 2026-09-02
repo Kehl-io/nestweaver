@@ -95,6 +95,10 @@ pub struct AffectedTestsResult {
     /// Machine-readable reasons the selection was incomplete or degraded.
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// Repositories whose persisted edges were not produced by the exact
+    /// resolver generation this binary understands.
+    #[serde(default)]
+    pub resolver_stale_repos: Vec<String>,
     /// Machine-readable CI directive derived from `status` (TIA-style
     /// fail-safe widening): any non-Complete run says "run-full-suite" so a
     /// pipeline can act on degradation without parsing notifications.
@@ -145,7 +149,22 @@ pub(crate) fn derive_recommendation(status: AnalysisStatus) -> &'static str {
 ///   4. bucket by traversal depth (tier_1 = depth 1, etc.), ordering within a
 ///      tier by edge confidence.
 pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<AffectedTestsResult> {
-    affected_tests_within(store, changed_files, None)
+    let changed_files = crate::changed_files::require_changed_files(changed_files)?;
+    affected_tests_within(store, &changed_files, None)
+}
+
+/// Compute affected tests for a file list derived from a trusted VCS diff.
+///
+/// Unlike [`affected_tests`], this deliberately permits an empty list because
+/// `base_ref == HEAD` is a valid, proven empty diff. Transport/user input must
+/// never use this entry point merely to turn an omitted list into a green
+/// selection.
+pub fn affected_tests_for_derived_diff(
+    store: &GraphStore,
+    changed_files: &[String],
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
+    affected_tests_within(store, &changed_files, None)
 }
 
 /// Compute affected tests inside an induced symbol subgraph.
@@ -158,7 +177,18 @@ pub fn affected_tests_scoped(
     changed_files: &[String],
     allowed_symbols: &HashSet<String>,
 ) -> Result<AffectedTestsResult> {
-    affected_tests_within(store, changed_files, Some(allowed_symbols))
+    let changed_files = crate::changed_files::require_changed_files(changed_files)?;
+    affected_tests_within(store, &changed_files, Some(allowed_symbols))
+}
+
+/// Scoped twin of [`affected_tests_for_derived_diff`].
+pub fn affected_tests_scoped_for_derived_diff(
+    store: &GraphStore,
+    changed_files: &[String],
+    allowed_symbols: &HashSet<String>,
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
+    affected_tests_within(store, &changed_files, Some(allowed_symbols))
 }
 
 fn affected_tests_within(
@@ -170,6 +200,15 @@ fn affected_tests_within(
     // consumer runs the full suite instead of trusting an incomplete subset.
     let mut status = AnalysisStatus::Complete;
     let mut notifications: Vec<Notification> = Vec::new();
+    let resolver_stale_repos = crate::resolver_generation::incompatible_repos_for_store(store)?;
+    if !resolver_stale_repos.is_empty() {
+        status = status.max(AnalysisStatus::Degraded);
+        notifications.push(Notification {
+            level: NotificationLevel::Error,
+            message: crate::resolver_generation::incompatibility_message(&resolver_stale_repos),
+            descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
+        });
+    }
 
     // Step 1: changed files → changed symbols, via direct per-file lookup.
     //
@@ -439,6 +478,7 @@ fn affected_tests_within(
         recommendation: derive_recommendation(status).to_string(),
         status,
         notifications,
+        resolver_stale_repos,
         measured: None,
     })
 }
@@ -642,6 +682,18 @@ mod tests {
             link_type: None,
             evidence: vec![],
         }
+    }
+
+    #[test]
+    fn explicit_api_rejects_empty_while_derived_empty_diff_is_complete() {
+        let store = GraphStore::in_memory().expect("store");
+        let error = affected_tests(&store, &[]).unwrap_err().to_string();
+        assert!(error.contains("at least one"), "{error}");
+
+        let derived = affected_tests_for_derived_diff(&store, &[]).unwrap();
+        assert!(derived.changed_files.is_empty());
+        assert_eq!(derived.status, AnalysisStatus::Complete);
+        assert_eq!(derived.recommendation, "selection-usable");
     }
 
     #[test]

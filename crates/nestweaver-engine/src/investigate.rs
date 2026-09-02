@@ -578,7 +578,10 @@ pub fn investigate(
             );
             nodes
         }
-        Err(_) => bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH),
+        Err(error) if is_no_seed_resolution_error(&error) => {
+            bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH)
+        }
+        Err(error) => return Err(error),
     };
     if let Some(ref filter) = scope_filter {
         connected.retain(|n| node_in_scope(store, n, filter));
@@ -1059,6 +1062,16 @@ fn bm25_fallback(
     nodes
 }
 
+/// The hybrid query's unresolved-seed outcome is the one benign failure for
+/// which `investigate` can still produce an honest lexical map. Everything
+/// else is an operational or integrity failure and must retain its typed error
+/// instead of being mistaken for an empty semantic result.
+fn is_no_seed_resolution_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("No seeds resolved."))
+}
+
 /// Whether a node survives the scope filter. Only symbol nodes are scoped;
 /// non-symbol nodes (notes/sections/tags) are vault-global and pass through
 /// unfiltered — this mirrors the long-standing `repo:` notes handling.
@@ -1394,6 +1407,31 @@ mod tests {
     use super::*;
     use crate::index::index_directory_in_memory;
     use std::fs;
+
+    #[test]
+    fn investigate_fallback_does_not_swallow_unreadable_embedding_identity() {
+        let no_seeds = anyhow::anyhow!(
+            "No seeds resolved. Tried as UIDs, note titles, tags, symbol names, and semantic search."
+        )
+        .context("hybrid retrieval");
+        assert!(is_no_seed_resolution_error(&no_seeds));
+
+        let identity_error =
+            anyhow::Error::new(nestweaver_store::StoreError::EmbeddingIdentityUnreadable {
+                detail: "injected malformed embedding metadata".to_string(),
+            })
+            .context("hybrid retrieval");
+        assert!(!is_no_seed_resolution_error(&identity_error));
+        assert!(
+            identity_error
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    nestweaver_store::StoreError::EmbeddingIdentityUnreadable { .. }
+                )),
+            "the fail-closed store error must remain typed through context"
+        );
+    }
 
     fn make_store() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
         let dir = tempfile::tempdir().unwrap();

@@ -241,6 +241,9 @@ pub fn redact_blast_radius_for_visibility(
         .coverage
         .stale_repos
         .retain(|sr| visible_only.allows(&sr.repo_uid));
+    result
+        .resolver_stale_repos
+        .retain(|uid| visible_only.allows(uid));
 
     // affected_clusters is a graph-wide (potentially cross-repo) aggregate: each
     // cluster's `total_count` is its full size and `name` can be derived from a
@@ -608,6 +611,7 @@ mod tests {
             }),
             status: Default::default(),
             notifications: vec![],
+            resolver_stale_repos: vec!["repo:b".to_string()],
             gate_state: Default::default(),
             coverage: Coverage {
                 repos_in_scope: vec!["repo:a".to_string(), "repo:b".to_string()],
@@ -750,6 +754,7 @@ mod tests {
         assert_eq!(result.coverage.repos_in_scope, vec!["repo:a".to_string()]);
         assert!(result.coverage.repos_not_indexed.is_empty());
         assert!(result.coverage.stale_repos.is_empty());
+        assert!(result.resolver_stale_repos.is_empty());
     }
 
     #[test]

@@ -108,7 +108,7 @@ pub fn pagerank_fingerprint_from_declared(parameters: &serde_json::Value) -> Opt
         let query = edge.get("query")?.as_str()?.to_string();
         let edge_type = match edge.get("edge_type") {
             Some(serde_json::Value::Null) | None => None,
-            Some(value) => Some(nestweaver_schema::EdgeType::from_rel_table_name(
+            Some(value) => Some(nestweaver_schema::EdgeType::from_any_rel_table_name(
                 value.as_str()?,
             )?),
         };
@@ -757,6 +757,10 @@ impl GraphScope {
         scope.edge_queries.push(ScopedEdgeQuery {
             query: "MATCH (p:Project)-[r:PROJECT_HAS_COMPONENT]->(q:Project) RETURN p.uid, q.uid, r.confidence".to_string(),
             edge_type: Some(EdgeType::ProjectHasComponent),
+        });
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_HAS_PARENT]->(q:Project) RETURN p.uid, q.uid, r.confidence".to_string(),
+            edge_type: Some(EdgeType::ProjectHasParent),
         });
         scope
     }
@@ -1760,6 +1764,90 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    #[test]
+    fn every_supported_pagerank_scope_round_trips_its_declared_fingerprint() {
+        for (name, scope) in [
+            ("code-only", GraphScope::code_only()),
+            ("notes-only", GraphScope::notes_only()),
+            ("unified", GraphScope::unified()),
+        ] {
+            let declared = super::pagerank_declared_parameters(
+                super::PAGERANK_DAMPING,
+                super::PAGERANK_ITERATIONS,
+                &scope,
+            );
+            assert_eq!(
+                super::pagerank_fingerprint_from_declared(&declared),
+                Some(super::pagerank_algorithm_fingerprint(
+                    super::PAGERANK_DAMPING,
+                    super::PAGERANK_ITERATIONS,
+                    &scope,
+                )),
+                "the {name} scope must accept the declaration it produced"
+            );
+        }
+    }
+
+    #[test]
+    fn pagerank_presets_cover_every_typed_note_and_project_relationship() {
+        let notes = GraphScope::notes_only();
+        for relation in crate::read::VAULT_RELATIONS
+            .iter()
+            .filter(|relation| relation.in_notes_scope)
+        {
+            assert!(
+                notes
+                    .edge_queries
+                    .iter()
+                    .any(|edge| edge.query.contains(&format!(":{}]", relation.rel))),
+                "notes PageRank omitted inventory relationship {}",
+                relation.rel
+            );
+        }
+        for relationship in ["SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "RELATES_TO"] {
+            assert!(
+                crate::read::VAULT_RELATIONS
+                    .iter()
+                    .any(|relation| relation.rel == relationship && relation.in_notes_scope),
+                "typed Note relationship {relationship} is absent from the shared vault inventory"
+            );
+        }
+
+        let unified = GraphScope::unified();
+        for edge_type in nestweaver_schema::ALL_EDGE_TYPES
+            .iter()
+            .copied()
+            .filter(|edge_type| edge_type.rel_table_name().starts_with("PROJECT_"))
+        {
+            assert!(
+                unified
+                    .edge_queries
+                    .iter()
+                    .any(|edge| edge.edge_type == Some(edge_type)),
+                "unified PageRank omitted {}",
+                edge_type.rel_table_name()
+            );
+        }
+    }
+
+    #[test]
+    fn pagerank_declaration_rejects_an_unknown_typed_relationship() {
+        let mut declared = super::pagerank_declared_parameters(
+            super::PAGERANK_DAMPING,
+            super::PAGERANK_ITERATIONS,
+            &GraphScope::unified(),
+        );
+        let typed_edge = declared["edge_queries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|edge| !edge["edge_type"].is_null())
+            .expect("unified scope declares typed project edges");
+        typed_edge["edge_type"] = serde_json::json!("UNKNOWN_RELATIONSHIP");
+
+        assert_eq!(super::pagerank_fingerprint_from_declared(&declared), None);
     }
 
     fn make_calls_edge(src: &str, tgt: &str) -> ResolvedEdge {

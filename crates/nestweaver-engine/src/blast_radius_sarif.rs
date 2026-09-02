@@ -305,6 +305,7 @@ mod tests {
             org_wide: None,
             status: AnalysisStatus::Complete,
             notifications: vec![],
+            resolver_stale_repos: vec![],
             gate_state: GateState::Ok,
             coverage: Coverage::default(),
             cochanged_files: Vec::new(),

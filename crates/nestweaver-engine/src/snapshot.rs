@@ -406,6 +406,49 @@ fn sync_directory_tree(root: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Copy a rebuildable, generation-bound sidecar into a snapshot only when its
+/// full identity/schema/fingerprint/payload contract is valid for the graph
+/// being captured.
+///
+/// Generation staleness is the one recoverable case: the graph is healthy and
+/// the optional artifact can be recomputed, so omit it with a warning. Every
+/// other validation failure remains fatal rather than laundering a foreign or
+/// corrupt artifact into an apparently valid snapshot.
+fn copy_optional_generation_bound_sidecar(
+    logical_path: &str,
+    source: &Path,
+    destination: &Path,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+) -> Result<bool, anyhow::Error> {
+    match artifact_contract_for_path(logical_path, source, stamp, source_graph_generation) {
+        Ok(_) => {}
+        Err(error) => {
+            let message = format!("{error:#}");
+            if nestweaver_store::artifact_envelope::is_stale_artifact_generation(&message) {
+                tracing::warn!(
+                    artifact = logical_path,
+                    source = %source.display(),
+                    reason = %message,
+                    "omitting generation-stale optional artifact from snapshot; rebuild it after restore"
+                );
+                return Ok(false);
+            }
+            return Err(anyhow::anyhow!(
+                "snapshot refused optional artifact {logical_path} at {}: {message}",
+                source.display()
+            ));
+        }
+    }
+    std::fs::copy(source, destination).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to copy validated optional artifact {logical_path} from {}: {error}",
+            source.display()
+        )
+    })?;
+    Ok(true)
+}
+
 fn build_snapshot_files(
     output_dir: &Path,
     stamp: &Stamp,
@@ -426,12 +469,13 @@ fn build_snapshot_files(
     // ── Sidecars ────────────────────────────────────────────────────────────
     let pagerank_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_PAGERANK}"));
     if pagerank_src.exists() {
-        std::fs::copy(&pagerank_src, output_dir.join(SIDECAR_PAGERANK)).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to copy pagerank sidecar {}: {e}",
-                pagerank_src.display()
-            )
-        })?;
+        copy_optional_generation_bound_sidecar(
+            SIDECAR_PAGERANK,
+            &pagerank_src,
+            &output_dir.join(SIDECAR_PAGERANK),
+            stamp,
+            source_graph_generation,
+        )?;
     } else {
         tracing::debug!(
             src = %pagerank_src.display(),
@@ -441,12 +485,13 @@ fn build_snapshot_files(
 
     let manifests_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_MANIFESTS}"));
     if manifests_src.exists() {
-        std::fs::copy(&manifests_src, output_dir.join(SIDECAR_MANIFESTS)).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to copy manifests sidecar {}: {e}",
-                manifests_src.display()
-            )
-        })?;
+        copy_optional_generation_bound_sidecar(
+            SIDECAR_MANIFESTS,
+            &manifests_src,
+            &output_dir.join(SIDECAR_MANIFESTS),
+            stamp,
+            source_graph_generation,
+        )?;
     } else {
         tracing::debug!(
             src = %manifests_src.display(),
@@ -1564,6 +1609,149 @@ mod tests {
             .is_err(),
             "an incompatible snapshot must refuse to materialize"
         );
+    }
+
+    #[test]
+    fn build_omits_only_generation_stale_optional_derived_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store
+            .compute_pagerank(
+                nestweaver_store::ranking::PAGERANK_DAMPING,
+                nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        store
+            .save_pagerank_cache(&crate::sidecar_path(&db, ".pagerank.json"))
+            .unwrap();
+        crate::save_manifest_cache_for_db(&std::collections::HashMap::new(), &store, &db).unwrap();
+        store.bump_and_persist_graph_generation(&crate::sidecar_path(&db, ".generation"));
+        drop(store);
+
+        build_snapshot(
+            &snap_dir,
+            &make_stamp(env!("CARGO_PKG_VERSION"), "0.1.0", "schema-hash", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        assert!(!snap_dir.join(SIDECAR_PAGERANK).exists());
+        assert!(!snap_dir.join(SIDECAR_MANIFESTS).exists());
+        verify_snapshot(&snap_dir).unwrap();
+    }
+
+    #[test]
+    fn build_refuses_corrupt_optional_derived_artifact_instead_of_omitting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        let pagerank_path = crate::sidecar_path(&db, ".pagerank.json");
+        std::fs::write(&pagerank_path, b"not an artifact envelope").unwrap();
+
+        let error = build_snapshot(
+            &snap_dir,
+            &make_stamp(env!("CARGO_PKG_VERSION"), "0.1.0", "schema-hash", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("snapshot refused optional artifact pagerank.json"));
+        assert!(!snap_dir.exists(), "failed snapshot must not be published");
+    }
+
+    #[test]
+    fn build_refuses_foreign_optional_derived_artifact_instead_of_omitting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign_dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        let foreign_db = make_test_db(foreign_dir.path());
+        let foreign = nestweaver_store::GraphStore::open(&foreign_db).unwrap();
+        foreign
+            .compute_pagerank(
+                nestweaver_store::ranking::PAGERANK_DAMPING,
+                nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        let foreign_pagerank = crate::sidecar_path(&foreign_db, ".pagerank.json");
+        foreign.save_pagerank_cache(&foreign_pagerank).unwrap();
+        std::fs::copy(
+            &foreign_pagerank,
+            crate::sidecar_path(&db, ".pagerank.json"),
+        )
+        .unwrap();
+
+        let error = build_snapshot(
+            &snap_dir,
+            &make_stamp(env!("CARGO_PKG_VERSION"), "0.1.0", "schema-hash", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("foreign artifact identity"), "{error}");
+        assert!(!snap_dir.exists(), "failed snapshot must not be published");
+    }
+
+    #[test]
+    fn optional_derived_artifact_schema_and_fingerprint_mismatch_remain_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_test_db(dir.path());
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store
+            .compute_pagerank(
+                nestweaver_store::ranking::PAGERANK_DAMPING,
+                nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        let pagerank_path = crate::sidecar_path(&db, ".pagerank.json");
+        store.save_pagerank_cache(&pagerank_path).unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let mut stamp = make_stamp(env!("CARGO_PKG_VERSION"), "0.1.0", "schema-hash", "model");
+        stamp.brain_uuid = identity.brain_uuid;
+        stamp.publication_uuid = identity.publication_uuid;
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pagerank_path).unwrap()).unwrap();
+
+        for (field, replacement, expected) in [
+            (
+                "artifact_schema_version",
+                serde_json::json!(nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION + 1),
+                "incompatible artifact",
+            ),
+            (
+                "algorithm_fingerprint",
+                serde_json::json!("foreign-fingerprint"),
+                "fingerprint",
+            ),
+        ] {
+            let mut mismatched = valid.clone();
+            mismatched[field] = replacement;
+            std::fs::write(&pagerank_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+            let error = copy_optional_generation_bound_sidecar(
+                SIDECAR_PAGERANK,
+                &pagerank_path,
+                &dir.path().join(format!("copied-{field}.json")),
+                &stamp,
+                store.graph_generation(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{field}: {error}");
+            assert!(
+                !nestweaver_store::artifact_envelope::is_stale_artifact_generation(&error),
+                "{field} mismatch must not be misclassified as rebuildable staleness"
+            );
+        }
     }
 
     #[test]

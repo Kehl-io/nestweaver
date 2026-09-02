@@ -1764,6 +1764,13 @@ pub fn build_brain_context_hybrid_with_aliases(
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
     let semantic_requested = config.weight_semantic > 0.0;
+    // Identity corruption is not an ordinary unavailable-model condition.
+    // Guard at the transport-independent core boundary, before the empty-index
+    // fast path or model inference can silently turn a requested semantic leg
+    // into a successful lexical/PPR-only response.
+    if semantic_requested {
+        store.require_verified_embedding_identity()?;
+    }
     let mut semantic_applied = false;
     let mut semantic_seed_count: usize = 0;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();

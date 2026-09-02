@@ -120,6 +120,34 @@ pub const VAULT_RELATIONS: &[VaultRelation] = &[
         scored: false,
         in_notes_scope: true,
     },
+    VaultRelation {
+        rel: "SUPERSEDES",
+        from: "Note",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "DEPENDS_ON",
+        from: "Note",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "CAUSED_BY",
+        from: "Note",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "RELATES_TO",
+        from: "Note",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
 ];
 
 /// The cross-domain bridges. Without these a "code + vault" export is two
@@ -3493,33 +3521,34 @@ impl GraphStore {
 
     /// Read the stored embedding metadata (model ID and dimension).
     ///
-    /// Returns `Some((model_id, dimension))` when a record has been written
-    /// by [`GraphStore::set_embedding_metadata`], or `None` if the Meta table
-    /// does not exist yet (old DB) or the `"embedding"` key has never been set.
+    /// Returns `Some((model_id, dimension))` when a valid record has been
+    /// written by [`GraphStore::set_embedding_metadata`], or `None` only when
+    /// the query completed successfully and no `"embedding"` row exists.
+    /// Prepare/execute/extract/decode/validation failures are errors: callers
+    /// must never confuse unreadable identity with a fresh semantic space.
     pub fn get_embedding_metadata(&self) -> Result<Option<(String, u32)>, StoreError> {
         let conn = self.conn()?;
         let q = "MATCH (m:Meta {key: $k}) RETURN m.value";
-        let mut stmt = match conn.prepare(q) {
-            Ok(s) => s,
-            Err(_) => {
-                // Meta table doesn't exist on older databases — treat as absent.
-                return Ok(None);
-            }
-        };
-        let mut result = match conn.execute(
-            &mut stmt,
-            vec![("k", Value::String("embedding".to_string()))],
-        ) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
+        let mut stmt = conn.prepare(q).map_err(|error| {
+            StoreError::Query(format!("prepare embedding metadata read: {error}"))
+        })?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("k", Value::String("embedding".to_string()))],
+            )
+            .map_err(|error| {
+                StoreError::Query(format!("execute embedding metadata read: {error}"))
+            })?;
         let row = match result.next() {
             Some(r) => r,
             None => return Ok(None),
         };
         let value = extract_string(&row, 0)?;
         if value.is_empty() {
-            return Ok(None);
+            return Err(StoreError::Query(
+                "validate embedding metadata: stored value is empty".to_string(),
+            ));
         }
         // Parse the JSON value stored by set_embedding_metadata.
         // Expected format: {"model_id":"<id>","dimension":<n>}
@@ -3528,16 +3557,29 @@ impl GraphStore {
         let model_id = parsed
             .get("model_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .filter(|model_id| !model_id.trim().is_empty())
+            .ok_or_else(|| {
+                StoreError::Query(
+                    "validate embedding metadata: model_id is missing or empty".to_string(),
+                )
+            })?
             .to_string();
-        let dimension = parsed
+        let dimension_u64 = parsed
             .get("dimension")
             .or_else(|| parsed.get("produced_dimension"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        if model_id.is_empty() || dimension == 0 {
-            return Ok(None);
-        }
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(|| {
+                StoreError::Query(
+                    "validate embedding metadata: dimension is missing, zero, or invalid"
+                        .to_string(),
+                )
+            })?;
+        let dimension = u32::try_from(dimension_u64).map_err(|_| {
+            StoreError::Query(format!(
+                "validate embedding metadata: dimension {dimension_u64} exceeds u32"
+            ))
+        })?;
         Ok(Some((model_id, dimension)))
     }
 
@@ -3548,17 +3590,19 @@ impl GraphStore {
         &self,
     ) -> Result<Option<nestweaver_schema::EmbeddingPipelineV2>, StoreError> {
         let conn = self.conn()?;
-        let mut statement = match conn.prepare("MATCH (m:Meta {key: $k}) RETURN m.value") {
-            Ok(statement) => statement,
-            Err(_) => return Ok(None),
-        };
-        let mut rows = match conn.execute(
-            &mut statement,
-            vec![("k", Value::String("embedding".to_string()))],
-        ) {
-            Ok(rows) => rows,
-            Err(_) => return Ok(None),
-        };
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+            .map_err(|error| {
+                StoreError::Query(format!("prepare embedding pipeline read: {error}"))
+            })?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("k", Value::String("embedding".to_string()))],
+            )
+            .map_err(|error| {
+                StoreError::Query(format!("execute embedding pipeline read: {error}"))
+            })?;
         let Some(row) = rows.next() else {
             return Ok(None);
         };

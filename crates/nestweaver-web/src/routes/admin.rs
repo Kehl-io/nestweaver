@@ -19,6 +19,37 @@ use crate::state::{AdminState, PendingDevice};
 use nestweaver_engine::jobs::JobQueue;
 use std::sync::Mutex;
 
+/// Shutdown-visible admission for an admin mutation.
+///
+/// Increment-before-check with sequential consistency gives the daemon drain
+/// and this request a single order: either the drain observes this writer, or
+/// this request observes shutdown and refuses before its first mutation.
+struct AdminMutationAdmission {
+    active_writes: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl AdminMutationAdmission {
+    fn admit(state: &AdminState) -> Result<Self, (StatusCode, String)> {
+        state.active_writes.fetch_add(1, Ordering::SeqCst);
+        if state.shutdown_started.load(Ordering::SeqCst) {
+            state.active_writes.fetch_sub(1, Ordering::SeqCst);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon is shutting down and is not accepting new admin mutations; retry against the daemon that starts next".to_string(),
+            ));
+        }
+        Ok(Self {
+            active_writes: Arc::clone(&state.active_writes),
+        })
+    }
+}
+
+impl Drop for AdminMutationAdmission {
+    fn drop(&mut self) {
+        self.active_writes.fetch_sub(1, Ordering::Release);
+    }
+}
+
 // ── Shared job-queue access ────────────────────────────────────────────
 
 /// RAII handle to a job-queue connection for an admin operation. Wraps either
@@ -446,6 +477,30 @@ pub async fn remove_repo(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
     Path(repo_uid): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    // Admission must precede queue/config/scheduler as well as graph mutation:
+    // all are durable parts of this operation and none may outlive shutdown.
+    // The task owns the admission (and the entire mutation) independently of
+    // the HTTP request future: dropping an axum request drops its JoinHandle,
+    // not the spawned task, so a disconnected/aborted client cannot make the
+    // drain counter reach zero while spawn_blocking still owns graph work.
+    let admission = AdminMutationAdmission::admit(&state)?;
+    tokio::spawn(async move {
+        let _admission = admission;
+        remove_repo_owned(state, repo_uid).await
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("admin repo removal task panicked: {error}"),
+        )
+    })?
+}
+
+async fn remove_repo_owned(
+    state: Arc<AdminState>,
+    repo_uid: String,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let store = state.daemon_store.clone();
     let uid = repo_uid.clone();
@@ -1659,6 +1714,77 @@ mod tests {
         admin_state_with_auth(Some("test-query-token".to_string()))
     }
 
+    #[test]
+    fn admin_mutation_admission_is_shutdown_visible_and_fail_closed() {
+        let state = test_admin_state();
+        let admission = AdminMutationAdmission::admit(&state).expect("admit before shutdown");
+        assert_eq!(state.active_writes.load(Ordering::SeqCst), 1);
+
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        let error = AdminMutationAdmission::admit(&state)
+            .err()
+            .expect("new admin mutation must be refused after shutdown");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.active_writes.load(Ordering::SeqCst), 1);
+
+        drop(admission);
+        assert_eq!(state.active_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_remove_request_keeps_admission_until_blocked_writer_finishes() {
+        let gate = nestweaver_engine::write_gate::WriteGate::new();
+        let blocker = gate.lock("test_block_admin_remove").await;
+        let mut state = test_admin_state();
+        Arc::get_mut(&mut state)
+            .expect("test owns the only state Arc")
+            .write_gate = Some(gate.clone());
+        let active_writes = Arc::clone(&state.active_writes);
+        let app = Router::new()
+            .route("/admin/api/repos/{id}", delete(remove_repo))
+            .with_state(state);
+
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/api/repos/missing-repo")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admin graph worker must block on the held write gate");
+        assert_eq!(active_writes.load(Ordering::SeqCst), 1);
+
+        request.abort();
+        let _ = request.await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            active_writes.load(Ordering::SeqCst),
+            1,
+            "request cancellation must not release the mutation admission"
+        );
+        assert_eq!(gate.waiting(), 1, "the owned mutation must still be alive");
+
+        drop(blocker);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while active_writes.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned mutation must finish and release admission");
+        assert_eq!(gate.waiting(), 0);
+    }
+
     fn admin_state_with_auth(auth_token: Option<String>) -> Arc<AdminState> {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db_path = dir.path().join("test.lbug");
@@ -1677,6 +1803,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1935,6 +2062,7 @@ url = "https://github.com/example/existing"
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2069,6 +2197,7 @@ url = "https://github.com/example/existing"
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),

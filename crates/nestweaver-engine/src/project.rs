@@ -1,15 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use nestweaver_schema::{
     Heading, Note, NoteKind, Project, Section, heading_uid, note_uid, project_uid, section_uid,
     truncated_hash,
 };
-use nestweaver_store::GraphStore;
+use nestweaver_store::write::{
+    ReplaceMaterializedProjectsError, ReplaceMaterializedProjectsOutcome,
+};
+use nestweaver_store::{GraphStore, ProjectMutationDisposition};
 
 use crate::config::InstanceConfig;
 use crate::extensions::{load_extensions, save_extensions, set_property};
 use crate::html_to_md::maybe_convert_html_to_markdown;
+use crate::manifest::{
+    GraphMutationPublicationGuard, GraphMutationPublicationOutcome,
+    begin_graph_mutation_publication, finalize_committed_graph_mutation,
+};
 use crate::mcp_client::McpClient;
 use crate::repo_display_name;
 
@@ -20,6 +27,47 @@ pub struct ProjectMaterializationResult {
     pub component_edges: usize,
     pub wiki_notes_ingested: usize,
     pub wiki_fetch_errors: usize,
+    pub publication: GraphMutationPublicationOutcome,
+}
+
+pub struct ImplicitProjectDetectionResult {
+    pub projects: Vec<String>,
+    pub publication: GraphMutationPublicationOutcome,
+}
+
+fn resolve_project_replacement<'a>(
+    publication: GraphMutationPublicationGuard<'a>,
+    replacement: Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError>,
+) -> Result<
+    (
+        GraphMutationPublicationGuard<'a>,
+        ReplaceMaterializedProjectsOutcome,
+    ),
+    anyhow::Error,
+> {
+    match replacement {
+        Ok(outcome) => Ok((publication, outcome)),
+        Err(error)
+            if matches!(
+                error.disposition,
+                ProjectMutationDisposition::ConfirmedUnchanged
+                    | ProjectMutationDisposition::ConfirmedRolledBack
+            ) =>
+        {
+            if let Err(finish_error) = publication.finish(false) {
+                return Err(anyhow::anyhow!(
+                    "{error}; additionally failed to retire the no-change publication: {finish_error:#}"
+                ));
+            }
+            Err(error.into())
+        }
+        Err(error) => {
+            // Changed/ambiguous failures retain the durable crash fence. The
+            // guard drop releases live ownership only; readers stay fail-closed.
+            drop(publication);
+            Err(error.into())
+        }
+    }
 }
 
 /// Heuristic patterns that indicate an MCP tool response is an error message
@@ -197,6 +245,7 @@ pub fn materialize_projects_with_lease(
     let mut symbol_edges: Vec<(String, String)> = Vec::new();
     let mut component_edges: Vec<(String, String)> = Vec::new();
     let mut parent_edges: Vec<(String, String)> = Vec::new();
+    let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -222,24 +271,21 @@ pub fn materialize_projects_with_lease(
         }
 
         // A transient wiki fetch failure must not erase the last successfully
-        // materialized membership. Successful sources are re-linked after
-        // their Note replacement below; failed sources preserve an existing
-        // Note edge if that Note is still present.
+        // materialized membership. Existing successful sources belong in the
+        // desired replacement too: omitting them here deleted and re-created
+        // the same edge on every run, so an identical wiki response could
+        // never be a true graph no-op.
         for ws in &project_cfg.wiki_sources {
-            let key = (
-                project_cfg.name.clone(),
-                ws.mcp_server.clone(),
-                ws.tool.clone(),
-                ws.label.clone(),
+            let wiki_note_uid = note_uid(
+                &format!("wiki:{}", ws.mcp_server),
+                &format!("{}/{}", ws.tool, ws.label),
             );
-            if !prepared_wiki_contents.contains_key(&key) {
-                let wiki_note_uid = note_uid(
-                    &format!("wiki:{}", ws.mcp_server),
-                    &format!("{}/{}", ws.tool, ws.label),
-                );
-                if all_notes.iter().any(|note| note.uid == wiki_note_uid) {
-                    note_edges.push((uid.clone(), wiki_note_uid));
-                }
+            wiki_project_uids
+                .entry(wiki_note_uid.clone())
+                .or_default()
+                .push(uid.clone());
+            if all_notes.iter().any(|note| note.uid == wiki_note_uid) {
+                note_edges.push((uid.clone(), wiki_note_uid));
             }
         }
 
@@ -293,24 +339,36 @@ pub fn materialize_projects_with_lease(
             parent_edges.push((uid.clone(), parent_uid));
         }
     }
+    for project_uids in wiki_project_uids.values_mut() {
+        project_uids.sort();
+        project_uids.dedup();
+    }
 
     // One transaction replaces the complete configured Project subgraph.
     // Relationship COPY turns the 139k-edge hot path from one execute per edge
     // into four bounded bulk loads, and rollback preserves the old graph if
     // any replacement step fails.
-    store.replace_materialized_projects(
-        &projects,
-        &note_edges,
-        &symbol_edges,
-        &component_edges,
-        &parent_edges,
+    let graph_publication =
+        begin_graph_mutation_publication(store, "explicit Project materialization")?;
+    let (graph_publication, replacement) = resolve_project_replacement(
+        graph_publication,
+        store.replace_materialized_projects(
+            &projects,
+            &note_edges,
+            &symbol_edges,
+            &component_edges,
+            &parent_edges,
+        ),
     )?;
+    let mut graph_changed = replacement.changed();
 
     let projects_created = projects.len();
     let total_note_edges = note_edges.len();
     let total_symbol_edges = symbol_edges.len();
     let total_component_edges = component_edges.len();
     let mut total_wiki_notes_ingested = 0usize;
+    let mut wiki_mutation_errors = Vec::new();
+    let mut reconciled_wiki_notes = HashSet::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -372,6 +430,9 @@ pub fn materialize_projects_with_lease(
                     &format!("wiki:{}", ws.mcp_server),
                     &format!("{}/{}", ws.tool, ws.label),
                 );
+                if reconciled_wiki_notes.contains(&wiki_note_uid) {
+                    continue;
+                }
 
                 let note = Note {
                     uid: wiki_note_uid.clone(),
@@ -391,122 +452,122 @@ pub fn materialize_projects_with_lease(
                     embedding: None,
                 };
 
-                if let Err(e) = store.upsert_note(&note) {
-                    tracing::warn!(
-                        label = ws.label,
-                        error = %e,
-                        "failed to upsert wiki note"
-                    );
-                    continue;
-                }
-
-                // Decompose the wiki note into headings and sections.
-                if let Ok(parsed) = nestweaver_parser::parse_markdown(
+                // Decompose the complete desired wiki topology before the
+                // store transaction. Parse failure therefore cannot publish a
+                // replacement Note with missing children.
+                let parsed = match nestweaver_parser::parse_markdown(
                     &format!("{}/{}", ws.tool, ws.label),
                     &content,
                 ) {
-                    // Build heading UIDs so sections can reference them.
-                    let heading_uids: Vec<String> = parsed
-                        .headings
-                        .iter()
-                        .map(|h| heading_uid(&wiki_note_uid, &h.slug, h.start_line))
-                        .collect();
-
-                    let headings: Vec<Heading> = parsed
-                        .headings
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, h)| Heading {
-                            uid: heading_uids[idx].clone(),
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        wiki_mutation_errors.push(format!(
+                            "wiki source '{}' could not be parsed before graph mutation: {error:#}",
+                            ws.label
+                        ));
+                        continue;
+                    }
+                };
+                let heading_uids: Vec<String> = parsed
+                    .headings
+                    .iter()
+                    .map(|heading| heading_uid(&wiki_note_uid, &heading.slug, heading.start_line))
+                    .collect();
+                let headings: Vec<Heading> = parsed
+                    .headings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, heading)| Heading {
+                        uid: heading_uids[index].clone(),
+                        note_uid: wiki_note_uid.clone(),
+                        level: heading.level,
+                        text: heading.text.clone(),
+                        slug: heading.slug.clone(),
+                        start_line: heading.start_line,
+                        end_line: heading.end_line,
+                        content_hash: truncated_hash(&heading.text),
+                        embedding: None,
+                    })
+                    .collect();
+                let sections: Vec<Section> = parsed
+                    .sections
+                    .iter()
+                    .map(|section| {
+                        let text_hash = truncated_hash(&section.text);
+                        Section {
+                            uid: section_uid(&wiki_note_uid, section.start_line, &text_hash),
                             note_uid: wiki_note_uid.clone(),
-                            level: h.level,
-                            text: h.text.clone(),
-                            slug: h.slug.clone(),
-                            start_line: h.start_line,
-                            end_line: h.end_line,
-                            content_hash: truncated_hash(&h.text),
-                            embedding: None,
-                        })
-                        .collect();
-
-                    if !headings.is_empty() {
-                        if let Err(e) = store.batch_insert_headings(&headings) {
-                            tracing::warn!(
-                                label = ws.label,
-                                error = %e,
-                                "failed to insert wiki note headings"
-                            );
-                        } else {
-                            let nh_edges: Vec<(&str, &str)> = heading_uids
-                                .iter()
-                                .map(|h| (wiki_note_uid.as_str(), h.as_str()))
-                                .collect();
-                            let _ = store.batch_insert_note_heading_edges(&nh_edges);
+                            heading_uid: section
+                                .heading_idx
+                                .and_then(|index| heading_uids.get(index))
+                                .cloned(),
+                            start_line: section.start_line,
+                            end_line: section.end_line,
+                            text_hash,
+                            text_content: section.text.clone(),
+                            word_count: u32::try_from(section.text.split_whitespace().count())
+                                .unwrap_or(u32::MAX),
+                            pagerank_score: None,
                         }
+                    })
+                    .collect();
+
+                let project_uids = wiki_project_uids
+                    .get(&wiki_note_uid)
+                    .expect("configured wiki source has planned Project memberships");
+                match store.replace_project_wiki_note_memberships(
+                    project_uids,
+                    &note,
+                    &headings,
+                    &sections,
+                ) {
+                    Ok(outcome) => {
+                        reconciled_wiki_notes.insert(wiki_note_uid);
+                        graph_changed |= outcome.changed();
+                        total_wiki_notes_ingested += 1;
+                        tracing::info!(
+                            label = ws.label,
+                            project = project_cfg.name,
+                            changed = outcome.changed(),
+                            "reconciled wiki source"
+                        );
                     }
-
-                    let sections: Vec<Section> = parsed
-                        .sections
-                        .iter()
-                        .map(|sec| {
-                            let text_hash = truncated_hash(&sec.text);
-                            let s_uid = section_uid(&wiki_note_uid, sec.start_line, &text_hash);
-                            let heading_link =
-                                sec.heading_idx.and_then(|i| heading_uids.get(i)).cloned();
-                            let word_count = u32::try_from(sec.text.split_whitespace().count())
-                                .unwrap_or(u32::MAX);
-                            Section {
-                                uid: s_uid,
-                                note_uid: wiki_note_uid.clone(),
-                                heading_uid: heading_link,
-                                start_line: sec.start_line,
-                                end_line: sec.end_line,
-                                text_hash,
-                                text_content: sec.text.clone(),
-                                word_count,
-                                pagerank_score: None,
-                            }
-                        })
-                        .collect();
-
-                    if !sections.is_empty() {
-                        if let Err(e) = store.batch_upsert_sections(&sections) {
-                            tracing::warn!(
-                                label = ws.label,
-                                error = %e,
-                                "failed to upsert wiki note sections"
-                            );
-                        } else {
-                            let ns_edges: Vec<(&str, &str)> = sections
-                                .iter()
-                                .map(|s| (wiki_note_uid.as_str(), s.uid.as_str()))
-                                .collect();
-                            let _ = store.batch_insert_note_section_edges(&ns_edges);
-                        }
-                    }
+                    Err(error) => wiki_mutation_errors.push(format!(
+                        "wiki source '{}' topology transaction failed: {error:#}",
+                        ws.label
+                    )),
                 }
-
-                let edge = (uid.as_str(), wiki_note_uid.as_str());
-                if let Err(e) = store.batch_insert_project_note_edges(&[edge]) {
-                    tracing::warn!(
-                        label = ws.label,
-                        error = %e,
-                        "failed to link wiki note to project"
-                    );
-                }
-
-                total_wiki_notes_ingested += 1;
-                tracing::info!(
-                    label = ws.label,
-                    project = project_cfg.name,
-                    "ingested wiki source"
-                );
             }
         }
     }
 
     // Persist the extension sidecar once after all projects are processed.
-    save_extensions(db_path, &ext_store)?;
+    let extension_save_error = save_extensions(db_path, &ext_store).err();
+    let mut publication = graph_publication.finish(graph_changed)?;
+    if !wiki_mutation_errors.is_empty() {
+        if graph_changed {
+            for error in wiki_mutation_errors {
+                publication.record_warning("materialize-project-wiki", error);
+            }
+        } else {
+            anyhow::bail!(
+                "project wiki materialization failed before any graph change: {}",
+                wiki_mutation_errors.join("; ")
+            );
+        }
+    }
+    if let Some(error) = extension_save_error {
+        if graph_changed {
+            publication.record_warning(
+                "save-project-extensions",
+                format!(
+                    "graph materialization committed but the project extension sidecar was not published: {error:#}"
+                ),
+            );
+        } else {
+            return Err(error);
+        }
+    }
 
     Ok(ProjectMaterializationResult {
         projects_created,
@@ -515,16 +576,15 @@ pub fn materialize_projects_with_lease(
         component_edges: total_component_edges,
         wiki_notes_ingested: total_wiki_notes_ingested,
         wiki_fetch_errors: total_wiki_fetch_errors,
+        publication,
     })
 }
 
 /// Walk `vault_root/Projects/` and auto-detect project folders whose entry
 /// note exists at `Projects/<slug>/<slug>.md`.
 ///
-/// For each detected project:
-/// 1. A Project node is created (or silently skipped on duplicate-UID errors).
-/// 2. All notes whose path starts with `Projects/<slug>/` are linked via
-///    PROJECT_INCLUDES_NOTE edges.
+/// All detected Project nodes and their `PROJECT_INCLUDES_NOTE` relationships
+/// are planned first, then replaced atomically as one graph mutation.
 ///
 /// Returns the list of detected project slugs (folder names).
 /// Vault folders that hold one directory per project.
@@ -554,10 +614,9 @@ pub fn detect_implicit_projects(
 
 /// [`detect_implicit_projects`] with an explicit write mode.
 ///
-/// nw-161: this function WRITES — `upsert_project` and
-/// `batch_insert_project_note_edges` — despite a read-sounding name, and
-/// nothing in `--help` signalled it. `dry_run` reports what would be created
-/// without touching the graph.
+/// nw-161: this function WRITES despite a read-sounding name, and nothing in
+/// `--help` signalled it. `dry_run` reports what would be created without
+/// touching the graph.
 pub fn detect_implicit_projects_with_mode(
     store: &GraphStore,
     vault_root: &Path,
@@ -565,33 +624,95 @@ pub fn detect_implicit_projects_with_mode(
     instance_id: &str,
     dry_run: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
-    let mut detected: Vec<String> = Vec::new();
+    Ok(detect_implicit_projects_with_publication(
+        store,
+        vault_root,
+        vault_uid,
+        instance_id,
+        dry_run,
+    )?
+    .projects)
+}
+
+/// Detect implicit projects and return the complete graph-publication result.
+///
+/// Callers that expose mutation status should use this form so a committed
+/// graph update followed by degraded generation/artifact reconciliation is not
+/// flattened into ordinary success.
+pub fn detect_implicit_projects_with_publication(
+    store: &GraphStore,
+    vault_root: &Path,
+    vault_uid: &str,
+    instance_id: &str,
+    dry_run: bool,
+) -> Result<ImplicitProjectDetectionResult, anyhow::Error> {
+    let mut detected: Vec<(String, String)> = Vec::new();
     for container in PROJECT_CONTAINER_DIRS {
         let projects_dir = vault_root.join(container);
         if !projects_dir.is_dir() {
             continue;
         }
-        detect_in_container(
-            store,
-            &projects_dir,
-            container,
-            vault_uid,
-            instance_id,
-            dry_run,
-            &mut detected,
-        )?;
+        detect_in_container(&projects_dir, container, &mut detected)?;
     }
-    Ok(detected)
+
+    let mut project_names = Vec::new();
+    let mut unique_names = std::collections::HashSet::new();
+    for (slug, _) in &detected {
+        if unique_names.insert(slug.clone()) {
+            project_names.push(slug.clone());
+        }
+    }
+
+    if dry_run || detected.is_empty() {
+        return Ok(ImplicitProjectDetectionResult {
+            projects: project_names,
+            publication: finalize_committed_graph_mutation(store, false),
+        });
+    }
+
+    // Plan every node and relationship before the single atomic store write.
+    // This prevents a later filesystem/read failure from leaving earlier
+    // Projects committed without a generation publication.
+    let all_notes = store.list_notes(Some(vault_uid))?;
+    let projects = project_names
+        .iter()
+        .map(|slug| Project {
+            uid: project_uid(instance_id, slug),
+            name: slug.clone(),
+            summary: None,
+            instance_id: instance_id.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let mut note_edges = Vec::new();
+    for (slug, container) in &detected {
+        let uid = project_uid(instance_id, slug);
+        let prefix = format!("{container}/{slug}/");
+        note_edges.extend(
+            all_notes
+                .iter()
+                .filter(|note| note.file_path.starts_with(&prefix))
+                .map(|note| (uid.clone(), note.uid.clone())),
+        );
+    }
+    note_edges.sort();
+    note_edges.dedup();
+
+    let graph_publication = begin_graph_mutation_publication(store, "implicit Project detection")?;
+    let (graph_publication, replacement) = resolve_project_replacement(
+        graph_publication,
+        store.replace_implicit_project_note_memberships(&projects, &note_edges),
+    )?;
+    let publication = graph_publication.finish(replacement.changed())?;
+    Ok(ImplicitProjectDetectionResult {
+        projects: project_names,
+        publication,
+    })
 }
 
 fn detect_in_container(
-    store: &GraphStore,
     projects_dir: &Path,
     container: &str,
-    vault_uid: &str,
-    instance_id: &str,
-    dry_run: bool,
-    detected: &mut Vec<String>,
+    detected: &mut Vec<(String, String)>,
 ) -> Result<(), anyhow::Error> {
     let read_dir = std::fs::read_dir(projects_dir)?;
     for entry in read_dir {
@@ -609,42 +730,7 @@ fn detect_in_container(
         if !is_entry_note(&path, &slug) {
             continue;
         }
-        if dry_run {
-            detected.push(slug);
-            continue;
-        }
-
-        // Generate UID and create the Project node. If the node already
-        // exists the store will return a duplicate-key error; skip gracefully.
-        let uid = project_uid(instance_id, &slug);
-        let project = Project {
-            uid: uid.clone(),
-            name: slug.clone(),
-            summary: None,
-            instance_id: instance_id.to_string(),
-        };
-        if let Err(e) = store.upsert_project(&project) {
-            tracing::debug!(
-                "detect_implicit_projects: skipping '{}' (upsert_project failed: {e})",
-                slug
-            );
-            // Still wire up edges even if the upsert failed.
-            let _ = e;
-        }
-
-        // Attach all notes under <container>/<slug>/ via vault-relative paths.
-        let prefix = format!("{container}/{slug}/");
-        let all_notes = store.list_notes(Some(vault_uid))?;
-        let edges: Vec<(&str, &str)> = all_notes
-            .iter()
-            .filter(|n| n.file_path.starts_with(&prefix))
-            .map(|n| (uid.as_str(), n.uid.as_str()))
-            .collect();
-        if !edges.is_empty() {
-            store.batch_insert_project_note_edges(&edges)?;
-        }
-
-        detected.push(slug);
+        detected.push((slug, container.to_string()));
     }
 
     Ok(())
@@ -698,6 +784,101 @@ components = ["child-b"]
             err.to_string().contains("\"dup\""),
             "error must name the duplicate project, got: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_configured_project_topology_retires_marker_without_advancing_generation() {
+        for (case, topology) in [
+            ("component", "components = [\"missing\"]"),
+            ("parent", "parent = \"missing\""),
+        ] {
+            let toml = format!(
+                r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "configured"
+{topology}
+"#
+            );
+            let config = crate::config::InstanceConfig::from_toml_str(&toml).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{case}.lbug"));
+            let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+            let generation_before = store.graph_generation();
+
+            let error = super::materialize_projects(&store, &config, "test-instance", &db_path)
+                .err()
+                .expect("an undeclared Project endpoint must fail preflight");
+
+            assert!(error.to_string().contains("not configured"), "{error:#}");
+            assert_eq!(store.graph_generation(), generation_before);
+            assert!(
+                !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+                "proven {case} preflight failure must retire the publication marker"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_project_replacement_failure_retires_only_proven_restored_marker() {
+        for (case, disposition, marker_expected) in [
+            (
+                "restored",
+                nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack,
+                false,
+            ),
+            (
+                "ambiguous",
+                nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                true,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{case}.lbug"));
+            let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+            let generation_before = store.graph_generation();
+            let publication = crate::manifest::begin_graph_mutation_publication(
+                &store,
+                format!("injected {case} Project replacement"),
+            )
+            .unwrap();
+            let injected = nestweaver_store::write::ReplaceMaterializedProjectsError {
+                disposition,
+                primary: nestweaver_store::StoreError::Query(format!(
+                    "injected {case} Project replacement failure"
+                )),
+            };
+
+            let error = match super::resolve_project_replacement(publication, Err(injected)) {
+                Ok(_) => panic!("injected replacement must remain an operation failure"),
+                Err(error) => error,
+            };
+
+            assert!(error.to_string().contains("injected"), "{error:#}");
+            assert_eq!(store.graph_generation(), generation_before);
+            assert_eq!(
+                crate::sidecar_path(&db_path, ".index-dirty").exists(),
+                marker_expected,
+                "{case} disposition retained the wrong publication-marker state"
+            );
+        }
     }
 
     #[test]
@@ -779,6 +960,244 @@ args = { page = "123" }
             vec![wiki_note_uid],
             "a transient remote failure must preserve the last good wiki membership"
         );
+    }
+
+    #[test]
+    fn explicit_project_materialization_versions_change_but_not_exact_noop() {
+        let toml = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "stable"
+description = "Stable project"
+"#;
+        let config = crate::config::InstanceConfig::from_toml_str(toml).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+
+        let changed =
+            super::materialize_projects(&store, &config, "test-instance", &db_path).unwrap();
+        assert_eq!(
+            changed.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+        );
+        assert_eq!(
+            changed.publication.generation_after,
+            changed.publication.generation_before + 1
+        );
+
+        let unchanged =
+            super::materialize_projects(&store, &config, "test-instance", &db_path).unwrap();
+        assert_eq!(
+            unchanged.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange
+        );
+        assert_eq!(
+            unchanged.publication.generation_after,
+            changed.publication.generation_after
+        );
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "clean and no-op publications must both retire the crash fence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_wiki_source_keeps_all_project_memberships_and_repeats_as_exact_noop() {
+        use nestweaver_schema::{note_uid, project_uid};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = dir.path().join("mock-mcp.sh");
+        std::fs::write(
+            &server_path,
+            r##"while IFS= read -r request; do
+  case "$request" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"# Shared Wiki\nOne canonical document."}],"isError":false}}'
+      ;;
+  esac
+done
+"##,
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "alpha"
+
+[[projects.wiki_sources]]
+label = "Architecture"
+mcp_server = "mock"
+tool = "get_page"
+args = {{ page = "shared" }}
+
+[[projects]]
+name = "beta"
+
+[[projects.wiki_sources]]
+label = "Architecture"
+mcp_server = "mock"
+tool = "get_page"
+args = {{ page = "shared" }}
+
+[[mcp_servers]]
+name = "mock"
+command = "/bin/sh"
+args = ["{}"]
+timeout_secs = 5
+"#,
+            server_path.display()
+        );
+        let config = crate::config::InstanceConfig::from_toml_str(&toml).unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+
+        let first =
+            super::materialize_projects(&store, &config, "test-instance", &db_path).unwrap();
+        let alpha_uid = project_uid("test-instance", "alpha");
+        let beta_uid = project_uid("test-instance", "beta");
+        let shared_note_uid = note_uid("wiki:mock", "get_page/Architecture");
+        for project_uid in [&alpha_uid, &beta_uid] {
+            assert_eq!(
+                store.list_project_note_uids(project_uid).unwrap(),
+                vec![shared_note_uid.clone()],
+                "the shared wiki Note must remain attached to every configured Project"
+            );
+        }
+        assert_eq!(
+            store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .filter(|note| note.uid == shared_note_uid)
+                .count(),
+            1,
+            "shared Project membership must use one canonical wiki Note"
+        );
+        assert_eq!(first.wiki_notes_ingested, 1);
+
+        let second =
+            super::materialize_projects(&store, &config, "test-instance", &db_path).unwrap();
+        assert_eq!(
+            second.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange
+        );
+        assert_eq!(
+            second.publication.generation_after, first.publication.generation_after,
+            "an identical shared-source rerun must not advance graph generation"
+        );
+    }
+
+    #[test]
+    fn implicit_project_detection_versions_atomic_change_and_dry_run_is_noop() {
+        use nestweaver_schema::{Note, NoteKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        let project_dir = vault_root.join("Workspaces/alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("_Overview.md"), "# Alpha").unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:vault:alpha".to_string(),
+                vault_uid: "vault:test".to_string(),
+                file_path: "Workspaces/alpha/_Overview.md".to_string(),
+                title: "Alpha".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "alpha".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let dry_run = super::detect_implicit_projects_with_publication(
+            &store,
+            &vault_root,
+            "vault:test",
+            "test-instance",
+            true,
+        )
+        .unwrap();
+        assert_eq!(dry_run.projects, vec!["alpha"]);
+        assert_eq!(
+            dry_run.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange
+        );
+        assert_eq!(store.graph_generation(), 0);
+
+        let changed = super::detect_implicit_projects_with_publication(
+            &store,
+            &vault_root,
+            "vault:test",
+            "test-instance",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            changed.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+        );
+        assert_eq!(changed.publication.generation_after, 1);
+
+        let unchanged = super::detect_implicit_projects_with_publication(
+            &store,
+            &vault_root,
+            "vault:test",
+            "test-instance",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            unchanged.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange
+        );
+        assert_eq!(store.graph_generation(), 1);
     }
 
     #[test]

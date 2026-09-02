@@ -2639,6 +2639,18 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
             ));
         }
     }
+    if !status.identity_state.is_empty() {
+        lines.push(format!("  Identity:         {}", status.identity_state));
+    }
+    if !status.identity_error.is_empty() {
+        lines.push(format!("  Identity error:   {}", status.identity_error));
+    }
+    if !status.identity_remediation.is_empty() {
+        lines.push(format!(
+            "  Identity repair:  {}",
+            status.identity_remediation
+        ));
+    }
     if !status.error.is_empty() {
         lines.push(format!("  Error:            {}", status.error));
     }
@@ -2665,6 +2677,40 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
         index_live: value["index_live"].as_u64().unwrap_or(0),
         index_tombstoned: value["index_tombstoned"].as_u64().unwrap_or(0),
         index_stored: value["index_stored"].as_u64().unwrap_or(0),
+        identity_state: value["identity_state"].as_str().unwrap_or("").to_string(),
+        identity_error: value["identity_error"].as_str().unwrap_or("").to_string(),
+        identity_remediation: value["identity_remediation"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn format_search_status(status: &nestweaver_proto::SearchStatus) -> String {
+    let mut lines = vec![
+        format!("  Reader available: {}", status.reader_available),
+        format!("  Writer available: {}", status.writer_available),
+        format!("  Corpus current:   {}", status.current),
+        format!("  Rebuild debt:     {}", status.reconciliation_debt),
+    ];
+    if !status.debt_operation.is_empty() {
+        lines.push(format!("  Debt operation:   {}", status.debt_operation));
+    }
+    if !status.error.is_empty() {
+        lines.push(format!("  Error:            {}", status.error));
+    }
+    lines.join("\n")
+}
+
+fn search_status_from_json(value: &serde_json::Value) -> nestweaver_proto::SearchStatus {
+    nestweaver_proto::SearchStatus {
+        reader_available: value["reader_available"].as_bool().unwrap_or(false),
+        writer_available: value["writer_available"].as_bool().unwrap_or(false),
+        current: value["current"].as_bool().unwrap_or(false),
+        reconciliation_debt: value["reconciliation_debt"].as_bool().unwrap_or(false),
+        error: value["error"].as_str().unwrap_or("").to_string(),
+        debt_operation: value["debt_operation"].as_str().unwrap_or("").to_string(),
+        debt_created_at: value["debt_created_at"].as_i64().unwrap_or(0),
     }
 }
 
@@ -2964,6 +3010,12 @@ fn format_daemon_status_response(
             } else {
                 lines.push("  State:            unknown (older daemon)".to_string());
             }
+            lines.push("Search index:".to_string());
+            if let Some(search) = status.search_status.as_ref() {
+                lines.push(format_search_status(search));
+            } else {
+                lines.push("  State:            unknown (older daemon)".to_string());
+            }
             lines.join("\n")
         }
         Err(error) => [
@@ -2971,6 +3023,8 @@ fn format_daemon_status_response(
             "Embedding:".to_string(),
             "  State:            unavailable (daemon booting or unreachable)".to_string(),
             format!("  Error:            {error}"),
+            "Search index:".to_string(),
+            "  State:            unavailable (daemon booting or unreachable)".to_string(),
         ]
         .join("\n"),
     }
@@ -3097,7 +3151,10 @@ mod daemon_status_renderer_tests {
         let output = format_daemon_status_response(Err("transport refused"));
         assert!(output.starts_with("Config: unknown (daemon unreachable)\nEmbedding:\n"));
         assert!(output.contains("unavailable (daemon booting or unreachable)"));
-        assert!(output.ends_with("  Error:            transport refused"));
+        assert!(output.contains("  Error:            transport refused\nSearch index:\n"));
+        assert!(output.ends_with(
+            "Search index:\n  State:            unavailable (daemon booting or unreachable)"
+        ));
     }
 
     #[test]
@@ -3333,16 +3390,16 @@ enum Commands {
     ///
     /// Recovery is not a delete: the stale PageRank sidecar is removed and the
     /// generation advanced and persisted BEFORE the marker is cleared, then
-    /// PageRank is recomputed against the committed graph. A publication whose
-    /// writer process is still alive is left strictly alone.
+    /// PageRank is recomputed against the committed graph. The database writer
+    /// lock and in-process publication lease are never overridden.
     ///
     /// Without --force this refuses any marker it cannot prove was abandoned:
     /// one carrying no writer pid (written by an older release, truncated by a
     /// crash, or created by hand) and one whose state cannot be read at all.
-    /// --force overrides exactly that conservatism. It never overrides a writer
-    /// that is demonstrably alive.
+    /// --force overrides exactly that conservatism. A marker PID alone is not
+    /// ownership because PIDs are recyclable.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. A live writer is never overridden, even with\n--force; stop that process first."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first."
     )]
     Repair {
         #[arg(
@@ -3356,7 +3413,7 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
-            help = "Recover a marker that carries no usable writer pid, or whose state cannot be read. Never overrides a live writer."
+            help = "Recover a marker that carries no usable writer pid, or whose state cannot be read. Never overrides database/publication ownership."
         )]
         force: bool,
     },
@@ -4593,7 +4650,7 @@ enum Commands {
     /// about every 5 minutes and once at the end of the pass, so interrupting
     /// a run keeps only the work completed up to the last checkpoint.
     #[command(
-        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
+        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing\n  nestweaver embed --force --repair-identity  # discard an unreadable semantic space and rebuild"
     )]
     Embed {
         #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
@@ -4641,6 +4698,12 @@ enum Commands {
         scope: String,
         #[arg(long, help = "Re-embed nodes that already have embeddings")]
         force: bool,
+        #[arg(
+            long,
+            requires = "force",
+            help = "Destructively discard all vectors and unreadable embedding metadata before rebuilding; requires --force"
+        )]
+        repair_identity: bool,
         #[arg(long, help = "Print timing and statistics")]
         stats: bool,
     },
@@ -10022,7 +10085,10 @@ fn repair_outcome_name(
         R::NotFileBacked => "not_file_backed",
         R::Undeterminable { .. } => "undeterminable",
         R::WriterAlive { .. } => "writer_alive",
+        R::WriterLivenessUnknown { .. } => "writer_liveness_unknown",
         R::WriterUnattributed => "writer_unattributed",
+        R::WriterAuthorityRequired { .. } => "writer_authority_required",
+        R::MarkerChanged => "marker_changed",
         R::LeaseHeld => "lease_held",
         R::ReadOnlyStore { .. } => "read_only_store",
         R::Recovered { .. } => "recovered",
@@ -10137,12 +10203,15 @@ fn run_repair_index_publication(
     let mut open_error: Option<anyhow::Error> = None;
 
     if status.dirty && !dry_run {
+        let authority = require_exclusive_store_access(db_path, "repair index publication")?;
         match nestweaver_store::GraphStore::open(db_path) {
             Ok(store) => {
                 outcome = Some(if force {
-                    nestweaver_engine::index::force_recover_index_publication(&store)?
+                    nestweaver_engine::index::force_recover_index_publication(&store, &authority)?
                 } else {
-                    nestweaver_engine::index::recover_abandoned_index_publication(&store, true)?
+                    nestweaver_engine::index::recover_abandoned_index_publication(
+                        &store, &authority,
+                    )?
                 });
             }
             Err(error) => open_error = Some(repair_open_failure(db_path, error)),
@@ -10198,6 +10267,8 @@ fn run_repair_index_publication(
                 "determinable": status.determinable,
                 "writer_pid": status.writer_pid,
                 "writer_alive": status.writer_alive,
+                "writer_liveness_unknown": status.writer_liveness_unknown,
+                "writer_authority_held": status.writer_authority_held,
                 "marker_age_s": status.marker_age_s,
                 "writer_reason": status.writer_reason,
                 "wedged": status.is_wedged(),
@@ -10233,7 +10304,7 @@ fn run_repair_index_publication(
         return Ok(exit);
     }
     println!(
-        "Index publication is DIRTY (writer_pid={}, writer_alive={}, marker_age={}, wedged={}).",
+        "Index publication is DIRTY (writer_pid={}, writer_alive={}, writer_authority_held={}, marker_age={}, wedged={}).",
         status
             .writer_pid
             .map(|p| p.to_string())
@@ -10241,6 +10312,10 @@ fn run_repair_index_publication(
         status
             .writer_alive
             .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        status
+            .writer_authority_held
+            .map(|held| held.to_string())
             .unwrap_or_else(|| "unknown".into()),
         status
             .marker_age_s
@@ -10270,10 +10345,11 @@ fn run_repair_index_publication(
                  re-run with --force:\n    nestweaver repair --db {} --force",
                 db_path.display()
             );
-        } else if after.writer_alive == Some(true) {
+        } else if after.writer_authority_held == Some(true) {
             eprintln!(
-                "A live writer (pid {}) owns this publication. Wait for it to finish or stop \
-                 that process; --force will not override it.",
+                "The canonical writer lease is held, so a writer owns this publication. \
+                 Diagnostic marker pid: {}. Wait for the lease owner to finish or stop it; \
+                 --force will not override writer authority.",
                 after.writer_pid.unwrap_or(0)
             );
         }
@@ -11184,10 +11260,11 @@ fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: b
 /// write. Eight write paths honoured that answer and opened the store
 /// read-write with no check for a running daemon at all.
 ///
-/// The lock is the only thing that can answer the question that matters: is
-/// someone else holding this database RIGHT NOW. It lives on the database file
-/// itself, so unlike the pidfile an operator's `rm` cannot erase it, and the
-/// kernel releases it on process exit so there is no stale state to reap.
+/// The authority is the only thing that can answer the question that matters:
+/// is someone else holding this database RIGHT NOW. It combines lbug's real
+/// POSIX database-lock class with descriptor-scoped database and stable-
+/// sidecar flocks. Removing only a pidfile or sidecar cannot mint a competing
+/// authority, and the kernel releases every claim on process exit.
 ///
 /// `Unknown` fails CLOSED. A lock state we could not read is not evidence of
 /// freedom, and the cost of being wrong is two writers on a store that is not
@@ -14044,6 +14121,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             batch_size,
             scope,
             force,
+            repair_identity,
             stats,
         } => run_embed(
             db.as_deref(),
@@ -14056,6 +14134,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             batch_size,
             &scope,
             force,
+            repair_identity,
             stats,
             use_daemon,
             load_cli_local_embedder,
@@ -14072,6 +14151,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let files = match nestweaver_engine::changed_files::require_changed_files(&files) {
+                Ok(files) => files,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
 
@@ -14115,7 +14201,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 render_blast_radius_text(&payload);
             }
-            Ok((EXIT_SUCCESS, None))
+            let exit = if payload["resolver_stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty())
+            {
+                EXIT_NEEDS_REINDEX
+            } else {
+                EXIT_SUCCESS
+            };
+            Ok((exit, None))
         }
 
         Commands::DetectChanges {
@@ -14125,6 +14219,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let files = match nestweaver_engine::changed_files::require_changed_files(&files) {
+                Ok(files) => files,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
             // nw-174 added a default cap to the underlying tool. Without a flag
@@ -14177,7 +14278,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
             }
-            Ok((EXIT_SUCCESS, None))
+            let exit = if payload["resolver_stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty())
+            {
+                EXIT_NEEDS_REINDEX
+            } else {
+                EXIT_SUCCESS
+            };
+            Ok((exit, None))
         }
 
         Commands::FlowTrace {
@@ -14660,6 +14769,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         coverage: nestweaver_engine::blast_radius::Coverage::default(),
                         blind_spots: Vec::new(),
                         cochanged_files: Vec::new(),
+                        resolver_stale_repos: Vec::new(),
                         analysis_direction: "over-approximate".to_string(),
                     };
                     let mut payload = serde_json::to_value(&empty)?;
@@ -14786,27 +14896,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Computed up front so the daemon path can send a proper
             // `changed_files` array (the tool never accepted the raw --files
             // string under the legacy `files` key).
-            let changed_files: Vec<String> = if let Some(files_str) = files {
-                files_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else if let Some(base) = base_ref {
-                let repo_root = detect_repo_root();
-                out.status(&format!("Detecting changed files via git diff {base}..."));
-                changed_files_from_git(&repo_root, Some(&base))
-                    .context("git diff")?
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect()
+            let (changed_files, explicitly_named): (Vec<String>, bool) =
+                if let Some(files_str) = files {
+                    (
+                        files_str.split(',').map(ToString::to_string).collect(),
+                        true,
+                    )
+                } else if let Some(base) = base_ref {
+                    let repo_root = detect_repo_root();
+                    out.status(&format!("Detecting changed files via git diff {base}..."));
+                    (
+                        changed_files_from_git(&repo_root, Some(&base))
+                            .context("git diff")?
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        false,
+                    )
+                } else {
+                    // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                    // sysexits.h) — the same code clap's own parse failures
+                    // return. Exiting 1 made "you invoked this wrong" and "the
+                    // operation failed" indistinguishable to a caller.
+                    eprintln!("Error: provide either --files or --base-ref");
+                    return Ok((EXIT_USAGE, None));
+                };
+
+            let changed_files = if explicitly_named {
+                match nestweaver_engine::changed_files::require_changed_files(&changed_files) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        return Ok((EXIT_USAGE, None));
+                    }
+                }
             } else {
-                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
-                // sysexits.h) — the same code clap's own parse failures
-                // return. Exiting 1 made "you invoked this wrong" and "the
-                // operation failed" indistinguishable to a caller.
-                eprintln!("Error: provide either --files or --base-ref");
-                return Ok((EXIT_USAGE, None));
+                changed_files
             };
 
             if changed_files.is_empty() {
@@ -14910,7 +15035,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let stats = format!("{} in {}", result.summary, format_elapsed(t0.elapsed()));
-            Ok((EXIT_SUCCESS, Some(stats)))
+            let exit = if result.resolver_stale_repos.is_empty() {
+                EXIT_SUCCESS
+            } else {
+                EXIT_NEEDS_REINDEX
+            };
+            Ok((exit, Some(stats)))
         }
 
         Commands::WatchStop { db, config } => {
@@ -15128,7 +15258,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Held for the whole watch, which is the point — the lease's
             // lifetime has to cover the writes, not just the decision to
             // start.
-            let _write_lease = require_exclusive_store_access(&db_path, "watch")?;
+            let write_lease = require_exclusive_store_access(&db_path, "watch")?;
 
             let watcher =
                 CodeWatcher::new(&db_path, &repo_path, &instance_id).with_limits(index_limits);
@@ -15202,7 +15332,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 repo_path.display(),
                 db_path.display()
             );
-            if let Err(e) = watcher.run() {
+            if let Err(e) = watcher.run_with_write_lease(&write_lease) {
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
@@ -17567,6 +17697,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::DetectImplicitProjects { vault, dry_run, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
 
             if !vault.exists() || !vault.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", vault.display());
@@ -17584,17 +17715,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── daemon guard ──────────────────────────────────────
-            // nw-161: NOT taken for --dry-run. The daemon RPC has no dry-run
-            // parameter, so routing a preview through it would perform the very
-            // writes the flag exists to avoid — the same shape as nw-186, where
-            // a daemon branch silently ignored the caller's flags. The local
-            // path opens read-only, so a preview cannot write by construction.
-            if use_daemon && !dry_run {
+            // Route apply and preview through the same identity resolver. The
+            // daemon treats dry_run as a read and keeps it outside the write
+            // funnel; apply acquires its exact worker-owned writer lease.
+            if use_daemon {
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory.
                 let vault_abs = abs_for_daemon(&vault);
                 let args = serde_json::json!({
                     "vault": vault_abs.to_string_lossy(),
+                    "instance_id": "",
+                    "dry_run": dry_run,
                 });
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)?
@@ -17602,9 +17733,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // nw-271: a decode failure must not print "No implicit
                     // projects detected" — that is a claim about the vault,
                     // made from a failure to read the response.
-                    let detected: Vec<String> =
-                        serde_json::from_value(unwrap_hybrid_payload(value))
-                            .context("decode detected implicit projects from the daemon")?;
+                    let payload = unwrap_hybrid_payload(value);
+                    let detected: Vec<String> = if payload.is_array() {
+                        // Backward compatibility with pre-publication-outcome
+                        // daemons.
+                        serde_json::from_value(payload.clone())
+                            .context("decode detected implicit projects from the daemon")?
+                    } else {
+                        serde_json::from_value(payload["projects"].clone())
+                            .context("decode detected implicit projects from the daemon")?
+                    };
+                    let publication = payload.get("publication");
                     if detected.is_empty() {
                         println!("No implicit projects detected in {}", vault.display());
                     } else {
@@ -17613,26 +17752,58 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("  {slug}");
                         }
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    let degraded = publication.and_then(|value| value["disposition"].as_str())
+                        == Some("committed_degraded");
+                    if let Some(warnings) =
+                        publication.and_then(|value| value["warnings"].as_array())
+                    {
+                        for warning in warnings {
+                            eprintln!(
+                                "Warning: graph mutation committed, but publication stage '{}' is degraded: {}",
+                                warning["stage"].as_str().unwrap_or("unknown"),
+                                warning["message"].as_str().unwrap_or("unknown failure")
+                            );
+                        }
+                    }
+                    return Ok((if degraded { EXIT_ERROR } else { EXIT_SUCCESS }, None));
                 }
             }
 
-            let store = open_store(Some(&db_path))?;
+            // A preview is structurally read-only. Apply is a graph writer and
+            // must hold the same cross-process lease as every other direct
+            // mutation before opening a writable store.
+            let _write_lease = if dry_run {
+                None
+            } else {
+                Some(require_exclusive_store_access(
+                    &db_path,
+                    "detect and materialize implicit projects",
+                )?)
+            };
+            let store = if dry_run {
+                open_store(Some(&db_path))?
+            } else {
+                GraphStore::open(&db_path)
+                    .map_err(|error| daemon_held_store_error(&db_path, error))?
+            };
 
             // Resolve vault UID the same way the indexer does.
             let canonical = abs_for_daemon(&vault);
-            let instance_id = "default";
-            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
+            let instance_id = store
+                .data_instance_id()?
+                .unwrap_or_else(|| "default".to_string());
+            let vault_uid =
+                nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
-            let detected = nestweaver_engine::detect_implicit_projects_with_mode(
+            let detected = nestweaver_engine::project::detect_implicit_projects_with_publication(
                 &store,
                 &vault,
                 &vault_uid,
-                instance_id,
+                &instance_id,
                 dry_run,
             )?;
 
-            if detected.is_empty() {
+            if detected.projects.is_empty() {
                 println!(
                     "No implicit projects detected in {} (looked under {})",
                     vault.display(),
@@ -17641,19 +17812,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else if dry_run {
                 println!(
                     "Would create {} implicit project(s) (dry run — nothing written):",
-                    detected.len()
+                    detected.projects.len()
                 );
-                for slug in &detected {
+                for slug in &detected.projects {
                     println!("  {slug}");
                 }
             } else {
-                println!("Detected {} implicit project(s):", detected.len());
-                for slug in &detected {
+                println!("Detected {} implicit project(s):", detected.projects.len());
+                for slug in &detected.projects {
                     println!("  {slug}");
                 }
             }
-
-            Ok((EXIT_SUCCESS, None))
+            for warning in &detected.publication.warnings {
+                eprintln!(
+                    "Warning: graph mutation committed, but publication stage '{}' is degraded: {}",
+                    warning.stage, warning.message
+                );
+            }
+            let exit = if detected.publication.is_degraded() {
+                EXIT_ERROR
+            } else {
+                EXIT_SUCCESS
+            };
+            Ok((exit, None))
         }
 
         Commands::Index {
@@ -17942,7 +18123,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // filemeta, resolution deps, parsed cache, pagerank, git activity,
             // cochange and the trigram rebuild below. Dropping it here would
             // make this a probe again.
-            let _write_lease = require_exclusive_store_access(&db_path, "index")?;
+            let write_lease = require_exclusive_store_access(&db_path, "index")?;
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
@@ -17965,8 +18146,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .name(name.as_deref())
                 .limits(index_limits)
                 .excludes(&repo_excludes);
-                let result = nestweaver_engine::index::index_directory_with_opts(
-                    &repo_path, &db_path, &opts,
+                let result = nestweaver_engine::index::index_directory_with_opts_and_write_lease(
+                    &repo_path,
+                    &db_path,
+                    &opts,
+                    &write_lease,
                 )
                 .context("index_directory")?;
 
@@ -17984,16 +18168,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 skipped_files = result.skipped_files;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = nestweaver_engine::index::incremental_index_with_excludes(
-                    &repo_path,
-                    &db_path,
-                    &instance_id,
-                    &repo_url,
-                    name.as_deref(),
-                    index_limits,
-                    &repo_excludes,
-                )
-                .context("incremental_index")?;
+                let inc =
+                    nestweaver_engine::index::incremental_index_with_excludes_and_write_lease(
+                        &repo_path,
+                        &db_path,
+                        &instance_id,
+                        &repo_url,
+                        name.as_deref(),
+                        index_limits,
+                        &repo_excludes,
+                        &write_lease,
+                    )
+                    .context("incremental_index")?;
 
                 files_count = inc.files_added + inc.files_modified;
                 symbols_count = inc.symbols_added;
@@ -20552,6 +20738,32 @@ fn now_epoch_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn require_complete_graph_publication(
+    operation: &str,
+    publication: &nestweaver_engine::manifest::GraphMutationPublicationOutcome,
+) -> anyhow::Result<()> {
+    use nestweaver_engine::manifest::GraphMutationPublicationDisposition;
+
+    if publication.disposition != GraphMutationPublicationDisposition::CommittedDegraded {
+        return Ok(());
+    }
+    let warnings = if publication.warnings.is_empty() {
+        "unspecified publication stage".to_string()
+    } else {
+        publication
+            .warnings
+            .iter()
+            .map(|warning| format!("{}: {}", warning.stage, warning.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    anyhow::bail!(
+        "{operation} committed graph changes (generation {} -> {}), but publication reconciliation is degraded: {warnings}. The graph was NOT rolled back; repair the named stage(s) before treating derived artifacts as current",
+        publication.generation_before,
+        publication.generation_after,
+    )
+}
+
 fn run_memory(
     command: MemoryCommands,
     t0: std::time::Instant,
@@ -20654,10 +20866,44 @@ fn run_memory(
                     args,
                 )? {
                     println!("{}", serde_json::to_string_pretty(&value)?);
+                    let failed_apply = apply
+                        && !value
+                            .get("applied")
+                            .and_then(|applied| applied.as_bool())
+                            .unwrap_or(false)
+                        && value
+                            .get("proposals_total")
+                            .and_then(|total| total.as_u64())
+                            .or_else(|| {
+                                value
+                                    .get("proposals")
+                                    .and_then(|items| items.as_array())
+                                    .map(|items| items.len() as u64)
+                            })
+                            .unwrap_or(0)
+                            > 0;
+                    if failed_apply {
+                        anyhow::bail!(
+                            "memory consolidation apply did not complete; the JSON manifest above contains recovery warnings"
+                        );
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
-            let store = open_store(Some(&db_path))?;
+            let _write_lease = if apply {
+                Some(require_exclusive_store_access(
+                    &db_path,
+                    "apply memory consolidation",
+                )?)
+            } else {
+                None
+            };
+            let store = if apply {
+                GraphStore::open(&db_path)
+                    .map_err(|error| daemon_held_store_error(&db_path, error))?
+            } else {
+                open_store(Some(&db_path))?
+            };
             let manifest = nestweaver_engine::memory_consolidate(&store, apply, now_epoch_secs())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
@@ -20683,6 +20929,11 @@ fn run_memory(
                 manifest.proposals.len(),
                 format_elapsed(t0.elapsed())
             );
+            if apply && !manifest.applied && !manifest.proposals.is_empty() {
+                anyhow::bail!(
+                    "memory consolidation apply did not complete; review the warnings above and recover the durable journal before retrying"
+                );
+            }
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
@@ -21835,6 +22086,12 @@ fn run_brain(
                             format_embedding_status(&embedding_status_from_json(embedding))
                         );
                     }
+                    if let Some(search) =
+                        value.get("search_status").filter(|value| !value.is_null())
+                    {
+                        println!("Search index:");
+                        println!("{}", format_search_status(&search_status_from_json(search)));
+                    }
                     // Interaction tracking — local check (not in MCP response).
                     // The sidecar is created (empty) by `InteractionTracker::new`
                     // when an MCP/daemon starts with --track-interactions, so:
@@ -22640,7 +22897,7 @@ fn run_brain(
             // it cannot survive PID reuse and an operator's `rm` erases it.
             //
             // Held for the whole watch.
-            let _write_lease = require_exclusive_store_access(&db_path, "brain watch")?;
+            let write_lease = require_exclusive_store_access(&db_path, "brain watch")?;
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
@@ -22728,7 +22985,7 @@ fn run_brain(
                 path.display(),
                 db_path.display()
             ));
-            if let Err(e) = watcher.run() {
+            if let Err(e) = watcher.run_with_write_lease(&write_lease) {
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
@@ -22965,6 +23222,10 @@ fn run_brain(
                     &extra_patterns,
                 )
                 .context("index_markdown_directory_since")?;
+                require_complete_graph_publication(
+                    "incremental vault refresh",
+                    &result.publication,
+                )?;
 
                 // Record the indexer run timestamp.
                 if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {
@@ -23000,6 +23261,7 @@ fn run_brain(
                     &extra_patterns,
                 )
                 .context("index_markdown_directory")?;
+                require_complete_graph_publication("full vault refresh", &result.publication)?;
 
                 // Record the indexer run timestamp.
                 if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {
@@ -23643,6 +23905,11 @@ fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
+            if rerank {
+                store.require_verified_embedding_identity().context(
+                    "verify the database embedding identity before direct context reranking",
+                )?;
+            }
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
@@ -25090,6 +25357,15 @@ fn brain_search_result_item_json(item: &nestweaver_proto::SearchResultItem) -> s
     value
 }
 
+fn semantic_unavailable_json(detail: &nestweaver_proto::SemanticUnavailable) -> serde_json::Value {
+    serde_json::json!({
+        "cause": detail.cause,
+        "reason": detail.reason,
+        "error": detail.error,
+        "remediation": detail.remediation,
+    })
+}
+
 fn render_brain_search_response(
     resp: &nestweaver_proto::BrainSearchResponse,
     json: bool,
@@ -25118,8 +25394,18 @@ fn render_brain_search_response(
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
         }
+        if let Some(detail) = &resp.semantic_unavailable {
+            payload["semantic_unavailable"] = semantic_unavailable_json(detail);
+        }
         print_json_payload(&payload)?;
         return Ok(());
+    }
+
+    if let Some(detail) = &resp.semantic_unavailable {
+        println!(
+            "Warning: semantic search unavailable ({}): {}\n  Remediation: {}",
+            detail.reason, detail.error, detail.remediation
+        );
     }
 
     if resp.results.is_empty() {
@@ -26983,6 +27269,7 @@ mod brain_search_renderer_tests {
             truncated: false,
             semantic_applied: false,
             degraded_components: Vec::new(),
+            semantic_unavailable: None,
         };
 
         let metadata = brain_search_display_metadata(&response);
@@ -26994,6 +27281,21 @@ mod brain_search_renderer_tests {
             brain_search_result_item_json(&response.results[0])["canonical_id"],
             "canonical-needle"
         );
+    }
+
+    #[test]
+    fn typed_semantic_unavailability_keeps_all_structured_fields() {
+        let detail = nestweaver_proto::SemanticUnavailable {
+            cause: "embedding_identity".to_string(),
+            reason: "embedding_identity_unreadable".to_string(),
+            error: "malformed persisted metadata".to_string(),
+            remediation: "repair the identity".to_string(),
+        };
+        let value = semantic_unavailable_json(&detail);
+        assert_eq!(value["cause"], "embedding_identity");
+        assert_eq!(value["reason"], "embedding_identity_unreadable");
+        assert_eq!(value["error"], "malformed persisted metadata");
+        assert_eq!(value["remediation"], "repair the identity");
     }
 
     #[test]
@@ -27336,6 +27638,7 @@ fn run_embed<Load>(
     batch_size: usize,
     scope: &str,
     force: bool,
+    repair_identity: bool,
     stats: bool,
     use_daemon: bool,
     local_model_loader: Load,
@@ -27358,6 +27661,7 @@ where
         batch_size,
         scope,
         force,
+        repair_identity,
         stats,
         use_daemon,
         local_model_loader,
@@ -27377,6 +27681,7 @@ fn run_embed_with_cancel<Load>(
     batch_size: usize,
     scope: &str,
     force: bool,
+    repair_identity: bool,
     stats: bool,
     use_daemon: bool,
     local_model_loader: Load,
@@ -27411,6 +27716,12 @@ where
     if batch_size == 0 {
         anyhow::bail!("--batch-size must be at least 1");
     }
+    let do_symbols = scope == "all" || scope == "symbols";
+    let do_notes = scope == "all" || scope == "notes";
+    let do_headings = scope == "all" || scope == "headings";
+    if !do_symbols && !do_notes && !do_headings {
+        anyhow::bail!("unknown --scope '{scope}': expected one of: all, symbols, notes, headings");
+    }
 
     let t0 = std::time::Instant::now();
     let default = default_db_path();
@@ -27432,16 +27743,22 @@ where
         // to the default (that is what the daemon would load); a DB that
         // exists but cannot be read gets a warning, because comparing against
         // the default could then produce a spurious "cannot honor" error.
-        let recorded_model = match nestweaver_store::GraphStore::open_read_only(path) {
-            Ok(store) => store.get_embedding_metadata().ok().flatten(),
-            Err(e) => {
-                if path.exists() {
-                    eprintln!(
-                        "Warning: could not read the recorded embedding model ({e:#}); \
-                         assuming the default model"
-                    );
+        let recorded_model = if repair_identity {
+            None
+        } else {
+            match nestweaver_store::GraphStore::open_read_only(path) {
+                Ok(store) => store
+                    .get_embedding_metadata()
+                    .context("read the database embedding identity before daemon embedding")?,
+                Err(e) => {
+                    if path.exists() {
+                        eprintln!(
+                            "Warning: could not read the recorded embedding model ({e:#}); \
+                             assuming the default model"
+                        );
+                    }
+                    None
                 }
-                None
             }
         };
         let recorded_model = recorded_model
@@ -27453,31 +27770,33 @@ where
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
-                match rt.block_on(client.plan_embed(scope, force)) {
-                    Ok(plan) => {
-                        eprintln!(
-                            "Embedding plan: {} eligible, {} already embedded, {} scoped node(s).",
-                            plan.eligible, plan.skipped, plan.scoped
-                        );
-                        if plan.eligible == 0 {
+                if !repair_identity {
+                    match rt.block_on(client.plan_embed(scope, force)) {
+                        Ok(plan) => {
                             eprintln!(
-                                "No embedding work required; every scoped node already has an authoritative sidecar embedding."
+                                "Embedding plan: {} eligible, {} already embedded, {} scoped node(s).",
+                                plan.eligible, plan.skipped, plan.scoped
                             );
-                            return Ok(EXIT_SUCCESS);
+                            if plan.eligible == 0 {
+                                eprintln!(
+                                    "No embedding work required; every scoped node already has an authoritative sidecar embedding."
+                                );
+                                return Ok(EXIT_SUCCESS);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        // A same-version daemon from before PlanEmbed can survive a binary
-                        // upgrade. Keep the legacy route usable, but make the lost preflight
-                        // visible and tell the operator how to enable it.
-                        if daemon_lacks_embedding_preflight(&error) {
-                            eprintln!(
-                                "Daemon does not support embedding preflight; restart it with \
+                        Err(error) => {
+                            // A same-version daemon from before PlanEmbed can survive a binary
+                            // upgrade. Keep the legacy route usable, but make the lost preflight
+                            // visible and tell the operator how to enable it.
+                            if daemon_lacks_embedding_preflight(&error) {
+                                eprintln!(
+                                    "Daemon does not support embedding preflight; restart it with \
                                  `nestweaver daemon --db {} restart` to enable eligibility reporting.",
-                                path.display()
-                            );
-                        } else {
-                            return Err(error).context("daemon embedding preflight failed");
+                                    path.display()
+                                );
+                            } else {
+                                return Err(error).context("daemon embedding preflight failed");
+                            }
                         }
                     }
                 }
@@ -27495,10 +27814,35 @@ where
                         "nestweaver embed",
                         nestweaver_client::progress::NoticeKind::EmbedProgress,
                     );
-                    client.embed(scope, force, batch_size as u32).await
+                    client
+                        .embed_with_identity_repair(
+                            scope,
+                            force,
+                            batch_size as u32,
+                            repair_identity,
+                        )
+                        .await
                 }) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
+                        if repair_identity && !resp.identity_repaired {
+                            anyhow::bail!(
+                                "daemon returned without confirming embedding identity repair; \
+                                 restart it and retry --repair-identity"
+                            );
+                        }
+                        if resp.identity_repaired {
+                            eprintln!(
+                                "Discarded {} embedding(s) and removed the unreadable semantic identity.",
+                                resp.discarded_embeddings
+                            );
+                        }
+                        if resp.restart_required {
+                            eprintln!(
+                                "Restart the daemon to load the configured embedding model, then run `nestweaver embed --force`."
+                            );
+                            return Ok(EXIT_SUCCESS);
+                        }
                         if resp.rejected > 0 {
                             eprintln!(
                                 "Error: {} embedding(s) rejected by the embedding guards \
@@ -27584,15 +27928,22 @@ where
             path.display()
         )
     })?;
-    store.reset_embedding_force_guard();
-
-    let do_symbols = scope == "all" || scope == "symbols";
-    let do_notes = scope == "all" || scope == "notes";
-    let do_headings = scope == "all" || scope == "headings";
-
-    if !do_symbols && !do_notes && !do_headings {
-        anyhow::bail!("unknown --scope '{scope}': expected one of: all, symbols, notes, headings");
+    if repair_identity {
+        let discarded = store
+            .reset_embedding_space_for_identity_repair()
+            .context("discard the unreadable semantic space before direct embedding")?;
+        eprintln!(
+            "Discarded {discarded} embedding(s) and removed the unreadable semantic identity; rebuilding from the requested model."
+        );
     }
+    // Validate the complete persisted pipeline before model loading, network
+    // calls, or local inference. `--force` may replace a verified identity; it
+    // must never authorize spending work against an unreadable one.
+    store
+        .require_verified_embedding_identity()
+        .context("verify the database embedding identity before direct embedding")?;
+    store.reset_embedding_force_guard();
+    let force = force || repair_identity;
 
     // The direct paths (--local / --endpoint) resolve their model from flags
     // alone and bypass the daemon route's recorded-model guard at the top of
@@ -27601,10 +27952,9 @@ where
     // conflicting explicit model requires --force. Absent metadata means the
     // database was never stamped: unknown, so proceed (first embed).
     let recorded_model_id = store
-        .get_embedding_metadata()
-        .ok()
-        .flatten()
-        .map(|(model_id, _)| model_id);
+        .get_embedding_pipeline()
+        .context("read the complete database embedding pipeline before direct embedding")?
+        .map(|pipeline| pipeline.model_id);
     if !force && let Some(recorded) = recorded_model_id.as_deref() {
         // On the endpoint branch the comparison operand is the endpoint's
         // model (--model, defaulting to the external default), never
@@ -28128,13 +28478,15 @@ where
                 success_count = 0;
             }
         }
-    } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
-        && let Ok(Some((recorded, _))) = store.get_embedding_metadata()
+    } else if let Some(requested) = if endpoint.is_some() { model } else { model_id }
+        && let Some((recorded, _)) = store
+            .get_embedding_metadata()
+            .context("read the database embedding identity after a zero-work embed")?
         && recorded != requested
     {
-        // Zero-work path with an explicit model mismatch: name it, or the run
-        // ends with "Done: 0 embedding(s)" and no hint that the requested
-        // model was never applied.
+        // Zero-work path with an explicit model mismatch: name it, or the
+        // run ends with "Done: 0 embedding(s)" and no hint that the
+        // requested model was never applied.
         eprintln!(
             "No embeddings were produced; the database remains embedded with '{recorded}'. \
              Re-run with --force to re-embed everything with '{requested}'."
@@ -28768,7 +29120,7 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
             // Offline recovery: operate on the sidecar journals directly (the
             // daemon is wedged and won't boot). nw-091 / Bug 3B.
             let db_path = db.unwrap_or_else(default_db_path);
-            match nestweaver_engine::abort_instance_extension_migration(&db_path, force)? {
+            match abort_instance_migration_offline(&db_path, force)? {
                 nestweaver_engine::AbortMigrationOutcome::NothingToAbort => {
                     println!("No pending instance-migration journal — nothing to abort.");
                 }
@@ -28795,6 +29147,23 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
             Ok(EXIT_SUCCESS)
         }
     }
+}
+
+/// Abort recovery is an offline mutation of the same durable journal a live
+/// daemon merge advances. Hold the canonical database write lease before even
+/// inspecting that journal, and retain it through durable removal. `--force`
+/// changes phase policy only; it never bypasses ownership.
+fn abort_instance_migration_offline(
+    db_path: &Path,
+    force: bool,
+) -> anyhow::Result<nestweaver_engine::AbortMigrationOutcome> {
+    require_existing_db(db_path)?;
+    let _lease = require_exclusive_store_access_with_remedy(
+        db_path,
+        "abort an instance-migration recovery journal",
+        ExclusivityRemedy::StopTheHolder,
+    )?;
+    nestweaver_engine::abort_instance_extension_migration(db_path, force)
 }
 
 /// Guidance for vaults whose notes were discarded by a merge collision.
@@ -29083,14 +29452,14 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             // cleanup. The pidfile above permits absent, empty and stale
             // states; none of those is evidence that nobody is writing, and
             // this is what supplies that evidence.
-            let _restore_leases = require_exclusive_restore_access(&data_dir)?;
-
             let config = nestweaver_engine::RestoreConfig {
                 snapshot_path: path,
                 data_dir: data_dir.clone(),
             };
 
-            let result = nestweaver_engine::backup_restore(&config)?;
+            let result = with_exclusive_restore_access(&data_dir, || {
+                nestweaver_engine::backup_restore(&config)
+            })?;
             let m = &result.manifest;
 
             eprintln!("Backup restored to {}", data_dir.display());
@@ -29211,11 +29580,51 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// holds its lease on the inode that now lives under `.restoring`. Looking
 /// only at `data_dir` would create a brand-new, trivially-free lease file
 /// beside a partial copy and conclude that nobody was writing.
-fn restore_lease_targets(data_dir: &Path) -> Vec<PathBuf> {
-    [data_dir.to_path_buf(), data_dir.with_extension("restoring")]
-        .iter()
-        .filter_map(|dir| find_lbug_in_dir(dir))
-        .collect()
+fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+
+    for dir in [data_dir.to_path_buf(), data_dir.with_extension("restoring")] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                anyhow::bail!(
+                    "cannot enumerate incumbent databases in {} before destructive restore: {error}",
+                    dir.display()
+                )
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "cannot enumerate every incumbent database in {} before destructive restore",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("lbug") {
+                continue;
+            }
+
+            let metadata = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "cannot inspect possible incumbent database {} before destructive restore",
+                    path.display()
+                )
+            })?;
+            if metadata.is_file() {
+                targets.push(nestweaver_daemon::lifecycle::canonical_db_path(&path));
+            }
+        }
+    }
+
+    // Every restore takes leases in the same canonical order, so two recovery
+    // attempts cannot deadlock by discovering directory entries differently.
+    // Canonicalisation also collapses symlink aliases to one lock identity.
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
 }
 
 /// Hold the canonical database write lease over every database a restore is
@@ -29233,11 +29642,11 @@ fn restore_lease_targets(data_dir: &Path) -> Vec<PathBuf> {
 /// brain, and the loss of the current data.
 ///
 /// The lease is the same one `index`, `watch`, `embed`, `brain watch`, the
-/// vault commands, the Tantivy rebuild and the daemon itself take — an
-/// `flock` on `<db>.write.lock`, per-DESCRIPTOR so it survives the store's own
-/// open/close, released by the kernel on process exit so there is no stale
-/// state to reap. `snapshot build` already corroborates its pidfile check with
-/// the database write lock, for exactly this reason; restore did not.
+/// vault commands, the Tantivy rebuild and the daemon itself take. It combines
+/// lbug-compatible database ownership with descriptor-scoped database and
+/// sidecar locks, while restore additionally closes the stable parent
+/// namespace before enumeration. The kernel releases every claim on process
+/// exit, so there is no stale ownership record to reap.
 ///
 /// A probe answers "was anyone holding this a moment ago". Only a HELD lease
 /// answers "is anyone holding this for as long as I am deleting their data",
@@ -29246,19 +29655,89 @@ fn restore_lease_targets(data_dir: &Path) -> Vec<PathBuf> {
               immediately reduces this to a probe, and the window that reopens \
               is precisely the one in which the data directory is renamed aside \
               and unlinked"]
-fn require_exclusive_restore_access(
-    data_dir: &Path,
-) -> anyhow::Result<Vec<nestweaver_daemon::lifecycle::DbWriteLease>> {
-    restore_lease_targets(data_dir)
+fn require_exclusive_restore_access(data_dir: &Path) -> anyhow::Result<RestoreWriteAuthority> {
+    // Close the namespace before the first enumeration. Every upgraded
+    // database creator takes a shared claim on this stable parent inode before
+    // creating/opening its database; restore takes the exclusive form. Unlike
+    // a lock on `data_dir` itself, renaming that directory cannot swap this
+    // authority onto an obsolete inode.
+    let namespace = match nestweaver_daemon::lifecycle::acquire_db_namespace_lease(data_dir) {
+        Ok(lease) => lease,
+        Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held) => anyhow::bail!(
+            "cannot restore a backup over {}: a writer holds the database namespace write lease; stop every writer and retry",
+            data_dir.display()
+        ),
+        Err(nestweaver_daemon::lifecycle::WriteLeaseError::Unavailable(error)) => {
+            anyhow::bail!(
+                "cannot prove exclusive ownership of the database namespace containing {}: {error}; refusing destructive restore",
+                data_dir.display()
+            )
+        }
+    };
+    let targets = restore_lease_targets(data_dir)?;
+    let leases = targets
         .iter()
         .map(|db| {
-            require_exclusive_store_access_with_remedy(
+            match nestweaver_daemon::lifecycle::acquire_db_write_lease_under_namespace(
                 db,
-                "restore a backup over this data directory",
-                ExclusivityRemedy::StopTheHolder,
-            )
+                &namespace,
+            ) {
+                Ok(lease) => Ok(lease),
+                Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held) => anyhow::bail!(
+                    "cannot restore a backup over this data directory: another process holds the write lease for {}. Stop the holder first, then retry.",
+                    db.display()
+                ),
+                Err(nestweaver_daemon::lifecycle::WriteLeaseError::Unavailable(error)) => {
+                    anyhow::bail!(
+                        "cannot take the write lease for {} before destructive restore: {error}",
+                        db.display()
+                    )
+                }
+            }
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Re-enumerate as an invariant check. Unlike the previous check-only
+    // scheme, the exclusive namespace authority remains held after this read
+    // and through cutover, so an upgraded late creator cannot enter after it.
+    let observed = restore_lease_targets(data_dir)?;
+    anyhow::ensure!(
+        observed == targets,
+        "the incumbent database set changed while restore write leases were being acquired — refusing destructive restore; stop every writer and retry"
+    );
+
+    Ok(RestoreWriteAuthority {
+        _namespace: namespace,
+        _leases: leases,
+    })
+}
+
+#[must_use = "dropping this authority reopens the restore namespace"]
+#[derive(Debug)]
+struct RestoreWriteAuthority {
+    // Drop database leases before the enclosing namespace authority.
+    _leases: Vec<nestweaver_daemon::lifecycle::DbWriteLease>,
+    _namespace: nestweaver_daemon::lifecycle::DbNamespaceLease,
+}
+
+/// Run the destructive restore phase under exact database and namespace
+/// authority, then release that authority before the caller performs any
+/// post-restore work such as `--start` daemon launch.
+fn with_exclusive_restore_access<T>(
+    data_dir: &Path,
+    restore: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let authority = require_exclusive_restore_access(data_dir)?;
+    let result = restore();
+    drop(authority);
+    result
+}
+
+impl RestoreWriteAuthority {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self._leases.len()
+    }
 }
 
 /// Refuse a restore while a live daemon serves the target data directory.
@@ -30332,12 +30811,24 @@ fn run_publication_rebuild(
                         }
                     }
                     let store = GraphStore::open(&target_db)?;
-                    nestweaver_engine::project::materialize_projects(
+                    let projects = nestweaver_engine::project::materialize_projects(
                         &store,
                         &config,
                         &config.instance_id,
                         &target_db,
                     )?;
+                    if projects.publication.is_degraded() {
+                        let details = projects
+                            .publication
+                            .warnings
+                            .iter()
+                            .map(|warning| format!("{}: {}", warning.stage, warning.message))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        anyhow::bail!(
+                            "project graph committed but its derived-artifact publication is degraded; refusing to publish the staged brain: {details}"
+                        );
+                    }
                     if let Some(links) = config.links.as_deref() {
                         nestweaver_engine::materialize_declared_links(&store, links)?;
                     }
@@ -30422,6 +30913,7 @@ fn run_publication_rebuild(
                         batch_size,
                         "all",
                         true,
+                        false,
                         true,
                         false,
                         load_cli_local_embedder,
@@ -32066,6 +32558,106 @@ mod restore_guard_tests {
             .expect_err("the restore must still be HOLDING the lease, not have dropped it");
     }
 
+    /// `backup restore --start` enters daemon startup only after the restore
+    /// scope returns. That boundary must release the exclusive namespace and
+    /// database claims or the restored daemon rejects its own writer lease.
+    #[test]
+    fn completed_restore_scope_releases_authority_before_start_phase() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, _pidfile) = fixture();
+
+        let value = with_exclusive_restore_access(data_dir.path(), || {
+            require_exclusive_store_access(&db, "probe during restore")
+                .expect_err("the destructive phase must still hold exact authority");
+            Ok(17)
+        })
+        .expect("a free fixture authorizes the restore scope");
+        assert_eq!(value, 17);
+
+        let _daemon_start_authority = require_exclusive_store_access(&db, "daemon start phase")
+            .expect("post-restore daemon startup must be able to claim writer authority");
+    }
+
+    #[test]
+    fn restore_namespace_blocks_a_late_sibling_creator_until_cutover_finishes() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, _db, _sidecar, _pidfile) = fixture();
+
+        let authority = require_exclusive_restore_access(data_dir.path())
+            .expect("the restore must close its namespace before enumeration");
+        let late = data_dir.path().join("late.lbug");
+        let error = require_exclusive_store_access(&late, "create a late sibling")
+            .expect_err("a late creator must not enter the closed restore namespace");
+        assert!(error.to_string().contains("write lease"));
+        assert!(
+            !late.exists(),
+            "the namespace refusal must happen before database creation"
+        );
+
+        drop(authority);
+        let _late_authority = require_exclusive_store_access(&late, "create after restore")
+            .expect("the namespace reopens only after restore authority drops");
+    }
+
+    /// Directory iteration order is not an ownership policy. A writer holding
+    /// the second sibling database must refuse restore just as surely as the
+    /// lexically first database covered by `restore_refuses_while_the_write_lease_is_held`.
+    #[test]
+    fn restore_refuses_when_a_later_sibling_database_is_held() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, first_db, _sidecar, _pidfile) = fixture();
+        let later_db = data_dir.path().join("zeta.lbug");
+        std::fs::write(&later_db, b"second database").unwrap();
+
+        let _held = require_exclusive_store_access(&later_db, "hold the later sibling database")
+            .expect("the sibling lease starts free");
+        let before = dir_fingerprint(data_dir.path());
+
+        let error = require_exclusive_restore_access(data_dir.path())
+            .expect_err("a held later sibling must stop destructive restore");
+        assert!(
+            error.to_string().contains("write lease"),
+            "err was: {error}"
+        );
+        assert_eq!(
+            before,
+            dir_fingerprint(data_dir.path()),
+            "refusal must preserve every sibling byte"
+        );
+        assert!(!data_dir.path().with_extension("restoring").exists());
+
+        // The earlier sibling was not the source of the refusal.
+        let _available =
+            require_exclusive_store_access(&first_db, "prove the first sibling stayed free")
+                .expect("the first sibling lease must remain available");
+    }
+
+    /// All live and interrupted-cutover databases are canonicalized,
+    /// deterministically ordered, and returned exactly once before leasing.
+    #[test]
+    fn restore_lease_targets_include_every_sibling_in_canonical_order() {
+        let (data_dir, first_db, _sidecar, _pidfile) = fixture();
+        let live_later = data_dir.path().join("zeta.lbug");
+        std::fs::write(&live_later, b"live sibling").unwrap();
+
+        let restoring = data_dir.path().with_extension("restoring");
+        std::fs::create_dir_all(&restoring).unwrap();
+        let aside_db = restoring.join("aside.lbug");
+        std::fs::write(&aside_db, b"aside sibling").unwrap();
+
+        let mut expected = vec![first_db, live_later, aside_db]
+            .into_iter()
+            .map(|path| nestweaver_daemon::lifecycle::canonical_db_path(&path))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+
+        assert_eq!(restore_lease_targets(data_dir.path()).unwrap(), expected);
+    }
+
     /// No pidfile state — absent, empty, whitespace-only or stale — may stand
     /// in for lock proof, in either direction.
     ///
@@ -32124,7 +32716,7 @@ mod restore_guard_tests {
             drop(held);
 
             // With the lease free, the same pidfile state is fine.
-            require_exclusive_restore_access(data_dir.path())
+            let _authority = require_exclusive_restore_access(data_dir.path())
                 .unwrap_or_else(|error| panic!("{label}: a free lease must authorize: {error}"));
         }
     }
@@ -32259,6 +32851,39 @@ mod restore_guard_tests {
         assert_eq!(
             direct, daemon_aware,
             "both entry paths must hand the same Restore payload to run_backup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod abort_migration_ownership_tests {
+    use super::*;
+
+    /// Neither the ordinary recovery path nor `--force` may inspect/remove the
+    /// migration journal while the daemon merge worker owns the database.
+    #[test]
+    fn abort_migration_refuses_without_write_ownership_even_when_forced() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("graph.lbug");
+        drop(nestweaver_store::GraphStore::create(&db).unwrap());
+
+        let _held = require_exclusive_store_access(&db, "simulate a live merge owner")
+            .expect("fixture lease starts free");
+        for force in [false, true] {
+            let error = abort_instance_migration_offline(&db, force)
+                .expect_err("abort must not bypass the live writer");
+            assert!(
+                error.to_string().contains("write lease"),
+                "force={force}: err was {error}"
+            );
+        }
+
+        let mut journal = db.as_os_str().to_owned();
+        journal.push(".extensions.migration.json");
+        let journal = PathBuf::from(journal);
+        assert!(
+            !journal.exists(),
+            "the ownership refusal must not create or mutate the journal"
         );
     }
 }
@@ -34914,6 +35539,9 @@ mod diagnostics_cli_tests {
             error: "Metal probe failed".to_string(),
             metal_compiled: true,
             fallback_used: false,
+            identity_state: "unreadable".to_string(),
+            identity_error: "parse embedding metadata failed".to_string(),
+            identity_remediation: "restore verified metadata or re-embed".to_string(),
             ..Default::default()
         };
         let text = format_embedding_status(&status);
@@ -34921,6 +35549,9 @@ mod diagnostics_cli_tests {
         assert!(text.contains("Device:           metal -> unavailable"));
         assert!(text.contains("Fallback used:    false"));
         assert!(text.contains("Metal probe failed"));
+        assert!(text.contains("Identity:         unreadable"));
+        assert!(text.contains("parse embedding metadata failed"));
+        assert!(text.contains("restore verified metadata or re-embed"));
     }
 }
 
@@ -36325,6 +36956,39 @@ mod embed_metadata_truth_tests {
     }
 
     #[test]
+    fn invalid_repair_scope_is_rejected_before_discarding_embeddings() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let error = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL),
+            None,
+            None,
+            8,
+            "typo",
+            true,
+            true,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect_err("invalid scope must fail before identity repair");
+
+        assert!(error.to_string().contains("unknown --scope 'typo'"));
+        assert_eq!(loader.call_count(), 0);
+        let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        assert!(store.has_embedding("sym:seeded"));
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some((RECORDED_MODEL.to_string(), 3))
+        );
+    }
+
+    #[test]
     fn publication_embed_cancellation_stops_before_loading_the_model() {
         let (_dir, db_path) = seed_embed_db(&[], &["pending"], None);
         let loader = StubLoader::new(3);
@@ -36339,6 +37003,7 @@ mod embed_metadata_truth_tests {
             8,
             "all",
             true,
+            false,
             false,
             false,
             loader.closure(),
@@ -36389,6 +37054,7 @@ mod embed_metadata_truth_tests {
             8,
             "symbols",
             false, // no --force
+            false,
             false,
             false, // direct path
             loader.closure(),
@@ -36442,6 +37108,7 @@ mod embed_metadata_truth_tests {
             false,
             false,
             false,
+            false,
             loader.closure(),
         )
         .expect("a rejected run still returns an exit code");
@@ -36490,6 +37157,7 @@ mod embed_metadata_truth_tests {
             false,
             false,
             false,
+            false,
             loader.closure(),
         )
         .expect("a rejected run still returns an exit code");
@@ -36529,6 +37197,7 @@ mod embed_metadata_truth_tests {
             true, // --force
             false,
             false,
+            false,
             loader.closure(),
         )
         .expect("a forced re-embed must run");
@@ -36564,6 +37233,7 @@ mod embed_metadata_truth_tests {
             false,
             false,
             false,
+            false,
             loader.closure(),
         )
         .expect("a matching model id must not bail");
@@ -36595,6 +37265,7 @@ mod embed_metadata_truth_tests {
             8,
             "all",
             true, // --force, so the mismatch guard does not bail
+            false,
             false,
             false,
             loader.closure(),
@@ -36637,6 +37308,7 @@ mod embed_metadata_truth_tests {
             false,
             false,
             false,
+            false,
             loader.closure(),
         )
         .expect("the local --model-id must not bail the endpoint branch");
@@ -36674,6 +37346,7 @@ mod embed_metadata_truth_tests {
             None,
             8,
             "symbols",
+            false,
             false,
             false,
             false,

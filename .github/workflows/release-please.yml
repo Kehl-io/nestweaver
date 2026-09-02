@@ -3,31 +3,374 @@ name: Release Please
 on:
   push:
     branches: [main]
-  # A release artifact is materially different from the ordinary CI binary:
-  # it is built on the compatibility runner, with the release linker and the
-  # exact runtime layout users download. Allow that contract to be exercised
-  # before cutting another public tag when a platform-specific failure needs
-  # diagnosis. A manual run builds and verifies the matrix but cannot publish.
+  # Manual runs either exercise the complete gate or recover one exact private
+  # draft/public package. Every mutating recovery input is bound to an explicit
+  # commit, tag, release id, and (for resume) source workflow run.
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Release-gate operation
+        required: true
+        default: dry-run
+        type: choice
+        options: [dry-run, resume, cleanup-draft, recover-npm]
+      candidate_sha:
+        description: Exact release commit SHA (dry-run defaults to the workflow SHA)
+        required: false
+        type: string
+      release_id:
+        description: Exact GitHub release id for resume, cleanup, or npm recovery
+        required: false
+        type: string
+      release_tag:
+        description: Exact vX.Y.Z tag for resume, cleanup, or npm recovery
+        required: false
+        type: string
+      source_run_id:
+        description: Completed release workflow run containing all release artifacts for resume or npm recovery
+        required: false
+        type: string
+      fault_mode:
+        description: Negative-control behavior for one matrix target
+        required: true
+        default: none
+        type: choice
+        options: [none, fail, omit]
+      fault_target:
+        description: Matrix target used when fault_mode is fail or omit
+        required: true
+        default: x86_64-unknown-linux-gnu
+        type: choice
+        options:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
 
-permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
-  attestations: write
+# A second main push must not ask Release Please to inspect history while the
+# previous run still owns a deliberately tagless private draft. Resume,
+# cleanup, and npm recovery share that mutation lane so two exact-id operators
+# cannot race each other or the automatic publisher. Read-only dry-run probes
+# remain independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'dry-run' && github.run_id || 'main' }}
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
   release-please:
+    # Manual verification must be publication-side-effect free. This literal
+    # condition is also guarded by the release-workflow contract test.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      release_sha: ${{ steps.release.outputs.sha }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      # Release creation and next-PR generation are deliberately separate.
+      # With `draft: true`, GitHub does not create a tag until publication. A
+      # single Release Please invocation can then fail its second pass while it
+      # looks for that intentionally absent tag, stranding an unreachable draft.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
+          # The built-in token deliberately leaves automation-authored PRs
+          # behind the repository's explicit Actions/manual-dispatch gate.
+          token: ${{ github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+  release-context:
+    name: Bind exact release identity
+    needs: release-please
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      active: ${{ steps.context.outputs.active }}
+      mode: ${{ steps.context.outputs.mode }}
+      release_sha: ${{ steps.context.outputs.release_sha }}
+      tag_name: ${{ steps.context.outputs.tag_name }}
+      release_id: ${{ steps.context.outputs.release_id }}
+      upload_url: ${{ steps.context.outputs.upload_url }}
+      source_run_id: ${{ steps.context.outputs.source_run_id }}
+      dry_run_version: ${{ steps.context.outputs.dry_run_version }}
+    steps:
+      - name: Validate immutable release context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          OPERATION: ${{ inputs.operation }}
+          INPUT_SHA: ${{ inputs.candidate_sha }}
+          INPUT_RELEASE_ID: ${{ inputs.release_id }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_JOB_RESULT: ${{ needs.release-please.result }}
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_UPLOAD_URL: ${{ needs.release-please.outputs.upload_url }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          output() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          require_sha() {
+            [[ "$1" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::release SHA must be 40 lowercase hexadecimal characters" >&2
+              exit 1
+            }
+          }
+          require_tag() {
+            [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+              echo "::error::release tag must be an exact vX.Y.Z semantic version: $1" >&2
+              exit 1
+            }
+          }
+          assert_tag_absent() {
+            local encoded status
+            encoded="$(jq -rn --arg value "$1" '$value | @uri')"
+            set +e
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$encoded" >/dev/null 2> tag-error.txt
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ] || ! grep -q 'HTTP 404' tag-error.txt; then
+              echo "::error::could not prove that tag $1 is absent" >&2
+              cat tag-error.txt >&2
+              exit 1
+            fi
+          }
+          validate_release() {
+            local expected_draft=$1 release_json
+            release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              --arg sha "$RELEASE_SHA" \
+              --argjson draft "$expected_draft" \
+              '.draft == $draft and .tag_name == $tag and .target_commitish == $sha' \
+              <<< "$release_json" >/dev/null
+            if [ "$expected_draft" = false ]; then
+              jq -e '.immutable == true' <<< "$release_json" >/dev/null || {
+                echo "::error::public release $RELEASE_ID is mutable; refusing recovery or npm publication" >&2
+                exit 1
+              }
+            fi
+            RELEASE_UPLOAD_URL="$(jq -er '.upload_url' <<< "$release_json")"
+          }
+
+          output active false
+          output mode none
+          output release_sha ""
+          output tag_name ""
+          output release_id ""
+          output upload_url ""
+          output source_run_id ""
+          output dry_run_version ""
+
+          if [ "$EVENT_NAME" = push ]; then
+            if [ "$RELEASE_JOB_RESULT" != success ]; then
+              echo "::error::Release Please did not complete successfully" >&2
+              exit 1
+            fi
+            if [ "$RELEASE_CREATED" != true ]; then
+              exit 0
+            fi
+            require_sha "$RELEASE_SHA"
+            require_tag "$RELEASE_TAG"
+            RELEASE_ID="$(sed -E 's#^.*/releases/([0-9]+)/assets.*#\1#' <<< "$RELEASE_UPLOAD_URL")"
+            [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+              echo "::error::could not derive the draft release id" >&2
+              exit 1
+            }
+            validate_release true
+            assert_tag_absent "$RELEASE_TAG"
+            output active true
+            output mode publish
+            output release_sha "$RELEASE_SHA"
+            output tag_name "$RELEASE_TAG"
+            output release_id "$RELEASE_ID"
+            output upload_url "$RELEASE_UPLOAD_URL"
+            output source_run_id "$GITHUB_RUN_ID"
+            exit 0
+          fi
+
+          expected_workflow_ref="refs/heads/$DEFAULT_BRANCH"
+          [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
+            echo "::error::manual release operations must run from $expected_workflow_ref" >&2
+            exit 1
+          }
+          current_default_sha="$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
+          [ "$WORKFLOW_SHA" = "$current_default_sha" ] || {
+            echo "::error::manual release policy $WORKFLOW_SHA is not current $DEFAULT_BRANCH tip $current_default_sha" >&2
+            exit 1
+          }
+
+          case "$OPERATION" in
+            dry-run)
+              RELEASE_SHA="${INPUT_SHA:-$GITHUB_SHA}"
+              require_sha "$RELEASE_SHA"
+              if [ "$RELEASE_SHA" != "$GITHUB_SHA" ]; then
+                echo "::error::dry-run SHA must equal the selected workflow ref SHA" >&2
+                exit 1
+              fi
+              RELEASE_TAG="dry-run-${RELEASE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              output active true
+              output mode dry-run
+              output release_sha "$RELEASE_SHA"
+              output tag_name "$RELEASE_TAG"
+              output dry_run_version "0.0.0-release-gate.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+              ;;
+            resume|cleanup-draft|recover-npm)
+              RELEASE_SHA="$INPUT_SHA"
+              RELEASE_ID="$INPUT_RELEASE_ID"
+              RELEASE_TAG="$INPUT_RELEASE_TAG"
+              require_sha "$RELEASE_SHA"
+              require_tag "$RELEASE_TAG"
+              [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+                echo "::error::release_id must be numeric" >&2
+                exit 1
+              }
+
+              if [ "$OPERATION" = recover-npm ]; then
+                validate_release false
+                tag_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+                tag_sha="$(jq -er '.object.sha' <<< "$tag_json")"
+                tag_type="$(jq -er '.object.type' <<< "$tag_json")"
+                if [ "$tag_type" = tag ]; then
+                  tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+                fi
+                [ "$tag_sha" = "$RELEASE_SHA" ] || {
+                  echo "::error::$RELEASE_TAG resolves to $tag_sha, expected $RELEASE_SHA" >&2
+                  exit 1
+                }
+                expected_assets="$(mktemp)"
+                actual_assets="$(mktemp)"
+                for target in \
+                  aarch64-apple-darwin aarch64-unknown-linux-gnu \
+                  x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+                  archive="nestweaver-${RELEASE_TAG}-${target}.tar.gz"
+                  printf '%s\n%s\n' "$archive" "$archive.sha256" >> "$expected_assets"
+                done
+                sort -o "$expected_assets" "$expected_assets"
+                assets_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+                jq -r '.[].name' <<< "$assets_json" | sort > "$actual_assets"
+                diff -u "$expected_assets" "$actual_assets"
+                jq -e 'length == 8 and all(.[];
+                  .state == "uploaded" and (.digest | startswith("sha256:")))' \
+                  <<< "$assets_json" >/dev/null
+                rm -f "$expected_assets" "$actual_assets"
+              else
+                validate_release true
+                assert_tag_absent "$RELEASE_TAG"
+              fi
+
+              if [ "$OPERATION" = resume ] || [ "$OPERATION" = recover-npm ]; then
+                [[ "$INPUT_SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || {
+                  echo "::error::source_run_id must be numeric for $OPERATION" >&2
+                  exit 1
+                }
+                source_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$INPUT_SOURCE_RUN_ID")"
+                jq -e \
+                  --arg sha "$RELEASE_SHA" \
+                  --arg branch "$DEFAULT_BRANCH" \
+                  '.head_sha == $sha and .event == "push" and
+                   .head_branch == $branch and
+                   .path == ".github/workflows/release-please.yml" and
+                   .status == "completed"' <<< "$source_run" >/dev/null
+              fi
+
+              output active true
+              output mode "$OPERATION"
+              output release_sha "$RELEASE_SHA"
+              output tag_name "$RELEASE_TAG"
+              output release_id "$RELEASE_ID"
+              output upload_url "$RELEASE_UPLOAD_URL"
+              output source_run_id "$INPUT_SOURCE_RUN_ID"
+              ;;
+            *)
+              echo "::error::unknown release operation: $OPERATION" >&2
+              exit 1
+              ;;
+          esac
+
+  cleanup-draft:
+    name: Delete exact private draft
+    needs: release-context
+    if: ${{ needs.release-context.outputs.mode == 'cleanup-draft' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Revalidate and delete only the bound tagless draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" \
+            '.draft == true and .tag_name == $tag and .target_commitish == $sha' \
+            <<< "$release" >/dev/null
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            >/dev/null 2> tag-error.txt
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ] || ! grep -q 'HTTP 404' tag-error.txt; then
+            echo "::error::could not prove the cleanup target has no visible tag" >&2
+            cat tag-error.txt >&2
+            exit 1
+          fi
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --silent
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            >/dev/null 2> release-error.txt
+          release_status=$?
+          set -e
+          if [ "$release_status" -eq 0 ] || ! grep -q 'HTTP 404' release-error.txt; then
+            echo "::error::could not prove draft release $RELEASE_ID was deleted" >&2
+            cat release-error.txt >&2
+            exit 1
+          fi
+
+  release-pr:
+    # On an ordinary push this creates or updates the pending release PR. When
+    # a release was drafted, it waits until publication creates the tag before
+    # asking Release Please for the next PR; otherwise Release Please's tag
+    # lookup can fail against the intentionally tagless private draft.
+    needs: [release-please, publish-release]
+    if: ${{ always() && github.event_name == 'push' && needs.release-please.result == 'success' && (needs.release-please.outputs.release_created != 'true' || needs.publish-release.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      number: ${{ steps.release_pr.outputs.number }}
+      branch: ${{ steps.release_pr.outputs.branch }}
+      head_sha: ${{ steps.release_pr.outputs.head_sha }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: release
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
       # Find the open release PR by LABEL, not by `prs_created`.
       #
       # `prs_created` is true only when release-please CREATES the PR. When it
@@ -37,8 +380,8 @@ jobs:
       # `cargo build --locked` refuses outright (verified: exit 101, "cannot
       # update the lock file ... because --locked was passed"). Merging it would
       # have CUT THE TAG and then failed every one of the four binary builds,
-      # publishing a release with no artifacts -- and the release PR is the one
-      # PR in this repo that gets no CI, so nothing would have caught it.
+      # publishing a release with no artifacts -- and the release PR was the
+      # one PR in this repo that got no CI, so nothing caught it at the time.
       #
       # `autorelease: pending` is release-please's own label on an open release
       # PR and is present however the PR got there.
@@ -47,11 +390,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ACTION_PR: ${{ steps.release.outputs.pr }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PRS_CREATED: ${{ steps.release.outputs.prs_created }}
         run: |
           set -euo pipefail
           NUM=""
-          BRANCH=""
+          ACTION_BRANCH=""
+          EXPECTED_BRANCH="release-please--branches--${DEFAULT_BRANCH}--components--nestweaver"
 
           # PREFER THE ACTION'S OWN OUTPUT. When release-please has just CREATED
           # the PR, its `autorelease: pending` label is not attached yet: PR #338
@@ -61,7 +406,7 @@ jobs:
           # The action's output is populated in-process and cannot race.
           if [ -n "${ACTION_PR:-}" ] && [ "$ACTION_PR" != "null" ]; then
             NUM="$(jq -r '.number // empty' <<< "$ACTION_PR")"
-            BRANCH="$(jq -r '.headBranchName // empty' <<< "$ACTION_PR")"
+            ACTION_BRANCH="$(jq -r '.headBranchName // empty' <<< "$ACTION_PR")"
           fi
 
           # FALL BACK TO THE LABEL for a PR that already existed and was merely
@@ -71,9 +416,14 @@ jobs:
           if [ -z "$NUM" ]; then
             for attempt in 1 2 3; do
               PR_JSON="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-                --label 'autorelease: pending' --json number,headRefName --limit 1)"
+                --label 'autorelease: pending' --json number --limit 100)"
+              match_count="$(jq 'length' <<< "$PR_JSON")"
+              if [ "$match_count" -gt 1 ]; then
+                echo "::error::multiple open autorelease: pending PRs exist; refusing to choose a privileged mutation target" >&2
+                jq . <<< "$PR_JSON" >&2
+                exit 1
+              fi
               NUM="$(jq -r '.[0].number // empty' <<< "$PR_JSON")"
-              BRANCH="$(jq -r '.[0].headRefName // empty' <<< "$PR_JSON")"
               [ -n "$NUM" ] && break
               echo "no open release PR yet (attempt $attempt/3); retrying in 5s"
               sleep 5
@@ -88,51 +438,195 @@ jobs:
             exit 1
           fi
 
-          echo "located release PR: ${NUM:-<none>} (${BRANCH:-<none>})"
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-      - name: Check out release PR
-        if: steps.release_pr.outputs.number != ''
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ steps.release_pr.outputs.branch }}
-      - name: Install Rust toolchain
-        if: steps.release_pr.outputs.number != ''
-        uses: dtolnay/rust-toolchain@stable
-      - name: Synchronize release lockfile
-        if: steps.release_pr.outputs.number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_PR_NUMBER: ${{ steps.release_pr.outputs.number }}
-          RELEASE_PR_BRANCH: ${{ steps.release_pr.outputs.branch }}
-        run: |
-          set -euo pipefail
-
-          cargo update --workspace
-
-          if ! git diff --quiet -- Cargo.lock; then
-            git add Cargo.lock
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore: synchronize Cargo.lock for release"
-            git push origin "HEAD:$RELEASE_PR_BRANCH"
+          if [ -n "$NUM" ]; then
+            [[ "$NUM" =~ ^[0-9]+$ ]] || {
+              echo "::error::release PR number is not numeric" >&2
+              exit 1
+            }
+            PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM")"
+            jq -e \
+              --arg base "$DEFAULT_BRANCH" \
+              --arg branch "$EXPECTED_BRANCH" \
+              --arg repo "$GITHUB_REPOSITORY" '
+                .state == "open" and
+                .base.ref == $base and
+                .head.ref == $branch and
+                .head.repo.full_name == $repo and
+                .head.repo.fork == false and
+                .user.login == "github-actions[bot]"
+              ' <<< "$PR_JSON" >/dev/null || {
+                echo "::error::candidate release PR failed trusted base/head/repository/author validation" >&2
+                jq '{number, state, author: .user.login, base: .base.ref,
+                     head: .head.ref, head_repo: .head.repo.full_name,
+                     head_repo_fork: .head.repo.fork}' <<< "$PR_JSON" >&2
+                exit 1
+              }
+            BRANCH="$(jq -er '.head.ref' <<< "$PR_JSON")"
+            HEAD_SHA="$(jq -er '.head.sha' <<< "$PR_JSON")"
+            [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            if [ -n "$ACTION_BRANCH" ] && [ "$ACTION_BRANCH" != "$BRANCH" ]; then
+              echo "::error::release-please output branch $ACTION_BRANCH disagrees with validated PR branch $BRANCH" >&2
+              exit 1
+            fi
+          else
+            BRANCH=""
+            HEAD_SHA=""
           fi
 
-          # Prove the state we are about to let someone merge actually builds.
-          # `cargo update --workspace` exiting 0 is not that proof: it says the
-          # lock was refreshed, not that --locked now accepts it, and --locked
-          # is what the build job uses.
-          cargo metadata --locked --format-version 1 > /dev/null
+          echo "located release PR: ${NUM:-<none>} (${BRANCH:-<none>} @ ${HEAD_SHA:-<none>})"
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
-          if [ "$(gh pr view "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true" ]; then
+  prepare-release-lockfile:
+    name: Prepare release lockfile without write authority
+    needs: release-pr
+    if: ${{ needs.release-pr.outputs.number != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # This job executes Cargo against the release PR, so it deliberately has
+      # no write token. The following job receives only two inert data files
+      # and never checks out or executes the PR tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-pr.outputs.head_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Resolve and validate the lockfile
+        env:
+          RELEASE_PR_HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          original_blob="$(git rev-parse HEAD:Cargo.lock)"
+          [[ "$original_blob" =~ ^[0-9a-f]{40}$ ]]
+          cargo update --workspace
+          cargo metadata --locked --format-version 1 > /dev/null
+          changed=false
+          if ! git diff --quiet -- Cargo.lock; then
+            changed=true
+          fi
+          unexpected="$(git status --porcelain --untracked-files=all | grep -vE '^ M Cargo\.lock$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::lockfile preparation modified files outside Cargo.lock" >&2
+            printf '%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          sha256="$(sha256sum Cargo.lock | awk '{print $1}')"
+          jq -n \
+            --arg head_sha "$RELEASE_PR_HEAD_SHA" \
+            --arg original_blob "$original_blob" \
+            --arg sha256 "$sha256" \
+            --argjson changed "$changed" \
+            '{head_sha: $head_sha, original_blob: $original_blob,
+              sha256: $sha256, changed: $changed}' > lockfile-state.json
+      - name: Transfer only inert lockfile data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-lockfile-${{ needs.release-pr.outputs.number }}
+          path: |
+            Cargo.lock
+            lockfile-state.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release-lockfile:
+    name: Publish validated release lockfile without executing PR code
+    needs: [release-pr, prepare-release-lockfile]
+    if: ${{ needs.prepare-release-lockfile.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-lockfile-${{ needs.release-pr.outputs.number }}
+          path: lockfile-artifact
+      - name: Revalidate identity and publish Cargo.lock with an exact-head lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR_BRANCH: ${{ needs.release-pr.outputs.branch }}
+          RELEASE_PR_HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          RELEASE_PR_NUMBER: ${{ needs.release-pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          files="$(find lockfile-artifact -maxdepth 1 -type f -printf '%f\n' | sort)"
+          [ "$files" = $'Cargo.lock\nlockfile-state.json' ]
+          test "$(stat -c '%s' lockfile-artifact/Cargo.lock)" -le 10485760
+          jq -e \
+            --arg head "$RELEASE_PR_HEAD_SHA" \
+            '.head_sha == $head and
+             (.original_blob | test("^[0-9a-f]{40}$")) and
+             (.sha256 | test("^[0-9a-f]{64}$")) and
+             (.changed | type == "boolean")' \
+            lockfile-artifact/lockfile-state.json >/dev/null
+          expected_sha256="$(jq -er '.sha256' lockfile-artifact/lockfile-state.json)"
+          [ "$(sha256sum lockfile-artifact/Cargo.lock | awk '{print $1}')" = "$expected_sha256" ]
+
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER")"
+          jq -e \
+            --arg branch "$RELEASE_PR_BRANCH" \
+            --arg head "$RELEASE_PR_HEAD_SHA" \
+            --arg repo "$GITHUB_REPOSITORY" '
+              .state == "open" and .base.ref == "main" and
+              .head.ref == $branch and .head.sha == $head and
+              .head.repo.full_name == $repo and .head.repo.fork == false and
+              .user.login == "github-actions[bot]"
+            ' <<< "$pr" >/dev/null
+
+          current_lock="$(gh api \
+            "repos/$GITHUB_REPOSITORY/contents/Cargo.lock?ref=$RELEASE_PR_BRANCH")"
+          original_blob="$(jq -er '.original_blob' lockfile-artifact/lockfile-state.json)"
+          [ "$(jq -er '.sha' <<< "$current_lock")" = "$original_blob" ]
+          changed="$(jq -er '.changed' lockfile-artifact/lockfile-state.json)"
+          expected_head="$RELEASE_PR_HEAD_SHA"
+          if [ "$changed" = true ]; then
+            branch_head="$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_PR_BRANCH" \
+              --jq '.object.sha')"
+            [ "$branch_head" = "$RELEASE_PR_HEAD_SHA" ]
+            base_tree="$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/commits/$RELEASE_PR_HEAD_SHA" \
+              --jq '.tree.sha')"
+            blob="$(base64 -w 0 lockfile-artifact/Cargo.lock | \
+              jq -Rs '{content: ., encoding: "base64"}' | \
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha')"
+            tree="$(jq -n \
+              --arg base_tree "$base_tree" --arg blob "$blob" \
+              '{base_tree: $base_tree, tree: [{path: "Cargo.lock", mode: "100644", type: "blob", sha: $blob}]}' | \
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/trees" --input - --jq '.sha')"
+            expected_head="$(jq -n \
+              --arg message 'chore: synchronize Cargo.lock for release' \
+              --arg tree "$tree" --arg parent "$RELEASE_PR_HEAD_SHA" \
+              '{message: $message, tree: $tree, parents: [$parent]}' | \
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/commits" --input - --jq '.sha')"
+            jq -n --arg sha "$expected_head" '{sha: $sha, force: false}' | \
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_PR_BRANCH" \
+                --input - >/dev/null
+          fi
+          actual_head="$(gh api \
+            "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq '.head.sha')"
+          [ "$actual_head" = "$expected_head" ]
+          if [ "$(jq -r '.draft' <<< "$pr")" = true ]; then
             gh pr ready "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY"
           fi
 
   build:
     name: Build ${{ matrix.target }}
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch' }}
+    needs: [release-context, dry-run-baseline]
+    if: ${{ always() && (needs.release-context.outputs.mode == 'publish' || (needs.release-context.outputs.mode == 'dry-run' && needs.dry-run-baseline.result == 'success')) }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -177,11 +671,45 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
           df -h /
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out exact release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Bind the immutable release identity
+        id: candidate
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.release-context.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $ACTUAL_SHA, expected exact release candidate $EXPECTED_SHA" >&2
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$ACTUAL_SHA" != "${{ github.sha }}" ]; then
+            echo "::error::manual candidate $ACTUAL_SHA differs from workflow SHA ${{ github.sha }}; dispatch the workflow from the candidate ref so provenance binds to the tested source" >&2
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$ACTUAL_SHA" != "${{ github.sha }}" ]; then
+            echo "::error::Release Please selected $ACTUAL_SHA, but the reviewed main push is ${{ github.sha }}" >&2
+            exit 1
+          fi
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="dry-run-${ACTUAL_SHA:0:12}"
+          fi
+          {
+            echo "RELEASE_SHA=$ACTUAL_SHA"
+            echo "RELEASE_TAG=$RELEASE_TAG"
+          } >> "$GITHUB_ENV"
+          echo "sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-targets: false
           cache-on-failure: true
@@ -268,7 +796,7 @@ jobs:
       # LadybugDB opened a database. The same GCC 13 source build linked with
       # GNU ld passes that operation, and native upstream Ladybug builds also
       # use the system linker. Link speed is not an artifact requirement.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
@@ -299,7 +827,7 @@ jobs:
         # Keyed on package versions (not Cargo.lock) so the cache survives
         # release lockfile churn; per-target and per-native-toolchain so an
         # incomplete GCC 12 build cannot poison the GCC 13 repair job.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -451,41 +979,7 @@ jobs:
             fi
           fi
 
-          HOST="$(uname -s)-$(uname -m)"
-          case "$HOST:$TARGET" in
-            Linux-x86_64:x86_64-unknown-linux-gnu|Linux-aarch64:aarch64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
-              "$BIN" --version
-              SMOKE_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-smoke.XXXXXX")"
-              trap 'rm -rf "$SMOKE_DIR"' EXIT
-              if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
-                "$BIN" index \
-                    --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
-                    --name release-artifact-smoke \
-                    --db "$SMOKE_DIR/smoke.lbug" \
-                    --no-embed \
-                    --with-trigrams \
-                    --json; then
-                :
-              else
-                SMOKE_STATUS=$?
-                if [ "${{ runner.os }}" = "Linux" ]; then
-                  DEBUG_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-debug.XXXXXX")"
-                  NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
-                    gdb --batch --quiet \
-                      -ex run \
-                      -ex 'thread apply all backtrace' \
-                      --args "$BIN" index \
-                        --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
-                        --name release-artifact-debug \
-                        --db "$DEBUG_DIR/debug.lbug" \
-                        --no-embed \
-                        --with-trigrams \
-                        --json || true
-                fi
-                exit "$SMOKE_STATUS"
-              fi
-              ;;
-          esac
+          "$BIN" --version
       - name: Verify Apple Metal capability
         if: runner.os == 'macOS'
         shell: bash
@@ -497,12 +991,11 @@ jobs:
           printf '%s\n' "$CAPABILITIES"
           jq -e '.metal_compiled == true' <<< "$CAPABILITIES"
       - name: Package binary
-        if: github.event_name != 'workflow_dispatch'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          ARCHIVE="nestweaver-${{ needs.release-please.outputs.tag_name }}-$TARGET.tar.gz"
+          ARCHIVE="nestweaver-${RELEASE_TAG}-$TARGET.tar.gz"
           if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
             tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver lib
           else
@@ -510,36 +1003,718 @@ jobs:
           fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Generate SHA-256 checksum
-        if: github.event_name != 'workflow_dispatch'
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+      - name: Extract and smoke the consumer archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c "$ARCHIVE.sha256"
+          EXTRACT_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-extract.XXXXXX")"
+          SMOKE_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-smoke.XXXXXX")"
+          DEBUG_DIR=""
+          trap 'rm -rf "$EXTRACT_DIR" "$SMOKE_DIR" "${DEBUG_DIR:-}"' EXIT
+          tar xzf "$ARCHIVE" -C "$EXTRACT_DIR"
+          BIN="$EXTRACT_DIR/nestweaver"
+          test -x "$BIN"
+          "$BIN" --version
+
+          if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+            "$BIN" index \
+              --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+              --name release-artifact-smoke \
+              --db "$SMOKE_DIR/smoke.lbug" \
+              --no-embed \
+              --with-trigrams \
+              --json; then
+            :
+          else
+            SMOKE_STATUS=$?
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              DEBUG_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-debug.XXXXXX")"
+              NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+                gdb --batch --quiet \
+                  -ex run \
+                  -ex 'thread apply all backtrace' \
+                  --args "$BIN" index \
+                    --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                    --name release-artifact-debug \
+                    --db "$DEBUG_DIR/debug.lbug" \
+                    --no-embed \
+                    --with-trigrams \
+                    --json || true
+            fi
+            exit "$SMOKE_STATUS"
+          fi
+      - name: Exercise a failed target
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.fault_mode == 'fail' && inputs.fault_target == matrix.target }}
+        run: |
+          echo "::error::deliberately failing ${{ matrix.target }} before it can enter the publication bundle"
+          exit 1
       - name: Attest build provenance
-        if: github.event_name != 'workflow_dispatch'
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: ${{ env.ARCHIVE }}
-      - name: Upload release artifact
-        if: github.event_name != 'workflow_dispatch'
-        uses: softprops/action-gh-release@v3
+      - name: Stage verified target for the all-or-nothing gate
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.fault_mode != 'omit' || inputs.fault_target != matrix.target }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
-          files: |
+          name: release-bundle-${{ matrix.target }}
+          path: |
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 7
 
-  publish-npm:
-    name: Publish npm wrapper
-    needs: [release-please, build]
-    if: ${{ needs.release-please.outputs.release_created }}
+  dry-run-baseline:
+    name: Capture dry-run visibility baseline
+    needs: release-context
+    if: ${{ needs.release-context.outputs.mode == 'dry-run' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      visibility: ${{ steps.observe.outputs.visibility }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Observe tag, release, and npm absence before the matrix
+        id: observe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+          DRY_RUN_VERSION: ${{ needs.release-context.outputs.dry_run_version }}
+        run: |
+          set -euo pipefail
+          visibility="$(bash scripts/observe-release-visibility.sh \
+            "$GITHUB_REPOSITORY" "$RELEASE_TAG" nestweaver "$DRY_RUN_VERSION")"
+          jq -e '.all_absent == true' <<< "$visibility" >/dev/null
+          echo "visibility=$(jq -c . <<< "$visibility")" >> "$GITHUB_OUTPUT"
+
+  preflight-package:
+    name: Preflight release package
+    needs: [release-context, build]
+    if: ${{ always() && needs.release-context.outputs.active == 'true' && ((needs.release-context.outputs.mode == 'publish' && needs.build.result == 'success') || needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+      version: ${{ steps.package.outputs.version }}
+      integrity: ${{ steps.package.outputs.integrity }}
+      filename: ${{ steps.package.outputs.filename }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      already_published: ${{ steps.registry.outputs.already_published }}
+    steps:
+      - name: Check out exact release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Check out current release policy for recovery
+        if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-policy
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+      - name: Recover exact package from the bound source run
+        if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-npm-package
+          path: ${{ runner.temp }}/npm-package
+          run-id: ${{ needs.release-context.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify Cargo, manifest, npm, tag, and package contents
+        id: package
+        env:
+          RELEASE_MODE: ${{ needs.release-context.outputs.mode }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$RELEASE_MODE" = resume ] || [ "$RELEASE_MODE" = recover-npm ]; then
+            policy_root="$GITHUB_WORKSPACE/.release-policy"
+          fi
+          package_dir="$RUNNER_TEMP/npm-package"
+          mkdir -p "$package_dir"
+          if [ "$RELEASE_MODE" = publish ]; then
+            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
+              "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
+            printf '%s\n' "$package" > "$package_dir/release-package.json"
+            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
+              --verify-artifact "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
+          else
+            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
+              --verify-artifact "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
+          fi
+          for field in name version integrity filename sha256; do
+            echo "$field=$(jq -er --arg field "$field" '.[$field]' <<< "$package")" \
+              >> "$GITHUB_OUTPUT"
+          done
+      - name: Attest the exact npm tarball
+        if: ${{ needs.release-context.outputs.mode == 'publish' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/npm-package/${{ steps.package.outputs.filename }}
+      - name: Revalidate recovered package provenance
+        if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_FILENAME: ${{ steps.package.outputs.filename }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "$RUNNER_TEMP/npm-package/$PACKAGE_FILENAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+            --source-digest "$RELEASE_SHA"
+      - name: Preserve the exact package for publication or recovery
+        if: ${{ needs.release-context.outputs.mode == 'publish' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-npm-package
+          path: ${{ runner.temp }}/npm-package
+          if-no-files-found: error
+          retention-days: 7
+      - name: Prove npm authorization and exact-version visibility
+        id: registry
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_INTEGRITY: ${{ steps.package.outputs.integrity }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is unavailable in the protected release environment" >&2
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org >/dev/null
+
+          set +e
+          npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
+            name version gitHead dist.integrity --json \
+            > registry-version.json 2> registry-error.txt
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            jq -e \
+              --arg name "$PACKAGE_NAME" \
+              --arg version "$PACKAGE_VERSION" \
+              --arg sha "$RELEASE_SHA" \
+              --arg integrity "$PACKAGE_INTEGRITY" \
+              '.name == $name and .version == $version and .gitHead == $sha and
+               .["dist.integrity"] == $integrity' registry-version.json >/dev/null
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eq 'E404|404 Not Found' registry-error.txt; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          else
+            cat registry-error.txt >&2
+            echo "::error::could not establish npm version visibility" >&2
+            exit 1
+          fi
+
+  publish-release:
+    name: Publish complete release
+    needs: [release-context, build, preflight-package]
+    if: ${{ always() && needs.preflight-package.result == 'success' && ((needs.release-context.outputs.mode == 'publish' && needs.build.result == 'success') || needs.release-context.outputs.mode == 'resume') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    steps:
+      - name: Check out exact release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Check out current release policy for resume
+        if: ${{ needs.release-context.outputs.mode == 'resume' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-policy
+          persist-credentials: false
+      - name: Require successful main CI on the exact release SHA
+        timeout-minutes: 90
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          DEADLINE=$((SECONDS + 5100))
+          while true; do
+            RUNS="$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&event=push&per_page=20")"
+            RUN="$(jq -c --arg sha "$RELEASE_SHA" \
+              '[.workflow_runs[] | select(.head_sha == $sha and .event == "push")]
+               | sort_by(.id) | last // empty' <<< "$RUNS")"
+
+            if [ -n "$RUN" ]; then
+              RUN_ID="$(jq -r '.id' <<< "$RUN")"
+              RUN_STATUS="$(jq -r '.status' <<< "$RUN")"
+              RUN_CONCLUSION="$(jq -r '.conclusion // "pending"' <<< "$RUN")"
+              RUN_URL="$(jq -r '.html_url' <<< "$RUN")"
+              if [ "$RUN_STATUS" = completed ]; then
+                [ "$RUN_CONCLUSION" = success ] || {
+                  echo "::error::exact-SHA CI concluded $RUN_CONCLUSION: $RUN_URL" >&2
+                  exit 1
+                }
+                JOBS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100")"
+                jq -e --arg sha "$RELEASE_SHA" \
+                  'any(.jobs[]; .name == "Required CI" and .head_sha == $sha and
+                    .status == "completed" and .conclusion == "success")' \
+                  <<< "$JOBS" >/dev/null || {
+                    echo "::error::successful CI run $RUN_ID lacks exact-SHA Required CI" >&2
+                    exit 1
+                  }
+                echo "exact-SHA main CI passed: $RUN_URL"
+                break
+              fi
+              echo "exact-SHA CI is $RUN_STATUS; waiting: $RUN_URL"
+            else
+              echo "no main CI run is visible yet for $RELEASE_SHA; waiting"
+            fi
+            [ "$SECONDS" -lt "$DEADLINE" ] || {
+              echo "::error::timed out waiting for exact-SHA main CI" >&2
+              exit 1
+            }
+            sleep 15
+          done
+      - name: Download all four artifacts from the bound source run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-bundle-*
+          path: release-bundle
+          merge-multiple: true
+          run-id: ${{ needs.release-context.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify complete checksum-bound bundle and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MODE: ${{ needs.release-context.outputs.mode }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$RELEASE_MODE" = resume ]; then
+            policy_root="$GITHUB_WORKSPACE/.release-policy"
+          fi
+          bash "$policy_root/scripts/verify-release-bundle.sh" \
+            release-bundle "$RELEASE_TAG"
+
+          for archive in release-bundle/*.tar.gz; do
+            verified=false
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify "$archive" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+                --source-digest "$RELEASE_SHA"; then
+                verified=true
+                break
+              fi
+              echo "attestation not visible yet for $archive (attempt $attempt/5)"
+              sleep 10
+            done
+            [ "$verified" = true ] || {
+              echo "::error::no valid release-workflow attestation for $archive" >&2
+              exit 1
+            }
+          done
+      - name: Replace private assets by exact release id and verify remote digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" \
+            '.draft == true and .tag_name == $tag and .target_commitish == $sha' \
+            <<< "$release" >/dev/null
+          upload_template="$(jq -er '.upload_url' <<< "$release")"
+          expected_template="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets{?name,label}"
+          [ "$upload_template" = "$expected_template" ] || {
+            echo "::error::release upload URL is not bound to exact release id $RELEASE_ID" >&2
+            exit 1
+          }
+          upload_base="${upload_template%%\{*}"
+
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            >/dev/null 2> tag-error.txt
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ] || ! grep -q 'HTTP 404' tag-error.txt; then
+            echo "::error::could not prove that $RELEASE_TAG remains absent" >&2
+            exit 1
+          fi
+
+          existing_assets="$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+          jq -r '.[][] | .id' <<< "$existing_assets" | while read -r asset_id; do
+              [ -z "$asset_id" ] || gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" --silent
+            done
+
+          for file in release-bundle/*; do
+            name="${file##*/}"
+            encoded_name="$(jq -rn --arg value "$name" '$value | @uri')"
+            local_size="$(stat -c '%s' "$file")"
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            uploaded="$(curl --fail-with-body --silent --show-error --location \
+              --request POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Content-Type: application/octet-stream' \
+              "$upload_base?name=$encoded_name" \
+              --data-binary "@$file")"
+            jq -e \
+              --arg name "$name" \
+              --argjson size "$local_size" \
+              --arg digest "$local_digest" \
+              '.name == $name and .state == "uploaded" and
+               .size == $size and .digest == $digest' <<< "$uploaded" >/dev/null
+          done
+
+          find release-bundle -maxdepth 1 -type f -printf '%f\n' | sort > expected-assets.txt
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+          jq -r '.[].name' <<< "$assets" | sort > remote-assets.txt
+          diff -u expected-assets.txt remote-assets.txt
+
+          for file in release-bundle/*; do
+            name="${file##*/}"
+            local_size="$(stat -c '%s' "$file")"
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            asset_id="$(jq -er --arg name "$name" \
+              '[.[] | select(.name == $name)] |
+               if length == 1 then .[0].id else error("asset name is not unique") end' \
+              <<< "$assets")"
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            jq -e \
+              --arg name "$name" \
+              --argjson size "$local_size" \
+              --arg digest "$local_digest" \
+              'any(.[]; .name == $name and .state == "uploaded" and
+                .size == $size and .digest == $digest)' <<< "$assets" >/dev/null
+
+            remote_file="$RUNNER_TEMP/release-asset-$asset_id"
+            curl --fail-with-body --silent --show-error --location \
+              --retry 3 --retry-all-errors \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              --output "$remote_file" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            cmp --silent "$file" "$remote_file" || {
+              echo "::error::remote bytes differ for exact asset id $asset_id ($name)" >&2
+              exit 1
+            }
+            [ "$(stat -c '%s' "$remote_file")" = "$local_size" ]
+            [ "sha256:$(sha256sum "$remote_file" | awk '{print $1}')" = "$local_digest" ]
+            rm -f -- "$remote_file"
+          done
+      - name: Publish the complete draft and create its exact-SHA tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          published="$(gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false)"
+          for attempt in 1 2 3 4 5 6; do
+            published="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+            if jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" '
+              .draft == false and .immutable == true and
+              .tag_name == $tag and .target_commitish == $sha
+            ' <<< "$published" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::published release did not become immutable; npm publication is forbidden" >&2
+              jq '{id, draft, immutable, tag_name, target_commitish}' <<< "$published" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_type="$(jq -r '.object.type' <<< "$tag_object")"
+          tag_sha="$(jq -r '.object.sha' <<< "$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          [ "$tag_sha" = "$RELEASE_SHA" ] || {
+            echo "::error::published tag $RELEASE_TAG points to $tag_sha, expected $RELEASE_SHA" >&2
+            exit 1
+          }
+
+  verify-dry-run:
+    name: Verify release dry run
+    needs: [release-context, dry-run-baseline, build]
+    if: ${{ always() && needs.release-context.outputs.mode == 'dry-run' && needs.dry-run-baseline.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out dry-run candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Download staged targets
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-bundle-*
+          path: release-bundle
+          merge-multiple: true
+      - name: Prove matrix rejection, external visibility, and automation PR enforcement
+        env:
+          BASELINE_VISIBILITY: ${{ needs.dry-run-baseline.outputs.visibility }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          CANDIDATE_SHA: ${{ needs.release-context.outputs.release_sha }}
+          DRY_RUN_VERSION: ${{ needs.release-context.outputs.dry_run_version }}
+          FAULT_MODE: ${{ inputs.fault_mode }}
+          FAULT_TARGET: ${{ inputs.fault_target }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$CANDIDATE_SHA" = "${{ github.sha }}"
+
+          set +e
+          bash scripts/verify-release-bundle.sh release-bundle "$RELEASE_TAG"
+          VERIFY_STATUS=$?
+          set -e
+
+          case "$FAULT_MODE" in
+            none)
+              test "$BUILD_RESULT" = success
+              test "$VERIFY_STATUS" -eq 0
+              ;;
+            fail)
+              test "$BUILD_RESULT" = failure
+              test "$VERIFY_STATUS" -ne 0
+              ;;
+            omit)
+              test "$BUILD_RESULT" = success
+              test "$VERIFY_STATUS" -ne 0
+              ;;
+            *)
+              echo "::error::unknown fault mode: $FAULT_MODE" >&2
+              exit 1
+              ;;
+          esac
+
+          final_visibility="$(bash scripts/observe-release-visibility.sh \
+            "$GITHUB_REPOSITORY" "$RELEASE_TAG" nestweaver "$DRY_RUN_VERSION")"
+          jq -e '.all_absent == true' <<< "$BASELINE_VISIBILITY" >/dev/null
+          jq -e '.all_absent == true' <<< "$final_visibility" >/dev/null
+
+          canary="$(bash scripts/verify-release-canary-pr.sh \
+            "$GITHUB_REPOSITORY" "$CANDIDATE_SHA")"
+
+          jq -n \
+            --arg candidate_sha "$CANDIDATE_SHA" \
+            --arg tag "$RELEASE_TAG" \
+            --arg fault_mode "$FAULT_MODE" \
+            --arg fault_target "$FAULT_TARGET" \
+            --arg build_result "$BUILD_RESULT" \
+            --argjson verifier_status "$VERIFY_STATUS" \
+            --argjson before "$BASELINE_VISIBILITY" \
+            --argjson after "$final_visibility" \
+            --argjson canary "$canary" \
+            '{candidate_sha: $candidate_sha, tag: $tag, fault_mode: $fault_mode,
+              fault_target: $fault_target, build_result: $build_result,
+              bundle_verifier_status: $verifier_status, visibility_before: $before,
+              visibility_after: $after, automation_pr: $canary}' \
+            > release-gate-evidence.json
+          cat release-gate-evidence.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve dry-run evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-gate-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+  cleanup-canary:
+    name: Clean release-gate canary
+    needs: [release-context, verify-dry-run]
+    if: ${{ always() && needs.release-context.outputs.mode == 'dry-run' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Close canary PR and delete its exact branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="release-gate-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$branch" \
+            --json number --jq '.[].number' | while read -r pr_number; do
+              [ -z "$pr_number" ] || gh pr close "$pr_number" \
+                --repo "$GITHUB_REPOSITORY"
+            done
+
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            >/dev/null 2> ref-error.txt
+          ref_status=$?
+          set -e
+          if [ "$ref_status" -eq 0 ]; then
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" --silent
+          elif ! grep -q 'HTTP 404' ref-error.txt; then
+            cat ref-error.txt >&2
+            echo "::error::could not establish canary branch state" >&2
+            exit 1
+          fi
+
+          test "$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --head "$branch" --json number --jq 'length')" -eq 0
+          set +e
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            >/dev/null 2> final-ref-error.txt
+          final_status=$?
+          set -e
+          if [ "$final_status" -eq 0 ] || ! grep -q 'HTTP 404' final-ref-error.txt; then
+            echo "::error::canary branch cleanup was not proven" >&2
+            cat final-ref-error.txt >&2
+            exit 1
+          fi
+
+  publish-npm:
+    name: Publish npm wrapper
+    needs: [release-context, preflight-package, publish-release]
+    if: ${{ always() && needs.preflight-package.result == 'success' && (((needs.release-context.outputs.mode == 'publish' || needs.release-context.outputs.mode == 'resume') && needs.publish-release.result == 'success') || needs.release-context.outputs.mode == 'recover-npm') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-context.outputs.release_sha }}
+          persist-credentials: false
+      - name: Check out current release policy for recovery
+        if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-policy
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download the exact attested npm package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-npm-package
+          path: ${{ runner.temp }}/npm-package
+          run-id: ${{ needs.release-context.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Revalidate public remote bytes, checksums, and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
+          RELEASE_MODE: ${{ needs.release-context.outputs.mode }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" \
+            '.draft == false and .immutable == true and .tag_name == $tag and .target_commitish == $sha' \
+            <<< "$release" >/dev/null
+
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_type="$(jq -er '.object.type' <<< "$tag_object")"
+          tag_sha="$(jq -er '.object.sha' <<< "$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          [ "$tag_sha" = "$RELEASE_SHA" ]
+
+          mkdir release-bundle
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+          expected_assets="$(mktemp)"
+          actual_assets="$(mktemp)"
+          for target in \
+            aarch64-apple-darwin aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+            archive="nestweaver-${RELEASE_TAG}-${target}.tar.gz"
+            printf '%s\n%s\n' "$archive" "$archive.sha256" >> "$expected_assets"
+          done
+          sort -o "$expected_assets" "$expected_assets"
+          jq -r '.[].name' <<< "$assets" | sort > "$actual_assets"
+          diff -u "$expected_assets" "$actual_assets"
+          rm -f -- "$expected_assets" "$actual_assets"
+
+          jq -r '.[] | [.id, .name, .size, .digest] | @tsv' <<< "$assets" |
+            while IFS=$'\t' read -r asset_id name expected_size expected_digest; do
+              [[ "$asset_id" =~ ^[0-9]+$ ]]
+              [[ "$expected_size" =~ ^[0-9]+$ ]]
+              [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              remote_file="release-bundle/$name"
+              curl --fail-with-body --silent --show-error --location \
+                --retry 3 --retry-all-errors \
+                -H 'Accept: application/octet-stream' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                --output "$remote_file" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              [ "$(stat -c '%s' "$remote_file")" = "$expected_size" ]
+              actual_digest="sha256:$(sha256sum "$remote_file" | awk '{print $1}')"
+              [ "$actual_digest" = "$expected_digest" ]
+            done
+
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$RELEASE_MODE" = resume ] || [ "$RELEASE_MODE" = recover-npm ]; then
+            policy_root="$GITHUB_WORKSPACE/.release-policy"
+          fi
+          bash "$policy_root/scripts/verify-release-bundle.sh" \
+            release-bundle "$RELEASE_TAG"
+          for archive in release-bundle/*.tar.gz; do
+            gh attestation verify "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+              --source-digest "$RELEASE_SHA"
+          done
       # The wrapper's postinstall downloads the matching release binary, so it
-      # must publish only after the `build` job has uploaded the assets for
-      # this tag.
+      # must publish only after the complete draft has become public and its
+      # exact-SHA tag and eight-asset inventory have been verified.
       #
       # This step FAILS rather than skips when the token is absent. It used to
       # exit 0 with a "skipping" message so releases stayed green before the
@@ -549,30 +1724,65 @@ jobs:
       # (nw-115). A release job that cannot publish must say so.
       - name: Publish to npm
         working-directory: npm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_INTEGRITY: ${{ needs.preflight-package.outputs.integrity }}
+          PACKAGE_FILENAME: ${{ needs.preflight-package.outputs.filename }}
+          PACKAGE_NAME: ${{ needs.preflight-package.outputs.name }}
+          PACKAGE_SHA256: ${{ needs.preflight-package.outputs.sha256 }}
+          PACKAGE_VERSION: ${{ needs.preflight-package.outputs.version }}
+          RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
+          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN is not set, so the npm wrapper cannot be published." >&2
-            echo "Add the NPM_TOKEN repository secret. A release must not report" >&2
-            echo "success while silently dropping a distribution channel (nw-115)." >&2
-            exit 1
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" \
+            '.draft == false and .immutable == true and .tag_name == $tag and .target_commitish == $sha' \
+            <<< "$release" >/dev/null
+
+          [[ "$PACKAGE_FILENAME" =~ ^nestweaver-[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?\.tgz$ ]]
+          package_tarball="$RUNNER_TEMP/npm-package/$PACKAGE_FILENAME"
+          test -f "$package_tarball"
+          test -f "$package_tarball.sha256"
+          (cd "$RUNNER_TEMP/npm-package" && sha256sum -c "$PACKAGE_FILENAME.sha256")
+          actual_sha256="$(sha256sum "$package_tarball" | awk '{print $1}')"
+          [ "$actual_sha256" = "$PACKAGE_SHA256" ]
+          gh attestation verify "$package_tarball" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+            --source-digest "$RELEASE_SHA"
+
+          verify_registry() {
+            local metadata
+            metadata="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
+              name version gitHead dist.integrity --json 2>/dev/null)" || return 1
+            jq -e \
+              --arg name "$PACKAGE_NAME" \
+              --arg version "$PACKAGE_VERSION" \
+              --arg sha "$RELEASE_SHA" \
+              --arg integrity "$PACKAGE_INTEGRITY" \
+              '.name == $name and .version == $version and .gitHead == $sha and
+               .["dist.integrity"] == $integrity' <<< "$metadata" >/dev/null
+          }
+
+          if verify_registry; then
+            echo "Verified existing immutable $PACKAGE_NAME@$PACKAGE_VERSION; nothing to republish."
+            exit 0
           fi
-          NAME=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          npm publish --access public
-          # Read it back. `npm publish` exiting 0 is a claim, not evidence: a
-          # publish that is not resolvable from the registry did not happen, and
-          # trusting the exit code is the exact failure this step is here to
-          # stop. Retry only for registry propagation lag.
-          for attempt in 1 2 3 4 5; do
-            if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
-              echo "Verified $NAME@$VERSION is resolvable from the registry."
+
+          set +e
+          npm publish "$package_tarball" --ignore-scripts --access public
+          publish_status=$?
+          set -e
+          for attempt in 1 2 3 4 5 6; do
+            if verify_registry; then
+              echo "Verified exact $PACKAGE_NAME@$PACKAGE_VERSION from $RELEASE_SHA."
               exit 0
             fi
-            echo "Registry has not caught up (attempt $attempt/5); retrying in 10s."
+            echo "Registry has not caught up (attempt $attempt/6); retrying in 10s."
             sleep 10
           done
-          echo "::error::npm publish exited 0 but $NAME@$VERSION is not resolvable." >&2
+          echo "::error::npm publish status $publish_status did not produce the exact expected immutable package." >&2
           exit 1
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

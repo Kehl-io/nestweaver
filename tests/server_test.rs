@@ -300,6 +300,7 @@ async fn server_exposes_read_only_embed_plan_rpc() {
                 scope: "all".to_string(),
                 force: false,
                 batch_size: 0,
+                repair_identity: false,
             }),
             PathAndQuery::from_static("/nestweaver.daemon.v1.NestWeaverDaemon/PlanEmbed"),
             tonic_prost::ProstCodec::default(),
@@ -1262,7 +1263,7 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
 /// totals before applying `limit`. A query-scoped caller must never receive the
 /// larger admin-visible total or any hidden repo identifiers.
 #[tokio::test]
-async fn server_mcp_http_blast_count_is_exact_within_visible_scope() {
+async fn server_mcp_http_blast_radius_fails_closed_for_restricted_identity() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("authz").join("test.lbug");
     let visible_repo = dir.path().join("visible_repo");
@@ -1399,34 +1400,24 @@ credential_method = "ssh"
     let query_body: Value = query_response.json().await.unwrap();
     assert_eq!(
         query_body["result"]["isError"],
-        json!(false),
-        "query-scoped blast_radius failed: {query_body}"
+        json!(true),
+        "restricted blast_radius must refuse global-score traversal: {query_body}"
     );
-    let visible = &query_body["result"]["structuredContent"];
 
     let admin_total = admin["affected_symbol_count"]
         .as_u64()
         .expect("admin affected_symbol_count");
-    let visible_total = visible["affected_symbol_count"]
-        .as_u64()
-        .expect("visible affected_symbol_count");
     assert_eq!(
         admin_total, 5,
         "admin fixture should include two visible and three hidden affected symbols: {admin}"
     );
-    assert_eq!(
-        visible_total, 2,
-        "restricted total must count only the two visible affected symbols: {visible}"
-    );
-    assert_eq!(
-        visible["returned_affected_symbol_count"],
-        json!(1),
-        "small limit should return one visible row: {visible}"
-    );
-    assert_eq!(
-        visible["affected_symbols_truncated"],
-        json!(true),
-        "restricted total should remain exact when the visible rows are truncated: {visible}"
+    let refusal = query_body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("restricted refusal text");
+    assert!(
+        refusal.contains("authorization-induced subgraph")
+            && refusal.contains("refusing before seed resolution or traversal"),
+        "restricted refusal must explain the safe boundary: {query_body}"
     );
 
     let admin_serialized = admin.to_string();
@@ -1434,7 +1425,7 @@ credential_method = "ssh"
         admin_serialized.contains("hiddencaller"),
         "admin fixture must prove hidden affected rows exist: {admin}"
     );
-    let visible_serialized = visible.to_string();
+    let visible_serialized = query_body.to_string();
     for hidden_marker in [
         "hidden_repo",
         "hidden_callers.js",
@@ -1443,7 +1434,7 @@ credential_method = "ssh"
     ] {
         assert!(
             !visible_serialized.contains(hidden_marker),
-            "query-scoped output leaked {hidden_marker}: {visible}"
+            "query-scoped refusal leaked {hidden_marker}: {query_body}"
         );
     }
 }
@@ -3348,25 +3339,16 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     assert_eq!(restricted_response.status(), 200);
     let restricted_body: Value = restricted_response.json().await.expect("restricted JSON");
     assert_eq!(
-        restricted_body["result"]["isError"], false,
-        "restricted request failed: {restricted_body}"
+        restricted_body["result"]["isError"], true,
+        "restricted blast_radius must fail closed: {restricted_body}"
     );
-
-    let structured = &restricted_body["result"]["structuredContent"];
-    assert_eq!(structured["tier"], "two_tier");
+    let refusal = restricted_body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("restricted refusal text");
     assert!(
-        structured["local_impact"]
-            .to_string()
-            .contains("visiblefederationcanary"),
-        "authorized local tier must remain available: {structured}"
-    );
-    let org = &structured["org_wide_impact"];
-    assert_eq!(org["status"], "withheld");
-    assert_eq!(org["reason"], "authorization-unproven");
-    assert_eq!(
-        org.as_object().expect("org status object").len(),
-        2,
-        "withheld org tier must expose no rows, paths, sources, or counts: {org}"
+        refusal.contains("authorization-induced subgraph")
+            && refusal.contains("refusing before seed resolution or traversal"),
+        "restricted refusal must explain why traversal was not attempted: {restricted_body}"
     );
 
     let serialized = restricted_body.to_string();
@@ -3387,15 +3369,6 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
             "restricted response leaked hidden upstream marker {hidden_marker}: {restricted_body}"
         );
     }
-    let meta = &restricted_body["result"]["structuredContent"]["_meta"];
-    assert_eq!(meta["sources"], json!(["daemon"]));
-    assert_eq!(meta["scope"], "single-node");
-    assert_eq!(
-        meta["stale_repos"],
-        json!([]),
-        "global staleness cache must not leak repo URLs across caller scope"
-    );
-
     // The unrestricted local tier proves both local repositories participate
     // in impact traversal. The restricted HTTP route must remove hidden local
     // rows before computing totals and before the federation envelope is

@@ -19,7 +19,9 @@
 //! existed has no entry — which is exactly the "predates the fix" answer we
 //! want, at zero migration cost.
 
+use anyhow::Context;
 use nestweaver_schema::Repo;
+use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -97,7 +99,8 @@ impl ResolverGenerations {
         self.repos.get(repo_uid).copied().unwrap_or(0)
     }
 
-    /// Repo uids whose edges predate [`RESOLVER_GENERATION`], SORTED.
+    /// Repo uids whose edges were not produced by exactly
+    /// [`RESOLVER_GENERATION`], SORTED.
     ///
     /// nw-358. This is the sole computation behind every route's
     /// `stale_repos` — the CLI's two staleness constructors, `hub_nodes` /
@@ -116,7 +119,7 @@ impl ResolverGenerations {
     pub fn stale_repos<'a, I: IntoIterator<Item = &'a str>>(&self, known: I) -> Vec<String> {
         let mut stale: Vec<String> = known
             .into_iter()
-            .filter(|uid| self.generation_for(uid) < RESOLVER_GENERATION)
+            .filter(|uid| self.generation_for(uid) != RESOLVER_GENERATION)
             .map(|uid| uid.to_string())
             .collect();
         stale.sort_unstable();
@@ -134,6 +137,38 @@ pub fn load(db_path: &Path) -> ResolverGenerations {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Stable descriptor carried by every edge-dependent analysis that cannot
+/// trust the resolver generation recorded for its graph.
+pub const INCOMPATIBLE_RESOLVER_DESCRIPTOR: &str = "resolver-generation-incompatible";
+
+/// Return every repository whose persisted edges are incompatible with the
+/// running resolver.
+///
+/// In-memory stores have no persisted sidecar and are used heavily by pure
+/// analysis tests, so there is no disk generation to prove or reject. Every
+/// disk-backed store is checked, including absent and unreadable sidecars:
+/// [`load`] maps both to generation zero, which is deliberately incompatible.
+pub fn incompatible_repos_for_store(store: &GraphStore) -> anyhow::Result<Vec<String>> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(Vec::new());
+    };
+    let repos = store
+        .list_repos(None)
+        .context("list repositories for resolver-generation compatibility")?;
+    Ok(load(db_path).stale_repos(repos.iter().map(|repo| repo.uid.as_str())))
+}
+
+/// One shared diagnostic for affected-tests, detect-changes, and blast-radius.
+pub fn incompatibility_message(repos: &[String]) -> String {
+    format!(
+        "edge-dependent analysis cannot trust repositories with a resolver generation that \
+         differs from the running generation {}: {}. Re-index each repository with \
+         `nestweaver index --repo <path> --force`",
+        RESOLVER_GENERATION,
+        repos.join(", ")
+    )
 }
 
 /// Record that `repo_uid` was just indexed by the current resolver.
@@ -174,7 +209,7 @@ pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
 /// drift from this one the first time either is edited.
 ///
 /// `total` is `None` where the population is genuinely unknown. It is rendered
-/// as a floor ("N repo(s) are known to have been") rather than by inventing a
+/// as a floor ("N repo(s) are known to be incompatible") rather than by inventing a
 /// denominator, because on that route `stale_repos` can UNDER-count: the
 /// sidecar fallback for a pre-`attach_ranking_staleness` daemon sees only the
 /// repos the sidecar records, and a repo present in the graph but absent from
@@ -196,13 +231,14 @@ pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<Stri
     }
     let scope = match total {
         Some(total) => format!("{} of {total} repo(s) were", stale.len()),
-        None => format!("{} repo(s) are known to have been", stale.len()),
+        None => format!("{} repo(s) are known to be", stale.len()),
     };
     Some(format!(
-        "{scope} indexed by an older resolver, so their edges are the ones that \
-         resolver wrote: rankings over them are wrong, and edge families added since \
-         (C/C++ MEMBER_OF, C++ IMPORTS) are absent entirely. Upgrading the binary does \
-         not repair data already on disk. Re-index each one with \
+        "{scope} incompatible with this resolver. This includes repositories indexed by an \
+         older resolver, repositories with missing or unreadable generation metadata, and \
+         repositories claiming a future generation this binary cannot understand. Their edges \
+         cannot be trusted: rankings may be wrong, and edge families may be absent entirely. \
+         Upgrading the binary does not repair data already on disk. Re-index each one with \
          `nestweaver index --repo <path> --force`."
     ))
 }
@@ -443,12 +479,105 @@ mod tests {
     }
 
     #[test]
-    fn only_repos_below_the_current_generation_are_stale() {
+    fn only_the_exact_current_generation_is_compatible() {
         let mut g = ResolverGenerations::default();
         g.repos.insert("fresh".into(), RESOLVER_GENERATION);
         g.repos.insert("ancient".into(), 0);
-        let stale = g.stale_repos(vec!["fresh", "ancient", "unrecorded"]);
-        assert_eq!(stale, vec!["ancient".to_string(), "unrecorded".to_string()]);
+        g.repos.insert("future".into(), RESOLVER_GENERATION + 1);
+        let stale = g.stale_repos(vec!["fresh", "future", "ancient", "unrecorded"]);
+        assert_eq!(
+            stale,
+            vec![
+                "ancient".to_string(),
+                "future".to_string(),
+                "unrecorded".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn corrupt_and_missing_sidecars_fail_closed_for_known_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let known = ["repo:a"];
+
+        assert_eq!(load(&db).stale_repos(known), vec!["repo:a"]);
+        std::fs::write(
+            crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR),
+            "not-json",
+        )
+        .unwrap();
+        assert_eq!(load(&db).stale_repos(known), vec!["repo:a"]);
+    }
+
+    #[test]
+    fn all_changed_file_engines_share_the_same_incompatible_repo_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let repo = Repo {
+            uid: "repo:default:future".into(),
+            url: "file:///tmp/future".into(),
+            indexed_sha: "deadbeef".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some("/tmp/future".into()),
+        };
+        store.insert_repo(&repo).unwrap();
+        record(&db, &repo.uid).unwrap();
+
+        let files = vec!["src/new.rs".to_string()];
+        assert!(
+            crate::affected_tests::affected_tests(&store, &files)
+                .unwrap()
+                .resolver_stale_repos
+                .is_empty()
+        );
+
+        let mut generations = load(&db);
+        generations
+            .repos
+            .insert(repo.uid.clone(), RESOLVER_GENERATION + 1);
+        std::fs::write(
+            crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_string(&generations).unwrap(),
+        )
+        .unwrap();
+
+        let affected = crate::affected_tests::affected_tests(&store, &files).unwrap();
+        assert_eq!(affected.resolver_stale_repos, vec![repo.uid.clone()]);
+        assert_eq!(affected.recommendation, "run-full-suite");
+
+        let detected = crate::process::detect_changes_impact(&store, &files, 3).unwrap();
+        assert_eq!(detected.resolver_stale_repos, vec![repo.uid.clone()]);
+        assert_eq!(
+            detected.gate_state,
+            crate::blast_radius::GateState::DegradedUnknown
+        );
+
+        let blast = crate::blast_radius::analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/new.rs")],
+            &crate::blast_radius::BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .unwrap();
+        assert_eq!(blast.resolver_stale_repos, vec![repo.uid]);
+        assert_eq!(
+            blast.gate_state,
+            crate::blast_radius::GateState::DegradedUnknown
+        );
+        for notifications in [
+            &affected.notifications,
+            &detected.notifications,
+            &blast.notifications,
+        ] {
+            assert!(notifications.iter().any(|notification| {
+                notification.descriptor == INCOMPATIBLE_RESOLVER_DESCRIPTOR
+            }));
+        }
     }
 
     #[test]

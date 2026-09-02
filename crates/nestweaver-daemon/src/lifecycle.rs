@@ -447,71 +447,7 @@ impl std::error::Error for EffectiveConfigBindingError {
 /// directory and append the original filename. This keeps socket IDs stable for
 /// paths such as macOS `/tmp/...` and `/private/tmp/...`.
 pub fn canonical_db_path(db_path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(db_path) {
-        return canonical;
-    }
-
-    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
-        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
-    {
-        return canonical_parent.join(file_name);
-    }
-
-    // A relative path whose parent does not resolve — most importantly a BARE
-    // `nestweaver.lbug`, where `parent()` is `Some("")` and also fails to
-    // canonicalize — used to be returned unchanged, hashing to a DIFFERENT
-    // instance id than the same database gets once the file exists:
-    //
-    //   before creation: canonicalize fails -> id = hash("nestweaver.lbug")
-    //   after creation:  canonicalize wins  -> id = hash("/cwd/nestweaver.lbug")
-    //
-    // So the first `daemon start` in a fresh directory bound one identity, and
-    // every command after the database existed looked for another — leaving a
-    // daemon holding the write lock that the CLI could no longer address by
-    // name. Joining the cwd makes the pre-creation answer agree with the
-    // post-creation one, which is what `database_path_fingerprint` already did
-    // for the same reason; this function simply never got the same treatment.
-    //
-    // The join is LEXICALLY NORMALIZED. `cwd.join("sub/../nw.lbug")` yields
-    // `/cwd/sub/../nw.lbug`, which hashes differently from the `/cwd/nw.lbug`
-    // that `canonicalize` returns once the file exists — the same fork, one
-    // path shape further out.
-    if db_path.is_relative()
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        return lexically_normalize(&cwd.join(db_path));
-    }
-
-    db_path.to_path_buf()
-}
-
-/// Collapse `.` and `..` without touching the filesystem.
-///
-/// `Path::join` is purely textual, so a relative `--db` containing `..` would
-/// otherwise produce a path that never equals the canonicalized form.
-/// Deliberately lexical: the point is to agree with `canonicalize` for paths
-/// that do not exist YET, so it cannot resolve symlinks — and on the platforms
-/// this runs on, a `..` crossing a symlinked directory is the only case where
-/// the two disagree, which no `--db` argument in practice exercises.
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                // Never pop past the root; `/..` is `/`.
-                if out
-                    .components()
-                    .next_back()
-                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
-                {
-                    out.pop();
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    nestweaver_store::canonical_db_path(db_path)
 }
 
 /// Reproduce the PRE-nw-208 canonicalization exactly.
@@ -1016,101 +952,18 @@ pub fn checkpoint_artifacts(db_path: &Path) -> CheckpointArtifacts {
     CheckpointArtifacts::Debris { artifacts }
 }
 
-/// Path of the dedicated write-lease file for a database.
+/// Canonical writer and destructive-namespace authority primitives.
 ///
-/// A SEPARATE file, deliberately. The obvious choice — lock the database file
-/// itself — is unsafe with POSIX record locks, and `db_write_lock` above
-/// documents why: `fcntl` locks are held per PROCESS, so closing ANY
-/// descriptor to that file drops every lock this process holds on it. A lease
-/// taken on the database would be destroyed by the store's own routine
-/// open/close, silently admitting a second writer. Nothing but the lease
-/// opens this file, so nothing can drop it by accident.
-pub fn write_lease_path(db_path: &Path) -> PathBuf {
-    let canonical = canonical_db_path(db_path);
-    let mut name = canonical.as_os_str().to_owned();
-    name.push(".write.lock");
-    PathBuf::from(name)
-}
-
-/// An exclusive claim on a database's write access, held for as long as the
-/// value lives and released by the kernel when the process exits.
-///
-/// `flock`, not `fcntl`: `flock` is per-DESCRIPTOR, so it survives unrelated
-/// opens and closes of the database, and the kernel drops it on exit with no
-/// stale state to reap. That is the property a pidfile does not have and the
-/// reason this can be trusted where a probe cannot.
-///
-/// A probe answers "was anyone holding this a moment ago". Only a held lease
-/// answers "is anyone holding this for as long as I am writing", which is the
-/// question a check-then-write cannot ask. Every comparable embedded store —
-/// SQLite, RocksDB, LMDB, DuckDB, Kuzu — holds a lock for the lifetime of the
-/// handle for exactly this reason.
-// nw-274: `#[must_use]` on the TYPE, not only on the helper that returns it.
-//
-// The single `#[must_use]` guarding this lived on `require_exclusive_store_access`
-// in `main.rs`, and an unrelated function inserted above it silently detached
-// the attribute — the fifth docblock detachment this release. A per-function
-// attribute protects one function and can be separated from it by an edit
-// elsewhere; on the type it covers every present and future producer, and
-// nothing can come between them.
-#[must_use = "the lease must be HELD for the duration of the write; dropping it \
-              immediately reduces this to a probe, which is the check-then-act \
-              race it exists to remove"]
-#[derive(Debug)]
-pub struct DbWriteLease {
-    _file: std::fs::File,
-    path: PathBuf,
-}
-
-impl DbWriteLease {
-    /// The lease file this claim is held on.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Why a write lease could not be taken.
-#[derive(Debug)]
-pub enum WriteLeaseError {
-    /// Someone else holds it. They are writing right now.
-    Held,
-    /// The lease file itself could not be created or locked.
-    Unavailable(std::io::Error),
-}
-
-/// Take an exclusive, non-blocking write lease on `db_path`.
-///
-/// Non-blocking on purpose: a caller that would block has a live writer to
-/// report, and telling the operator who holds the database is more useful than
-/// hanging. Callers that genuinely want to wait can retry.
-pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
-    use std::os::unix::io::AsRawFd;
-
-    let path = write_lease_path(db_path);
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent).map_err(WriteLeaseError::Unavailable)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(WriteLeaseError::Unavailable)?;
-
-    // LOCK_NB so a contended lease fails immediately instead of hanging.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return match error.kind() {
-            std::io::ErrorKind::WouldBlock => Err(WriteLeaseError::Held),
-            _ => Err(WriteLeaseError::Unavailable(error)),
-        };
-    }
-    Ok(DbWriteLease { _file: file, path })
-}
-
+/// The writer lease deliberately holds three compatible claims for its full
+/// lifetime: lbug's POSIX database-lock class (to exclude older writers), a
+/// descriptor-scoped database flock (to exclude duplicate same-process
+/// authorities), and the stable sidecar flock (to survive database cutover).
+/// It is acquired before the store and dropped after the store, so routine
+/// store descriptors cannot shorten the authority lifetime.
+pub use nestweaver_store::{
+    DbNamespaceLease, DbWriteLease, WriteLeaseError, acquire_db_namespace_lease,
+    acquire_db_write_lease, acquire_db_write_lease_under_namespace, write_lease_path,
+};
 /// PID of the process on the other end of a connected unix socket, as
 /// reported by the kernel. Unlike the pidfile (whose contents can be
 /// overwritten while the daemon still holds its flock), this cannot be faked

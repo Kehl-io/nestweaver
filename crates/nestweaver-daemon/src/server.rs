@@ -214,6 +214,24 @@ struct ConnectionGuard {
     counter: Arc<AtomicU32>,
 }
 
+fn try_admit_write_with<F>(
+    active_writes: &AtomicU32,
+    shutdown_started: &AtomicBool,
+    after_increment: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    active_writes.fetch_add(1, Ordering::SeqCst);
+    after_increment();
+    if shutdown_started.load(Ordering::SeqCst) {
+        active_writes.fetch_sub(1, Ordering::SeqCst);
+        false
+    } else {
+        true
+    }
+}
+
 impl ConnectionGuard {
     fn read(state: &DaemonState) -> Self {
         state.active_reads.fetch_add(1, Ordering::Relaxed);
@@ -226,10 +244,10 @@ impl ConnectionGuard {
     /// Admit a write, or refuse it because shutdown has begun.
     ///
     /// THIS REFUSAL IS WHAT MAKES THE DRAIN TERMINATE. `active_writes` is the
-    /// drain's exit condition and this constructor is its ONLY incrementer (the
-    /// web admin crate holds the same `Arc` but never adds to it), so gating
-    /// here — and only here — makes the count monotonically non-increasing once
-    /// shutdown starts.
+    /// drain's exit condition. This constructor and the web admin mutation
+    /// admission guard are its only incrementers; both use the same
+    /// increment-before-shutdown-check ordering, so the count is monotonically
+    /// non-increasing once shutdown starts.
     ///
     /// Without it the drain is not merely slow, it is not guaranteed to
     /// terminate at all. The old SIGTERM broadcast closed every listener, which
@@ -252,19 +270,19 @@ impl ConnectionGuard {
     /// extend the drain, and continuing to serve them for the whole drain is
     /// the point of this design.
     fn write(state: &DaemonState) -> Result<Self, Status> {
-        // Ordering: this load pairs with the `swap` in `begin_shutdown_drain`.
-        // `Relaxed` matches every other access to this flag; the race window it
-        // leaves is one already-admitted write, which the drain then waits for
-        // exactly as it would have anyway. What must not happen — an unbounded
-        // stream of new writes — is closed regardless of ordering.
-        if state.shutdown_started.load(Ordering::Relaxed) {
+        // Increment first, then recheck shutdown. With SeqCst this gives the
+        // drain and admission one total order: an increment before shutdown is
+        // visible to the drain; an increment after shutdown rolls itself back
+        // and never reaches mutation work. Check-then-increment allowed the
+        // drain to observe zero between those two operations and finish before
+        // a late writer.
+        if !try_admit_write_with(&state.active_writes, &state.shutdown_started, || {}) {
             return Err(Status::unavailable(
                 "daemon is shutting down and is not accepting new writes; it is \
                  finishing the writes already in flight and still serving reads. \
                  Retry against the daemon that starts next.",
             ));
         }
-        state.active_writes.fetch_add(1, Ordering::Relaxed);
         state.idle_notify.notify_one();
         Ok(Self {
             counter: Arc::clone(&state.active_writes),
@@ -274,8 +292,18 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// Exact-worker ownership with deliberate drop order.
+///
+/// Rust drops struct fields in declaration order. Releasing the process write
+/// gate before decrementing `active_writes` prevents even a tiny interval in
+/// which shutdown observes zero writers while the gate is still held.
+struct MutationWorkerOwnership {
+    _write_lease: WriteLease,
+    _connection_guard: ConnectionGuard,
 }
 
 /// Compose shutdown admission and the process-wide writer gate in the only
@@ -295,7 +323,10 @@ fn daemon_mutation_lease_factory(
             }
         })?;
         let write = state.write_gate.blocking_lock(label);
-        Ok(Box::new((guard, write)))
+        Ok(Box::new(MutationWorkerOwnership {
+            _write_lease: write,
+            _connection_guard: guard,
+        }))
     })
 }
 
@@ -390,11 +421,33 @@ fn request_is_applying(args_json: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(feature = "embed", test))]
 fn settle_embed_counts(succeeded: u32, failed: u32, flush_ok: bool) -> (u32, u32) {
     if flush_ok {
         return (succeeded, failed);
     }
     (0, failed.saturating_add(succeeded))
+}
+
+/// Publish one embed pass in identity-before-vector order.
+///
+/// The `?` on the metadata stamp is a security boundary, not shorthand: if
+/// the database keeps its old pipeline, flushing same-dimension vectors from a
+/// replacement model would label those vectors with the old fingerprint. A
+/// stamp failure therefore prevents the flush from being attempted at all.
+#[cfg(feature = "embed")]
+fn persist_embed_output(
+    store: &GraphStore,
+    pipeline: Option<&nestweaver_schema::EmbeddingPipelineV2>,
+    succeeded: u32,
+) -> Result<(), nestweaver_store::StoreError> {
+    if let Some(pipeline) = pipeline {
+        store.set_embedding_pipeline(pipeline)?;
+    }
+    if succeeded > 0 {
+        store.flush_embedding_index()?;
+    }
+    Ok(())
 }
 
 fn unix_now_seconds() -> i64 {
@@ -414,15 +467,13 @@ impl EmbedProgress {
     /// Claim the reporting slot for a starting pass. `total` is 0 until
     /// preflight finishes, which is reported honestly rather than guessed at.
     ///
-    /// Returns a guard that is INERT when a pass is already running. The write
-    /// lease is owned by the RPC future while the pass itself runs on a
-    /// blocking task, so a client that disconnects releases the lock while its
-    /// pass keeps embedding; a re-issued `embed` then acquires the gate with
-    /// the first pass still in flight. Without this claim its `begin` would
-    /// zero the shared counters and whichever guard dropped first would report
-    /// `pass_active: false` during a live embed — precisely the class of
-    /// status lie this work exists to remove. The second pass therefore
-    /// reports nothing rather than corrupting the first pass's numbers.
+    /// Returns a guard that is INERT when a pass is already running. The unary
+    /// mutation helper now moves write ownership into this exact blocking
+    /// worker, so a disconnected client cannot admit a second pass. The
+    /// independent progress claim remains a defense against callers outside
+    /// that RPC path and against future wiring mistakes: a second pass reports
+    /// nothing rather than zeroing or prematurely clearing the first pass's
+    /// counters.
     #[must_use]
     pub fn begin(self: &Arc<Self>, scope: &str) -> EmbedProgressGuard {
         let mut slot = self.lock();
@@ -445,18 +496,22 @@ impl EmbedProgress {
         EmbedProgressGuard(Some(Arc::clone(self)))
     }
 
+    #[cfg(any(feature = "embed", test))]
     fn set_total(&self, total: u64) {
         if let Some(state) = self.lock().as_mut() {
             state.total = total;
         }
     }
 
+    #[cfg(any(feature = "embed", test))]
     fn advance(&self, by: u64) {
         if let Some(state) = self.lock().as_mut() {
             state.processed = state.processed.saturating_add(by);
         }
     }
 
+    #[cfg(any(feature = "embed", test))]
+    #[cfg_attr(all(test, not(feature = "embed")), allow(dead_code))]
     fn processed(&self) -> u64 {
         self.lock().as_ref().map(|s| s.processed).unwrap_or(0)
     }
@@ -495,23 +550,28 @@ const EMBED_PASS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 pub struct EmbedProgressGuard(Option<Arc<EmbedProgress>>);
 
 impl EmbedProgressGuard {
+    #[cfg(any(feature = "embed", test))]
     fn set_total(&self, total: u64) {
         if let Some(progress) = &self.0 {
             progress.set_total(total);
         }
     }
 
+    #[cfg(any(feature = "embed", test))]
     fn advance(&self, by: u64) {
         if let Some(progress) = &self.0 {
             progress.advance(by);
         }
     }
 
+    #[cfg(any(feature = "embed", test))]
+    #[cfg_attr(all(test, not(feature = "embed")), allow(dead_code))]
     fn processed(&self) -> u64 {
         self.0.as_ref().map(|p| p.processed()).unwrap_or(0)
     }
 
     /// Whether this pass owns the reporting slot.
+    #[cfg(any(feature = "embed", test))]
     fn reports(&self) -> bool {
         self.0.is_some()
     }
@@ -543,6 +603,161 @@ enum SearchIndexReconciliation {
 /// a restart and long enough to be invisible.
 const SEARCH_REOPEN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Durable proof that the graph may be newer than the BM25 sidecar.
+///
+/// The marker is established before a vault mutation enters the engine. It is
+/// intentionally conservative: a failed graph operation may have committed a
+/// prefix, so only a successful full rebuild, a proven no-op, or an
+/// intentionally disabled writer may clear it.
+const SEARCH_RECONCILIATION_DEBT_SUFFIX: &str = ".search-reconciliation.json";
+const SEARCH_RECONCILIATION_DEBT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+struct SearchReconciliationDebt {
+    version: u32,
+    operation: String,
+    created_at_unix: i64,
+    graph_generation_before: u64,
+    attempts: u64,
+    #[serde(default)]
+    last_error: String,
+}
+
+fn search_reconciliation_debt_path(db_path: &Path) -> PathBuf {
+    nestweaver_engine::sidecar_path(db_path, SEARCH_RECONCILIATION_DEBT_SUFFIX)
+}
+
+fn load_search_reconciliation_debt(
+    db_path: &Path,
+) -> Result<Option<SearchReconciliationDebt>, anyhow::Error> {
+    let path = search_reconciliation_debt_path(db_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read durable search-reconciliation debt {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let debt: SearchReconciliationDebt = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "decode durable search-reconciliation debt {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        debt.version == SEARCH_RECONCILIATION_DEBT_VERSION,
+        "unsupported search-reconciliation debt version {} in {} (expected {})",
+        debt.version,
+        path.display(),
+        SEARCH_RECONCILIATION_DEBT_VERSION
+    );
+    anyhow::ensure!(
+        !debt.operation.trim().is_empty(),
+        "search-reconciliation debt {} has an empty operation",
+        path.display()
+    );
+    Ok(Some(debt))
+}
+
+fn write_search_reconciliation_debt(
+    db_path: &Path,
+    debt: &SearchReconciliationDebt,
+) -> Result<(), anyhow::Error> {
+    let path = search_reconciliation_debt_path(db_path);
+    let bytes = serde_json::to_vec_pretty(debt)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")
+    })
+    .with_context(|| {
+        format!(
+            "durably publish search-reconciliation debt {}",
+            path.display()
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchDebtAdmission {
+    had_existing_debt: bool,
+}
+
+fn establish_search_reconciliation_debt(
+    state: &DaemonState,
+    operation: &str,
+) -> Result<SearchDebtAdmission, anyhow::Error> {
+    let existing = load_search_reconciliation_debt(&state.db_path)?;
+    let had_existing_debt = existing.is_some();
+    let debt = match existing {
+        Some(mut debt) => {
+            // Preserve the earliest possible divergence point. The latest
+            // operation remains useful in diagnostics, while the generation
+            // and timestamp continue to describe how long the corpus may have
+            // been stale.
+            debt.operation = operation.to_string();
+            debt
+        }
+        None => SearchReconciliationDebt {
+            version: SEARCH_RECONCILIATION_DEBT_VERSION,
+            operation: operation.to_string(),
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            graph_generation_before: state.store.graph_generation(),
+            attempts: 0,
+            last_error: String::new(),
+        },
+    };
+    write_search_reconciliation_debt(&state.db_path, &debt)?;
+    Ok(SearchDebtAdmission { had_existing_debt })
+}
+
+fn record_search_reconciliation_failure(
+    state: &DaemonState,
+    operation: &str,
+    error: &anyhow::Error,
+) -> Result<(), anyhow::Error> {
+    let mut debt =
+        load_search_reconciliation_debt(&state.db_path)?.unwrap_or(SearchReconciliationDebt {
+            version: SEARCH_RECONCILIATION_DEBT_VERSION,
+            operation: operation.to_string(),
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            graph_generation_before: state.store.graph_generation(),
+            attempts: 0,
+            last_error: String::new(),
+        });
+    debt.operation = operation.to_string();
+    debt.attempts = debt.attempts.saturating_add(1);
+    debt.last_error = format!("{error:#}");
+    write_search_reconciliation_debt(&state.db_path, &debt)
+}
+
+fn clear_search_reconciliation_debt(db_path: &Path) -> Result<(), anyhow::Error> {
+    let path = search_reconciliation_debt_path(db_path);
+    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)
+        .with_context(|| {
+            format!(
+                "durably clear search-reconciliation debt {}",
+                path.display()
+            )
+        })
+        .map(|_| ())
+}
+
+#[derive(Clone)]
+struct SearchRecoveryContext {
+    state: std::sync::Weak<DaemonState>,
+    runtime: tokio::runtime::Handle,
+}
+
 /// The daemon's full-text search capability, re-establishable.
 ///
 /// This is the `tantivy` + `search_reconciliation` pair that used to sit
@@ -570,6 +785,12 @@ pub struct SearchRuntime {
     /// Guards the re-open attempt itself, so a burst of concurrent queries
     /// against a broken sidecar performs ONE open, not one per query.
     next_attempt: std::sync::Mutex<Instant>,
+    /// Installed after [`DaemonState`] is assembled. Weak ownership avoids a
+    /// state → runtime → state cycle while still letting a recovered writer
+    /// enqueue the exact-worker reconciliation that makes it safe to clear a
+    /// durable debt.
+    recovery_context: std::sync::OnceLock<SearchRecoveryContext>,
+    recovery_in_flight: Arc<AtomicBool>,
 }
 
 /// Readiness and the exact usable handle as one value, so a caller can never
@@ -631,7 +852,101 @@ impl SearchRuntime {
             retry_interval,
             inner: std::sync::RwLock::new(snapshot),
             next_attempt: std::sync::Mutex::new(Instant::now()),
+            recovery_context: std::sync::OnceLock::new(),
+            recovery_in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn attach_recovery_context(&self, state: &Arc<DaemonState>) {
+        let _ = self.recovery_context.set(SearchRecoveryContext {
+            state: Arc::downgrade(state),
+            runtime: tokio::runtime::Handle::current(),
+        });
+    }
+
+    fn current_snapshot(&self) -> SearchRuntimeSnapshot {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn debt_is_pending(&self) -> bool {
+        self.recovery_context
+            .get()
+            .and_then(|context| context.state.upgrade())
+            .is_some_and(|state| {
+                matches!(load_search_reconciliation_debt(&state.db_path), Ok(Some(_)))
+            })
+    }
+
+    /// Schedule a debt repair under the same exact-worker ownership as every
+    /// other daemon writer. A query may discover that the Tantivy writer has
+    /// recovered, but the query itself must never perform the rebuild or clear
+    /// the durable marker outside the write gate.
+    fn schedule_debt_reconciliation(&self, tantivy: Arc<TantivyIndex>) {
+        if !self.debt_is_pending()
+            || self
+                .recovery_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let Some(context) = self.recovery_context.get().cloned() else {
+            self.recovery_in_flight.store(false, Ordering::Release);
+            return;
+        };
+        let SearchRecoveryContext {
+            state: weak_state,
+            runtime,
+        } = context;
+        let in_flight = Arc::clone(&self.recovery_in_flight);
+        runtime.spawn(async move {
+            let Some(state) = weak_state.upgrade() else {
+                in_flight.store(false, Ordering::Release);
+                return;
+            };
+            let guard = match ConnectionGuard::write(&state) {
+                Ok(guard) => guard,
+                Err(status) => {
+                    tracing::debug!(
+                        error = %status,
+                        "search-reconciliation recovery was refused during shutdown"
+                    );
+                    in_flight.store(false, Ordering::Release);
+                    return;
+                }
+            };
+            let lease = state.write_gate.lock("search_debt_recovery").await;
+            let repair_state = Arc::clone(&state);
+            let result = tokio::task::spawn_blocking(move || {
+                let _ownership = MutationWorkerOwnership {
+                    _write_lease: lease,
+                    _connection_guard: guard,
+                };
+                reconcile_pending_search_debt(
+                    &repair_state,
+                    SearchIndexReconciliation::Available(tantivy),
+                    "search_writer_recovery",
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => tracing::info!(
+                    "reconciled durable search debt after the Tantivy writer recovered"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    error = %error,
+                    "search debt remains pending after writer recovery"
+                ),
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "search-debt recovery worker panicked; durable debt remains"
+                ),
+            }
+            in_flight.store(false, Ordering::Release);
+        });
     }
 
     /// The current search state, re-establishing it first if it is degraded
@@ -643,6 +958,9 @@ impl SearchRuntime {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if current.is_healthy() {
+                if let SearchIndexReconciliation::Available(tantivy) = &current.reconciliation {
+                    self.schedule_debt_reconciliation(Arc::clone(tantivy));
+                }
                 return current.clone();
             }
         }
@@ -683,7 +1001,10 @@ impl SearchRuntime {
         *self
             .inner
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.clone();
+        if let SearchIndexReconciliation::Available(tantivy) = candidate.reconciliation {
+            self.schedule_debt_reconciliation(tantivy);
+        }
     }
 
     /// Replace the reconciliation verdict. Used by the deletion-reconciliation
@@ -732,6 +1053,32 @@ pub struct WatcherRegistration {
     owner_pid: Option<i32>,
 }
 
+/// A retained watcher worker. The id ties the otherwise-unstructured join
+/// handle back to its registration, so an explicit stop can signal and await
+/// the exact blocking worker instead of merely hoping shutdown catches it.
+pub struct WatcherTask {
+    id: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// A watcher started as part of a ServeUI session.
+///
+/// ServeUI shares the daemon's single canonical watcher slot with WatchCode
+/// and WatchVault. Recording the registration id here lets StopUI stop only
+/// the watcher it owns; it must never tear down an unrelated replacement.
+struct UiWatcherBinding {
+    id: u64,
+    repo_path: PathBuf,
+    instance_id: String,
+}
+
+/// Resources owned by one ServeUI session.
+pub struct UiServerRegistration {
+    port: u16,
+    handle: tokio::task::JoinHandle<()>,
+    watcher: Option<UiWatcherBinding>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct EmbeddingRuntimeStatus {
     state: String,
@@ -742,6 +1089,173 @@ struct EmbeddingRuntimeStatus {
     error: String,
     metal_compiled: bool,
     fallback_used: bool,
+}
+
+const EMBEDDING_IDENTITY_REMEDIATION: &str = "repair or restore the recorded embedding model/pipeline metadata, or intentionally rebuild all embeddings from a verified source; --force cannot bypass an unreadable identity";
+
+fn embedding_identity_unreadable_status(
+    mut status: EmbeddingRuntimeStatus,
+    error: impl std::fmt::Display,
+) -> EmbeddingRuntimeStatus {
+    status.state = "identity_unreadable".to_string();
+    status.selected_device.clear();
+    status.error = format!("{error}");
+    status
+}
+
+fn embedding_status_with_store_identity(
+    status: EmbeddingRuntimeStatus,
+    store: &GraphStore,
+) -> EmbeddingRuntimeStatus {
+    match store.embedding_identity_error() {
+        Some(error) => embedding_identity_unreadable_status(status, error),
+        None => status,
+    }
+}
+
+fn embedding_identity_fields(
+    store: &GraphStore,
+    status: &EmbeddingRuntimeStatus,
+) -> (&'static str, String, &'static str) {
+    match store
+        .embedding_identity_error()
+        .or_else(|| (status.state == "identity_unreadable").then(|| status.error.clone()))
+    {
+        Some(error) => ("unreadable", error, EMBEDDING_IDENTITY_REMEDIATION),
+        None => ("verified", String::new(), ""),
+    }
+}
+
+fn require_verified_embedding_identity(store: &GraphStore, operation: &str) -> Result<(), Status> {
+    store
+        .require_verified_embedding_identity()
+        .map_err(|error| embedding_identity_precondition_status(operation, &error))
+}
+
+fn embedding_identity_precondition_status(
+    operation: &str,
+    error: &dyn std::fmt::Display,
+) -> Status {
+    Status::failed_precondition(format!(
+        "{operation} refused because the persisted embedding identity is unreadable. \
+         Source error: {error}. Remediation: {EMBEDDING_IDENTITY_REMEDIATION}."
+    ))
+}
+
+fn require_verified_embedding_runtime_identity(
+    store: &GraphStore,
+    runtime_status: &EmbeddingRuntimeStatus,
+    operation: &str,
+) -> Result<(), Status> {
+    require_verified_embedding_identity(store, operation)?;
+    if runtime_status.state == "identity_unreadable" {
+        return Err(embedding_identity_precondition_status(
+            operation,
+            &runtime_status.error,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether this invocation actually requests a semantic/rerank operation.
+/// Pure lexical `brain_search` stays available and is annotated as degraded;
+/// callers that ask for reranking or a semantic hybrid leg fail closed.
+fn embedding_identity_operation(
+    tool_name: &str,
+    args: &serde_json::Value,
+    instance_cfg: Option<&nestweaver_engine::InstanceConfig>,
+) -> Option<&'static str> {
+    let rerank = args
+        .get("rerank")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if rerank {
+        return Some("rerank");
+    }
+    match tool_name {
+        "brain_context" => {
+            let defaults = instance_cfg
+                .map(|config| config.embedding.clone())
+                .unwrap_or_default();
+            let ppr = args
+                .get("weight_ppr")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(defaults.weight_ppr)
+                .max(0.0);
+            let bm25 = args
+                .get("weight_bm25")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(defaults.weight_bm25)
+                .max(0.0);
+            let semantic = args
+                .get("weight_semantic")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(defaults.weight_semantic)
+                .max(0.0);
+            let semantic = if ppr == 0.0 && bm25 == 0.0 && semantic == 0.0 {
+                defaults.weight_semantic.max(0.0)
+            } else {
+                semantic
+            };
+            (semantic > 0.0).then_some("semantic brain_context")
+        }
+        // Project context has no per-request semantic knob but does honor the
+        // instance default. Investigate currently constructs the engine's
+        // semantic-on HybridSearchConfig directly, so it always requests the
+        // leg when routed through a daemon model.
+        "project_context"
+            if instance_cfg
+                .map(|config| config.embedding.weight_semantic)
+                .unwrap_or_else(|| {
+                    nestweaver_engine::config::EmbeddingConfig::default().weight_semantic
+                })
+                > 0.0 =>
+        {
+            Some("semantic project_context")
+        }
+        "investigate" => Some("semantic investigate"),
+        "compact_embeddings"
+            if !args
+                .get("dry_run")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            Some("embedding compaction write")
+        }
+        _ => None,
+    }
+}
+
+fn annotate_lexical_identity_degradation(
+    tool_name: &str,
+    identity_error: Option<&str>,
+    value: &mut serde_json::Value,
+) {
+    if tool_name != "brain_search" || identity_error.is_none() {
+        return;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("semantic_applied".to_string(), serde_json::json!(false));
+        let degraded = object
+            .entry("degraded_components")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(components) = degraded.as_array_mut()
+            && !components
+                .iter()
+                .any(|component| component.as_str() == Some("semantic"))
+        {
+            components.push(serde_json::json!("semantic"));
+        }
+        object.insert(
+            "semantic_unavailable".to_string(),
+            serde_json::json!({
+                "cause": "embedding_identity",
+                "reason": "embedding_identity_unreadable",
+                "error": identity_error.unwrap_or_default(),
+                "remediation": EMBEDDING_IDENTITY_REMEDIATION,
+            }),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -944,7 +1458,10 @@ fn embedding_status_proto(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
     occupancy: nestweaver_store::EmbeddingIndexOccupancy,
+    store: &GraphStore,
 ) -> nestweaver_proto::EmbeddingStatus {
+    let (identity_state, identity_error, identity_remediation) =
+        embedding_identity_fields(store, status);
     nestweaver_proto::EmbeddingStatus {
         state: effective_embedding_state(status, progress),
         backend: status.backend.clone(),
@@ -962,6 +1479,9 @@ fn embedding_status_proto(
         index_live: occupancy.live as u64,
         index_tombstoned: occupancy.tombstoned as u64,
         index_stored: occupancy.stored as u64,
+        identity_state: identity_state.to_string(),
+        identity_error,
+        identity_remediation: identity_remediation.to_string(),
     }
 }
 
@@ -969,7 +1489,10 @@ fn embedding_status_json(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
     occupancy: nestweaver_store::EmbeddingIndexOccupancy,
+    store: &GraphStore,
 ) -> serde_json::Value {
+    let (identity_state, identity_error, identity_remediation) =
+        embedding_identity_fields(store, status);
     serde_json::json!({
         "state": effective_embedding_state(status, progress),
         "backend": status.backend,
@@ -987,6 +1510,9 @@ fn embedding_status_json(
         "index_live": occupancy.live,
         "index_tombstoned": occupancy.tombstoned,
         "index_stored": occupancy.stored,
+        "identity_state": identity_state,
+        "identity_error": identity_error,
+        "identity_remediation": identity_remediation,
     })
 }
 
@@ -1239,12 +1765,8 @@ pub struct DaemonState {
     /// Retained for exactly the reason stated above, which this task violated
     /// by being spawned detached: it performs the same kind of unabortable
     /// blocking store write on a `spawn_blocking` thread. The write gate
-    /// covers the common case, but `ConnectionGuard::write` reads
-    /// `shutdown_started` with `Relaxed` and then increments `active_writes`
-    /// — a pass that slips between those two steps is invisible to the drain,
-    /// so teardown could remove the socket, the pidfile and the INSTANCE LOCK
-    /// while the outgoing process was still rewriting the sidecar, letting a
-    /// successor daemon open the same database concurrently.
+    /// covers each mutation; the retained handle is the second line of
+    /// defence that lets teardown await the loop itself after admission closes.
     pub embedding_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for every watcher task this daemon has spawned.
     ///
@@ -1259,15 +1781,13 @@ pub struct DaemonState {
     /// A Vec rather than an Option because a FORCE-RETIRED watcher is still
     /// draining: `register_watcher(force)` stops the incumbent and immediately
     /// registers a replacement, so at shutdown there may be several tasks
-    /// winding down. Awaiting the collection covers them without any extra
-    /// bookkeeping.
-    pub watcher_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// Handle to the `serve_ui` web-server task plus the port it is bound
-    /// to, aborted by `stop_ui` so the listen port is released when the CLI
-    /// exits (LOW: ui port leak). The port is tracked so a repeated
-    /// `serve_ui` can report the ACTUAL running port instead of echoing the
-    /// requested one (which would send the CLI to a dead URL).
-    pub ui_server: std::sync::Mutex<Option<(u16, tokio::task::JoinHandle<()>)>>,
+    /// winding down. Each handle is paired with its registration id so an
+    /// explicit watcher/UI stop can await its exact worker too.
+    pub watcher_tasks: std::sync::Mutex<Vec<WatcherTask>>,
+    /// Handle to the `serve_ui` web-server task, its bound port, and its
+    /// optional canonical watcher registration. `stop_ui` aborts the server
+    /// and stops/drains only the watcher this UI session owns.
+    pub ui_server: std::sync::Mutex<Option<UiServerRegistration>>,
 }
 
 impl DaemonState {
@@ -1704,7 +2224,7 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
     // listener mid-drain. An operator who runs `daemon restart` and then
     // `daemon stop` now gets one drain that keeps serving reads, and the CLI
     // reports honestly instead of the second signal cutting the first one short.
-    if state.shutdown_started.swap(true, Ordering::Relaxed) {
+    if state.shutdown_started.swap(true, Ordering::SeqCst) {
         tracing::info!(
             trigger,
             "shutdown already in progress — not starting a second drain"
@@ -2143,6 +2663,47 @@ fn clear_watcher_registration(state: &DaemonState, id: u64) {
     }
 }
 
+/// Whether `id` is still the daemon's canonical active watcher.
+fn watcher_registration_is_active(state: &DaemonState, id: u64) -> bool {
+    state
+        .watcher_stop
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|registration| registration.id == id))
+        .unwrap_or(false)
+}
+
+/// Remove the retained worker for `id`, if it is still tracked.
+///
+/// The mutex is released before callers await the handle. The watcher worker
+/// clears its registration as it exits and therefore must never be awaited
+/// while either registry lock is held.
+fn take_watcher_task(state: &DaemonState, id: u64) -> Option<tokio::task::JoinHandle<()>> {
+    let mut tasks = state
+        .watcher_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = tasks.iter().position(|task| task.id == id)?;
+    Some(tasks.swap_remove(position).handle)
+}
+
+/// Signal `id` only if it still owns the canonical slot.
+fn stop_watcher_registration(state: &DaemonState, id: u64) -> bool {
+    let Ok(mut guard) = state.watcher_stop.lock() else {
+        return false;
+    };
+    let Some(registration) = guard.as_ref() else {
+        return false;
+    };
+    if registration.id != id {
+        return false;
+    }
+    let registration = guard.take().expect("registration checked above");
+    tracing::info!(watcher_id = id, "stopping registered watcher");
+    registration.handle.stop();
+    true
+}
+
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
 pub struct DaemonService {
     state: Arc<DaemonState>,
@@ -2162,6 +2723,101 @@ impl DaemonService {
         Self { state }
     }
 
+    /// Run a unary mutation with ownership held by the exact blocking worker.
+    ///
+    /// Dropping a Tokio `JoinHandle` does not cancel `spawn_blocking`. Keeping
+    /// either guard in the RPC future therefore creates a dangerous split: a
+    /// disconnected client drops the guards while the worker continues to
+    /// mutate, allowing a conflicting writer or shutdown to overlap it. Both
+    /// guards are moved into the closure here, so `active_writes`, holder
+    /// reporting, writer exclusion, and shutdown draining all describe the
+    /// real lifetime of the work.
+    #[allow(clippy::result_large_err)]
+    async fn run_unary_mutation<T, F>(&self, label: &'static str, task: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, Status> + Send + 'static,
+    {
+        // Admission precedes queueing, preserving the immediate UNAVAILABLE
+        // shutdown refusal instead of waiting behind a write that is draining.
+        let guard = ConnectionGuard::write(&self.state)?;
+        let write_gate = self.state.write_gate.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: write_gate.blocking_lock(label),
+                _connection_guard: guard,
+            };
+            task()
+        })
+        .await
+        .map_err(|error| Status::internal(format!("{label} task panicked: {error}")))?
+    }
+
+    /// Construct, register, retain, and run a CodeWatcher through the daemon's
+    /// one canonical lifecycle. Used by both WatchCode and ServeUI.
+    fn start_registered_code_watcher(
+        &self,
+        repo_path: PathBuf,
+        instance_id: String,
+        force: bool,
+        owner_pid: Option<i32>,
+    ) -> Result<u64, Status> {
+        let limits = self
+            .state
+            .instance_cfg
+            .as_ref()
+            .map(|config| config.indexing.limits())
+            .unwrap_or_default();
+        let mut watcher =
+            nestweaver_engine::CodeWatcher::new(&self.state.db_path, &repo_path, &instance_id)
+                .with_limits(limits);
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Refuse shutdown before mutating the registry. This admission guard
+        // covers registration only; each actual watcher batch obtains its own
+        // exact-worker lease from the factory below.
+        let admission_guard = ConnectionGuard::write(&self.state)?;
+        let watcher_id = register_watcher(&self.state, shutdown_handle, force, owner_pid)?;
+
+        watcher =
+            watcher.with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()));
+        let state = self.state.clone();
+        let store = self.state.store.clone();
+        let on_change = Self::make_embed_on_change(
+            self.state.embedding_runtime.clone(),
+            self.state.store.clone(),
+        );
+        let watcher_task = tokio::task::spawn_blocking(move || {
+            tracing::info!(repo = %repo_path.display(), watcher_id, "code watcher thread started");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher.run_with_store(store, on_change)
+            }));
+            match result {
+                Ok(Ok(())) => tracing::info!(watcher_id, "code watcher exited cleanly"),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, watcher_id, "code watcher exited with error")
+                }
+                Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
+            }
+            clear_watcher_registration(&state, watcher_id);
+        });
+
+        let mut tasks = self
+            .state
+            .watcher_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.retain(|task| !task.handle.is_finished());
+        tasks.push(WatcherTask {
+            id: watcher_id,
+            handle: watcher_task,
+        });
+        // Admission includes handle publication. Shutdown cannot observe this
+        // registration as finished until teardown owns the spawned task.
+        drop(admission_guard);
+        Ok(watcher_id)
+    }
+
     /// Generic JSON pass-through dispatch. Maps every read RPC to the
     /// corresponding MCP tool via `nestweaver_mcp::tools::dispatch`.
     /// Runs the blocking dispatch on a dedicated thread to avoid
@@ -2174,6 +2830,31 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
         visible: nestweaver_engine::authz::VisibleRepos,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.dispatch_json_tool_with_ownership(tool_name, args_json, visible, None)
+            .await
+    }
+
+    /// Mutating JSON dispatch whose admission guard is transferred to the
+    /// exact blocking dispatch worker.
+    async fn dispatch_json_mutation(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+        visible: nestweaver_engine::authz::VisibleRepos,
+        label: &'static str,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let guard = ConnectionGuard::write(&self.state)?;
+        self.dispatch_json_tool_with_ownership(tool_name, args_json, visible, Some((guard, label)))
+            .await
+    }
+
+    async fn dispatch_json_tool_with_ownership(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+        visible: nestweaver_engine::authz::VisibleRepos,
+        mutation: Option<(ConnectionGuard, &'static str)>,
     ) -> Result<Response<JsonResponse>, Status> {
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
@@ -2188,7 +2869,8 @@ impl DaemonService {
         // `with_safeguard_cancellable` on timeout and observed by the
         // `spawn_blocking` dispatch (e.g. brain_context's vector fan-out).
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler = self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone(), visible);
+        let handler =
+            self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone(), visible, mutation);
 
         let response = if self.state.server_mode {
             with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
@@ -2220,9 +2902,15 @@ impl DaemonService {
         args_json: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         visible: nestweaver_engine::authz::VisibleRepos,
+        mutation: Option<(ConnectionGuard, &'static str)>,
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
-        let _guard = ConnectionGuard::read(&self.state);
+        // Read dispatches retain their historical request-scoped accounting.
+        // Mutations transfer their write accounting into the blocking worker
+        // below, where cancellation cannot release it prematurely.
+        let _read_guard = mutation
+            .is_none()
+            .then(|| ConnectionGuard::read(&self.state));
         // Trip the cancel flag if this request future is dropped (client cancel
         // / disconnect), the same flag the timeout path sets.
         let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
@@ -2239,6 +2927,11 @@ impl DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            let has_authoritative_writer = mutation.is_some();
+            let _mutation_scope = mutation.map(|(guard, label)| MutationWorkerOwnership {
+                _write_lease: state.write_gate.blocking_lock(label),
+                _connection_guard: guard,
+            });
             let t_parse = std::time::Instant::now();
             let args: serde_json::Value = serde_json::from_str(&args_json)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
@@ -2306,6 +2999,20 @@ impl DaemonService {
             };
 
             let embed_ref = embed_arc.as_deref();
+            if let Some(operation) =
+                embedding_identity_operation(&tool_name, &args, state.instance_cfg.as_deref())
+            {
+                require_verified_embedding_runtime_identity(
+                    &state.store,
+                    &state.embedding_runtime.status(),
+                    operation,
+                )?;
+            }
+            let runtime_status = state.embedding_runtime.status();
+            let identity_error = state.store.embedding_identity_error().or_else(|| {
+                (runtime_status.state == "identity_unreadable")
+                    .then(|| runtime_status.error.clone())
+            });
             tracing::debug!(
                 has_model = embed_ref.is_some(),
                 "dispatch_json_tool embed_model status"
@@ -2313,21 +3020,36 @@ impl DaemonService {
 
             let t_dispatch = std::time::Instant::now();
             let dispatch_tantivy = state.tantivy();
-            let mut value = nestweaver_mcp::tools::dispatch_cancellable(
-                &state.store,
-                dispatch_tantivy.as_deref(),
-                &tool_name,
-                args,
-                embed_ref,
-                Some(&cancel),
-                // R9/R9b: scope blast_radius output to the caller's visible
-                // repos. `visible` was resolved from the request's Identity
-                // extension before the request was consumed. With no `[authz]`
-                // config this is `VisibleRepos::All`, so redaction is a no-op
-                // (zero behavior change); every non-blast_radius tool ignores it.
-                Some(&visible),
-            )
+            let dispatch = || {
+                nestweaver_mcp::tools::dispatch_cancellable(
+                    &state.store,
+                    dispatch_tantivy.as_deref(),
+                    &tool_name,
+                    args,
+                    embed_ref,
+                    Some(&cancel),
+                    // Repository visibility was resolved from the request's
+                    // identity before it was consumed. The tool registry now
+                    // requires every producer to enforce, fail closed, or be
+                    // explicitly global.
+                    Some(&visible),
+                )
+            };
+            // The memory-consolidation apply guard is thread-local. Install it
+            // only inside the exact blocking worker that owns both daemon write
+            // admission and the write gate; wrapping the future outside this
+            // closure would bless the wrong thread and release too early.
+            let mut value = if has_authoritative_writer {
+                nestweaver_mcp::tools::with_authoritative_writer_ownership(dispatch)
+            } else {
+                dispatch()
+            }
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
+            annotate_lexical_identity_degradation(
+                &tool_name,
+                identity_error.as_deref(),
+                &mut value,
+            );
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -2448,26 +3170,41 @@ impl DaemonService {
             nestweaver_mcp::tools::set_server_mode(state.server_mode);
 
             let embed_ref = embed_arc.as_deref();
+            if let Some(operation) =
+                embedding_identity_operation(&tool_name, &args, state.instance_cfg.as_deref())
+            {
+                require_verified_embedding_runtime_identity(
+                    &state.store,
+                    &state.embedding_runtime.status(),
+                    operation,
+                )?;
+            }
+            let runtime_status = state.embedding_runtime.status();
+            let identity_error = state.store.embedding_identity_error().or_else(|| {
+                (runtime_status.state == "identity_unreadable")
+                    .then(|| runtime_status.error.clone())
+            });
 
             let t_dispatch = std::time::Instant::now();
             let dispatch_tantivy = state.tantivy();
-            let value = nestweaver_mcp::tools::dispatch_cancellable(
+            let mut value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
                 dispatch_tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
                 Some(&cancel),
-                // R9/R9b: scope tool output to the caller's visible repos
-                // (`visible`, resolved from the request Identity by the typed
-                // handler). With no `[authz]` config this is
-                // `VisibleRepos::All` ⇒ redaction is a no-op. Enforcement
-                // applies to blast_radius and to the repo-scoped search tools
-                // (brain_search, brain_impact, affected_tests); other tools
-                // ignore it.
+                // Scope or fail closed according to the canonical tool
+                // visibility registry. With no `[authz]` config this is
+                // `VisibleRepos::All` and preserves single-domain behavior.
                 Some(&visible),
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
+            annotate_lexical_identity_degradation(
+                &tool_name,
+                identity_error.as_deref(),
+                &mut value,
+            );
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -2565,6 +3302,19 @@ impl DaemonService {
                     return;
                 }
                 st.last_pass = Some(std::time::Instant::now());
+            }
+            if let Err(error) = require_verified_embedding_runtime_identity(
+                &store,
+                &embedding_runtime.status(),
+                "watcher embedding write",
+            ) {
+                tracing::warn!(
+                    error = %error,
+                    remediation = EMBEDDING_IDENTITY_REMEDIATION,
+                    "watcher embedding pass refused because persisted embedding identity is unreadable"
+                );
+                state.lock().unwrap().disabled = true;
+                return;
             }
             let model = embedding_runtime.current_model();
             let Some(model) = model else { return };
@@ -2785,9 +3535,10 @@ macro_rules! json_rpc {
         // R9/R9b: resolve the caller's per-repo visibility from the request's
         // Identity extension BEFORE consuming the request. This covers the
         // generic `/mcp` tool path and every typed RPC routed through this
-        // macro (including `blast_radius`), so their output is redacted to the
-        // caller's visible repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒
-        // no-op redaction (backward compatible).
+        // macro, so authorization-aware tools receive the caller's induced
+        // repository scope and unsupported repo-owned analyses fail closed at
+        // the common tool boundary. No `[authz]` config ⇒ `VisibleRepos::All`
+        // (backward compatible).
         let visible = $self.state.visible_repos_for($request.extensions())?;
         let req = $request.into_inner();
         $self
@@ -3012,7 +3763,7 @@ fn finalize_node_graph_deletion(
     failures
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct IndexedSearchDocument {
     uid: String,
     kind: &'static str,
@@ -3162,9 +3913,21 @@ fn indexed_search_rows_before(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedSearchMutationScope {
+    /// The operation mutates only graph rows. Equal projections therefore
+    /// prove that the indexed corpus did not change.
+    GraphOnly,
+    /// The operation may have changed vault files before the graph preflight.
+    /// Equal graph projections cannot prove that Tantivy already has the new
+    /// on-disk body.
+    MayIncludeVaultFiles,
+}
+
 fn indexed_search_mutation(
     before: Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>>,
     store: &GraphStore,
+    scope: IndexedSearchMutationScope,
 ) -> IndexedSearchMutation {
     match before {
         None => IndexedSearchMutation::Unchanged,
@@ -3176,7 +3939,16 @@ fn indexed_search_mutation(
             IndexedSearchMutation::Unknown
         }
         Some(Ok(before)) => match indexed_search_rows(store) {
-            Ok(after) if before == after => IndexedSearchMutation::Unchanged,
+            // The preflight graph can already observe a newly-written vault
+            // file, so equality is not proof that the existing Tantivy index
+            // contains that body (notably legacy empty-section rows). Preserve
+            // that conservative verdict for vault indexing while allowing
+            // graph-only cleanup operations to prove that the corpus stayed
+            // unchanged.
+            Ok(after) if before == after => match scope {
+                IndexedSearchMutationScope::GraphOnly => IndexedSearchMutation::Unchanged,
+                IndexedSearchMutationScope::MayIncludeVaultFiles => IndexedSearchMutation::Unknown,
+            },
             Ok(_) => IndexedSearchMutation::Changed,
             Err(error) => {
                 tracing::warn!(
@@ -3209,6 +3981,174 @@ fn reconcile_search_index(
             anyhow::bail!("configured Tantivy index unavailable: {reason}")
         }
     }
+}
+
+/// Finish a graph mutation's durable search contract through the canonical
+/// full-corpus reconciler. The debt is cleared only after the rebuild (or a
+/// proven no-op / intentional Disabled state) succeeds. Recording a failure is
+/// itself part of the error path: if refreshing the marker fails, the caller
+/// sees both failures and must not report Done.
+fn finish_search_reconciliation(
+    state: &DaemonState,
+    mutation: IndexedSearchMutation,
+    operation: &str,
+    admission: SearchDebtAdmission,
+) -> Result<(), anyhow::Error> {
+    let reconciliation = state.search_reconciliation();
+    // A prior failed mutation owns the earliest divergence point. A later
+    // no-op may not clear that debt; it must retry a full reconciliation.
+    let mutation = if admission.had_existing_debt {
+        IndexedSearchMutation::Unknown
+    } else {
+        mutation
+    };
+    match reconcile_search_index(&reconciliation, &state.store, mutation, operation) {
+        Ok(()) => clear_search_reconciliation_debt(&state.db_path),
+        Err(error) => {
+            if let Err(marker_error) =
+                record_search_reconciliation_failure(state, operation, &error)
+            {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; additionally failed to preserve durable search-reconciliation debt: {marker_error:#}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Retry a previously established debt. Durable debt means the precise graph
+/// delta is unknown, so recovery always chooses the safe full rebuild.
+fn reconcile_pending_search_debt(
+    state: &DaemonState,
+    reconciliation: SearchIndexReconciliation,
+    operation: &str,
+) -> Result<(), anyhow::Error> {
+    let Some(_) = load_search_reconciliation_debt(&state.db_path)? else {
+        return Ok(());
+    };
+    match reconcile_search_index(
+        &reconciliation,
+        &state.store,
+        IndexedSearchMutation::Unknown,
+        operation,
+    ) {
+        Ok(()) => clear_search_reconciliation_debt(&state.db_path),
+        Err(error) => {
+            if let Err(marker_error) =
+                record_search_reconciliation_failure(state, operation, &error)
+            {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; additionally failed to update durable search-reconciliation debt: {marker_error:#}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SearchCapabilityStatus {
+    reader_available: bool,
+    writer_available: bool,
+    current: bool,
+    reconciliation_debt: bool,
+    error: String,
+    debt_operation: String,
+    debt_created_at: i64,
+}
+
+fn search_capability_status(state: &DaemonState) -> SearchCapabilityStatus {
+    let snapshot = state.search.snapshot();
+    let reader_available = snapshot.tantivy.is_some();
+    let (writer_available, writer_error) = match &snapshot.reconciliation {
+        SearchIndexReconciliation::Available(_) => (true, String::new()),
+        SearchIndexReconciliation::Disabled => (false, String::new()),
+        SearchIndexReconciliation::Unavailable(error) => (false, error.clone()),
+    };
+    match load_search_reconciliation_debt(&state.db_path) {
+        Ok(Some(debt)) => SearchCapabilityStatus {
+            reader_available,
+            writer_available,
+            current: false,
+            reconciliation_debt: true,
+            error: if debt.last_error.is_empty() {
+                writer_error
+            } else if writer_error.is_empty() {
+                debt.last_error
+            } else {
+                format!("{writer_error}; {}", debt.last_error)
+            },
+            debt_operation: debt.operation,
+            debt_created_at: debt.created_at_unix,
+        },
+        Ok(None) => SearchCapabilityStatus {
+            reader_available,
+            writer_available,
+            current: true,
+            reconciliation_debt: false,
+            error: writer_error,
+            debt_operation: String::new(),
+            debt_created_at: 0,
+        },
+        Err(error) => SearchCapabilityStatus {
+            reader_available,
+            writer_available,
+            current: false,
+            reconciliation_debt: true,
+            error: format!(
+                "durable search-reconciliation debt is unreadable and cannot be cleared safely: {error:#}"
+            ),
+            debt_operation: String::new(),
+            debt_created_at: 0,
+        },
+    }
+}
+
+fn search_status_proto(status: &SearchCapabilityStatus) -> nestweaver_proto::SearchStatus {
+    nestweaver_proto::SearchStatus {
+        reader_available: status.reader_available,
+        writer_available: status.writer_available,
+        current: status.current,
+        reconciliation_debt: status.reconciliation_debt,
+        error: status.error.clone(),
+        debt_operation: status.debt_operation.clone(),
+        debt_created_at: status.debt_created_at,
+    }
+}
+
+fn search_status_json(status: &SearchCapabilityStatus) -> serde_json::Value {
+    serde_json::json!({
+        "reader_available": status.reader_available,
+        "writer_available": status.writer_available,
+        "current": status.current,
+        "reconciliation_debt": status.reconciliation_debt,
+        "error": status.error,
+        "debt_operation": status.debt_operation,
+        "debt_created_at": status.debt_created_at,
+    })
+}
+
+async fn retry_search_reconciliation_debt_at_startup(
+    state: &Arc<DaemonState>,
+) -> Result<(), anyhow::Error> {
+    if state.read_only || load_search_reconciliation_debt(&state.db_path)?.is_none() {
+        return Ok(());
+    }
+    let reconciliation = state.search.current_snapshot().reconciliation;
+    let guard =
+        ConnectionGuard::write(state).map_err(|status| anyhow::anyhow!(status.to_string()))?;
+    let lease = state.write_gate.lock("search_debt_startup").await;
+    let recovery_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let _ownership = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        reconcile_pending_search_debt(&recovery_state, reconciliation, "daemon_startup")
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("startup search-debt worker panicked: {error}"))?
 }
 
 fn open_search_index(
@@ -3593,7 +4533,11 @@ where
     };
     reconcile_deleted_extension_uids(state, &removed_vault_uids, &mut failures);
     let search_mutation = if changed {
-        indexed_search_mutation(search_rows_before, &state.store)
+        indexed_search_mutation(
+            search_rows_before,
+            &state.store,
+            IndexedSearchMutationScope::GraphOnly,
+        )
     } else {
         IndexedSearchMutation::Unchanged
     };
@@ -3682,7 +4626,11 @@ where
             reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
             reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
             let search_mutation = if changed {
-                indexed_search_mutation(search_rows_before, &state.store)
+                indexed_search_mutation(
+                    search_rows_before,
+                    &state.store,
+                    IndexedSearchMutationScope::GraphOnly,
+                )
             } else {
                 IndexedSearchMutation::Unchanged
             };
@@ -3706,7 +4654,11 @@ where
             };
             reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
             reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
-            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            let search_mutation = indexed_search_mutation(
+                search_rows_before,
+                &state.store,
+                IndexedSearchMutationScope::GraphOnly,
+            );
             if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
@@ -4075,7 +5027,11 @@ where
                 Vec::new()
             });
             let search_mutation = if changed {
-                indexed_search_mutation(search_rows_before, &state.store)
+                indexed_search_mutation(
+                    search_rows_before,
+                    &state.store,
+                    IndexedSearchMutationScope::GraphOnly,
+                )
             } else {
                 IndexedSearchMutation::Unchanged
             };
@@ -4097,7 +5053,11 @@ where
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
-            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            let search_mutation = indexed_search_mutation(
+                search_rows_before,
+                &state.store,
+                IndexedSearchMutationScope::GraphOnly,
+            );
             if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
@@ -4131,7 +5091,11 @@ fn run_remove_vault_with_projection(
     if !confirmed_noop {
         failures = finalize_node_graph_deletion(state, "remove_vault");
         reconcile_deleted_extension_uids(state, &[vault_uid.to_string()], &mut failures);
-        let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+        let search_mutation = indexed_search_mutation(
+            search_rows_before,
+            &state.store,
+            IndexedSearchMutationScope::GraphOnly,
+        );
         if search_mutation != IndexedSearchMutation::Unchanged {
             append_search_reconciliation(
                 &mut failures,
@@ -4229,6 +5193,57 @@ fn plan_embeddings(store: &GraphStore, scope: &str, force: bool) -> Result<Embed
     })
 }
 
+fn degraded_graph_publication_message(
+    operation: &str,
+    publication: &nestweaver_engine::manifest::GraphMutationPublicationOutcome,
+) -> Option<String> {
+    use nestweaver_engine::manifest::GraphMutationPublicationDisposition;
+
+    if publication.disposition != GraphMutationPublicationDisposition::CommittedDegraded {
+        return None;
+    }
+    let warnings = if publication.warnings.is_empty() {
+        "unspecified publication stage".to_string()
+    } else {
+        publication
+            .warnings
+            .iter()
+            .map(|warning| format!("{}: {}", warning.stage, warning.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    Some(format!(
+        "{operation} committed graph changes (generation {} -> {}), but publication reconciliation is degraded: {warnings}. The graph was NOT rolled back; repair the named stage(s) before treating derived artifacts as current.",
+        publication.generation_before, publication.generation_after,
+    ))
+}
+
+fn materialize_projects_terminal_progress(
+    result: &nestweaver_engine::ProjectMaterializationResult,
+) -> IndexProgress {
+    let degraded = degraded_graph_publication_message("MaterializeProjects", &result.publication);
+    let message = if let Some(message) = &degraded {
+        message.clone()
+    } else {
+        format!(
+            "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
+            result.projects_created, result.note_edges, result.symbol_edges, result.component_edges,
+        )
+    };
+    IndexProgress {
+        phase: if degraded.is_some() {
+            Phase::Error as i32
+        } else {
+            Phase::Done as i32
+        },
+        message,
+        files_processed: result.projects_created as u64,
+        files_total: result.projects_created as u64,
+        symbols_found: result.symbol_edges as u64,
+        ..Default::default()
+    }
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -4249,6 +5264,7 @@ impl NestWeaverDaemon for DaemonService {
             // The daemon's own PID, so the CLI can cross-check a pidfile
             // PID against the socket-reported PID before signaling it.
             pid: std::process::id(),
+            embedding_identity_repair: true,
         }))
     }
 
@@ -4305,27 +5321,17 @@ impl NestWeaverDaemon for DaemonService {
             },
         };
 
-        // Stage the backup while HOLDING the write lock. Quiesce == lock-held:
-        // no writer touches the files mid-copy, and the RAII guard releases the
-        // lock on drop/panic — there is no persistent quiesce flag to leak.
-        let staged = {
-            // Guard BEFORE the write gate: during a drain the gate is held by the
-            // in-flight write for as long as it runs, so taking it first meant this
-            // request queued for minutes and only then learned it was refused. A
-            // client with a deadline saw DEADLINE_EXCEEDED instead of the
-            // explanatory UNAVAILABLE, which defeats the point of the message.
-            let _guard = ConnectionGuard::write(&self.state)?;
-            let _write_lock = self.state.write_gate.lock("backup").await;
-            let store = self.state.store.clone();
-            let cfg = config.clone();
-            tracing::info!("backup: staging under write lock");
-            tokio::task::spawn_blocking(move || {
+        // Stage under exact-worker ownership. Packaging below is detached from
+        // the live database and deliberately does not retain the write lease.
+        let store = self.state.store.clone();
+        let cfg = config.clone();
+        let staged = self
+            .run_unary_mutation("backup", move || {
+                tracing::info!("backup: staging under write lock");
                 nestweaver_engine::stage_backup_from_store(&store, &cfg)
+                    .map_err(|error| Status::internal(format!("backup staging failed: {error}")))
             })
-            .await
-            .map_err(|e| Status::internal(format!("backup staging panicked: {e}")))?
-            .map_err(|e| Status::internal(format!("backup staging failed: {e}")))?
-        }; // write lock released here — writers resume while we package below
+            .await?;
 
         let cfg = config.clone();
         let result =
@@ -4445,9 +5451,6 @@ impl NestWeaverDaemon for DaemonService {
             }
             Err(e) => return Err(e),
         };
-        // Registration is admitted as one short mutation. The endless service
-        // must not remain an active write while it is merely waiting for files.
-        drop(admission_guard);
         let state = self.state.clone();
         let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
         watcher = watcher.with_mutation_lease_factory(mutation_factory);
@@ -4475,13 +5478,23 @@ impl NestWeaverDaemon for DaemonService {
         // Retained so shutdown can AWAIT it before releasing the socket,
         // pidfile and instance lock — a watcher write that outlives teardown
         // is the hazard the reconcile loops already guard against.
-        if let Ok(mut tasks) = self.state.watcher_tasks.lock() {
-            // Drop handles for tasks that already finished, so a long-lived
-            // daemon that starts and stops many watchers does not accumulate
-            // them.
-            tasks.retain(|task| !task.is_finished());
-            tasks.push(watcher_task);
-        }
+        let mut tasks = self
+            .state
+            .watcher_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Drop handles for tasks that already finished, so a long-lived
+        // daemon that starts and stops many watchers does not accumulate
+        // them.
+        tasks.retain(|task| !task.handle.is_finished());
+        tasks.push(WatcherTask {
+            id: watcher_id,
+            handle: watcher_task,
+        });
+        // Registration, spawn, and handle retention are one admitted unit.
+        // Only now may the drain observe it as complete; later watcher batches
+        // take their own exact-worker leases.
+        drop(admission_guard);
 
         Ok(Response::new(WatchVaultResponse {
             ok: true,
@@ -4529,34 +5542,11 @@ impl NestWeaverDaemon for DaemonService {
             false,
         )?;
 
-        let db_path = self.state.db_path.clone();
-
-        let limits = self
-            .state
-            .instance_cfg
-            .as_ref()
-            .map(|config| config.indexing.limits())
-            .unwrap_or_default();
-        let mut watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id)
-            .with_limits(limits);
-        let shutdown_handle = watcher.shutdown_handle();
-
-        // Refuse BEFORE registering — and here the ordering matters more than in
-        // `watch_vault`, because `force` is passed through. With the guard
-        // second, `nestweaver watch --force` during a drain would STOP THE
-        // RUNNING INCUMBENT WATCHER and then refuse the request that replaced
-        // it, leaving no watcher at all plus a registration pointing at a
-        // dropped `CodeWatcher`. Destroying live state on behalf of a rejected
-        // request is not something a refusal is allowed to do.
-        let admission_guard = ConnectionGuard::write(&self.state)?;
-
-        // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // With `force`, an already-running watcher whose owner is ALIVE is
-        // stopped and replaced. nw-302: one orphaned by a kill -9'd `watch`
-        // CLI no longer needs `force` — its owner pid is recorded, so the
-        // reclaim is automatic.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
-            Ok(id) => id,
+        // ServeUI and WatchCode use this same constructor, so registration,
+        // per-batch ownership, task retention, and shutdown behavior cannot
+        // drift between the two entry points.
+        match self.start_registered_code_watcher(repo_path, instance_id, force, owner_pid) {
+            Ok(_) => {}
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
                     ok: false,
@@ -4566,41 +5556,6 @@ impl NestWeaverDaemon for DaemonService {
                 }));
             }
             Err(e) => return Err(e),
-        };
-        drop(admission_guard);
-        let state = self.state.clone();
-        let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
-        watcher = watcher.with_mutation_lease_factory(mutation_factory);
-        let store = self.state.store.clone();
-        let on_change = Self::make_embed_on_change(
-            self.state.embedding_runtime.clone(),
-            self.state.store.clone(),
-        );
-
-        let watcher_task = tokio::task::spawn_blocking(move || {
-            tracing::info!(repo = %repo_path.display(), "code watcher thread started");
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, on_change)
-            }));
-
-            match result {
-                Ok(Ok(())) => tracing::info!("code watcher exited cleanly"),
-                Ok(Err(e)) => tracing::error!(error = %e, "code watcher exited with error"),
-                Err(_) => tracing::error!("code watcher thread panicked"),
-            }
-
-            clear_watcher_registration(&state, watcher_id);
-        });
-        // Retained so shutdown can AWAIT it before releasing the socket,
-        // pidfile and instance lock — a watcher write that outlives teardown
-        // is the hazard the reconcile loops already guard against.
-        if let Ok(mut tasks) = self.state.watcher_tasks.lock() {
-            // Drop handles for tasks that already finished, so a long-lived
-            // daemon that starts and stops many watchers does not accumulate
-            // them.
-            tasks.retain(|task| !task.is_finished());
-            tasks.push(watcher_task);
         }
 
         Ok(Response::new(WatchCodeResponse {
@@ -4618,15 +5573,19 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let mut guard = self
+        let watcher_id = self
             .state
             .watcher_stop
             .lock()
-            .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?
+            .as_ref()
+            .map(|registration| registration.id);
 
-        if let Some(reg) = guard.take() {
-            tracing::info!(watcher_id = reg.id, "stop_watch: stopping active watcher");
-            reg.handle.stop();
+        if let Some(watcher_id) = watcher_id {
+            stop_watcher_registration(&self.state, watcher_id);
+            if let Some(task) = take_watcher_task(&self.state, watcher_id) {
+                let _ = task.await;
+            }
             Ok(Response::new(StopWatchResponse { ok: true }))
         } else {
             Ok(Response::new(StopWatchResponse { ok: false }))
@@ -4786,7 +5745,29 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let state = self.state.clone();
-        let watch_instance = resolve_effective_instance_id(&req.watch_instance_id, &state)?;
+        let requested_watch = if req.watch && !req.watch_repo_path.is_empty() {
+            let repo_path =
+                PathBuf::from(&req.watch_repo_path)
+                    .canonicalize()
+                    .map_err(|error| {
+                        Status::invalid_argument(format!(
+                            "cannot canonicalize watched repo path: {error}"
+                        ))
+                    })?;
+            watch_path_allowed(
+                state
+                    .instance_cfg
+                    .as_ref()
+                    .map(|config| config.repos.as_slice()),
+                &repo_path,
+                "repo",
+                false,
+            )?;
+            let instance_id = resolve_effective_instance_id(&req.watch_instance_id, &state)?;
+            Some((repo_path, instance_id))
+        } else {
+            None
+        };
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
@@ -4820,48 +5801,79 @@ impl NestWeaverDaemon for DaemonService {
         // is a no-op success, but a FOREIGN process bound to the port must be a
         // clear error — the old code spawned a task whose bind failure was only
         // logged, and reported ok:true regardless.
-        {
-            let guard = self
+        let stale_watcher = {
+            let mut guard = self
                 .state
                 .ui_server
                 .lock()
                 .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
-            if let Some((running_port, handle)) = guard.as_ref()
-                && !handle.is_finished()
+            if let Some(running) = guard.as_mut()
+                && !running.handle.is_finished()
             {
-                // A watch request must not be silently dropped just because
-                // the UI is already served — start the watcher here too.
-                if req.watch && !req.watch_repo_path.is_empty() {
-                    let watch_db = state.db_path.clone();
-                    let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
-                    let watch_store = state.store.clone();
-                    let watch_instance = watch_instance.clone();
-                    let watch_limits = state
-                        .instance_cfg
-                        .as_ref()
-                        .map(|config| config.indexing.limits())
-                        .unwrap_or_default();
-
-                    tokio::task::spawn_blocking(move || {
-                        let watcher = nestweaver_engine::CodeWatcher::new(
-                            &watch_db,
-                            &watch_repo,
-                            &watch_instance,
-                        )
-                        .with_limits(watch_limits);
-                        if let Err(e) = watcher.run_with_store(watch_store, None) {
-                            tracing::error!("CodeWatcher failed: {e}");
+                if let Some((watch_repo, watch_instance)) = requested_watch.as_ref() {
+                    if let Some(binding) = running.watcher.as_ref()
+                        && watcher_registration_is_active(&state, binding.id)
+                    {
+                        if binding.repo_path == *watch_repo
+                            && binding.instance_id == *watch_instance
+                        {
+                            return Ok(Response::new(ServeUiResponse {
+                                ok: true,
+                                message: format!(
+                                    "UI server already running on port {}; watcher already running for {}",
+                                    running.port,
+                                    watch_repo.display()
+                                ),
+                                port: u32::from(running.port),
+                                error: String::new(),
+                            }));
                         }
+                        return Ok(Response::new(ServeUiResponse {
+                            ok: false,
+                            message: format!(
+                                "UI server is already watching {} for instance {}; stop it before watching {} for instance {}",
+                                binding.repo_path.display(),
+                                binding.instance_id,
+                                watch_repo.display(),
+                                watch_instance
+                            ),
+                            port: u32::from(running.port),
+                            error: "watcher_conflict".to_string(),
+                        }));
+                    }
+
+                    let watcher_id = match self.start_registered_code_watcher(
+                        watch_repo.clone(),
+                        watch_instance.clone(),
+                        false,
+                        None,
+                    ) {
+                        Ok(id) => id,
+                        Err(error) if error.code() == tonic::Code::AlreadyExists => {
+                            return Ok(Response::new(ServeUiResponse {
+                                ok: false,
+                                message: "another daemon watcher is already running; stop it before enabling the UI watcher".to_string(),
+                                port: u32::from(running.port),
+                                error: "watcher_conflict".to_string(),
+                            }));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    running.watcher = Some(UiWatcherBinding {
+                        id: watcher_id,
+                        repo_path: watch_repo.clone(),
+                        instance_id: watch_instance.clone(),
                     });
                     // Report the ACTUAL running port, not the requested one —
                     // the CLI prints this port in the URL it shows the user.
                     return Ok(Response::new(ServeUiResponse {
                         ok: true,
                         message: format!(
-                            "UI server already running on port {running_port}; watcher started for {}",
-                            req.watch_repo_path
+                            "UI server already running on port {}; watcher started for {}",
+                            running.port,
+                            watch_repo.display()
                         ),
-                        port: u32::from(*running_port),
+                        port: u32::from(running.port),
                         error: String::new(),
                     }));
                 }
@@ -4869,10 +5881,17 @@ impl NestWeaverDaemon for DaemonService {
                 // the CLI prints this port in the URL it shows the user.
                 return Ok(Response::new(ServeUiResponse {
                     ok: true,
-                    message: format!("UI server already running on port {running_port}"),
-                    port: u32::from(*running_port),
+                    message: format!("UI server already running on port {}", running.port),
+                    port: u32::from(running.port),
                     error: String::new(),
                 }));
+            }
+            guard.take().and_then(|registration| registration.watcher)
+        };
+        if let Some(watcher) = stale_watcher {
+            stop_watcher_registration(&self.state, watcher.id);
+            if let Some(task) = take_watcher_task(&self.state, watcher.id) {
+                let _ = task.await;
             }
         }
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
@@ -4897,6 +5916,37 @@ impl NestWeaverDaemon for DaemonService {
             tracing::info!("admin API also mounted on web UI server");
         }
 
+        // Register the optional watcher before publishing the UI registration.
+        // It uses the same canonical slot and retained task path as WatchCode;
+        // a competing watcher refuses the request instead of spawning an
+        // unobservable duplicate.
+        let watcher = if let Some((watch_repo, watch_instance)) = requested_watch.as_ref() {
+            let watcher_id = match self.start_registered_code_watcher(
+                watch_repo.clone(),
+                watch_instance.clone(),
+                false,
+                None,
+            ) {
+                Ok(id) => id,
+                Err(error) if error.code() == tonic::Code::AlreadyExists => {
+                    return Ok(Response::new(ServeUiResponse {
+                        ok: false,
+                        message: "another daemon watcher is already running; stop it before enabling the UI watcher".to_string(),
+                        port: 0,
+                        error: "watcher_conflict".to_string(),
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+            Some(UiWatcherBinding {
+                id: watcher_id,
+                repo_path: watch_repo.clone(),
+                instance_id: watch_instance.clone(),
+            })
+        } else {
+            None
+        };
+
         // Spawn web server as a background task inside the daemon. The handle
         // is tracked so `stop_ui` can abort it and release the listen port
         // (LOW: ui port leak).
@@ -4917,27 +5967,10 @@ impl NestWeaverDaemon for DaemonService {
                 .ui_server
                 .lock()
                 .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
-            *guard = Some((port, handle));
-        }
-
-        // If watch mode requested, spawn a CodeWatcher.
-        if req.watch && !req.watch_repo_path.is_empty() {
-            let watch_db = state.db_path.clone();
-            let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
-            let watch_store = state.store.clone();
-            let watch_limits = state
-                .instance_cfg
-                .as_ref()
-                .map(|config| config.indexing.limits())
-                .unwrap_or_default();
-
-            tokio::task::spawn_blocking(move || {
-                let watcher =
-                    nestweaver_engine::CodeWatcher::new(&watch_db, &watch_repo, &watch_instance)
-                        .with_limits(watch_limits);
-                if let Err(e) = watcher.run_with_store(watch_store, None) {
-                    tracing::error!("CodeWatcher failed: {e}");
-                }
+            *guard = Some(UiServerRegistration {
+                port,
+                handle,
+                watcher,
             });
         }
 
@@ -4967,12 +6000,25 @@ impl NestWeaverDaemon for DaemonService {
             guard.take()
         };
         match handle {
-            Some((_port, handle)) if !handle.is_finished() => {
-                // Aborting the task drops the axum listener, releasing the port.
-                handle.abort();
+            Some(registration) => {
+                let server_was_running = !registration.handle.is_finished();
+                if server_was_running {
+                    // Aborting the task drops the axum listener, releasing the port.
+                    registration.handle.abort();
+                }
+                if let Some(watcher) = registration.watcher {
+                    stop_watcher_registration(&self.state, watcher.id);
+                    if let Some(task) = take_watcher_task(&self.state, watcher.id) {
+                        let _ = task.await;
+                    }
+                }
                 Ok(Response::new(StopUiResponse {
                     ok: true,
-                    message: "UI server stopped".to_string(),
+                    message: if server_was_running {
+                        "UI server stopped".to_string()
+                    } else {
+                        "UI server had exited; its watcher was stopped and drained".to_string()
+                    },
                 }))
             }
             _ => Ok(Response::new(StopUiResponse {
@@ -5116,8 +6162,10 @@ impl NestWeaverDaemon for DaemonService {
         let cancel_for_index = cancel;
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("index_repo");
-            let _guard = guard;
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: write_lock.blocking_lock("index_repo"),
+                _connection_guard: guard,
+            };
             // Dropped when the index task ends → fires the watchdog's `done_rx`
             // so it releases its stream sender and the response can terminate.
             let _done = done_tx;
@@ -5424,8 +6472,10 @@ impl NestWeaverDaemon for DaemonService {
         let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("index_vault");
-            let _guard = guard;
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: write_lock.blocking_lock("index_vault"),
+                _connection_guard: guard,
+            };
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning vault {}", vault_path.display()),
@@ -5434,6 +6484,22 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
                 ..Default::default()
             }));
+
+            let indexed_before = indexed_search_rows_before(&state);
+            let search_admission = match establish_search_reconciliation_debt(&state, "index_vault")
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Error as i32,
+                            message: format!(
+                                "IndexVault refused before graph mutation because durable search-reconciliation debt could not be established: {error:#}"
+                            ),
+                            ..Default::default()
+                        }));
+                    return;
+                }
+            };
 
             let index_result =
                 nestweaver_engine::index_markdown_directory_with_store_and_deletion_count(
@@ -5471,63 +6537,46 @@ impl NestWeaverDaemon for DaemonService {
                         trigram_refresh: None,
                     }));
 
-                    // Rebuild Tantivy search index so BM25 search reflects
-                    // the freshly indexed vault content.
-                    //
-                    // nw-249: when there is NO writer this whole block was
-                    // skipped and the DONE phase below still reported a full
-                    // set of counts — so an index that could not touch the
-                    // search index at all looked identical to one that
-                    // rebuilt it. Unlike a failed rebuild, this is not an
-                    // error: a read-only replica legitimately has no writer.
-                    // So it is disclosed rather than failed, and the phrasing
-                    // says which of the two happened.
-                    let search_index_rebuilt =
-                        state.tantivy().is_some_and(|tantivy| tantivy.has_writer());
-                    if !search_index_rebuilt {
+                    let mutation = indexed_search_mutation(
+                        indexed_before,
+                        &state.store,
+                        IndexedSearchMutationScope::MayIncludeVaultFiles,
+                    );
+                    if let Err(error) = finish_search_reconciliation(
+                        &state,
+                        mutation,
+                        "index_vault",
+                        search_admission,
+                    ) {
+                        tracing::error!(error = %error, "search reconciliation failed after vault indexing");
                         let _ = tx.blocking_send(Ok(IndexProgress {
-                            message: "note: the graph was updated but the BM25 search index \
-                                      was NOT rebuilt (this daemon holds no search-index \
-                                      writer), so `brain search` will not reflect this \
-                                      index until one does"
-                                .to_string(),
+                            phase: Phase::Error as i32,
+                            message: format!(
+                                "IndexVault committed graph changes but BM25 search reconciliation failed and remains durably pending: {error:#}"
+                            ),
+                            files_processed: result.index.notes_count as u64,
+                            files_total: result.index.notes_count as u64,
+                            symbols_found: result.index.headings_count as u64,
                             ..Default::default()
                         }));
+                        return;
                     }
-                    if let Some(tantivy) = state.tantivy()
-                        && tantivy.has_writer()
+
+                    if let Some(message) =
+                        degraded_graph_publication_message("IndexVault", &result.publication)
                     {
-                        match tantivy.reindex_from_store(&state.store) {
-                            Ok(n) => {
-                                tracing::info!(docs = n, "Tantivy reindexed after vault indexing")
-                            }
-                            // Report the failure instead of walking into the
-                            // DONE phase below with a full set of counts.
-                            //
-                            // `refresh_vault_since` — the sibling roughly 80
-                            // lines down, doing the same rebuild after the same
-                            // kind of commit — already emits Phase::Error and
-                            // returns. This one warned to the log and then told
-                            // the user it was finished, so a vault re-index
-                            // looked clean while BM25 search kept serving the
-                            // PRE-INDEX corpus. The graph write did land, which
-                            // is why the message says so explicitly rather than
-                            // implying the whole operation failed.
-                            Err(error) => {
-                                tracing::error!(error = %error, "Tantivy reindex failed after vault indexing");
-                                let _ = tx.blocking_send(Ok(IndexProgress {
-                                    phase: Phase::Error as i32,
-                                    message: format!(
-                                        "IndexVault committed graph changes but Tantivy rebuild failed: {error:#}"
-                                    ),
-                                    files_processed: result.index.notes_count as u64,
-                                    files_total: result.index.notes_count as u64,
-                                    symbols_found: result.index.headings_count as u64,
-                                    ..Default::default()
-                                }));
-                                return;
-                            }
-                        }
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Error as i32,
+                            message,
+                            files_processed: result.index.notes_count as u64,
+                            files_total: result.index.notes_count as u64,
+                            symbols_found: result.index.headings_count as u64,
+                            skipped_count: skipped_count as u64,
+                            skipped_files,
+                            coverage_status,
+                            trigram_refresh: None,
+                        }));
+                        return;
                     }
 
                     // DONE phase
@@ -5546,6 +6595,15 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(e) => {
+                    let error = anyhow::anyhow!("IndexVault graph mutation failed: {e:#}");
+                    if let Err(marker_error) =
+                        record_search_reconciliation_failure(&state, "index_vault", &error)
+                    {
+                        tracing::error!(
+                            error = %marker_error,
+                            "failed to update durable search debt after IndexVault error"
+                        );
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
                         message: format!("IndexVault failed: {e:#}"),
@@ -5588,8 +6646,10 @@ impl NestWeaverDaemon for DaemonService {
         let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("refresh_vault_since");
-            let _guard = guard;
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: write_lock.blocking_lock("refresh_vault_since"),
+                _connection_guard: guard,
+            };
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!(
@@ -5603,6 +6663,24 @@ impl NestWeaverDaemon for DaemonService {
                 ..Default::default()
             }));
 
+            let indexed_before = indexed_search_rows_before(&state);
+            let search_admission = match establish_search_reconciliation_debt(
+                &state,
+                "refresh_vault_since",
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Error as i32,
+                            message: format!(
+                                "RefreshVaultSince refused before graph mutation because durable search-reconciliation debt could not be established: {error:#}"
+                            ),
+                            ..Default::default()
+                        }));
+                    return;
+                }
+            };
+
             match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore(
                 &state.store,
                 &vault_path,
@@ -5612,20 +6690,40 @@ impl NestWeaverDaemon for DaemonService {
                 &extra_patterns,
             ) {
                 Ok(result) => {
-                    if let Some(tantivy) = state.tantivy()
-                        && tantivy.has_writer()
-                        && let Err(error) = tantivy.reindex_from_store(&state.store)
-                    {
+                    let mutation = indexed_search_mutation(
+                        indexed_before,
+                        &state.store,
+                        IndexedSearchMutationScope::MayIncludeVaultFiles,
+                    );
+                    if let Err(error) = finish_search_reconciliation(
+                        &state,
+                        mutation,
+                        "refresh_vault_since",
+                        search_admission,
+                    ) {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                                 phase: Phase::Error as i32,
                                 message: format!(
-                                    "RefreshVaultSince committed graph changes but Tantivy rebuild failed: {error:#}"
+                                    "RefreshVaultSince committed graph changes but BM25 search reconciliation failed and remains durably pending: {error:#}"
                                 ),
                                 files_processed: result.files_checked as u64,
                                 files_total: result.files_checked as u64,
                                 symbols_found: result.headings_count as u64,
                                 ..Default::default()
                             }));
+                        return;
+                    }
+                    if let Some(message) =
+                        degraded_graph_publication_message("RefreshVaultSince", &result.publication)
+                    {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Error as i32,
+                            message,
+                            files_processed: result.files_checked as u64,
+                            files_total: result.files_checked as u64,
+                            symbols_found: result.headings_count as u64,
+                            ..Default::default()
+                        }));
                         return;
                     }
                     let vault_uid = nestweaver_schema::vault_uid(
@@ -5659,6 +6757,18 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(error) => {
+                    let debt_error =
+                        anyhow::anyhow!("RefreshVaultSince graph mutation failed: {error:#}");
+                    if let Err(marker_error) = record_search_reconciliation_failure(
+                        &state,
+                        "refresh_vault_since",
+                        &debt_error,
+                    ) {
+                        tracing::error!(
+                            error = %marker_error,
+                            "failed to update durable search debt after RefreshVaultSince error"
+                        );
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
                         message: format!("RefreshVaultSince failed: {error:#}"),
@@ -5741,20 +6851,7 @@ impl NestWeaverDaemon for DaemonService {
                 Some(mutation_factory),
             ) {
                 Ok(result) => {
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Done as i32,
-                        message: format!(
-                            "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
-                            result.projects_created,
-                            result.note_edges,
-                            result.symbol_edges,
-                            result.component_edges,
-                        ),
-                        files_processed: result.projects_created as u64,
-                        files_total: result.projects_created as u64,
-                        symbols_found: result.symbol_edges as u64,
-                        ..Default::default()
-                    }));
+                    let _ = tx.blocking_send(Ok(materialize_projects_terminal_progress(&result)));
                 }
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -5783,26 +6880,14 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("remove_vault").await;
-
         let req = request.into_inner();
         let state = self.state.clone();
-
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("remove_vault", move || {
             let search_rows_before = indexed_search_rows_before(&state);
             run_remove_vault_with_projection(&state, &req.vault_uid, search_rows_before)
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     async fn remove_repo(
@@ -5814,19 +6899,9 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("remove_repo").await;
-
         let req = request.into_inner();
         let state = self.state.clone();
-
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("remove_repo", move || {
             run_remove_repo_with(
                 &state,
                 &req.repo_uid,
@@ -5843,9 +6918,7 @@ impl NestWeaverDaemon for DaemonService {
             )
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     async fn remove_project(
@@ -5857,19 +6930,9 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("remove_project").await;
-
         let req = request.into_inner();
         let state = self.state.clone();
-
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("remove_project", move || {
             run_remove_project_with(
                 &state,
                 &req.project_uid,
@@ -5880,9 +6943,7 @@ impl NestWeaverDaemon for DaemonService {
             )
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     async fn prune_stale(
@@ -5894,19 +6955,9 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("prune_stale").await;
-
         let _req = request.into_inner();
         let state = self.state.clone();
-
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("prune_stale", move || {
             run_prune_stale_with(
                 &state,
                 delete_repo_cascade,
@@ -5920,9 +6971,7 @@ impl NestWeaverDaemon for DaemonService {
             )
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     /// nw-204. Reclaim embedding vectors for nodes that no longer exist.
@@ -5945,21 +6994,7 @@ impl NestWeaverDaemon for DaemonService {
         let dry_run = request.into_inner().dry_run;
         let state = self.state.clone();
 
-        // A dry run writes NOTHING, so it must not take the write gate: doing so
-        // would let a purely informational query block indexing and the watcher,
-        // and be refused outright during a drain. The real run takes the guard
-        // BEFORE the gate, matching every other write RPC — during a drain the
-        // gate is held for as long as the in-flight write runs, so taking it
-        // first would queue this behind a write it is about to be refused after.
-        let _write_scope = if dry_run {
-            None
-        } else {
-            let guard = ConnectionGuard::write(&self.state)?;
-            let lease = self.state.write_gate.lock("compact_embeddings").await;
-            Some((guard, lease))
-        };
-
-        let response = tokio::task::spawn_blocking(move || {
+        let compact = move || {
             let sidecar = nestweaver_engine::sidecar_path(&state.db_path, ".embeddings.bin");
             let bytes_of = |path: &std::path::Path| {
                 std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
@@ -5969,7 +7004,7 @@ impl NestWeaverDaemon for DaemonService {
             let bytes_before = bytes_of(&sidecar);
 
             if dry_run {
-                return Ok::<_, nestweaver_store::StoreError>(CompactEmbeddingsResponse {
+                return Ok::<_, Status>(CompactEmbeddingsResponse {
                     stored_before: before.stored as u64,
                     tombstoned_before: before.tombstoned as u64,
                     stored_after: before.stored as u64,
@@ -5981,13 +7016,24 @@ impl NestWeaverDaemon for DaemonService {
                 });
             }
 
+            require_verified_embedding_runtime_identity(
+                &state.store,
+                &state.embedding_runtime.status(),
+                "embedding compaction write",
+            )?;
+
             // Reconcile FIRST, always. Compaction rewrites the base without
             // tombstoned rows, so running it alone on a brain whose orphans
             // were never tombstoned reclaims exactly nothing — which is the
             // state every pre-fix brain is in.
-            state.store.reconcile_embedding_index()?;
+            state
+                .store
+                .reconcile_embedding_index()
+                .map_err(|error| Status::internal(format!("compact embeddings failed: {error}")))?;
             if state.store.embedding_index_occupancy().tombstoned > 0 {
-                state.store.compact_embedding_index()?;
+                state.store.compact_embedding_index().map_err(|error| {
+                    Status::internal(format!("compact embeddings failed: {error}"))
+                })?;
             }
 
             let after = state.store.embedding_index_occupancy();
@@ -5997,10 +7043,20 @@ impl NestWeaverDaemon for DaemonService {
                 bytes_before,
                 bytes_of(&sidecar),
             ))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?
-        .map_err(|e| Status::internal(format!("compact embeddings failed: {e}")))?;
+        };
+
+        // A dry run writes nothing and remains outside write admission. The
+        // applying path transfers ownership into the exact worker.
+        let response = if dry_run {
+            tokio::task::spawn_blocking(compact)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("compact_embeddings task panicked: {error}"))
+                })??
+        } else {
+            self.run_unary_mutation("compact_embeddings", compact)
+                .await?
+        };
 
         Ok(Response::new(response))
     }
@@ -6022,18 +7078,8 @@ impl NestWeaverDaemon for DaemonService {
                 "source and target instance IDs must differ",
             ));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("merge_instance").await;
-
         let state = self.state.clone();
-
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("merge_instance", move || {
             let result = run_merge_instance_with(
                 &state,
                 &from_id,
@@ -6067,9 +7113,7 @@ impl NestWeaverDaemon for DaemonService {
             })
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     type PurgeInstanceStream = ProgressStream;
@@ -6092,8 +7136,10 @@ impl NestWeaverDaemon for DaemonService {
         let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("purge_instance");
-            let _guard = guard;
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: write_lock.blocking_lock("purge_instance"),
+                _connection_guard: guard,
+            };
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Writing as i32,
                 message: format!("Purging instance {instance_id}"),
@@ -6168,36 +7214,25 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Rebuilding the Tantivy index is a mutation: it must run under the
-        // write gate so it serializes against a `backup`'s sidecar staging
-        // (which copies under the same lock) and is visible to the shutdown
-        // drain / idle timeout via `active_writes` — mirroring `prune_stale`
-        // and `purge_instance`.
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("reindex_search").await;
-
         let state = self.state.clone();
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("reindex_search", move || {
             let tantivy = state.tantivy().filter(|t| t.has_writer()).ok_or_else(|| {
                 Status::failed_precondition("daemon has no writer-mode Tantivy index")
             })?;
             let count = tantivy
                 .reindex_from_store(&state.store)
                 .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
+            clear_search_reconciliation_debt(&state.db_path).map_err(|error| {
+                Status::internal(format!(
+                    "search index rebuilt, but durable reconciliation debt could not be cleared: {error:#}"
+                ))
+            })?;
             Ok::<_, Status>(ReindexSearchResponse {
                 document_count: count as i32,
             })
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     // ── Read RPCs — typed hot-path ─────────────────────────────────
@@ -6327,6 +7362,45 @@ impl NestWeaverDaemon for DaemonService {
         let truncated = explicit_truncated
             || total_matches_relation != "eq"
             || returned_matches < total_matches;
+        let semantic_applied = value
+            .get("semantic_applied")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let degraded_components = value
+            .get("degraded_components")
+            .and_then(serde_json::Value::as_array)
+            .map(|components| {
+                components
+                    .iter()
+                    .filter_map(|component| component.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let semantic_unavailable = value
+            .get("semantic_unavailable")
+            .and_then(serde_json::Value::as_object)
+            .map(|detail| SemanticUnavailable {
+                cause: detail
+                    .get("cause")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: detail
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                error: detail
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                remediation: detail
+                    .get("remediation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
 
         Ok(Response::new(BrainSearchResponse {
             query: query_echo,
@@ -6337,10 +7411,13 @@ impl NestWeaverDaemon for DaemonService {
             returned_matches,
             total_matches_relation,
             truncated,
-            // `brain_search` is keyword/BM25-only; it must not claim a
-            // semantic leg was requested or degraded.
-            semantic_applied: false,
-            degraded_components: Vec::new(),
+            // `brain_search` remains keyword/BM25-only. A semantic-identity
+            // failure is nevertheless reported as an unavailable optional
+            // capability so lexical success cannot be mistaken for full
+            // semantic readiness.
+            semantic_applied,
+            degraded_components,
+            semantic_unavailable,
         }))
     }
 
@@ -6362,6 +7439,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainContextRequest>,
     ) -> Result<Response<BrainContextResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "seeds": req.seeds,
@@ -6419,13 +7497,11 @@ impl NestWeaverDaemon for DaemonService {
             args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
+        // The common tool boundary either executes on an authorization-safe
+        // induced subgraph or refuses before traversal. The typed route must
+        // pass the request-derived scope just like generic JSON-RPC.
         let value = self
-            .dispatch_tool_json(
-                "brain_context",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_context", args, visible)
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
@@ -6455,6 +7531,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<ProjectContextRequest>,
     ) -> Result<Response<ProjectContextResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "project": req.project,
@@ -6500,13 +7577,8 @@ impl NestWeaverDaemon for DaemonService {
             args["exclude_tags"] = serde_json::json!(req.exclude_tags);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "project_context",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("project_context", args, visible)
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
@@ -6617,16 +7689,12 @@ impl NestWeaverDaemon for DaemonService {
 
     async fn brain_status(
         &self,
-        _r: Request<BrainStatusRequest>,
+        r: Request<BrainStatusRequest>,
     ) -> Result<Response<BrainStatusResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let args = serde_json::json!({});
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "brain_status",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_status", args, visible)
             .await?;
 
         let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
@@ -6636,11 +7704,17 @@ impl NestWeaverDaemon for DaemonService {
             String::new()
         };
         let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
+        let embedding_runtime_status = embedding_status_with_store_identity(
+            self.state.embedding_runtime.status(),
+            &self.state.store,
+        );
         let embedding_status = embedding_status_proto(
-            &self.state.embedding_runtime.status(),
+            &embedding_runtime_status,
             &self.state.embed_progress.snapshot(),
             self.state.store.embedding_index_occupancy(),
+            &self.state.store,
         );
+        let search_status = search_capability_status(&self.state);
         let write_queue_depth = self.state.write_gate.waiting() as i32;
         let (write_holder, write_holder_seconds) = self
             .state
@@ -6679,6 +7753,7 @@ impl NestWeaverDaemon for DaemonService {
             write_queue_depth,
             write_holder,
             write_holder_seconds,
+            search_status: Some(search_status_proto(&search_status)),
         }))
     }
 
@@ -6686,6 +7761,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<HubNodesRequest>,
     ) -> Result<Response<HubNodesResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
         let mut args = serde_json::json!({});
         if req.top_n > 0 {
@@ -6695,14 +7771,7 @@ impl NestWeaverDaemon for DaemonService {
             args["response_format"] = serde_json::json!(req.response_format);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
-        let value = self
-            .dispatch_tool_json(
-                "hub_nodes",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
-            .await?;
+        let value = self.dispatch_tool_json("hub_nodes", args, visible).await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
 
@@ -6713,14 +7782,10 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
-        // Fixed non-blast_radius tool — pass `VisibleRepos::All` (no scoping).
         let resp = self
-            .dispatch_json_tool(
-                "brain_status",
-                &req.args_json,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_json_tool("brain_status", &req.args_json, visible)
             .await?;
         // Inject server-side indexing status into the JSON response so
         // AI agents see it via the MCP tool path as well.
@@ -6753,12 +7818,17 @@ impl NestWeaverDaemon for DaemonService {
                 .unwrap_or_else(|| (String::new(), 0));
             value["write_holder"] = serde_json::json!(write_holder);
             value["write_holder_seconds"] = serde_json::json!(write_holder_seconds);
-            let embedding_status = self.state.embedding_runtime.status();
+            let embedding_status = embedding_status_with_store_identity(
+                self.state.embedding_runtime.status(),
+                &self.state.store,
+            );
             value["embedding_status"] = embedding_status_json(
                 &embedding_status,
                 &self.state.embed_progress.snapshot(),
                 self.state.store.embedding_index_occupancy(),
+                &self.state.store,
             );
+            value["search_status"] = search_status_json(&search_capability_status(&self.state));
             // Daemon-side witness counter in the `cache` block (the
             // `hit_rate_pct` session-counter precedent): an adopted client
             // proves the answer came from THIS daemon because the counter
@@ -6778,8 +7848,9 @@ impl NestWeaverDaemon for DaemonService {
 
     async fn repo_states(
         &self,
-        _request: Request<RepoStatesRequest>,
+        request: Request<RepoStatesRequest>,
     ) -> Result<Response<RepoStatesResponse>, Status> {
+        let visible = self.state.visible_repos_for(request.extensions())?;
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
 
@@ -6787,7 +7858,10 @@ impl NestWeaverDaemon for DaemonService {
             let repos = state
                 .store
                 .list_repos(None)
-                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?
+                .into_iter()
+                .filter(|repo| visible.allows(&repo.uid))
+                .collect::<Vec<_>>();
 
             // `unwrap_or(0)` made a failed read indistinguishable from a repo
             // that genuinely has no symbols — which reads as "this repo was
@@ -7025,15 +8099,22 @@ impl NestWeaverDaemon for DaemonService {
             return json_rpc!(self, r, "brain_memory_consolidate");
         }
 
-        // Guard BEFORE the gate, for the reason spelled out on `set_extension`:
-        // during a drain the gate is held for as long as the in-flight write
-        // runs, so taking it first means the caller waits minutes only to learn
-        // it was refused, and sees DEADLINE_EXCEEDED instead of the explanatory
-        // UNAVAILABLE.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("brain_memory_consolidate").await;
-
-        json_rpc!(self, r, "brain_memory_consolidate")
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            r.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied(
+                "tool 'brain_memory_consolidate' is mutating and requires the admin token",
+            ));
+        }
+        let visible = self.state.visible_repos_for(r.extensions())?;
+        let req = r.into_inner();
+        self.dispatch_json_mutation(
+            "brain_memory_consolidate",
+            &req.args_json,
+            visible,
+            "brain_memory_consolidate",
+        )
+        .await
     }
 
     async fn brain_memory_related(
@@ -7106,29 +8187,13 @@ impl NestWeaverDaemon for DaemonService {
                 "tool 'set_extension' is mutating and requires the admin token",
             ));
         }
-        // Read-modify-write of the `.extensions.json` sidecar, which is part of
-        // the backup sidecar set. It must run under the write gate — write_mutex
-        // + ConnectionGuard::write — so it serializes against a `backup`'s
-        // sidecar staging (which copies under the same lock), is visible to the
-        // shutdown drain / idle timeout, and two concurrent callers cannot lose
-        // updates (last-writer-wins). This is the single gated write path: the
-        // MCP `tool_set_extension` routes here rather than mutating directly.
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("set_extension").await;
-
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
         // Errors are wrapped in the standard `tool <name> failed:` format (see
         // dispatch_err_to_status) so MCP clients don't mislabel tool argument
         // errors as gRPC transport failures.
-        #[allow(clippy::result_large_err)]
-        let result = tokio::task::spawn_blocking(move || {
+        self.run_unary_mutation("set_extension", move || {
             let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
                 Status::invalid_argument(format!(
                     "tool set_extension failed: invalid JSON in args_json: {e}"
@@ -7160,9 +8225,7 @@ impl NestWeaverDaemon for DaemonService {
             Ok::<_, Status>(JsonResponse { result_json })
         })
         .await
-        .map_err(|e| Status::internal(format!("tool set_extension failed: spawn_blocking: {e}")))?;
-
-        result.map(Response::new)
+        .map(Response::new)
     }
 
     async fn query_extensions(
@@ -7555,34 +8618,92 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let _guard = ConnectionGuard::read(&self.state);
+        let is_admin = matches!(
+            r.extensions().get::<crate::auth::IsAdmin>(),
+            Some(crate::auth::IsAdmin(true))
+        );
         let state = self.state.clone();
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let vault_path = args
+            .get("vault")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Status::invalid_argument("missing 'vault' argument"))?;
+        let vault = PathBuf::from(vault_path);
+        let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+        let requested_instance = args
+            .get("instance_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let instance_id = resolve_effective_instance_id(requested_instance, &state)?;
+        let vault_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
+        let dry_run = args
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if state.read_only && !dry_run {
+            return Err(Status::failed_precondition(
+                "this daemon serves a read-only snapshot replica; detect_implicit_projects requires dry_run=true",
+            ));
+        }
+        if !dry_run && !is_admin {
+            return Err(Status::permission_denied(
+                "detect_implicit_projects is mutating and requires the admin token",
+            ));
+        }
 
-        let result = tokio::task::spawn_blocking(move || {
-            let vault_path = args
-                .get("vault")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Status::invalid_argument("missing 'vault' argument"))?;
-            let vault = std::path::PathBuf::from(vault_path);
-            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
-            let instance_id = "default";
-            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
-            let detected = nestweaver_engine::detect_implicit_projects(
+        let detect = move || {
+            let detected = nestweaver_engine::project::detect_implicit_projects_with_publication(
                 &state.store,
                 &vault,
                 &vault_uid,
-                instance_id,
+                &instance_id,
+                dry_run,
             )
-            .map_err(|e| Status::internal(format!("detect_implicit_projects failed: {e:#}")))?;
-            serde_json::to_string(&detected)
-                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
-
-        result.map(|j| Response::new(JsonResponse { result_json: j }))
+            .map_err(|error| {
+                Status::internal(format!("detect_implicit_projects failed: {error:#}"))
+            })?;
+            let disposition = match detected.publication.disposition {
+                nestweaver_engine::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange => {
+                    "confirmed_no_change"
+                }
+                nestweaver_engine::manifest::GraphMutationPublicationDisposition::CommittedComplete => {
+                    "committed_complete"
+                }
+                nestweaver_engine::manifest::GraphMutationPublicationDisposition::CommittedDegraded => {
+                    "committed_degraded"
+                }
+            };
+            let payload = serde_json::json!({
+                "projects": detected.projects,
+                "publication": {
+                    "disposition": disposition,
+                    "generation_before": detected.publication.generation_before,
+                    "generation_after": detected.publication.generation_after,
+                    "warnings": detected.publication.warnings.into_iter().map(|warning| {
+                        serde_json::json!({
+                            "stage": warning.stage,
+                            "message": warning.message,
+                        })
+                    }).collect::<Vec<_>>(),
+                },
+            });
+            serde_json::to_string(&payload)
+                .map_err(|error| Status::internal(format!("serialization failed: {error:#}")))
+        };
+        let result = if dry_run {
+            tokio::task::spawn_blocking(detect)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("detect_implicit_projects task panicked: {error}"))
+                })??
+        } else {
+            self.run_unary_mutation("detect_implicit_projects", detect)
+                .await?
+        };
+        Ok(Response::new(JsonResponse {
+            result_json: result,
+        }))
     }
 
     #[allow(clippy::result_large_err)]
@@ -7599,6 +8720,11 @@ impl NestWeaverDaemon for DaemonService {
         // loudly (Unavailable, after one retry inside `visible_repos_for`)
         // instead of silently redacting everything.
         let visible = self.state.visible_repos_for(r.extensions())?;
+        if matches!(visible, nestweaver_engine::authz::VisibleRepos::Only(_)) {
+            return Err(Status::permission_denied(
+                "pr_impact is unavailable for a repository-restricted identity: blast-radius traversal cannot yet be computed on an authorization-induced subgraph",
+            ));
+        }
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
@@ -7629,20 +8755,31 @@ impl NestWeaverDaemon for DaemonService {
             depth
         };
 
-        let changed_files: Vec<std::path::PathBuf> = args
+        let provided_files = args
             .get("files")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
-                    .collect()
+            .ok_or_else(|| Status::invalid_argument("missing or invalid 'files' array argument"))?;
+        // Never filter invalid elements out of an analysis request. Doing so
+        // turns a malformed N-file diff into a green result for a smaller
+        // diff, which is more dangerous than rejecting it. Decode the whole
+        // array first, then apply the shared CLI/MCP/engine path contract.
+        let raw_files: Vec<String> = provided_files
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "invalid files[{index}]: expected a repository-relative path string"
+                    ))
+                })
             })
-            .unwrap_or_default();
-        if changed_files.is_empty() {
-            return Err(Status::invalid_argument(
-                "missing or empty 'files' array argument",
-            ));
-        }
+            .collect::<Result<_, _>>()?;
+        let changed_files: Vec<PathBuf> =
+            nestweaver_engine::changed_files::require_changed_files(&raw_files)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
 
         let cancel_for_task = cancel.clone();
         let handler = async move {
@@ -7737,14 +8874,6 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        // Guard BEFORE the write gate: during a drain the gate is held by the
-        // in-flight write for as long as it runs, so taking it first meant this
-        // request queued for minutes and only then learned it was refused. A
-        // client with a deadline saw DEADLINE_EXCEEDED instead of the
-        // explanatory UNAVAILABLE, which defeats the point of the message.
-        let _guard = ConnectionGuard::write(&self.state)?;
-        let _write_lock = self.state.write_gate.lock("embed").await;
-
         #[cfg(not(feature = "embed"))]
         {
             let _ = request;
@@ -7757,7 +8886,8 @@ impl NestWeaverDaemon for DaemonService {
         {
             let req = request.into_inner();
             let scope = req.scope.clone();
-            let force = req.force;
+            let repair_identity = req.repair_identity;
+            let force = req.force || repair_identity;
             let batch_size = if req.batch_size == 0 {
                 32
             } else {
@@ -7765,6 +8895,13 @@ impl NestWeaverDaemon for DaemonService {
             };
 
             let scopes = embedding_scopes(&scope)?;
+            if !repair_identity {
+                require_verified_embedding_runtime_identity(
+                    &self.state.store,
+                    &self.state.embedding_runtime.status(),
+                    "embedding write",
+                )?;
+            }
             let do_symbols = scopes.symbols;
             let do_notes = scopes.notes;
             let do_headings = scopes.headings;
@@ -7772,6 +8909,27 @@ impl NestWeaverDaemon for DaemonService {
             let (status, model) = self.state.embedding_runtime.snapshot();
             let model = match model {
                 Some(model) => model,
+                None if repair_identity => {
+                    let store = self.state.store.clone();
+                    let discarded = self
+                        .run_unary_mutation("repair_embedding_identity", move || {
+                            store
+                                .reset_embedding_space_for_identity_repair()
+                                .map(|count| count as u64)
+                                .map_err(|error| {
+                                    Status::internal(format!(
+                                        "reset unreadable embedding identity: {error}"
+                                    ))
+                                })
+                        })
+                        .await?;
+                    return Ok(Response::new(EmbedResponse {
+                        identity_repaired: true,
+                        restart_required: true,
+                        discarded_embeddings: discarded,
+                        ..EmbedResponse::default()
+                    }));
+                }
                 None => {
                     // nw-139: the daemon is the single writer, and since 6.3.0
                     // the CLI refuses `embed --local` while the daemon holds
@@ -7783,26 +8941,15 @@ impl NestWeaverDaemon for DaemonService {
                     //
                     // Seed it here instead. This is safe precisely because it
                     // is NOT the startup path: the request is operator-
-                    // initiated, already admin-authenticated, and already holds
-                    // the write gate above, so no lock ever changes hands.
+                    // initiated, already admin-authenticated, and the cache
+                    // seed below runs inside the same exact-worker write lease,
+                    // so no lock ever changes hands.
                     // Startup stays CacheOnly, so booting never depends on
                     // network reachability.
                     //
                     // A complete cache makes DownloadMissing a no-op, so a
                     // failure for any other reason simply reproduces itself
                     // below and reports the original diagnosis.
-                    tracing::info!(
-                        state = %status.state,
-                        "embedding model unavailable; seeding the configured artifact cache"
-                    );
-                    // Download the missing artifacts ONLY. Constructing the
-                    // model here would run it on a tokio worker, and a local
-                    // backend must be loaded on the main block_on thread or
-                    // MTLCompilerService is unreachable and Metal silently
-                    // degrades to CPU — the regression `load_embedding_model`
-                    // documents and asserts against. Seeding is pure network
-                    // and disk I/O, so it is safe from any thread.
-                    let outcome = seed_embedding_artifact_cache(&self.state);
                     let detail = if status.error.is_empty() {
                         format!("embedding is not ready (state: {})", status.state)
                     } else {
@@ -7811,16 +8958,33 @@ impl NestWeaverDaemon for DaemonService {
                             status.state, status.error
                         )
                     };
-                    return Err(Status::failed_precondition(match outcome {
-                        Ok(cache_dir) => format!(
-                            "{detail}. The missing model artifacts have now been downloaded \
-                             into {} by the daemon itself, so the write lock never changed \
-                             hands. Restart the daemon to load them \
-                             (`nestweaver daemon restart`), then re-run this command.",
-                            cache_dir.display()
-                        ),
-                        Err(error) => format!("{detail}. Seeding the cache failed: {error:#}"),
-                    }));
+                    let state = self.state.clone();
+                    return self
+                        .run_unary_mutation("embed", move || {
+                            tracing::info!(
+                                state = %status.state,
+                                "embedding model unavailable; seeding the configured artifact cache"
+                            );
+                            // Cache writes are part of this unary mutation too:
+                            // a disconnect must not make shutdown claim the
+                            // daemon is idle while downloads are still being
+                            // published.
+                            let outcome = seed_embedding_artifact_cache(&state);
+                            Err::<EmbedResponse, _>(Status::failed_precondition(match outcome {
+                                Ok(cache_dir) => format!(
+                                    "{detail}. The missing model artifacts have now been downloaded \
+                                     into {} by the daemon itself, so the write lock never changed \
+                                     hands. Restart the daemon to load them \
+                                     (`nestweaver daemon restart`), then re-run this command.",
+                                    cache_dir.display()
+                                ),
+                                Err(error) => {
+                                    format!("{detail}. Seeding the cache failed: {error:#}")
+                                }
+                            }))
+                        })
+                        .await
+                        .map(Response::new);
                 }
             };
             // The model the daemon actually loaded (startup preference: the
@@ -7831,7 +8995,18 @@ impl NestWeaverDaemon for DaemonService {
             let progress = Arc::clone(&self.state.embed_progress);
             let progress_scope = scope.clone();
 
-            let result = tokio::task::spawn_blocking(move || {
+            self.run_unary_mutation("embed", move || {
+                let discarded_embeddings = if repair_identity {
+                    store
+                        .reset_embedding_space_for_identity_repair()
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "reset unreadable embedding identity: {error}"
+                            ))
+                        })? as u64
+                } else {
+                    0
+                };
                 // Owned by the blocking task, not by the RPC future: a client
                 // that disconnects does not stop the pass, so progress must
                 // keep reporting `active` until the work actually ends. The
@@ -8084,24 +9259,16 @@ impl NestWeaverDaemon for DaemonService {
                 //
                 // Only from vectors this run produced: an embed that produced
                 // nothing must not invent or overwrite metadata.
-                if let Some(pipeline) = produced_pipeline.as_ref()
-                    && let Err(e) = store.set_embedding_pipeline(pipeline)
-                {
-                    tracing::warn!("failed to record embedding model metadata: {e}");
-                }
-
-                let flush = if succeeded > 0 {
-                    store.flush_embedding_index()
-                } else {
-                    Ok(())
-                };
-                if let Err(e) = &flush {
+                let persistence =
+                    persist_embed_output(&store, produced_pipeline.as_ref(), succeeded);
+                if let Err(e) = &persistence {
                     tracing::error!(
-                        "failed to flush embedding index, reporting {succeeded} \
+                        "failed to stamp or flush embedding index, reporting {succeeded} \
                          unpersisted vector(s) as failures: {e}"
                     );
                 }
-                let (succeeded, failed) = settle_embed_counts(succeeded, failed, flush.is_ok());
+                let (succeeded, failed) =
+                    settle_embed_counts(succeeded, failed, persistence.is_ok());
 
                 log_pass_progress(true);
                 tracing::info!(
@@ -8118,12 +9285,13 @@ impl NestWeaverDaemon for DaemonService {
                     scoped,
                     eligible,
                     skipped: scoped.saturating_sub(eligible),
+                    identity_repaired: repair_identity,
+                    restart_required: false,
+                    discarded_embeddings,
                 })
             })
             .await
-            .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;
-
-            result.map(Response::new)
+            .map(Response::new)
         }
     }
 }
@@ -8389,6 +9557,8 @@ const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
     "CrossRepoContracts",
     "DeadCode",
     "DetectChanges",
+    // Payload-gated: `dry_run=true` is a pure read; the handler rejects the
+    // mutating form explicitly on a replica.
     "DetectImplicitProjectsJson",
     "EmbeddingDimension",
     "ExportGraph",
@@ -9994,6 +11164,19 @@ async fn load_embedding_model_with_mode(
     state: &std::sync::Arc<DaemonState>,
     mode: nestweaver_embed::ArtifactMode,
 ) {
+    if let Err(error) = state.store.require_verified_embedding_identity() {
+        let status = embedding_identity_unreadable_status(
+            state.embedding_runtime.status(),
+            format!("{error}. Remediation: {EMBEDDING_IDENTITY_REMEDIATION}."),
+        );
+        state.embedding_runtime.publish_unavailable(status);
+        tracing::warn!(
+            error = %error,
+            remediation = EMBEDDING_IDENTITY_REMEDIATION,
+            "embedding model load skipped because persisted identity is unreadable; graph and lexical service remain available"
+        );
+        return;
+    }
     let cfg = state
         .instance_cfg
         .as_ref()
@@ -10020,12 +11203,22 @@ async fn load_embedding_model_with_mode(
     // model regardless of the compiled default or config — it must match the stored vectors,
     // or semantic search is disabled on a dimension mismatch. This lets the shipped default
     // stay light while a given instance uses whatever it was actually embedded with.
-    let stored_model_id = state
-        .store
-        .get_embedding_metadata()
-        .ok()
-        .flatten()
-        .map(|(model_id, _)| model_id);
+    let stored_model_id = match state.store.get_embedding_metadata() {
+        Ok(metadata) => metadata.map(|(model_id, _)| model_id),
+        Err(error) => {
+            let status = embedding_identity_unreadable_status(
+                state.embedding_runtime.status(),
+                format!("{error}. Remediation: {EMBEDDING_IDENTITY_REMEDIATION}."),
+            );
+            state.embedding_runtime.publish_unavailable(status);
+            tracing::warn!(
+                error = %error,
+                remediation = EMBEDDING_IDENTITY_REMEDIATION,
+                "embedding metadata became unreadable during model load; semantic service remains disabled"
+            );
+            return;
+        }
+    };
     if let Some(stored_model_id) = stored_model_id.as_deref() {
         let configured_model = if cfg.external_endpoint.is_some() {
             cfg.external_model.as_deref().unwrap_or_default()
@@ -10149,8 +11342,13 @@ async fn load_embedding_model_with_mode(
 /// recover on a read-write boot), with
 /// `read_write_daemon_boot_recovers_the_abandoned_publication` pinning the
 /// call-site binding end to end.
-fn reconcile_index_publication_before_ppr_warm(store: &GraphStore, read_only: bool) {
-    nestweaver_engine::index::recover_abandoned_index_publication_best_effort(store, !read_only);
+fn reconcile_index_publication_before_ppr_warm(
+    store: &GraphStore,
+    authority: Option<&nestweaver_store::DbWriteLease>,
+) {
+    if let Some(authority) = authority {
+        nestweaver_engine::index::recover_abandoned_index_publication_best_effort(store, authority);
+    }
     match store.warm_ppr_cache() {
         Ok(()) => tracing::info!("PPR adjacency cache warmed"),
         // nw-C2: this specific failure used to be swallowed as a generic warn,
@@ -10250,6 +11448,24 @@ pub async fn run_server(
         nestweaver_engine::publication::resolve_selected_database(&base_db_path)?
     };
 
+    // Parse the asserted identity before writer-authority acquisition. The
+    // authority deliberately creates a missing database file so it can close
+    // the create/open race; when expected_brain_uuid is configured, however,
+    // absence is a refusal and no database may be materialized at all.
+    let (instance_cfg, effective_config) =
+        load_daemon_instance_config(config_path, server_opts.is_some())?;
+    if !snapshot_replica
+        && !db_path.exists()
+        && let Some(expected) = instance_cfg
+            .as_ref()
+            .and_then(|config| config.expected_brain_uuid.as_deref())
+    {
+        anyhow::bail!(
+            "instance config expects brain {expected}, but no database exists at {}; refusing to create a different brain. Restore or rebuild the expected brain explicitly, or remove the assertion only when intentionally creating a new brain",
+            db_path.display()
+        );
+    }
+
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
     // nw-019: two identities. `instance_id` (db-path hash) is for RUNTIME paths
@@ -10291,82 +11507,47 @@ pub async fn run_server(
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
-    // The WRITE LEASE, held for the daemon's whole life. This is what makes a
+    // The WRITE LEASE, held for a read-write daemon's whole life. This is what makes a
     // direct CLI write safe to refuse: without the daemon participating, a
     // CLI-side lease would only exclude other CLI writers and the daemon —
     // the writer that actually matters — would be invisible to it.
     //
     // Deliberately a different claim from the pidfile lock above. That one is
-    // about instance identity and lives on an inode an operator's `rm` can
-    // erase; this one is about who may write this database, and nothing but
-    // the lease ever opens its file.
+    // about instance identity; this one is dual-anchored on the database and
+    // its stable lease sidecar so replacing either one alone cannot mint a
+    // second authority.
     //
     // A daemon that cannot take it must not start: something else is already
     // writing, and two writers against a store that is not crash-safe is the
     // failure this exists to prevent.
-    let _write_lease = match lifecycle::acquire_db_write_lease(&db_path) {
-        Ok(lease) => lease,
-        Err(lifecycle::WriteLeaseError::Held) => {
-            anyhow::bail!(
-                "another process holds the write lease for {}. Stop it before starting a \
-                 daemon — two writers against this store risk corruption.",
-                db_path.display()
-            );
-        }
-        Err(lifecycle::WriteLeaseError::Unavailable(error)) => {
-            anyhow::bail!(
-                "could not take the write lease for {}: {error}. Refusing to start rather \
-                 than write without exclusivity.",
-                db_path.display()
-            );
-        }
+    let write_authority = if snapshot_replica {
+        None
+    } else {
+        Some(match lifecycle::acquire_db_write_lease(&db_path) {
+            Ok(lease) => Arc::new(lease),
+            Err(lifecycle::WriteLeaseError::Held) => {
+                anyhow::bail!(
+                    "another process holds the write lease for {}. Stop it before starting a \
+                     daemon — two writers against this store risk corruption.",
+                    db_path.display()
+                );
+            }
+            Err(lifecycle::WriteLeaseError::Unavailable(error)) => {
+                anyhow::bail!(
+                    "could not take the write lease for {}: {error}. Refusing to start rather \
+                     than write without exclusivity.",
+                    db_path.display()
+                );
+            }
+        })
     };
 
-    // The pidfile lock is NOT sufficient proof of ownership. It is held on an
-    // inode: if anyone unlinked `daemon.pid` (which is exactly what an operator
-    // does while recovering a stuck instance), the live owner keeps its lock on
-    // a now-unlinked inode and the claim above succeeds against a brand-new
-    // file with no contention at all. Continuing from here would delete the
-    // live daemon's effective-config binding and, further down, unlink its
-    // socket before binding — leaving a healthy daemon that no client can
-    // reach. Corroborate with the database write lock, which lives on the
-    // database file itself and no recovery step removes.
-    //
-    // Read-only snapshot replicas are exempt: they never take the write lock
-    // (lbug sets it only when `!readOnly`; see storage_manager.cpp), so a held
-    // lock says nothing about them.
-    //
-    // State only what the kernel actually told us. The lock proves a process
-    // holds THIS DATABASE — not that it is a daemon, and not that anyone
-    // deleted a pidfile: `embed --local`, an index run, and every `--no-daemon`
-    // command hold the same lock for their duration.
-    //
-    // Matching only `Held` — and so proceeding on `Unknown` — is the one
-    // deliberate exception to the "treat Unknown as possibly-owned" rule every
-    // other caller follows. This probe runs BEFORE this process opens the
-    // store, so the self-probe guard cannot fire here, and if the lock really
-    // is held, `GraphStore::open_or_create` below fails on lbug's own lock a
-    // moment later. Failing closed here would instead refuse to boot whenever
-    // the database is merely unreadable-by-probe, which is a worse trade for
-    // the one caller whose next action already fails safely.
-    let serves_snapshot = server_opts
-        .as_ref()
-        .and_then(|o| o.snapshot.as_ref())
-        .is_some();
-    if !serves_snapshot
-        && let lifecycle::DbWriteLock::Held { pid } = lifecycle::db_write_lock(&db_path)
-    {
-        let owner = pid
-            .map(|pid| format!("PID {pid}"))
-            .unwrap_or_else(|| "another process".to_string());
-        anyhow::bail!(
-            "refusing to start instance {instance_label}: {owner} holds the write lock on {}. \
-             This daemon claimed the instance pidfile lock ({}) anyway, so that lock is not \
-             evidence of ownership here — check what {owner} is before doing anything to it.",
-            db_path.display(),
-            lifecycle::pidfile_path(&instance_id).display()
-        );
-    }
+    // The pidfile is not ownership proof. The write authority above already
+    // took lbug's real whole-database POSIX lock class before the store open,
+    // so a pre-upgrade writer that knows nothing about the sidecar is excluded
+    // without a second check-then-act probe. Do not call `db_write_lock` here:
+    // opening and closing another descriptor would release this process's
+    // POSIX record lock before GraphStore replaces it with its own.
 
     // We now exclusively own this instance's pidfile lock, so any binding left
     // by a crashed predecessor is stale. Clear it before fallible startup work;
@@ -10374,12 +11555,6 @@ pub async fn run_server(
     lifecycle::remove_effective_config_binding(&instance_id).with_context(|| {
         format!("remove stale effective-config binding for instance {instance_id}")
     })?;
-
-    // Parse explicit config before snapshot compatibility checks. Core-schema
-    // snapshots deliberately support configless replicas; extension snapshots
-    // require this config so their effective schema can be mediated.
-    let (instance_cfg, effective_config) =
-        load_daemon_instance_config(config_path, server_opts.is_some())?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
@@ -10414,23 +11589,6 @@ pub async fn run_server(
     } else {
         db_path
     };
-
-    // An expected brain UUID is an assertion, never an instruction to assign
-    // identity to a new empty database. Refuse before `open_or_create` can
-    // materialize a different brain at a mistyped/missing path. Snapshot
-    // replicas have already materialized a verified graph above and are
-    // checked against the assertion immediately after opening it.
-    if !read_only
-        && !db_path.exists()
-        && let Some(expected) = instance_cfg
-            .as_ref()
-            .and_then(|config| config.expected_brain_uuid.as_deref())
-    {
-        anyhow::bail!(
-            "instance config expects brain {expected}, but no database exists at {}; refusing to create a different brain. Restore or rebuild the expected brain explicitly, or remove the assertion only when intentionally creating a new brain",
-            db_path.display()
-        );
-    }
 
     // Open the graph store: read-only for a snapshot replica, read-write
     // otherwise (the daemon is the sole DB owner).
@@ -10727,17 +11885,36 @@ pub async fn run_server(
         .as_ref()
         .map(|config| config.embedding.clone())
         .unwrap_or_default();
-    let stored_embedding_model = store
-        .get_embedding_metadata()
-        .ok()
-        .flatten()
-        .map(|(model_id, _)| model_id);
-    let embedding_status = initial_embedding_status(
+    let (stored_embedding_model, embedding_identity_error) =
+        match store.require_verified_embedding_identity() {
+            Ok(()) => match store.get_embedding_metadata() {
+                Ok(metadata) => (metadata.map(|(model_id, _)| model_id), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            Err(error) => (
+                None,
+                store
+                    .embedding_identity_error()
+                    .or_else(|| Some(error.to_string())),
+            ),
+        };
+    let mut embedding_status = initial_embedding_status(
         &embedding_cfg,
         stored_embedding_model.as_deref(),
         cfg!(feature = "embed"),
         daemon_metal_compiled(),
     );
+    if let Some(error) = embedding_identity_error {
+        embedding_status = embedding_identity_unreadable_status(
+            embedding_status,
+            format!("{error}. Remediation: {EMBEDDING_IDENTITY_REMEDIATION}."),
+        );
+        tracing::warn!(
+            error = %error,
+            remediation = EMBEDDING_IDENTITY_REMEDIATION,
+            "persisted embedding identity is unreadable; daemon will serve graph and lexical operations with semantic service disabled"
+        );
+    }
     let embedding_probe_ms = embedding_probe_started.elapsed().as_millis() as u64;
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
@@ -10779,6 +11956,24 @@ pub async fn run_server(
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
         ui_server: std::sync::Mutex::new(None),
     });
+    state.search.attach_recovery_context(&state);
+
+    // Retry durable graph→search debt before the socket is exposed, but do
+    // not make graph/lexical service availability depend on the writer. A
+    // failed retry remains durable and is surfaced through SearchStatus; a
+    // later successful writer re-open schedules the same exact-worker repair.
+    match retry_search_reconciliation_debt_at_startup(&state).await {
+        Ok(())
+            if load_search_reconciliation_debt(&state.db_path).is_ok_and(|debt| debt.is_none()) =>
+        {
+            tracing::debug!("startup search-reconciliation debt is clear")
+        }
+        Ok(()) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "startup could not reconcile durable search-index debt; graph and lexical service remain available and status is degraded"
+        ),
+    }
 
     // nw-119: two instrumentation passes narrowed the unattributed boot time to
     // the span between the Tantivy open and the bind — 253s of a 268s boot,
@@ -10814,13 +12009,19 @@ pub async fn run_server(
 
     let extension_reconcile_ms = reconcile_started.elapsed().as_millis() as u64;
 
-    // Pre-warm PPR adjacency cache so the first PPR query after startup
-    // hits the cache instead of spending ~350ms rebuilding from the DB.
+    // Recover any interrupted index publication, then pre-warm the PPR
+    // adjacency cache before any listener can serve. This work may write and
+    // spawn_blocking cannot be cancelled; awaiting it here ensures an
+    // immediate shutdown can never let the task outlive run_server (and its
+    // DbWriteLease) or expose the pre-recovery graph to a request.
     {
         let store = state.store.clone();
+        let write_authority = write_authority.clone();
         tokio::task::spawn_blocking(move || {
-            reconcile_index_publication_before_ppr_warm(&store, read_only)
-        });
+            reconcile_index_publication_before_ppr_warm(&store, write_authority.as_deref())
+        })
+        .await
+        .context("boot publication recovery/PPR warm task panicked")?;
     }
 
     // Spawn periodic rate limiter cleanup (every 10 minutes).
@@ -10884,7 +12085,6 @@ pub async fn run_server(
     if let Some(timeout) = idle_timeout {
         let notify = idle_notify.clone();
         let active = state.clone();
-        let tx = shutdown_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -10899,13 +12099,12 @@ pub async fn run_server(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
                             );
-                            // Symmetry with the SIGTERM handler: this
-                            // broadcasts immediately, so a Shutdown RPC
-                            // arriving afterwards has nothing left to drain
-                            // and should not spawn a loop that would only
-                            // re-broadcast.
-                            active.shutdown_started.store(true, Ordering::Relaxed);
-                            let _ = tx.send(true);
+                            // A write may be admitted after the idle counters
+                            // were observed but before shutdown is marked. The
+                            // shared drain establishes the SeqCst admission
+                            // boundary, then waits for that write instead of
+                            // tearing listeners and ownership down beneath it.
+                            begin_shutdown_drain(Arc::clone(&active), "idle_timeout");
                             return;
                         }
                     }
@@ -11016,6 +12215,11 @@ pub async fn run_server(
     // admin API (dashboard "connected clients") and the metrics task
     // (`MCP_SESSIONS` gauge). `None` outside server mode.
     let mut mcp_session_gauge_opt: Option<std::sync::Arc<std::sync::atomic::AtomicU32>> = None;
+
+    // Public listeners own service clones (and therefore GraphStore Arcs).
+    // Retain their roots so graceful shutdown can prove the complete network
+    // task trees are gone before socket/pid/DbWriteLease cleanup.
+    let mut network_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
     // MCP-over-HTTP server — spawned alongside the gRPC servers.
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
@@ -11246,6 +12450,7 @@ pub async fn run_server(
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
                 active_writes: state.active_writes.clone(),
+                shutdown_started: state.shutdown_started.clone(),
                 mcp_sessions: mcp_session_gauge_opt
                     .clone()
                     .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
@@ -11493,58 +12698,63 @@ pub async fn run_server(
         // Store the MCP port — written alongside the gRPC port below.
         let mcp_port_for_file = mcp_actual_addr.port();
 
+        // Finish every fallible public-listener setup step before spawning
+        // either server. Otherwise a TCP bind/port-file error would return
+        // from run_server while a detached MCP task still owned the store.
+        let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+            .await
+            .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
+        let actual_addr = tcp_listener.local_addr()?;
+        tracing::info!(%actual_addr, "TCP server listening");
+        eprintln!("[daemon] TCP server listening on {}", actual_addr);
+        if let Some(ref pf) = opts.port_file {
+            // Write gRPC port on line 1, MCP HTTP port on line 2.
+            let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
+            std::fs::write(pf, contents)?;
+        }
+        let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+
         let mcp_tls_acceptor = tls_config.as_ref().map(|(_, a)| a.clone());
         let mut mcp_shutdown_rx = shutdown_tx.subscribe();
-        let mut mcp_accept_shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let mcp_task = tokio::spawn(async move {
             if let Some(acceptor) = mcp_tls_acceptor {
                 // B3: run each TLS handshake in its OWN task under a timeout and
-                // funnel only completed handshakes through a channel, so a peer
-                // that connects and never sends a ClientHello can't stall accepts
-                // for every other client on this public listener. A semaphore caps
-                // in-flight handshakes so a silent-client flood can't exhaust
-                // resources, and the accept task exits on shutdown so it doesn't
-                // leak the listener / spawn doomed handshakes.
+                // retain every handshake and connection in JoinSets. The shutdown
+                // path aborts+awaits pre-HTTP handshakes, gracefully closes+awaits
+                // HTTP connections, and only then lets this server root release
+                // its router/store ownership.
                 let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::channel::<
                     tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
                 >(256);
                 let handshake_sem =
                     std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
-                tokio::spawn(async move {
-                    loop {
-                        let (stream, _addr) = tokio::select! {
-                            _ = mcp_accept_shutdown_rx.changed() => break,
-                            res = mcp_listener.accept() => match res {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::debug!("MCP TCP accept failed: {e}");
-                                    continue;
-                                }
-                            },
-                        };
-                        // Backpressure: wait for a handshake permit before spawning.
-                        let permit = tokio::select! {
-                            _ = mcp_accept_shutdown_rx.changed() => break,
-                            res = handshake_sem.clone().acquire_owned() => match res {
-                                Ok(p) => p,
-                                Err(_) => break,
-                            },
-                        };
-                        let acceptor = acceptor.clone();
-                        let handshake_tx = handshake_tx.clone();
-                        tokio::spawn(drive_capped_handshake(
-                            permit,
-                            acceptor,
-                            stream,
-                            TLS_HANDSHAKE_TIMEOUT,
-                            handshake_tx,
-                            "MCP",
-                        ));
-                    }
-                });
-                let mut shutdown = Box::pin(mcp_shutdown_rx.changed());
+                let mut handshakes = tokio::task::JoinSet::new();
+                let mut connections = tokio::task::JoinSet::new();
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = mcp_shutdown_rx.changed() => break,
+                        accepted = mcp_listener.accept(), if handshakes.len() < MAX_INFLIGHT_HANDSHAKES => {
+                            let (stream, _addr) = match accepted {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    tracing::debug!("MCP TCP accept failed: {error}");
+                                    continue;
+                                }
+                            };
+                            let Ok(permit) = handshake_sem.clone().try_acquire_owned() else {
+                                tracing::debug!("MCP handshake permit unavailable despite JoinSet cap");
+                                continue;
+                            };
+                            handshakes.spawn(drive_capped_handshake(
+                                permit,
+                                acceptor.clone(),
+                                stream,
+                                TLS_HANDSHAKE_TIMEOUT,
+                                handshake_tx.clone(),
+                                "MCP",
+                            ));
+                        }
                         Some(stream) = handshake_rx.recv() => {
                             // Serving the router directly via hyper here does not
                             // populate `ConnectInfo<SocketAddr>`, so the nested
@@ -11557,19 +12767,47 @@ pub async fn run_server(
                             // MCP limiter's documented TLS fallback below. Terminate
                             // TLS at a trusted proxy that sets XFF for per-IP fidelity.
                             let svc = mcp_router.clone();
-                            tokio::spawn(async move {
-                                let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                            let mut connection_shutdown = mcp_shutdown_rx.clone();
+                            connections.spawn(async move {
+                                let hyper_svc =
+                                    hyper_util::service::TowerToHyperService::new(svc);
                                 let io = hyper_util::rt::TokioIo::new(stream);
-                                let _ = hyper_util::server::conn::auto::Builder::new(
+                                let builder = hyper_util::server::conn::auto::Builder::new(
                                     hyper_util::rt::TokioExecutor::new(),
-                                )
-                                .serve_connection(io, hyper_svc)
-                                .await;
+                                );
+                                let connection = builder.serve_connection(io, hyper_svc);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    _ = connection.as_mut() => {}
+                                    _ = connection_shutdown.changed() => {
+                                        connection.as_mut().graceful_shutdown();
+                                        let _ = connection.await;
+                                    }
+                                }
                             });
                         }
-                        _ = &mut shutdown => break,
+                        Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                            if let Err(error) = result {
+                                tracing::debug!("MCP TLS handshake task failed: {error}");
+                            }
+                        }
+                        Some(result) = connections.join_next(), if !connections.is_empty() => {
+                            if let Err(error) = result {
+                                tracing::debug!("MCP HTTP connection task failed: {error}");
+                            }
+                        }
                     }
                 }
+
+                // Handshakes have not entered application code, so cancellation
+                // is safe; nevertheless await every aborted task before dropping
+                // the listener. Existing HTTP work receives a graceful signal and
+                // is fully awaited so its router/GraphStore Arc cannot escape.
+                handshakes.abort_all();
+                while handshakes.join_next().await.is_some() {}
+                drop(handshake_tx);
+                while handshake_rx.try_recv().is_ok() {}
+                while connections.join_next().await.is_some() {}
             } else {
                 // `into_make_service_with_connect_info` populates
                 // `ConnectInfo<SocketAddr>` so the MCP rate limiter can key
@@ -11589,23 +12827,10 @@ pub async fn run_server(
                 .ok();
             }
         });
+        network_tasks.push(("MCP HTTP", mcp_task));
 
         // TCP listener for server mode — spawned before the blocking UDS serve.
         {
-            let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
-                .await
-                .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
-            let actual_addr = tcp_listener.local_addr()?;
-            tracing::info!(%actual_addr, "TCP server listening");
-            eprintln!("[daemon] TCP server listening on {}", actual_addr);
-
-            if let Some(ref pf) = opts.port_file {
-                // Write gRPC port on line 1, MCP HTTP port on line 2.
-                let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
-                std::fs::write(pf, contents)?;
-            }
-
-            let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
             let mut tcp_shutdown_rx = shutdown_tx.subscribe();
             let mut grpc_accept_shutdown_rx = shutdown_tx.subscribe();
 
@@ -11619,7 +12844,7 @@ pub async fn run_server(
             let tcp_svc =
                 tonic::service::interceptor::InterceptedService::new(svc.clone(), interceptor);
 
-            tokio::spawn(async move {
+            let tcp_task = tokio::spawn(async move {
                 let mut builder = tonic::transport::Server::builder();
                 let shutdown = async move {
                     let _ = tcp_shutdown_rx.changed().await;
@@ -11656,41 +12881,44 @@ pub async fn run_server(
                         let handshake_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
                             MAX_INFLIGHT_HANDSHAKES,
                         ));
-                        tokio::spawn(async move {
+                        let accept_task = tokio::spawn(async move {
                             let mut tcp = tcp_stream;
+                            let mut handshakes = tokio::task::JoinSet::new();
                             loop {
-                                let conn = tokio::select! {
+                                tokio::select! {
+                                    biased;
                                     _ = grpc_accept_shutdown_rx.changed() => break,
-                                    c = tcp.next() => match c {
-                                        Some(c) => c,
-                                        None => break,
-                                    },
-                                };
-                                let tcp_conn = match conn {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        tracing::debug!("gRPC TCP accept failed: {e}");
-                                        continue;
+                                    conn = tcp.next(), if handshakes.len() < MAX_INFLIGHT_HANDSHAKES => {
+                                        let Some(conn) = conn else { break };
+                                        let tcp_conn = match conn {
+                                            Ok(connection) => connection,
+                                            Err(error) => {
+                                                tracing::debug!("gRPC TCP accept failed: {error}");
+                                                continue;
+                                            }
+                                        };
+                                        let Ok(permit) = handshake_sem.clone().try_acquire_owned() else {
+                                            tracing::debug!("gRPC handshake permit unavailable despite JoinSet cap");
+                                            continue;
+                                        };
+                                        handshakes.spawn(drive_capped_handshake(
+                                            permit,
+                                            acme_acceptor.clone(),
+                                            tcp_conn,
+                                            TLS_HANDSHAKE_TIMEOUT,
+                                            tls_tx.clone(),
+                                            "gRPC",
+                                        ));
                                     }
-                                };
-                                let permit = tokio::select! {
-                                    _ = grpc_accept_shutdown_rx.changed() => break,
-                                    res = handshake_sem.clone().acquire_owned() => match res {
-                                        Ok(p) => p,
-                                        Err(_) => break,
-                                    },
-                                };
-                                let acme_acceptor = acme_acceptor.clone();
-                                let tls_tx = tls_tx.clone();
-                                tokio::spawn(drive_capped_handshake(
-                                    permit,
-                                    acme_acceptor,
-                                    tcp_conn,
-                                    TLS_HANDSHAKE_TIMEOUT,
-                                    tls_tx,
-                                    "gRPC",
-                                ));
+                                    Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                                        if let Err(error) = result {
+                                            tracing::debug!("gRPC TLS handshake task failed: {error}");
+                                        }
+                                    }
+                                }
                             }
+                            handshakes.abort_all();
+                            while handshakes.join_next().await.is_some() {}
                         });
                         // tonic wants a stream of `Result<conn, E>`; our channel
                         // carries only successfully-handshaked streams.
@@ -11700,6 +12928,7 @@ pub async fn run_server(
                             .add_service(tcp_svc)
                             .serve_with_incoming_shutdown(tls_incoming, shutdown)
                             .await;
+                        let _ = accept_task.await;
                     }
                     // Plain TCP (loopback / no TLS).
                     None => {
@@ -11710,6 +12939,7 @@ pub async fn run_server(
                     }
                 }
             });
+            network_tasks.push(("TCP gRPC", tcp_task));
         }
 
         // Spawn the worker pool to consume index jobs from the SQLite queue.
@@ -12184,10 +13414,29 @@ pub async fn run_server(
         }
     }
 
-    uds_serve
+    let uds_result = uds_serve
         .await
-        .context("UDS serve task panicked")?
-        .context("gRPC server error")?;
+        .context("UDS serve task panicked")
+        .and_then(|result| result.context("gRPC server error"));
+
+    // A serve error/panic can end UDS without a Shutdown RPC or signal. Enter
+    // the same admission-closing drain in that case; otherwise retained public
+    // servers would wait forever (or have to be detached) while writers could
+    // still be admitted.
+    if !state.shutdown_started.load(Ordering::SeqCst) {
+        begin_shutdown_drain(Arc::clone(&state), "uds_server_exit");
+    }
+
+    // The shutdown broadcast has stopped accepts and initiated each server's
+    // graceful drain. Await the retained roots before any filesystem/lease
+    // cleanup: their complete task trees own the public service clones, and a
+    // dropped JoinHandle would merely detach those GraphStore Arcs.
+    for (label, task) in network_tasks {
+        tracing::info!(server = label, "draining public network server before exit");
+        if let Err(error) = task.await {
+            tracing::error!(server = label, %error, "public network server task failed");
+        }
+    }
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
@@ -12251,7 +13500,7 @@ pub async fn run_server(
             "draining watcher task(s) before exit"
         );
         for task in watcher_tasks {
-            let _ = task.await;
+            let _ = task.handle.await;
         }
     }
 
@@ -12281,7 +13530,7 @@ pub async fn run_server(
     // is inside.
     lifecycle::remove_instance_dirs_for_temp_db(&db_path, &instance_id);
 
-    Ok(())
+    uds_result
 }
 
 // ── FlowTraceContinue implementation ────────────────────────────────────
@@ -12758,6 +14007,49 @@ fn probe_remote_sha(
 mod startup_helper_tests {
     use super::*;
     use nestweaver_engine::{RepoConfig, RepoType};
+
+    #[tokio::test]
+    async fn expected_brain_uuid_refuses_a_missing_database_before_writer_authority_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.lbug");
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(
+            &config_path,
+            r#"instance_id = "expected-brain"
+expected_brain_uuid = "11111111-1111-4111-8111-111111111111"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver-test-snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver-test-workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+        )
+        .unwrap();
+
+        let error = run_server(&db_path, None, Some(&config_path), None)
+            .await
+            .expect_err("an asserted identity must never initialize a missing database");
+        assert!(
+            error.to_string().contains("refusing to create"),
+            "{error:#}"
+        );
+        assert!(!db_path.exists(), "the refusal created a database file");
+        assert!(
+            !nestweaver_store::write_lease_path(&db_path).exists(),
+            "the refusal created a writer sidecar before validating identity"
+        );
+    }
 
     /// Helper: init a git repo with one commit and return its path.
     fn init_repo(dir: &std::path::Path) {
@@ -14933,6 +16225,7 @@ mod startup_helper_tests {
                 "deterministic preflight projection failure"
             ))),
             &store,
+            IndexedSearchMutationScope::GraphOnly,
         );
 
         assert_eq!(comparison, IndexedSearchMutation::Unknown);
@@ -14949,6 +16242,32 @@ mod startup_helper_tests {
                 .unwrap()
                 .is_empty(),
             "available search must repair after an unknown preflight projection"
+        );
+    }
+
+    #[test]
+    fn equal_search_projections_are_proven_only_for_graph_only_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("test.lbug")).unwrap();
+        let before = indexed_search_rows(&store).unwrap();
+
+        assert_eq!(
+            indexed_search_mutation(
+                Some(Ok(before.clone())),
+                &store,
+                IndexedSearchMutationScope::GraphOnly,
+            ),
+            IndexedSearchMutation::Unchanged,
+            "equal graph projections prove a graph-only cleanup did not change Tantivy rows"
+        );
+        assert_eq!(
+            indexed_search_mutation(
+                Some(Ok(before)),
+                &store,
+                IndexedSearchMutationScope::MayIncludeVaultFiles,
+            ),
+            IndexedSearchMutation::Unknown,
+            "vault files may already differ from Tantivy even when graph projections are equal"
         );
     }
 
@@ -15124,6 +16443,163 @@ mod startup_helper_tests {
         assert!(
             Arc::ptr_eq(&first_handle, &second_handle),
             "a healthy runtime must hand back the SAME handle, not re-open"
+        );
+    }
+
+    #[test]
+    fn search_debt_clears_only_after_a_proven_noop_or_successful_rebuild() {
+        let state = test_state_with_writer();
+        let admission = establish_search_reconciliation_debt(&state, "index_vault").unwrap();
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "writer lock held".to_string(),
+            ));
+
+        finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Unchanged,
+            "index_vault",
+            admission,
+        )
+        .expect("a newly established proven no-op needs no writer and may clear debt");
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+
+        let admission =
+            establish_search_reconciliation_debt(&state, "refresh_vault_since").unwrap();
+        let error = finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Changed,
+            "refresh_vault_since",
+            admission,
+        )
+        .expect_err("a changed corpus without a writer must remain degraded");
+        assert!(format!("{error:#}").contains("writer lock held"));
+        let debt = load_search_reconciliation_debt(&state.db_path)
+            .unwrap()
+            .expect("failed reconciliation remains durable");
+        assert_eq!(debt.operation, "refresh_vault_since");
+        assert_eq!(debt.attempts, 1);
+
+        let status = search_capability_status(&state);
+        assert!(status.reader_available);
+        assert!(!status.writer_available);
+        assert!(!status.current);
+        assert!(status.reconciliation_debt);
+        assert!(status.error.contains("writer lock held"));
+    }
+
+    #[test]
+    fn a_later_noop_cannot_clear_an_earlier_failed_search_reconciliation() {
+        let state = test_state_with_writer();
+        let first = establish_search_reconciliation_debt(&state, "index_vault").unwrap();
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "writer lock held".to_string(),
+            ));
+        finish_search_reconciliation(&state, IndexedSearchMutation::Changed, "index_vault", first)
+            .expect_err("the first failed rebuild must leave durable debt");
+
+        let second = establish_search_reconciliation_debt(&state, "refresh_vault_since").unwrap();
+        assert!(second.had_existing_debt);
+        finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Unchanged,
+            "refresh_vault_since",
+            second,
+        )
+        .expect_err("a later no-op must retry, not erase, the earlier debt");
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_retries_durable_search_debt_under_writer_ownership() {
+        let state = test_state_with_writer();
+        establish_search_reconciliation_debt(&state, "index_vault").unwrap();
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_some()
+        );
+
+        retry_search_reconciliation_debt_at_startup(&state)
+            .await
+            .expect("healthy startup writer rebuilds the corpus");
+
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none(),
+            "successful startup rebuild is the clearing proof"
+        );
+        assert!(search_capability_status(&state).current);
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+        assert!(state.write_gate.holder_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_writer_schedules_durable_debt_recovery_under_the_write_gate() {
+        let state = test_state_with_writer();
+        state.search.attach_recovery_context(&state);
+        establish_search_reconciliation_debt(&state, "index_vault").unwrap();
+
+        let held = state.write_gate.mutex().lock_owned().await;
+        assert!(
+            state.tantivy().is_some(),
+            "reader remains usable while debt waits"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("debt recovery must enter write admission before waiting");
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_some(),
+            "the marker cannot clear before the recovery owns the writer gate"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if load_search_reconciliation_debt(&state.db_path)
+                    .unwrap()
+                    .is_none()
+                    && state.active_writes.load(Ordering::Relaxed) == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovered writer must rebuild and clear durable debt");
+    }
+
+    #[test]
+    fn unreadable_search_debt_never_reports_the_corpus_current() {
+        let state = test_state_with_writer();
+        std::fs::write(search_reconciliation_debt_path(&state.db_path), b"not-json").unwrap();
+
+        let status = search_capability_status(&state);
+        assert!(!status.current);
+        assert!(status.reconciliation_debt);
+        assert!(status.error.contains("unreadable"));
+        assert!(
+            establish_search_reconciliation_debt(&state, "index_vault").is_err(),
+            "a corrupt marker must refuse the graph mutation, never be overwritten"
         );
     }
 
@@ -16401,6 +17877,271 @@ mod startup_helper_tests {
         );
     }
 
+    #[test]
+    fn degraded_project_materialization_is_a_committed_error_not_done() {
+        use nestweaver_engine::manifest::{
+            GraphMutationPublicationDisposition, GraphMutationPublicationOutcome,
+            GraphMutationPublicationWarning,
+        };
+
+        let mut result = nestweaver_engine::ProjectMaterializationResult {
+            projects_created: 2,
+            note_edges: 3,
+            symbol_edges: 5,
+            component_edges: 1,
+            wiki_notes_ingested: 0,
+            wiki_fetch_errors: 0,
+            publication: GraphMutationPublicationOutcome {
+                disposition: GraphMutationPublicationDisposition::CommittedDegraded,
+                generation_before: 40,
+                generation_after: 41,
+                warnings: vec![GraphMutationPublicationWarning {
+                    stage: "persist-generation".to_string(),
+                    message: "disk full".to_string(),
+                }],
+            },
+        };
+        let terminal = materialize_projects_terminal_progress(&result);
+        assert_eq!(terminal.phase, Phase::Error as i32);
+        assert!(terminal.message.contains("committed graph changes"));
+        assert!(terminal.message.contains("generation 40 -> 41"));
+        assert!(terminal.message.contains("persist-generation: disk full"));
+        assert!(terminal.message.contains("NOT rolled back"));
+
+        result.publication.disposition = GraphMutationPublicationDisposition::CommittedComplete;
+        result.publication.warnings.clear();
+        assert_eq!(
+            materialize_projects_terminal_progress(&result).phase,
+            Phase::Done as i32
+        );
+        result.publication.disposition = GraphMutationPublicationDisposition::ConfirmedNoChange;
+        assert_eq!(
+            materialize_projects_terminal_progress(&result).phase,
+            Phase::Done as i32
+        );
+    }
+
+    /// Implicit-project detection is a graph writer on apply, despite its
+    /// read-sounding name. The daemon must stamp its configured identity and
+    /// retain write ownership after the requesting future is cancelled; the
+    /// explicit dry-run remains able to complete without the write gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn implicit_project_detection_uses_daemon_identity_and_exact_worker_ownership() {
+        let mut state = test_state_with_writer();
+        {
+            let state = Arc::get_mut(&mut state).expect("sole test-state owner");
+            state.data_instance_id = "configured-brain".to_string();
+            state.instance_stated_by_config = true;
+        }
+        let vault = tempfile::tempdir().unwrap();
+        let project_dir = vault.path().join("Projects").join("owned-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("owned-project.md"), "# Owned\n").unwrap();
+
+        let held_gate = state.write_gate.mutex().lock_owned().await;
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(JsonRequest {
+            args_json: serde_json::json!({
+                "vault": vault.path().to_string_lossy(),
+                "instance_id": "",
+            })
+            .to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let rpc = tokio::spawn(async move { service.detect_implicit_projects_json(request).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("implicit-project worker must be admitted before it queues");
+        rpc.abort();
+        let _ = rpc.await;
+        assert_eq!(
+            state.active_writes.load(Ordering::Relaxed),
+            1,
+            "disconnect must not hide the queued blocking writer"
+        );
+
+        drop(held_gate);
+        let uid = nestweaver_schema::project_uid("configured-brain", "owned-project");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state.store.project_exists(&uid).unwrap_or(false)
+                    && state.active_writes.load(Ordering::Relaxed) == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled implicit-project writer must finish under configured identity");
+        assert!(
+            !state
+                .store
+                .project_exists(&nestweaver_schema::project_uid("default", "owned-project"))
+                .unwrap(),
+            "daemon detection must not hard-code the default namespace"
+        );
+
+        let explicit_dir = vault.path().join("Projects").join("explicit-project");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+        std::fs::write(explicit_dir.join("explicit-project.md"), "# Explicit\n").unwrap();
+        let mut explicit_request = Request::new(JsonRequest {
+            args_json: serde_json::json!({
+                "vault": vault.path().to_string_lossy(),
+                "instance_id": "explicit-brain",
+                "dry_run": false,
+            })
+            .to_string(),
+        });
+        explicit_request
+            .extensions_mut()
+            .insert(crate::auth::IsAdmin(true));
+        let explicit = DaemonService::new(state.clone())
+            .detect_implicit_projects_json(explicit_request)
+            .await
+            .expect("an exact request identity remains authoritative")
+            .into_inner();
+        let explicit: serde_json::Value =
+            serde_json::from_str(&explicit.result_json).expect("publication-aware JSON");
+        assert!(explicit["projects"].as_array().is_some_and(|projects| {
+            projects
+                .iter()
+                .any(|name| name.as_str() == Some("explicit-project"))
+        }));
+        assert!(explicit["publication"]["disposition"].is_string());
+        assert!(
+            state
+                .store
+                .project_exists(&nestweaver_schema::project_uid(
+                    "explicit-brain",
+                    "explicit-project"
+                ))
+                .unwrap(),
+            "a non-empty request identity must be stamped exactly"
+        );
+
+        let preview_dir = vault.path().join("Workspaces").join("preview-project");
+        std::fs::create_dir_all(&preview_dir).unwrap();
+        std::fs::write(preview_dir.join("_Overview.md"), "# Preview\n").unwrap();
+        let held_gate = state.write_gate.mutex().lock_owned().await;
+        let preview = DaemonService::new(state.clone())
+            .detect_implicit_projects_json(Request::new(JsonRequest {
+                args_json: serde_json::json!({
+                    "vault": vault.path().to_string_lossy(),
+                    "dry_run": true,
+                })
+                .to_string(),
+            }))
+            .await
+            .expect("dry-run must not wait for write ownership");
+        drop(held_gate);
+        let preview: serde_json::Value = serde_json::from_str(&preview.into_inner().result_json)
+            .expect("dry-run publication-aware JSON");
+        assert!(preview["projects"].as_array().is_some_and(|projects| {
+            projects
+                .iter()
+                .any(|name| name.as_str() == Some("preview-project"))
+        }));
+        assert_eq!(preview["publication"]["disposition"], "confirmed_no_change");
+        assert!(
+            !state
+                .store
+                .project_exists(&nestweaver_schema::project_uid(
+                    "configured-brain",
+                    "preview-project"
+                ))
+                .unwrap(),
+            "dry-run must not mutate the graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_replica_allows_implicit_project_preview_but_rejects_apply() {
+        let mut state = test_state_with_writer();
+        Arc::get_mut(&mut state).unwrap().read_only = true;
+        let vault = tempfile::tempdir().unwrap();
+        let project_dir = vault.path().join("Workspaces").join("preview");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("_Overview.md"), "# Preview\n").unwrap();
+        let service = DaemonService::new(state);
+
+        assert!(
+            read_only_rejection(
+                true,
+                "/nestweaver.daemon.v1.NestWeaverDaemon/DetectImplicitProjectsJson"
+            )
+            .is_none(),
+            "the transport must let the payload-aware handler inspect dry_run"
+        );
+        service
+            .detect_implicit_projects_json(Request::new(JsonRequest {
+                args_json: serde_json::json!({
+                    "vault": vault.path().to_string_lossy(),
+                    "dry_run": true,
+                })
+                .to_string(),
+            }))
+            .await
+            .expect("preview is a read and must remain available on a replica");
+
+        let mut apply = Request::new(JsonRequest {
+            args_json: serde_json::json!({
+                "vault": vault.path().to_string_lossy(),
+                "dry_run": false,
+            })
+            .to_string(),
+        });
+        apply.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let error = service
+            .detect_implicit_projects_json(apply)
+            .await
+            .expect_err("the mutating form must still fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// The daemon proxy must reject a malformed PR file set atomically. The
+    /// former `filter_map` silently discarded bad entries and analyzed a
+    /// smaller diff, allowing a partial-input result to look authoritative.
+    #[tokio::test]
+    async fn pr_impact_rejects_every_invalid_file_array_without_filtering() {
+        let service = DaemonService::new(test_state_with_writer());
+        for (files, expected) in [
+            (serde_json::json!([]), "at least one"),
+            (serde_json::json!(["src/lib.rs", 17]), "invalid files[1]"),
+            (serde_json::json!(["src/lib.rs", "  "]), "changed_files[1]"),
+            (serde_json::json!(["/tmp/lib.rs"]), "changed_files[0]"),
+            (
+                serde_json::json!(["src/lib.rs", "../outside.rs"]),
+                "changed_files[1]",
+            ),
+            (
+                serde_json::json!(vec!["src/lib.rs"; 1001]),
+                "maximum is 1000",
+            ),
+            (
+                serde_json::json!(["src/lib.rs", format!("src/{}", "a".repeat(509))]),
+                "maximum is 512",
+            ),
+        ] {
+            let error = service
+                .pr_impact_json(Request::new(JsonRequest {
+                    args_json: serde_json::json!({ "files": files }).to_string(),
+                }))
+                .await
+                .expect_err("invalid changed-file array must be rejected before analysis");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(
+                error.message().contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
     /// A per-request `--instance` still beats the recorded identity: the
     /// request is the most explicit statement of intent there is, and
     /// `instance merge --from/--to` (the documented remedy for an already
@@ -17403,7 +19144,10 @@ mod startup_helper_tests {
             open_browser: false,
             watch: false,
             watch_repo_path: String::new(),
-            watch_instance_id: "default".to_string(),
+            // Empty delegates to the daemon's exact live DB/config identity;
+            // a test helper must not smuggle a literal default into every UI
+            // request and mask identity regressions.
+            watch_instance_id: String::new(),
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         request
@@ -17467,6 +19211,93 @@ mod startup_helper_tests {
         assert_eq!(resp.error, "port_in_use");
         assert_eq!(resp.port, 0);
         drop(blocker);
+    }
+
+    /// ServeUI watchers use the same canonical registration and retained-task
+    /// path as WatchCode. Repeating an equivalent request is idempotent, the
+    /// daemon's configured identity is retained, and StopUI drains the exact
+    /// watcher it created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_ui_watcher_is_registered_idempotent_and_drained() {
+        let mut state = test_state_with_writer();
+        {
+            let state = Arc::get_mut(&mut state).expect("sole test-state owner");
+            state.data_instance_id = "configured-brain".to_string();
+            state.instance_stated_by_config = true;
+        }
+        let service = DaemonService::new(state.clone());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("seed.rs"), "fn seed() {}\n").unwrap();
+        let repo_path = repo.path().canonicalize().unwrap();
+        let port = free_port();
+
+        let request = |requested_port: u16| {
+            let mut request = Request::new(ServeUiRequest {
+                port: u32::from(requested_port),
+                open_browser: false,
+                watch: true,
+                watch_repo_path: repo_path.to_string_lossy().into_owned(),
+                // Empty means the daemon owns identity resolution.
+                watch_instance_id: String::new(),
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            request
+        };
+
+        let first = service.serve_ui(request(port)).await.unwrap().into_inner();
+        assert!(first.ok, "first ServeUI failed: {}", first.message);
+        let watcher_id = {
+            let ui = state.ui_server.lock().unwrap();
+            let binding = ui
+                .as_ref()
+                .and_then(|registration| registration.watcher.as_ref())
+                .expect("ServeUI watcher binding");
+            assert_eq!(binding.instance_id, "configured-brain");
+            binding.id
+        };
+
+        let second = service
+            .serve_ui(request(free_port()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(second.ok, "repeated ServeUI failed: {}", second.message);
+        assert_eq!(second.port, u32::from(port));
+        assert_eq!(
+            state
+                .ui_server
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|registration| registration.watcher.as_ref())
+                .map(|binding| binding.id),
+            Some(watcher_id),
+            "an equivalent ServeUI request must not create a second watcher"
+        );
+        assert_eq!(
+            state
+                .watcher_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| task.id == watcher_id)
+                .count(),
+            1
+        );
+
+        let mut stop = Request::new(StopUiRequest {});
+        stop.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_ui(stop).await.unwrap().into_inner().ok);
+        assert!(!watcher_registration_is_active(&state, watcher_id));
+        assert!(
+            state
+                .watcher_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|task| task.id != watcher_id),
+            "StopUI must await and remove its retained watcher task"
+        );
     }
 
     /// nw-258(a). The daemon writes this sidecar and never reloaded it, so
@@ -17725,6 +19556,11 @@ credential_method = "gh"
             response.effective_config.unwrap().source,
             Some(effective_config::Source::CompiledDefaults(_))
         ));
+        let search = response.search_status.expect("structured search status");
+        assert!(search.reader_available);
+        assert!(search.writer_available);
+        assert!(search.current);
+        assert!(!search.reconciliation_debt);
         let typed = response
             .embedding_status
             .expect("structured embedding status");
@@ -17733,6 +19569,8 @@ credential_method = "gh"
         assert_eq!(typed.selected_device, "");
         assert!(typed.error.contains("Metal"));
         assert!(!typed.fallback_used);
+        assert_eq!(typed.identity_state, "verified");
+        assert!(typed.identity_error.is_empty());
 
         let json = service
             .brain_status_json(Request::new(JsonRequest {
@@ -17747,6 +19585,11 @@ credential_method = "gh"
         assert_eq!(value["embedding_status"]["requested_device"], "metal");
         assert_eq!(value["embedding_status"]["selected_device"], "");
         assert_eq!(value["embedding_status"]["fallback_used"], false);
+        assert_eq!(value["embedding_status"]["identity_state"], "verified");
+        assert_eq!(value["search_status"]["reader_available"], true);
+        assert_eq!(value["search_status"]["writer_available"], true);
+        assert_eq!(value["search_status"]["current"], true);
+        assert_eq!(value["search_status"]["reconciliation_debt"], false);
         assert!(
             value.get("effective_config").is_none(),
             "effective config provenance must remain typed-only so Combined federation cannot backfill it"
@@ -17849,6 +19692,137 @@ credential_method = "gh"
             ..EmbeddingRuntimeStatus::default()
         };
         assert_eq!(effective_embedding_state(&failed, &running), "failed");
+    }
+
+    #[test]
+    fn unreadable_embedding_identity_is_typed_and_force_is_not_an_override() {
+        let status = embedding_identity_precondition_status(
+            "embedding write",
+            &"metadata row could not be decoded",
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("embedding write"));
+        assert!(
+            status
+                .message()
+                .contains("metadata row could not be decoded")
+        );
+        assert!(status.message().contains("--force cannot bypass"));
+
+        let runtime = embedding_identity_unreadable_status(
+            EmbeddingRuntimeStatus {
+                state: "ready".to_string(),
+                selected_device: "metal".to_string(),
+                ..EmbeddingRuntimeStatus::default()
+            },
+            "bad identity",
+        );
+        assert_eq!(runtime.state, "identity_unreadable");
+        assert!(runtime.selected_device.is_empty());
+        assert_eq!(runtime.error, "bad identity");
+    }
+
+    #[tokio::test]
+    async fn typed_brain_search_round_trips_malformed_embedding_identity_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed-search-identity.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("recorded-model", 3).unwrap();
+        {
+            let conn = store.begin_transaction().unwrap();
+            conn.query("MATCH (m:Meta {key: 'embedding'}) SET m.value = '{not-json'")
+                .unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let degraded = Arc::new(GraphStore::open(&db_path).unwrap());
+        assert!(degraded.embedding_identity_error().is_some());
+        let service = DaemonService::new(test_state_with_authz(
+            degraded,
+            build_daemon_permission_source(None),
+        ));
+
+        let response = service
+            .search(Request::new(BrainSearchRequest {
+                query: "needle".to_string(),
+                limit: 10,
+                response_format: None,
+                include_bodies: false,
+                prf: false,
+                rerank: false,
+                root: None,
+            }))
+            .await
+            .expect("lexical search remains available")
+            .into_inner();
+
+        assert_eq!(response.degraded_components, ["semantic"]);
+        let detail = response
+            .semantic_unavailable
+            .expect("typed response must preserve structured degradation");
+        assert_eq!(detail.cause, "embedding_identity");
+        assert_eq!(detail.reason, "embedding_identity_unreadable");
+        assert!(detail.error.contains("embedding"), "{}", detail.error);
+        assert!(
+            detail.remediation.contains("repair"),
+            "{}",
+            detail.remediation
+        );
+    }
+
+    #[test]
+    fn only_requested_semantic_or_rerank_routes_require_verified_identity() {
+        assert_eq!(
+            embedding_identity_operation("brain_context", &serde_json::json!({}), None,),
+            Some("semantic brain_context")
+        );
+        assert_eq!(
+            embedding_identity_operation(
+                "brain_context",
+                &serde_json::json!({
+                    "weight_ppr": 1.0,
+                    "weight_bm25": 0.0,
+                    "weight_semantic": 0.0,
+                }),
+                None,
+            ),
+            None,
+            "an explicitly nonzero lexical/graph leg plus zero semantic is a usable non-semantic query"
+        );
+        assert_eq!(
+            embedding_identity_operation(
+                "brain_search",
+                &serde_json::json!({ "rerank": true }),
+                None,
+            ),
+            Some("rerank")
+        );
+        assert_eq!(
+            embedding_identity_operation(
+                "brain_search",
+                &serde_json::json!({ "rerank": false }),
+                None,
+            ),
+            None
+        );
+
+        let mut lexical = serde_json::json!({
+            "semantic_applied": false,
+            "degraded_components": [],
+        });
+        annotate_lexical_identity_degradation(
+            "brain_search",
+            Some("identity metadata unreadable"),
+            &mut lexical,
+        );
+        assert_eq!(
+            lexical["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
+        assert_eq!(
+            lexical["semantic_unavailable"]["reason"],
+            "embedding_identity_unreadable"
+        );
     }
 
     /// A pass that ends — normally, by panic, or by cancellation — must not
@@ -18128,6 +20102,7 @@ credential_method = "gh"
             scope: "all".to_string(),
             force: false,
             batch_size: 0,
+            repair_identity: false,
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
 
@@ -18146,6 +20121,49 @@ credential_method = "gh"
 
     #[cfg(feature = "embed")]
     #[tokio::test]
+    async fn explicit_daemon_identity_repair_discards_unverified_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed-embedding.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("old-model", 3).unwrap();
+        assert!(store.add_embedding("symbol:old", vec![0.1, 0.2, 0.3]));
+        store.flush_embedding_index().unwrap();
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        {
+            let conn = store.begin_transaction().unwrap();
+            conn.query("MATCH (m:Meta {key: 'embedding'}) SET m.value = '{not-json'")
+                .unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let degraded = Arc::new(GraphStore::open(&db_path).unwrap());
+        assert!(degraded.embedding_identity_error().is_some());
+
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test state must be uniquely owned");
+        state_mut.store = Arc::clone(&degraded);
+        state_mut.db_path = db_path;
+        let service = DaemonService::new(state);
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: true,
+            batch_size: 1,
+            repair_identity: true,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let response = service.embed(request).await.unwrap().into_inner();
+        assert!(response.identity_repaired);
+        assert!(response.restart_required);
+        assert_eq!(response.discarded_embeddings, 1);
+        assert_eq!(degraded.embedding_identity_error(), None);
+        assert_eq!(degraded.get_embedding_pipeline().unwrap(), None);
+        assert_eq!(degraded.embedding_count(), 0);
+        assert!(!embedding_path.exists());
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
     async fn embed_plan_reports_all_missing_nodes_as_eligible() {
         let state = test_state_with_writer();
         insert_unembedded_nodes_for_every_scope(&state.store, "plan-missing");
@@ -18156,6 +20174,7 @@ credential_method = "gh"
                 scope: "all".to_string(),
                 force: false,
                 batch_size: 0,
+                repair_identity: false,
             }))
             .await
             .unwrap()
@@ -18181,6 +20200,7 @@ credential_method = "gh"
                 scope: "all".to_string(),
                 force: false,
                 batch_size: 0,
+                repair_identity: false,
             }))
             .await
             .unwrap()
@@ -18206,6 +20226,7 @@ credential_method = "gh"
                 scope: "all".to_string(),
                 force: true,
                 batch_size: 0,
+                repair_identity: false,
             }))
             .await
             .unwrap()
@@ -18226,6 +20247,7 @@ credential_method = "gh"
                 scope: "unknown".to_string(),
                 force: false,
                 batch_size: 0,
+                repair_identity: false,
             }))
             .await
             .unwrap_err();
@@ -18261,6 +20283,7 @@ credential_method = "gh"
             scope: "all".to_string(),
             force: false,
             batch_size: 1,
+            repair_identity: false,
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         let response = service.embed(request).await.unwrap().into_inner();
@@ -18469,6 +20492,7 @@ external_model = "unavailable-test-model"
                 scope: "symbols".to_string(),
                 force: true,
                 batch_size: 1,
+                repair_identity: false,
             });
             request.extensions_mut().insert(crate::auth::IsAdmin(true));
             if let Err(error) = service.embed(request).await {
@@ -18489,6 +20513,7 @@ external_model = "unavailable-test-model"
             scope: "symbols".to_string(),
             force: true,
             batch_size: 1,
+            repair_identity: false,
         });
         final_request
             .extensions_mut()
@@ -18541,6 +20566,7 @@ external_model = "unavailable-test-model"
             scope: "symbols".to_string(),
             force: false,
             batch_size: 8,
+            repair_identity: false,
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         let response = DaemonService::new(state.clone())
@@ -18591,6 +20617,7 @@ external_model = "unavailable-test-model"
             scope: "symbols".to_string(),
             force: false,
             batch_size: 8,
+            repair_identity: false,
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         let response = DaemonService::new(state.clone())
@@ -18699,6 +20726,73 @@ external_model = "unavailable-test-model"
         );
     }
 
+    #[tokio::test]
+    async fn typed_context_routes_propagate_restricted_visibility_to_the_tool_boundary() {
+        use nestweaver_engine::authz::{Identity, StaticConfigPermissionSource};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        for repo in [
+            test_repo("repo:visible", "https://github.com/acme/visible.git", None),
+            test_repo("repo:hidden", "https://github.com/acme/hidden.git", None),
+        ] {
+            store.insert_repo(&repo).unwrap();
+        }
+        let token = "typed-context-scope";
+        let source = Arc::new(StaticConfigPermissionSource::new(
+            [(token.to_string(), vec!["repo:visible".to_string()])]
+                .into_iter()
+                .collect(),
+        ));
+        let service = DaemonService::new(test_state_with_authz(store, source));
+
+        let mut context = Request::new(BrainContextRequest {
+            seeds: vec!["seed".to_string()],
+            ..Default::default()
+        });
+        context
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+        let error = service.get_context(context).await.unwrap_err();
+        assert!(
+            error.message().contains("repository-restricted identity"),
+            "typed context must pass request visibility to the common fail-closed boundary: {error}"
+        );
+
+        let mut project = Request::new(ProjectContextRequest {
+            project: "project".to_string(),
+            ..Default::default()
+        });
+        project
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+        let error = service.get_project_context(project).await.unwrap_err();
+        assert!(
+            error.message().contains("repository-restricted identity"),
+            "typed project context must pass request visibility to the common fail-closed boundary: {error}"
+        );
+
+        let mut hubs = Request::new(HubNodesRequest::default());
+        hubs.extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+        let error = service.hub_nodes(hubs).await.unwrap_err();
+        assert!(error.message().contains("repository-restricted identity"));
+
+        let mut status = Request::new(BrainStatusRequest {});
+        status
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+        let error = service.brain_status(status).await.unwrap_err();
+        assert!(error.message().contains("repository-restricted identity"));
+
+        let mut repos = Request::new(RepoStatesRequest {});
+        repos
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+        let repos = service.repo_states(repos).await.unwrap().into_inner();
+        assert_eq!(repos.repos.len(), 1);
+        assert_eq!(repos.repos[0].repo_uid, "repo:visible");
+    }
+
     /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled
     /// `[authz]` policy. The UDS interceptor is the trusted-local-admin
     /// boundary; before the fix it attached only `IsAdmin(true)` and no
@@ -18763,6 +20857,91 @@ external_model = "unavailable-test-model"
     /// must block until the gate is released. An ungated implementation returns
     /// immediately — the RED failure this test guards against.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_unary_worker_retains_write_ownership_until_it_finishes() {
+        let state = test_state_with_writer();
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let service = DaemonService::new(state.clone());
+        let worker_started = started.clone();
+        let worker_release = release.clone();
+
+        let request = tokio::spawn(async move {
+            service
+                .run_unary_mutation("disconnect_probe", move || {
+                    worker_started.store(true, Ordering::Release);
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Ok::<_, Status>(())
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first blocking worker must start");
+
+        // Simulate a client disconnect. The JoinHandle owned by the RPC future
+        // is dropped, but spawn_blocking itself continues.
+        request.abort();
+        let _ = request.await;
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.write_gate.holder_snapshot().map(|(label, _)| label),
+            Some("disconnect_probe".to_string())
+        );
+
+        let competitor_entered = Arc::new(AtomicBool::new(false));
+        let competitor_flag = competitor_entered.clone();
+        let competing_service = DaemonService::new(state.clone());
+        let competitor = tokio::spawn(async move {
+            competing_service
+                .run_unary_mutation("competing_probe", move || {
+                    competitor_flag.store(true, Ordering::Release);
+                    Ok::<_, Status>(())
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("competing worker must queue behind the disconnected worker");
+        assert!(!competitor_entered.load(Ordering::Acquire));
+
+        let mut shutdown = state.shutdown_tx.subscribe();
+        begin_shutdown_drain(state.clone(), "disconnect_test");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), shutdown.changed())
+                .await
+                .is_err(),
+            "shutdown must not broadcast while the disconnected worker is live"
+        );
+
+        release.store(true, Ordering::Release);
+        competitor
+            .await
+            .expect("competitor task")
+            .expect("competitor mutation");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both exact workers must release write ownership");
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.changed())
+            .await
+            .expect("shutdown broadcasts after the workers finish")
+            .expect("shutdown sender remains live");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reindex_search_holds_write_gate() {
         let state = test_state_with_writer();
         let service = DaemonService::new(state.clone());
@@ -18786,6 +20965,13 @@ external_model = "unavailable-test-model"
         );
 
         drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled reindex worker must finish after the gate is released");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18809,6 +20995,13 @@ external_model = "unavailable-test-model"
             "remove_project must serialize with the daemon write gate"
         );
         drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled remove-project worker must finish after gate release");
     }
 
     /// The admin `set_extension` RPC does a read-modify-write of the
@@ -18819,8 +21012,8 @@ external_model = "unavailable-test-model"
     ///
     /// Probed the same way as `reindex_search_holds_write_gate`: while the
     /// test holds `write_mutex`, a gated `set_extension` must block until the
-    /// gate is released. The `json_rpc!`-dispatched implementation runs under
-    /// a *read* guard and returns immediately — the RED failure this guards.
+    /// gate is released. An implementation that falls back to ordinary
+    /// read-dispatch returns immediately — the RED failure this guards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_extension_holds_write_gate() {
         let state = test_state_with_writer();
@@ -18846,6 +21039,13 @@ external_model = "unavailable-test-model"
         );
 
         drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled extension worker must finish after gate release");
     }
 
     /// nw-244: PR #308 wired `brain_memory_consolidate` to the write gate ONLY
@@ -18900,6 +21100,32 @@ external_model = "unavailable-test-model"
         );
 
         drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled applying consolidation must finish after gate release");
+
+        // The MCP leaf defaults to refusing apply unless its synchronous host
+        // attests authoritative ownership on the SAME thread. Reaching a
+        // successful empty-store apply through the daemon proves the scope is
+        // installed inside (and only for) the exact blocking worker above.
+        let mut owned_apply = Request::new(JsonRequest {
+            args_json: serde_json::json!({ "apply": true }).to_string(),
+        });
+        owned_apply
+            .extensions_mut()
+            .insert(crate::auth::IsAdmin(true));
+        let result = service
+            .brain_memory_consolidate(owned_apply)
+            .await
+            .expect("daemon-owned apply must satisfy MCP authoritative-writer guard")
+            .into_inner();
+        let result: serde_json::Value =
+            serde_json::from_str(&result.result_json).expect("valid consolidation JSON");
+        assert_eq!(result["dry_run"], false);
     }
 
     /// T6.2: the Shutdown RPC MUST set `state.drained` synchronously — before
@@ -19172,6 +21398,61 @@ external_model = "unavailable-test-model"
             state.drained.load(Ordering::Relaxed),
             "the worker must stop claiming new jobs on every shutdown route"
         );
+    }
+
+    #[test]
+    fn shutdown_between_write_increment_and_recheck_rolls_admission_back() {
+        let active = AtomicU32::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let admitted = try_admit_write_with(&active, &shutdown, || {
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            shutdown.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!admitted);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_write_increment_ordered_before_shutdown_remains_visible_to_the_drain() {
+        let active = AtomicU32::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        assert!(try_admit_write_with(&active, &shutdown, || {}));
+        shutdown.store(true, Ordering::SeqCst);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+    }
+
+    /// A writer admitted after idle observed zero but before it begins
+    /// shutdown must be drained. Broadcasting directly from the idle task
+    /// closed listeners and ownership while this unabortable write continued.
+    #[tokio::test]
+    async fn idle_shutdown_drains_a_write_admitted_after_the_idle_observation() {
+        let state = test_state_with_writer();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        assert!(is_idle(
+            state.active_reads.load(Ordering::Relaxed)
+                + state.active_writes.load(Ordering::Relaxed),
+            state.indexing_active.load(Ordering::Relaxed),
+        ));
+
+        let admitted = ConnectionGuard::write(&state)
+            .expect("write enters after the idle task's zero-counter observation");
+        begin_shutdown_drain(Arc::clone(&state), "idle_timeout");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), shutdown_rx.changed())
+                .await
+                .is_err(),
+            "idle shutdown broadcast while the newly admitted write was in flight"
+        );
+        drop(admitted);
+        tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
+            .await
+            .expect("idle drain must finish after the write")
+            .expect("shutdown channel closed");
+        assert!(*shutdown_rx.borrow());
     }
 
     /// The contract change, at the unit level: a SIGTERM-triggered shutdown must
@@ -19842,7 +22123,8 @@ external_model = "unavailable-test-model"
         );
     }
 
-    /// health_check must report the daemon process's own PID so the CLI
+    /// health_check must report the daemon process's own PID and destructive
+    /// repair capability so the CLI can negotiate before mutation. The PID
     /// can cross-check a pidfile PID against the socket-reported PID before
     /// signaling it (a foreign PID planted in the pidfile fails that check).
     #[tokio::test]
@@ -19855,6 +22137,7 @@ external_model = "unavailable-test-model"
             .expect("health check ok")
             .into_inner();
         assert_eq!(resp.pid, std::process::id());
+        assert!(resp.embedding_identity_repair);
     }
 
     /// A second watcher registration is refused without force; with
@@ -20527,7 +22810,7 @@ mod boot_reconciliation_tests {
         // Open exactly as the snapshot-replica boot does, then run the boot
         // reconciliation with the same `read_only` the boot computes.
         let store = GraphStore::open_read_only(&db_path).unwrap();
-        reconcile_index_publication_before_ppr_warm(&store, true);
+        reconcile_index_publication_before_ppr_warm(&store, None);
 
         assert_eq!(
             std::fs::read(&marker_path).unwrap(),
@@ -20567,7 +22850,8 @@ mod boot_reconciliation_tests {
         // Open exactly as the read-write boot does, then run the boot
         // reconciliation with the same `read_only` the boot computes.
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        reconcile_index_publication_before_ppr_warm(&store, false);
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        reconcile_index_publication_before_ppr_warm(&store, Some(&authority));
 
         assert!(
             !marker_path.exists(),
@@ -20606,7 +22890,7 @@ mod boot_reconciliation_tests {
     // would buy nothing.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn read_write_daemon_boot_recovers_the_abandoned_publication() {
+    async fn read_write_daemon_boot_recovers_before_immediate_shutdown() {
         // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
         // the daemon's whole lifetime under the same lock the sibling e2e
         // tests hold while swapping XDG vars.
@@ -20639,22 +22923,15 @@ mod boot_reconciliation_tests {
         }
         let mut client = client.expect("daemon socket did not come up within 10s");
 
-        // The boot reconciliation needs no RPC: it runs on a blocking thread
-        // during startup and must retire the marker on its own.
-        let mut retired = false;
-        for _ in 0..300 {
-            if !marker_path.exists() {
-                retired = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        // The socket is a readiness boundary: publication recovery/PPR warm
+        // must already be complete, so an immediate shutdown cannot race a
+        // detached boot writer or release its DbWriteLease first.
         assert!(
-            retired,
-            "a read-write daemon boot must recover the abandoned publication \
-             (retire the marker) within 30s of startup"
+            !marker_path.exists(),
+            "a read-write daemon must retire the abandoned marker before serving"
         );
 
+        // Deliberately issue shutdown as the first RPC after connect.
         client
             .shutdown(nestweaver_proto::ShutdownRequest {})
             .await
@@ -21337,7 +23614,42 @@ mod watcher_e2e_tests {
 /// nw-212: the daemon must not report success for work that did not persist.
 #[cfg(test)]
 mod daemon_honesty_tests {
+    #[cfg(feature = "embed")]
+    use super::persist_embed_output;
     use super::settle_embed_counts;
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn metadata_stamp_failure_prevents_the_vector_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stamp-failure.lbug");
+        let first = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let replacement =
+            nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-b", 2);
+        let writer = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        writer.set_embedding_pipeline(&first).unwrap();
+        assert!(writer.add_embedding_with_pipeline(
+            "symbol:preserved",
+            vec![1.0, 0.0],
+            &first,
+            false,
+        ));
+        writer.flush_embedding_index().unwrap();
+        let sidecar = writer.embedding_sidecar_path().unwrap();
+        let original_base = std::fs::read(&sidecar).unwrap();
+        drop(writer);
+
+        // A read-only store makes the metadata stamp fail deterministically.
+        // Its existing base has no pending deltas and would flush successfully,
+        // so returning that success would prove the stamp error was swallowed
+        // and the flush was still attempted.
+        let read_only = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        let error = persist_embed_output(&read_only, Some(&replacement), 1)
+            .expect_err("metadata failure must terminate persistence before flush");
+        assert!(error.to_string().contains("read-only"));
+        assert_eq!(std::fs::read(&sidecar).unwrap(), original_base);
+        assert_eq!(read_only.get_embedding_pipeline().unwrap(), Some(first));
+    }
 
     /// The fsyncgate case. The CLI's embed path already zeroed its success
     /// count on a failed flush; the daemon route returned the count unchanged,

@@ -1202,18 +1202,22 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
     );
     assert!(
         workflow.contains("workflow_dispatch:")
-            && workflow.contains("github.event_name == 'workflow_dispatch'")
+            && workflow.contains("operation:")
+            && workflow.contains("options: [dry-run, resume, cleanup-draft, recover-npm]")
+            && workflow.contains("needs.release-context.outputs.mode == 'dry-run'")
+            && workflow.contains("needs.release-context.outputs.mode == 'publish'")
+            && workflow.contains("verify-dry-run:")
+            && workflow.contains("cleanup-canary:")
+            && workflow.contains("scripts/observe-release-visibility.sh")
+            && workflow.contains("scripts/verify-release-canary-pr.sh")
             && workflow.contains("CFLAGS: \"-DZSTD_DISABLE_ASM\"")
             && !workflow.contains("fuse-ld=mold")
             && workflow.contains("zstdnoasm-gnuld")
             && workflow.contains("thread apply all backtrace")
-            && workflow
-                .matches("if: github.event_name != 'workflow_dispatch'")
-                .count()
-                == 4,
-        "release artifacts must be manually verifiable before tagging; Linux must use \
-         the system linker and the same zstd native-code contract as normal CI, with a \
-         backtrace on functional-smoke failure, without uploading to a release"
+            && workflow.contains("visibility_after: $after, automation_pr: $canary"),
+        "release dry-run must be mode-isolated and preserve observed tag/release/npm plus \
+         automation-PR evidence; Linux must use the system linker and the same zstd \
+         native-code contract as normal CI, with a backtrace on functional-smoke failure"
     );
 }
 
@@ -1252,10 +1256,62 @@ fn release_workflow_syncs_the_lockfile_however_the_release_pr_got_there() {
     let workflow =
         std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
 
+    let release_pr = workflow
+        .split_once("\n  release-pr:\n")
+        .expect("release workflow must define release-pr")
+        .1
+        .split_once("\n  prepare-release-lockfile:\n")
+        .expect("release-pr must precede the read-only lockfile job")
+        .0;
+    for output in [
+        "number: ${{ steps.release_pr.outputs.number }}",
+        "branch: ${{ steps.release_pr.outputs.branch }}",
+        "head_sha: ${{ steps.release_pr.outputs.head_sha }}",
+    ] {
+        assert!(
+            release_pr.contains(output),
+            "release-pr must export `{output}` across the job boundary"
+        );
+    }
+
+    let prepare = workflow
+        .split_once("\n  prepare-release-lockfile:\n")
+        .expect("release workflow must define prepare-release-lockfile")
+        .1
+        .split_once("\n  publish-release-lockfile:\n")
+        .expect("the read-only lockfile job must precede its publisher")
+        .0;
     assert!(
-        workflow.contains("Synchronize release lockfile"),
-        "the release job must synchronize Cargo.lock; without it a version bump \
-         ships a lockfile the build refuses"
+        prepare.contains("permissions:\n      contents: read")
+            && !prepare.contains("contents: write")
+            && prepare.contains("cargo update --workspace")
+            && prepare.contains("cargo metadata --locked"),
+        "untrusted release-PR Cargo execution must remain in the read-only preparation job"
+    );
+
+    let publisher = workflow
+        .split_once("\n  publish-release-lockfile:\n")
+        .expect("release workflow must define publish-release-lockfile")
+        .1
+        .split_once("\n  build:\n")
+        .expect("the lockfile publisher must precede release builds")
+        .0;
+    for lease_contract in [
+        "repos/$GITHUB_REPOSITORY/git/commits/$RELEASE_PR_HEAD_SHA",
+        "parents: [$parent]",
+        "{sha: $sha, force: false}",
+        "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_PR_BRANCH",
+    ] {
+        assert!(
+            publisher.contains(lease_contract),
+            "lockfile publication must preserve exact-head lease contract `{lease_contract}`"
+        );
+    }
+    assert!(
+        !publisher.contains("actions/checkout")
+            && !publisher.contains("cargo ")
+            && !publisher.contains("--method PUT"),
+        "the write-capable publisher must neither execute PR code nor use a blob-only Contents API lease"
     );
     // Assert on the GATES, not on the file text: the comments above these steps
     // name `prs_created` deliberately, to explain why it is the wrong condition.
@@ -1293,8 +1349,8 @@ fn release_workflow_syncs_the_lockfile_however_the_release_pr_got_there() {
          sync is how a release reaches `cargo build --locked` with a stale lock"
     );
     assert!(
-        workflow.contains("cargo metadata --locked"),
-        "the job must PROVE --locked accepts the synchronized tree; \
+        prepare.contains("cargo metadata --locked"),
+        "the read-only job must PROVE --locked accepts the synchronized tree; \
          `cargo update` exiting 0 says the lock was refreshed, not that the \
          build job's --locked will accept it"
     );

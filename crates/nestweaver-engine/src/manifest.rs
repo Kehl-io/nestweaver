@@ -93,6 +93,312 @@ pub fn load_manifest_cache_for_db(
     .unwrap_or_default())
 }
 
+/// Publication status for a graph mutation that has already committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphMutationPublicationDisposition {
+    /// The store proved that no graph state changed.
+    ConfirmedNoChange,
+    /// The mutation and every required derived-artifact reconciliation step
+    /// completed.
+    CommittedComplete,
+    /// The graph mutation committed, but one or more reconciliation steps
+    /// failed and require operator repair.
+    CommittedDegraded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphMutationPublicationWarning {
+    pub stage: String,
+    pub message: String,
+}
+
+/// Complete publication result for a graph mutation.
+///
+/// A committed graph write is never turned back into a plain `Err` merely
+/// because generation persistence or sidecar reconciliation subsequently
+/// failed. Callers can therefore report the truthful committed-but-degraded
+/// state instead of implying that the graph rolled back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphMutationPublicationOutcome {
+    pub disposition: GraphMutationPublicationDisposition,
+    pub generation_before: u64,
+    pub generation_after: u64,
+    pub warnings: Vec<GraphMutationPublicationWarning>,
+}
+
+/// Crash fence for a non-index graph mutation.
+///
+/// Unlike a full index publication this guard does not reserve dirty N+1 and
+/// clean N+2 generations: the materialization contract requires exactly one
+/// successor generation. The durable marker still brackets the graph commit,
+/// so interruption before post-commit reconciliation leaves every ranked read
+/// and snapshot fail-closed until normal abandoned-publication repair runs.
+pub struct GraphMutationPublicationGuard<'a> {
+    lease: Option<nestweaver_store::IndexPublicationLease<'a>>,
+    marker_path: Option<PathBuf>,
+    operation: String,
+}
+
+impl<'a> GraphMutationPublicationGuard<'a> {
+    /// Finish a bracketed operation. A confirmed no-op retires the marker
+    /// without advancing generation; a commit publishes exactly once.
+    pub fn finish(
+        mut self,
+        changed: bool,
+    ) -> Result<GraphMutationPublicationOutcome, anyhow::Error> {
+        let store = self
+            .lease
+            .as_ref()
+            .expect("publication guard always owns its lease until finish")
+            .store();
+        let mut outcome = finalize_committed_graph_mutation(store, changed);
+
+        if !outcome.is_degraded()
+            && let Some(marker_path) = &self.marker_path
+            && let Err(error) = store.with_index_publication_rank_barrier(|| {
+                nestweaver_store::durable_sidecar::remove_file_durable_if_exists(marker_path)
+            })
+        {
+            if changed {
+                outcome.record_warning(
+                    "retire-graph-publication-marker",
+                    format!(
+                        "{} committed clean state but could not retire {}: {error}",
+                        self.operation,
+                        marker_path.display()
+                    ),
+                );
+            } else {
+                anyhow::bail!(
+                    "{} made no graph change but could not retire publication marker {}: {error}",
+                    self.operation,
+                    marker_path.display()
+                );
+            }
+        }
+
+        if let Some(lease) = self.lease.take()
+            && let Err(error) = lease.release()
+        {
+            if changed {
+                outcome.record_warning(
+                    "release-graph-publication-lease",
+                    format!(
+                        "{} committed but could not release its publication lease: {error}",
+                        self.operation
+                    ),
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "{} made no graph change but could not release its publication lease: {error}",
+                    self.operation
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// Durably mark a graph publication dirty before its first possible write.
+///
+/// The returned guard must span the graph commit and post-commit finalizer.
+/// Dropping it early intentionally releases only live ownership; the durable
+/// marker remains so a crash or ambiguous write cannot make old derived data
+/// authoritative.
+pub fn begin_graph_mutation_publication<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    operation: impl Into<String>,
+) -> Result<GraphMutationPublicationGuard<'a>, anyhow::Error> {
+    let operation = operation.into();
+    let lease = store
+        .acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?;
+    lease.ensure_clean_for_snapshot().map_err(|error| {
+        anyhow::anyhow!("{operation}: refusing to overwrite a dirty publication: {error}")
+    })?;
+
+    let marker_path = if let Some(db_path) = store.db_path() {
+        lease.preflight_generation().map_err(|error| {
+            anyhow::anyhow!("{operation}: preflight successor generation: {error}")
+        })?;
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+        let payload = nestweaver_store::index_publication::format_marker_payload(
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            None,
+        );
+        store
+            .with_index_publication_rank_barrier(|| {
+                nestweaver_store::durable_sidecar::atomic_replace_file(&marker_path, |file| {
+                    file.write_all(payload.as_bytes())
+                })
+            })
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{operation}: publish graph mutation marker {}: {error}",
+                    marker_path.display()
+                )
+            })?;
+        Some(marker_path)
+    } else {
+        lease.preflight_transient_generation().map_err(|error| {
+            anyhow::anyhow!("{operation}: preflight in-memory successor generation: {error}")
+        })?;
+        None
+    };
+
+    Ok(GraphMutationPublicationGuard {
+        lease: Some(lease),
+        marker_path,
+        operation,
+    })
+}
+
+impl GraphMutationPublicationOutcome {
+    pub fn changed(&self) -> bool {
+        self.disposition != GraphMutationPublicationDisposition::ConfirmedNoChange
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.disposition == GraphMutationPublicationDisposition::CommittedDegraded
+    }
+
+    pub fn record_warning(&mut self, stage: impl Into<String>, message: impl Into<String>) {
+        self.warnings.push(GraphMutationPublicationWarning {
+            stage: stage.into(),
+            message: message.into(),
+        });
+        if self.disposition == GraphMutationPublicationDisposition::CommittedComplete {
+            self.disposition = GraphMutationPublicationDisposition::CommittedDegraded;
+        }
+    }
+}
+
+/// Publish one already-committed graph mutation.
+///
+/// A confirmed no-op leaves every generation and derived artifact untouched.
+/// A change invalidates both live and durable PageRank, advances generation
+/// exactly once, persists it, and rebinds a valid repository-manifest cache to
+/// the successor generation. Post-commit failures are accumulated instead of
+/// being returned as rollback-looking errors.
+pub fn finalize_committed_graph_mutation(
+    store: &nestweaver_store::GraphStore,
+    changed: bool,
+) -> GraphMutationPublicationOutcome {
+    let generation_before = store.graph_generation();
+    if !changed {
+        return GraphMutationPublicationOutcome {
+            disposition: GraphMutationPublicationDisposition::ConfirmedNoChange,
+            generation_before,
+            generation_after: generation_before,
+            warnings: Vec::new(),
+        };
+    }
+
+    let db_path = store.db_path().map(Path::to_path_buf);
+    let mut outcome = GraphMutationPublicationOutcome {
+        disposition: GraphMutationPublicationDisposition::CommittedComplete,
+        generation_before,
+        generation_after: generation_before,
+        warnings: Vec::new(),
+    };
+    let carried_manifests = db_path.as_ref().and_then(|db_path| {
+        let path = manifest_cache_path(db_path);
+        if !path.exists() {
+            return None;
+        }
+        match load_manifest_cache_for_db(store, db_path) {
+            Ok(manifests) => Some(manifests),
+            Err(error) => {
+                outcome.record_warning(
+                    "load-manifest-cache",
+                    format!(
+                        "could not carry the repository manifest cache across publication: {error:#}"
+                    ),
+                );
+                None
+            }
+        }
+    });
+
+    // Clear live scores before exposing the new generation. The durable copy
+    // is removed as well, so a process restart cannot reload pre-mutation
+    // ranking even if a later publication step is degraded.
+    store.invalidate_pagerank();
+    if let Some(db_path) = &db_path {
+        let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+        if let Err(error) =
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&pagerank_path)
+        {
+            outcome.record_warning(
+                "invalidate-pagerank-sidecar",
+                format!(
+                    "could not durably remove stale PageRank sidecar {}: {error}",
+                    pagerank_path.display()
+                ),
+            );
+        }
+    }
+
+    let generation_after = match store.try_bump_graph_generation() {
+        Ok(generation) => generation,
+        Err(error) => {
+            outcome.record_warning(
+                "advance-graph-generation",
+                format!("committed graph mutation could not advance generation: {error}"),
+            );
+            outcome.generation_after = store.graph_generation();
+            return outcome;
+        }
+    };
+    outcome.generation_after = generation_after;
+
+    let generation_persisted = if let Some(db_path) = &db_path {
+        let generation_path = crate::sidecar_path(db_path, ".generation");
+        match store.save_graph_generation(&generation_path) {
+            Ok(()) => true,
+            Err(error) => {
+                outcome.record_warning(
+                    "persist-graph-generation",
+                    format!(
+                        "generation {generation_after} is live but could not be durably published to {}: {error}",
+                        generation_path.display()
+                    ),
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    if generation_persisted
+        && let (Some(db_path), Some(manifests)) = (&db_path, carried_manifests)
+        && let Err(error) = save_manifest_cache_for_db(&manifests, store, db_path)
+    {
+        outcome.record_warning(
+            "rebind-manifest-cache",
+            format!(
+                "could not rebind the repository manifest cache to generation {generation_after}: {error:#}"
+            ),
+        );
+    }
+
+    for warning in &outcome.warnings {
+        tracing::warn!(
+            stage = %warning.stage,
+            message = %warning.message,
+            generation_before,
+            generation_after = outcome.generation_after,
+            "graph mutation committed with degraded publication reconciliation"
+        );
+    }
+    outcome
+}
+
 /// Advance the graph generation while carrying the manifest cache across the
 /// boundary.
 ///
@@ -955,6 +1261,160 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
                 .contains("foreign artifact identity"),
             "{foreign_error}"
         );
+    }
+
+    #[test]
+    fn committed_graph_publication_advances_once_and_reconciles_derived_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        let manifests = HashMap::from([("repo:stable".to_string(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
+        store
+            .compute_pagerank(
+                0.85,
+                20,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        store.save_pagerank_cache(&pagerank_path).unwrap();
+
+        let unchanged = finalize_committed_graph_mutation(&store, false);
+        assert_eq!(
+            unchanged.disposition,
+            GraphMutationPublicationDisposition::ConfirmedNoChange
+        );
+        assert_eq!(unchanged.generation_before, unchanged.generation_after);
+        assert!(pagerank_path.exists());
+
+        let changed = finalize_committed_graph_mutation(&store, true);
+        assert_eq!(
+            changed.disposition,
+            GraphMutationPublicationDisposition::CommittedComplete
+        );
+        assert_eq!(changed.generation_after, changed.generation_before + 1);
+        assert_eq!(store.graph_generation(), changed.generation_after);
+        assert_eq!(
+            std::fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            changed.generation_after
+        );
+        assert!(!pagerank_path.exists());
+        assert!(
+            load_manifest_cache_for_db(&store, &db_path)
+                .unwrap()
+                .contains_key("repo:stable")
+        );
+
+        let repeated_noop = finalize_committed_graph_mutation(&store, false);
+        assert_eq!(repeated_noop.generation_after, changed.generation_after);
+    }
+
+    #[test]
+    fn committed_graph_publication_reports_reconciliation_degradation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        std::fs::create_dir(&pagerank_path).unwrap();
+
+        let publication =
+            begin_graph_mutation_publication(&store, "injected reconciliation failure").unwrap();
+        let outcome = publication.finish(true).unwrap();
+
+        assert_eq!(
+            outcome.disposition,
+            GraphMutationPublicationDisposition::CommittedDegraded
+        );
+        assert_eq!(outcome.generation_after, outcome.generation_before + 1);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.stage == "invalidate-pagerank-sidecar")
+        );
+        assert!(
+            crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "degraded reconciliation must retain the crash fence"
+        );
+
+        let backup_config = crate::backup::BackupConfig {
+            db_path: db_path.clone(),
+            output_path: dir.path().join("backup.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+        };
+        let backup_error = crate::backup::stage_backup_from_store(&store, &backup_config)
+            .err()
+            .expect("backup must fail closed on committed-but-degraded publication")
+            .to_string();
+        assert!(
+            backup_error.contains("dirty index publication"),
+            "{backup_error}"
+        );
+
+        let snapshot_dir = dir.path().join("snapshot");
+        let snapshot_stamp = crate::snapshot::Stamp {
+            format_version: 0,
+            capabilities: Vec::new(),
+            instance_id: "test".to_string(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            min_compatible_engine: crate::snapshot::MIN_SNAPSHOT_READER_VERSION.to_string(),
+            schema_hash_core: nestweaver_schema::core_schema_hash(),
+            schema_hash_extensions: "none".to_string(),
+            schema_hash_effective: "schema".to_string(),
+            embedding_model_id: "model".to_string(),
+            embedding_dimension: 0,
+            embedding_count: 0,
+            built_at: "2026-09-02T00:00:00Z".to_string(),
+            repos: Vec::new(),
+        };
+        let snapshot_manifest = crate::snapshot::Manifest { repos: Vec::new() };
+        let snapshot_error = crate::snapshot::build_snapshot_from_store(
+            &snapshot_dir,
+            &snapshot_stamp,
+            &snapshot_manifest,
+            &store,
+        )
+        .expect_err("snapshot must fail closed on committed-but-degraded publication")
+        .to_string();
+        assert!(
+            snapshot_error.contains("dirty index publication"),
+            "{snapshot_error}"
+        );
+    }
+
+    #[test]
+    fn interrupted_bracketed_mutation_retains_fail_closed_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        let publication = begin_graph_mutation_publication(&store, "interrupted mutation").unwrap();
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:test:interrupted".to_string(),
+                name: "interrupted".to_string(),
+                summary: None,
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+
+        // Model interruption after the graph commit but before `finish`.
+        drop(publication);
+
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        assert_eq!(store.graph_generation(), 0);
+        let error = store
+            .ensure_pagerank_loaded()
+            .expect_err("ranked reads must fail closed across the interruption window")
+            .to_string();
+        assert!(error.contains("dirty index publication"), "{error}");
     }
 
     #[test]
