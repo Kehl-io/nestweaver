@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use nestweaver_store::{GraphStore, ImpactNode, StoreError};
 
 use crate::cluster_dispatch::{ClusteringOutput, load_clusters};
+use crate::git_cmd::{git_net_timeout, run_git_with_timeout};
+use crate::git_diff::resolve_commit_ref;
 use crate::process::RiskLevel;
 
 /// A symbol that was directly changed (lives in a changed file).
@@ -1186,21 +1188,43 @@ fn compute_affected_clusters(
     result
 }
 
-/// Get changed files from `git diff --name-only` in the given repo path.
-///
-/// When `base_ref` is provided, diffs against that ref. Otherwise diffs
-/// against HEAD (showing unstaged + staged changes).
-pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Result<Vec<PathBuf>> {
-    let mut cmd = Command::new("git");
-    cmd.arg("diff").arg("--name-only");
-
-    if let Some(base) = base_ref {
-        cmd.arg(base);
+/// Parse the exact NUL-delimited framing requested from `git diff`.
+fn parse_name_only_z(output: &[u8]) -> Result<Vec<PathBuf>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !output.ends_with(&[0]) {
+        anyhow::bail!("git diff returned malformed non-NUL-terminated output");
     }
 
-    let output = cmd
-        .current_dir(repo_path)
-        .output()
+    output[..output.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|path| {
+            if path.is_empty() {
+                anyhow::bail!("git diff returned an empty path record");
+            }
+            let path = std::str::from_utf8(path)
+                .context("git diff returned a path that is not valid UTF-8")?;
+            Ok(PathBuf::from(path))
+        })
+        .collect()
+}
+
+/// Get changed files from `git diff --name-only` in the given repo path.
+///
+/// When `base_ref` is provided, resolves it to a commit OID and diffs against
+/// that OID. Otherwise diffs against HEAD (showing unstaged + staged changes).
+pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Result<Vec<PathBuf>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--name-only").arg("-z");
+
+    if let Some(base) = base_ref {
+        let oid = resolve_commit_ref(repo_path, base)?;
+        cmd.arg(oid);
+    }
+
+    cmd.arg("--").current_dir(repo_path);
+    let output = run_git_with_timeout(cmd, git_net_timeout())
         .context("failed to run git diff --name-only")?;
 
     if !output.status.success() {
@@ -1208,14 +1232,7 @@ pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Resul
         anyhow::bail!("git diff failed: {}", stderr.trim());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<PathBuf> = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(PathBuf::from)
-        .collect();
-
-    Ok(files)
+    parse_name_only_z(&output.stdout)
 }
 
 #[cfg(test)]
@@ -3245,27 +3262,46 @@ mod tests {
             "working-tree diff must list the modified tracked file"
         );
 
-        // Commit a second change (modify a.txt, add b.txt) so a base-ref diff
-        // has two files between HEAD~1 and the working tree.
+        // Commit a second change (modify a.txt and add two files) so a
+        // base-ref diff exercises NUL framing, including a valid filename that
+        // contains a newline.
         git(repo, &["add", "a.txt"]);
         std::fs::write(repo.join("b.txt"), "bee\n").unwrap();
         git(repo, &["add", "b.txt"]);
+        std::fs::write(repo.join("line\nbreak.txt"), "newline path\n").unwrap();
+        git(repo, &["add", "--", "line\nbreak.txt"]);
         git(repo, &["commit", "-q", "-m", "second"]);
 
-        // Base-ref case (Some): diff against the first commit lists both files.
-        let mut against_base = changed_files_from_git(repo, Some("HEAD~1")).unwrap();
-        against_base.sort();
-        assert_eq!(
-            against_base,
-            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
-            "base-ref diff must list every file changed since the base"
-        );
+        git(repo, &["branch", "test-base-branch", "HEAD~1"]);
+        git(repo, &["tag", "test-base-tag", "HEAD~1"]);
+
+        // Revision expressions, branch names, and tag names are all resolved
+        // to a commit OID before that OID is passed to `git diff`.
+        for base in ["HEAD~1", "test-base-branch", "test-base-tag"] {
+            let mut against_base = changed_files_from_git(repo, Some(base)).unwrap();
+            against_base.sort();
+            assert_eq!(
+                against_base,
+                vec![
+                    PathBuf::from("a.txt"),
+                    PathBuf::from("b.txt"),
+                    PathBuf::from("line\nbreak.txt"),
+                ],
+                "base-ref diff must list every file changed since {base}"
+            );
+        }
 
         // Empty-diff case: a clean working tree against HEAD yields no files.
         let empty = changed_files_from_git(repo, Some("HEAD")).unwrap();
         assert!(
             empty.is_empty(),
             "a clean tree against HEAD must yield an empty vec, got: {empty:?}"
+        );
+
+        let invalid = changed_files_from_git(repo, Some("ref-that-does-not-exist"));
+        assert!(
+            invalid.is_err(),
+            "an invalid base ref must be rejected, got: {invalid:?}"
         );
 
         // Error case: a path that is not a git repo must return Err, never a
@@ -3276,6 +3312,70 @@ mod tests {
             err.is_err(),
             "git diff outside a repository must return Err, got: {err:?}"
         );
+    }
+
+    /// A base ref must never be interpreted as a `git diff` option. In
+    /// particular, `--output=<path>` opens and truncates its target before Git
+    /// produces the diff, so both existing and nonexistent targets are
+    /// protected here.
+    #[test]
+    fn changed_files_from_git_rejects_option_injection_without_writing() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("tracked.txt"), "committed\n").unwrap();
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-q", "-m", "baseline"]);
+
+        // Keep a tracked file dirty so an unsafe `git diff --output=...`
+        // invocation would have real output to redirect.
+        std::fs::write(repo.join("tracked.txt"), "dirty\n").unwrap();
+
+        let sentinel = repo.join("sentinel.bin");
+        let sentinel_contents = b"do not truncate\0or overwrite\n";
+        std::fs::write(&sentinel, sentinel_contents).unwrap();
+        let malicious_existing = format!("--output={}", sentinel.display());
+        let existing_result = changed_files_from_git(repo, Some(&malicious_existing));
+        assert!(
+            existing_result.is_err(),
+            "option-like base ref must be rejected, got: {existing_result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap().as_slice(),
+            sentinel_contents,
+            "rejected base ref must not truncate or overwrite an existing target"
+        );
+
+        let nonexistent = repo.join("must-not-be-created.out");
+        let malicious_new = format!("--output={}", nonexistent.display());
+        let new_result = changed_files_from_git(repo, Some(&malicious_new));
+        assert!(
+            new_result.is_err(),
+            "option-like base ref must be rejected, got: {new_result:?}"
+        );
+        assert!(
+            !nonexistent.exists(),
+            "rejected base ref must not create an output target"
+        );
+    }
+
+    #[test]
+    fn parse_name_only_z_is_strict_about_framing_and_utf8() {
+        assert_eq!(
+            parse_name_only_z(b"normal.rs\0line\nbreak.rs\0").unwrap(),
+            vec![PathBuf::from("normal.rs"), PathBuf::from("line\nbreak.rs")]
+        );
+        assert!(parse_name_only_z(b"missing-terminator.rs").is_err());
+        assert!(parse_name_only_z(b"first.rs\0\0").is_err());
+        assert!(parse_name_only_z(b"invalid-\xff.rs\0").is_err());
     }
 
     // ── cluster wiring end-to-end ───────────────────────────────────────

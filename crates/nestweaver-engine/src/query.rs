@@ -510,6 +510,111 @@ impl TruncationCause {
     }
 }
 
+/// How many symbols ONE bare-name seed input may contribute to the PPR
+/// personalization vector.
+///
+/// nw-393. This cap has existed since the first `context` implementation, as
+/// a bare `5` inlined at two call sites, and it is the only cap in the
+/// pipeline the caller cannot raise: `--limit` bounds the CONNECTED list,
+/// `--token-budget` bounds the rendered output, and neither can recover a
+/// seed that was never resolved. `context validate` on the live graph seeded
+/// PPR from 5 of 200+ symbols named `validate`, and then derived `total`,
+/// `truncated` and `truncated_by: "limit"` from that subgraph — so the one
+/// number that was silently wrong was also the input to every number that
+/// looked right.
+///
+/// ONE constant, for the same reason [`CODE_CONTEXT_DEFAULT_LIMIT`] is one:
+/// `nestweaver context` / `code_context` and `brain context` / `brain_context`
+/// are separate routes to the same seed resolution, and a cap that lives on
+/// only one of them is how the two come to disagree.
+pub const SEED_NAME_MATCH_LIMIT: usize = 5;
+
+/// What the bare-name seed searches matched, versus what they contributed.
+///
+/// nw-393. `seeds_resolved: 5` is INDISTINGUISHABLE from a name that
+/// genuinely has five definitions, which is why a count of survivors is not a
+/// disclosure. This carries the `(returned, total, truncated)` triple
+/// `Bounded` standardised — the same shape nw-353 landed for the CONNECTED
+/// list — one layer earlier, over the SEED set.
+///
+/// [`SearchTotal`] verbatim rather than a bare `usize`: the store's counted
+/// search is precise only up to `SYMBOL_SEARCH_COUNT_CAP`, and collapsing its
+/// `exact` / `lower_bound` relation into a plain number would reintroduce, in
+/// the disclosure itself, exactly the over-confidence this reports on.
+#[derive(Debug, Clone, Copy, Default)]
+struct SeedNameMatchTally {
+    /// Symbols the name searches actually contributed as PPR seeds.
+    resolved: usize,
+    /// Symbols the name searches MATCHED, summed across every bare-name
+    /// input, before [`SEED_NAME_MATCH_LIMIT`] cut.
+    matched: usize,
+    /// `true` once any constituent count saturated `SYMBOL_SEARCH_COUNT_CAP`,
+    /// so `matched` is a floor rather than a census.
+    lower_bound: bool,
+    /// Whether ANY bare-name input matched more than it was allowed to
+    /// contribute. Deliberately not derived from `matched > resolved`: a
+    /// two-input query where one name is capped and the other resolves
+    /// nothing must still report the cap.
+    truncated: bool,
+    /// Whether any bare-name input was resolved at all. `false` means the
+    /// whole tally is inapplicable (UID / file-path / note-title seeds only),
+    /// which is distinct from "resolved, and nothing was cut".
+    applicable: bool,
+}
+
+impl SeedNameMatchTally {
+    /// Fold one bare-name search's page into the tally.
+    ///
+    /// `returned` is the page's own symbol count and not `SEED_NAME_MATCH_LIMIT`,
+    /// because a name with three definitions returns three under a cap of five
+    /// and must not be reported as truncated — that counterweight is the whole
+    /// reason this compares two observed numbers instead of comparing against
+    /// the constant.
+    fn record(&mut self, page: &nestweaver_store::traverse::SymbolSearchPage) {
+        use nestweaver_store::tantivy_index::SearchTotalRelation;
+        self.applicable = true;
+        self.resolved += page.symbols.len();
+        self.matched += page.total.value;
+        if page.total.relation == SearchTotalRelation::LowerBound {
+            self.lower_bound = true;
+        }
+        if page.total.value > page.symbols.len() {
+            self.truncated = true;
+        }
+    }
+
+    /// The honest match total, or `None` when no bare-name input was resolved
+    /// and there is therefore nothing to disclose.
+    fn total(&self) -> Option<usize> {
+        if !self.applicable {
+            return None;
+        }
+        Some(self.matched)
+    }
+
+    /// The relation spelling that rides beside [`Self::total`], using
+    /// `brain_search`'s `"eq"` / `"gte"` vocabulary so one convention covers
+    /// every "count that may be a lower bound" on the wire.
+    fn total_relation(&self) -> Option<String> {
+        if !self.applicable {
+            return None;
+        }
+        Some(if self.lower_bound { "gte" } else { "eq" }.to_string())
+    }
+
+    /// Whether the seed set the caller is holding is a proper subset of what
+    /// its own query named. `None` when no bare-name input was resolved.
+    fn truncated(&self) -> Option<bool> {
+        self.applicable.then_some(self.truncated)
+    }
+
+    /// Symbols the bare-name inputs contributed. `None` when inapplicable, so
+    /// a renderer never prints `0 of 0` for a UID-seeded query.
+    fn resolved(&self) -> Option<usize> {
+        self.applicable.then_some(self.resolved)
+    }
+}
+
 /// The full result returned by `build_context`.
 // Deserialize so the daemon's `code_context` reply round-trips back into the
 // same type the direct path builds, and BOTH render through one function.
@@ -566,6 +671,72 @@ pub struct ContextResult {
     /// the same service `limit` performs for `truncated_by: "limit"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<usize>,
+    /// How many symbols the bare-name seed inputs MATCHED, before
+    /// [`SEED_NAME_MATCH_LIMIT`] cut them down to the PPR seed set.
+    ///
+    /// nw-393. The seed cap is one layer UPSTREAM of everything nw-320 /
+    /// nw-353 disclose: `connected`, `connected_total` and `truncated_by` are
+    /// all computed from the subgraph this cap chose, so a caller reading a
+    /// complete-looking `total: 737` was reading an honest count of an
+    /// arbitrary 5-of-200+ seeding. The store already computes this number and
+    /// the engine used to throw it away by calling the `total`-discarding
+    /// `search_symbols_by_name` wrapper.
+    ///
+    /// `None` when no bare-name input was resolved (UID, file-path or
+    /// note-title seeds only) and there is nothing to disclose — distinct from
+    /// a `Some` total that equals the resolved count, which means "counted,
+    /// and nothing was cut".
+    ///
+    /// The relation is carried alongside in `seed_matches_total_relation`
+    /// (`"eq"` / `"gte"`) rather than nested, so the count never claims a
+    /// census the counted search does not perform past
+    /// `SYMBOL_SEARCH_COUNT_CAP`.
+    ///
+    /// FLAT, NOT A NESTED `SearchTotal`, and this is load-bearing rather than
+    /// cosmetic. This struct is not only a return value: the CLI's DAEMON route
+    /// deserializes the `code_context` MCP payload straight back into it. A
+    /// nested struct made the two routes disagree in SHAPE — the direct route
+    /// serialized `{"value":2,"relation":"exact"}` while the MCP payload built
+    /// the flat `brain_search` spelling — so the daemon route died with
+    /// `invalid type: integer 2, expected struct SearchTotal` and five
+    /// `parity_test` cases failed. Flat is also the spelling `brain_search`
+    /// already ships (`total_matches` + `total_matches_relation`), so there is
+    /// one convention for "a count that may be a lower bound", not two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_matches_total: Option<usize>,
+    /// `"eq"` when the count is exact, `"gte"` when the counted search stopped
+    /// at `SYMBOL_SEARCH_COUNT_CAP`. Same spelling as `brain_search`'s
+    /// `total_matches_relation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_matches_total_relation: Option<String>,
+    /// Whether the PPR seed set is a proper subset of what the query named.
+    ///
+    /// nw-393. Deliberately a SEPARATE boolean rather than a third
+    /// [`TruncationCause`] variant, and for the reason the impact arm already
+    /// records for `truncated_by_depth` / `truncated_by_limit`: these caps do
+    /// not compose into a precedence. `truncated_by: "limit"` is a correct and
+    /// actionable statement about `connected` even while the seed set was also
+    /// cut, and folding the two would make the caller raise `--limit` — which
+    /// is precisely the misdirection reported, since NO caller-settable knob
+    /// can recover a seed that was never resolved.
+    ///
+    /// `None` when no bare-name input was resolved. `Some(false)` is the
+    /// counterweight case that must stay reachable: a name with exactly
+    /// [`SEED_NAME_MATCH_LIMIT`] definitions resolved all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeds_truncated: Option<bool>,
+    /// The per-input name-match cap that `seeds_truncated` reports on, echoed
+    /// for the same reason `token_budget` is echoed: a disclosure that names a
+    /// cut without naming the bound leaves the caller unable to judge how much
+    /// was lost.
+    ///
+    /// Present whenever the cap was IN FORCE, not only when it bit — same rule
+    /// `token_budget` follows. `{limit: 5, truncated: false}` is a stronger
+    /// statement than an absent field: it says a bound existed and did not
+    /// reach. Not settable today, and that it is a constant is itself what the
+    /// caller needs to know, because it is why no retry can widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_resolution_limit: Option<usize>,
 }
 
 /// Detect whether an input string looks like a file path.
@@ -582,7 +753,10 @@ fn is_file_path(input: &str) -> bool {
 /// Each entry in `inputs` is resolved to one or more symbol UIDs:
 /// - Starts with `"sym:"` or `"repo:"` → UID lookup
 /// - Looks like a file path → `symbols_in_file`
-/// - Otherwise → `search_symbols_by_name(input, 5)`
+/// - Otherwise → a name search bounded by [`SEED_NAME_MATCH_LIMIT`], whose
+///   pre-cap match count is reported as `seed_matches_total` /
+///   `seeds_truncated` (nw-393) because no caller-settable knob can recover a
+///   seed this cap dropped
 ///
 /// Personalized PageRank (d = 0.85, 20 iterations) is then run from all
 /// resolved seeds and the results are split into `seeds` and `connected`.
@@ -620,6 +794,12 @@ pub fn build_context_with_intent(
 ) -> Result<ContextResult, anyhow::Error> {
     let mut seed_uids: Vec<String> = Vec::new();
     let mut file_paths_tried: Vec<String> = Vec::new();
+    // nw-393. Accumulated across every bare-name input so the cap that chose
+    // the PPR personalization vector is reportable at all. Without it the only
+    // seed number any surface could quote was `seeds.len()` — a count of
+    // survivors, which agrees with the returned list by construction and so
+    // reads identically whether the name had five definitions or five hundred.
+    let mut seed_name_tally = SeedNameMatchTally::default();
 
     for input in inputs {
         if input.starts_with("sym:") || input.starts_with("repo:") {
@@ -644,15 +824,22 @@ pub fn build_context_with_intent(
                 seed_uids.push(sym.uid);
             }
         } else {
-            // Name search — take up to 5 matches.
-            let matches = store
-                .search_symbols_by_name(
+            // Name search — take up to `SEED_NAME_MATCH_LIMIT` matches.
+            //
+            // nw-393: the `_page` variant, not the `total`-discarding
+            // `search_symbols_by_name` wrapper. Both run the identical scan;
+            // the wrapper's only difference is that it drops the count on the
+            // floor, and that dropped count is the entire disclosure gap —
+            // the honest number was already computed on every single call.
+            let page = store
+                .search_symbols_by_name_page(
                     input,
-                    5,
+                    SEED_NAME_MATCH_LIMIT,
                     &nestweaver_store::SeedResolutionConfig::default(),
                 )
                 .map_err(|e| anyhow::anyhow!(e))?;
-            for sym in matches {
+            seed_name_tally.record(&page);
+            for sym in page.symbols {
                 seed_uids.push(sym.uid);
             }
         }
@@ -761,6 +948,16 @@ pub fn build_context_with_intent(
         // policy the caller chose, it is a fact only this traversal can
         // observe, so the engine is the only layer that CAN report it.
         connected_total: Some(connected_total),
+        // nw-393. Same argument as `connected_total`, one layer earlier: the
+        // seed cap is the engine's own, no caller states it and no caller can
+        // raise it, so the engine is the only layer that can report it — and
+        // it is reported unconditionally rather than left for a caller to
+        // "decide whether the extra row arrived", because there is no extra
+        // row to ask for.
+        seed_matches_total: seed_name_tally.total(),
+        seed_matches_total_relation: seed_name_tally.total_relation(),
+        seeds_truncated: seed_name_tally.truncated(),
+        seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
     })
 }
 
@@ -812,6 +1009,7 @@ mod promote_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec![],
+            ..Default::default()
         };
         let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
             .into_iter()
@@ -842,6 +1040,7 @@ mod promote_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec![],
+            ..Default::default()
         };
         let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
 
@@ -881,6 +1080,7 @@ mod promote_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec![],
+            ..Default::default()
         };
         let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
             .into_iter()
@@ -913,6 +1113,7 @@ mod promote_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec![],
+            ..Default::default()
         };
         let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
 
@@ -1298,7 +1499,10 @@ fn is_zero_usize(n: &usize) -> bool {
     *n == 0
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// `Default` so the three disclosure fields nw-393 added (and any future one)
+// can be appended without rewriting every struct literal that only cares about
+// two of them — that churn is what keeps honesty fields out of shared types.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BrainContextResult {
     /// Resolved seed nodes. The MCP `brain_context` tool omits this field
     /// when `include_seeds=false` is requested, so deserializing daemon
@@ -1337,6 +1541,36 @@ pub struct BrainContextResult {
     /// PPR, and BM25 legs remain usable when semantic retrieval degrades.
     #[serde(default)]
     pub degraded_components: Vec<String>,
+    /// nw-393, brain half. How many symbols the bare-name seed inputs MATCHED
+    /// before [`SEED_NAME_MATCH_LIMIT`] cut them down to the PPR seed set.
+    ///
+    /// The twin of [`ContextResult::seed_matches_total`], and it exists
+    /// separately because `brain context` / `brain_context` resolve seeds
+    /// through their OWN loop (UID prefixes, note titles, tags, projects,
+    /// aliases, then symbol names) rather than through `build_context`. The
+    /// same cap sat inlined in both loops; a disclosure on only one of them is
+    /// how the two routes would start disagreeing about the same query.
+    ///
+    /// `None` when no bare-name input reached symbol search — UID, tag, note
+    /// title, project and semantic-only seeds are not capped by this bound and
+    /// must not be described as if they were.
+    ///
+    /// [`SearchTotal`]: nestweaver_store::tantivy_index::SearchTotal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_matches_total: Option<usize>,
+    /// `"eq"` / `"gte"`; see [`ContextResult::seed_matches_total_relation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_matches_total_relation: Option<String>,
+    /// Whether the seed set is a proper subset of what the query named.
+    /// `Some(false)` — a name with exactly [`SEED_NAME_MATCH_LIMIT`]
+    /// definitions — is the counterweight case and must stay reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeds_truncated: Option<bool>,
+    /// The cap `seeds_truncated` reports on, echoed so the caller can see the
+    /// bound and not merely that a bound existed. Present whenever the cap was
+    /// in force, matching `ContextResult::seed_resolution_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_resolution_limit: Option<usize>,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -1605,6 +1839,10 @@ pub fn build_brain_context_hybrid_with_aliases(
 
     let mut seed_uids: Vec<String> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
+    // nw-393. Only bare-name symbol resolution is capped here; UID, tag, note
+    // title and project seeds are exhaustive, so an inapplicable tally reports
+    // nothing rather than a misleading `0 of 0`.
+    let mut seed_name_tally = SeedNameMatchTally::default();
 
     for raw in inputs {
         let trimmed = raw.trim();
@@ -1647,11 +1885,17 @@ pub fn build_brain_context_hybrid_with_aliases(
         // [`HybridSearchConfig::seed_resolution`] (sourced from
         // `[seed_resolution]` in instance config) so user overrides actually
         // take effect at seed resolution.
-        let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5, &config.seed_resolution)
+        //
+        // nw-393: `_page`, not the `total`-discarding wrapper. `brain context`
+        // reported `semantic_seed_count: 5` for a name with 200+ definitions
+        // and nothing distinguished that from a name with five — the count was
+        // computed by this very call and dropped one frame later.
+        let symbol_page = store
+            .search_symbols_by_name_page(trimmed, SEED_NAME_MATCH_LIMIT, &config.seed_resolution)
             .map_err(|e| anyhow::anyhow!(e))?;
-        if !symbol_matches.is_empty() {
-            for s in symbol_matches {
+        if !symbol_page.symbols.is_empty() {
+            seed_name_tally.record(&symbol_page);
+            for s in symbol_page.symbols {
                 seed_uids.push(s.uid);
             }
             continue;
@@ -1919,6 +2163,13 @@ pub fn build_brain_context_hybrid_with_aliases(
         } else {
             Vec::new()
         },
+        // nw-393. Reported unconditionally: the seed cap is the engine's own,
+        // it is not a policy any caller stated, and the `None` case already
+        // encodes "no bare-name input was capped by it".
+        seed_matches_total: seed_name_tally.total(),
+        seed_matches_total_relation: seed_name_tally.total_relation(),
+        seeds_truncated: seed_name_tally.truncated(),
+        seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
     })
 }
 
@@ -2733,6 +2984,179 @@ pub fn expand_query_with_aliases(
     format!("{} {}", query, expansions.join(" "))
 }
 
+// nw-393. The seed cap is the ONE cap in the context pipeline that no caller
+// can raise, so a disclosure of it is the only thing that distinguishes "this
+// name has five definitions" from "this name has two hundred and you were
+// handed five of them". Both routes are tested because the cap sat inlined in
+// two separate seed loops (`build_context` and the brain hybrid path) and a
+// fix to one of them is how the two routes start disagreeing.
+#[cfg(test)]
+mod seed_resolution_disclosure_tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+
+    use super::{
+        HybridSearchConfig, SEED_NAME_MATCH_LIMIT, build_brain_context_hybrid_with_aliases,
+        build_context,
+    };
+
+    fn symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: format!("sym:{uid}"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// `count` distinct symbols whose names all contain `validate`, and one
+    /// control that does not — so a total that accidentally counted the whole
+    /// symbol table would be caught rather than passing by coincidence.
+    fn store_with_validate_definitions(count: usize) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..count {
+            store
+                .insert_symbol(&symbol(&format!("v{i}"), &format!("validate{i}")))
+                .unwrap();
+        }
+        store.insert_symbol(&symbol("other", "unrelated")).unwrap();
+        store
+    }
+
+    fn brain_context_for(
+        store: &GraphStore,
+        seed: &str,
+    ) -> Result<super::BrainContextResult, anyhow::Error> {
+        build_brain_context_hybrid_with_aliases(
+            store,
+            &[seed.to_string()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_seed_name_with_more_definitions_than_the_cap_cannot_report_a_complete_seed_set() {
+        let store = store_with_validate_definitions(50);
+
+        let result = build_context(&store, &["validate".to_string()]).unwrap();
+
+        let total = result
+            .seed_matches_total
+            .expect("a bare-name seed must report what it matched");
+        assert_eq!(
+            total, 50,
+            "the honest match count is computed by the same scan that returns the seeds"
+        );
+        assert_eq!(
+            result.seed_matches_total_relation.as_deref(),
+            Some("eq"),
+            "50 is far below SYMBOL_SEARCH_COUNT_CAP, so the count is a census not a floor"
+        );
+        assert_eq!(
+            result.seeds_truncated,
+            Some(true),
+            "45 of 50 definitions never entered the PPR personalization vector"
+        );
+        assert_eq!(
+            result.seed_resolution_limit,
+            Some(SEED_NAME_MATCH_LIMIT),
+            "naming the cut without naming the bound leaves the caller unable to judge the loss"
+        );
+    }
+
+    /// Counterweight. The disclosure must not fire on a name that genuinely has
+    /// exactly as many definitions as the cap allows — that case is
+    /// indistinguishable from the bug by seed COUNT alone, which is precisely
+    /// why the count was never a disclosure.
+    #[test]
+    fn a_seed_name_with_exactly_the_cap_many_definitions_is_not_reported_as_truncated() {
+        let store = store_with_validate_definitions(SEED_NAME_MATCH_LIMIT);
+
+        let result = build_context(&store, &["validate".to_string()]).unwrap();
+
+        assert_eq!(
+            result.seed_matches_total,
+            Some(SEED_NAME_MATCH_LIMIT),
+            "every definition matched"
+        );
+        assert_eq!(
+            result.seeds_truncated,
+            Some(false),
+            "a complete seed set must not be reported as cut"
+        );
+        assert_eq!(
+            result.seed_resolution_limit,
+            Some(SEED_NAME_MATCH_LIMIT),
+            "the bound is echoed whenever it was in force — `limit: 5, truncated: false` \
+             says more than an absent field, exactly as `token_budget` does"
+        );
+    }
+
+    /// A UID-seeded query is not bounded by this cap at all. Reporting
+    /// `0 of 0` there would be a second false disclosure, not a fix.
+    #[test]
+    fn a_seed_form_the_cap_does_not_bound_reports_no_seed_truncation_at_all() {
+        let store = store_with_validate_definitions(50);
+
+        let result = build_context(&store, &["sym:v0".to_string()]).unwrap();
+
+        assert_eq!(
+            result.seed_matches_total, None,
+            "UID lookup is exhaustive; it has no match total to disclose"
+        );
+        assert_eq!(result.seeds_truncated, None);
+        assert_eq!(result.seed_resolution_limit, None);
+    }
+
+    #[test]
+    fn brain_context_discloses_the_same_seed_cut_the_code_route_does() {
+        let store = store_with_validate_definitions(50);
+
+        let result = brain_context_for(&store, "validate").unwrap();
+
+        assert_eq!(
+            result.seed_matches_total,
+            Some(50),
+            "`brain context` resolves seeds through its own loop and must not \
+             under-report where `nestweaver context` reports"
+        );
+        assert_eq!(result.seeds_truncated, Some(true));
+        assert_eq!(result.seed_resolution_limit, Some(SEED_NAME_MATCH_LIMIT));
+    }
+
+    /// Counterweight for the brain route.
+    #[test]
+    fn brain_context_does_not_report_a_seed_cut_that_did_not_happen() {
+        let store = store_with_validate_definitions(SEED_NAME_MATCH_LIMIT);
+
+        let result = brain_context_for(&store, "validate").unwrap();
+
+        assert_eq!(result.seed_matches_total, Some(SEED_NAME_MATCH_LIMIT));
+        assert_eq!(result.seeds_truncated, Some(false));
+        assert_eq!(result.seed_resolution_limit, Some(SEED_NAME_MATCH_LIMIT));
+    }
+}
+
 #[cfg(test)]
 mod render_brain_node_tests {
     use nestweaver_schema::{Note, NoteKind, Section};
@@ -3421,6 +3845,7 @@ mod dedup_heading_section_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec![],
+            ..Default::default()
         }
     }
 

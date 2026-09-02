@@ -491,10 +491,38 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
 /// Remove the stale checkpoint sidecars lbug's error tells us to delete — but ONLY
 /// when the shadow file is absent or empty (0 bytes), the exact signature of an
 /// aborted checkpoint. A non-empty shadow could belong to a live mid-checkpoint
-/// writer; never touch that. (Reaching the stale-checkpoint error already implies
-/// no other process holds the write lock — that would surface as a lock error
-/// instead.) Returns true if the checkpoint file was removed (worth a retry).
-fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
+/// writer; never touch that. Returns true if the checkpoint file was removed
+/// (worth a retry).
+///
+/// nw-373. THE SENTENCE THAT USED TO BE HERE IS DELETED, not softened, because
+/// it was the reasoning that produced the bug: *"Reaching the stale-checkpoint
+/// error already implies no other process holds the write lock — that would
+/// surface as a lock error instead."* That is FALSE on the path that reached it
+/// most often. A READ-ONLY open never contends for the write lock at all, so it
+/// can never surface a lock error, so the implication has no antecedent — and
+/// this function was deleting `<db>.wal.checkpoint` and `<db>.shadow` of a
+/// database another process was writing, on the strength of it. An inference
+/// about what a caller did NOT observe is not a proof of exclusivity.
+///
+/// `read_write` is the gate that replaces the inference, and it is the same one
+/// [`quarantine_orphaned_wal`] has always had — these two arms of ONE recovery
+/// disagreed about whether a read-only caller may mutate the directory, and the
+/// arm that DELETES was the ungated one. A read-write open has at least taken
+/// lbug's own write lock on the database file, which is evidence; a read-only
+/// open has taken nothing. The self-heal that motivated this recovery is
+/// unaffected: it is the daemon that crash-loops, and the daemon opens
+/// read-write.
+///
+/// HANDOFF, and the reason this is a NARROWING rather than nw-373's fix: even a
+/// read-write open only PROBED exclusivity in the past — it holds lbug's lock,
+/// not the canonical write lease, across the delete. The property nw-373 asks
+/// for is a `DbWriteLease` HELD across the whole enumerate-and-delete, and
+/// `acquire_db_write_lease` lives in `nestweaver-daemon`, which depends on this
+/// crate. See the report for the signature; do not grow a second lease here.
+fn remove_stale_checkpoint_sidecars(path: &Path, read_write: bool) -> bool {
+    if !read_write {
+        return false;
+    }
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     let checkpoint = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
     let shadow_empty = std::fs::metadata(&shadow)
@@ -712,6 +740,16 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 /// Only acts on the exact orphan signature — `.wal` present AND `.shadow`
 /// absent. A `.wal` with its `.shadow` intact is a normal recoverable log and
 /// must be left for the engine to replay.
+///
+/// nw-373, unfixed and named: the caller gates this on a read-write open, which
+/// means lbug's write lock was taken — but nothing HOLDS the canonical write
+/// lease across the rename, so this is still a check-then-act on exclusivity.
+/// A probe answers a question about the past; the rename happens in the future.
+/// The blast radius is bounded by the fact that this only ever RENAMES (see
+/// above) and only on the orphan signature, which is why it is named here rather
+/// than papered over with a second probe. The fix needs
+/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which this crate
+/// cannot reach; see the report's HANDOFF.
 fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
@@ -728,13 +766,52 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
         .map(|()| quarantined)
 }
 
+/// Turn a failed open into a `StoreError`, consulting the write lease when — and
+/// only when — the caller could not be the process holding it.
+///
+/// nw-404. The veto (`from_engine_message_for_db`) exists because a live
+/// writer's partially-appended WAL tail and a genuinely damaged log produce the
+/// SAME engine sentence, and the remedy for the second destroys the first. But
+/// `flock` carries no holder identity, so the probe cannot tell "someone else is
+/// writing" from "I am writing": the daemon takes the lease for its whole life
+/// (`server.rs`, before it ever opens the store) and every `--no-daemon` writer
+/// takes it through `require_exclusive_store_access`. Asked blindly, the probe
+/// would answer "a live writer holds it" to the writer itself, and a genuinely
+/// corrupt database would fail daemon boot with a contention message instead of
+/// the corruption runbook — trading nw-404's false alarm for a silent one, on the
+/// exact recovery path nw-332's outage needed.
+///
+/// `read_write` is the STRUCTURAL proxy for "not the holder", and it is exact
+/// rather than approximate: lbug takes its own write lock on the database file
+/// for a read-write open, so a read-write open by a NON-holder while someone
+/// else is writing fails with "Could not set lock" and never reaches a WAL
+/// verdict at all. The only read-write opener that can arrive here with a lease
+/// held is the holder. Read-only opens are the complement — the direct
+/// `impact --repo` / `brain context --no-tests` route that filed nw-404 — and
+/// they are the ones that get the veto.
+///
+/// HANDOFF, for the exact rather than the structural answer: a self-ownership
+/// latch (the shape `lifecycle::note_local_store_write_lock` already uses to stop
+/// `db_write_lock` destroying its own lock) set by `acquire_db_write_lease`. That
+/// is a `crates/nestweaver-daemon/src/lifecycle.rs` edit.
+fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
+    if read_write {
+        // nw-346: the frame that knows WHICH database failed attaches the path,
+        // so no caller has to guess one from prose.
+        return StoreError::from_engine_message(message).with_db_path(path);
+    }
+    StoreError::from_engine_message_for_db(message, path)
+}
+
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
 /// `read_write` gates the orphaned-WAL arm. Replay is inherently a write
 /// operation, so a read-only open must report the condition rather than mutate
 /// the directory to clear it — and a read-only caller quarantining a log out
-/// from under a live writer would be a genuine hazard.
+/// from under a live writer would be a genuine hazard. It also gates nw-404's
+/// writer-liveness veto; see [`open_failure`] for why the two questions share
+/// one flag.
 fn open_lbug_with_recovery(
     path: &Path,
     read_write: bool,
@@ -752,14 +829,15 @@ fn open_lbug_with_recovery(
         Ok(db) => Ok(db),
         Err(e) => {
             let msg = e.to_string();
-            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path) {
+            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, read_write)
+            {
                 tracing::warn!(
                     "recovered a stale WAL checkpoint for {} (a prior crash left \
                      .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
                     path.display()
                 );
                 return lbug::Database::new(path, make_config())
-                    .map_err(|e| StoreError::from(e).with_db_path(path));
+                    .map_err(|e| open_failure(path, e.to_string(), read_write));
             }
             if read_write
                 && is_orphaned_wal_error(&msg)
@@ -774,12 +852,13 @@ fn open_lbug_with_recovery(
                     quarantined.display()
                 );
                 return lbug::Database::new(path, make_config())
-                    .map_err(|e| StoreError::from(e).with_db_path(path));
+                    .map_err(|e| open_failure(path, e.to_string(), read_write));
             }
-            // nw-346. This is the frame that knows WHICH database failed; the
-            // engine's message names no path, so attaching it here is what
-            // retires the caller's need to guess one.
-            Err(StoreError::from(e).with_db_path(path))
+            // nw-346 / nw-404. This is the frame that knows WHICH database
+            // failed AND whether this open could be the one writing it — the
+            // two facts an unreadable-WAL verdict depends on and that
+            // `StoreError::from` cannot supply. See [`open_failure`].
+            Err(open_failure(path, e.to_string(), read_write))
         }
     }
 }
@@ -4241,6 +4320,40 @@ mod tests {
         ));
     }
 
+    /// nw-373. The deleted doc sentence claimed that reaching this error already
+    /// implied nobody else held the write lock. A READ-ONLY open never asks for
+    /// that lock, so it could never have observed the lock error the inference
+    /// relied on — and it was deleting `.wal.checkpoint` and `.shadow` of a
+    /// database the daemon was writing.
+    ///
+    /// The counterweight is the second half: the read-WRITE self-heal that this
+    /// recovery exists for must still fire, or the fix trades a data hazard for
+    /// the crash-loop outage it was written to end.
+    #[test]
+    fn a_read_only_open_cannot_delete_checkpoint_sidecars_it_never_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.lbug");
+        let cp = dir.path().join("db.lbug.wal.checkpoint");
+        let shadow = dir.path().join("db.lbug.shadow");
+        std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
+        std::fs::write(&shadow, b"").unwrap();
+
+        assert!(
+            !remove_stale_checkpoint_sidecars(&db, false),
+            "a read-only open holds nothing and must not perform sidecar surgery"
+        );
+        assert!(cp.exists(), "the checkpoint must survive a read-only open");
+        assert!(shadow.exists(), "and so must the shadow");
+
+        assert!(
+            remove_stale_checkpoint_sidecars(&db, true),
+            "the read-write self-heal is the reason this recovery exists and must \
+             still fire — gating it into uselessness would restore the crash loop"
+        );
+        assert!(!cp.exists());
+        assert!(!shadow.exists());
+    }
+
     #[test]
     fn removes_stale_checkpoint_only_when_shadow_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -4251,14 +4364,14 @@ mod tests {
         // Empty shadow + checkpoint present → recover (remove both).
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
-        assert!(remove_stale_checkpoint_sidecars(&db));
+        assert!(remove_stale_checkpoint_sidecars(&db, true));
         assert!(!cp.exists(), "stale checkpoint should be removed");
         assert!(!shadow.exists(), "empty shadow should be removed");
 
         // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
         std::fs::write(&cp, b"stale").unwrap();
         std::fs::write(&shadow, b"live-writer-state").unwrap();
-        assert!(!remove_stale_checkpoint_sidecars(&db));
+        assert!(!remove_stale_checkpoint_sidecars(&db, true));
         assert!(
             cp.exists(),
             "must not remove checkpoint when shadow is non-empty"
@@ -5556,5 +5669,90 @@ mod git_activity_loader_tests {
 
         store.load_git_activity_sidecar(&path).unwrap();
         assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), Some(0.9));
+    }
+}
+
+/// nw-404: the writer-liveness veto on an unreadable-WAL verdict, exercised
+/// through the OPEN FUNNEL rather than through the classifier alone.
+#[cfg(test)]
+mod live_writer_wal_tests {
+    use super::GraphStore;
+
+    /// nw-404. The veto belongs to the READ-ONLY open and to nothing else.
+    ///
+    /// The read-only leg is the defect: `impact --repo` / `brain context
+    /// --no-tests` bypass the daemon, open read-only, meet the daemon's
+    /// half-written WAL tail and get told the database is corrupt — with a
+    /// runbook that moves aside the `.wal` the daemon is still appending to.
+    ///
+    /// The read-write leg is the COUNTERWEIGHT, and it is not hypothetical: the
+    /// daemon holds this very lease for its whole life and then opens the store,
+    /// so a blind probe would answer "a live writer holds it" to the writer
+    /// itself and swallow the corruption diagnosis on the one path that most
+    /// needs it. Both legs are asserted here against a lease this test actually
+    /// holds, so neither can be broken without the other failing.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_read_only_open_lets_a_live_writer_retract_an_unreadable_wal_verdict() {
+        use std::os::unix::io::AsRawFd;
+
+        const ENGINE: &str = "Corrupted wal file. Read out invalid WAL record type.";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.lbug");
+        std::fs::write(&db, b"").unwrap();
+
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(format!("{}.write.lock", db.display()))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test must actually hold the lease or it proves nothing"
+        );
+
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), false).corruption_kind(),
+            None,
+            "a read-only open meeting a live writer must not report corruption, \
+             because its remedy moves aside a WAL that is still being written"
+        );
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), true).corruption_kind(),
+            Some(crate::error::CorruptionKind::WalUnreadable),
+            "a read-write open holds the lease itself, so the same probe would \
+             be the writer asking about itself — it must keep the corruption \
+             verdict and its recovery runbook"
+        );
+    }
+
+    /// The narrowness half of nw-404, at the surface a user actually touches.
+    ///
+    /// A 0-byte `<db>.wal` opens and serves today — an empty log is a log with
+    /// nothing in it, not a damaged one — and the veto must not change that in
+    /// either direction: not by declining the open, and not by routing a
+    /// perfectly ordinary open through the contention arm. The veto only ever
+    /// runs on the ERROR branch of `open_lbug_with_recovery`, and this is what
+    /// pins that.
+    #[test]
+    fn a_zero_byte_write_ahead_log_still_opens_and_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.lbug");
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            store.ensure_data_instance_id("2051a9da").unwrap();
+        }
+        std::fs::write(format!("{}.wal", db.display()), b"").unwrap();
+
+        let reopened = GraphStore::open_read_only(&db)
+            .expect("a 0-byte write-ahead log is an empty log, not a corrupt one");
+        assert_eq!(
+            reopened.data_instance_id().unwrap().as_deref(),
+            Some("2051a9da"),
+            "and it must still SERVE, not merely open"
+        );
     }
 }

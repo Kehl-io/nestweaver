@@ -620,6 +620,63 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             let seeds_len = result["seeds"].as_array().map_or(0, Vec::len);
             result["seeds_resolved"] = Value::from(seeds_len);
         }
+        // nw-393. The SEED cap, merged across tiers.
+        //
+        // `seed_resolution_limit` is a compile-time BOUND, not a count — both
+        // tiers run the same `SEED_NAME_MATCH_LIMIT` — so it is CARRIED, never
+        // summed. Summing a bound would state a limit neither tier applied.
+        //
+        // `seeds_truncated` is the OR: a seed cut on EITHER tier means the
+        // merged seed set is short, and a `false` from the other tier cannot
+        // undo that.
+        //
+        // `seed_matches_total` is SUMMED — but the sum cannot be exact, and
+        // saying so is the whole point of carrying a relation. The
+        // matched-but-CUT symbols never reach the payload, so unlike
+        // `seeds_resolved` above (which is recomputed from the merged array
+        // precisely because `rrf_merge` deduplicates) there is nothing here to
+        // deduplicate against: a repo indexed on BOTH tiers is counted twice
+        // and we cannot detect it. So whenever both tiers contributed a total,
+        // the merged relation is forced to `gte` — the sum is an honest LOWER
+        // BOUND, which is exactly what `SearchTotal`'s `gte` already means.
+        // Reporting a two-tier sum as `eq` would be the one answer that is
+        // affirmatively wrong.
+        let local_total = local.get("seed_matches_total").and_then(Value::as_u64);
+        let server_total = server.get("seed_matches_total").and_then(Value::as_u64);
+        if local_total.is_some() || server_total.is_some() {
+            let summed = local_total
+                .unwrap_or(0)
+                .saturating_add(server_total.unwrap_or(0));
+            result["seed_matches_total"] = Value::from(summed);
+            let either_is_gte = [
+                local.get("seed_matches_total_relation"),
+                server.get("seed_matches_total_relation"),
+            ]
+            .iter()
+            .flatten()
+            .any(|v| v.as_str() == Some("gte"));
+            let both_contributed = local_total.is_some() && server_total.is_some();
+            result["seed_matches_total_relation"] =
+                Value::from(if either_is_gte || both_contributed {
+                    "gte"
+                } else {
+                    "eq"
+                });
+        }
+        let local_cut = local.get("seeds_truncated").and_then(Value::as_bool);
+        let server_cut = server.get("seeds_truncated").and_then(Value::as_bool);
+        if local_cut.is_some() || server_cut.is_some() {
+            result["seeds_truncated"] =
+                Value::from(local_cut.unwrap_or(false) || server_cut.unwrap_or(false));
+        }
+        if let Some(bound) = local
+            .get("seed_resolution_limit")
+            .or_else(|| server.get("seed_resolution_limit"))
+            .and_then(Value::as_u64)
+        {
+            result["seed_resolution_limit"] = Value::from(bound);
+        }
+
         // `limit` and `truncated` must survive AND be re-honoured.
         //
         // Carrying them through is not enough: each tier caps at the SAME

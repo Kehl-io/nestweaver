@@ -18,7 +18,7 @@ pub const MAX_CHANGED_FILE_LEN: usize = 512;
 pub fn validate_changed_file_entries(changed_files: &[String]) -> Result<Vec<String>> {
     if changed_files.len() > MAX_CHANGED_FILES {
         bail!(
-            "'changed_files' contains {} entries; maximum is {MAX_CHANGED_FILES}",
+            "request REJECTED: 'changed_files' contains {} entries; maximum is {MAX_CHANGED_FILES}",
             changed_files.len()
         );
     }
@@ -44,7 +44,7 @@ pub fn require_changed_paths(changed_files: &[PathBuf]) -> Result<Vec<PathBuf>> 
     }
     if changed_files.len() > MAX_CHANGED_FILES {
         bail!(
-            "'changed_files' contains {} entries; maximum is {MAX_CHANGED_FILES}",
+            "request REJECTED: 'changed_files' contains {} entries; maximum is {MAX_CHANGED_FILES}",
             changed_files.len()
         );
     }
@@ -72,7 +72,7 @@ fn validate_changed_file(raw: &str, index: usize) -> Result<String> {
     }
     if value.len() > MAX_CHANGED_FILE_LEN {
         bail!(
-            "invalid changed_files[{index}]: path is {} bytes; maximum is {MAX_CHANGED_FILE_LEN}",
+            "request REJECTED: invalid changed_files[{index}]: path is {} bytes; maximum is {MAX_CHANGED_FILE_LEN}",
             value.len()
         );
     }
@@ -153,6 +153,7 @@ mod tests {
         let error = validate_changed_file_entries(&too_many)
             .unwrap_err()
             .to_string();
+        assert!(error.contains("REJECTED"), "{error}");
         assert!(error.contains("maximum is 1000"), "{error}");
         let too_many_paths = vec![PathBuf::from("src/lib.rs"); MAX_CHANGED_FILES + 1];
         let error = require_changed_paths(&too_many_paths)
@@ -164,6 +165,7 @@ mod tests {
         let error = require_changed_files(&["src/ok.rs".to_string(), overlong])
             .unwrap_err()
             .to_string();
+        assert!(error.contains("REJECTED"), "{error}");
         assert!(error.contains("changed_files[1]"), "{error}");
         assert!(error.contains("maximum is 512"), "{error}");
     }

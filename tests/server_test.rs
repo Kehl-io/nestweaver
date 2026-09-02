@@ -1259,9 +1259,9 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
     );
 }
 
-/// Regression guard: the authenticated MCP-HTTP boundary must redact blast
-/// totals before applying `limit`. A query-scoped caller must never receive the
-/// larger admin-visible total or any hidden repo identifiers.
+/// Regression guard: the authenticated MCP-HTTP boundary must refuse blast
+/// traversal for a query-scoped caller before seed resolution. Authorization-
+/// induced subgraphs are not valid substitutes for the canonical impact graph.
 #[tokio::test]
 async fn server_mcp_http_blast_radius_fails_closed_for_restricted_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -3370,9 +3370,8 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
         );
     }
     // The unrestricted local tier proves both local repositories participate
-    // in impact traversal. The restricted HTTP route must remove hidden local
-    // rows before computing totals and before the federation envelope is
-    // assembled.
+    // in impact traversal. The restricted HTTP route must refuse before local
+    // traversal and before the federation envelope is assembled.
     let impact_arguments = json!({
         "symbol": "visiblefederationcanary",
         "depth": 3
