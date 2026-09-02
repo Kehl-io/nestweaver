@@ -103,6 +103,10 @@ pub fn write_lease_path(db_path: &Path) -> PathBuf {
 #[must_use = "the lease must be held for the complete mutation"]
 #[derive(Debug)]
 pub struct DbWriteLease {
+    // System scratch roots such as /tmp cannot be destructively restored by
+    // NestWeaver, so a database directly below one needs only the exact
+    // database and sidecar authorities. Every replaceable data directory also
+    // holds this shared namespace descriptor.
     _namespace_file: Option<std::fs::File>,
     _db_file: std::fs::File,
     _lease_file: std::fs::File,
@@ -186,12 +190,11 @@ pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, W
         .truncate(false)
         .open(&lease_path)
         .map_err(WriteLeaseError::Unavailable)?;
-    // The POSIX record lock is not inherited across fork. Take it first so a
-    // live external namespace owner still fails immediately, while the flock
-    // retry below can be limited to same-process ownership or the brief
-    // fork-before-exec interval of an otherwise finished owner.
-    lock_posix_nonblocking(&file, libc::F_WRLCK as libc::c_short)?;
-    lock_flock_after_posix_authority(&file, libc::LOCK_EX)?;
+    // Namespace coordination is an upgraded-writer protocol, so one
+    // descriptor-scoped flock is sufficient. Do not layer a POSIX record lock
+    // onto this same inode: macOS makes flock/fcntl locks cooperate and
+    // explicitly permits only one of those interfaces per file in a process.
+    lock_flock_with_inheritance_retry(&file, libc::LOCK_EX)?;
     Ok(DbNamespaceLease {
         _file: file,
         data_dir,
@@ -199,6 +202,12 @@ pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, W
 }
 
 fn namespace_lease_path(data_dir: &Path) -> Result<PathBuf, WriteLeaseError> {
+    if is_system_scratch_data_dir(data_dir) {
+        return Err(WriteLeaseError::Unavailable(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "system scratch directories cannot be destructively replaced as database namespaces",
+        )));
+    }
     let parent = data_dir.parent().ok_or_else(|| {
         WriteLeaseError::Unavailable(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -215,6 +224,23 @@ fn namespace_lease_path(data_dir: &Path) -> Result<PathBuf, WriteLeaseError> {
     lock_name.push(name);
     lock_name.push(".nestweaver-write-namespace.lock");
     Ok(parent.join(lock_name))
+}
+
+/// Direct scratch databases are valid, but replacing the system scratch root
+/// itself is not. Keeping that distinction explicit prevents `/tmp/x.lbug`
+/// from trying to create its shared namespace lock in `/`, while every exact
+/// database writer still holds the database inode and stable sidecar locks.
+///
+/// The paths are fixed rather than derived from `TMPDIR`: an untrusted ambient
+/// environment variable must not be able to opt an ordinary data directory out
+/// of restore coordination. Canonicalisation covers macOS aliases such as
+/// `/tmp -> /private/tmp`.
+fn is_system_scratch_data_dir(data_dir: &Path) -> bool {
+    let data_dir = canonical_db_path(data_dir);
+    [Path::new("/tmp"), Path::new("/var/tmp")]
+        .into_iter()
+        .map(canonical_db_path)
+        .any(|scratch| scratch == data_dir)
 }
 
 fn acquire_db_write_lease_inner(
@@ -236,22 +262,25 @@ fn acquire_db_write_lease_inner(
                 "database path has no stable namespace ancestor",
             ))
         })?;
-        if let Some(stable_parent) = data_dir.parent()
-            && !stable_parent.exists()
-        {
-            std::fs::create_dir_all(stable_parent).map_err(WriteLeaseError::Unavailable)?;
+        if is_system_scratch_data_dir(&data_dir) {
+            None
+        } else {
+            if let Some(stable_parent) = data_dir.parent()
+                && !stable_parent.exists()
+            {
+                std::fs::create_dir_all(stable_parent).map_err(WriteLeaseError::Unavailable)?;
+            }
+            let lease_path = namespace_lease_path(&data_dir)?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(lease_path)
+                .map_err(WriteLeaseError::Unavailable)?;
+            lock_flock_with_inheritance_retry(&file, libc::LOCK_SH)?;
+            Some(file)
         }
-        let lease_path = namespace_lease_path(&data_dir)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lease_path)
-            .map_err(WriteLeaseError::Unavailable)?;
-        lock_posix_nonblocking(&file, libc::F_RDLCK as libc::c_short)?;
-        lock_flock_after_posix_authority(&file, libc::LOCK_SH)?;
-        Some(file)
     };
     // The data directory may have been absent, or restore may have renamed it
     // away immediately before this acquisition. Recreate it only after the
@@ -278,10 +307,10 @@ fn acquire_db_write_lease_inner(
     // knows nothing about the sidecar: successful authority acquisition must
     // exclude it, not merely exclude other upgraded NestWeaver processes.
     lock_posix_write_nonblocking(&db_file)?;
-    // POSIX locks are process-scoped, so a second descriptor in this process
-    // would not conflict with the first. The additional flock is descriptor-
-    // scoped and closes that same-process duplicate-authority hole.
-    lock_flock_after_posix_authority(&db_file, libc::LOCK_EX)?;
+    // Never flock this same inode as well. Linux keeps the two lock families
+    // independent, while macOS makes them cooperate and a second interface can
+    // contend with this process's own record lock. The process claim and the
+    // distinct sidecar flock below close the same-process duplicate hole.
 
     let lease_file = std::fs::OpenOptions::new()
         .create(true)
@@ -290,7 +319,7 @@ fn acquire_db_write_lease_inner(
         .truncate(false)
         .open(&lease_path)
         .map_err(WriteLeaseError::Unavailable)?;
-    lock_flock_after_posix_authority(&lease_file, libc::LOCK_EX)?;
+    lock_flock_with_inheritance_retry(&lease_file, libc::LOCK_EX)?;
     Ok(DbWriteLease {
         _namespace_file: namespace_file,
         _db_file: db_file,
@@ -306,7 +335,7 @@ fn data_dir_for_db(db_path: &Path) -> Option<PathBuf> {
     canonical.parent().map(Path::to_path_buf)
 }
 
-fn lock_flock_after_posix_authority(
+fn lock_flock_with_inheritance_retry(
     file: &std::fs::File,
     operation: libc::c_int,
 ) -> Result<(), WriteLeaseError> {
@@ -314,10 +343,11 @@ fn lock_flock_after_posix_authority(
 
     // `flock` follows the open file description across fork. Rust marks these
     // descriptors CLOEXEC, but a child created by another thread can retain a
-    // just-dropped owner's description until exec completes. The preceding
-    // POSIX record lock is not inherited, so a live external canonical owner
-    // normally fails at that first gate. Bounded retry here covers inherited
-    // descriptions and retains the flock fallback for same-process authority.
+    // just-dropped owner's description until exec completes. Bounded retry
+    // covers that transient inheritance window. A live upgraded owner keeps
+    // the flock past the bound and is reported as Held; an exact database
+    // writer is also excluded first by the non-inherited POSIX lock on the
+    // separate database inode.
     for attempt in 0..=100 {
         if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
             return Ok(());
@@ -457,9 +487,11 @@ mod tests {
 
     fn await_write_lease_free(db: &Path) {
         for _ in 0..100 {
-            let namespace_free = data_dir_for_db(db)
-                .and_then(|data_dir| namespace_lease_path(&data_dir).ok())
-                .is_some_and(|path| probe_flock_state(&path) == WriteLeaseState::Free);
+            let namespace_free = data_dir_for_db(db).is_some_and(|data_dir| {
+                namespace_lease_path(&data_dir)
+                    .map(|path| probe_flock_state(&path) == WriteLeaseState::Free)
+                    .unwrap_or(true)
+            });
             if write_lease_state(db) == WriteLeaseState::Free && namespace_free {
                 return;
             }
@@ -471,10 +503,39 @@ mod tests {
         }
         assert_eq!(write_lease_state(db), WriteLeaseState::Free);
         let data_dir = data_dir_for_db(db).expect("database path has a data directory");
-        assert_eq!(
-            probe_flock_state(&namespace_lease_path(&data_dir).unwrap()),
-            WriteLeaseState::Free
-        );
+        if let Ok(namespace_path) = namespace_lease_path(&data_dir) {
+            assert_eq!(probe_flock_state(&namespace_path), WriteLeaseState::Free);
+        }
+    }
+
+    #[test]
+    fn a_database_directly_in_system_scratch_does_not_require_a_root_lock() {
+        let scratch_root = Path::new("/tmp");
+        if !scratch_root.is_dir() {
+            return;
+        }
+        assert!(is_system_scratch_data_dir(scratch_root));
+        assert!(matches!(
+            namespace_lease_path(scratch_root),
+            Err(WriteLeaseError::Unavailable(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        let scratch_db = tempfile::Builder::new()
+            .prefix("nestweaver-write-lease-")
+            .suffix(".lbug")
+            .tempfile_in(scratch_root)
+            .unwrap();
+        let db_path = scratch_db.path().to_path_buf();
+        let sidecar = write_lease_path(&db_path);
+        let authority = acquire_db_write_lease(&db_path)
+            .expect("an exact scratch database lease must not need write access to /");
+        assert!(authority.authorizes(&db_path));
+        assert_eq!(write_lease_state(&db_path), WriteLeaseState::Held);
+
+        drop(authority);
+        await_write_lease_free(&db_path);
+        std::fs::remove_file(sidecar).unwrap();
     }
 
     #[test]
