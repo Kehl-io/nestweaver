@@ -8,11 +8,25 @@ binary matching this package's version from the project's GitHub Releases,
 verifies it against the SHA-256 published alongside the archive, and puts a
 `nestweaver` executable on your PATH.
 
+**Lifecycle scripts must be enabled.** The binary is fetched in `postinstall`,
+so `npm install --ignore-scripts` — and **pnpm 10+, which blocks lifecycle
+scripts by default** — leave you with a wrapper and no binary. `nestweaver` then
+exits 1 saying the binary was not found. With pnpm, allow it explicitly:
+
+```jsonc
+// package.json
+{ "pnpm": { "onlyBuiltDependencies": ["nestweaver"] } }
+```
+
+If your organisation disallows install scripts outright, install a release
+archive from GitHub or build from source (`cargo install --locked --path .`)
+instead.
+
 ## Platforms
 
 macOS and Linux, on x86_64 and arm64. On any other platform the install step
-exits without failing and prints the supported targets; use a release archive
-or a source build instead.
+FAILS and prints the supported targets, rather than leaving you with a wrapper
+that cannot run; use a release archive or a source build instead.
 
 Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer and
 Debian 12. The archive includes the GCC 13 runtime LadybugDB needs and the npm

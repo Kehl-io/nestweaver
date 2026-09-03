@@ -353,12 +353,16 @@ pub fn detect_changes_impact(
     let mut status = AnalysisStatus::Complete;
     let mut notifications = Vec::new();
     let mut unassessed = Vec::new();
-    let resolver_stale_repos = crate::resolver_generation::incompatible_repos_for_store(store)?;
-    if !resolver_stale_repos.is_empty() {
+    // nw-424: the SET is unchanged (every incompatible repository still
+    // degrades), but the message now says whether the caller owns the problem.
+    let incompatibility =
+        crate::resolver_generation::incompatibility_for_changed_files(store, &changed_files)?;
+    let resolver_stale_repos = incompatibility.all();
+    if incompatibility.is_incompatible() {
         status = status.max(AnalysisStatus::Degraded);
         notifications.push(Notification {
             level: NotificationLevel::Error,
-            message: crate::resolver_generation::incompatibility_message(&resolver_stale_repos),
+            message: incompatibility.message(),
             descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
         });
     }
