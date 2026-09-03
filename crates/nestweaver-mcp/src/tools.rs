@@ -15132,66 +15132,17 @@ fn resolver_generation_refusal(
 /// missing edge makes the affected-test set SMALLER: the regression test that
 /// would have caught the change is never selected, the gate reports success,
 /// and there is no list for anyone to review. A test selector that refuses is
-/// safe; one that silently narrows is not.
-const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
-     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
-     safer — it can only drop a test that should have run, while `status` still reads complete. \
-     The error is one-directional and it is silent: nothing downstream can tell a test that was \
-     not selected from a test that does not exist.";
-
-/// Turn the shared resolver-generation verdict into `affected_tests`'
-/// refusal.
+/// Turn the shared resolver-generation verdict into `affected-tests`' refusal.
 ///
-/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
-/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
-/// `status`, same `remedies` array of ready-to-run
-/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
-/// a CI job already gates on. Only two things are tool-specific:
-///
-///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
-///    "dead-code will not produce a list on this graph", which is the wrong
-///    sentence in front of the right remedies.
-///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
-///    consumer of this tool acts on, and the refusal deliberately carries no
-///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
-///    get tiers" would read the refusal as "no tests affected", which is the
-///    exact silent narrowing this refusal exists to prevent. It is the same
-///    fail-safe widening value the tool already emits for any non-complete
-///    run, so the vocabulary is unchanged.
-///  * `notifications` carries the shared resolver-incompatibility descriptor,
-///    matching the other changed-file analysis tools so machine consumers do
-///    not need a tool-specific way to recognize the same unsafe graph.
+/// nw-412. Built ONCE in the engine
+/// (`DeadCodeRefusal::affected_tests_payload`) and shared with the CLI's direct
+/// and daemon routes, so a CI gate cannot tell which route answered. This and
+/// its `src/main.rs` twin previously each carried their own copy of the
+/// preamble constant and the remedy-rendering loop.
 fn affected_tests_refusal_payload(
     refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
 ) -> Value {
-    let mut payload = refusal.payload();
-    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
-    for remedy in payload
-        .get("remedies")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        match remedy.get("command").and_then(Value::as_str) {
-            Some(command) => note.push_str(&format!("\n  {command}")),
-            None => note.push_str(&format!(
-                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
-                 pass to `--repo`; re-index it where it lives",
-                remedy
-                    .get("uid")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(unnamed repo)")
-            )),
-        }
-    }
-    payload["note"] = json!(note.clone());
-    payload["notifications"] = json!([{
-        "level": "error",
-        "descriptor": nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR,
-        "message": note,
-    }]);
-    payload["recommendation"] = json!("run-full-suite");
-    payload
+    refusal.affected_tests_payload()
 }
 
 /// The notification `blast_radius` attaches when its graph is

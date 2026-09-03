@@ -270,6 +270,19 @@ const WHY_DEAD_CODE_REFUSES: &str = "dead-code will not produce a list on this g
      edge cannot make the list safer — it can only fail to reach a live symbol and report it as \
      dead. The error is one-directional and the deletion it invites is not recoverable.";
 
+/// Why `affected-tests` REFUSES rather than degrading.
+///
+/// Lived as two copies -- `src/main.rs` and `nestweaver-mcp/src/tools.rs` --
+/// each carrying a doc comment claiming byte-identity with the other. One
+/// definition removes the claim and the drift it invited. Public because the
+/// CLI also uses it as the fallback when a daemon-supplied refusal payload
+/// carries no `note`.
+pub const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
+     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
+     safer — it can only drop a test that should have run, while `status` still reads complete. \
+     The error is one-directional and it is silent: nothing downstream can tell a test that was \
+     not selected from a test that does not exist.";
+
 /// One generation-stale repo, named the way the refusal names it.
 ///
 /// `command` is a string the user can PASTE. `staleness_note_for` prints a
@@ -396,20 +409,58 @@ impl DeadCodeRefusal {
             Self::OutdatedResolver { repos, total } => {
                 let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
                 let note = staleness_note_for(&uids, *total).unwrap_or_default();
-                let mut message = format!("{preamble} {note}");
-                for repo in repos {
-                    match &repo.command {
-                        Some(command) => message.push_str(&format!("\n  {command}")),
-                        None => message.push_str(&format!(
-                            "\n  {} — indexed from a bare clone, so this machine has no \
-                             working tree to pass to `--repo`; re-index it where it lives",
-                            repo.uid
-                        )),
-                    }
-                }
-                message
+                format!("{preamble} {note}{}", self.remedy_lines())
             }
         }
+    }
+
+    /// The pasteable remedy block appended under every preamble.
+    ///
+    /// This sentence existed in THREE places -- here, and hand-copied into
+    /// `affected_tests_refusal_payload` in both `src/main.rs` and
+    /// `nestweaver-mcp/src/tools.rs`, where each iterated the JSON `remedies`
+    /// array to rebuild the identical string. `payload()` serialises `remedies`
+    /// straight from `repos`, so iterating the typed rows produces byte-identical
+    /// output without the round trip.
+    fn remedy_lines(&self) -> String {
+        let Self::OutdatedResolver { repos, .. } = self;
+        let mut lines = String::new();
+        for repo in repos {
+            match &repo.command {
+                Some(command) => lines.push_str(&format!("\n  {command}")),
+                None => lines.push_str(&format!(
+                    "\n  {} — indexed from a bare clone, so this machine has no \
+                     working tree to pass to `--repo`; re-index it where it lives",
+                    repo.uid
+                )),
+            }
+        }
+        lines
+    }
+
+    /// `affected-tests`' refusal payload, shared by the CLI direct route, the
+    /// CLI daemon route and the MCP tool.
+    ///
+    /// It previously existed as two hand-maintained copies whose only guarantee
+    /// of agreement was a doc comment asserting they were "byte-identical" --
+    /// including a duplicated copy of the preamble constant itself. A CI gate
+    /// must not be able to tell which route answered, so agreement is now
+    /// structural.
+    pub fn affected_tests_payload(&self) -> serde_json::Value {
+        let mut payload = self.payload();
+        let note = format!("{WHY_AFFECTED_TESTS_REFUSES}{}", self.remedy_lines());
+        payload["note"] = serde_json::json!(note.clone());
+        payload["notifications"] = serde_json::json!([{
+            "level": "error",
+            "descriptor": INCOMPATIBLE_RESOLVER_DESCRIPTOR,
+            "message": note,
+        }]);
+        // The one key a CI consumer acts on. The refusal deliberately carries
+        // no tier_1/tier_2/tier_3, so without it a caller keying off "did I get
+        // tiers" reads the refusal as "no tests affected" -- the exact silent
+        // narrowing this refusal exists to prevent.
+        payload["recommendation"] = serde_json::json!("run-full-suite");
+        payload
     }
 
     /// The refusal a MACHINE reads.
@@ -499,6 +550,76 @@ mod tests {
     fn missing_entry_reads_as_generation_zero() {
         let g = ResolverGenerations::default();
         assert_eq!(g.generation_for("repo:whatever"), 0);
+    }
+
+    /// The three preambles share ONE remedy renderer, and the whole safety
+    /// claim of that consolidation is that no output text moved. Pin the exact
+    /// bytes for both remedy shapes -- a repo with a working tree and a bare
+    /// clone without one -- so a future edit to the renderer cannot silently
+    /// reword an operator-facing remedy on three surfaces at once.
+    #[test]
+    fn every_preamble_shares_one_remedy_block_and_none_of_them_moved() {
+        let refusal = DeadCodeRefusal::OutdatedResolver {
+            repos: vec![
+                StaleRepoRemedy::new("repo:worktree".to_string(), Some("/src/a".to_string())),
+                StaleRepoRemedy::new("repo:bare".to_string(), None),
+            ],
+            total: Some(2),
+        };
+
+        let expected_remedies = concat!(
+            "\n  nestweaver index --repo /src/a --force",
+            "\n  repo:bare — indexed from a bare clone, so this machine has no working tree ",
+            "to pass to `--repo`; re-index it where it lives",
+        );
+
+        // All three surfaces end with the identical block.
+        for (label, produced) in [
+            ("dead-code", refusal.message()),
+            ("edge-analysis", refusal.edge_analysis_message()),
+            (
+                "affected-tests",
+                refusal.affected_tests_payload()["note"]
+                    .as_str()
+                    .expect("note is a string")
+                    .to_string(),
+            ),
+        ] {
+            assert!(
+                produced.ends_with(expected_remedies),
+                "{label} remedy block moved:\n{produced}"
+            );
+        }
+
+        // And each still opens with ITS OWN preamble, so sharing the tail did
+        // not collapse three different explanations into one.
+        assert!(refusal.message().starts_with("dead-code will not produce"));
+        assert!(
+            refusal.affected_tests_payload()["note"]
+                .as_str()
+                .unwrap()
+                .starts_with("affected-tests will not produce")
+        );
+        assert!(
+            refusal
+                .edge_analysis_message()
+                .starts_with("edge-dependent analysis cannot trust")
+        );
+
+        // The keys a CI consumer acts on survive the move into the engine.
+        let payload = refusal.affected_tests_payload();
+        assert_eq!(payload["recommendation"], "run-full-suite");
+        assert_eq!(payload["needs_reindex"], true);
+        assert_eq!(payload["reason"], "outdated_resolver");
+        assert_eq!(
+            payload["notifications"][0]["descriptor"],
+            INCOMPATIBLE_RESOLVER_DESCRIPTOR
+        );
+        assert_eq!(payload["notifications"][0]["message"], payload["note"]);
+        assert!(
+            payload.get("tier_1").is_none(),
+            "a refusal carries no tiers"
+        );
     }
 
     /// nw-419: `message()` opens with `WHY_DEAD_CODE_REFUSES`, which is the

@@ -2867,84 +2867,29 @@ fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
 /// there is no list for anyone to review. A test selector that refuses is
 /// safe; one that silently narrows is not.
 ///
-/// Byte-identical to `WHY_AFFECTED_TESTS_REFUSES` in
-/// `crates/nestweaver-mcp/src/tools.rs`, which is where the same sentence is
-/// produced for the MCP tool and for this command's DAEMON route.
-const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
-     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
-     safer — it can only drop a test that should have run, while `status` still reads complete. \
-     The error is one-directional and it is silent: nothing downstream can tell a test that was \
-     not selected from a test that does not exist.";
-
 /// Turn the shared resolver-generation verdict into `affected-tests`' refusal.
 ///
-/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
-/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
-/// `status`, same `remedies` array of ready-to-run
-/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
-/// a CI job already gates on. Only two things are tool-specific:
-///
-///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
-///    "dead-code will not produce a list on this graph", which is the wrong
-///    sentence in front of the right remedies.
-///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
-///    consumer acts on, and the refusal deliberately carries no
-///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
-///    get tiers" would read the refusal as "no tests affected", which is the
-///    exact silent narrowing this refusal exists to prevent.
-///  * `notifications` carries the shared resolver-incompatibility descriptor,
-///    matching the other changed-file analysis tools so machine consumers do
-///    not need a route-specific way to recognize the same unsafe graph.
-///
-/// This mirrors `affected_tests_refusal_payload` in the MCP crate so the
-/// direct route and the daemon route emit the SAME object; a CI gate must not
-/// be able to tell which one answered.
+/// nw-412. The payload is built ONCE in the engine
+/// (`DeadCodeRefusal::affected_tests_payload`) and shared by this direct route,
+/// this command's daemon route, and the MCP tool -- a CI gate must not be able
+/// to tell which one answered. It previously existed as two hand-maintained
+/// copies (here and in `nestweaver-mcp/src/tools.rs`), each duplicating the
+/// preamble constant and the remedy-rendering loop, with a doc comment claiming
+/// byte-identity as the only guarantee they agreed.
 fn affected_tests_refusal_payload(
     refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
 ) -> serde_json::Value {
-    let mut payload = refusal.payload();
-    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
-    for remedy in payload
-        .get("remedies")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        match remedy.get("command").and_then(|v| v.as_str()) {
-            Some(command) => note.push_str(&format!("\n  {command}")),
-            None => note.push_str(&format!(
-                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
-                 pass to `--repo`; re-index it where it lives",
-                remedy
-                    .get("uid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unnamed repo)")
-            )),
-        }
-    }
-    payload["note"] = serde_json::json!(note.clone());
-    payload["notifications"] = serde_json::json!([{
-        "level": "error",
-        "descriptor": nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR,
-        "message": note,
-    }]);
-    payload["recommendation"] = serde_json::json!("run-full-suite");
-    payload
+    refusal.affected_tests_payload()
 }
 
-/// The refusal paragraph out of an `affected_tests` payload the DAEMON
-/// produced.
-///
-/// The twin of [`dead_code_refusal_note`], and it decides nothing for the same
-/// reason: the tool that computed the refusal also wrote the sentence, so this
-/// route prints what it was sent. The fallback covers only a payload that says
-/// `refused` and carries no `note`, which this binary cannot produce.
 fn affected_tests_refusal_note(payload: &serde_json::Value) -> String {
     payload
         .get("note")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| WHY_AFFECTED_TESTS_REFUSES.to_string())
+        .unwrap_or_else(|| {
+            nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES.to_string()
+        })
 }
 
 #[derive(Debug)]
@@ -3082,7 +3027,7 @@ fn parse_affected_tests_rpc_payload(
             let note = refusal
                 .get("note")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or(WHY_AFFECTED_TESTS_REFUSES);
+                .unwrap_or(nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES);
             notes.push(format!("{label}: {note}"));
         }
         value["refused"] = serde_json::json!(true);
