@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
+use crate::write_lease::{DbWriteLease, WriteLeaseError, acquire_db_write_lease};
 
 /// Dead fraction at which the embedding base is worth rewriting. 20% matches
 /// the threshold shape used by segment-merge reclaim in Lucene and by Milvus's
@@ -266,6 +267,7 @@ impl Drop for IndexPublicationLease<'_> {
 /// given that Connection<'a> borrows &'a Database.
 pub struct GraphStore {
     pub(crate) db: lbug::Database,
+    access_mode: GraphStoreAccessMode,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
     /// Algorithm and scope fingerprint for the scores currently held in
     /// `pagerank_cache`. It is persisted with the scores so a loader cannot
@@ -357,10 +359,21 @@ pub struct GraphStore {
     /// LadybugDB (which has no float-array column type). Loaded on open,
     /// saved on mutation via `flush_embedding_index`.
     pub(crate) embedding_index: Mutex<crate::search::EmbeddingIndex>,
+    /// Why the database-owned semantic identity could not be verified at
+    /// open. Graph traversal and lexical search remain usable, but every
+    /// semantic read/write must fail closed until metadata is repaired.
+    embedding_identity_error: Mutex<Option<String>>,
     /// LRU cache for PPR result vectors keyed by a hash of
     /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
+}
+
+/// Capability fixed by the constructor that opened a [`GraphStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphStoreAccessMode {
+    ReadWrite,
+    ReadOnly,
 }
 
 /// Persistent identity of one NestWeaver brain and its current publication
@@ -492,23 +505,11 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
 /// database another process was writing, on the strength of it. An inference
 /// about what a caller did NOT observe is not a proof of exclusivity.
 ///
-/// `read_write` is the gate that replaces the inference, and it is the same one
-/// [`quarantine_orphaned_wal`] has always had — these two arms of ONE recovery
-/// disagreed about whether a read-only caller may mutate the directory, and the
-/// arm that DELETES was the ungated one. A read-write open has at least taken
-/// lbug's own write lock on the database file, which is evidence; a read-only
-/// open has taken nothing. The self-heal that motivated this recovery is
-/// unaffected: it is the daemon that crash-loops, and the daemon opens
-/// read-write.
-///
-/// HANDOFF, and the reason this is a NARROWING rather than nw-373's fix: even a
-/// read-write open only PROBED exclusivity in the past — it holds lbug's lock,
-/// not the canonical write lease, across the delete. The property nw-373 asks
-/// for is a `DbWriteLease` HELD across the whole enumerate-and-delete, and
-/// `acquire_db_write_lease` lives in `nestweaver-daemon`, which depends on this
-/// crate. See the report for the signature; do not grow a second lease here.
-fn remove_stale_checkpoint_sidecars(path: &Path, read_write: bool) -> bool {
-    if !read_write {
+/// nw-373: mutation requires a matching borrowed [`DbWriteLease`]. The lease is
+/// held across the failed open, artifact inspection/removal, and retry; missing
+/// or sibling authority leaves every byte untouched.
+fn remove_stale_checkpoint_sidecars(path: &Path, authority: Option<&DbWriteLease>) -> bool {
+    if !authority.is_some_and(|authority| authority.authorizes(path)) {
         return false;
     }
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
@@ -729,16 +730,13 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 /// absent. A `.wal` with its `.shadow` intact is a normal recoverable log and
 /// must be left for the engine to replay.
 ///
-/// nw-373, unfixed and named: the caller gates this on a read-write open, which
-/// means lbug's write lock was taken — but nothing HOLDS the canonical write
-/// lease across the rename, so this is still a check-then-act on exclusivity.
-/// A probe answers a question about the past; the rename happens in the future.
-/// The blast radius is bounded by the fact that this only ever RENAMES (see
-/// above) and only on the orphan signature, which is why it is named here rather
-/// than papered over with a second probe. The fix needs
-/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which this crate
-/// cannot reach; see the report's HANDOFF.
-fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
+/// nw-373: like stale-checkpoint cleanup, the rename requires an exact borrowed
+/// [`DbWriteLease`]. A read-write engine open is not itself authority because
+/// it cannot close the check-then-act window around this filesystem mutation.
+fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
+    if !authority.is_some_and(|authority| authority.authorizes(path)) {
+        return None;
+    }
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     if !wal.exists() || shadow.exists() {
@@ -790,12 +788,9 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
 /// free, and it holds even for a lease taken by a path that never armed the
 /// latch.
 ///
-/// DONE in this commit, recorded because the sequencing matters if this is ever unpicked: the latch is armed: the sole producer of write
-/// leases is `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which is
-/// outside this crate. It needs, on the success path,
-/// `nestweaver_store::note_self_held_write_lease(db_path)` stored in a
-/// `DbWriteLease` field so latch and lease share a lifetime. That is a
-/// `crates/nestweaver-daemon/src/lifecycle.rs` edit.
+/// The canonical store-level lease producer arms that latch after acquiring all
+/// OS authorities and stores its guard in `DbWriteLease`, so latch and lease
+/// share one lifetime for daemon and direct-CLI callers alike.
 fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
     if read_write {
         // nw-346: the frame that knows WHICH database failed attaches the path,
@@ -808,15 +803,13 @@ fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
-/// `read_write` gates the orphaned-WAL arm. Replay is inherently a write
-/// operation, so a read-only open must report the condition rather than mutate
-/// the directory to clear it — and a read-only caller quarantining a log out
-/// from under a live writer would be a genuine hazard. It also gates nw-404's
-/// writer-liveness veto; see [`open_failure`] for why the two questions share
-/// one flag.
+/// `read_write` still selects diagnostics and forbids all recovery from a
+/// read-only open. Actual filesystem recovery additionally requires an exact
+/// `recovery_authority`, borrowed across this complete attempt and retry.
 fn open_lbug_with_recovery(
     path: &Path,
     read_write: bool,
+    recovery_authority: Option<&DbWriteLease>,
     make_config: impl Fn() -> lbug::SystemConfig,
 ) -> Result<lbug::Database, StoreError> {
     // nw-285. Every arm below inspects an `Err` that `lbug::Database::new`
@@ -831,7 +824,22 @@ fn open_lbug_with_recovery(
         Ok(db) => Ok(db),
         Err(e) => {
             let msg = e.to_string();
-            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, read_write)
+            // The failed engine open just closed its database descriptor.
+            // POSIX record locks are process-wide, so that close also released
+            // the compatibility lock held by `DbWriteLease::_db_file`. Re-arm
+            // it before any recovery mutation; if a pre-upgrade writer won the
+            // gap, preserve every artifact and return the original diagnostic.
+            let authority = read_write
+                .then_some(recovery_authority)
+                .flatten()
+                .filter(|authority| authority.authorizes(path))
+                .and_then(|authority| {
+                    authority
+                        .rearm_legacy_writer_exclusion()
+                        .map(|()| authority)
+                        .ok()
+                });
+            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, authority)
             {
                 tracing::warn!(
                     "recovered a stale WAL checkpoint for {} (a prior crash left \
@@ -841,9 +849,9 @@ fn open_lbug_with_recovery(
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
             }
-            if read_write
+            if authority.is_some()
                 && is_orphaned_wal_error(&msg)
-                && let Some(quarantined) = quarantine_orphaned_wal(path)
+                && let Some(quarantined) = quarantine_orphaned_wal(path, authority)
             {
                 tracing::warn!(
                     "recovered {} from an orphaned write-ahead log left by a prior \
@@ -1069,9 +1077,24 @@ fn is_column_already_present(message: &str) -> bool {
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        Self::create_inner(path, None)
+    }
+
+    /// Create a persistent database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn create_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::create_inner(path, Some(authority))
+    }
+
+    fn create_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1091,6 +1114,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1121,10 +1145,51 @@ impl GraphStore {
                 path.display()
             )));
         }
+        Self::create_with_publication_identity_inner(path, identity, None)
+    }
 
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+    /// Create a staged publication under an authority that atomically created
+    /// the destination inode. Creation provenance prevents an arbitrary
+    /// pre-existing zero-byte file from being adopted as a fresh publication.
+    pub fn create_with_publication_identity_and_authority(
+        path: &Path,
+        identity: &PublicationIdentity,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        identity.validate()?;
+        Self::require_matching_authority(path, authority)?;
+        if !authority.authorizes_fresh_creation(path) {
+            return Err(StoreError::Query(format!(
+                "refusing to create staged publication over pre-existing database {}",
+                path.display()
+            )));
+        }
+        let size = std::fs::metadata(path)
+            .map_err(|error| {
+                StoreError::Query(format!(
+                    "inspect freshly authorized publication database {}: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        if size != 0 {
+            return Err(StoreError::Query(format!(
+                "fresh publication database {} changed before initialization",
+                path.display()
+            )));
+        }
+        Self::create_with_publication_identity_inner(path, identity, Some(authority))
+    }
+
+    fn create_with_publication_identity_inner(
+        path: &Path,
+        identity: &PublicationIdentity,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1144,6 +1209,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1159,9 +1225,21 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        Self::open_inner(path, None)
+    }
+
+    /// Open an existing database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn open_with_authority(path: &Path, authority: &DbWriteLease) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::open_inner(path, Some(authority))
+    }
+
+    fn open_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1181,6 +1259,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1208,8 +1287,56 @@ impl GraphStore {
     /// up-to-date database — the steady state — this costs one catalog query
     /// per migrated table and touches no lock at all.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let mut db =
-            open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+        Self::open_read_only_inner(path, None)
+    }
+
+    /// Open read-only while borrowing an already-held writer authority for a
+    /// schema migration, if the catalog proves one is necessary.
+    pub fn open_read_only_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::open_read_only_inner(path, Some(authority))
+    }
+
+    /// Open read-only without ever attempting schema migration or crash-debris
+    /// recovery. Use this for forensic probes and sealed snapshot/backup
+    /// verification, where even a compatible DDL upgrade would invalidate the
+    /// bytes whose identity was just checked.
+    pub fn open_read_only_without_migration(path: &Path) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, false, None, || {
+            bounded_system_config().read_only(true)
+        })?;
+        Self::finish_read_only_open(path, db)
+    }
+
+    /// Catalog migrations this handle still needs, rendered as
+    /// `Table.column`. Strict read-only peers use this to fail with an
+    /// actionable upgrade requirement instead of surfacing later binder
+    /// errors or briefly becoming a writer themselves.
+    pub fn missing_schema_columns(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        Ok(Self::missing_migration_columns(&conn)
+            .iter()
+            .map(|migration| format!("{}.{}", migration.table, migration.column))
+            .collect())
+    }
+
+    fn open_read_only_inner(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<Self, StoreError> {
+        // A borrowed authority may already have survived descriptor churn in
+        // an earlier phase. Restore its compatibility lock before opening any
+        // new same-inode descriptor, then again after the attempt in case the
+        // engine opened and closed internal descriptors or failed outright.
+        Self::rearm_borrowed_authority(path, authority)?;
+        let initial = open_lbug_with_recovery(path, false, None, || {
+            bounded_system_config().read_only(true)
+        });
+        Self::rearm_borrowed_authority(path, authority)?;
+        let mut db = initial?;
         let stale = lbug::Connection::new(&db)
             .map(|conn| {
                 Self::missing_migration_columns(&conn)
@@ -1220,7 +1347,18 @@ impl GraphStore {
             .unwrap_or_default();
         if !stale.is_empty() {
             drop(db);
-            match Self::migrate_for_read_only(path) {
+            // Closing the probe releases every POSIX record lock this process
+            // held on the database inode, including the compatibility lock on
+            // a borrowed canonical authority. Re-arm before any DDL-capable
+            // open, and refuse the migration if a legacy writer won the gap.
+            Self::rearm_borrowed_authority(path, authority)?;
+            let migration = Self::migrate_for_read_only(path, authority);
+            // `migrate_for_read_only` normally restores this itself after its
+            // writable handle closes. Keep this second assertion at the call
+            // boundary as well so an early/error return cannot hand a caller
+            // a borrowed authority whose legacy exclusion silently vanished.
+            Self::rearm_borrowed_authority(path, authority)?;
+            match migration {
                 Ok(()) => tracing::info!(
                     "upgraded the schema of {} in place before a read-only open; \
                      added {} column(s): {}",
@@ -1237,10 +1375,26 @@ impl GraphStore {
                     stale.join(", ")
                 ),
             }
-            db = open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+            let reopened = open_lbug_with_recovery(path, false, None, || {
+                bounded_system_config().read_only(true)
+            });
+            // A failed engine open closes a same-inode descriptor too. Restore
+            // the borrowed authority before propagating either outcome.
+            Self::rearm_borrowed_authority(path, authority)?;
+            db = reopened?;
         }
+        let opened = Self::finish_read_only_open(path, db);
+        // A successful read-only engine open does not itself carry writer
+        // authority. Reassert the compatibility lock after all constructor
+        // descriptor churn so the caller's wider mutation remains protected.
+        Self::rearm_borrowed_authority(path, authority)?;
+        opened
+    }
+
+    fn finish_read_only_open(path: &Path, db: lbug::Database) -> Result<Self, StoreError> {
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadOnly,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1260,6 +1414,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1275,6 +1430,20 @@ impl GraphStore {
             Self::open(path)
         } else {
             Self::create(path)
+        }
+    }
+
+    /// Open or create a database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn open_or_create_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        if path.exists() {
+            Self::open_inner(path, Some(authority))
+        } else {
+            Self::create_inner(path, Some(authority))
         }
     }
 
@@ -1305,6 +1474,7 @@ impl GraphStore {
             .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
             db,
+            access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_declared_parameters: Mutex::new(None),
@@ -1324,6 +1494,7 @@ impl GraphStore {
             impact_snapshot_cache: Mutex::new(None),
             impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(crate::search::EmbeddingIndex::new()),
+            embedding_identity_error: Mutex::new(None),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
@@ -1339,6 +1510,16 @@ impl GraphStore {
     /// only after the in-memory cache is reloaded from the sidecar.
     pub fn pagerank_generation(&self) -> u64 {
         self.pagerank_generation.load(Ordering::Acquire)
+    }
+
+    /// Access capability derived from the constructor; callers cannot upgrade
+    /// a read-only handle with a boolean argument.
+    pub fn access_mode(&self) -> GraphStoreAccessMode {
+        self.access_mode
+    }
+
+    pub fn is_read_write(&self) -> bool {
+        self.access_mode == GraphStoreAccessMode::ReadWrite
     }
 
     /// True if the caller's observed generation is older than the current
@@ -2124,21 +2305,26 @@ impl GraphStore {
     /// Hand the embedding index the model id recorded in the database's
     /// embedding metadata, so `add_embedding_with_force` can refuse a
     /// same-dimension write from a different model. Read once here — never
-    /// per-add — and kept current by `set_embedding_metadata`. Absent or
-    /// unreadable metadata means unknown: the model guard stays off and the
-    /// dimension guard alone applies.
+    /// per-add — and kept current by `set_embedding_metadata`. A successfully
+    /// queried absent row means unconfigured. Any read/decode/validation error
+    /// records a degraded semantic identity and disables every semantic
+    /// operation while leaving graph and lexical reads available.
     fn load_recorded_embedding_model_into_index(&self) {
+        let mut identity_errors = Vec::new();
         let recorded = match self.get_embedding_metadata() {
             Ok(recorded) => recorded.map(|(model_id, _)| model_id),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read embedding metadata; the recorded-model write guard is \
-                     disabled for this store: {e}"
-                );
+            Err(error) => {
+                identity_errors.push(format!("read embedding metadata: {error}"));
                 None
             }
         };
-        let pipeline = self.get_embedding_pipeline().ok().flatten();
+        let pipeline = match self.get_embedding_pipeline() {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                identity_errors.push(format!("read embedding pipeline: {error}"));
+                None
+            }
+        };
         let pipeline_fingerprint = pipeline
             .as_ref()
             .and_then(|pipeline| pipeline.fingerprint().ok());
@@ -2175,13 +2361,68 @@ impl GraphStore {
             if let Err(error) = index.replay_journal_v2(&journal, &identity, &pipeline) {
                 tracing::warn!(%error, "embedding journal is invalid; semantic search is unavailable until a full re-embed");
                 index.clear();
+                identity_errors.push(format!("replay embedding journal: {error}"));
             }
         }
-        index.set_recorded_model_id(recorded);
-        index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
-        if let Some(pipeline) = pipeline {
-            index.set_similarity(pipeline.similarity);
+        if identity_errors.is_empty() {
+            *self
+                .embedding_identity_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            index.set_recorded_model_id(recorded);
+            index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
+            if let Some(pipeline) = pipeline {
+                index.set_similarity(pipeline.similarity);
+            }
+        } else {
+            let message = format!(
+                "embedding identity is unreadable: {}; repair or re-embed from verified database metadata before semantic search or embedding writes",
+                identity_errors.join("; ")
+            );
+            // Keep the exact source chain available to typed semantic
+            // operations, but do not spray backend binder/parser text during
+            // an otherwise unrelated graph-only command. That output can
+            // contain implementation details and can obscure the command's
+            // own classified database diagnostic (for example, a schema-less
+            // zero-byte database).
+            tracing::warn!(
+                "semantic subsystem is degraded; typed semantic operations will return repair guidance"
+            );
+            *self
+                .embedding_identity_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(message);
+            index.clear();
+            index.set_recorded_model_id(None);
+            index.set_recorded_pipeline_fingerprint(None);
         }
+    }
+
+    /// Current semantic-identity degradation, if metadata could not be read or
+    /// validated. This is intentionally separate from store-open health so a
+    /// daemon can continue serving graph traversal and lexical search.
+    pub fn embedding_identity_error(&self) -> Option<String> {
+        self.embedding_identity_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Fail a semantic operation under unverified database identity.
+    pub fn require_verified_embedding_identity(&self) -> Result<(), StoreError> {
+        match self.embedding_identity_error() {
+            Some(detail) => Err(StoreError::EmbeddingIdentityUnreadable { detail }),
+            None => Ok(()),
+        }
+    }
+
+    /// Mark the semantic identity verified after a valid metadata pipeline has
+    /// been durably written and the in-memory guards have been synchronized.
+    pub(crate) fn clear_embedding_identity_error(&self) {
+        *self
+            .embedding_identity_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// Compute the legacy JSON sidecar path for a given database path.
@@ -2241,6 +2482,9 @@ impl GraphStore {
     /// [`add_embedding_with_force`]: GraphStore::add_embedding_with_force
     #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut idx = self
             .embedding_index
             .lock()
@@ -2260,6 +2504,9 @@ impl GraphStore {
         model_id: &str,
         force: bool,
     ) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut idx = self
             .embedding_index
             .lock()
@@ -2275,6 +2522,9 @@ impl GraphStore {
         pipeline: &nestweaver_schema::EmbeddingPipelineV2,
         force: bool,
     ) -> bool {
+        if self.require_verified_embedding_identity().is_err() {
+            return false;
+        }
         let mut index = self
             .embedding_index
             .lock()
@@ -2305,6 +2555,7 @@ impl GraphStore {
     /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         let mut idx = self
             .embedding_index
             .lock()
@@ -2322,6 +2573,22 @@ impl GraphStore {
                         .to_string(),
                 )
             })?;
+            let persisted_fingerprint = pipeline.fingerprint().map_err(|error| {
+                StoreError::Query(format!(
+                    "fingerprint persisted embedding pipeline before flush: {error}"
+                ))
+            })?;
+            let producer_fingerprint = idx.recorded_pipeline_fingerprint().ok_or_else(|| {
+                StoreError::Query(
+                    "embedding index producer pipeline is unverified; refusing to persist vectors"
+                        .to_string(),
+                )
+            })?;
+            if producer_fingerprint != persisted_fingerprint.as_str() {
+                return Err(StoreError::Query(format!(
+                    "embedding index producer pipeline fingerprint {producer_fingerprint} does not match persisted database fingerprint {persisted_fingerprint}; refusing to persist vectors under stale metadata"
+                )));
+            }
             let db_path = self
                 .db_path
                 .as_ref()
@@ -2402,6 +2669,7 @@ impl GraphStore {
     /// Fold the append journal into a complete sibling-safe base snapshot.
     /// Backup/cutover paths use this to package one self-contained artifact.
     pub fn compact_embedding_index(&self) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         let mut index = self
             .embedding_index
             .lock()
@@ -2447,6 +2715,7 @@ impl GraphStore {
         &self,
         destination: &Path,
     ) -> Result<EmbeddingSnapshotLease<'_>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -2776,6 +3045,7 @@ impl GraphStore {
         limit: usize,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -2792,6 +3062,7 @@ impl GraphStore {
         limit: usize,
         uid_prefix: Option<&str>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.require_verified_embedding_identity()?;
         let idx = self
             .embedding_index
             .lock()
@@ -3772,20 +4043,40 @@ impl GraphStore {
     /// Bring an out-of-date database up to the current schema before a
     /// read-only open, or explain why it could not be.
     ///
-    /// Best-effort by construction: if another process holds the writer lock we
+    /// Best-effort by construction: if another process holds canonical writer authority we
     /// cannot migrate, and must not fail the read — that process is normally a
     /// current-version daemon which has already migrated, and the reopen below
     /// will simply see the columns. What we must NOT do is stay silent when the
     /// columns really are absent, which is exactly how 8.0.1 shipped.
-    fn migrate_for_read_only(path: &Path) -> Result<(), StoreError> {
-        // `read_write: false` even though this open IS write-capable. That flag
-        // gates only the orphaned-WAL quarantine arm, and the hazard its doc
-        // describes — "a read-only caller quarantining a log out from under a
-        // live writer" — is exactly this caller. A missing column is worth
-        // taking the writer lock for; it is not worth moving someone else's
-        // write-ahead log aside for. An orphaned WAL here is reported, not
-        // cleared.
-        let db = open_lbug_with_recovery(path, false, hardened_system_config)?;
+    fn migrate_for_read_only(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<(), StoreError> {
+        if let Some(authority) = authority {
+            Self::require_matching_authority(path, authority)?;
+        }
+        let acquired = if authority.is_none() {
+            Some(acquire_db_write_lease(path).map_err(|error| match error {
+                WriteLeaseError::Held => StoreError::Query(format!(
+                    "canonical writer authority for {} is held by another operation",
+                    path.display()
+                )),
+                WriteLeaseError::Unavailable(error) => StoreError::Query(format!(
+                    "canonical writer authority for {} is unavailable: {error}",
+                    path.display()
+                )),
+            })?)
+        } else {
+            None
+        };
+        let authority = authority
+            .or(acquired.as_ref())
+            .expect("provided or acquired writer authority");
+        // `read_write: false` even though this open IS write-capable. Schema
+        // DDL is authorized by the borrowed lease above, but a read-only
+        // convenience open must never turn into WAL/checkpoint recovery. An
+        // orphaned WAL here is reported, not moved.
+        let db = open_lbug_with_recovery(path, false, Some(authority), hardened_system_config)?;
         let conn = lbug::Connection::new(&db)?;
         // Only what is actually missing, re-derived under the writer so the
         // decision is made against the schema we are about to change rather
@@ -3793,13 +4084,80 @@ impl GraphStore {
         // failure for a migration this database never needed would make the
         // warning below say something untrue.
         let missing = Self::missing_migration_columns(&conn);
-        Self::apply_migrations(&conn, missing.into_iter())
+        let migrated = Self::apply_migrations(&conn, missing.into_iter());
+        drop(conn);
+        drop(db);
+        // lbug's descriptor close releases process-wide POSIX locks on this
+        // inode. Restore the exact authority before returning it to a caller;
+        // if a legacy writer entered the gap, fail instead of continuing with
+        // a canonical lease that no longer excludes it.
+        authority
+            .rearm_legacy_writer_exclusion()
+            .map_err(|error| Self::write_authority_error(path, error))?;
+        migrated
+    }
+
+    fn rearm_borrowed_authority(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<(), StoreError> {
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        Self::require_matching_authority(path, authority)?;
+        authority
+            .rearm_legacy_writer_exclusion()
+            .map_err(|error| Self::write_authority_error(path, error))
+    }
+
+    fn write_authority_error(path: &Path, error: WriteLeaseError) -> StoreError {
+        match error {
+            WriteLeaseError::Held => StoreError::Query(format!(
+                "legacy writer exclusion for {} was lost to another process",
+                path.display()
+            )),
+            WriteLeaseError::Unavailable(error) => StoreError::Query(format!(
+                "could not restore legacy writer exclusion for {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn require_matching_authority(path: &Path, authority: &DbWriteLease) -> Result<(), StoreError> {
+        if authority.authorizes(path) {
+            Ok(())
+        } else {
+            Err(StoreError::Query(format!(
+                "writer authority does not cover database {}",
+                path.display()
+            )))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors_fix_the_store_access_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.lbug");
+        let created = GraphStore::create(&path).unwrap();
+        assert_eq!(created.access_mode(), GraphStoreAccessMode::ReadWrite);
+        drop(created);
+        let read_only = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(read_only.access_mode(), GraphStoreAccessMode::ReadOnly);
+        drop(read_only);
+        assert_eq!(
+            GraphStore::open(&path).unwrap().access_mode(),
+            GraphStoreAccessMode::ReadWrite
+        );
+        assert_eq!(
+            GraphStore::in_memory().unwrap().access_mode(),
+            GraphStoreAccessMode::ReadWrite
+        );
+    }
 
     #[test]
     fn publication_identity_is_created_once_and_survives_reopen() {
@@ -3875,6 +4233,56 @@ mod tests {
             reopened.publication_identity().unwrap(),
             Some(incumbent_identity)
         );
+    }
+
+    #[test]
+    fn staged_publication_authority_distinguishes_fresh_creation_from_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = PublicationIdentity {
+            brain_uuid: uuid::Uuid::new_v4().to_string(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+
+        let fresh_path = dir.path().join("fresh.lbug");
+        let fresh = acquire_db_write_lease(&fresh_path).unwrap();
+        assert!(fresh.authorizes_fresh_creation(&fresh_path));
+        let store = GraphStore::create_with_publication_identity_and_authority(
+            &fresh_path,
+            &identity,
+            &fresh,
+        )
+        .unwrap();
+        assert_eq!(
+            store.publication_identity().unwrap(),
+            Some(identity.clone())
+        );
+        drop(store);
+        drop(fresh);
+
+        let existing_path = dir.path().join("existing-empty.lbug");
+        std::fs::write(&existing_path, b"").unwrap();
+        let existing = acquire_db_write_lease(&existing_path).unwrap();
+        assert!(!existing.authorizes_fresh_creation(&existing_path));
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &existing_path,
+            &identity,
+            &existing,
+        )
+        .err()
+        .expect("pre-existing empty file must not acquire creation provenance");
+        assert!(error.to_string().contains("pre-existing database"));
+        assert_eq!(std::fs::metadata(&existing_path).unwrap().len(), 0);
+
+        let wrong_path = dir.path().join("wrong.lbug");
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &wrong_path,
+            &identity,
+            &existing,
+        )
+        .err()
+        .expect("a sibling authority must be rejected");
+        assert!(error.to_string().contains("does not cover database"));
+        assert!(!wrong_path.exists());
     }
 
     #[test]
@@ -4008,8 +4416,19 @@ mod tests {
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(dir.path().join("brain.lbug.wal"), b"orphan-contents").unwrap();
+        assert!(quarantine_orphaned_wal(&db, None).is_none());
+        assert!(dir.path().join("brain.lbug.wal").exists());
 
-        let moved = quarantine_orphaned_wal(&db).expect("orphaned wal must be quarantined");
+        let sibling = dir.path().join("sibling.lbug");
+        let wrong = acquire_db_write_lease(&sibling).unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&wrong)).is_none());
+        assert!(dir.path().join("brain.lbug.wal").exists());
+        drop(wrong);
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        let moved = quarantine_orphaned_wal(&db, Some(&authority))
+            .expect("orphaned wal must be quarantined");
 
         assert!(
             !dir.path().join("brain.lbug.wal").exists(),
@@ -4033,9 +4452,10 @@ mod tests {
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(dir.path().join("brain.lbug.wal"), b"live").unwrap();
         std::fs::write(dir.path().join("brain.lbug.shadow"), b"shadow").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
 
         assert!(
-            quarantine_orphaned_wal(&db).is_none(),
+            quarantine_orphaned_wal(&db, Some(&authority)).is_none(),
             "a wal accompanied by its shadow must never be moved"
         );
         assert!(dir.path().join("brain.lbug.wal").exists());
@@ -4047,7 +4467,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"db").unwrap();
-        assert!(quarantine_orphaned_wal(&db).is_none());
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&authority)).is_none());
     }
 
     #[test]
@@ -4210,15 +4631,23 @@ mod tests {
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
 
-        assert!(
-            !remove_stale_checkpoint_sidecars(&db, false),
-            "a read-only open holds nothing and must not perform sidecar surgery"
-        );
+        assert!(!remove_stale_checkpoint_sidecars(&db, None));
         assert!(cp.exists(), "the checkpoint must survive a read-only open");
         assert!(shadow.exists(), "and so must the shadow");
 
+        let sibling = dir.path().join("sibling.lbug");
+        let wrong = acquire_db_write_lease(&sibling).unwrap();
         assert!(
-            remove_stale_checkpoint_sidecars(&db, true),
+            !remove_stale_checkpoint_sidecars(&db, Some(&wrong)),
+            "a sibling authority must preserve every artifact"
+        );
+        assert!(cp.exists());
+        assert!(shadow.exists());
+        drop(wrong);
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(
+            remove_stale_checkpoint_sidecars(&db, Some(&authority)),
             "the read-write self-heal is the reason this recovery exists and must \
              still fire — gating it into uselessness would restore the crash loop"
         );
@@ -4236,14 +4665,15 @@ mod tests {
         // Empty shadow + checkpoint present → recover (remove both).
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
-        assert!(remove_stale_checkpoint_sidecars(&db, true));
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(remove_stale_checkpoint_sidecars(&db, Some(&authority)));
         assert!(!cp.exists(), "stale checkpoint should be removed");
         assert!(!shadow.exists(), "empty shadow should be removed");
 
         // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
         std::fs::write(&cp, b"stale").unwrap();
         std::fs::write(&shadow, b"live-writer-state").unwrap();
-        assert!(!remove_stale_checkpoint_sidecars(&db, true));
+        assert!(!remove_stale_checkpoint_sidecars(&db, Some(&authority)));
         assert!(
             cp.exists(),
             "must not remove checkpoint when shadow is non-empty"
@@ -4709,6 +5139,211 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_embedding_identity_degrades_only_semantic_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("verified-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:old-space", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        assert!(embedding_path.is_file());
+
+        // Model an interrupted/manual metadata edit at the durable boundary.
+        // Reopening must not reinterpret this row as an unconfigured semantic
+        // space, because that would permit vectors from an unrelated model.
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String("embedding".to_string())),
+                ("value", lbug::Value::String("{not-json".to_string())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        drop(store);
+
+        let degraded = GraphStore::open(&db_path).unwrap();
+        let identity_error = degraded
+            .embedding_identity_error()
+            .expect("malformed durable metadata must be a typed degradation");
+        assert!(identity_error.contains("embedding identity is unreadable"));
+        assert!(degraded.get_embedding_metadata().is_err());
+        assert!(!degraded.add_embedding("symbol:rejected", vec![1.0, 0.0]));
+        assert!(!degraded.add_embedding_with_force(
+            "symbol:force-cannot-bypass",
+            vec![1.0, 0.0],
+            "replacement-model",
+            true,
+        ));
+        assert!(degraded.try_vector_search(&[1.0, 0.0], 1).is_err());
+        assert!(degraded.flush_embedding_index().is_err());
+
+        // Graph/lexical capability remains available while semantic identity
+        // awaits explicit repair.
+        assert!(
+            degraded
+                .hybrid_search(
+                    "no-match",
+                    None,
+                    None,
+                    10,
+                    &crate::ranking::SeedResolutionConfig::default(),
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            degraded
+                .reset_embedding_space_for_identity_repair()
+                .unwrap(),
+            1
+        );
+        assert_eq!(degraded.embedding_identity_error(), None);
+        assert_eq!(degraded.get_embedding_pipeline().unwrap(), None);
+        assert_eq!(degraded.embedding_count(), 0);
+        assert!(!embedding_path.exists());
+
+        degraded
+            .set_embedding_metadata("verified-replacement", 2)
+            .unwrap();
+        assert!(degraded.add_embedding("symbol:accepted-after-explicit-repair", vec![1.0, 0.0],));
+        drop(degraded);
+
+        let repaired = GraphStore::open(&db_path).unwrap();
+        repaired.require_verified_embedding_identity().unwrap();
+        assert_eq!(
+            repaired.get_embedding_pipeline().unwrap().unwrap().model_id,
+            "verified-replacement"
+        );
+    }
+
+    #[test]
+    fn forced_pipeline_switch_publishes_a_complete_base_that_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pipeline-switch.lbug");
+        let first = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let second = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-b", 2);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_pipeline(&first).unwrap();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:old-space",
+            vec![1.0, 0.0],
+            &first,
+            false,
+        ));
+        store.flush_embedding_index().unwrap();
+
+        store.reset_embedding_force_guard();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:new-space",
+            vec![0.0, 1.0],
+            &second,
+            true,
+        ));
+        assert!(!store.has_embedding("symbol:old-space"));
+        store.set_embedding_pipeline(&second).unwrap();
+        store.flush_embedding_index().unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(second));
+        assert!(reopened.has_embedding("symbol:new-space"));
+        assert!(
+            !reopened.has_embedding("symbol:old-space"),
+            "the old semantic space must not reappear after publication"
+        );
+    }
+
+    #[test]
+    fn flush_refuses_vectors_whose_producer_differs_from_database_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pipeline-mismatch.lbug");
+        let first = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let second = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-b", 2);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_pipeline(&first).unwrap();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:old-space",
+            vec![1.0, 0.0],
+            &first,
+            false,
+        ));
+        store.flush_embedding_index().unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        let original_base = std::fs::read(&sidecar).unwrap();
+
+        store.reset_embedding_force_guard();
+        assert!(store.add_embedding_with_pipeline(
+            "symbol:new-space",
+            vec![0.0, 1.0],
+            &second,
+            true,
+        ));
+        let error = store
+            .flush_embedding_index()
+            .expect_err("stale database metadata must block vector persistence");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match persisted database fingerprint"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            original_base,
+            "a rejected flush must leave the authoritative base untouched"
+        );
+        drop(store);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(first));
+        assert!(reopened.has_embedding("symbol:old-space"));
+        assert!(!reopened.has_embedding("symbol:new-space"));
+    }
+
+    #[test]
+    fn read_only_identity_repair_refuses_before_touching_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("read-only-repair.lbug");
+        let pipeline = nestweaver_schema::EmbeddingPipelineV2::external("provider", "model-a", 2);
+        let writer = GraphStore::open_or_create(&db_path).unwrap();
+        writer.set_embedding_pipeline(&pipeline).unwrap();
+        assert!(writer.add_embedding_with_pipeline(
+            "symbol:preserved",
+            vec![1.0, 0.0],
+            &pipeline,
+            false,
+        ));
+        writer.flush_embedding_index().unwrap();
+        let sidecar = writer.embedding_sidecar_path().unwrap();
+        let original_base = std::fs::read(&sidecar).unwrap();
+        drop(writer);
+
+        let read_only = GraphStore::open_read_only(&db_path).unwrap();
+        let error = read_only
+            .reset_embedding_space_for_identity_repair()
+            .expect_err("a read-only handle must not repair semantic identity");
+        assert!(error.to_string().contains("requires a read-write store"));
+        assert_eq!(std::fs::read(&sidecar).unwrap(), original_base);
+        assert_eq!(
+            read_only.get_embedding_pipeline().unwrap(),
+            Some(pipeline.clone())
+        );
+        assert!(read_only.has_embedding("symbol:preserved"));
+        drop(read_only);
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert_eq!(reopened.get_embedding_pipeline().unwrap(), Some(pipeline));
+        assert!(reopened.has_embedding("symbol:preserved"));
+    }
+
+    #[test]
     fn snapshot_embedding_lease_serializes_metadata_updates() {
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
@@ -4950,6 +5585,7 @@ mod data_instance_identity_tests {
 #[cfg(test)]
 mod schema_migration_tests {
     use super::{COLUMN_MIGRATIONS, GraphStore, bounded_system_config, is_column_already_present};
+    use crate::{acquire_db_namespace_lease, acquire_db_write_lease};
 
     /// Column names of `table`, read straight from the catalog.
     fn columns(path: &std::path::Path, table: &str) -> Vec<String> {
@@ -5118,6 +5754,165 @@ mod schema_migration_tests {
                 migration.column
             );
         }
+    }
+
+    /// A read-only convenience open may migrate only after taking the same
+    /// shared namespace authority as every other database writer. Restore's
+    /// exclusive namespace therefore makes the migration stand down without
+    /// making ordinary reads unavailable.
+    #[test]
+    fn an_exclusive_namespace_prevents_read_only_schema_ddl() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join("old.lbug");
+        build_old_schema_database(&path);
+
+        let namespace = acquire_db_namespace_lease(&data_dir).unwrap();
+        let store = GraphStore::open_read_only(&path)
+            .expect("schema contention must not make compatible old-schema reads unavailable");
+        assert!(
+            !GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "read-only open performed DDL without shared namespace authority"
+        );
+        drop(store);
+        drop(namespace);
+
+        assert!(
+            COLUMN_MIGRATIONS.iter().any(|migration| {
+                !columns(&path, migration.table).contains(&migration.column.to_string())
+            }),
+            "the exclusive namespace must leave the catalog unchanged"
+        );
+    }
+
+    #[test]
+    fn a_strict_read_only_open_never_migrates_the_bytes_it_is_inspecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+
+        let store = GraphStore::open_read_only_without_migration(&path).unwrap();
+        assert!(
+            !GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "strict verification must observe, not rewrite, an old schema"
+        );
+        drop(store);
+        assert!(
+            COLUMN_MIGRATIONS.iter().any(|migration| {
+                !columns(&path, migration.table).contains(&migration.column.to_string())
+            }),
+            "strict verification changed the on-disk catalog"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_exact_authority_migrates_but_a_sibling_authority_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join("old.lbug");
+        build_old_schema_database(&path);
+
+        let sibling_path = data_dir.join("sibling.lbug");
+        let sibling = acquire_db_write_lease(&sibling_path).unwrap();
+        let error = match GraphStore::open_read_only_with_authority(&path, &sibling) {
+            Ok(_) => panic!("a sibling authority must not authorize schema DDL"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not cover database"),
+            "a sibling authority must be rejected explicitly: {error}"
+        );
+        drop(sibling);
+
+        let authority = acquire_db_write_lease(&path).unwrap();
+        let store = GraphStore::open_read_only_with_authority(&path, &authority).unwrap();
+        assert!(
+            GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "the exact borrowed authority must cover the complete DDL migration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_read_only_migration_restores_legacy_writer_exclusion() {
+        use std::os::unix::io::AsRawFd as _;
+
+        const CHILD_ENV: &str = "NW_TEST_PROBE_MIGRATION_POSIX_DB_LOCK";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as libc::c_short;
+            lock.l_whence = libc::SEEK_SET as libc::c_short;
+            lock.l_start = 0;
+            lock.l_len = 0;
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) };
+            if result == 0 {
+                println!("migration-posix-lock-free");
+            } else {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    error
+                        .raw_os_error()
+                        .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN),
+                    "unexpected POSIX lock error: {error}"
+                );
+                println!("migration-posix-lock-held");
+            }
+            return;
+        }
+
+        let probe = |path: &std::path::Path| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "db::schema_migration_tests::borrowed_read_only_migration_restores_legacy_writer_exclusion",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, path)
+                .output()
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+        let authority = acquire_db_write_lease(&path).unwrap();
+
+        // Prove the child assertion is sensitive: an unrelated same-inode
+        // close really does release the process-scoped compatibility lock,
+        // and a strict read-only handle does not replace it on this path.
+        let descriptor = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        drop(descriptor);
+        let strict = GraphStore::open_read_only_without_migration(&path).unwrap();
+        let before = probe(&path);
+        assert!(before.status.success());
+        assert!(
+            String::from_utf8_lossy(&before.stdout).contains("migration-posix-lock-free"),
+            "control did not observe the released POSIX lock: {}",
+            String::from_utf8_lossy(&before.stdout)
+        );
+        drop(strict);
+
+        let migrated = GraphStore::open_read_only_with_authority(&path, &authority).unwrap();
+        let after = probe(&path);
+        assert!(after.status.success());
+        assert!(
+            String::from_utf8_lossy(&after.stdout).contains("migration-posix-lock-held"),
+            "borrowed migration returned without restoring legacy-writer exclusion: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
+        drop(migrated);
+        drop(authority);
     }
 
     /// The same database opened read-WRITE must recover too. `open` does run

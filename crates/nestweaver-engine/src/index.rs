@@ -1286,12 +1286,21 @@ pub enum IndexPublicationRecovery {
     /// Fails closed: "cannot tell" is not "abandoned".
     Undeterminable { detail: String },
     /// The marker records a writer that is still alive. A live publication is
-    /// never recovered out from under its writer.
+    /// reported by a read-only caller that cannot prove database ownership.
     WriterAlive { pid: i32 },
+    /// The marker records a writer PID whose liveness could not be classified,
+    /// and this read-only caller cannot prove database ownership.
+    WriterLivenessUnknown { pid: i32 },
     /// The marker records no pid we can attribute (an older binary, a
     /// truncated write, or a hand-created marker). Auto-heal declines; the
     /// operator escape hatch can still be pointed at it explicitly.
     WriterUnattributed,
+    /// The caller did not supply the exact canonical writer authority, or the
+    /// store itself was constructed read-only. No publication bytes changed.
+    WriterAuthorityRequired { detail: String },
+    /// The marker changed between triage and the process-local publication
+    /// lease. Decline rather than guessing which publication it represents.
+    MarkerChanged,
     /// A live in-process publisher holds the lease, so this publication is
     /// in flight rather than abandoned.
     LeaseHeld,
@@ -1336,10 +1345,24 @@ impl IndexPublicationRecovery {
                  failing closed rather than assuming it was abandoned"
             ),
             IndexPublicationRecovery::WriterAlive { pid } => format!(
-                "index publication is in flight; writer pid {pid} is alive — not recovering"
+                "index publication marker names live pid {pid}; this caller does not own the \
+                 database writer lock — not recovering"
+            ),
+            IndexPublicationRecovery::WriterLivenessUnknown { pid } => format!(
+                "index publication marker names pid {pid}, whose liveness could not be \
+                 determined; this caller does not own the database writer lock — not recovering"
             ),
             IndexPublicationRecovery::WriterUnattributed => {
                 "index publication marker records no writer pid; not recovering automatically"
+                    .to_string()
+            }
+            IndexPublicationRecovery::WriterAuthorityRequired { detail } => format!(
+                "index publication recovery requires the exact held database writer lease \
+                 and a read-write store ({detail}); not recovering"
+            ),
+            IndexPublicationRecovery::MarkerChanged => {
+                "index publication marker changed while recovery was acquiring ownership; not \
+                 recovering this observation"
                     .to_string()
             }
             IndexPublicationRecovery::LeaseHeld => {
@@ -1358,7 +1381,7 @@ impl IndexPublicationRecovery {
                 was_cancelled_run,
             } => {
                 let who = match abandoned_writer_pid {
-                    Some(pid) => format!("dead writer pid {pid}"),
+                    Some(pid) => format!("marker pid {pid} (diagnostic only)"),
                     None => "an unattributable writer (forced repair)".to_string(),
                 };
                 let base = format!(
@@ -1429,38 +1452,45 @@ impl IndexPublicationRecovery {
 /// store read-only, so it must never be the process performing repair.
 pub fn recover_abandoned_index_publication(
     store: &GraphStore,
-    read_write: bool,
+    authority: &nestweaver_store::DbWriteLease,
 ) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
-    recover_abandoned_index_publication_with_io(
-        store,
-        read_write,
-        false,
-        &FileSystemIndexEpilogueIo,
-    )
+    recover_abandoned_index_publication_with_io(store, authority, false, &FileSystemIndexEpilogueIo)
 }
 
-/// Operator-forced recovery: proceeds on the two cases the automatic predicate
-/// must decline — a marker with no attributable writer, and one whose state
-/// cannot be read.
+/// Operator-forced recovery: proceeds when the marker state cannot be read.
+/// A readable marker needs no PID attribution once the caller holds the exact
+/// database authority and the in-process publication lease.
 ///
-/// `force` never overrides a writer we can prove is ALIVE, and never overrides
-/// an in-process lease holder; those remain hard declines. What it overrides is
-/// only "cannot prove dead", which is the automatic predicate's conservatism,
-/// not a safety property. The real protection against clobbering a live writer
-/// is that every recovery path holds a read-write `GraphStore`, and lbug's
-/// exclusive write lock means no other process can hold one at the same time;
-/// the pid and lease checks are defence in depth on top of that.
+/// `force` never overrides the database writer lock or an in-process
+/// publication lease. Marker PID liveness is diagnostic rather than
+/// authoritative because PID reuse is normal: every recovery path holds a
+/// read-write `GraphStore`, and lbug's exclusive write lock means no other
+/// process can own this database writer at the same time.
 pub fn force_recover_index_publication(
     store: &GraphStore,
+    authority: &nestweaver_store::DbWriteLease,
 ) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
-    recover_abandoned_index_publication_with_io(store, true, true, &FileSystemIndexEpilogueIo)
+    recover_abandoned_index_publication_with_io(store, authority, true, &FileSystemIndexEpilogueIo)
 }
 
 pub(crate) fn recover_abandoned_index_publication_with_io(
     store: &GraphStore,
-    read_write: bool,
+    authority: &nestweaver_store::DbWriteLease,
     force: bool,
     io: &dyn IndexEpilogueIo,
+) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
+    recover_abandoned_index_publication_with_io_and_marker_hook(store, authority, force, io, |_| {})
+}
+
+/// Recovery implementation with a narrow between-read seam. Production uses
+/// a no-op callback; tests use it to deterministically replace the marker
+/// after the process-local publication lease is held but before confirmation.
+fn recover_abandoned_index_publication_with_io_and_marker_hook(
+    store: &GraphStore,
+    authority: &nestweaver_store::DbWriteLease,
+    force: bool,
+    io: &dyn IndexEpilogueIo,
+    between_marker_reads: impl FnOnce(&Path),
 ) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
     const OPERATION: &str = "recover abandoned index publication";
 
@@ -1478,7 +1508,7 @@ pub(crate) fn recover_abandoned_index_publication_with_io(
         nestweaver_store::index_publication::MarkerState::Undeterminable(detail) => {
             // "Cannot tell" is not "abandoned" — never automatically. An
             // operator who has looked at the directory can still override.
-            if !(force && read_write) {
+            if !force {
                 return Ok(IndexPublicationRecovery::Undeterminable {
                     detail: detail.clone(),
                 });
@@ -1490,44 +1520,26 @@ pub(crate) fn recover_abandoned_index_publication_with_io(
         }
         nestweaver_store::index_publication::MarkerState::Present(_) => {}
     }
-    let record = state.record();
-    let was_cancelled_run = record.is_some_and(|r| r.is_deliberately_dirty());
-    // `pid` is `None` for an unattributed or undeterminable marker. Automatic
-    // recovery declines; a forced one proceeds.
-    let pid = match record.and_then(|r| r.writer_pid) {
-        Some(pid) => {
-            if crate::index_publication::process_is_alive(pid) {
-                // Never overridden, not even by `force`.
-                return Ok(IndexPublicationRecovery::WriterAlive { pid });
-            }
-            Some(pid)
-        }
-        None => {
-            if !(force && read_write) {
-                return Ok(IndexPublicationRecovery::WriterUnattributed);
-            }
-            None
-        }
-    };
-    if !read_write {
-        // Report, never clear. Same rule, and the same reason, as the
-        // read-only arm of `open_lbug_with_recovery`: "a read-only caller
-        // quarantining a log out from under a live writer would be a genuine
-        // hazard". The MCP server opens the store read-only and can be a
-        // different process from the daemon, so it lands here. A read-only
-        // handle also does not hold lbug's exclusive write lock, which is what
-        // actually keeps a live writer safe.
-        return Ok(match pid {
-            Some(pid) => IndexPublicationRecovery::ReadOnlyStore {
-                abandoned_writer_pid: pid,
-            },
-            // Unreachable in practice: a pid-less marker only gets past the
-            // match above when `force && read_write`, and `read_write` is false
-            // here. Written totally rather than unwrapped so it cannot become a
-            // panic if that gating ever changes.
-            None => IndexPublicationRecovery::WriterUnattributed,
+    if !store.is_read_write() {
+        return Ok(IndexPublicationRecovery::WriterAuthorityRequired {
+            detail: "the GraphStore was opened read-only".to_string(),
         });
     }
+    if !authority.authorizes(&db_path) {
+        return Ok(IndexPublicationRecovery::WriterAuthorityRequired {
+            detail: format!(
+                "lease {} does not authorize {}",
+                authority.path().display(),
+                db_path.display()
+            ),
+        });
+    }
+    let record = state.record();
+    let was_cancelled_run = record.is_some_and(|r| r.is_deliberately_dirty());
+    // PID is diagnostic only. Exact cross-process database authority plus the
+    // in-process publication lease below prove that no writer can still
+    // finish this readable marker, including legacy pid-less markers.
+    let pid = record.and_then(|r| r.writer_pid);
 
     // Second half of the abandoned predicate: no in-process publisher owns the
     // lease. Acquired non-blockingly — queueing behind a live publisher would
@@ -1551,22 +1563,11 @@ pub(crate) fn recover_abandoned_index_publication_with_io(
     // Re-read under the lease. Between the triage read and here, a fresh
     // publisher in another process could have established a new marker with a
     // live pid; recovering that would clear a marker out from under its writer.
+    let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+    between_marker_reads(&marker_path);
     let confirmed = nestweaver_store::index_publication::read_marker(&db_path);
-    match (confirmed.record().and_then(|r| r.writer_pid), pid) {
-        // A different pid appeared: a fresh publisher established a new marker
-        // between the triage read and here. Recovering it would clear a marker
-        // out from under its writer.
-        (Some(current), Some(original)) if current != original => {
-            return Ok(IndexPublicationRecovery::WriterAlive { pid: current });
-        }
-        // A forced recovery of a pid-less marker that has since GAINED a pid is
-        // likewise a new publisher; decline if that publisher is alive.
-        (Some(current), None) if crate::index_publication::process_is_alive(current) => {
-            return Ok(IndexPublicationRecovery::WriterAlive { pid: current });
-        }
-        (Some(_), _) => {}
-        (None, Some(_)) => return Ok(IndexPublicationRecovery::WriterUnattributed),
-        (None, None) => {}
+    if confirmed != state {
+        return Ok(IndexPublicationRecovery::MarkerChanged);
     }
 
     // The `u64::MAX` arm. When `.generation` is missing or unparseable while
@@ -1659,10 +1660,22 @@ pub(crate) fn recover_abandoned_index_publication_with_io(
 /// watchers); the daemon reconciles separately at startup. Read-only openers —
 /// notably the MCP server, which commonly runs in a different process from the
 /// daemon — deliberately do NOT have an equivalent and must never repair.
-pub fn open_store_for_writing_with_recovery(db_path: &Path) -> Result<GraphStore, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
+/// Open through an already-held exact writer authority. This is the path for
+/// CLI/daemon owners whose mutation lifetime is wider than the store open.
+pub(crate) fn open_store_for_writing_with_authority(
+    db_path: &Path,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<GraphStore, anyhow::Error> {
+    if !authority.authorizes(db_path) {
+        anyhow::bail!(
+            "writer lease {} does not authorize database {}",
+            authority.path().display(),
+            db_path.display()
+        );
+    }
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("open/create store at {}", db_path.display()))?;
-    recover_abandoned_index_publication_best_effort(&store, true);
+    recover_abandoned_index_publication_best_effort(&store, authority);
     Ok(store)
 }
 
@@ -1671,9 +1684,9 @@ pub fn open_store_for_writing_with_recovery(db_path: &Path) -> Result<GraphStore
 /// best-effort improvement and must never be able to fail the caller.
 pub fn recover_abandoned_index_publication_best_effort(
     store: &GraphStore,
-    read_write: bool,
+    authority: &nestweaver_store::DbWriteLease,
 ) -> Option<IndexPublicationRecovery> {
-    match recover_abandoned_index_publication(store, read_write) {
+    match recover_abandoned_index_publication(store, authority) {
         Ok(outcome) => {
             if outcome.recovered() {
                 tracing::warn!("{}", outcome.describe());
@@ -2248,7 +2261,21 @@ pub fn index_directory_with_opts(
     db_path: &Path,
     opts: &IndexOptions,
 ) -> Result<IndexResult, anyhow::Error> {
-    let store = open_store_for_writing_with_recovery(db_path)?;
+    let authority = nestweaver_store::acquire_db_write_lease(db_path)
+        .map_err(|error| anyhow::anyhow!("cannot index {}: {error:?}", db_path.display()))?;
+    let store = open_store_for_writing_with_authority(db_path, &authority)?;
+    index_directory_with_store_inner(&store, repo_path, db_path, opts, None)
+}
+
+/// [`index_directory_with_opts`] under an exact authority already held by the
+/// caller for a wider mutation lifetime.
+pub fn index_directory_with_opts_and_write_lease(
+    repo_path: &Path,
+    db_path: &Path,
+    opts: &IndexOptions,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<IndexResult, anyhow::Error> {
+    let store = open_store_for_writing_with_authority(db_path, authority)?;
     index_directory_with_store_inner(&store, repo_path, db_path, opts, None)
 }
 
@@ -2279,7 +2306,9 @@ pub fn index_directory_with_options_and_limits(
     // nw-C1: reconcile an abandoned publication before indexing. A crashed
     // predecessor's `.index-dirty` otherwise wedges every ranked query, and the
     // fail-closed `u64::MAX` generation base can block this run's own preflight.
-    let store = open_store_for_writing_with_recovery(db_path)?;
+    let authority = nestweaver_store::acquire_db_write_lease(db_path)
+        .map_err(|error| anyhow::anyhow!("cannot index {}: {error:?}", db_path.display()))?;
+    let store = open_store_for_writing_with_authority(db_path, &authority)?;
     index_directory_with_store_and_limits(
         &store,
         repo_path,
@@ -5600,6 +5629,60 @@ pub fn incremental_index_with_excludes_and_unskip(
     )
 }
 
+/// [`incremental_index_with_excludes`] under the caller's already-held exact
+/// database writer authority.
+#[allow(clippy::too_many_arguments)]
+pub fn incremental_index_with_excludes_and_write_lease(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_excludes_and_unskip_and_write_lease(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        &[],
+        authority,
+    )
+}
+
+/// Incremental index honouring both per-repo directory-policy halves under
+/// the caller's already-held exact database writer authority.
+#[allow(clippy::too_many_arguments)]
+pub fn incremental_index_with_excludes_and_unskip_and_write_lease(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+    unskip: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_name_and_io_and_authority(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        unskip,
+        &FileSystemIndexEpilogueIo,
+        authority,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental_index_with_name_and_io(
     repo_path: &Path,
@@ -5616,7 +5699,40 @@ fn incremental_index_with_name_and_io(
     // which returns early without ever establishing a marker. Without this, an
     // idle repo could never clear an abandoned publication however often it was
     // re-indexed.
-    let store = open_store_for_writing_with_recovery(db_path)?;
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot index {} without exact writer authority: {error:?}",
+            db_path.display()
+        )
+    })?;
+    incremental_index_with_name_and_io_and_authority(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        unskip,
+        epilogue_io,
+        &authority,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incremental_index_with_name_and_io_and_authority(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+    unskip: &[String],
+    epilogue_io: &dyn IndexEpilogueIo,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<IncrementalResult, anyhow::Error> {
+    let store = open_store_for_writing_with_authority(db_path, authority)?;
 
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
 
@@ -7804,14 +7920,18 @@ mod tests {
         // Seed the incremental database at the FIRST commit, so the file added
         // below arrives through the change loop's `Added` arm — the arm that
         // `continue`d past it.
-        index_directory_with_opts(
-            &repo,
-            &incremental_db,
-            &IndexOptions::new("test", repo_url, &first_sha)
-                .force(true)
-                .unskip(&unskip),
-        )
-        .unwrap();
+        {
+            let authority = nestweaver_store::acquire_db_write_lease(&incremental_db).unwrap();
+            index_directory_with_opts_and_write_lease(
+                &repo,
+                &incremental_db,
+                &IndexOptions::new("test", repo_url, &first_sha)
+                    .force(true)
+                    .unskip(&unskip),
+                &authority,
+            )
+            .unwrap();
+        }
 
         fs::write(
             repo.join("public/added.py"),
@@ -7822,31 +7942,39 @@ mod tests {
         git(&["commit", "-q", "-m", "add a second public source file"]);
         let second_sha = git(&["rev-parse", "HEAD"]);
 
-        let incremental = incremental_index_with_excludes_and_unskip(
-            &repo,
-            &incremental_db,
-            "test",
-            repo_url,
-            None,
-            crate::index_limits::IndexLimits::default(),
-            &[],
-            &unskip,
-        )
-        .unwrap();
+        let incremental = {
+            let authority = nestweaver_store::acquire_db_write_lease(&incremental_db).unwrap();
+            incremental_index_with_excludes_and_unskip_and_write_lease(
+                &repo,
+                &incremental_db,
+                "test",
+                repo_url,
+                None,
+                crate::index_limits::IndexLimits::default(),
+                &[],
+                &unskip,
+                &authority,
+            )
+            .unwrap()
+        };
         assert!(
             !incremental.fell_back_to_full,
             "precondition: this must exercise the incremental change loop, not \
              the full-index fallback that would mask the bug"
         );
 
-        index_directory_with_opts(
-            &repo,
-            &forced_db,
-            &IndexOptions::new("test", repo_url, &second_sha)
-                .force(true)
-                .unskip(&unskip),
-        )
-        .unwrap();
+        {
+            let authority = nestweaver_store::acquire_db_write_lease(&forced_db).unwrap();
+            index_directory_with_opts_and_write_lease(
+                &repo,
+                &forced_db,
+                &IndexOptions::new("test", repo_url, &second_sha)
+                    .force(true)
+                    .unskip(&unskip),
+                &authority,
+            )
+            .unwrap();
+        }
 
         let symbol_names = |db: &Path| {
             let store = GraphStore::open_or_create(db).unwrap();
@@ -8285,7 +8413,8 @@ mod tests {
         assert!(marker_path.exists(), "the crash must leave the marker set");
 
         // The whole point: an ordinary read-write open, nothing else.
-        let store = open_store_for_writing_with_recovery(&db_path).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let store = open_store_for_writing_with_authority(&db_path, &authority).unwrap();
 
         assert!(
             !marker_path.exists(),
@@ -8346,14 +8475,15 @@ mod tests {
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
 
-        let (dead_pid, _) = abandon_publication_after_commit(&db_path, "readonly");
+        let (_dead_pid, _) = abandon_publication_after_commit(&db_path, "readonly");
 
         let store = GraphStore::open_read_only(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&store, false).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert_eq!(
             outcome,
-            IndexPublicationRecovery::ReadOnlyStore {
-                abandoned_writer_pid: dead_pid
+            IndexPublicationRecovery::WriterAuthorityRequired {
+                detail: "the GraphStore was opened read-only".to_string()
             },
             "a read-only caller must report, never repair"
         );
@@ -8366,6 +8496,87 @@ mod tests {
             store.is_index_publication_dirty(),
             "a read-only open must keep failing closed"
         );
+    }
+
+    #[test]
+    fn a_wrong_database_authority_cannot_mutate_any_publication_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let sibling = dir.path().join("sibling.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        abandon_publication_after_commit(&db_path, "wrong-authority");
+        let before = [
+            std::fs::read(&marker_path).unwrap(),
+            std::fs::read(&generation_path).unwrap(),
+            std::fs::read(&pagerank_path).unwrap(),
+        ];
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let wrong = nestweaver_store::acquire_db_write_lease(&sibling).unwrap();
+        let outcome = force_recover_index_publication(&store, &wrong).unwrap();
+        assert!(matches!(
+            outcome,
+            IndexPublicationRecovery::WriterAuthorityRequired { .. }
+        ));
+        assert_eq!(std::fs::read(&marker_path).unwrap(), before[0]);
+        assert_eq!(std::fs::read(&generation_path).unwrap(), before[1]);
+        assert_eq!(std::fs::read(&pagerank_path).unwrap(), before[2]);
+    }
+
+    #[test]
+    fn marker_change_declines_first_repair_and_second_repair_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let (_original_pid, canonical) =
+            abandon_publication_after_commit(&db_path, "marker-changed");
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let replacement_pid = reaped_child_pid();
+        let replacement_marker = nestweaver_store::index_publication::format_marker_payload(
+            replacement_pid as u32,
+            42,
+            Some(nestweaver_store::index_publication::MARKER_REASON_CANCELLED),
+        );
+        let generation_before = std::fs::read(&generation_path).unwrap();
+        let pagerank_before = std::fs::read(&pagerank_path).unwrap();
+
+        let first = recover_abandoned_index_publication_with_io_and_marker_hook(
+            &store,
+            &authority,
+            false,
+            &FileSystemIndexEpilogueIo,
+            |path| std::fs::write(path, &replacement_marker).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first, IndexPublicationRecovery::MarkerChanged);
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            replacement_marker.as_bytes(),
+            "the declined repair must not overwrite or retire the new publisher's marker"
+        );
+        assert_eq!(std::fs::read(&generation_path).unwrap(), generation_before);
+        assert_eq!(std::fs::read(&pagerank_path).unwrap(), pagerank_before);
+
+        let second = recover_abandoned_index_publication(&store, &authority).unwrap();
+        assert_eq!(
+            second,
+            IndexPublicationRecovery::Recovered {
+                abandoned_writer_pid: Some(replacement_pid),
+                generation: canonical + 2,
+                was_cancelled_run: true,
+            }
+        );
+        assert!(!marker_path.exists());
+        assert_eq!(store.graph_generation(), canonical + 2);
+        let scores = store.pagerank_scores().unwrap();
+        assert!(scores.contains_key("sym:publisher-marker-changed:source"));
+        assert!(scores.contains_key("note:marker-changed:one"));
     }
 
     #[test]
@@ -8387,16 +8598,12 @@ mod tests {
         )
         .unwrap();
         let dirty_generation = store.graph_generation();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
 
-        // The marker names THIS process, which is alive: liveness alone must
-        // stop recovery, before the lease is even consulted.
-        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
-        assert_eq!(
-            outcome,
-            IndexPublicationRecovery::WriterAlive {
-                pid: std::process::id() as i32
-            }
-        );
+        // PID liveness is diagnostic only. The in-process publication lease is
+        // the authoritative proof that this writer is genuinely active.
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
+        assert_eq!(outcome, IndexPublicationRecovery::LeaseHeld);
         assert!(marker_path.exists());
         assert_eq!(store.graph_generation(), dirty_generation);
 
@@ -8404,7 +8611,7 @@ mod tests {
         // the second half of the predicate must decline too.
         write_marker_with_pid(&marker_path, reaped_child_pid(), None);
         assert_eq!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
+            recover_abandoned_index_publication(&store, &authority).unwrap(),
             IndexPublicationRecovery::LeaseHeld,
             "a held lease means the publication is in flight, not abandoned"
         );
@@ -8438,7 +8645,8 @@ mod tests {
         std::fs::create_dir(&marker_path).unwrap();
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert!(
             matches!(outcome, IndexPublicationRecovery::Undeterminable { .. }),
             "cannot tell is not abandoned: {outcome:?}"
@@ -8448,7 +8656,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unattributed_marker_is_not_auto_recovered() {
+    fn an_unattributed_marker_is_auto_recovered_under_exact_authority() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
@@ -8460,11 +8668,19 @@ mod tests {
         std::fs::write(&marker_path, b"dirty").unwrap();
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        assert_eq!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
-            IndexPublicationRecovery::WriterUnattributed
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                IndexPublicationRecovery::Recovered {
+                    abandoned_writer_pid: None,
+                    ..
+                }
+            ),
+            "readable legacy marker should recover without PID attribution: {outcome:?}"
         );
-        assert!(marker_path.exists());
+        assert!(!marker_path.exists());
     }
 
     #[test]
@@ -8502,7 +8718,8 @@ mod tests {
             );
         }
 
-        let store = open_store_for_writing_with_recovery(&db_path).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let store = open_store_for_writing_with_authority(&db_path, &authority).unwrap();
         assert!(
             !marker_path.exists(),
             "recovery must re-derive rather than add to u64::MAX"
@@ -8561,21 +8778,11 @@ mod tests {
             "the deliberate hold must be recorded in the marker payload"
         );
 
-        // Still owned by a live process → never recovered.
-        assert_eq!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
-            IndexPublicationRecovery::WriterAlive {
-                pid: std::process::id() as i32
-            }
-        );
-        drop(store);
-
-        // Once that writer is gone, the publication IS reconciled — the
-        // sidecars really do predate the commit either way — but the outcome
-        // says so, so the `index --force` guidance is not silently lost.
-        write_marker_with_pid(&marker_path, reaped_child_pid(), Some("cancelled"));
-        let store = GraphStore::open_or_create(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        // The publisher released its lease when it deliberately left the
+        // marker dirty. This process still being alive cannot veto recovery:
+        // the writable store and unowned lease prove exclusive ownership.
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert!(outcome.recovered());
         assert!(
             matches!(
@@ -8665,7 +8872,7 @@ mod tests {
     }
 
     #[test]
-    fn force_recovers_an_unattributed_marker_that_auto_heal_must_decline() {
+    fn auto_recovery_of_an_unattributed_marker_rebuilds_unified_ranks() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
@@ -8678,14 +8885,8 @@ mod tests {
         std::fs::write(&marker_path, b"dirty").unwrap();
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        assert_eq!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
-            IndexPublicationRecovery::WriterUnattributed,
-            "auto-heal must still decline what it cannot prove abandoned"
-        );
-        assert!(marker_path.exists());
-
-        let outcome = force_recover_index_publication(&store).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert!(outcome.recovered(), "{outcome:?}");
         assert!(
             matches!(
@@ -8695,7 +8896,7 @@ mod tests {
                     ..
                 }
             ),
-            "a forced recovery names no pid because there was none: {outcome:?}"
+            "automatic recovery names no pid because there was none: {outcome:?}"
         );
         assert!(!marker_path.exists());
         assert!(!store.is_index_publication_dirty());
@@ -8705,21 +8906,42 @@ mod tests {
     }
 
     #[test]
-    fn force_never_overrides_a_live_writer() {
+    fn a_live_but_unrelated_marker_pid_does_not_veto_owned_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_publication_graph(&store, "pid-reuse");
         write_marker_with_pid(&marker_path, std::process::id() as i32, None);
 
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = force_recover_index_publication(&store, &authority).unwrap();
+        assert!(outcome.recovered(), "{outcome:?}");
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn force_never_overrides_a_genuine_in_process_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "live forced publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+
         assert_eq!(
-            force_recover_index_publication(&store).unwrap(),
-            IndexPublicationRecovery::WriterAlive {
-                pid: std::process::id() as i32
-            },
-            "--force overrides 'cannot prove dead', never 'provably alive'"
+            force_recover_index_publication(&store, &authority).unwrap(),
+            IndexPublicationRecovery::LeaseHeld,
+            "--force never overrides authoritative in-process ownership"
         );
         assert!(marker_path.exists());
+        drop(lease);
     }
 
     #[test]
@@ -8734,14 +8956,15 @@ mod tests {
         std::fs::create_dir(&marker_path).unwrap();
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         // Auto-heal always declines: "cannot tell" is never "abandoned".
         assert!(matches!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
+            recover_abandoned_index_publication(&store, &authority).unwrap(),
             IndexPublicationRecovery::Undeterminable { .. }
         ));
         // Forced, it proceeds — and honestly reports the failure to remove a
         // directory rather than pretending the publication is clean.
-        let forced = force_recover_index_publication(&store);
+        let forced = force_recover_index_publication(&store, &authority);
         assert!(
             forced.is_err(),
             "clearing a directory-shaped marker must fail loudly: {forced:?}"
@@ -8755,13 +8978,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         assert_eq!(
-            recover_abandoned_index_publication(&store, true).unwrap(),
+            recover_abandoned_index_publication(&store, &authority).unwrap(),
             IndexPublicationRecovery::Clean
         );
         let memory = GraphStore::in_memory().unwrap();
         assert_eq!(
-            recover_abandoned_index_publication(&memory, true).unwrap(),
+            recover_abandoned_index_publication(&memory, &authority).unwrap(),
             IndexPublicationRecovery::NotFileBacked
         );
     }
@@ -11245,6 +11469,7 @@ function hello(name) { return "Hello " + name; }
     fn deletion_finalizer_removes_phantom_manifest_suggestions_and_preserves_survivors() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         let repos = [
             (
                 "app",
@@ -11271,7 +11496,9 @@ function hello(name) { return "Hello " + name; }
             )
             .unwrap();
             fs::write(root.join("package.json"), manifest).unwrap();
-            index_directory(&root, &db_path, "test", url, "sha").unwrap();
+            let options = IndexOptions::new("test", url, "sha");
+            index_directory_with_opts_and_write_lease(&root, &db_path, &options, &authority)
+                .unwrap();
         }
 
         let removed_uid = nestweaver_schema::repo_uid("test", "https://example.com/removed");
@@ -12300,7 +12527,8 @@ function hello(name) { return "Hello " + name; }
         // After reconciliation the healed ranks must not contain the stale score.
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
         write_marker_with_pid(&marker_path, reaped_child_pid(), None);
-        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert!(
             outcome.recovered(),
             "the dirty publication must reconcile: {}",
@@ -12362,7 +12590,8 @@ function hello(name) { return "Hello " + name; }
             "a failed PageRank refresh must leave the publication dirty"
         );
         write_marker_with_pid(&marker_path, reaped_child_pid(), None);
-        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, &authority).unwrap();
         assert!(
             outcome.recovered(),
             "the dirty publication must reconcile: {}",
@@ -12479,7 +12708,8 @@ function hello(name) { return "Hello " + name; }
         if marker_path.exists() {
             // Dirty is acceptable: recovery self-heals it right here.
             write_marker_with_pid(&marker_path, reaped_child_pid(), None);
-            let outcome = recover_abandoned_index_publication(&reopened, true).unwrap();
+            let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+            let outcome = recover_abandoned_index_publication(&reopened, &authority).unwrap();
             assert!(
                 outcome.recovered(),
                 "a marker present after the crash must reconcile: {}",
@@ -12518,7 +12748,8 @@ function hello(name) { return "Hello " + name; }
         );
         write_marker_with_pid(&marker_path, reaped_child_pid(), None);
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&reopened, true).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&reopened, &authority).unwrap();
         assert!(
             outcome.recovered(),
             "the dirty publication must reconcile: {}",
@@ -12588,7 +12819,8 @@ function hello(name) { return "Hello " + name; }
         // And it recovers on the next open — with note ranks, not just code.
         write_marker_with_pid(&marker_path, reaped_child_pid(), None);
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&reopened, true).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&reopened, &authority).unwrap();
         assert!(
             outcome.recovered(),
             "the dirty publication must reconcile: {}",
@@ -13423,6 +13655,7 @@ function hello(name) { return "Hello " + name; }
         let removed_repo = dir.path().join("removed-repo");
         let surviving_repo = dir.path().join("surviving-repo");
         let db_path = dir.path().join("test.lbug");
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         fs::create_dir_all(&removed_repo).unwrap();
         fs::create_dir_all(&surviving_repo).unwrap();
         let removed_file = removed_repo.join("removed.js");
@@ -13433,32 +13666,29 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        index_directory(
+        index_directory_with_opts_and_write_lease(
             &removed_repo,
             &db_path,
-            "test",
-            "https://example.com/removed",
-            "abc123",
+            &IndexOptions::new("test", "https://example.com/removed", "abc123"),
+            &authority,
         )
         .unwrap();
-        index_directory(
+        index_directory_with_opts_and_write_lease(
             &surviving_repo,
             &db_path,
-            "test",
-            "https://example.com/surviving",
-            "abc123",
+            &IndexOptions::new("test", "https://example.com/surviving", "abc123"),
+            &authority,
         )
         .unwrap();
 
         let pagerank_before = persisted_pagerank(&db_path);
         fs::remove_file(&removed_file).unwrap();
 
-        let result = index_directory(
+        let result = index_directory_with_opts_and_write_lease(
             &removed_repo,
             &db_path,
-            "test",
-            "https://example.com/removed",
-            "abc123",
+            &IndexOptions::new("test", "https://example.com/removed", "abc123"),
+            &authority,
         )
         .unwrap();
 
@@ -15183,9 +15413,24 @@ function hello(name) { return "Hello " + name; }
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
 
+        // This regression isolates the fallback's filemeta hand-off, not
+        // writer-authority reacquisition. Model the daemon's real lifetime:
+        // one caller-owned exact authority spans both successive publications.
+        // `IncrementalResult` contains only counters/vectors and owns no lease.
+        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         let local_root = src.display().to_string();
         let file_url = format!("file://{local_root}");
-        let r1 = incremental_index_with_name(&src, &db_path, "test", &file_url, None).unwrap();
+        let r1 = incremental_index_with_excludes_and_write_lease(
+            &src,
+            &db_path,
+            "test",
+            &file_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &[],
+            &authority,
+        )
+        .unwrap();
         assert!(r1.fell_back_to_full, "non-git dir must fall back to full");
 
         let old_uid = repo_uid("test", &file_url);
@@ -15198,7 +15443,17 @@ function hello(name) { return "Hello " + name; }
         );
 
         let origin_url = "https://example.com/acme/demo.git";
-        let r2 = incremental_index_with_name(&src, &db_path, "test", origin_url, None).unwrap();
+        let r2 = incremental_index_with_excludes_and_write_lease(
+            &src,
+            &db_path,
+            "test",
+            origin_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &[],
+            &authority,
+        )
+        .unwrap();
         assert!(r2.fell_back_to_full);
 
         let new_uid = repo_uid("test", origin_url);

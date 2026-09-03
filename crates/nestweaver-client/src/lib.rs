@@ -44,6 +44,17 @@ pub struct DaemonClient {
     inner: NestWeaverDaemonClient<Channel>,
 }
 
+fn require_embedding_identity_repair_capability(
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<()> {
+    anyhow::ensure!(
+        health.embedding_identity_repair,
+        "the running daemon does not advertise embedding identity repair; restart it with \
+         `nestweaver daemon --db <path> restart` before retrying --repair-identity"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartConfig {
     Configured(PathBuf),
@@ -1479,6 +1490,7 @@ impl DaemonClient {
                 scope: scope.to_string(),
                 force,
                 batch_size: 0,
+                repair_identity: false,
             })
             .await
             .context("plan_embed RPC failed")?;
@@ -1486,18 +1498,42 @@ impl DaemonClient {
     }
 
     /// Run bulk embedding on the daemon using its configured embedding backend.
+    ///
+    /// This preserves the established source-compatible API. Identity repair
+    /// uses a separate method because it requires explicit capability
+    /// negotiation before the mutating RPC is sent.
     pub async fn embed(
         &mut self,
         scope: &str,
         force: bool,
         batch_size: u32,
     ) -> Result<nestweaver_proto::EmbedResponse> {
+        self.embed_with_identity_repair(scope, force, batch_size, false)
+            .await
+    }
+
+    /// Run bulk embedding with optional unreadable-identity repair.
+    pub async fn embed_with_identity_repair(
+        &mut self,
+        scope: &str,
+        force: bool,
+        batch_size: u32,
+        repair_identity: bool,
+    ) -> Result<nestweaver_proto::EmbedResponse> {
+        if repair_identity {
+            let health = self
+                .health_check()
+                .await
+                .context("negotiate daemon embedding repair capability")?;
+            require_embedding_identity_repair_capability(&health)?;
+        }
         let resp = self
             .inner
             .embed(nestweaver_proto::EmbedRequest {
                 scope: scope.to_string(),
                 force,
                 batch_size,
+                repair_identity,
             })
             .await
             .context("embed RPC failed")?;
@@ -1564,6 +1600,22 @@ mod status_rendering_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_capability_is_required_before_the_mutating_rpc() {
+        let mut legacy = nestweaver_proto::HealthCheckResponse::default();
+        let error = require_embedding_identity_repair_capability(&legacy)
+            .expect_err("an older daemon's default-false field must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not advertise embedding identity repair")
+        );
+
+        legacy.embedding_identity_repair = true;
+        require_embedding_identity_repair_capability(&legacy)
+            .expect("a current daemon advertises repair explicitly");
+    }
 
     fn valid_config(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);

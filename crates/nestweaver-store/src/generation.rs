@@ -22,6 +22,62 @@ use crate::db::GraphStore;
 use crate::error::StoreError;
 
 impl GraphStore {
+    /// Capture the durable generation of a clean graph publication.
+    ///
+    /// Unlike [`Self::graph_generation`], this is a cross-process snapshot for
+    /// file-backed stores: it reads the canonical `<db>.generation` sidecar
+    /// instead of the process-local atomic loaded when the store was opened.
+    /// Callers can compare snapshots around a multi-read operation to detect a
+    /// publication that started *and completed* between dirty-marker probes.
+    ///
+    /// The snapshot fails closed while an in-process publisher owns the lease,
+    /// while the durable marker is present or unreadable, or when the durable
+    /// generation itself is missing/unreadable after generation zero. A fresh
+    /// database is the only valid file-backed state without a sidecar.
+    pub fn clean_published_generation_snapshot(&self) -> Result<u64, StoreError> {
+        if !self.index_publication_lease_is_unowned() {
+            return Err(StoreError::RankingUnavailable);
+        }
+        if !matches!(
+            self.index_publication_marker_state(),
+            crate::index_publication::MarkerState::Absent
+        ) {
+            return Err(StoreError::RankingUnavailable);
+        }
+
+        let generation = match self.db_path() {
+            None => self.graph_generation(),
+            Some(_) => {
+                let generation_path = self.generation_sidecar_path();
+                match std::fs::read(&generation_path) {
+                    Ok(contents) => parse_published_generation(&contents)?,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && self.graph_generation() == 0 =>
+                    {
+                        0
+                    }
+                    Err(_) => return Err(StoreError::RankingUnavailable),
+                }
+            }
+        };
+
+        // Re-probe both process-local ownership and the cross-process marker
+        // after the sidecar read. Atomic sidecar replacement means the read
+        // observed either the old complete file or the new complete file; the
+        // probes reject an in-progress publication on either side of it.
+        if !self.index_publication_lease_is_unowned()
+            || !matches!(
+                self.index_publication_marker_state(),
+                crate::index_publication::MarkerState::Absent
+            )
+        {
+            return Err(StoreError::RankingUnavailable);
+        }
+
+        Ok(generation)
+    }
+
     fn load_fail_closed_index_publication_generation(&self, canonical: Option<u64>) {
         let canonical = canonical.unwrap_or(u64::MAX);
         let reserved = canonical.saturating_add(1);
@@ -95,5 +151,73 @@ impl GraphStore {
         if let Err(e) = self.save_graph_generation(path) {
             tracing::warn!("failed to persist graph generation: {e}");
         }
+    }
+}
+
+fn parse_published_generation(contents: &[u8]) -> Result<u64, StoreError> {
+    if contents.is_empty() || !contents.iter().all(u8::is_ascii_digit) {
+        return Err(StoreError::RankingUnavailable);
+    }
+    let value = std::str::from_utf8(contents).map_err(|_| StoreError::RankingUnavailable)?;
+    value
+        .parse::<u64>()
+        .map_err(|_| StoreError::RankingUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_snapshot_uses_the_in_memory_generation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.bump_graph_generation();
+
+        assert_eq!(store.clean_published_generation_snapshot().unwrap(), 1);
+    }
+
+    #[test]
+    fn clean_snapshot_strictly_parses_the_durable_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation_path = store.generation_sidecar_path();
+
+        assert_eq!(
+            store.clean_published_generation_snapshot().unwrap(),
+            0,
+            "generation zero is the only clean state allowed without a sidecar"
+        );
+
+        std::fs::write(&generation_path, b"42").unwrap();
+        assert_eq!(store.clean_published_generation_snapshot().unwrap(), 42);
+
+        std::fs::write(&generation_path, b"42\n").unwrap();
+        assert!(matches!(
+            store.clean_published_generation_snapshot(),
+            Err(StoreError::RankingUnavailable)
+        ));
+    }
+
+    #[test]
+    fn clean_snapshot_rejects_missing_nonzero_generation_and_a_local_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        store.bump_graph_generation();
+        assert!(matches!(
+            store.clean_published_generation_snapshot(),
+            Err(StoreError::RankingUnavailable)
+        ));
+
+        store
+            .save_graph_generation(&store.generation_sidecar_path())
+            .unwrap();
+        let _publication = store.acquire_index_publication_lease().unwrap();
+        assert!(matches!(
+            store.clean_published_generation_snapshot(),
+            Err(StoreError::RankingUnavailable)
+        ));
     }
 }

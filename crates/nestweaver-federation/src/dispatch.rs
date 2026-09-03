@@ -184,7 +184,7 @@ fn brain_search_response_to_json(
     };
     let truncated =
         response.truncated || relation != "eq" || returned_matches < response.total_matches;
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "query": response.query,
         "engine": response.engine,
         "total_matches": response.total_matches,
@@ -195,7 +195,16 @@ fn brain_search_response_to_json(
         "expansion_terms": response.expansion_terms,
         "semantic_applied": response.semantic_applied,
         "degraded_components": response.degraded_components,
-    })
+    });
+    if let Some(detail) = &response.semantic_unavailable {
+        value["semantic_unavailable"] = serde_json::json!({
+            "cause": detail.cause,
+            "reason": detail.reason,
+            "error": detail.error,
+            "remediation": detail.remediation,
+        });
+    }
+    value
 }
 
 /// Typed dispatch for `brain_search` -> `Search` RPC.
@@ -565,6 +574,7 @@ mod tests {
             truncated: false,
             semantic_applied: false,
             degraded_components: Vec::new(),
+            semantic_unavailable: None,
         };
 
         let value = brain_search_response_to_json(&response, false);

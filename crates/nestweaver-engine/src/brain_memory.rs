@@ -30,7 +30,8 @@
 //! | RelatesTo   | `skos:related`        |
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use nestweaver_store::GraphStore;
@@ -667,8 +668,54 @@ pub struct ConsolidationManifest {
     pub dry_run: bool,
     pub applied: bool,
     pub proposals: Vec<ConsolidationProposal>,
-    /// Warnings (e.g. that `--apply` is not yet implemented).
+    /// Apply summaries, recovery locations, and re-index guidance.
     pub warnings: Vec<String>,
+}
+
+const CONSOLIDATION_JOURNAL_VERSION: u32 = 1;
+const CONSOLIDATION_JOURNAL_DIR: &str = ".nestweaver-consolidation-journal";
+
+/// A durable checkpoint for one promotion. Journals intentionally live in the
+/// affected vault: recovering a note move must not depend on the graph DB or
+/// on database-side backup/snapshot policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ConsolidationPhase {
+    Prepared,
+    DestinationPublished,
+    SourceRemoved,
+    RewritesApplied,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsolidationJournal {
+    version: u32,
+    journal_id: String,
+    vault_uid: String,
+    proposal: ConsolidationProposal,
+    source_path: String,
+    destination_path: String,
+    source_byte_len: u64,
+    source_blake3: String,
+    rewrite_paths: Vec<String>,
+    old_link_stem: String,
+    new_link_stem: String,
+    phase: ConsolidationPhase,
+}
+
+#[derive(Debug)]
+struct JournalEntry {
+    vault_root: PathBuf,
+    path: PathBuf,
+    journal: ConsolidationJournal,
+}
+
+#[derive(Debug)]
+struct ApplyProposalsOutcome {
+    all_succeeded: bool,
+    had_work: bool,
+    summaries: Vec<String>,
+    proposals: Vec<ConsolidationProposal>,
 }
 
 /// Number of distinct idea-note referrers a daily log needs to be promoted.
@@ -694,7 +741,7 @@ pub fn memory_consolidate(
 ) -> Result<ConsolidationManifest> {
     let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     let mut warnings = Vec::new();
-    if notes.is_empty() {
+    if notes.is_empty() && !apply {
         return Ok(ConsolidationManifest {
             dry_run: !apply,
             applied: false,
@@ -813,11 +860,11 @@ pub fn memory_consolidate(
             .then(a.promote_to.cmp(&b.promote_to))
     });
 
-    if apply && !proposals.is_empty() {
+    if apply {
         match apply_proposals(store, &proposals, &notes) {
-            Ok((success, summaries)) => {
-                warnings.extend(summaries);
-                if success {
+            Ok(outcome) => {
+                warnings.extend(outcome.summaries);
+                if outcome.all_succeeded && outcome.had_work {
                     warnings.push(
                         "Re-index the vault to update the graph: \
                          nestweaver brain refresh <vault-path>"
@@ -826,8 +873,8 @@ pub fn memory_consolidate(
                 }
                 return Ok(ConsolidationManifest {
                     dry_run: false,
-                    applied: success,
-                    proposals,
+                    applied: outcome.all_succeeded && outcome.had_work,
+                    proposals: outcome.proposals,
                     warnings,
                 });
             }
@@ -851,209 +898,1280 @@ pub fn memory_consolidate(
     })
 }
 
-/// Execute the file moves described by `proposals`, returning
-/// `(all_succeeded, summaries)`.
+/// Recover every incomplete vault-local journal, then execute newly discovered
+/// proposals. New proposals are completely preflighted before the first
+/// Prepared journal is written. Once a journal exists, its captured plan is
+/// authoritative even when a re-run's graph no longer discovers the proposal.
 fn apply_proposals(
     store: &GraphStore,
     proposals: &[ConsolidationProposal],
     notes: &[nestweaver_schema::Note],
-) -> Result<(bool, Vec<String>)> {
+) -> Result<ApplyProposalsOutcome> {
     let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
-
-    let vault_roots: HashMap<&str, &str> = vaults
+    let vault_roots: HashMap<&str, PathBuf> = vaults
         .iter()
-        .map(|v| (v.uid.as_str(), v.root_path.as_str()))
-        .collect();
-
+        .map(|v| {
+            validate_vault_root(Path::new(v.root_path.as_str())).map(|root| (v.uid.as_str(), root))
+        })
+        .collect::<Result<_>>()?;
     let note_by_uid: HashMap<&str, &nestweaver_schema::Note> =
         notes.iter().map(|n| (n.uid.as_str(), n)).collect();
 
-    let mut summaries = Vec::new();
-    let mut all_ok = true;
-
-    for p in proposals {
-        // Resolve the vault root for this note.
-        let note = match note_by_uid.get(p.source_uid.as_str()) {
-            Some(n) => *n,
-            None => {
-                summaries.push(format!(
-                    "SKIP: note uid '{}' not found in store",
-                    p.source_uid
-                ));
-                all_ok = false;
-                continue;
-            }
-        };
-        let vault_root = match vault_roots.get(note.vault_uid.as_str()) {
-            Some(r) => std::path::Path::new(*r),
-            None => {
-                summaries.push(format!(
-                    "SKIP: vault uid '{}' not found for note '{}'",
-                    note.vault_uid, p.source_path
-                ));
-                all_ok = false;
-                continue;
-            }
-        };
-
-        let src = vault_root.join(&p.source_path);
-        if !src.exists() {
-            summaries.push(format!("SKIP: source does not exist: {}", src.display()));
-            all_ok = false;
+    // Loading and validating every existing journal is part of preflight. A
+    // corrupt or foreign journal must stop application before any new note is
+    // moved.
+    let mut entries = load_consolidation_journals(&vaults, &vault_roots)?;
+    // Prepare every fresh proposal in memory first. This catches ambiguous
+    // same-source/same-destination batches and all current read/path failures
+    // before publishing even the first Prepared checkpoint.
+    let mut new_entries = Vec::new();
+    let mut obsolete: Vec<String> = Vec::new();
+    for proposal in proposals {
+        let note = note_by_uid
+            .get(proposal.source_uid.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot prepare consolidation for missing note uid '{}'",
+                    proposal.source_uid
+                )
+            })?;
+        let vault_root = vault_roots.get(note.vault_uid.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot prepare consolidation for '{}': vault uid '{}' is unavailable",
+                proposal.source_path,
+                note.vault_uid
+            )
+        })?;
+        let source_relative = validate_vault_relative_path(Path::new(&proposal.source_path))?;
+        let destination_relative = destination_relative_path(proposal)?;
+        let id = consolidation_journal_id(
+            &note.vault_uid,
+            &proposal.source_uid,
+            &path_to_slash_string(&source_relative),
+            &path_to_slash_string(&destination_relative),
+        );
+        let path = consolidation_journal_path(vault_root, &id);
+        if let Some(existing) = entries
+            .iter()
+            .chain(new_entries.iter())
+            .find(|entry| entry.path == path)
+        {
+            validate_journal_for_proposal(&existing.journal, proposal, note, &path)?;
             continue;
         }
+        // A proposal whose SOURCE FILE is gone is not a validation failure --
+        // it is a proposal the graph is too stale to know is already done.
+        // Letting `prepare_consolidation_journal` raise it turned one such row
+        // into a hard `Err` from the whole preflight, which aborted EVERY other
+        // pending consolidation across EVERY vault, permanently, until the
+        // vault was re-indexed. Skipping it preserves the preflight guarantee
+        // (nothing is mutated until every remaining proposal validates) while
+        // keeping one stale row from wedging the batch.
+        let source_absent =
+            validated_vault_path(vault_root, &source_relative, "consolidation source")
+                .ok()
+                .is_some_and(|source| {
+                    matches!(
+                        std::fs::symlink_metadata(&source),
+                        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+                });
+        if source_absent {
+            obsolete.push(format!(
+                "SKIPPED: '{}' was already consolidated -- its source {} no longer exists.                  The graph still lists it, so re-index the vault to stop it being proposed:                  nestweaver brain refresh <vault-path>",
+                proposal.source_uid, proposal.source_path
+            ));
+            continue;
+        }
+        let journal = prepare_consolidation_journal(proposal, note, vault_root, &note_by_uid)?;
+        new_entries.push(JournalEntry {
+            vault_root: vault_root.clone(),
+            path,
+            journal,
+        });
+    }
 
-        // Determine the destination path.
-        let file_name = match src.file_name() {
-            Some(f) => f,
-            None => {
-                summaries.push(format!(
-                    "SKIP: cannot extract filename from '{}'",
-                    src.display()
-                ));
-                all_ok = false;
-                continue;
-            }
-        };
+    validate_non_conflicting_journals(entries.iter().chain(new_entries.iter()))?;
 
-        let dest_dir = if p.promote_to == "_ideas" {
-            vault_root.join("_ideas")
-        } else if p.promote_to.starts_with("project-file (") {
-            // Extract the project dir from "project-file (<dir>)".
-            let inner = p
-                .promote_to
-                .strip_prefix("project-file (")
-                .and_then(|s| s.strip_suffix(')'));
-            match inner {
-                Some(proj_dir) => vault_root.join(proj_dir),
-                None => {
-                    summaries.push(format!(
-                        "SKIP: cannot parse project dir from promote_to '{}'",
-                        p.promote_to
-                    ));
+    // Only now does application begin. Each Prepared write is independently
+    // durable, so even failure while preparing a later proposal leaves an
+    // exact recovery point and no unjournaled note mutation.
+    for entry in &new_entries {
+        ensure_journal_directory(&entry.vault_root)?;
+        write_consolidation_journal(&entry.vault_root, &entry.path, &entry.journal)?;
+    }
+    entries.extend(new_entries);
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut summaries = obsolete;
+    let mut all_ok = true;
+    let mut had_work = false;
+    let mut result_proposals: Vec<_> = proposals
+        .iter()
+        .filter(|proposal| {
+            !entries.iter().any(|entry| {
+                entry.journal.phase == ConsolidationPhase::Complete
+                    && entry.journal.proposal.source_uid == proposal.source_uid
+                    && entry.journal.proposal.promote_to == proposal.promote_to
+            })
+        })
+        .cloned()
+        .collect();
+
+    for entry in &mut entries {
+        if entry.journal.phase == ConsolidationPhase::Complete {
+            // A Complete journal is a transaction receipt, and it has exactly
+            // one remaining job: keep a re-run idempotent while the graph still
+            // names the source it consolidated. Two conditions end that job.
+            //
+            // DRIFT -- the vault no longer matches the receipt. The user
+            // deleted or renamed the promoted note. Nothing can re-apply the
+            // consolidation (source and destination are both gone), so the
+            // receipt is obsolete, not broken. Reporting it as a failure made
+            // one ordinary vault edit a PERMANENT failure on every future run,
+            // clearable only by deleting journal files by hand.
+            //
+            // ABSORBED -- the vault has been re-indexed and the source uid is
+            // gone from the graph, so no proposal can regenerate. Without this,
+            // every consolidation a vault ever performs leaves a file that is
+            // re-read and re-stat'd forever.
+            // Retire on a POSITIVE drift signal only. "validation returned
+            // Err" conflated "the user edited the vault" with "I could not
+            // READ the vault", so a transiently unavailable network mount would
+            // irrevocably delete a receipt describing work that DID complete.
+            let drift = match retained_receipt_drift(&entry.vault_root, &entry.journal) {
+                Ok(drift) => drift,
+                Err(error) => {
                     all_ok = false;
+                    summaries.push(format!(
+                        "FAILED: cannot inspect completed consolidation '{}' in {}: {error}",
+                        entry.journal.journal_id,
+                        entry.path.display()
+                    ));
                     continue;
                 }
-            }
-        } else {
-            summaries.push(format!(
-                "SKIP: unknown promote_to target '{}'",
-                p.promote_to
-            ));
-            all_ok = false;
-            continue;
-        };
-
-        let dest = dest_dir.join(file_name);
-
-        if dest.exists() {
-            summaries.push(format!(
-                "SKIP: destination already exists: {}",
-                dest.display()
-            ));
-            all_ok = false;
-            continue;
-        }
-
-        // Ensure destination directory exists.
-        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-            summaries.push(format!(
-                "SKIP: cannot create dir '{}': {e}",
-                dest_dir.display()
-            ));
-            all_ok = false;
-            continue;
-        }
-
-        // Move the file: try rename first, fall back to copy + delete for
-        // cross-filesystem moves.
-        let moved = match std::fs::rename(&src, &dest) {
-            Ok(()) => true,
-            Err(_rename_err) => match std::fs::copy(&src, &dest) {
-                Ok(_) => {
-                    if let Err(e) = std::fs::remove_file(&src) {
+            };
+            let absorbed = !note_by_uid.contains_key(entry.journal.proposal.source_uid.as_str());
+            if drift.is_some() || absorbed {
+                match retire_consolidation_journal(&entry.path) {
+                    // Only drift is worth telling the user about; an absorbed
+                    // receipt retiring on schedule is not an event.
+                    Ok(()) => {
+                        if let Some(error) = drift {
+                            summaries.push(format!(
+                                "RETIRED: completed consolidation '{}' no longer matches the vault \
+                                 and its receipt was removed from {}: {error}",
+                                entry.journal.journal_id,
+                                entry.path.display()
+                            ));
+                        }
+                    }
+                    // Failing to REMOVE the receipt is a real filesystem fault
+                    // on this run, and is reported as one.
+                    Err(error) => {
+                        all_ok = false;
                         summaries.push(format!(
-                            "WARN: copied to '{}' but failed to remove source '{}': {e}",
-                            dest.display(),
-                            src.display(),
+                            "FAILED: could not retire completed consolidation '{}' at {}: {error}",
+                            entry.journal.journal_id,
+                            entry.path.display()
                         ));
                     }
-                    true
                 }
-                Err(e) => {
-                    summaries.push(format!(
-                        "SKIP: failed to move '{}' → '{}': {e}",
-                        src.display(),
-                        dest.display(),
-                    ));
-                    all_ok = false;
-                    false
-                }
-            },
-        };
+            }
+            continue;
+        }
+        had_work = true;
+        if !result_proposals.iter().any(|proposal| {
+            proposal.source_uid == entry.journal.proposal.source_uid
+                && proposal.promote_to == entry.journal.proposal.promote_to
+        }) {
+            result_proposals.push(entry.journal.proposal.clone());
+        }
 
-        if moved {
-            summaries.push(format!("MOVED: {} → {}", src.display(), dest.display()));
-
-            // Rewrite path-based wikilinks in notes that reference this file.
-            let old_stem = Path::new(&p.source_path)
-                .with_extension("")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let new_rel = dest
-                .strip_prefix(vault_root)
-                .unwrap_or(&dest)
-                .with_extension("")
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            if old_stem != new_rel {
-                let rewrite_count =
-                    rewrite_wikilinks(vault_root, &note_by_uid, &p.evidence, &old_stem, &new_rel);
+        match apply_consolidation_journal(entry) {
+            Ok(rewrite_count) => {
+                let source = entry.vault_root.join(&entry.journal.source_path);
+                let destination = entry.vault_root.join(&entry.journal.destination_path);
+                summaries.push(format!(
+                    "MOVED: {} → {}",
+                    source.display(),
+                    destination.display()
+                ));
                 if rewrite_count > 0 {
                     summaries.push(format!(
-                        "  REWRITE: updated [[{old_stem}]] → [[{new_rel}]] in {rewrite_count} file(s)"
+                        "  REWRITE: updated [[{}]] → [[{}]] in {rewrite_count} file(s)",
+                        entry.journal.old_link_stem, entry.journal.new_link_stem
+                    ));
+                }
+            }
+            Err(error) => {
+                all_ok = false;
+                summaries.push(format!(
+                    "FAILED: consolidation '{}' remains recoverable at {:?} in {}: {error}",
+                    entry.journal.journal_id,
+                    entry.journal.phase,
+                    entry.path.display()
+                ));
+            }
+        }
+    }
+
+    result_proposals.sort_by(|a, b| {
+        a.source_uid
+            .cmp(&b.source_uid)
+            .then(a.promote_to.cmp(&b.promote_to))
+    });
+    result_proposals.dedup_by(|a, b| a.source_uid == b.source_uid && a.promote_to == b.promote_to);
+
+    Ok(ApplyProposalsOutcome {
+        all_succeeded: all_ok,
+        had_work,
+        summaries,
+        proposals: result_proposals,
+    })
+}
+
+fn prepare_consolidation_journal(
+    proposal: &ConsolidationProposal,
+    source_note: &nestweaver_schema::Note,
+    vault_root: &Path,
+    note_by_uid: &HashMap<&str, &nestweaver_schema::Note>,
+) -> Result<ConsolidationJournal> {
+    let source_relative = validate_vault_relative_path(Path::new(&proposal.source_path))?;
+    if source_note.file_path != proposal.source_path {
+        anyhow::bail!(
+            "proposal source path '{}' does not match stored note path '{}'",
+            proposal.source_path,
+            source_note.file_path
+        );
+    }
+    let destination_relative = destination_relative_path(proposal)?;
+    if source_relative == destination_relative {
+        anyhow::bail!(
+            "consolidation source and destination are identical: {}",
+            source_relative.display()
+        );
+    }
+
+    let source = validated_vault_path(vault_root, &source_relative, "consolidation source")?;
+    let destination = validated_vault_path(
+        vault_root,
+        &destination_relative,
+        "consolidation destination",
+    )?;
+    let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+        anyhow::anyhow!("read consolidation source {}: {error}", source.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("consolidation source is not a file: {}", source.display());
+    }
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => anyhow::bail!(
+            "consolidation destination already exists without a journal: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect consolidation destination {}: {error}",
+                destination.display()
+            ));
+        }
+    }
+    let source_bytes = std::fs::read(&source).map_err(|error| {
+        anyhow::anyhow!("read consolidation source {}: {error}", source.display())
+    })?;
+
+    let mut rewrite_paths = Vec::new();
+    for uid in &proposal.evidence {
+        let note = note_by_uid.get(uid.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot prepare wikilink rewrite: evidence note uid '{uid}' is unavailable"
+            )
+        })?;
+        if note.vault_uid != source_note.vault_uid {
+            anyhow::bail!(
+                "cannot rewrite cross-vault evidence note '{}' for source '{}'",
+                note.file_path,
+                proposal.source_path
+            );
+        }
+        let relative = validate_vault_relative_path(Path::new(&note.file_path))?;
+        let path = validated_vault_path(vault_root, &relative, "wikilink rewrite target")?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            anyhow::anyhow!("preflight wikilink rewrite {}: {error}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "preflight wikilink rewrite target is not a regular file: {}",
+                path.display()
+            );
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            anyhow::anyhow!("preflight wikilink rewrite {}: {error}", path.display())
+        })?;
+        std::str::from_utf8(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "preflight wikilink rewrite {} as UTF-8: {error}",
+                path.display()
+            )
+        })?;
+        rewrite_paths.push(path_to_slash_string(&relative));
+    }
+    rewrite_paths.sort();
+    rewrite_paths.dedup();
+
+    let source_path = path_to_slash_string(&source_relative);
+    let destination_path = path_to_slash_string(&destination_relative);
+    let old_link_stem = path_to_slash_string(&source_relative.with_extension(""));
+    let new_link_stem = path_to_slash_string(&destination_relative.with_extension(""));
+    let journal_id = consolidation_journal_id(
+        &source_note.vault_uid,
+        &proposal.source_uid,
+        &source_path,
+        &destination_path,
+    );
+    let mut captured_proposal = proposal.clone();
+    captured_proposal.source_path = source_path.clone();
+
+    Ok(ConsolidationJournal {
+        version: CONSOLIDATION_JOURNAL_VERSION,
+        journal_id,
+        vault_uid: source_note.vault_uid.clone(),
+        proposal: captured_proposal,
+        source_path,
+        destination_path,
+        source_byte_len: source_bytes.len() as u64,
+        source_blake3: crate::hash::blake3_hex_bytes(&source_bytes),
+        rewrite_paths,
+        old_link_stem,
+        new_link_stem,
+        phase: ConsolidationPhase::Prepared,
+    })
+}
+
+fn destination_relative_path(proposal: &ConsolidationProposal) -> Result<PathBuf> {
+    let source = validate_vault_relative_path(Path::new(&proposal.source_path))?;
+    let file_name = source.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot extract a filename from consolidation source '{}'",
+            proposal.source_path
+        )
+    })?;
+    let parent = if proposal.promote_to == "_ideas" {
+        PathBuf::from("_ideas")
+    } else if let Some(project) = proposal
+        .promote_to
+        .strip_prefix("project-file (")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        validate_vault_relative_path(Path::new(project))?
+    } else {
+        anyhow::bail!("unknown consolidation target '{}'", proposal.promote_to);
+    };
+    validate_vault_relative_path(&parent.join(file_name))
+}
+
+fn validate_vault_relative_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        anyhow::bail!(
+            "vault path must be non-empty and relative: {}",
+            path.display()
+        );
+    }
+    if !path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!(
+            "vault path contains a non-normal component: {}",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_vault_root(vault_root: &Path) -> Result<PathBuf> {
+    let absolute = if vault_root.is_absolute() {
+        vault_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| anyhow::anyhow!("resolve current directory: {error}"))?
+            .join(vault_root)
+    };
+    // `symlink_metadata("alias/")` follows `alias` on POSIX because the
+    // trailing separator requires directory traversal. Rebuild the lexical
+    // spelling from components first so the final component is always checked
+    // without a trailing separator or terminal `/.` bypass.
+    let lexical_root: PathBuf = absolute.components().collect();
+    let metadata = std::fs::symlink_metadata(&lexical_root).map_err(|error| {
+        anyhow::anyhow!("inspect vault root {}: {error}", lexical_root.display())
+    })?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("vault root is a symlink: {}", lexical_root.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("vault root is not a directory: {}", lexical_root.display());
+    }
+    std::fs::canonicalize(&lexical_root).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize vault root {}: {error}",
+            lexical_root.display()
+        )
+    })
+}
+
+/// Resolve one validated vault-relative path after rejecting symlinks and
+/// non-directories in every existing parent component. The leaf may be absent,
+/// but an existing leaf is never allowed to be a symlink.
+fn validated_vault_path(vault_root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
+    let relative = validate_vault_relative_path(relative)?;
+    let vault_root = validate_vault_root(vault_root)?;
+    let mut current = vault_root.clone();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                unreachable!("validated path contains only normal components");
+            };
+            current.push(name);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    anyhow::bail!("{label} parent is a symlink: {}", current.display())
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => anyhow::bail!("{label} parent is not a directory: {}", current.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "inspect {label} parent {}: {error}",
+                        current.display()
                     ));
                 }
             }
         }
     }
-
-    Ok((all_ok, summaries))
+    let path = vault_root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("{label} is a symlink: {}", path.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect {label} {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    Ok(path)
 }
 
-/// Rewrite `[[old_stem]]` → `[[new_stem]]` in the files identified by `evidence_uids`.
-/// Returns the number of files actually modified.
-fn rewrite_wikilinks(
-    vault_root: &Path,
-    note_by_uid: &HashMap<&str, &nestweaver_schema::Note>,
-    evidence_uids: &[String],
-    old_stem: &str,
-    new_stem: &str,
-) -> usize {
-    let old_link = format!("[[{old_stem}]]");
-    let new_link = format!("[[{new_stem}]]");
-    // Also handle display-text links: [[path|display]]
-    let old_link_prefix = format!("[[{old_stem}|");
-    let new_link_prefix = format!("[[{new_stem}|");
+fn path_to_slash_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
+fn consolidation_journal_id(
+    vault_uid: &str,
+    source_uid: &str,
+    source_path: &str,
+    destination_path: &str,
+) -> String {
+    crate::hash::blake3_hex(&format!(
+        "v1\0{vault_uid}\0{source_uid}\0{source_path}\0{destination_path}"
+    ))
+}
+
+fn consolidation_journal_path(vault_root: &Path, journal_id: &str) -> PathBuf {
+    vault_root
+        .join(CONSOLIDATION_JOURNAL_DIR)
+        .join(format!("{journal_id}.json"))
+}
+
+fn ensure_journal_directory(vault_root: &Path) -> Result<()> {
+    ensure_vault_directory(vault_root, Path::new(CONSOLIDATION_JOURNAL_DIR))
+}
+
+fn ensure_vault_directory(vault_root: &Path, relative: &Path) -> Result<()> {
+    let relative = validate_vault_relative_path(relative)?;
+    let mut current = validate_vault_root(vault_root)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            unreachable!("validated path contains only normal components");
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => anyhow::bail!(
+                "required consolidation directory is a symlink: {}",
+                current.display()
+            ),
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!(
+                "required consolidation directory is not a directory: {}",
+                current.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| {
+                    anyhow::anyhow!(
+                        "create consolidation directory {}: {error}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect consolidation directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            anyhow::anyhow!(
+                "re-inspect consolidation directory {}: {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!(
+                "required consolidation directory changed into a symlink or non-directory: {}",
+                current.display()
+            );
+        }
+        // Sync even when the directory was already visible: a prior attempt
+        // may have created it and then failed the parent sync.
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&current).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "publish consolidation directory {} durably: {error}",
+                    current.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove a receipt that has no remaining purpose. Durable, so a crash cannot
+/// leave it half-unlinked and reappearing on the next run.
+fn retire_consolidation_journal(path: &Path) -> Result<()> {
+    match nestweaver_store::durable_sidecar::remove_file_durable(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "retire consolidation journal {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_consolidation_journal(
+    vault_root: &Path,
+    path: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<()> {
+    let relative = path.strip_prefix(vault_root).map_err(|_| {
+        anyhow::anyhow!(
+            "consolidation journal path escapes vault root: {}",
+            path.display()
+        )
+    })?;
+    let path = validated_vault_path(vault_root, relative, "consolidation journal")?;
+    let mut bytes = serde_json::to_vec_pretty(journal)?;
+    bytes.push(b'\n');
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&bytes))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "write consolidation journal {} durably: {error}",
+                path.display()
+            )
+        })
+}
+
+fn load_consolidation_journals(
+    vaults: &[nestweaver_schema::Vault],
+    vault_roots: &HashMap<&str, PathBuf>,
+) -> Result<Vec<JournalEntry>> {
+    let mut entries = Vec::new();
+    for vault in vaults {
+        let vault_root = vault_roots.get(vault.uid.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot load consolidation journals: vault uid '{}' has no snapshotted root",
+                vault.uid
+            )
+        })?;
+        let directory = validated_vault_path(
+            vault_root,
+            Path::new(CONSOLIDATION_JOURNAL_DIR),
+            "consolidation journal directory",
+        )?;
+        let read_dir = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => anyhow::bail!(
+                "consolidation journal directory is a symlink: {}",
+                directory.display()
+            ),
+            Ok(metadata) if !metadata.is_dir() => anyhow::bail!(
+                "consolidation journal path is not a directory: {}",
+                directory.display()
+            ),
+            Ok(_) => std::fs::read_dir(&directory).map_err(|error| {
+                anyhow::anyhow!(
+                    "read consolidation journal directory {}: {error}",
+                    directory.display()
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect consolidation journal directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        };
+        let mut paths = Vec::new();
+        for item in read_dir {
+            let path = item
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "enumerate consolidation journal directory {}: {error}",
+                        directory.display()
+                    )
+                })?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        for path in paths {
+            let relative = path.strip_prefix(vault_root).map_err(|_| {
+                anyhow::anyhow!(
+                    "consolidation journal path escapes vault root: {}",
+                    path.display()
+                )
+            })?;
+            let path = validated_vault_path(vault_root, relative, "consolidation journal")?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                anyhow::anyhow!("inspect consolidation journal {}: {error}", path.display())
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!(
+                    "consolidation journal is not a regular file: {}",
+                    path.display()
+                );
+            }
+            // A prior atomic replacement may have returned after the rename but
+            // before its directory sync. Confirm that namespace change before
+            // trusting the checkpoint.
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "confirm consolidation journal {} durably: {error}",
+                        path.display()
+                    )
+                },
+            )?;
+            let bytes = std::fs::read(&path).map_err(|error| {
+                anyhow::anyhow!("read consolidation journal {}: {error}", path.display())
+            })?;
+            let journal: ConsolidationJournal =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    anyhow::anyhow!("parse consolidation journal {}: {error}", path.display())
+                })?;
+            validate_loaded_journal(&journal, &vault.uid, vault_root, &path)?;
+            entries.push(JournalEntry {
+                vault_root: vault_root.clone(),
+                path,
+                journal,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+fn validate_loaded_journal(
+    journal: &ConsolidationJournal,
+    vault_uid: &str,
+    vault_root: &Path,
+    path: &Path,
+) -> Result<()> {
+    if journal.version != CONSOLIDATION_JOURNAL_VERSION {
+        anyhow::bail!(
+            "unsupported consolidation journal version {} in {}",
+            journal.version,
+            path.display()
+        );
+    }
+    if journal.vault_uid != vault_uid {
+        anyhow::bail!(
+            "consolidation journal {} belongs to vault '{}' rather than '{}'",
+            path.display(),
+            journal.vault_uid,
+            vault_uid
+        );
+    }
+    let source = validate_vault_relative_path(Path::new(&journal.source_path))?;
+    let destination = validate_vault_relative_path(Path::new(&journal.destination_path))?;
+    if path_to_slash_string(&source) != journal.source_path
+        || path_to_slash_string(&destination) != journal.destination_path
+    {
+        anyhow::bail!(
+            "non-canonical path in consolidation journal {}",
+            path.display()
+        );
+    }
+    if journal.proposal.source_path != journal.source_path {
+        anyhow::bail!(
+            "proposal/source mismatch in consolidation journal {}",
+            path.display()
+        );
+    }
+    let derived_destination = destination_relative_path(&journal.proposal)?;
+    if derived_destination != destination {
+        anyhow::bail!(
+            "proposal/destination mismatch in consolidation journal {}",
+            path.display()
+        );
+    }
+    if journal.old_link_stem != path_to_slash_string(&source.with_extension(""))
+        || journal.new_link_stem != path_to_slash_string(&destination.with_extension(""))
+    {
+        anyhow::bail!(
+            "wikilink stem mismatch in consolidation journal {}",
+            path.display()
+        );
+    }
+    let mut normalized_rewrites = Vec::with_capacity(journal.rewrite_paths.len());
+    for rewrite in &journal.rewrite_paths {
+        let normalized = validate_vault_relative_path(Path::new(rewrite))?;
+        normalized_rewrites.push(path_to_slash_string(&normalized));
+    }
+    let mut sorted_rewrites = normalized_rewrites.clone();
+    sorted_rewrites.sort();
+    sorted_rewrites.dedup();
+    if normalized_rewrites != sorted_rewrites {
+        anyhow::bail!(
+            "rewrite paths are not canonical, sorted, and unique in consolidation journal {}",
+            path.display()
+        );
+    }
+    if journal.source_blake3.len() != 64
+        || !journal
+            .source_blake3
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!(
+            "invalid source digest in consolidation journal {}",
+            path.display()
+        );
+    }
+    let expected_id = consolidation_journal_id(
+        vault_uid,
+        &journal.proposal.source_uid,
+        &journal.source_path,
+        &journal.destination_path,
+    );
+    if journal.journal_id != expected_id
+        || path != consolidation_journal_path(vault_root, &expected_id)
+    {
+        anyhow::bail!(
+            "identity mismatch in consolidation journal {}",
+            path.display()
+        );
+    }
+    validate_journal_vault_paths(vault_root, journal, path)?;
+    Ok(())
+}
+
+fn validate_journal_vault_paths(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+    journal_path: &Path,
+) -> Result<()> {
+    validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    validated_vault_path(
+        vault_root,
+        Path::new(&journal.destination_path),
+        "consolidation destination",
+    )?;
+    for rewrite in &journal.rewrite_paths {
+        validated_vault_path(vault_root, Path::new(rewrite), "wikilink rewrite target")?;
+    }
+    let journal_relative = journal_path.strip_prefix(vault_root).map_err(|_| {
+        anyhow::anyhow!(
+            "consolidation journal path escapes vault root: {}",
+            journal_path.display()
+        )
+    })?;
+    validated_vault_path(vault_root, journal_relative, "consolidation journal")?;
+    Ok(())
+}
+
+fn validate_journal_for_proposal(
+    existing: &ConsolidationJournal,
+    proposal: &ConsolidationProposal,
+    note: &nestweaver_schema::Note,
+    path: &Path,
+) -> Result<()> {
+    let proposal_source = path_to_slash_string(&validate_vault_relative_path(Path::new(
+        &proposal.source_path,
+    ))?);
+    if existing.vault_uid != note.vault_uid
+        || existing.proposal.source_uid != proposal.source_uid
+        || existing.source_path != proposal_source
+        || existing.proposal.promote_to != proposal.promote_to
+    {
+        anyhow::bail!(
+            "fresh proposal conflicts with durable consolidation journal {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_non_conflicting_journals<'a>(
+    entries: impl Iterator<Item = &'a JournalEntry>,
+) -> Result<()> {
+    let active: Vec<&JournalEntry> = entries
+        .filter(|entry| entry.journal.phase != ConsolidationPhase::Complete)
+        .collect();
+    let mut sources: HashMap<(PathBuf, String), String> = HashMap::new();
+    let mut destinations: HashMap<(PathBuf, String), String> = HashMap::new();
+    for entry in &active {
+        let source_key = (entry.vault_root.clone(), entry.journal.source_path.clone());
+        if let Some(other) = sources.insert(source_key, entry.journal.journal_id.clone())
+            && other != entry.journal.journal_id
+        {
+            anyhow::bail!(
+                "conflicting consolidation journals '{other}' and '{}' share source '{}'",
+                entry.journal.journal_id,
+                entry.journal.source_path
+            );
+        }
+        let destination_key = (
+            entry.vault_root.clone(),
+            entry.journal.destination_path.clone(),
+        );
+        if let Some(other) = destinations.insert(destination_key, entry.journal.journal_id.clone())
+            && other != entry.journal.journal_id
+        {
+            anyhow::bail!(
+                "conflicting consolidation journals '{other}' and '{}' share destination '{}'",
+                entry.journal.journal_id,
+                entry.journal.destination_path
+            );
+        }
+    }
+    for entry in &active {
+        for rewrite in &entry.journal.rewrite_paths {
+            if let Some(source_journal) = sources.get(&(entry.vault_root.clone(), rewrite.clone()))
+            {
+                anyhow::bail!(
+                    "consolidation journal '{}' would rewrite source '{}' owned by journal '{}'",
+                    entry.journal.journal_id,
+                    rewrite,
+                    source_journal
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_consolidation_journal(entry: &mut JournalEntry) -> Result<usize> {
+    let mut rewrite_count = 0;
+    loop {
+        validate_journal_vault_paths(&entry.vault_root, &entry.journal, &entry.path)?;
+        match entry.journal.phase {
+            ConsolidationPhase::Prepared => {
+                publish_consolidation_destination(&entry.vault_root, &entry.journal)?;
+                advance_consolidation_phase(entry, ConsolidationPhase::DestinationPublished)?;
+            }
+            ConsolidationPhase::DestinationPublished => {
+                remove_consolidation_source(&entry.vault_root, &entry.journal)?;
+                advance_consolidation_phase(entry, ConsolidationPhase::SourceRemoved)?;
+            }
+            ConsolidationPhase::SourceRemoved => {
+                rewrite_count += rewrite_journal_wikilinks(&entry.vault_root, &entry.journal)?;
+                advance_consolidation_phase(entry, ConsolidationPhase::RewritesApplied)?;
+            }
+            ConsolidationPhase::RewritesApplied => {
+                // Validate the exact captured bytes and rewrites before the
+                // durable Complete checkpoint. Once Complete is published,
+                // later user edits to the destination are legitimate and the
+                // retained journal must not freeze them forever.
+                validate_consolidation_completion(&entry.vault_root, &entry.journal)?;
+                advance_consolidation_phase(entry, ConsolidationPhase::Complete)?;
+            }
+            ConsolidationPhase::Complete => {
+                validate_retained_complete_journal(&entry.vault_root, &entry.journal)?;
+                return Ok(rewrite_count);
+            }
+        }
+    }
+}
+
+fn advance_consolidation_phase(entry: &mut JournalEntry, phase: ConsolidationPhase) -> Result<()> {
+    let mut next = entry.journal.clone();
+    next.phase = phase;
+    write_consolidation_journal(&entry.vault_root, &entry.path, &next)?;
+    entry.journal = next;
+    Ok(())
+}
+
+fn publish_consolidation_destination(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<()> {
+    let source_relative = Path::new(&journal.source_path);
+    let source = validated_vault_path(vault_root, source_relative, "consolidation source")?;
+    let destination_relative = Path::new(&journal.destination_path);
+    let destination = validated_vault_path(
+        vault_root,
+        destination_relative,
+        "consolidation destination",
+    )?;
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            anyhow::bail!(
+                "published consolidation destination is not a regular file: {}",
+                destination.display()
+            );
+        }
+        Ok(_) => {
+            validate_journal_file(&destination, journal)?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&destination)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "confirm published consolidation destination {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect consolidation destination {}: {error}",
+                destination.display()
+            ));
+        }
+    }
+
+    validate_journal_file(&source, journal)?;
+    let parent_relative = destination_relative.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "consolidation destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    ensure_vault_directory(vault_root, parent_relative)?;
+    let source = validated_vault_path(vault_root, source_relative, "consolidation source")?;
+    let destination = validated_vault_path(
+        vault_root,
+        destination_relative,
+        "consolidation destination",
+    )?;
+    let mut input = std::fs::File::open(&source).map_err(|error| {
+        anyhow::anyhow!("open consolidation source {}: {error}", source.display())
+    })?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&destination, |output| {
+        std::io::copy(&mut input, output).map(|_| ())
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "publish consolidation destination {}: {error}",
+            destination.display()
+        )
+    })?;
+    validate_journal_file(&destination, journal)
+}
+
+fn validate_journal_file(path: &Path, journal: &ConsolidationJournal) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("inspect consolidation file {}: {error}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "consolidation file is not a regular file: {}",
+            path.display()
+        );
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read consolidation file {}: {error}", path.display()))?;
+    let digest = crate::hash::blake3_hex_bytes(&bytes);
+    if bytes.len() as u64 != journal.source_byte_len || digest != journal.source_blake3 {
+        anyhow::bail!(
+            "consolidation file {} no longer matches journaled source bytes",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_consolidation_source(vault_root: &Path, journal: &ConsolidationJournal) -> Result<()> {
+    let source = validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!(
+                    "refuse to unlink non-file consolidation source {}",
+                    source.display()
+                );
+            }
+            validate_journal_file(&source, journal)?;
+            nestweaver_store::durable_sidecar::remove_file_durable(&source).map_err(|error| {
+                anyhow::anyhow!("remove consolidation source {}: {error}", source.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The unlink may have happened before a prior attempt failed its
+            // parent sync. Syncing now turns observed absence into durable
+            // proof before the phase advances.
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&source).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "confirm removed consolidation source {}: {error}",
+                        source.display()
+                    )
+                },
+            )?;
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect consolidation source {}: {error}",
+                source.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_journal_wikilinks(vault_root: &Path, journal: &ConsolidationJournal) -> Result<usize> {
+    if journal.old_link_stem == journal.new_link_stem {
+        return Ok(0);
+    }
+    let old_link = format!("[[{}]]", journal.old_link_stem);
+    let new_link = format!("[[{}]]", journal.new_link_stem);
+    let old_link_prefix = format!("[[{}|", journal.old_link_stem);
+    let new_link_prefix = format!("[[{}|", journal.new_link_stem);
     let mut count = 0;
-    for uid in evidence_uids {
-        let Some(note) = note_by_uid.get(uid.as_str()) else {
-            continue;
-        };
-        let path = vault_root.join(&note.file_path);
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+
+    for relative in &journal.rewrite_paths {
+        let relative = validate_vault_relative_path(Path::new(relative))?;
+        let path = validated_vault_path(vault_root, &relative, "wikilink rewrite target")?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "inspect wikilink rewrite target {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "wikilink rewrite target is not a regular file: {}",
+                path.display()
+            );
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            anyhow::anyhow!("read wikilink rewrite target {}: {error}", path.display())
+        })?;
+        let content = std::str::from_utf8(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "read wikilink rewrite target {} as UTF-8: {error}",
+                path.display()
+            )
+        })?;
         let updated = content
             .replace(&old_link, &new_link)
             .replace(&old_link_prefix, &new_link_prefix);
-        if updated != content && std::fs::write(&path, &updated).is_ok() {
-            count += 1;
+        if updated == content {
+            // This can be an idempotent retry after rename succeeded but its
+            // parent sync failed. Re-sync before treating the rewrite as done.
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "confirm unchanged/idempotent wikilink target {}: {error}",
+                        path.display()
+                    )
+                },
+            )?;
+            continue;
+        }
+        let path = validated_vault_path(vault_root, &relative, "wikilink rewrite target")?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+            file.write_all(updated.as_bytes())
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("rewrite wikilinks in {} durably: {error}", path.display())
+        })?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn validate_consolidation_completion(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<()> {
+    let source = validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    match std::fs::symlink_metadata(&source) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "completed consolidation source unexpectedly exists: {}",
+            source.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect completed consolidation source {}: {error}",
+                source.display()
+            ));
         }
     }
-    count
+    let destination = validated_vault_path(
+        vault_root,
+        Path::new(&journal.destination_path),
+        "consolidation destination",
+    )?;
+    validate_journal_file(&destination, journal)?;
+
+    let old_link = format!("[[{}]]", journal.old_link_stem);
+    let old_link_prefix = format!("[[{}|", journal.old_link_stem);
+    for relative in &journal.rewrite_paths {
+        let path = validated_vault_path(
+            vault_root,
+            &validate_vault_relative_path(Path::new(relative))?,
+            "wikilink rewrite target",
+        )?;
+        let content = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "validate completed wikilink target {}: {error}",
+                path.display()
+            )
+        })?;
+        if content.contains(&old_link) || content.contains(&old_link_prefix) {
+            anyhow::bail!(
+                "completed consolidation still has an old wikilink in {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Classify a retained receipt against the vault.
+///
+/// `Ok(None)`  -- the receipt still matches.
+/// `Ok(Some)`  -- POSITIVE drift: the user deleted or moved what it describes.
+/// `Err`       -- the vault could not be inspected; the receipt is untouched.
+///
+/// The distinction is load-bearing. Retiring on "validation failed" would
+/// delete a receipt describing completed work whenever the vault was merely
+/// unreadable -- a transient network mount, a permissions change -- and the
+/// retire is irreversible.
+fn retained_receipt_drift(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<Option<String>> {
+    let source = validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    match std::fs::symlink_metadata(&source) {
+        // Expected: a completed consolidation removed its source.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Ok(Some(format!(
+                "its source {} exists again",
+                source.display()
+            )));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect completed consolidation source {}: {error}",
+                source.display()
+            ));
+        }
+    }
+
+    let destination = validated_vault_path(
+        vault_root,
+        Path::new(&journal.destination_path),
+        "consolidation destination",
+    )?;
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
+            "its destination {} was deleted or moved",
+            destination.display()
+        ))),
+        Err(error) => Err(anyhow::anyhow!(
+            "inspect completed consolidation destination {}: {error}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Ok(Some(format!(
+                "its destination {} is no longer a regular file",
+                destination.display()
+            )))
+        }
+        Ok(_) => Ok(None),
+    }
+}
+
+fn validate_retained_complete_journal(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<()> {
+    let source = validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    match std::fs::symlink_metadata(&source) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "completed consolidation source unexpectedly exists: {}",
+            source.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect completed consolidation source {}: {error}",
+                source.display()
+            ));
+        }
+    }
+
+    let destination = validated_vault_path(
+        vault_root,
+        Path::new(&journal.destination_path),
+        "consolidation destination",
+    )?;
+    let metadata = std::fs::symlink_metadata(&destination).map_err(|error| {
+        anyhow::anyhow!(
+            "inspect completed consolidation destination {}: {error}",
+            destination.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "completed consolidation destination is not a file: {}",
+            destination.display()
+        );
+    }
+    Ok(())
 }
 
 /// True when `path_lc` (lowercased, forward-slash) is inside a directory named
@@ -1537,6 +2655,510 @@ mod tests {
         assert!(
             !idea_a.contains("[[_logs/2025-01-01]]"),
             "idea-a.md should not have old wikilink"
+        );
+    }
+
+    /// A retained `Complete` journal is a transaction receipt. The sibling
+    /// test above pins that EDITING the destination does not fail; DELETING or
+    /// renaming it must not either. Nothing can re-apply the consolidation --
+    /// both source and destination are gone -- so the receipt is merely
+    /// obsolete. Reporting it as `FAILED` on every future run makes an
+    /// ordinary vault edit a PERMANENT failure with no way to clear it short
+    /// of deleting journal files by hand.
+    #[test]
+    fn a_deleted_destination_retires_its_receipt_instead_of_failing_forever() {
+        let (_dir, root, store, journal) = journal_fixture();
+        let journal_path = persist_test_journal(&root, &journal);
+        assert!(memory_consolidate(&store, true, 0.0).unwrap().applied);
+        assert_eq!(
+            read_test_journal(&journal_path).phase,
+            ConsolidationPhase::Complete
+        );
+
+        // Ordinary vault hygiene: the user deletes the promoted note.
+        fs::remove_file(root.join(&journal.destination_path)).unwrap();
+
+        // Runs 1..=3. The bug this pins is that the failure MOVES rather than
+        // clearing: run 1 retired the receipt, and every run after it aborted
+        // the whole preflight with `apply failed: read consolidation source
+        // ... No such file`, because the stale graph keeps re-proposing a
+        // consolidation whose source the first run had already moved.
+        //
+        // The earlier version of this assertion greped for "FAILED" and the
+        // permanent failure is spelled "apply failed" -- lowercase -- so it
+        // could not see the very thing it was named for. Match
+        // case-insensitively, and check every run, not just the first.
+        for run in 1..=3 {
+            let outcome = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+            let lowered: Vec<String> = outcome
+                .warnings
+                .iter()
+                .map(|warning| warning.to_lowercase())
+                .collect();
+            assert!(
+                lowered.iter().all(|warning| !warning.contains("failed")),
+                "run {run}: a deleted destination must not fail, now or ever: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                !journal_path.exists(),
+                "run {run}: the obsolete receipt must stay retired"
+            );
+        }
+
+        // And the batch must still be usable: an INDEPENDENT consolidation
+        // added afterwards has to apply. The original bug aborted the entire
+        // preflight, so nothing else in any vault could proceed.
+        fs::write(
+            root.join("_logs/2025-02-02.md"),
+            "# Log Feb 2\n\nA second recurring idea worth promoting.\n",
+        )
+        .unwrap();
+        for idea in ["idea-a", "idea-b", "idea-c"] {
+            let path = root.join(format!("_ideas/{idea}.md"));
+            let body = fs::read_to_string(&path).unwrap();
+            fs::write(&path, format!("{body}\nAlso [[_logs/2025-02-02]].\n")).unwrap();
+        }
+        let (_res, reindexed) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let fresh = memory_consolidate(&reindexed, true, 4_000_000_000.0).unwrap();
+        assert!(
+            fresh.applied,
+            "an independent consolidation must still apply after the drift: {:?}",
+            fresh.warnings
+        );
+        assert!(
+            root.join("_ideas/2025-02-02.md").exists(),
+            "the independent consolidation must actually have moved its file"
+        );
+    }
+
+    /// Journals are crash-recovery records, and their one live use after
+    /// `Complete` is keeping a re-run idempotent while the graph still names
+    /// the consolidated source. Once the vault has been re-indexed and that
+    /// source note is gone from the graph, no proposal can regenerate and the
+    /// receipt has no remaining purpose -- retire it, so the directory does not
+    /// grow without bound on every consolidation the vault ever performs.
+    #[test]
+    fn a_completed_journal_is_retired_once_the_graph_absorbs_it() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert!(
+            memory_consolidate(&store, true, 4_000_000_000.0)
+                .unwrap()
+                .applied
+        );
+
+        let journal_dir = root.join(CONSOLIDATION_JOURNAL_DIR);
+        assert_eq!(
+            fs::read_dir(&journal_dir).unwrap().count(),
+            1,
+            "one completed journal is retained while the graph is still stale"
+        );
+
+        // Re-index: the graph now reflects the moved note, so the source uid
+        // the receipt names no longer exists and no proposal can regenerate.
+        let (_res, reindexed) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        memory_consolidate(&reindexed, true, 4_000_000_000.0).unwrap();
+
+        assert_eq!(
+            fs::read_dir(&journal_dir).unwrap().count(),
+            0,
+            "an absorbed receipt must be retired, not retained forever"
+        );
+    }
+
+    fn prepared_log_promotion_journal(store: &GraphStore, root: &Path) -> ConsolidationJournal {
+        let manifest = memory_consolidate(store, false, 4_000_000_000.0).unwrap();
+        let proposal = manifest
+            .proposals
+            .into_iter()
+            .find(|proposal| proposal.source_path == "_logs/2025-01-01.md")
+            .expect("log promotion proposal");
+        let notes = store.list_notes(None).unwrap();
+        let source_note = notes
+            .iter()
+            .find(|note| note.uid == proposal.source_uid)
+            .unwrap();
+        let note_by_uid: HashMap<&str, &nestweaver_schema::Note> =
+            notes.iter().map(|note| (note.uid.as_str(), note)).collect();
+        prepare_consolidation_journal(&proposal, source_note, root, &note_by_uid).unwrap()
+    }
+
+    fn journal_fixture() -> (tempfile::TempDir, PathBuf, GraphStore, ConsolidationJournal) {
+        let (dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let journal = prepared_log_promotion_journal(&store, &root);
+        (dir, root, store, journal)
+    }
+
+    fn persist_test_journal(root: &Path, journal: &ConsolidationJournal) -> PathBuf {
+        ensure_journal_directory(root).unwrap();
+        let path = consolidation_journal_path(root, &journal.journal_id);
+        write_consolidation_journal(root, &path, journal).unwrap();
+        path
+    }
+
+    fn read_test_journal(path: &Path) -> ConsolidationJournal {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_root_canonicalizes_platform_ancestor_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let real_vault = real_parent.join("vault");
+        fs::create_dir_all(&real_vault).unwrap();
+        fs::write(real_vault.join("note.md"), "# Note\n").unwrap();
+        let alias_parent = dir.path().join("platform-alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let resolved = validated_vault_path(
+            &alias_parent.join("vault"),
+            Path::new("note.md"),
+            "fixture note",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(real_vault.join("note.md")).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_root_rejects_a_final_symlink_even_with_a_trailing_separator() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_vault = dir.path().join("real-vault");
+        fs::create_dir(&real_vault).unwrap();
+        let alias = dir.path().join("vault-alias");
+        symlink(&real_vault, &alias).unwrap();
+        let trailing = PathBuf::from(format!("{}/", alias.display()));
+
+        let error = validate_vault_root(&trailing).unwrap_err();
+        assert!(error.to_string().contains("vault root is a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_recovery_uses_one_snapshotted_physical_vault_root() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root, store, journal) = journal_fixture();
+        let journal_path = persist_test_journal(&root, &journal);
+        let root_name = root.file_name().unwrap();
+        let alias_parent = dir.path().join("platform-alias");
+        symlink(dir.path(), &alias_parent).unwrap();
+        let configured_root = alias_parent.join(root_name);
+
+        let mut vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        vaults[0].root_path = configured_root.display().to_string();
+        let vault_roots: HashMap<&str, PathBuf> = vaults
+            .iter()
+            .map(|vault| {
+                (
+                    vault.uid.as_str(),
+                    validate_vault_root(Path::new(&vault.root_path)).unwrap(),
+                )
+            })
+            .collect();
+
+        fs::remove_file(&alias_parent).unwrap();
+        let other_parent = dir.path().join("other-parent");
+        fs::create_dir(&other_parent).unwrap();
+        fs::create_dir(other_parent.join(root_name)).unwrap();
+        symlink(&other_parent, &alias_parent).unwrap();
+
+        let entries = load_consolidation_journals(&vaults, &vault_roots).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, fs::canonicalize(&journal_path).unwrap());
+        assert_eq!(entries[0].vault_root, fs::canonicalize(&root).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consolidate_rejects_symlinked_destination_parent_before_any_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root, store, journal) = journal_fixture();
+        let source = root.join(&journal.source_path);
+        let source_before = fs::read(&source).unwrap();
+        fs::rename(root.join("_ideas"), root.join("idea-evidence")).unwrap();
+        let outside = dir.path().join("outside-destination");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), "outside must stay unchanged").unwrap();
+        symlink(&outside, root.join("_ideas")).unwrap();
+
+        let manifest = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+
+        assert!(!manifest.applied);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("symlink")),
+            "warnings: {:?}",
+            manifest.warnings
+        );
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel.txt")).unwrap(),
+            "outside must stay unchanged"
+        );
+        assert!(!outside.join("2025-01-01.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consolidate_rejects_symlinked_rewrite_parent_before_any_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root, store, mut journal) = journal_fixture();
+        let source = root.join(&journal.source_path);
+        let source_before = fs::read(&source).unwrap();
+        let rewrite_parent = root.join("rewrites");
+        fs::create_dir(&rewrite_parent).unwrap();
+        fs::write(
+            rewrite_parent.join("link.md"),
+            "[[_logs/2025-01-01]] inside vault",
+        )
+        .unwrap();
+        journal.rewrite_paths = vec!["rewrites/link.md".to_string()];
+        let _journal_path = persist_test_journal(&root, &journal);
+        fs::remove_dir_all(&rewrite_parent).unwrap();
+        let outside = dir.path().join("outside-rewrites");
+        fs::create_dir(&outside).unwrap();
+        let outside_rewrite = outside.join("link.md");
+        let outside_before = "[[_logs/2025-01-01]] outside vault";
+        fs::write(&outside_rewrite, outside_before).unwrap();
+        symlink(&outside, &rewrite_parent).unwrap();
+
+        let manifest = memory_consolidate(&store, true, 0.0).unwrap();
+
+        assert!(!manifest.applied);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("symlink")),
+            "warnings: {:?}",
+            manifest.warnings
+        );
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert!(!root.join(&journal.destination_path).exists());
+        assert_eq!(fs::read_to_string(outside_rewrite).unwrap(), outside_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consolidate_rejects_symlinked_journal_directory_before_any_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root, store, journal) = journal_fixture();
+        let source = root.join(&journal.source_path);
+        let source_before = fs::read(&source).unwrap();
+        let outside = dir.path().join("outside-journals");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        fs::write(&sentinel, "not a journal").unwrap();
+        symlink(&outside, root.join(CONSOLIDATION_JOURNAL_DIR)).unwrap();
+
+        let manifest = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+
+        assert!(!manifest.applied);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("symlink")),
+            "warnings: {:?}",
+            manifest.warnings
+        );
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert!(!root.join(&journal.destination_path).exists());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "not a journal");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn consolidate_recovers_existing_journal_when_discovery_is_empty() {
+        let (_dir, root, store, journal) = journal_fixture();
+        let journal_path = persist_test_journal(&root, &journal);
+        // Simulate interruption after the atomic destination rename but before
+        // Prepared could be advanced to DestinationPublished.
+        publish_consolidation_destination(&root, &journal).unwrap();
+
+        // `now=0` makes the indexed log too young, so fresh discovery is empty.
+        // Recovery must still use the captured journal plan.
+        let manifest = memory_consolidate(&store, true, 0.0).unwrap();
+        assert!(manifest.applied, "warnings: {:?}", manifest.warnings);
+        assert_eq!(manifest.proposals.len(), 1, "recovered work stays visible");
+        assert!(!root.join("_logs/2025-01-01.md").exists());
+        assert!(root.join("_ideas/2025-01-01.md").exists());
+        assert_eq!(
+            read_test_journal(&journal_path).phase,
+            ConsolidationPhase::Complete
+        );
+
+        // A retained Complete journal is not new work once discovery is empty.
+        let second = memory_consolidate(&store, true, 0.0).unwrap();
+        assert!(!second.applied);
+        assert!(second.proposals.is_empty());
+
+        // A retained Complete journal is a transaction receipt, not a
+        // permanent content lock. The stale graph can rediscover the removed
+        // source, and users may legitimately edit the promoted destination.
+        fs::write(
+            root.join(&journal.destination_path),
+            "# Promoted and subsequently edited\n",
+        )
+        .unwrap();
+        let stale_graph_retry = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+        assert!(!stale_graph_retry.applied);
+        assert!(stale_graph_retry.proposals.is_empty());
+        assert!(
+            stale_graph_retry
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("FAILED")),
+            "warnings: {:?}",
+            stale_graph_retry.warnings
+        );
+    }
+
+    #[test]
+    fn consolidate_failed_unlink_stays_destination_published_and_is_not_applied() {
+        let (_dir, root, store, mut journal) = journal_fixture();
+        publish_consolidation_destination(&root, &journal).unwrap();
+        journal.phase = ConsolidationPhase::DestinationPublished;
+        let source = root.join(&journal.source_path);
+        fs::remove_file(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        let journal_path = persist_test_journal(&root, &journal);
+
+        let manifest = memory_consolidate(&store, true, 0.0).unwrap();
+        assert!(!manifest.applied);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("non-file consolidation source")),
+            "warnings: {:?}",
+            manifest.warnings
+        );
+        assert_eq!(
+            read_test_journal(&journal_path).phase,
+            ConsolidationPhase::DestinationPublished
+        );
+        assert!(root.join(&journal.destination_path).exists());
+        assert!(source.is_dir());
+    }
+
+    #[test]
+    fn consolidate_failed_rewrite_stays_source_removed_and_is_not_applied() {
+        let (_dir, root, store, mut journal) = journal_fixture();
+        publish_consolidation_destination(&root, &journal).unwrap();
+        nestweaver_store::durable_sidecar::remove_file_durable(&root.join(&journal.source_path))
+            .unwrap();
+        journal.phase = ConsolidationPhase::SourceRemoved;
+        journal.rewrite_paths = vec!["missing-rewrite-target.md".to_string()];
+        let journal_path = persist_test_journal(&root, &journal);
+
+        let manifest = memory_consolidate(&store, true, 0.0).unwrap();
+        assert!(!manifest.applied);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("wikilink rewrite target")),
+            "warnings: {:?}",
+            manifest.warnings
+        );
+        assert_eq!(
+            read_test_journal(&journal_path).phase,
+            ConsolidationPhase::SourceRemoved
+        );
+        assert!(root.join(&journal.destination_path).exists());
+    }
+
+    #[test]
+    fn consolidate_applies_multiple_independent_proposals_as_one_recoverable_batch() {
+        let (_dir, root) = make_vault(&[
+            ("_logs/2025-01-01.md", "# First log\n"),
+            ("_logs/2025-01-02.md", "# Second log\n"),
+            (
+                "_ideas/idea-a.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let manifest = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+        assert!(manifest.applied, "warnings: {:?}", manifest.warnings);
+        assert_eq!(manifest.proposals.len(), 2);
+        assert!(root.join("_ideas/2025-01-01.md").exists());
+        assert!(root.join("_ideas/2025-01-02.md").exists());
+        let idea = fs::read_to_string(root.join("_ideas/idea-a.md")).unwrap();
+        assert!(idea.contains("[[_ideas/2025-01-01]]"));
+        assert!(idea.contains("[[_ideas/2025-01-02]]"));
+
+        let journals: Vec<_> = fs::read_dir(root.join(CONSOLIDATION_JOURNAL_DIR))
+            .unwrap()
+            .map(|entry| read_test_journal(&entry.unwrap().path()))
+            .collect();
+        assert_eq!(journals.len(), 2);
+        assert!(
+            journals
+                .iter()
+                .all(|journal| journal.phase == ConsolidationPhase::Complete)
         );
     }
 

@@ -3,6 +3,8 @@
     ".": {
       "release-type": "simple",
       "draft-pull-request": true,
+      "draft": true,
+      "force-tag-creation": false,
       "component": "nestweaver",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,

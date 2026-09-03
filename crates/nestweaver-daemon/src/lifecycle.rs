@@ -447,71 +447,7 @@ impl std::error::Error for EffectiveConfigBindingError {
 /// directory and append the original filename. This keeps socket IDs stable for
 /// paths such as macOS `/tmp/...` and `/private/tmp/...`.
 pub fn canonical_db_path(db_path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(db_path) {
-        return canonical;
-    }
-
-    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
-        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
-    {
-        return canonical_parent.join(file_name);
-    }
-
-    // A relative path whose parent does not resolve — most importantly a BARE
-    // `nestweaver.lbug`, where `parent()` is `Some("")` and also fails to
-    // canonicalize — used to be returned unchanged, hashing to a DIFFERENT
-    // instance id than the same database gets once the file exists:
-    //
-    //   before creation: canonicalize fails -> id = hash("nestweaver.lbug")
-    //   after creation:  canonicalize wins  -> id = hash("/cwd/nestweaver.lbug")
-    //
-    // So the first `daemon start` in a fresh directory bound one identity, and
-    // every command after the database existed looked for another — leaving a
-    // daemon holding the write lock that the CLI could no longer address by
-    // name. Joining the cwd makes the pre-creation answer agree with the
-    // post-creation one, which is what `database_path_fingerprint` already did
-    // for the same reason; this function simply never got the same treatment.
-    //
-    // The join is LEXICALLY NORMALIZED. `cwd.join("sub/../nw.lbug")` yields
-    // `/cwd/sub/../nw.lbug`, which hashes differently from the `/cwd/nw.lbug`
-    // that `canonicalize` returns once the file exists — the same fork, one
-    // path shape further out.
-    if db_path.is_relative()
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        return lexically_normalize(&cwd.join(db_path));
-    }
-
-    db_path.to_path_buf()
-}
-
-/// Collapse `.` and `..` without touching the filesystem.
-///
-/// `Path::join` is purely textual, so a relative `--db` containing `..` would
-/// otherwise produce a path that never equals the canonicalized form.
-/// Deliberately lexical: the point is to agree with `canonicalize` for paths
-/// that do not exist YET, so it cannot resolve symlinks — and on the platforms
-/// this runs on, a `..` crossing a symlinked directory is the only case where
-/// the two disagree, which no `--db` argument in practice exercises.
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                // Never pop past the root; `/..` is `/`.
-                if out
-                    .components()
-                    .next_back()
-                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
-                {
-                    out.pop();
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    nestweaver_store::canonical_db_path(db_path)
 }
 
 /// Reproduce the PRE-nw-208 canonicalization exactly.
@@ -768,9 +704,11 @@ impl DbWriteLock {
     }
 }
 
-/// Records that THIS process holds a read-write store open on some database.
-/// Set by the daemon after `GraphStore::open_or_create`; read by
-/// [`db_write_lock`] to refuse a probe that would destroy that lock.
+/// Records that THIS process holds a read-write store open on some database
+/// without a canonical [`DbWriteLease`]. Set by the daemon after
+/// `GraphStore::open_or_create`; read by [`db_write_lock`] alongside the
+/// store's per-database self-ownership latch to refuse a probe that would
+/// destroy this process's POSIX lock.
 static LOCAL_STORE_WRITE_LOCK_HELD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -811,8 +749,9 @@ pub fn local_store_write_lock_held() -> bool {
 /// * and it sees `Free` regardless, because a process's own locks never
 ///   conflict with its own `F_GETLK`.
 ///
-/// So this is only safe from a process that does NOT have the store open — the
-/// CLI before it starts anything, or the daemon before its own store open.
+/// So this is only safe from a process that has neither the store open nor a
+/// canonical writer authority for this database — the CLI before it starts
+/// anything, or the daemon before its own store open.
 ///
 /// The guard below is a REAL RUNTIME BRANCH, not a `debug_assert`. Release
 /// builds disable debug assertions by default (this workspace sets no
@@ -827,7 +766,11 @@ pub fn local_store_write_lock_held() -> bool {
 /// equivalent, which would leave the hazard live on half the platforms. The
 /// runtime guard makes the question moot.)
 pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
-    db_write_lock_probe(local_store_write_lock_held(), db_path)
+    db_write_lock_probe(
+        local_store_write_lock_held()
+            || nestweaver_store::current_process_claims_write_lease(db_path),
+        db_path,
+    )
 }
 
 /// [`db_write_lock`] with the "do I hold the store open?" answer passed in.
@@ -934,7 +877,7 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     if !db_path.exists() {
         return None;
     }
-    match nestweaver_store::GraphStore::open_read_only(db_path) {
+    match nestweaver_store::GraphStore::open_read_only_without_migration(db_path) {
         Ok(_) => None,
         Err(error) => (error.corruption_kind()
             == Some(nestweaver_store::CorruptionKind::WalUnreadable))
@@ -1016,135 +959,21 @@ pub fn checkpoint_artifacts(db_path: &Path) -> CheckpointArtifacts {
     CheckpointArtifacts::Debris { artifacts }
 }
 
-/// Path of the dedicated write-lease file for a database.
+/// Canonical writer and destructive-namespace authority primitives.
 ///
-/// A SEPARATE file, deliberately. The obvious choice — lock the database file
-/// itself — is unsafe with POSIX record locks, and `db_write_lock` above
-/// documents why: `fcntl` locks are held per PROCESS, so closing ANY
-/// descriptor to that file drops every lock this process holds on it. A lease
-/// taken on the database would be destroyed by the store's own routine
-/// open/close, silently admitting a second writer. Nothing but the lease
-/// opens this file, so nothing can drop it by accident.
-pub fn write_lease_path(db_path: &Path) -> PathBuf {
-    let canonical = canonical_db_path(db_path);
-    let mut name = canonical.as_os_str().to_owned();
-    name.push(".write.lock");
-    PathBuf::from(name)
-}
-
-/// An exclusive claim on a database's write access, held for as long as the
-/// value lives and released by the kernel when the process exits.
-///
-/// `flock`, not `fcntl`: `flock` is per-DESCRIPTOR, so it survives unrelated
-/// opens and closes of the database, and the kernel drops it on exit with no
-/// stale state to reap. That is the property a pidfile does not have and the
-/// reason this can be trusted where a probe cannot.
-///
-/// A probe answers "was anyone holding this a moment ago". Only a held lease
-/// answers "is anyone holding this for as long as I am writing", which is the
-/// question a check-then-write cannot ask. Every comparable embedded store —
-/// SQLite, RocksDB, LMDB, DuckDB, Kuzu — holds a lock for the lifetime of the
-/// handle for exactly this reason.
-// nw-274: `#[must_use]` on the TYPE, not only on the helper that returns it.
-//
-// The single `#[must_use]` guarding this lived on `require_exclusive_store_access`
-// in `main.rs`, and an unrelated function inserted above it silently detached
-// the attribute — the fifth docblock detachment this release. A per-function
-// attribute protects one function and can be separated from it by an edit
-// elsewhere; on the type it covers every present and future producer, and
-// nothing can come between them.
-#[must_use = "the lease must be HELD for the duration of the write; dropping it \
-              immediately reduces this to a probe, which is the check-then-act \
-              race it exists to remove"]
-#[derive(Debug)]
-pub struct DbWriteLease {
-    _file: std::fs::File,
-    path: PathBuf,
-    /// nw-404. Arms the store's self-ownership latch for as long as this lease
-    /// lives.
-    ///
-    /// WHY IT IS NEEDED AT ALL: `flock` conflicts between open file
-    /// DESCRIPTIONS, not processes, so the store's live-writer probe opens a
-    /// second fd and gets `EWOULDBLOCK` against a lease THIS PROCESS ALREADY
-    /// HOLDS. Without the latch it therefore reads "another process is writing"
-    /// and retracts a `db_wal_corrupt` verdict — blaming a process that does not
-    /// exist and suppressing a real corruption report. `brain reindex-search` is
-    /// exactly that shape: it takes this lease, then opens the store read-only.
-    ///
-    /// THIS ONE SITE COVERS BOTH PRODUCERS — the daemon's boot lease and
-    /// `require_exclusive_store_access` — because both construct their claim
-    /// here. Dropping the lease clears the latch, so a stale `true` can never
-    /// outlive it and suppress corruption forever.
-    ///
-    /// **FIELD ORDER IS LOAD-BEARING — `_file` MUST be declared before this.**
-    /// Rust drops struct fields in declaration order, so the flock is released
-    /// FIRST and the latch clears second. That ordering is the safe one:
-    /// between the two, a probe sees "flock free, latch still set" -> treats the
-    /// lease as SELF-held -> does NOT veto -> a genuinely corrupt WAL is still
-    /// reported. Reversing the fields inverts it: "flock still held, latch
-    /// cleared" -> reads as ANOTHER process writing -> vetoes the verdict, which
-    /// silently suppresses a real corruption report for the duration of the
-    /// window. The two orderings fail in opposite directions and only one of
-    /// them fails safe.
-    _self_latch: nestweaver_store::SelfHeldWriteLease,
-}
-
-impl DbWriteLease {
-    /// The lease file this claim is held on.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Why a write lease could not be taken.
-#[derive(Debug)]
-pub enum WriteLeaseError {
-    /// Someone else holds it. They are writing right now.
-    Held,
-    /// The lease file itself could not be created or locked.
-    Unavailable(std::io::Error),
-}
-
-/// Take an exclusive, non-blocking write lease on `db_path`.
-///
-/// Non-blocking on purpose: a caller that would block has a live writer to
-/// report, and telling the operator who holds the database is more useful than
-/// hanging. Callers that genuinely want to wait can retry.
-pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
-    use std::os::unix::io::AsRawFd;
-
-    let path = write_lease_path(db_path);
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent).map_err(WriteLeaseError::Unavailable)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(WriteLeaseError::Unavailable)?;
-
-    // LOCK_NB so a contended lease fails immediately instead of hanging.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return match error.kind() {
-            std::io::ErrorKind::WouldBlock => Err(WriteLeaseError::Held),
-            _ => Err(WriteLeaseError::Unavailable(error)),
-        };
-    }
-    // Arm the latch BEFORE returning, so no window exists in which the lease is
-    // held and the store would still call it another process's.
-    let _self_latch = nestweaver_store::note_self_held_write_lease(db_path);
-    Ok(DbWriteLease {
-        _file: file,
-        path,
-        _self_latch,
-    })
-}
-
+/// The writer lease holds its process-local canonical-path claim, shared data-
+/// directory namespace flock (outside system scratch roots), and stable
+/// sidecar flock for its full lifetime. At acquisition it also takes lbug's
+/// POSIX database-lock class to exclude a pre-upgrade incumbent; that process-
+/// scoped compatibility lock can later transfer to, or be shortened by, the
+/// store's own descriptor lifecycle without weakening the durable upgraded-
+/// writer claims. A diagnostic self-ownership latch is armed after the OS
+/// locks are held so the writer's own read-only open is not mistaken for an
+/// external writer.
+pub use nestweaver_store::{
+    DbNamespaceLease, DbWriteLease, WriteLeaseError, acquire_db_namespace_lease,
+    acquire_db_write_lease, acquire_db_write_lease_under_namespace, write_lease_path,
+};
 /// PID of the process on the other end of a connected unix socket, as
 /// reported by the kernel. Unlike the pidfile (whose contents can be
 /// overwritten while the daemon still holds its flock), this cannot be faked
@@ -4610,6 +4439,24 @@ mod tests {
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"not really a database").unwrap();
         assert_eq!(db_write_lock(&db), db_write_lock_probe(false, &db));
+    }
+
+    /// The canonical store-level authority owns a POSIX compatibility lock as
+    /// well as its stable sidecar. Its per-database self-ownership latch must
+    /// therefore guard every lifecycle probe, including indirect callers such
+    /// as checkpoint-artifact classification.
+    #[test]
+    fn write_lock_probe_entry_point_refuses_a_canonical_self_held_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        assert_eq!(db_write_lock(&db), DbWriteLock::Unknown);
+        assert!(nestweaver_store::self_holds_write_lease(&db));
+
+        drop(authority);
+        assert!(!nestweaver_store::self_holds_write_lease(&db));
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
     }
 
     /// Ownership survives an operator deleting the pidfile: the flock evidence

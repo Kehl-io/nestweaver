@@ -66,8 +66,18 @@ pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 /// a writer. A direct MCP process is a read-only peer of the daemon/watcher;
 /// briefly taking the writer lock first can race or block the actual owner.
 fn open_direct_read_only_store(db_path: &Path) -> Result<GraphStore, anyhow::Error> {
-    GraphStore::open_read_only(db_path)
-        .with_context(|| format!("open read-only GraphStore at {}", db_path.display()))
+    let store = GraphStore::open_read_only_without_migration(db_path)
+        .with_context(|| format!("open read-only GraphStore at {}", db_path.display()))?;
+    let missing = store.missing_schema_columns()?;
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "database {} requires a schema upgrade before direct read-only MCP serving (missing {}). Start the owning daemon once with `nestweaver daemon --db {} start`, then retry",
+            db_path.display(),
+            missing.join(", "),
+            db_path.display()
+        );
+    }
+    Ok(store)
 }
 
 /// Warm the in-memory PageRank cache from the `<db>.lbug.pagerank.json`

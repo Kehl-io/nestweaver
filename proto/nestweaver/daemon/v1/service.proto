@@ -17,6 +17,9 @@ message HealthCheckResponse {
   // The daemon's own OS PID. Lets the CLI cross-check a pidfile PID against
   // the socket-reported PID before signaling it (B-1: pidfile PID hole).
   uint32 pid = 7;
+  // Explicit mutation capability negotiation. An older daemon decodes as
+  // false, so clients can refuse repair before sending a destructive Embed.
+  bool embedding_identity_repair = 8;
 }
 
 message ShutdownRequest {}
@@ -346,6 +349,13 @@ message BrainSearchResponse {
   bool truncated = 8;
   bool semantic_applied = 9;
   repeated string degraded_components = 10;
+  optional SemanticUnavailable semantic_unavailable = 11;
+}
+message SemanticUnavailable {
+  string cause = 1;
+  string reason = 2;
+  string error = 3;
+  string remediation = 4;
 }
 message SearchResultItem {
   string uid = 1;
@@ -363,7 +373,7 @@ message SearchResultItem {
 // brain_status
 message BrainStatusRequest {}
 message EmbeddingStatus {
-  // disabled | loading | ready | failed | embedding
+  // disabled | loading | ready | failed | embedding | identity_unreadable
   //
   // `embedding` was added in 4.2 and is reported INSTEAD of `ready` while a
   // daemon-route embedding pass is in flight. It implies the model is loaded
@@ -413,6 +423,39 @@ message EmbeddingStatus {
   uint64 index_live = 14;
   uint64 index_tombstoned = 15;
   uint64 index_stored = 16;
+
+  // ── Persisted identity verification (added 9.x) ─────────────────
+  // verified | unreadable. An unreadable identity is deliberately narrower
+  // than a generic model-load failure: graph traversal and lexical search
+  // remain available, but semantic/rerank operations and embedding writes
+  // fail closed until the recorded model/pipeline metadata is repaired.
+  string identity_state = 17;
+  // The source metadata read/validation failure. Empty when verified.
+  string identity_error = 18;
+  // Safe operator action. `--force` is explicitly not an identity override.
+  string identity_remediation = 19;
+}
+
+message SearchStatus {
+  // A Tantivy reader is serving BM25 queries. False means lexical search is
+  // using the graph-store substring fallback.
+  bool reader_available = 1;
+  // This daemon currently owns a Tantivy writer and can reconcile graph
+  // mutations into the search sidecar.
+  bool writer_available = 2;
+  // No durable graph-to-search reconciliation debt is outstanding.
+  bool current = 3;
+  // A committed (or conservatively possibly committed) graph mutation still
+  // requires a full search-index rebuild.
+  bool reconciliation_debt = 4;
+  // Writer/open/rebuild/debt-read diagnosis. Empty only when no such failure
+  // is currently known.
+  string error = 5;
+  // Operation that first/currently established the durable debt.
+  string debt_operation = 6;
+  // Unix seconds when the debt was first established; 0 when absent or when
+  // an unreadable debt artifact cannot be decoded safely.
+  int64 debt_created_at = 7;
 }
 message EffectiveConfig {
   // The daemon's effective configuration source. Absence of EffectiveConfig
@@ -465,6 +508,11 @@ message BrainStatusResponse {
   // How long the current holder has held the write lock, in seconds; 0 when
   // the lock is free.
   int64 write_holder_seconds = 17;
+
+  // Reader, writer and corpus-currentness are separate facts. In particular,
+  // a reader-only fallback may still serve the PRE-mutation corpus while a
+  // durable reconciliation debt waits for the configured writer to recover.
+  SearchStatus search_status = 18;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
@@ -620,6 +668,10 @@ message EmbedRequest {
   string scope = 1;    // "all", "symbols", "notes", "headings"
   bool force = 2;
   uint32 batch_size = 3;
+  // Explicitly discard every existing vector plus unreadable embedding
+  // metadata before rebuilding. This is destructive and is never implied by
+  // force, which cannot authorize adopting an unverified semantic identity.
+  bool repair_identity = 4;
 }
 
 message EmbedResponse {
@@ -634,6 +686,9 @@ message EmbedResponse {
   uint64 eligible = 5;
   // Scoped nodes omitted because their authoritative sidecar embedding exists.
   uint64 skipped = 6;
+  bool identity_repaired = 7;
+  bool restart_required = 8;
+  uint64 discarded_embeddings = 9;
 }
 
 // ─── Impact Analysis (Phase 4) ──────────────────────────────────────

@@ -412,6 +412,25 @@ impl EmbeddingIndex {
         self.recorded_pipeline_fingerprint = fingerprint;
     }
 
+    pub(crate) fn recorded_pipeline_fingerprint(&self) -> Option<&str> {
+        self.recorded_pipeline_fingerprint.as_deref()
+    }
+
+    fn require_recorded_pipeline(
+        &self,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<String, anyhow::Error> {
+        let persisted = pipeline.fingerprint().map_err(anyhow::Error::msg)?;
+        let producer = self.recorded_pipeline_fingerprint().ok_or_else(|| {
+            anyhow::anyhow!("embedding index producer pipeline is unverified; refusing persistence")
+        })?;
+        anyhow::ensure!(
+            producer == persisted.as_str(),
+            "embedding index producer pipeline fingerprint {producer} does not match persistence fingerprint {persisted}"
+        );
+        Ok(persisted)
+    }
+
     pub fn set_similarity(&mut self, similarity: nestweaver_schema::EmbeddingSimilarity) {
         self.similarity = similarity;
     }
@@ -466,6 +485,15 @@ impl EmbeddingIndex {
                 self.embeddings.clear();
                 self.base = None;
                 self.deleted_base_uids.clear();
+                // The mapped base belongs to `recorded`, while every vector
+                // after this Clear belongs to `incoming`. Retaining its
+                // envelope makes `GraphStore::flush_embedding_index` append a
+                // new-pipeline journal to an old-pipeline base. The next open
+                // then rejects the base before it can replay that journal and
+                // silently loses the completed force re-embed. Invalidating
+                // trust forces the checkpoint to publish one complete new
+                // base and retire the old journal instead.
+                self.artifact_envelope = None;
                 self.pending_deltas.push(EmbeddingDelta::Clear);
                 self.force_cleared = true;
             } else {
@@ -738,7 +766,7 @@ impl EmbeddingIndex {
         pipeline: &nestweaver_schema::EmbeddingPipelineV2,
     ) -> Result<EmbeddingArtifactEnvelopeV2, anyhow::Error> {
         use std::io::Write;
-        pipeline.validate().map_err(anyhow::Error::msg)?;
+        self.require_recorded_pipeline(pipeline)?;
         // nw-184: the base checksum is verified lazily on read, but the write
         // path must stay fail-closed — re-publishing an unverified base would
         // launder corruption into a freshly computed checksum that then looks
@@ -1032,7 +1060,7 @@ impl EmbeddingIndex {
         if self.pending_deltas.is_empty() {
             return Ok(0);
         }
-        let fingerprint = pipeline.fingerprint().map_err(anyhow::Error::msg)?;
+        let fingerprint = self.require_recorded_pipeline(pipeline)?;
         let mut journal = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1839,6 +1867,9 @@ impl GraphStore {
         seed_resolution: &SeedResolutionConfig,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        if query_embedding.is_some() && embedding_index.is_some() {
+            self.require_verified_embedding_identity()?;
+        }
         // 1. Text search
         let text_results = self.search_symbols_by_name(text_query, limit * 2, seed_resolution)?;
 
@@ -2499,6 +2530,75 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "greet");
+    }
+
+    #[test]
+    fn hybrid_search_requires_verified_identity_only_for_two_sided_vector_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hybrid-identity.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
+        store.set_embedding_metadata("verified-model", 2).unwrap();
+
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String("embedding".to_string())),
+                ("value", lbug::Value::String("{not-json".to_string())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        drop(store);
+
+        let degraded = GraphStore::open(&db_path).unwrap();
+        assert!(degraded.embedding_identity_error().is_some());
+        let query = [1.0_f32, 0.0];
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add("sym:1", query.to_vec(), false));
+
+        for (label, query_embedding, embedding_index) in [
+            ("neither", None, None),
+            ("query only", Some(query.as_slice()), None),
+            ("index only", None, Some(&index)),
+        ] {
+            let results = degraded
+                .hybrid_search_cancellable(
+                    "greet",
+                    query_embedding,
+                    embedding_index,
+                    10,
+                    &empty_seed_resolution(),
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{label} must retain lexical search under unreadable identity: {error}")
+                });
+            assert_eq!(
+                results.first().map(|result| result.uid.as_str()),
+                Some("sym:1"),
+                "{label} must return the lexical match"
+            );
+        }
+
+        let error = degraded
+            .hybrid_search_cancellable(
+                "greet",
+                Some(&query),
+                Some(&index),
+                10,
+                &empty_seed_resolution(),
+                None,
+            )
+            .expect_err("two-sided vector input must require verified identity");
+        assert!(matches!(
+            error,
+            StoreError::EmbeddingIdentityUnreadable { .. }
+        ));
     }
 
     #[test]

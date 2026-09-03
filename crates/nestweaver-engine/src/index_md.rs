@@ -74,6 +74,7 @@ pub struct MarkdownIndexResult {
 pub struct MarkdownRefreshResult {
     pub index: MarkdownIndexResult,
     pub notes_deleted: usize,
+    pub publication: crate::manifest::GraphMutationPublicationOutcome,
 }
 
 /// Canonical full-refresh summary shared by direct CLI and daemon progress.
@@ -180,6 +181,27 @@ pub fn index_markdown_directory_with_ignore(
     .map(|result| result.index)
 }
 
+/// Like [`index_markdown_directory_with_ignore`] under an exact writer
+/// authority already held by a wider CLI operation.
+pub fn index_markdown_directory_with_ignore_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        authority,
+    )
+    .map(|result| result.index)
+}
+
 /// Like [`index_markdown_directory_with_ignore`], but also returns the number
 /// of old notes deleted by the successfully committed replacement transaction.
 pub fn index_markdown_directory_with_ignore_and_deletion_count(
@@ -189,7 +211,33 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot index markdown database {}: {error:?}",
+            db_path.display()
+        )
+    })?;
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        &authority,
+    )
+}
+
+/// Full markdown indexing under an exact writer authority already held by a
+/// wider CLI operation.
+pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_with_store_and_deletion_count(
         &store,
@@ -409,6 +457,7 @@ pub struct MarkdownSinceResult {
     /// actually CHANGED — a fifth population, and the narrowest of them. It is
     /// not comparable with a full index's `resolved_link_edges`.
     pub changed_note_link_edges: usize,
+    pub publication: crate::manifest::GraphMutationPublicationOutcome,
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
@@ -444,7 +493,35 @@ pub fn index_markdown_directory_since_with_ignore(
     since: std::time::SystemTime,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot refresh markdown database {}: {error:?}",
+            db_path.display()
+        )
+    })?;
+    index_markdown_directory_since_with_ignore_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        since,
+        extra_ignore_patterns,
+        &authority,
+    )
+}
+
+/// Incremental markdown indexing under an exact writer authority already held
+/// by a wider CLI operation.
+pub fn index_markdown_directory_since_with_ignore_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_since_with_store_and_ignore(
         &store,
@@ -663,6 +740,7 @@ fn index_markdown_since_with_reader(
             sections_count: 0,
             tags_count: 0,
             changed_note_link_edges: 0,
+            publication: crate::manifest::finalize_committed_graph_mutation(store, false),
         });
     }
 
@@ -1053,6 +1131,8 @@ fn index_markdown_since_with_reader(
         .flatten()
         .collect();
 
+    let graph_publication =
+        crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
     store
         .incremental_vault_refresh_atomically(
             &Vault {
@@ -1082,19 +1162,7 @@ fn index_markdown_since_with_reader(
         )
         .context("atomic incremental vault refresh")?;
 
-    // Advance + persist the graph generation when any note was mutated.
-    // An in-place edit deletes and recreates the note's sections, leaving the
-    // candidate-node count unchanged — the generation bump is the only signal
-    // that stales the trigram posting table (mirrors `index.rs` and the full
-    // vault index above).
-    //
-    // nw-289: wrapped so the code manifest cache is carried across the
-    // boundary. A VAULT index advances the generation that `.manifests.json`
-    // is bound to, while being incapable of changing anything the manifest
-    // describes.
-    crate::manifest::advancing_generation_rebinding_manifests(store, || {
-        store.bump_and_persist_generation();
-    });
+    let publication = graph_publication.finish(true)?;
 
     // Best-effort and AFTER the commit, like the symbol epilogue: a
     // tombstoning failure must not fail a refresh that already succeeded.
@@ -1124,6 +1192,7 @@ fn index_markdown_since_with_reader(
         sections_count: total_sections,
         tags_count: total_tags,
         changed_note_link_edges: changed_wikilinks,
+        publication,
     })
 }
 
@@ -2082,6 +2151,11 @@ where
         .len();
 
     // 3 & 4. Flush all nodes and edges for this vault in one transaction.
+    // The durable dirty marker is established immediately before the first
+    // possible graph write and remains until generation/artifact publication
+    // has completed.
+    let graph_publication =
+        crate::manifest::begin_graph_mutation_publication(store, "full vault refresh")?;
     let notes_deleted = {
         let vault_note_refs: Vec<(&str, &str)> = edge_pairs
             .iter()
@@ -2182,20 +2256,7 @@ where
         record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
 
-    // Advance + persist the graph generation for this vault mutation,
-    // mirroring the code path (`index.rs`). Without it the trigram posting
-    // table's staleness check is blind to an in-place vault edit: a section
-    // delete+recreate keeps the candidate-node count identical, so
-    // `regex_search` would trust stale postings and silently drop new/edited
-    // note content. `bump_and_persist_generation` persists to the
-    // `<db>.generation` sidecar for persistent stores and just bumps for
-    // in-memory ones.
-    //
-    // nw-289: wrapped for the same reason as the incremental path — see
-    // `advancing_generation_rebinding_manifests`.
-    crate::manifest::advancing_generation_rebinding_manifests(store, || {
-        store.bump_and_persist_generation();
-    });
+    let publication = graph_publication.finish(true)?;
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -2225,6 +2286,7 @@ where
             skipped,
         },
         notes_deleted,
+        publication,
     })
 }
 
@@ -4954,6 +5016,77 @@ sub b body
         assert!(
             g2 > g1,
             "the since refresh must advance and persist the graph generation ({g1} -> {g2})"
+        );
+    }
+
+    #[test]
+    fn vault_refreshes_invalidate_live_and_durable_pagerank() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
+        let db_path = root.join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
+        store
+            .compute_pagerank(
+                nestweaver_store::ranking::PAGERANK_DAMPING,
+                nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                &nestweaver_store::ranking::GraphScope::unified(),
+            )
+            .unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        store.save_pagerank_cache(&pagerank_path).unwrap();
+        let computed_before = store.pagerank_generation();
+        assert!(pagerank_path.exists());
+
+        fs::write(root.join("a.md"), "# A\n\nbeta body rewritten\n").unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "v",
+            std::time::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "the pre-refresh PageRank envelope must be retired"
+        );
+        let _ = store.pagerank_scores().unwrap();
+        assert!(
+            store.pagerank_generation() > computed_before,
+            "the first ranked read after refresh must recompute rather than serve the live old cache"
+        );
+
+        store.save_pagerank_cache(&pagerank_path).unwrap();
+        let computed_after_incremental = store.pagerank_generation();
+        assert!(pagerank_path.exists());
+        fs::write(root.join("a.md"), "# A\n\ngamma body rewritten again\n").unwrap();
+        let full = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            full.publication.disposition,
+            crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "full vault replacement must also retire the pre-mutation PageRank envelope"
+        );
+        let _ = store.pagerank_scores().unwrap();
+        assert!(
+            store.pagerank_generation() > computed_after_incremental,
+            "ranked reads after full vault replacement must not reuse the live old cache"
         );
     }
 

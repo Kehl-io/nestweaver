@@ -184,6 +184,117 @@ One consequence worth expecting either way: switching a working tree between
 `-p` and `--workspace` re-resolves features, which re-fingerprints the build and
 forces a full `lbug` C++ rebuild. Pick one shape per tree and stay with it.
 
+## Release gate
+
+Release Please intentionally uses the workflow's `GITHUB_TOKEN`. GitHub may
+suppress the resulting `pull_request` event entirely or hold its workflow in
+`action_required` with zero jobs. This repository uses that as an explicit gate
+rather than adding another long-lived credential. After the release workflow
+has finished synchronizing the lockfile and marked the PR ready, a maintainer
+must approve a held CI run or explicitly dispatch `CI` from the release PR's
+latest branch. For example, after checking the current PR head:
+
+```sh
+PR=123
+HEAD_REF=$(gh pr view "$PR" --json headRefName --jq .headRefName)
+HEAD_SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+gh workflow run ci.yml --ref "$HEAD_REF"
+# Before merge, require the successful Required CI check to report HEAD_SHA.
+printf 'expected release PR head: %s\n' "$HEAD_SHA"
+```
+
+Do not approve, dispatch, or merge against an earlier head; another automation
+commit dismisses approval and makes that CI evidence stale.
+
+Protect `main` with a ruleset that requires pull requests, a CODEOWNER approval,
+and the **Required CI** check from the GitHub Actions app. Require the branch to
+be up to date, dismiss approvals after every push, and give neither admins nor
+the release automation actor a bypass. Conditional jobs such as Rustfmt and
+Cold Metal must not be named individually in the ruleset: `Required CI` fails
+closed when any applicable non-advisory job is failed, cancelled, missing, or
+unexpectedly skipped. A workflow held in `action_required`, a workflow that
+creates zero jobs, and an invalid workflow all leave `Required CI` absent, so
+the ruleset must treat the missing check as blocking. If repository Actions
+policy still holds the trusted automation actor for approval, approve that run
+explicitly; never merge around the absent check.
+
+Also protect `v*` tags from update and deletion, and restrict creation to the
+release automation identity. Require full-SHA action pins in repository Actions
+settings. Create a protected `release` environment, allow only `main`, require a
+maintainer reviewer, and expose `NPM_TOKEN` only there. These repository rules,
+environment protections, and Actions approval settings live in GitHub; the
+workflow file cannot install them by itself. The dry-run canary refuses to pass
+unless the applied branch rules include PR review, CODEOWNER review, strict
+up-to-date checks, and the `Required CI` check from a specific GitHub App.
+
+The public release is intentionally last. Release Please first creates a
+private draft without a tag. The workflow then checks out the exact release
+SHA, waits for that SHA's successful `CI` push run and `Required CI` job, builds
+all four targets, checksums each archive, extracts and smoke-tests the consumer
+layout, creates provenance attestations, and validates the exact eight-file
+bundle. Before publication, a protected-environment job proves Cargo, manifest,
+npm, and tag versions agree, validates the exact npm tarball contents and
+integrity, authenticates to npm, and observes whether the immutable version is
+already present. The publication job then replaces assets through the validated
+release ID, compares every remote size and SHA-256 digest, and downloads each
+exact asset ID for a byte-for-byte check against the verified local files. Only
+then does it publish the draft and create the tag. npm publication is idempotent
+and depends on that completed transition; immediately before npm publication it
+downloads the public assets again and rechecks the four checksum pairs and
+provenance. A failed or absent target leaves only a private draft and cannot
+publish npm.
+
+Run the lightweight local policy checks with:
+
+```sh
+bash scripts/verify-required-ci.sh --self-test
+bash scripts/verify-release-bundle.sh --self-test
+bash scripts/verify-release-package.sh --self-test
+bash -n scripts/observe-release-visibility.sh scripts/verify-release-canary-pr.sh
+```
+
+The release workflow also has positive and negative controls. They build and
+attest artifacts but never call Release Please, create a tag/release, or publish
+npm. Each run creates a temporary automation-authored canary branch and PR,
+observes that the real ruleset blocks it while `Required CI` is absent or held
+in `action_required`, then closes the PR and deletes the branch. It also queries
+GitHub tags, public/private releases, and the exact synthetic npm version before
+and after the matrix; the evidence is observed state, not a skipped-job claim:
+
+```sh
+SHA=$(git rev-parse origin/main)
+gh workflow run release-please.yml --ref main -f operation=dry-run -f candidate_sha="$SHA" -f fault_mode=none
+gh workflow run release-please.yml --ref main -f operation=dry-run -f candidate_sha="$SHA" -f fault_mode=fail -f fault_target=x86_64-unknown-linux-gnu
+gh workflow run release-please.yml --ref main -f operation=dry-run -f candidate_sha="$SHA" -f fault_mode=omit -f fault_target=aarch64-apple-darwin
+```
+
+Preserve the `release-gate-evidence-*` artifact from each run. The `none` run
+must validate all eight files. The `fail` and `omit` runs must show that an
+incomplete matrix is rejected while the exact synthetic tag, release, and npm
+version remain absent. The evidence must also contain the canary PR's blocked
+merge state and absent/`action_required` workflow observation.
+
+A private draft can be resumed only from the completed release workflow run
+whose artifacts and attestations belong to the same exact SHA. Resume deletes
+and deterministically replaces only that release ID's private assets. If that
+source run is incomplete, delete only the explicitly bound private draft and
+then repair/re-run Release Please; cleanup refuses a public release or visible
+tag. If GitHub publication succeeded but npm did not, the npm-only recovery
+revalidates the public release, exact tag/SHA, eight remote digests, package
+contents, and registry identity before publishing or accepting an already
+identical immutable version:
+
+```sh
+gh workflow run release-please.yml --ref main -f operation=resume \
+  -f candidate_sha="$SHA" -f release_id="$RELEASE_ID" \
+  -f release_tag="$TAG" -f source_run_id="$SOURCE_RUN_ID"
+gh workflow run release-please.yml --ref main -f operation=cleanup-draft \
+  -f candidate_sha="$SHA" -f release_id="$RELEASE_ID" -f release_tag="$TAG"
+gh workflow run release-please.yml --ref main -f operation=recover-npm \
+  -f candidate_sha="$SHA" -f release_id="$RELEASE_ID" \
+  -f release_tag="$TAG" -f source_run_id="$SOURCE_RUN_ID"
+```
+
 ### Code conventions
 
 - `thiserror` for all public error types in library crates

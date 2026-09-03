@@ -5,6 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main, staging]
+  # A PR created with the repository GITHUB_TOKEN may not emit a pull_request
+  # workflow event at all. Maintainers can explicitly run CI from that PR's
+  # latest branch head; the Required CI check remains bound to github.sha.
+  #
+  # TRUST BOUNDARY, recorded so it is not re-derived: workflow_dispatch reads
+  # this file from the SELECTED REF, so a dispatch against a branch runs that
+  # branch's definition of `Required CI`. That is not a widening -- the
+  # `pull_request` trigger above already runs the workflow from the PR's merge
+  # ref, so any PR that edits this file already runs its own edited copy. The
+  # control for both is the same and is NOT this trigger: CODEOWNERS requires
+  # maintainer review on `.github/workflows/**`, and branch protection requires
+  # that review before merge. Dispatch additionally requires repository write
+  # access, which already permits strictly more.
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 # Cancel a PR's earlier run when a new commit supersedes it.
 #
@@ -38,18 +55,25 @@ env:
 jobs:
   # Detect what actually changed so we don't recompile the entire Rust
   # workspace (~50 min) for a frontend-only PR, or run the frontend/e2e
-  # stack for a pure-Rust change. There are no branch-protection required
-  # checks, so skipped jobs are safe — they don't deadlock merges.
+  # stack for a pure-Rust change. Branch protection requires only the stable
+  # `Required CI` aggregate below; that job interprets these conditional skips
+  # instead of asking GitHub to require job names that may not be created.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       metal: ${{ steps.filter.outputs.metal }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -60,6 +84,14 @@ jobs:
               - '.cargo/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release-please.yml'
+              - '.github/CODEOWNERS'
+              - 'CONTRIBUTING.md'
+              - 'release-please-config.json'
+              - 'scripts/observe-release-visibility.sh'
+              - 'scripts/verify-release-canary-pr.sh'
+              - 'scripts/verify-release-bundle.sh'
+              - 'scripts/verify-release-package.sh'
+              - 'scripts/verify-required-ci.sh'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
@@ -107,9 +139,12 @@ jobs:
       - name: Verify native Apple Silicon runner
         shell: bash
         run: test "$(uname -m)" = "arm64"
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           shared-key: metal-smoke
@@ -199,7 +234,7 @@ jobs:
           done
       - name: Upload macOS crash reports
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-crash-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/crash-reports
@@ -358,21 +393,25 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          OUTPUT_DIR="${OUTPUT_DIR:-$RUNNER_TEMP/nestweaver-metal-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}}"
           mkdir -p "$OUTPUT_DIR"
           BIN="$PWD/target/release/nestweaver"
           "$BIN" diagnostics capabilities --json \
             >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
-          "$BIN" daemon --db "$TARGET_DB" status \
-            >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
-          DAEMON_LOG="$RUNTIME_DIR/daemon.log"
-          if [ -f "$DAEMON_LOG" ]; then
-            cp "$DAEMON_LOG" "$OUTPUT_DIR/daemon.log"
+          if [ -n "${TARGET_DB:-}" ]; then
+            "$BIN" daemon --db "$TARGET_DB" status \
+              >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
           fi
-          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
-            >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+          if [ -n "${RUNTIME_DIR:-}" ] && [ -f "$RUNTIME_DIR/daemon.log" ]; then
+            cp "$RUNTIME_DIR/daemon.log" "$OUTPUT_DIR/daemon.log"
+          fi
+          if [ -n "${INSTANCE_ID:-}" ]; then
+            launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+              >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+          fi
       - name: Upload Metal smoke evidence
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: metal-smoke-evidence
           path: ${{ runner.temp }}/nestweaver-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}-metal-smoke
@@ -415,8 +454,11 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -437,11 +479,14 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           shared-key: build
@@ -458,7 +503,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -504,11 +549,14 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           shared-key: build
@@ -522,7 +570,7 @@ jobs:
           RUSTC_VER=$(rustc --version | awk '{print $2}')
           echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
       - name: Cache native build outputs (lbug C++, OpenSSL)
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -550,9 +598,12 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           shared-key: build
@@ -569,7 +620,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -606,16 +657,21 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           key: coverage
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@2af88edc33c2d5ff8a473fd1c5ab83052f77afee # cargo-llvm-cov 2026-09-02
+        with:
+          tool: cargo-llvm-cov
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Compute native dependency cache key
@@ -629,7 +685,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -655,7 +711,7 @@ jobs:
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-report
           path: lcov.info
@@ -700,12 +756,14 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           # `--in-diff` needs the base commit to diff against.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           # Share the `build` cache the other Rust jobs populate, instead of a
@@ -718,7 +776,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2
         with:
           tool: cargo-mutants
       - name: Compute the PR diff
@@ -926,7 +984,7 @@ jobs:
           fi
       - name: Upload mutants report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-report
           path: mutants.out/
@@ -938,12 +996,17 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
       # Prebuilt binary via install-action instead of `cargo install cargo-audit`
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@8e38755317fb11cc24a0cd3b573a64008362d207 # cargo-audit 2026-09-02
+        with:
+          tool: cargo-audit
       # No `|| true`. This check is displayed as "Security Audit" on every pull
       # request in a public repo, which reads as an enforced supply-chain gate —
       # suppressing the exit code made that a false claim. Verified clean on
@@ -963,8 +1026,10 @@ jobs:
     # any file type, including ones no language filter matches.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           # Full history. This repo is public, so a secret that was committed and
           # later removed is still disclosed and still needs rotating — scanning
           # only the tip would miss exactly the case that matters most.
@@ -976,8 +1041,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=8.30.1
+          EXPECTED_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
           curl -sSfL -o /tmp/gitleaks.tar.gz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" /tmp/gitleaks.tar.gz | sha256sum -c -
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
@@ -1021,13 +1088,16 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
           df -h /
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           shared-key: build
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: "npm"
@@ -1048,7 +1118,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -1072,7 +1142,91 @@ jobs:
         run: npx playwright test
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-report
           path: crates/nestweaver-web/frontend/playwright-report/
+
+  required-ci:
+    name: Required CI
+    # `always()` is essential: a failed, cancelled, or unexpectedly skipped
+    # prerequisite must be reduced to a failing conclusion, not skip the one
+    # check the main-branch ruleset requires.
+    if: always()
+    needs:
+      - changes
+      - metal-smoke
+      - fmt
+      - build-and-check
+      - clippy
+      - daemon-tests
+      - audit
+      - secret-scan
+      - e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prove exact SHA and reduce required results
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Required CI checked out $ACTUAL_SHA, expected $EXPECTED_SHA" >&2
+            exit 1
+          fi
+
+          bash scripts/verify-required-ci.sh --self-test
+          node npm/install.test.js
+          bash scripts/verify-release-bundle.sh --self-test
+          bash scripts/verify-release-package.sh --self-test
+          bash -n scripts/observe-release-visibility.sh \
+            scripts/verify-release-canary-pr.sh
+          uses_key=uses
+          at_sign=@
+          # Strip trailing comments BEFORE testing the pin. The old check
+          # required the 40-hex to follow an `@`, but accepted it ANYWHERE on
+          # the line -- so `uses: evil/action@v1  # see actions/checkout@<sha>`
+          # passed on the hash in its own comment. Trailing whitespace after a
+          # valid pin is still a pin, and indented comment-only lines collapse
+          # to empty and are dropped rather than reported as unpinned.
+          unpinned_actions="$({
+            grep -REn "${uses_key}:[[:space:]]+[^[:space:]]+${at_sign}" \
+              .github/workflows || true
+          } | sed -E 's/[[:space:]]+#.*$//' \
+            | grep -Ev "${at_sign}[0-9a-f]{40}[[:space:]]*$" \
+            | grep -Ev ':[0-9]+:[[:space:]]*$' || true)"
+          if [ -n "$unpinned_actions" ]; then
+            echo "::error::every external action must be pinned to a full commit SHA" >&2
+            printf '%s\n' "$unpinned_actions" >&2
+            exit 1
+          fi
+          printf '%s\n' "$NEEDS_JSON" | bash scripts/verify-required-ci.sh -
+          {
+            echo "Required non-advisory CI passed."
+            echo ""
+            echo "Exact candidate SHA: \`$ACTUAL_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate GitHub Actions workflow syntax
+        if: always()
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          tool_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$tool_dir"
+          curl --fail-with-body --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$tool_dir" actionlint
+          "$tool_dir/actionlint" .github/workflows/*.yml

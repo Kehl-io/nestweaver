@@ -614,7 +614,26 @@ pub fn run_recorded(
     changed_files: &[String],
     db_path: Option<&Path>,
 ) -> Result<AffectedTestsResult> {
-    let mut result = crate::affected_tests::affected_tests(store, changed_files)?;
+    let result = crate::affected_tests::affected_tests(store, changed_files)?;
+    attach_recording(store, result, db_path)
+}
+
+/// Recorded affected-test selection for a trusted VCS-derived diff, including
+/// the valid zero-change case.
+pub fn run_recorded_derived_diff(
+    store: &nestweaver_store::GraphStore,
+    changed_files: &[String],
+    db_path: Option<&Path>,
+) -> Result<AffectedTestsResult> {
+    let result = crate::affected_tests::affected_tests_for_derived_diff(store, changed_files)?;
+    attach_recording(store, result, db_path)
+}
+
+fn attach_recording(
+    store: &nestweaver_store::GraphStore,
+    mut result: AffectedTestsResult,
+    db_path: Option<&Path>,
+) -> Result<AffectedTestsResult> {
     let Some(db) = db_path else {
         return Ok(result);
     };
@@ -775,6 +794,7 @@ mod tests {
             disclaimer: String::new(),
             status: AnalysisStatus::Complete,
             notifications: Vec::new(),
+            resolver_stale_repos: Vec::new(),
             recommendation: "selection-usable".to_string(),
             measured: None,
         }

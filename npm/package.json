@@ -21,6 +21,9 @@
     "x64",
     "arm64"
   ],
+  "libc": [
+    "glibc"
+  ],
   "keywords": [
     "mcp",
     "code-graph",

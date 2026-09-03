@@ -111,29 +111,12 @@ pub const LIVE_WRITER_DISCLOSURE: &str = "another process holds the write lease"
 
 /// Path of the write-lease file for `db_path` — `<db>.write.lock`.
 ///
-/// nw-404. DERIVED, not owned: the lease itself is
-/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, and this crate sits
-/// far below the daemon so it cannot call it. This function only NAMES the file
-/// that mechanism uses; it never creates it and never locks it for keeps.
-/// Keeping the two in sync is a real hazard — see the HANDOFF note on
-/// [`live_writer_holds_write_lease`].
-///
-/// The canonicalisation mirrors `lifecycle::canonical_db_path` in the shape that
-/// matters here (resolve the path, else resolve the parent and re-join the file
-/// name). The lease's own cwd-join fallback is deliberately NOT reproduced: the
-/// probe below tries the un-canonicalised name too, so a path this cannot
-/// resolve costs an extra `open` on the error path rather than a wrong answer.
+/// nw-404. The canonical candidate delegates to the authoritative store-level
+/// derivation so acquisition and diagnostics cannot drift. The caller also
+/// checks a literal candidate, preserving detection of a non-cooperating lease
+/// held under a symlink spelling.
 fn write_lease_path(db_path: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(db_path).ok().or_else(|| {
-        let parent = db_path.parent()?;
-        let file_name = db_path.file_name()?;
-        Some(std::fs::canonicalize(parent).ok()?.join(file_name))
-    });
-    let mut name = canonical
-        .unwrap_or_else(|| db_path.to_path_buf())
-        .into_os_string();
-    name.push(".write.lock");
-    PathBuf::from(name)
+    crate::write_lease::write_lease_path(db_path)
 }
 
 /// Every name a lease for `db_path` could be held under, most-canonical first.
@@ -241,15 +224,10 @@ impl Drop for SelfHeldWriteLease {
 /// beside the lease — the two must have the same lifetime or the latch is
 /// either useless (dropped early) or dangerous (dropped late).
 ///
-/// HANDOFF: the one producer of write leases is
-/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which is outside this
-/// crate. This crate cannot call itself into that path, so until `DbWriteLease`
-/// carries a `SelfHeldWriteLease` field the latch is armed only by callers that
-/// know to do it, and `open_failure`'s `read_write` gate stays as the structural
-/// backstop. The mechanism lives here rather than in the daemon because the
-/// question it answers — "may I call this WAL corrupt?" — is asked here, and a
-/// latch in the upper crate would leave this one asking a question it cannot
-/// answer.
+/// The canonical producer in `write_lease` stores this guard directly in
+/// `DbWriteLease`, after all OS locks are acquired. The mechanism lives beside
+/// the classifier because the question it answers — "may I call this WAL
+/// corrupt?" — is asked in this crate.
 pub fn note_self_held_write_lease(db_path: &Path) -> SelfHeldWriteLease {
     let paths = write_lease_path_candidates(db_path);
     let mut held = self_held_write_leases();
@@ -349,14 +327,10 @@ fn write_lease_is_held(_lease_path: &Path) -> bool {
 /// that does not exist. [`SELF_HELD_WRITE_LEASES`] is consulted FIRST, and only a
 /// lease this process did not record can answer "another writer".
 ///
-/// HANDOFF (out of this crate's reach): `write_lease_path` here and
-/// `nestweaver_daemon::lifecycle::write_lease_path` derive the same
-/// `<db>.write.lock` name independently, because the store cannot depend on the
-/// daemon. The lasting shape is for the daemon's to delegate to this one, and for
-/// `acquire_db_write_lease` to arm the latch; both are
-/// `crates/nestweaver-daemon/src/lifecycle.rs` edits. Until then the probe asks
-/// about BOTH the canonicalised and the literal name — a lease held under either
-/// is a live writer, and asking twice on an error path is free.
+/// The canonical `acquire_db_write_lease` producer arms the latch directly and
+/// the daemon delegates to it. The probe still asks about BOTH the canonicalised
+/// and literal names: a non-cooperating lease held under either is a live writer,
+/// and asking twice on an error path is free.
 pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
     let candidates = write_lease_path_candidates(db_path);
     // The self-ownership latch, before any syscall. Cheap, and it is the only
@@ -391,6 +365,24 @@ pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
 /// calls, where a path is in hand.
 pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     let lower = message.to_lowercase();
+    // These signatures are unambiguous and must win before the deliberately
+    // broad WAL heuristic below. A daemon-refusal path such as `/walnut/...`
+    // plus the words "risk corruption" satisfies `wal && corrupt` without
+    // saying anything about a log; if that prose shares an error chain with a
+    // truncation or engine assertion, the definite verdict must survive the
+    // live-writer sentinel.
+    if lower.contains("outside the database file") {
+        return Some(CorruptionKind::FileTruncated);
+    }
+    if lower.contains("assertion failed in file") {
+        return Some(CorruptionKind::EngineAssertion);
+    }
+    // A bare C++ exception `what()` with no sentence in it. Matched both as the
+    // raw engine text and as the already-Displayed `StoreError` prose, because
+    // this arm is reached from both directions.
+    if lower.starts_with("basic_string") || lower.contains("database error: basic_string") {
+        return Some(CorruptionKind::EngineAssertion);
+    }
     // The engine has at least TWO phrasings for an unreadable log and they do
     // not share a word order:
     //
@@ -440,18 +432,6 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     }
     if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
         return Some(CorruptionKind::WalUnreplayed);
-    }
-    if lower.contains("outside the database file") {
-        return Some(CorruptionKind::FileTruncated);
-    }
-    if lower.contains("assertion failed in file") {
-        return Some(CorruptionKind::EngineAssertion);
-    }
-    // A bare C++ exception `what()` with no sentence in it. Matched both as the
-    // raw engine text and as the already-Displayed `StoreError` prose, because
-    // this arm is reached from both directions.
-    if lower.starts_with("basic_string") || lower.contains("database error: basic_string") {
-        return Some(CorruptionKind::EngineAssertion);
     }
     None
 }
@@ -549,6 +529,14 @@ pub enum StoreError {
     /// empty graph.
     #[error("PageRank unavailable during dirty index publication")]
     RankingUnavailable,
+    /// Persisted embedding metadata exists but cannot be parsed or validated.
+    ///
+    /// This must remain distinct from an ordinary query failure: semantic
+    /// callers are allowed to tolerate model/network availability failures,
+    /// but must never turn an unverified database identity into a successful
+    /// lexical-only answer.
+    #[error("embedding identity is unreadable: {detail}")]
+    EmbeddingIdentityUnreadable { detail: String },
     #[error("not found")]
     NotFound,
     #[error("presentation limit {limit} exceeds maximum {max}")]
@@ -591,6 +579,7 @@ impl StoreError {
                     || lower.contains("constraint")
             }
             StoreError::Corruption(_)
+            | StoreError::EmbeddingIdentityUnreadable { .. }
             | StoreError::NotFound
             | StoreError::RankingUnavailable
             | StoreError::PresentationLimitExceeded { .. }
@@ -1160,25 +1149,24 @@ mod corruption_classification_tests {
         // the same prose. `into_diagnostic` re-classifies rendered error CHAINS,
         // so a contention sentence and an engine sentence share one string
         // routinely.
-        for (phrase, expected) in [
+        for (engine_phrase, expected) in [
             (
-                "cannot reindex directly: another process holds the write lease for \
-                 /home/u/brain.lbug. catalog page range starts at 3567 and spans 5 \
-                 pages, outside the database file with 1696 pages",
+                "catalog page range starts at 3567 and spans 5 pages, outside the \
+                 database file with 1696 pages",
                 CorruptionKind::FileTruncated,
             ),
             (
-                "another process holds the write lease. Assertion failed in file \
-                 \"<crate>/column.cpp\" on line 289: x <= y",
+                "Assertion failed in file \"<crate>/column.cpp\" on line 289: x <= y",
                 CorruptionKind::EngineAssertion,
             ),
             (
-                "another process holds the write lease: database error: basic_string",
+                "database error: basic_string",
                 CorruptionKind::EngineAssertion,
             ),
         ] {
+            let phrase = format!("{DAEMON_REFUSAL} {engine_phrase}");
             assert_eq!(
-                classify_engine_corruption(phrase),
+                classify_engine_corruption(&phrase),
                 Some(expected),
                 "a lease-contention sentence has no bearing on this verdict and \
                  must not suppress it: {phrase}"

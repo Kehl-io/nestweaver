@@ -19,7 +19,9 @@
 //! existed has no entry — which is exactly the "predates the fix" answer we
 //! want, at zero migration cost.
 
+use anyhow::Context;
 use nestweaver_schema::Repo;
+use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -97,7 +99,8 @@ impl ResolverGenerations {
         self.repos.get(repo_uid).copied().unwrap_or(0)
     }
 
-    /// Repo uids whose edges predate [`RESOLVER_GENERATION`], SORTED.
+    /// Repo uids whose edges were not produced by exactly
+    /// [`RESOLVER_GENERATION`], SORTED.
     ///
     /// nw-358. This is the sole computation behind every route's
     /// `stale_repos` — the CLI's two staleness constructors, `hub_nodes` /
@@ -116,7 +119,7 @@ impl ResolverGenerations {
     pub fn stale_repos<'a, I: IntoIterator<Item = &'a str>>(&self, known: I) -> Vec<String> {
         let mut stale: Vec<String> = known
             .into_iter()
-            .filter(|uid| self.generation_for(uid) < RESOLVER_GENERATION)
+            .filter(|uid| self.generation_for(uid) != RESOLVER_GENERATION)
             .map(|uid| uid.to_string())
             .collect();
         stale.sort_unstable();
@@ -134,6 +137,38 @@ pub fn load(db_path: &Path) -> ResolverGenerations {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Stable descriptor carried by every edge-dependent analysis that cannot
+/// trust the resolver generation recorded for its graph.
+pub const INCOMPATIBLE_RESOLVER_DESCRIPTOR: &str = "resolver-generation-incompatible";
+
+/// Return every repository whose persisted edges are incompatible with the
+/// running resolver.
+///
+/// In-memory stores have no persisted sidecar and are used heavily by pure
+/// analysis tests, so there is no disk generation to prove or reject. Every
+/// disk-backed store is checked, including absent and unreadable sidecars:
+/// [`load`] maps both to generation zero, which is deliberately incompatible.
+pub fn incompatible_repos_for_store(store: &GraphStore) -> anyhow::Result<Vec<String>> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(Vec::new());
+    };
+    let repos = store
+        .list_repos(None)
+        .context("list repositories for resolver-generation compatibility")?;
+    Ok(load(db_path).stale_repos(repos.iter().map(|repo| repo.uid.as_str())))
+}
+
+/// One shared diagnostic for affected-tests, detect-changes, and blast-radius.
+pub fn incompatibility_message(repos: &[String]) -> String {
+    format!(
+        "edge-dependent analysis cannot trust repositories with a resolver generation that \
+         differs from the running generation {}: {}. Re-index each repository with \
+         `nestweaver index --repo <path> --force`",
+        RESOLVER_GENERATION,
+        repos.join(", ")
+    )
 }
 
 /// Record that `repo_uid` was just indexed by the current resolver.
@@ -174,7 +209,7 @@ pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
 /// drift from this one the first time either is edited.
 ///
 /// `total` is `None` where the population is genuinely unknown. It is rendered
-/// as a floor ("N repo(s) are known to have been") rather than by inventing a
+/// as a floor ("N repo(s) are known to be incompatible") rather than by inventing a
 /// denominator, because on that route `stale_repos` can UNDER-count: the
 /// sidecar fallback for a pre-`attach_ranking_staleness` daemon sees only the
 /// repos the sidecar records, and a repo present in the graph but absent from
@@ -196,13 +231,14 @@ pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<Stri
     }
     let scope = match total {
         Some(total) => format!("{} of {total} repo(s) were", stale.len()),
-        None => format!("{} repo(s) are known to have been", stale.len()),
+        None => format!("{} repo(s) are known to be", stale.len()),
     };
     Some(format!(
-        "{scope} indexed by an older resolver, so their edges are the ones that \
-         resolver wrote: rankings over them are wrong, and edge families added since \
-         (C/C++ MEMBER_OF, C++ IMPORTS) are absent entirely. Upgrading the binary does \
-         not repair data already on disk. Re-index each one with \
+        "{scope} incompatible with this resolver. This includes repositories indexed by an \
+         older resolver, repositories with missing or unreadable generation metadata, and \
+         repositories claiming a future generation this binary cannot understand. Their edges \
+         cannot be trusted: rankings may be wrong, and edge families may be absent entirely. \
+         Upgrading the binary does not repair data already on disk. Re-index each one with \
          `nestweaver index --repo <path> --force`."
     ))
 }
@@ -233,6 +269,19 @@ const WHY_DEAD_CODE_REFUSES: &str = "dead-code will not produce a list on this g
      is a list of symbols to DELETE, computed by walking forward from entry points, so a MISSING \
      edge cannot make the list safer — it can only fail to reach a live symbol and report it as \
      dead. The error is one-directional and the deletion it invites is not recoverable.";
+
+/// Why `affected-tests` REFUSES rather than degrading.
+///
+/// Lived as two copies -- `src/main.rs` and `nestweaver-mcp/src/tools.rs` --
+/// each carrying a doc comment claiming byte-identity with the other. One
+/// definition removes the claim and the drift it invited. Public because the
+/// CLI also uses it as the fallback when a daemon-supplied refusal payload
+/// carries no `note`.
+pub const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
+     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
+     safer — it can only drop a test that should have run, while `status` still reads complete. \
+     The error is one-directional and it is silent: nothing downstream can tell a test that was \
+     not selected from a test that does not exist.";
 
 /// One generation-stale repo, named the way the refusal names it.
 ///
@@ -333,24 +382,98 @@ impl DeadCodeRefusal {
 
     /// The paragraph a human sees, on stderr, on every route.
     pub fn message(&self) -> String {
+        self.message_with_preamble(WHY_DEAD_CODE_REFUSES)
+    }
+
+    /// The same verdict and the same pasteable remedies, for a caller that is
+    /// DEGRADING an edge-dependent analysis rather than refusing `dead-code`.
+    ///
+    /// nw-419. Both blast-radius wrappers pushed [`Self::message`] verbatim, so
+    /// a blast-radius degrade opened by explaining why `dead-code` will not
+    /// produce a list -- a command the user did not run, in front of remedies
+    /// that were otherwise exactly right. `affected_tests_refusal_payload`
+    /// already replaces its `note` for this reason; this is that fix on the
+    /// surface that still needed it, shared rather than restated so the two
+    /// blast-radius routes cannot drift.
+    pub fn edge_analysis_message(&self) -> String {
+        match self {
+            Self::OutdatedResolver { repos, .. } => {
+                // Just the verdict. `incompatibility_message` ends with its own
+                // `index --repo <path> --force` TEMPLATE, and
+                // `message_with_preamble` appends `staleness_note_for`, which
+                // ends with the same template again -- so composing them
+                // printed the remedy twice as a run-on before the pasteable
+                // command. The preamble states the cause; the remedy block
+                // below it states the fix, once.
+                let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
+                format!(
+                    "edge-dependent analysis cannot trust repositories whose resolver \
+                     generation differs from the running generation \
+                     {RESOLVER_GENERATION}: {}. Re-index each one:{}",
+                    uids.join(", "),
+                    self.remedy_lines()
+                )
+            }
+        }
+    }
+
+    fn message_with_preamble(&self, preamble: &str) -> String {
         match self {
             Self::OutdatedResolver { repos, total } => {
                 let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
                 let note = staleness_note_for(&uids, *total).unwrap_or_default();
-                let mut message = format!("{WHY_DEAD_CODE_REFUSES} {note}");
-                for repo in repos {
-                    match &repo.command {
-                        Some(command) => message.push_str(&format!("\n  {command}")),
-                        None => message.push_str(&format!(
-                            "\n  {} — indexed from a bare clone, so this machine has no \
-                             working tree to pass to `--repo`; re-index it where it lives",
-                            repo.uid
-                        )),
-                    }
-                }
-                message
+                format!("{preamble} {note}{}", self.remedy_lines())
             }
         }
+    }
+
+    /// The pasteable remedy block appended under every preamble.
+    ///
+    /// This sentence existed in THREE places -- here, and hand-copied into
+    /// `affected_tests_refusal_payload` in both `src/main.rs` and
+    /// `nestweaver-mcp/src/tools.rs`, where each iterated the JSON `remedies`
+    /// array to rebuild the identical string. `payload()` serialises `remedies`
+    /// straight from `repos`, so iterating the typed rows produces byte-identical
+    /// output without the round trip.
+    fn remedy_lines(&self) -> String {
+        let Self::OutdatedResolver { repos, .. } = self;
+        let mut lines = String::new();
+        for repo in repos {
+            match &repo.command {
+                Some(command) => lines.push_str(&format!("\n  {command}")),
+                None => lines.push_str(&format!(
+                    "\n  {} — indexed from a bare clone, so this machine has no \
+                     working tree to pass to `--repo`; re-index it where it lives",
+                    repo.uid
+                )),
+            }
+        }
+        lines
+    }
+
+    /// `affected-tests`' refusal payload, shared by the CLI direct route, the
+    /// CLI daemon route and the MCP tool.
+    ///
+    /// It previously existed as two hand-maintained copies whose only guarantee
+    /// of agreement was a doc comment asserting they were "byte-identical" --
+    /// including a duplicated copy of the preamble constant itself. A CI gate
+    /// must not be able to tell which route answered, so agreement is now
+    /// structural.
+    pub fn affected_tests_payload(&self) -> serde_json::Value {
+        let mut payload = self.payload();
+        let note = format!("{WHY_AFFECTED_TESTS_REFUSES}{}", self.remedy_lines());
+        payload["note"] = serde_json::json!(note.clone());
+        payload["notifications"] = serde_json::json!([{
+            "level": "error",
+            "descriptor": INCOMPATIBLE_RESOLVER_DESCRIPTOR,
+            "message": note,
+        }]);
+        // The one key a CI consumer acts on. The refusal deliberately carries
+        // no tier_1/tier_2/tier_3, so without it a caller keying off "did I get
+        // tiers" reads the refusal as "no tests affected" -- the exact silent
+        // narrowing this refusal exists to prevent.
+        payload["recommendation"] = serde_json::json!("run-full-suite");
+        payload
     }
 
     /// The refusal a MACHINE reads.
@@ -442,13 +565,214 @@ mod tests {
         assert_eq!(g.generation_for("repo:whatever"), 0);
     }
 
+    /// The three preambles share ONE remedy renderer, and the whole safety
+    /// claim of that consolidation is that no output text moved. Pin the exact
+    /// bytes for both remedy shapes -- a repo with a working tree and a bare
+    /// clone without one -- so a future edit to the renderer cannot silently
+    /// reword an operator-facing remedy on three surfaces at once.
     #[test]
-    fn only_repos_below_the_current_generation_are_stale() {
+    fn every_preamble_shares_one_remedy_block_and_none_of_them_moved() {
+        let refusal = DeadCodeRefusal::OutdatedResolver {
+            repos: vec![
+                StaleRepoRemedy::new("repo:worktree".to_string(), Some("/src/a".to_string())),
+                StaleRepoRemedy::new("repo:bare".to_string(), None),
+            ],
+            total: Some(2),
+        };
+
+        let expected_remedies = concat!(
+            "\n  nestweaver index --repo /src/a --force",
+            "\n  repo:bare — indexed from a bare clone, so this machine has no working tree ",
+            "to pass to `--repo`; re-index it where it lives",
+        );
+
+        // All three surfaces end with the identical block.
+        for (label, produced) in [
+            ("dead-code", refusal.message()),
+            ("edge-analysis", refusal.edge_analysis_message()),
+            (
+                "affected-tests",
+                refusal.affected_tests_payload()["note"]
+                    .as_str()
+                    .expect("note is a string")
+                    .to_string(),
+            ),
+        ] {
+            assert!(
+                produced.ends_with(expected_remedies),
+                "{label} remedy block moved:\n{produced}"
+            );
+        }
+
+        // And each still opens with ITS OWN preamble, so sharing the tail did
+        // not collapse three different explanations into one.
+        assert!(refusal.message().starts_with("dead-code will not produce"));
+        assert!(
+            refusal.affected_tests_payload()["note"]
+                .as_str()
+                .unwrap()
+                .starts_with("affected-tests will not produce")
+        );
+        assert!(
+            refusal
+                .edge_analysis_message()
+                .starts_with("edge-dependent analysis cannot trust")
+        );
+
+        // The keys a CI consumer acts on survive the move into the engine.
+        let payload = refusal.affected_tests_payload();
+        assert_eq!(payload["recommendation"], "run-full-suite");
+        assert_eq!(payload["needs_reindex"], true);
+        assert_eq!(payload["reason"], "outdated_resolver");
+        assert_eq!(
+            payload["notifications"][0]["descriptor"],
+            INCOMPATIBLE_RESOLVER_DESCRIPTOR
+        );
+        assert_eq!(payload["notifications"][0]["message"], payload["note"]);
+        assert!(
+            payload.get("tier_1").is_none(),
+            "a refusal carries no tiers"
+        );
+    }
+
+    /// nw-419: `message()` opens with `WHY_DEAD_CODE_REFUSES`, which is the
+    /// right sentence for `dead-code` and the wrong one in front of a
+    /// blast-radius degrade. Both blast-radius wrappers push it verbatim, so a
+    /// user degrading `blast-radius` is told about a command they did not run.
+    /// The remedies below it are correct and must survive.
+    #[test]
+    fn the_edge_analysis_message_drops_dead_codes_sentence_and_keeps_its_remedies() {
+        let refusal = DeadCodeRefusal::OutdatedResolver {
+            repos: vec![StaleRepoRemedy::new(
+                "repo:a".to_string(),
+                Some("/src/a".to_string()),
+            )],
+            total: Some(1),
+        };
+
+        // Counterweight: dead-code's own message must KEEP the sentence.
+        assert!(
+            refusal
+                .message()
+                .contains("dead-code will not produce a list"),
+            "dead-code's own refusal keeps its rationale"
+        );
+
+        let edge = refusal.edge_analysis_message();
+        assert!(
+            !edge.contains("dead-code"),
+            "an edge-analysis degrade must not open with dead-code's sentence: {edge}"
+        );
+        assert!(
+            edge.contains("/src/a"),
+            "the pasteable remedy must survive: {edge}"
+        );
+        assert!(
+            edge.contains(&RESOLVER_GENERATION.to_string()),
+            "the running generation must still be named: {edge}"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_current_generation_is_compatible() {
         let mut g = ResolverGenerations::default();
         g.repos.insert("fresh".into(), RESOLVER_GENERATION);
         g.repos.insert("ancient".into(), 0);
-        let stale = g.stale_repos(vec!["fresh", "ancient", "unrecorded"]);
-        assert_eq!(stale, vec!["ancient".to_string(), "unrecorded".to_string()]);
+        g.repos.insert("future".into(), RESOLVER_GENERATION + 1);
+        let stale = g.stale_repos(vec!["fresh", "future", "ancient", "unrecorded"]);
+        assert_eq!(
+            stale,
+            vec![
+                "ancient".to_string(),
+                "future".to_string(),
+                "unrecorded".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn corrupt_and_missing_sidecars_fail_closed_for_known_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let known = ["repo:a"];
+
+        assert_eq!(load(&db).stale_repos(known), vec!["repo:a"]);
+        std::fs::write(
+            crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR),
+            "not-json",
+        )
+        .unwrap();
+        assert_eq!(load(&db).stale_repos(known), vec!["repo:a"]);
+    }
+
+    #[test]
+    fn all_changed_file_engines_share_the_same_incompatible_repo_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let repo = Repo {
+            uid: "repo:default:future".into(),
+            url: "file:///tmp/future".into(),
+            indexed_sha: "deadbeef".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some("/tmp/future".into()),
+        };
+        store.insert_repo(&repo).unwrap();
+        record(&db, &repo.uid).unwrap();
+
+        let files = vec!["src/new.rs".to_string()];
+        assert!(
+            crate::affected_tests::affected_tests(&store, &files)
+                .unwrap()
+                .resolver_stale_repos
+                .is_empty()
+        );
+
+        let mut generations = load(&db);
+        generations
+            .repos
+            .insert(repo.uid.clone(), RESOLVER_GENERATION + 1);
+        std::fs::write(
+            crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_string(&generations).unwrap(),
+        )
+        .unwrap();
+
+        let affected = crate::affected_tests::affected_tests(&store, &files).unwrap();
+        assert_eq!(affected.resolver_stale_repos, vec![repo.uid.clone()]);
+        assert_eq!(affected.recommendation, "run-full-suite");
+
+        let detected = crate::process::detect_changes_impact(&store, &files, 3).unwrap();
+        assert_eq!(detected.resolver_stale_repos, vec![repo.uid.clone()]);
+        assert_eq!(
+            detected.gate_state,
+            crate::blast_radius::GateState::DegradedUnknown
+        );
+
+        let blast = crate::blast_radius::analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/new.rs")],
+            &crate::blast_radius::BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .unwrap();
+        assert_eq!(blast.resolver_stale_repos, vec![repo.uid]);
+        assert_eq!(
+            blast.gate_state,
+            crate::blast_radius::GateState::DegradedUnknown
+        );
+        for notifications in [
+            &affected.notifications,
+            &detected.notifications,
+            &blast.notifications,
+        ] {
+            assert!(notifications.iter().any(|notification| {
+                notification.descriptor == INCOMPATIBLE_RESOLVER_DESCRIPTOR
+            }));
+        }
     }
 
     #[test]

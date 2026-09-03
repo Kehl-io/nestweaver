@@ -63,6 +63,35 @@ pub const ALL_SYMBOL_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::MemberOf,
 ];
 
+/// Every typed relationship that can be declared in an artifact contract.
+///
+/// This is deliberately separate from [`ALL_SYMBOL_EDGE_TYPES`]. The latter is
+/// a traversal inventory for code-symbol queries; widening it would make
+/// symbol-only callers start considering note, project, and contract edges.
+/// Artifact readers need the exhaustive vocabulary because unified graph
+/// scopes legitimately declare typed cross-domain relationships.
+pub const ALL_EDGE_TYPES: &[EdgeType] = &[
+    EdgeType::Calls,
+    EdgeType::Imports,
+    EdgeType::Extends,
+    EdgeType::Implements,
+    EdgeType::Includes,
+    EdgeType::Uses,
+    EdgeType::Accesses,
+    EdgeType::MemberOf,
+    EdgeType::Contains,
+    EdgeType::CrossRepoLink,
+    EdgeType::ProjectIncludesSymbol,
+    EdgeType::ProjectIncludesNote,
+    EdgeType::ProjectHasComponent,
+    EdgeType::ProjectHasParent,
+    EdgeType::ImplementsContract,
+    EdgeType::Supersedes,
+    EdgeType::DependsOn,
+    EdgeType::CausedBy,
+    EdgeType::RelatesTo,
+];
+
 impl EdgeType {
     /// Return the Cypher relationship table name used in the graph store.
     ///
@@ -104,6 +133,19 @@ impl EdgeType {
             .find(|et| et.rel_table_name() == name)
             .copied()
     }
+
+    /// Reverse lookup over the complete typed relationship vocabulary.
+    ///
+    /// Use this for self-describing artifact contracts and other unified-graph
+    /// declarations. Code-symbol traversals should continue to use
+    /// [`Self::from_rel_table_name`], whose intentionally narrower contract is
+    /// preserved.
+    pub fn from_any_rel_table_name(name: &str) -> Option<EdgeType> {
+        ALL_EDGE_TYPES
+            .iter()
+            .find(|edge_type| edge_type.rel_table_name() == name)
+            .copied()
+    }
 }
 
 impl fmt::Display for EdgeType {
@@ -129,6 +171,39 @@ impl fmt::Display for EdgeType {
             EdgeType::CausedBy => write!(f, "CAUSED_BY"),
             EdgeType::RelatesTo => write!(f, "RELATES_TO"),
         }
+    }
+}
+
+#[cfg(test)]
+mod edge_type_tests {
+    use super::{ALL_EDGE_TYPES, ALL_SYMBOL_EDGE_TYPES, EdgeType};
+
+    #[test]
+    fn exhaustive_relationship_names_round_trip_without_widening_symbol_lookup() {
+        for edge_type in ALL_EDGE_TYPES {
+            assert_eq!(
+                EdgeType::from_any_rel_table_name(edge_type.rel_table_name()),
+                Some(*edge_type),
+                "{} is missing from the exhaustive reverse map",
+                edge_type.rel_table_name()
+            );
+        }
+
+        for edge_type in ALL_SYMBOL_EDGE_TYPES {
+            assert_eq!(
+                EdgeType::from_rel_table_name(edge_type.rel_table_name()),
+                Some(*edge_type)
+            );
+        }
+        assert_eq!(
+            EdgeType::from_rel_table_name(EdgeType::ProjectIncludesNote.rel_table_name()),
+            None,
+            "the symbol-only lookup must remain symbol-only"
+        );
+        assert_eq!(
+            EdgeType::from_any_rel_table_name("NOT_A_RELATIONSHIP"),
+            None
+        );
     }
 }
 

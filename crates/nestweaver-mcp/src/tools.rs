@@ -36,6 +36,57 @@ use nestweaver_engine::{index_markdown_directory, save_extensions, set_property}
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
+const EMBEDDING_IDENTITY_REMEDIATION: &str = "repair or restore the recorded embedding model/pipeline metadata, or intentionally rebuild all embeddings from a verified source; --force cannot bypass an unreadable identity";
+
+fn rerank_requested(args: &Value) -> bool {
+    args.get("rerank").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn require_verified_embedding_identity_for_rerank(
+    store: &GraphStore,
+    args: &Value,
+) -> Result<(), anyhow::Error> {
+    if rerank_requested(args) {
+        store.require_verified_embedding_identity()?;
+    }
+    Ok(())
+}
+
+/// Keep lexical search available while reporting why semantic facilities are
+/// unavailable. This mirrors the daemon envelope exactly; callers should not
+/// have to infer degradation from a warning string or from transport choice.
+fn annotate_lexical_embedding_identity_degradation(
+    identity_error: Option<&str>,
+    value: &mut Value,
+) {
+    let Some(identity_error) = identity_error else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("semantic_applied".to_string(), json!(false));
+    let degraded_components = object
+        .entry("degraded_components")
+        .or_insert_with(|| json!([]));
+    if let Some(components) = degraded_components.as_array_mut()
+        && !components
+            .iter()
+            .any(|component| component.as_str() == Some("semantic"))
+    {
+        components.push(json!("semantic"));
+    }
+    object.insert(
+        "semantic_unavailable".to_string(),
+        json!({
+            "cause": "embedding_identity",
+            "reason": "embedding_identity_unreadable",
+            "error": identity_error,
+            "remediation": EMBEDDING_IDENTITY_REMEDIATION,
+        }),
+    );
+}
+
 /// Resolve a symbol name to a UID. When multiple symbols share the name,
 /// pick the most likely canonical definition using a composite heuristic:
 /// PageRank score (if computed), then source-path priority (src/ over tests/),
@@ -407,6 +458,48 @@ fn repo_is_visible(
     }
 }
 
+/// Resolve only inside the caller's visible repositories. Hidden and unknown
+/// UIDs deliberately collapse to the same not-found error.
+fn resolve_visible_symbol_uid(
+    store: &GraphStore,
+    name_or_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<String, anyhow::Error> {
+    if name_or_uid.contains(':') {
+        let symbol = store
+            .lookup_symbol(name_or_uid)
+            .map_err(|_| anyhow!("no symbol found: '{name_or_uid}'"))?;
+        if !repo_is_visible(&symbol.repo_uid, visible) {
+            anyhow::bail!("no symbol found: '{name_or_uid}'");
+        }
+        return Ok(symbol.uid);
+    }
+
+    let mut matches = store
+        .lookup_symbols_by_name(name_or_uid)
+        .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+    matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
+    let best = matches.into_iter().max_by(|a, b| {
+        let pr_a = a.pagerank_score.unwrap_or(0.0);
+        let pr_b = b.pagerank_score.unwrap_or(0.0);
+        if (pr_a - pr_b).abs() > f64::EPSILON {
+            return pr_a.partial_cmp(&pr_b).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        let non_src = |path: &str| {
+            let path = path.to_lowercase();
+            path.starts_with("test") || path.contains("__tests__") || path.starts_with("migrations")
+        };
+        let a_test = non_src(&a.file_path);
+        let b_test = non_src(&b.file_path);
+        if a_test != b_test {
+            return b_test.cmp(&a_test);
+        }
+        b.start_line.cmp(&a.start_line)
+    });
+    best.map(|symbol| symbol.uid)
+        .ok_or_else(|| anyhow!("no symbol found: '{name_or_uid}'"))
+}
+
 // ── nw-403: per-repo visibility, per tool ───────────────────────────────────
 
 /// What repo-scoped visibility MEANS for one MCP tool.
@@ -508,7 +601,7 @@ fn repo_scope(tool: &str) -> RepoScope {
         // ── Enforced inside the arm ──────────────────────────────────────
         // The original five. Each takes `visible` and filters over
         // `repo_is_visible` / `restricted_symbol_owners`.
-        "brain_search" | "brain_impact" | "brain_diff" | "blast_radius" | "affected_tests" => {
+        "brain_search" | "brain_impact" | "brain_diff" | "affected_tests" | "detect_changes" => {
             RepoScope::EnforcedInArm
         }
         // nw-403: `brain_status` enumerated every repo's URL and indexed git
@@ -526,9 +619,7 @@ fn repo_scope(tool: &str) -> RepoScope {
         // ── Redacted after dispatch ──────────────────────────────────────
         // Every row of these carries a uid, so one walk attributes them all.
         "brain_context" | "code_context" | "project_context" | "regex_search" | "dead_code"
-        | "hub_nodes" | "bridge_nodes" | "detect_changes" | "read_symbols" => {
-            RepoScope::RedactedAfterDispatch
-        }
+        | "hub_nodes" | "bridge_nodes" => RepoScope::RedactedAfterDispatch,
 
         // ── Opt-outs: genuinely not repo-scoped ──────────────────────────
         "note_get" | "backlinks" => RepoScope::NotRepoScoped(
@@ -550,6 +641,17 @@ fn repo_scope(tool: &str) -> RepoScope {
         }
 
         // ── Fail closed ──────────────────────────────────────────────────
+        "blast_radius" => RepoScope::FailClosed(
+            "its reverse-dependency traversal is global, and redacting rows after traversal can \
+             leave visible reachability that was created through hidden intermediates; the \
+             analysis cannot be scoped safely until it runs on an authorization-induced \
+             subgraph, so it is refusing before seed resolution or traversal",
+        ),
+        "read_symbols" => RepoScope::FailClosed(
+            "source bodies are read through a filesystem root supplied by the caller when an \
+             authoritative bare-clone reader is unavailable; an authorized symbol UID does not \
+             prove that the same relative path under that root belongs to the authorized repo",
+        ),
         "get_summary" => RepoScope::FailClosed(
             "summaries are generated PROSE that enumerates a file's exported symbols \
              (\"src/beta.py: exports 2 symbols: betaSecretHelper (Function)\"), the sidecar \
@@ -1273,6 +1375,24 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
+    fn changed_file_schemas_publish_the_shared_boundary_limits() {
+        for (tool, property) in [
+            ("detect_changes", "changed_files"),
+            ("detect_changes", "files"),
+            ("affected_tests", "changed_files"),
+            ("blast_radius", "changed_files"),
+        ] {
+            let schema = all_tool_schemas()
+                .into_iter()
+                .find(|candidate| candidate["name"] == tool)
+                .unwrap();
+            let files = &schema["inputSchema"]["properties"][property];
+            assert_eq!(files["maxItems"], json!(1000), "{tool}.{property}");
+            assert_eq!(files["items"]["maxLength"], json!(512), "{tool}.{property}");
+        }
+    }
+
+    #[test]
     fn explicit_tool_selection_is_transport_aware_and_never_silently_empty() {
         validate_tool_selection(
             Some(&["brain_context".to_string(), "brain_search".to_string()]),
@@ -1792,6 +1912,11 @@ mod tool_schema_validation_tests {
         for (name, args) in [
             ("read_symbols", json!({ "uids_or_fqns": [] })),
             ("detect_changes", json!({ "files": [] })),
+            ("affected_tests", json!({ "changed_files": [] })),
+            ("blast_radius", json!({ "changed_files": [] })),
+            ("detect_changes", json!({ "changed_files": [""] })),
+            ("affected_tests", json!({ "changed_files": [""] })),
+            ("blast_radius", json!({ "changed_files": [""] })),
         ] {
             assert_invalid(name, args);
         }
@@ -2411,6 +2536,7 @@ mod tool_schema_validation_tests {
             truncated: false,
             semantic_applied: false,
             degraded_components: Vec::new(),
+            semantic_unavailable: None,
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -2425,6 +2551,30 @@ mod tool_schema_validation_tests {
         let concise = daemon_brain_search_response_to_json(&response, true);
         assert_eq!(concise["results"][0]["uid"], "sym:needle");
         assert_eq!(concise["results"][0]["canonical_id"], "canonical-needle");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_brain_search_json_preserves_structured_semantic_unavailability() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            semantic_applied: false,
+            degraded_components: vec!["semantic".to_string()],
+            semantic_unavailable: Some(nestweaver_proto::SemanticUnavailable {
+                cause: "embedding_identity".to_string(),
+                reason: "embedding_identity_unreadable".to_string(),
+                error: "malformed persisted metadata".to_string(),
+                remediation: "repair the recorded identity".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let value = daemon_brain_search_response_to_json(&response, false);
+        assert_eq!(value["degraded_components"], json!(["semantic"]));
+        assert_eq!(value["semantic_unavailable"]["cause"], "embedding_identity");
+        assert_eq!(
+            value["semantic_unavailable"]["error"],
+            "malformed persisted metadata"
+        );
     }
 
     #[cfg(feature = "daemon")]
@@ -2485,6 +2635,7 @@ mod tool_schema_validation_tests {
             truncated: false,
             semantic_applied: false,
             degraded_components: Vec::new(),
+            semantic_unavailable: None,
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -2910,6 +3061,13 @@ pub fn dispatch_cancellable(
     enforce_tool_allowed(name)?;
 
     validate_tool_arguments(name, &args)?;
+    // Reranking consumes persisted embedding-derived similarity signals even
+    // when the primary retrieval request is lexical-only. Guard before the
+    // response cache so a prior successful response cannot bypass a newly
+    // unreadable durable embedding identity.
+    if matches!(name, "brain_context" | "brain_search") {
+        require_verified_embedding_identity_for_rerank(store, &args)?;
+    }
 
     // nw-C2: a query landing inside a normal index-publication window used to
     // fail outright with an internal-looking assertion string. Wait it out
@@ -2950,7 +3108,17 @@ pub fn dispatch_cancellable(
     // process cannot compute without I/O), so its richer stamp wins. What this
     // layer can say honestly is that the answer came from the local graph, and
     // saying that is what makes the absence of a richer verdict legible.
-    let result = result.map(|value| provenance_seam::stamp(Unstamped::new(value)));
+    let result = result.map(|mut value| {
+        // A cache hit predating identity degradation bypasses the tool body.
+        // Annotate at the common in-process transport seam as well as at the
+        // producer so every lexical brain_search response reflects current
+        // semantic availability.
+        if name == "brain_search" {
+            let identity_error = store.embedding_identity_error();
+            annotate_lexical_embedding_identity_degradation(identity_error.as_deref(), &mut value);
+        }
+        provenance_seam::stamp(Unstamped::new(value))
+    });
 
     // Tools that do not consult PageRank still succeed during a dirty
     // publication, so the classification is applied to the ERROR rather than
@@ -3027,9 +3195,16 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
     if !status.dirty {
         return error;
     }
-    let writer = match (status.writer_pid, status.writer_alive) {
-        (Some(pid), Some(true)) => format!("writer pid {pid} is running"),
-        (Some(pid), _) => format!("writer pid {pid} is NOT running"),
+    let writer = match (
+        status.writer_pid,
+        status.writer_alive,
+        status.writer_liveness_unknown,
+    ) {
+        (Some(pid), Some(true), _) => {
+            format!("diagnostic marker pid {pid} is running but does not prove ownership")
+        }
+        (Some(pid), _, true) => format!("writer pid {pid} has unknown liveness"),
+        (Some(pid), _, false) => format!("writer pid {pid} is NOT running"),
         _ => "no writer pid recorded in the marker".to_string(),
     };
     let age = status
@@ -3037,13 +3212,18 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
         .map(|s| format!("{s}s"))
         .unwrap_or_else(|| "unknown".to_string());
     let waited_ms = index_publication_wait().as_millis();
+    let ownership = match status.writer_authority_held {
+        Some(true) => "the canonical writer lease is held",
+        Some(false) => "the canonical writer lease is free",
+        None => "canonical writer-lease ownership is unknown",
+    };
     let preamble = "This is an index PUBLICATION window, not a dirty git working tree — \
                     editing files in a repo does not cause it.";
     if status.is_wedged() {
         let repair = status.repair_command_for(&db_path);
         anyhow!(
             "index publication WEDGED: ranked queries are failing closed because {} exists \
-             and {writer} (marker age {age}). {preamble} The PageRank and generation sidecars \
+             and {writer}; {ownership} (marker age {age}). {preamble} The PageRank and generation sidecars \
              may predate the committed graph, so serving them would return wrong ranks. \
              A HUMAN must recover with (there is no MCP tool for this): {repair}{}",
             status.marker_path,
@@ -3096,6 +3276,24 @@ fn dispatch_uncached(
         Some(nestweaver_engine::authz::VisibleRepos::Only(_))
     ) {
         return dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible);
+    }
+    // `brain_context` and `brain_search` are safe to scope while they return
+    // graph metadata, but their opt-in inline-body path falls back to a
+    // caller-selected filesystem root whenever a repo's authoritative bare
+    // clone is unavailable. The response row still carries the authorized
+    // symbol UID, so post-dispatch redaction cannot detect that the bytes came
+    // from another checkout with the same repo-relative path. Refuse before
+    // any source read for restricted identities; graph-only requests retain
+    // their existing scoped behavior.
+    if matches!(name, "brain_context" | "brain_search")
+        && args.get("include_bodies").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(anyhow!(
+            "{name} source-body retrieval is not available to a repository-scoped caller: \
+             fallback filesystem roots are caller-selected and cannot prove repository \
+             ownership. Refusing before reading source content; retry without \
+             include_bodies."
+        ));
     }
     match repo_scope(name) {
         // The arm takes `visible` itself; nothing to do here.
@@ -3163,11 +3361,11 @@ fn dispatch_tool_arm(
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
         "compact_embeddings" => tool_compact_embeddings(store, args),
-        "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
+        "cross_repo_contracts" => tool_cross_repo_contracts(store, args, visible),
         "brain_impact" => tool_brain_impact(store, args, cancel, visible),
         "brain_guide" => tool_brain_guide(store, args),
         "flow_trace" => tool_flow_trace(store, args, cancel, visible),
-        "detect_changes" => tool_detect_changes(store, args),
+        "detect_changes" => tool_detect_changes_scoped(store, args, visible),
         "clusters" => tool_clusters(store, args),
         "stale_check" => tool_stale_check(store, visible),
         "set_extension" => tool_set_extension(args),
@@ -3469,7 +3667,7 @@ fn semantic_cache_salt(name: &str, embed_model: Option<&dyn EmbedQueryFn>) -> u6
 }
 
 fn semantic_response_is_degraded(name: &str, value: &Value) -> bool {
-    matches!(name, "brain_context" | "project_context")
+    matches!(name, "brain_context" | "project_context" | "brain_search")
         && value
             .get("degraded_components")
             .and_then(Value::as_array)
@@ -4124,7 +4322,7 @@ fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4605,6 +4803,9 @@ fn tool_schema_brain_memory_lint() -> Value {
 
 fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    if apply {
+        require_authoritative_writer_ownership("apply memory consolidation")?;
+    }
     let limit = read_limit(
         &args,
         "limit",
@@ -4652,6 +4853,75 @@ fn tool_schema_brain_memory_consolidate() -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod memory_consolidation_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn in_process_dispatch_refuses_apply_without_host_writer_ownership() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let error = dispatch(
+            &store,
+            None,
+            "brain_memory_consolidate",
+            json!({ "apply": true }),
+            None,
+        )
+        .expect_err("an unowned in-process apply must fail closed")
+        .to_string();
+        assert!(error.contains("authoritative writer ownership"), "{error}");
+
+        let dry_run = dispatch(
+            &store,
+            None,
+            "brain_memory_consolidate",
+            json!({ "apply": false }),
+            None,
+        )
+        .expect("dry-run is read-only and needs no writer lease");
+        assert_eq!(dry_run["dry_run"], json!(true));
+    }
+
+    #[test]
+    fn host_owned_scope_allows_apply_and_does_not_leak_to_the_next_request() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = with_authoritative_writer_ownership(|| {
+            dispatch(
+                &store,
+                None,
+                "brain_memory_consolidate",
+                json!({ "apply": true }),
+                None,
+            )
+        })
+        .expect("host-attested apply reaches the engine");
+        assert_eq!(result["dry_run"], json!(false));
+
+        let error = dispatch(
+            &store,
+            None,
+            "brain_memory_consolidate",
+            json!({ "apply": true }),
+            None,
+        )
+        .expect_err("ownership must end with the scoped dispatch")
+        .to_string();
+        assert!(error.contains("authoritative writer ownership"), "{error}");
+    }
+
+    #[test]
+    fn host_owned_scope_restores_default_deny_after_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            with_authoritative_writer_ownership(|| panic!("fixture panic"));
+        });
+        let error = require_authoritative_writer_ownership("apply memory consolidation")
+            .expect_err("panic cleanup must restore default deny")
+            .to_string();
+        assert!(error.contains("authoritative writer ownership"), "{error}");
+    }
 }
 
 fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
@@ -4922,7 +5192,7 @@ fn tool_schema_brain_context() -> Value {
                 "include_bodies": {
                     "type": "boolean",
                     "default": false,
-                    "description": "When true, embed each high-relevance result's source body inline (under `inline_body`) so you can skip a follow-up read. Only results whose normalized relevance clears the configured threshold (default 0.75) get a body, and bodies count against `token_budget` in rank order. Default false."
+                    "description": "When true, embed each high-relevance result's source body inline (under `inline_body`) so you can skip a follow-up read. Only results whose normalized relevance clears the configured threshold (default 0.75) get a body, and bodies count against `token_budget` in rank order. Repository-scoped identities must leave this false because fallback filesystem roots are not an authoritative repository binding. Default false."
                 },
                 "root": {
                     "type": "string",
@@ -5112,6 +5382,7 @@ fn tool_brain_context(
     // no redactor walks — cannot enumerate repos this caller may not see.
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    require_verified_embedding_identity_for_rerank(store, &args)?;
     let seeds: Vec<String> = args
         .get("seeds")
         .and_then(|v| v.as_array())
@@ -5412,10 +5683,7 @@ fn tool_brain_context(
     // heuristic (NOT a validated nDCG win); an optional `<db>.rerank.json`
     // learned-weights file is used if present and version-matched. Reranking
     // only reorders an already-retrieved set; recall is unchanged.
-    let do_rerank = args
-        .get("rerank")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let do_rerank = rerank_requested(&args);
     if do_rerank {
         let reranker = nestweaver_engine::select_reranker(Some(&db_path));
         nestweaver_engine::rerank(
@@ -5727,7 +5995,7 @@ fn authorized_symbol_total(
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n- semantic_applied is always false and degraded_components always empty: this tool is keyword/BM25-only and never runs a semantic leg, so ranking is lexical. The fields are reported rather than omitted so their absence is never mistaken for an older server\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable\n- Keyword matching only — it will not find conceptually related wording that shares no terms with the query",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n- semantic_applied is always false because this tool's retrieval is keyword/BM25-only. When the recorded embedding identity is unreadable, lexical results remain available and the response reports degraded_components: [\"semantic\"] plus semantic_unavailable reason, error, and remediation; otherwise degraded_components is empty. The fields are reported rather than omitted so their absence is never mistaken for an older server\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable\n- Keyword matching only — it will not find conceptually related wording that shares no terms with the query",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5750,7 +6018,7 @@ fn tool_schema_brain_search() -> Value {
                 "include_bodies": {
                     "type": "boolean",
                     "default": false,
-                    "description": "When true (detailed mode only), embed each high-relevance hit's source body inline (under `inline_body`) so you can skip a follow-up note_get / read. Only hits whose normalized score clears the configured threshold (default 0.75) get a body. Default false."
+                    "description": "When true (detailed mode only), embed each high-relevance hit's source body inline (under `inline_body`) so you can skip a follow-up note_get / read. Only hits whose normalized score clears the configured threshold (default 0.75) get a body. Repository-scoped identities must leave this false because fallback filesystem roots are not an authoritative repository binding. Default false."
                 },
                 "root": {
                     "type": "string",
@@ -5799,6 +6067,7 @@ fn tool_brain_search(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    require_verified_embedding_identity_for_rerank(store, &args)?;
     let raw_query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -6108,10 +6377,7 @@ fn tool_brain_search(
     // heuristic, NOT a validated nDCG win; an optional `<db>.rerank.json`
     // learned-weights file is used if present and version-matched. Reranking
     // only reorders an already-retrieved set; recall is unchanged.
-    let do_rerank = args
-        .get("rerank")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let do_rerank = rerank_requested(&args);
     if do_rerank && !concise {
         // Build BrainNodes mirroring the JSON rows (UID-keyed; rows without a
         // UID — none in detailed mode — are dropped from the reorder set).
@@ -6303,11 +6569,12 @@ fn tool_brain_search(
         "total_matches_relation": search_total_relation_label(total.relation),
         "returned_matches": returned_matches,
         "truncated": truncated,
-        // `brain_search` is keyword/BM25-only; it must not claim a
-        // semantic leg was requested or degraded. Emitted unconditionally
-        // (and on both the bm25 and substring branches, which converge
-        // here) so callers can tell "no semantic leg" apart from "field
-        // not implemented on this path".
+        // `brain_search` is keyword/BM25-only, so it never claims that a
+        // semantic leg was applied. Emitted unconditionally (and on both the
+        // bm25 and substring branches, which converge here) so callers can
+        // tell "no semantic leg" apart from "field not implemented on this
+        // path". An unreadable durable embedding identity is annotated below:
+        // lexical results still succeed, but semantic capability is degraded.
         //
         // Other sites that must stay in agreement when a semantic leg is
         // added. This list is not a claim that they currently agree:
@@ -6341,6 +6608,8 @@ fn tool_brain_search(
         "semantic_applied": false,
         "degraded_components": [],
     });
+    let identity_error = store.embedding_identity_error();
+    annotate_lexical_embedding_identity_degradation(identity_error.as_deref(), &mut response);
     if engine == "substring" {
         response["engine_warning"] = json!(
             "tantivy_unavailable: BM25 index could not be opened (another process may hold the writer lock, or it has not been built yet). Results are substring matches only. Run `nestweaver brain reindex-search` to build the index."
@@ -6503,6 +6772,53 @@ mod brain_search_total_contract_tests {
 
     const QUERY: &str = "searchneedle";
 
+    #[test]
+    fn lexical_search_reports_unreadable_semantic_identity_without_failing() {
+        let mut response = json!({
+            "semantic_applied": false,
+            "degraded_components": [],
+            "results": [],
+        });
+        annotate_lexical_embedding_identity_degradation(
+            Some("embedding identity is unreadable: injected malformed metadata"),
+            &mut response,
+        );
+
+        assert_eq!(response["semantic_applied"], json!(false));
+        assert_eq!(response["degraded_components"], json!(["semantic"]));
+        assert_eq!(
+            response["semantic_unavailable"]["reason"],
+            "embedding_identity_unreadable"
+        );
+        assert_eq!(
+            response["semantic_unavailable"]["error"],
+            "embedding identity is unreadable: injected malformed metadata"
+        );
+        assert_eq!(
+            response["semantic_unavailable"]["remediation"],
+            EMBEDDING_IDENTITY_REMEDIATION
+        );
+
+        // The transport seam may see an already-annotated producer response;
+        // annotation is deliberately idempotent.
+        annotate_lexical_embedding_identity_degradation(
+            Some("embedding identity is unreadable: injected malformed metadata"),
+            &mut response,
+        );
+        assert_eq!(response["degraded_components"], json!(["semantic"]));
+    }
+
+    #[test]
+    fn lexical_search_keeps_clean_semantic_honesty_when_identity_is_verified() {
+        let mut response = json!({
+            "semantic_applied": false,
+            "degraded_components": [],
+        });
+        annotate_lexical_embedding_identity_degradation(None, &mut response);
+        assert_eq!(response["degraded_components"], json!([]));
+        assert!(response.get("semantic_unavailable").is_none());
+    }
+
     fn note(uid: &str, title: &str) -> Note {
         Note {
             uid: uid.to_string(),
@@ -6600,7 +6916,8 @@ mod brain_search_total_contract_tests {
         assert_eq!(drift["contracts_status"], json!("degraded"));
         assert_eq!(drift["degraded_repos"], json!(["repo:broken"]));
 
-        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        let cross =
+            tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" }), None).unwrap();
         assert_eq!(cross["contracts_status"], json!("degraded"), "{cross}");
         assert_eq!(cross["degraded_repos"], json!(["repo:broken"]));
     }
@@ -6616,7 +6933,8 @@ mod brain_search_total_contract_tests {
         assert_eq!(drift["contracts_status"], json!("complete"));
         assert_eq!(drift["degraded_repos"], json!([]));
 
-        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        let cross =
+            tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" }), None).unwrap();
         assert_eq!(cross["contracts_status"], json!("complete"), "{cross}");
         assert_eq!(cross["degraded_repos"], json!([]));
     }
@@ -7246,6 +7564,7 @@ mod brain_search_total_contract_tests {
             truncated: false,
             semantic_applied: false,
             degraded_components: Vec::new(),
+            semantic_unavailable: None,
         };
 
         // 2. Daemon-routed MCP: forwards the proto fields verbatim.
@@ -7622,7 +7941,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content — but a count of `null` means it could NOT BE READ, which is NOT zero and is not a reason to re-index. Check `unavailable` (and `counts_complete`) before acting on any count\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content — but a count of `null` means it could NOT BE READ, which is NOT zero and is not a reason to re-index. Check `unavailable` (and `counts_complete`) before acting on any count\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status, search_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -7893,8 +8212,8 @@ fn counts_disclosure(
 /// Fields only a live daemon can answer honestly — see
 /// [`DAEMON_RUNTIME_STATUS_FIELDS`] — are ALWAYS present, so a
 /// `--json 2>/dev/null` consumer can never silently receive a different
-/// schema on the direct path. The seven daemon-owned runtime fields are
-/// explicit nulls here (the daemon's gRPC handler overwrites them with live
+/// schema on the direct path. The daemon-owned runtime fields are explicit
+/// nulls here (the daemon's gRPC handler overwrites them with live
 /// values); the two tantivy fields are derived from the builder's own
 /// `tantivy` argument, and the CLI's direct fallback re-nulls even those via
 /// [`mark_brain_status_daemon_bypassed`] — a process without the daemon's
@@ -8091,6 +8410,8 @@ pub fn brain_status_json(
             "marker_age_s": status.marker_age_s,
             "writer_pid": status.writer_pid,
             "writer_alive": status.writer_alive,
+            "writer_liveness_unknown": status.writer_liveness_unknown,
+            "writer_authority_held": status.writer_authority_held,
             "writer_reason": status.writer_reason,
             "wedged": status.is_wedged(),
             "marker_path": status.marker_path,
@@ -8160,12 +8481,14 @@ pub fn brain_status_json(
         // fields (a process without the daemon's index open cannot claim
         // `false`/`0` honestly) and marks the document degraded.
         "embedding_status": Value::Null,
+        "search_status": Value::Null,
         "indexing_active": Value::Null,
         "indexing_repo": Value::Null,
         "queue_depth": Value::Null,
         "write_queue_depth": Value::Null,
         "write_holder": Value::Null,
         "write_holder_seconds": Value::Null,
+        "search_status": Value::Null,
         // The `brain_search` precedent: always present, empty unless a
         // component was bypassed. The direct fallback sets
         // ["daemon_runtime"] via `mark_brain_status_daemon_bypassed`.
@@ -8180,12 +8503,14 @@ pub fn brain_status_json(
 /// silently receive a different schema.
 pub const DAEMON_RUNTIME_STATUS_FIELDS: &[&str] = &[
     "embedding_status",
+    "search_status",
     "indexing_active",
     "indexing_repo",
     "queue_depth",
     "write_queue_depth",
     "write_holder",
     "write_holder_seconds",
+    "search_status",
     "tantivy_available",
     "tantivy_doc_count",
 ];
@@ -8231,7 +8556,7 @@ pub fn mark_brain_status_daemon_bypassed(value: &mut Value, cause: &str) {
         warnings.push(json!({
             "kind": "daemon_bypassed",
             "warning": "answered by the read-only direct path; daemon-runtime fields \
-                        (embedding_status, write/index queue, tantivy stats) are null",
+                        (embedding/search status, write/index queue, tantivy stats) are null",
             "cause": cause,
         }));
     }
@@ -8362,6 +8687,16 @@ fn brain_status_warnings_for(
                  I/O error on the sidecar directory); ranked queries fail closed."
             },
             "action": status.repair_command_for(p),
+        }));
+    }
+
+    if let Some(error) = store.embedding_identity_error() {
+        warnings.push(json!({
+            "kind": "embedding_identity_unreadable",
+            "warning": format!(
+                "embedding metadata could not be read or validated ({error}); graph and lexical reads remain available, but semantic search, reranking, and embedding writes are disabled"
+            ),
+            "action": "repair or restore verified embedding model/pipeline metadata, or intentionally rebuild all embeddings from a verified source; --force does not bypass unreadable identity",
         }));
     }
 
@@ -9029,11 +9364,33 @@ fn tool_schema_cross_repo_contracts() -> Value {
     })
 }
 
-fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_cross_repo_contracts(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    let restricted = matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    );
     let uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        uid.to_string()
+        if restricted {
+            let symbol = store
+                .lookup_symbol(uid)
+                .map_err(|_| anyhow!("no symbol found: '{uid}'"))?;
+            if !repo_is_visible(&symbol.repo_uid, visible) {
+                anyhow::bail!("no symbol found: '{uid}'");
+            }
+            symbol.uid
+        } else {
+            uid.to_string()
+        }
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        resolve_symbol_uid(store, name)?
+        if restricted {
+            resolve_visible_symbol_uid(store, name, visible)?
+        } else {
+            resolve_symbol_uid(store, name)?
+        }
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
     };
@@ -9049,8 +9406,19 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         .cross_repo_links(&uid)
         .map_err(|e| anyhow!("cross_repo_links: {e}"))?;
 
+    let owners = restricted_symbol_owners(store, visible)?;
+    let uid_is_visible = |candidate: &str| {
+        owners.as_ref().is_none_or(|owners| {
+            owners
+                .get(candidate)
+                .is_some_and(|repo_uid| repo_is_visible(repo_uid, visible))
+        })
+    };
     let mut rows: Vec<Value> = refs
         .iter()
+        // Scope both endpoints before totals/truncation. Unknown ownership is
+        // dropped under restriction rather than treated as globally visible.
+        .filter(|r| uid_is_visible(&r.source_uid) && uid_is_visible(&r.target_uid))
         .map(|r| {
             json!({
                 "source_uid": r.source_uid,
@@ -9089,9 +9457,10 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     // to the symbol's repo: contract UIDs carry no repo component, so the rows
     // above cannot be attributed to one repo, and a degraded repo anywhere can
     // cost this symbol a link.
-    let degraded_repos = store
+    let mut degraded_repos = store
         .contract_derivation_failures(None)
         .map_err(|e| anyhow!("contract_derivation_failures: {e}"))?;
+    degraded_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
     let contracts_status = if degraded_repos.is_empty() {
         "complete"
     } else {
@@ -9206,6 +9575,26 @@ fn tool_brain_impact(
                 .is_some_and(|repo_uid| repo_is_visible(repo_uid, visible))
         })
     };
+
+    // Reverse-impact depends entirely on resolver-produced edges. Refuse
+    // before symbol resolution/traversal when any repository the caller can
+    // see was indexed by an incompatible resolver generation. Hidden stale
+    // repositories are filtered first so their UIDs/count cannot leak into an
+    // otherwise healthy restricted response.
+    let mut resolver_stale_repos =
+        nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)?;
+    resolver_stale_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
+    if !resolver_stale_repos.is_empty() {
+        // A tool error is deliberate here. Existing CLI consumers treat every
+        // unknown success status as an ordinary empty impact set; returning a
+        // degraded success envelope would therefore print a confident "No
+        // impact found". Erroring preserves fail-closed semantics on every
+        // transport until all clients understand a structured refusal.
+        anyhow::bail!(
+            "brain_impact refused: {}",
+            nestweaver_engine::resolver_generation::incompatibility_message(&resolver_stale_repos)
+        );
+    }
 
     // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
     // contract in daemon mode, instead of the daemon path silently returning the best of
@@ -9462,7 +9851,15 @@ fn tool_flow_trace(
         .clamp(1, 15);
     let concise = is_concise(&args);
 
-    let resolved_uid = resolve_symbol_uid(store, symbol)?;
+    let restricted = matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    );
+    let resolved_uid = if restricted {
+        resolve_visible_symbol_uid(store, symbol, visible)?
+    } else {
+        resolve_symbol_uid(store, symbol)?
+    };
 
     let root = store
         .lookup_symbol(&resolved_uid)
@@ -9501,7 +9898,10 @@ fn tool_flow_trace(
         let direct_callees = store
             .callees_of(&root.uid)
             .map_err(|e| anyhow!("callees_of: {e}"))?;
-        if direct_callees.is_empty() {
+        let has_visible_direct_callee = direct_callees
+            .iter()
+            .any(|callee| repo_is_visible(&callee.repo_uid, visible));
+        if !has_visible_direct_callee {
             // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
             let members = store
                 .members_of(&root.uid)
@@ -9522,7 +9922,10 @@ fn tool_flow_trace(
             // computed, which is the shape this fix exists to remove.
             let methods_total: usize;
             let method_trees: Vec<Value> = if !members.is_empty() {
-                let methods: Vec<_> = members.iter().filter(|s| is_method(s)).collect();
+                let methods: Vec<_> = members
+                    .iter()
+                    .filter(|s| is_method(s) && repo_is_visible(&s.repo_uid, visible))
+                    .collect();
                 methods_total = methods.len();
                 methods
                     .iter()
@@ -9545,6 +9948,7 @@ fn tool_flow_trace(
                     .filter(|s| {
                         s.kind == SymbolKind::Class
                             && s.uid != root.uid
+                            && repo_is_visible(&s.repo_uid, visible)
                             && s.start_line > root.start_line
                             && s.end_line < root.end_line
                     })
@@ -9554,6 +9958,7 @@ fn tool_flow_trace(
                     .iter()
                     .filter(|s| {
                         s.uid != root.uid
+                            && repo_is_visible(&s.repo_uid, visible)
                             && is_method(s)
                             && s.start_line > root.start_line
                             && s.start_line <= root.end_line
@@ -9954,14 +10359,16 @@ fn tool_schema_detect_changes() -> Value {
             "properties": {
                 "changed_files": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
                     "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]. One of 'changed_files' or 'files' is required."
                 },
                 "files": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
                     "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "Backward-compatible alias for changed_files."
                 },
                 "limit": {
@@ -9985,19 +10392,30 @@ fn tool_schema_detect_changes() -> Value {
     })
 }
 
+#[cfg(test)]
 fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    tool_detect_changes_scoped(store, args, None)
+}
+
+fn tool_detect_changes_scoped(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     let files: Vec<String> = args
         .get("changed_files")
         .or_else(|| args.get("files"))
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("'changed_files' must be an array of strings"))?
         .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-
-    if files.is_empty() {
-        return Err(anyhow!("'files' must contain at least one path"));
-    }
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(String::from).ok_or_else(|| {
+                anyhow!("'changed_files[{index}]' must be a repository-relative path string")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let files = nestweaver_engine::changed_files::require_changed_files(&files)?;
 
     // nw-174: this tool inlined EVERY affected symbol and process. On a
     // high-fanout file that was 156 KB (~39K tokens) with 416 processes in one
@@ -10011,6 +10429,91 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_RESULT_LIMIT)
         .clamp(1, 1000);
+
+    // The process engine currently has no authorization-induced traversal.
+    // For restricted callers, compute only the visible changed-file seeds and
+    // stop before the global process graph is loaded. This is intentionally a
+    // degraded-unknown answer: it is useful for locating visible changed
+    // symbols but cannot be mistaken for a complete risk assessment.
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) {
+        let owners = restricted_symbol_owners(store, visible)?.unwrap_or_default();
+        let mut symbols = Vec::new();
+        let mut seen = HashSet::new();
+        for file in &files {
+            let candidates = store
+                .symbols_in_file(file)
+                .with_context(|| format!("mapping changed file {file} to visible symbols"))?;
+            for symbol in candidates {
+                if seen.insert(symbol.uid.clone())
+                    && owners.get(&symbol.uid).is_some_and(|repo_uid| {
+                        repo_uid == &symbol.repo_uid && repo_is_visible(repo_uid, visible)
+                    })
+                {
+                    symbols.push(symbol);
+                }
+            }
+        }
+        symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+        let total = symbols.len();
+        let affected_symbols: Vec<Value> = symbols
+            .iter()
+            .take(limit)
+            .map(|symbol| {
+                json!({
+                    "uid": symbol.uid,
+                    "name": symbol.name,
+                    "file_path": symbol.file_path,
+                })
+            })
+            .collect();
+        let symbols_omitted = total.saturating_sub(affected_symbols.len());
+        let mut resolver_stale_repos =
+            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)?;
+        resolver_stale_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
+        let mut notifications = vec![json!({
+            "level": "warning",
+            "descriptor": "authz.process-analysis-unavailable",
+            "message": "process impact is unavailable for repository-restricted analysis because process records lack authoritative repository ownership"
+        })];
+        // This route builds its own payload and returns before the shared
+        // preflight runs, so without this the SAME stale graph announced
+        // `resolver-generation-incompatible` on the unrestricted route and said
+        // nothing here. `status` is already hardcoded `degraded`, so the
+        // omission was invisible in the status field too -- and the descriptor
+        // is what a CI consumer keys on, because the prose is redacted for a
+        // restricted caller. The message names only the VISIBLE stale repos,
+        // since the list was filtered above.
+        if !resolver_stale_repos.is_empty() {
+            notifications.push(json!({
+                "level": "error",
+                "descriptor": nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR,
+                "message": nestweaver_engine::resolver_generation::incompatibility_message(
+                    &resolver_stale_repos,
+                ),
+            }));
+        }
+        return Ok(json!({
+            "files": files,
+            "risk": Value::Null,
+            "status": "degraded",
+            "gate_state": "degraded-unknown",
+            "notifications": notifications,
+            "resolver_stale_repos": resolver_stale_repos,
+            "blast_radius": total,
+            "affected_symbols": affected_symbols,
+            "affected_symbol_count": total,
+            "affected_processes": [],
+            "affected_process_count": 0,
+            "process_analysis_unavailable": true,
+            "limit": limit,
+            "truncated": symbols_omitted > 0,
+            "symbols_omitted": symbols_omitted,
+            "processes_omitted": 0,
+        }));
+    }
 
     let impact = detect_changes_impact(store, &files, 10).context("detect_changes_impact")?;
 
@@ -10075,6 +10578,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         "status": serde_json::to_value(impact.status)?,
         "gate_state": serde_json::to_value(impact.gate_state)?,
         "notifications": serde_json::to_value(&impact.notifications)?,
+        "resolver_stale_repos": impact.resolver_stale_repos,
         "blast_radius": impact.blast_radius,
         "affected_symbols": affected_symbols,
         // The TOTAL, not the returned length — so `affected_symbol_count`
@@ -10083,6 +10587,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         "affected_symbol_count": impact.affected_symbols.len(),
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
+        "process_analysis_unavailable": false,
         "limit": limit,
         "truncated": symbols_omitted > 0 || processes_omitted > 0,
         "symbols_omitted": symbols_omitted,
@@ -10109,8 +10614,9 @@ fn tool_schema_affected_tests() -> Value {
                 // narrowed one, so the bound is declared and enforced.
                 "changed_files": {
                     "type": "array",
-                    "items": { "type": "string", "maxLength": MAX_IDENTIFIER_LEN },
-                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
+                    "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]. At most 1000 entries of at most 512 bytes each; an oversized request is REJECTED rather than silently narrowed, because a test selection computed from a shortened change set is not a selection for that change."
                 },
                 "base_ref": {
@@ -10139,9 +10645,7 @@ fn tool_affected_tests(
     // nw-412: REFUSE before doing any work, the way `dead_code` does. On a
     // resolver-generation-stale graph a MISSING edge makes the affected-test
     // set SMALLER, so the regression test that should have run is silently
-    // dropped while the gate reports success. See
-    // `affected_tests_refusal_payload` for why this refuses where
-    // `blast_radius` degrades.
+    // dropped while the gate reports success.
     if let Some(refusal) = resolver_generation_refusal(store, visible)? {
         return Ok(affected_tests_refusal_payload(&refusal));
     }
@@ -10149,22 +10653,32 @@ fn tool_affected_tests(
     let owners = restricted_symbol_owners(store, visible)?;
 
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
-    let mut changed_files: Vec<String> = bound_identifiers(
-        args.get("changed_files")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "changed_files",
-    )?;
+    let explicit_changed_files = args
+        .get("changed_files")
+        .map(|value| {
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow!("'changed_files' must be an array of strings"))?;
+            let files: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let path = value.as_str().ok_or_else(|| {
+                        anyhow!(
+                            "'changed_files[{index}]' must be a repository-relative path string"
+                        )
+                    })?;
+                    Ok::<String, anyhow::Error>(String::from(path))
+                })
+                .collect::<Result<_, _>>()?;
+            nestweaver_engine::changed_files::require_changed_files(&files)
+        })
+        .transpose()?;
+    let explicit_input = explicit_changed_files.is_some();
+    let mut changed_files: Vec<String> = explicit_changed_files.unwrap_or_default();
 
     let base_ref = args.get("base_ref").and_then(|v| v.as_str());
-    if changed_files.is_empty()
-        && let Some(base_ref) = base_ref
-    {
+    if !explicit_input && let Some(base_ref) = base_ref {
         let repo_path = scoped_local_repo_path(store, visible)?.unwrap_or_else(|| ".".to_string());
         let files =
             nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
@@ -10173,6 +10687,8 @@ fn tool_affected_tests(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        changed_files =
+            nestweaver_engine::changed_files::validate_changed_file_entries(&changed_files)?;
     }
 
     // Only a genuine "no input" (neither changed_files nor base_ref) is an error.
@@ -10195,16 +10711,41 @@ fn tool_affected_tests(
             .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
             .map(|(uid, _)| uid.clone())
             .collect();
-        nestweaver_engine::affected_tests::affected_tests_scoped(store, &changed_files, &allowed)
+        if explicit_input {
+            nestweaver_engine::affected_tests::affected_tests_scoped(
+                store,
+                &changed_files,
+                &allowed,
+            )
             .context("affected_tests")?
+        } else {
+            nestweaver_engine::affected_tests::affected_tests_scoped_for_derived_diff(
+                store,
+                &changed_files,
+                &allowed,
+            )
+            .context("affected_tests")?
+        }
     } else {
         let db_path = current_db_path(store).ok();
-        nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
+        if explicit_input {
+            nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
+                .context("affected_tests")?
+        } else {
+            nestweaver_engine::rts_eval::run_recorded_derived_diff(
+                store,
+                &changed_files,
+                db_path.as_deref(),
+            )
             .context("affected_tests")?
+        }
     };
 
     if let Some(owners) = owners {
         let mut ownership_unproven = false;
+        result
+            .resolver_stale_repos
+            .retain(|repo_uid| repo_is_visible(repo_uid, visible));
         result.changed_symbols.retain(|symbol| {
             let repo_uid = if symbol.repo_uid.is_empty() {
                 owners.get(&symbol.uid).map(String::as_str)
@@ -10980,6 +11521,13 @@ fn tool_brain_diff(
     for file_path in &changed_paths {
         if let Ok(syms) = store.symbols_in_file(file_path) {
             for sym in syms {
+                // File paths are repository-relative and therefore collide
+                // across repositories. The selected visible repo is the
+                // authoritative owner; never attach same-path symbols from a
+                // hidden or merely different repository.
+                if sym.repo_uid != repo.uid || !repo_is_visible(&sym.repo_uid, visible) {
+                    continue;
+                }
                 affected_symbols.push(json!({
                     "uid": sym.uid,
                     "name": sym.name,
@@ -12010,13 +12558,15 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, results are redacted to the caller's visible repos.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "changed_files": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
+                    "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
                 },
                 "max_depth": {
@@ -12066,17 +12616,23 @@ fn tool_blast_radius(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    let files: Vec<std::path::PathBuf> = args
+    let files: Vec<String> = args
         .get("changed_files")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("'changed_files' must be an array of strings"))?
         .iter()
-        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
-        .collect();
-
-    if files.is_empty() {
-        return Err(anyhow!("'changed_files' must contain at least one path"));
-    }
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(String::from).ok_or_else(|| {
+                anyhow!("'changed_files[{index}]' must be a repository-relative path string")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let files: Vec<std::path::PathBuf> =
+        nestweaver_engine::changed_files::require_changed_files(&files)?
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
 
     let max_depth = args
         .get("max_depth")
@@ -12165,7 +12721,7 @@ fn tool_blast_radius(
             .notifications
             .push(nestweaver_engine::blast_radius::Notification {
                 level: nestweaver_engine::blast_radius::NotificationLevel::Error,
-                message: refusal.message(),
+                message: refusal.edge_analysis_message(),
                 descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
             });
         // `render_blast_summary` appends `[status: …]` for any non-Complete
@@ -12267,6 +12823,7 @@ fn tool_blast_radius(
         "status": status_json,
         "gate_state": gate_state_json,
         "notifications": notifications_json,
+        "resolver_stale_repos": result.resolver_stale_repos,
         "changed_symbols": changed_json,
         "changed_symbol_count": changed_json.len(),
         "affected_symbols": affected_json,
@@ -12785,6 +13342,13 @@ thread_local! {
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SERVER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DIRECT_READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Explicit host attestation that the CURRENT synchronous dispatch runs
+    // while the daemon/direct caller still holds its authoritative writer
+    // lease. Default-deny is deliberate: an in-process HTTP/MCP route that
+    // forgets the host hook must refuse consolidation apply, not become a
+    // second writer.
+    static AUTHORITATIVE_WRITER_OWNERSHIP_DEPTH: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
     // F16 response cache: size cap (MiB) and per-session hit/miss counters.
     static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
         const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
@@ -13168,6 +13732,49 @@ pub fn is_direct_read_only() -> bool {
     DIRECT_READ_ONLY.with(|value| value.get())
 }
 
+/// Run one synchronous tool dispatch while the HOST attests that it holds the
+/// canonical writer lease for the full closure lifetime.
+///
+/// This is an assertion boundary, not a lock implementation. The daemon must
+/// enter it only inside its existing write-gated mutation closure; a direct
+/// host must enter it only while its cross-process DB write lease is alive.
+/// Keeping it closure-scoped and thread-local prevents ownership from leaking
+/// to a later request on a reused blocking worker. Do not hold this scope
+/// across `.await`; enter it on the same blocking thread that calls
+/// [`dispatch`] or [`dispatch_cancellable`].
+pub fn with_authoritative_writer_ownership<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(u32);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AUTHORITATIVE_WRITER_OWNERSHIP_DEPTH.with(|depth| depth.set(self.0));
+        }
+    }
+
+    AUTHORITATIVE_WRITER_OWNERSHIP_DEPTH.with(|depth| {
+        let previous = depth.get();
+        depth.set(
+            previous
+                .checked_add(1)
+                .expect("authoritative writer ownership nesting overflow"),
+        );
+        let restore = Restore(previous);
+        let result = operation();
+        drop(restore);
+        result
+    })
+}
+
+fn require_authoritative_writer_ownership(operation: &str) -> Result<(), anyhow::Error> {
+    let owned = AUTHORITATIVE_WRITER_OWNERSHIP_DEPTH.with(|depth| depth.get() > 0);
+    if !owned {
+        anyhow::bail!(
+            "refusing to {operation}: authoritative writer ownership was not established by the MCP host"
+        );
+    }
+    Ok(())
+}
+
 pub fn set_allowed_tools(names: Vec<String>) {
     ALLOWED_TOOLS.with(|c| *c.borrow_mut() = Some(names));
 }
@@ -13295,6 +13902,14 @@ fn daemon_brain_search_response_to_json(
     });
     if !response.expansion_terms.is_empty() {
         value["expansion_terms"] = json!(response.expansion_terms);
+    }
+    if let Some(detail) = &response.semantic_unavailable {
+        value["semantic_unavailable"] = json!({
+            "cause": detail.cause,
+            "reason": detail.reason,
+            "error": detail.error,
+            "remediation": detail.remediation,
+        });
     }
     value
 }
@@ -14517,58 +15132,17 @@ fn resolver_generation_refusal(
 /// missing edge makes the affected-test set SMALLER: the regression test that
 /// would have caught the change is never selected, the gate reports success,
 /// and there is no list for anyone to review. A test selector that refuses is
-/// safe; one that silently narrows is not.
-const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
-     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
-     safer — it can only drop a test that should have run, while `status` still reads complete. \
-     The error is one-directional and it is silent: nothing downstream can tell a test that was \
-     not selected from a test that does not exist.";
-
-/// Turn the shared resolver-generation verdict into `affected_tests`'
-/// refusal.
+/// Turn the shared resolver-generation verdict into `affected-tests`' refusal.
 ///
-/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
-/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
-/// `status`, same `remedies` array of ready-to-run
-/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
-/// a CI job already gates on. Only two things are tool-specific:
-///
-///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
-///    "dead-code will not produce a list on this graph", which is the wrong
-///    sentence in front of the right remedies.
-///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
-///    consumer of this tool acts on, and the refusal deliberately carries no
-///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
-///    get tiers" would read the refusal as "no tests affected", which is the
-///    exact silent narrowing this refusal exists to prevent. It is the same
-///    fail-safe widening value the tool already emits for any non-complete
-///    run, so the vocabulary is unchanged.
+/// nw-412. Built ONCE in the engine
+/// (`DeadCodeRefusal::affected_tests_payload`) and shared with the CLI's direct
+/// and daemon routes, so a CI gate cannot tell which route answered. This and
+/// its `src/main.rs` twin previously each carried their own copy of the
+/// preamble constant and the remedy-rendering loop.
 fn affected_tests_refusal_payload(
     refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
 ) -> Value {
-    let mut payload = refusal.payload();
-    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
-    for remedy in payload
-        .get("remedies")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        match remedy.get("command").and_then(Value::as_str) {
-            Some(command) => note.push_str(&format!("\n  {command}")),
-            None => note.push_str(&format!(
-                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
-                 pass to `--repo`; re-index it where it lives",
-                remedy
-                    .get("uid")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(unnamed repo)")
-            )),
-        }
-    }
-    payload["note"] = json!(note);
-    payload["recommendation"] = json!("run-full-suite");
-    payload
+    refusal.affected_tests_payload()
 }
 
 /// The notification `blast_radius` attaches when its graph is
@@ -16338,6 +16912,7 @@ mod cache_dispatch_tests {
         reset_session();
         let (_dir, db_path) = index_on_disk();
         set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         write_marker(&db_path, std::process::id(), None);
         let store = GraphStore::open(&db_path).unwrap();
 
@@ -16395,18 +16970,21 @@ mod cache_dispatch_tests {
         let (_dir, db_path) = index_on_disk();
         set_current_db_path(db_path.clone());
         let marker = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        let writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
         write_marker(&db_path, std::process::id(), None);
         let store = GraphStore::open(&db_path).unwrap();
 
-        // The clearer touches ONLY the marker file — it never acquires or
-        // releases the publication lease, so the in-process condvar is never
-        // notified. This is what an out-of-process writer looks like from
-        // here, and it is why the wait must poll the file.
+        // The clearer owns canonical writer authority but never acquires or
+        // releases the in-process publication lease, so the condvar is never
+        // notified. This preserves the out-of-process marker-clear behavior
+        // that makes the wait poll the file while proving a real writer can
+        // finish and release its authority.
         let clearer = std::thread::spawn({
             let marker = marker.clone();
             move || {
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 fs::remove_file(&marker).unwrap();
+                drop(writer_authority);
             }
         });
 
@@ -17593,11 +18171,160 @@ mod arg_alias_tests {
     fn detect_changes_accepts_changed_files_and_files_alias() {
         let store = GraphStore::in_memory().unwrap();
         let via_new =
-            tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
+            tool_detect_changes(&store, json!({ "changed_files": ["  src/a.rs  "] })).unwrap();
         assert_eq!(via_new["files"], json!(["src/a.rs"]));
         let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
         assert_eq!(via_alias["files"], json!(["src/b.rs"]));
         assert!(tool_detect_changes(&store, json!({})).is_err());
+    }
+
+    #[test]
+    fn every_changed_file_handler_rejects_blank_and_mixed_lists_before_analysis() {
+        let store = GraphStore::in_memory().unwrap();
+        for files in [json!(["  "]), json!(["src/ok.rs", "\t"])] {
+            let detect = tool_detect_changes(&store, json!({ "changed_files": files.clone() }))
+                .unwrap_err()
+                .to_string();
+            assert!(detect.contains("changed_files["), "{detect}");
+
+            let affected =
+                tool_affected_tests(&store, json!({ "changed_files": files.clone() }), None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(affected.contains("changed_files["), "{affected}");
+
+            let blast = tool_blast_radius(&store, json!({ "changed_files": files }), None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(blast.contains("changed_files["), "{blast}");
+        }
+    }
+
+    #[test]
+    fn changed_file_tools_reject_explicit_oversized_and_overlong_lists_atomically() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let empty = tool_affected_tests(&store, json!({ "changed_files": [] }), None)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("at least one"), "{empty}");
+
+        let too_many = vec!["src/lib.rs"; 1001];
+        let count_error = tool_affected_tests(&store, json!({ "changed_files": too_many }), None)
+            .unwrap_err()
+            .to_string();
+        assert!(count_error.contains("1001"), "{count_error}");
+        assert!(count_error.contains("maximum is 1000"), "{count_error}");
+        for error in [
+            tool_detect_changes(&store, json!({ "changed_files": vec!["src/lib.rs"; 1001] }))
+                .unwrap_err()
+                .to_string(),
+            tool_blast_radius(
+                &store,
+                json!({ "changed_files": vec!["src/lib.rs"; 1001] }),
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+        ] {
+            assert!(error.contains("maximum is 1000"), "{error}");
+        }
+
+        let too_long = format!("src/{}", "a".repeat(509));
+        assert!(too_long.len() > 512);
+        let length_error = tool_affected_tests(
+            &store,
+            json!({ "changed_files": ["src/valid.rs", too_long] }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(length_error.contains("changed_files[1]"), "{length_error}");
+        assert!(length_error.contains("maximum is 512"), "{length_error}");
+        for error in [
+            tool_detect_changes(
+                &store,
+                json!({ "changed_files": ["src/valid.rs", format!("src/{}", "a".repeat(509))] }),
+            )
+            .unwrap_err()
+            .to_string(),
+            tool_blast_radius(
+                &store,
+                json!({ "changed_files": ["src/valid.rs", format!("src/{}", "a".repeat(509))] }),
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+        ] {
+            assert!(error.contains("changed_files[1]"), "{error}");
+            assert!(error.contains("maximum is 512"), "{error}");
+        }
+    }
+
+    #[test]
+    fn changed_file_tools_serialize_one_shared_future_generation_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("future.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let repo_uid = "repo:default:future";
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.to_string(),
+                url: "file:///tmp/future".to_string(),
+                indexed_sha: "deadbeef".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: Some("/tmp/future".to_string()),
+            })
+            .unwrap();
+        nestweaver_engine::resolver_generation::record(&db, repo_uid).unwrap();
+        let mut generations = nestweaver_engine::resolver_generation::load(&db);
+        generations.repos.insert(
+            repo_uid.to_string(),
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION + 1,
+        );
+        std::fs::write(
+            nestweaver_engine::sidecar_path(
+                &db,
+                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+            ),
+            serde_json::to_string(&generations).unwrap(),
+        )
+        .unwrap();
+
+        let detect =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/new.rs"] })).unwrap();
+        let affected =
+            tool_affected_tests(&store, json!({ "changed_files": ["src/new.rs"] }), None).unwrap();
+        let blast = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/new.rs"] }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        for payload in [&detect, &affected, &blast] {
+            assert_eq!(payload["resolver_stale_repos"], json!([repo_uid]));
+            assert!(
+                payload["notifications"]
+                    .as_array()
+                    .is_some_and(|notifications| {
+                        notifications.iter().any(|notification| {
+                            notification["descriptor"]
+                                == json!(
+                            nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR
+                        )
+                        })
+                    })
+            );
+        }
+        assert_eq!(detect["gate_state"], json!("degraded-unknown"));
+        assert_eq!(blast["gate_state"], json!("degraded-unknown"));
+        assert_eq!(affected["recommendation"], json!("run-full-suite"));
     }
 
     #[test]
@@ -18124,6 +18851,196 @@ mod blast_radius_visibility_tests {
         assert!(
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
+        );
+    }
+
+    #[test]
+    fn restricted_symbol_topology_tools_never_cross_a_two_repo_boundary() {
+        let store = cross_repo_store();
+        let api_only = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let client_only = VisibleRepos::Only(["repo:client".to_string()].into_iter().collect());
+
+        let contracts =
+            tool_cross_repo_contracts(&store, json!({ "uid": "api" }), Some(&api_only)).unwrap();
+        let contracts_json = serde_json::to_string(&contracts).unwrap();
+        assert!(!contracts_json.contains("repo:client"), "{contracts_json}");
+        assert!(!contracts_json.contains("Caller"), "{contracts_json}");
+
+        let flow = tool_flow_trace(
+            &store,
+            json!({ "symbol": "Caller", "max_depth": 3 }),
+            None,
+            Some(&client_only),
+        )
+        .unwrap();
+        let flow_json = serde_json::to_string(&flow).unwrap();
+        assert!(!flow_json.contains("repo:api"), "{flow_json}");
+        assert!(!flow_json.contains("Handler"), "{flow_json}");
+        assert!(
+            tool_flow_trace(
+                &store,
+                json!({ "symbol": "Handler" }),
+                None,
+                Some(&client_only),
+            )
+            .is_err(),
+            "a hidden seed must look absent"
+        );
+    }
+
+    #[test]
+    fn detect_changes_recomputes_visible_counts_and_suppresses_unowned_process_details() {
+        let store = cross_repo_store();
+        let mut hidden = store.lookup_symbol("client").unwrap();
+        hidden.uid = "hidden-same-path".to_string();
+        hidden.name = "HiddenSamePath".to_string();
+        hidden.file_path = "src/api.rs".to_string();
+        store.insert_symbol(&hidden).unwrap();
+
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let result = tool_detect_changes_scoped(
+            &store,
+            json!({ "changed_files": ["src/api.rs"] }),
+            Some(&visible),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("HiddenSamePath"), "{encoded}");
+        assert!(!encoded.contains("repo:client"), "{encoded}");
+        assert_eq!(result["affected_symbol_count"], 1);
+        assert_eq!(result["affected_process_count"], 0);
+        assert_eq!(result["gate_state"], "degraded-unknown");
+        assert_eq!(result["risk"], Value::Null);
+        assert_eq!(result["process_analysis_unavailable"], true);
+    }
+
+    #[test]
+    fn restricted_edge_tools_redact_hidden_resolver_staleness_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("resolver-scope.lbug")).unwrap();
+        let repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.test/{uid}"),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        for uid in ["repo:visible", "repo:hidden"] {
+            store.insert_repo(&repo(uid)).unwrap();
+        }
+        let symbol = |uid: &str, name: &str, repo_uid: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: "src/shared.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash:{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&symbol("visible-symbol", "VisibleSymbol", "repo:visible"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("hidden-symbol", "HiddenSymbol", "repo:hidden"))
+            .unwrap();
+
+        // No resolver-generation sidecar: both repositories are incompatible,
+        // but the restricted caller must see only its own stale UID.
+        let visible = VisibleRepos::Only(["repo:visible".to_string()].into_iter().collect());
+        let detect = tool_detect_changes_scoped(
+            &store,
+            json!({ "changed_files": ["src/shared.rs"] }),
+            Some(&visible),
+        )
+        .unwrap();
+        let detect_json = serde_json::to_string(&detect).unwrap();
+        assert!(detect_json.contains("repo:visible"), "{detect_json}");
+        assert!(!detect_json.contains("repo:hidden"), "{detect_json}");
+        assert!(!detect_json.contains("HiddenSymbol"), "{detect_json}");
+
+        let impact = tool_brain_impact(
+            &store,
+            json!({ "symbol": "VisibleSymbol" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(impact.contains("brain_impact refused"), "{impact}");
+        assert!(impact.contains("repo:visible"), "{impact}");
+        assert!(!impact.contains("repo:hidden"), "{impact}");
+        assert!(impact.contains("--force"), "{impact}");
+    }
+
+    /// The shared `resolver-generation-incompatible` descriptor is what a CI
+    /// consumer keys on -- the prose message is redacted for a restricted
+    /// caller, so the descriptor is the only machine-readable signal left. The
+    /// restricted `detect_changes` path returns early with its own hand-built
+    /// payload and carried only the authz notification, so the same stale graph
+    /// announced itself on the unrestricted route and stayed silent on the
+    /// restricted one.
+    #[test]
+    fn restricted_detect_changes_still_carries_the_resolver_incompatibility_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("descriptor.lbug")).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:visible".to_string(),
+                url: "https://example.test/visible".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "inst".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let descriptor = nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR;
+        let has_descriptor = |value: &Value| {
+            value["notifications"]
+                .as_array()
+                .is_some_and(|notifications| {
+                    notifications.iter().any(|n| n["descriptor"] == descriptor)
+                })
+        };
+
+        // No sidecar, so the repository is resolver-incompatible on both routes.
+        let unrestricted =
+            tool_detect_changes_scoped(&store, json!({ "changed_files": ["src/a.rs"] }), None)
+                .unwrap();
+        assert!(
+            has_descriptor(&unrestricted),
+            "precondition: the unrestricted route announces incompatibility: {unrestricted}"
+        );
+
+        let visible = VisibleRepos::Only(["repo:visible".to_string()].into_iter().collect());
+        let restricted = tool_detect_changes_scoped(
+            &store,
+            json!({ "changed_files": ["src/a.rs"] }),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            restricted["resolver_stale_repos"],
+            json!(["repo:visible"]),
+            "{restricted}"
+        );
+        assert!(
+            has_descriptor(&restricted),
+            "the restricted route must carry the same descriptor: {restricted}"
         );
     }
 
@@ -20427,6 +21344,61 @@ mod repo_visibility_coverage_tests {
         let text = format!("{error:#}");
         assert!(text.contains("repository-scoped caller"), "{text}");
         assert!(text.contains("nw-403"), "{text}");
+    }
+
+    /// A visible symbol UID is not authority over arbitrary bytes at the same
+    /// repo-relative path. Restricted callers must never be able to pair an
+    /// authorized graph row with a caller-selected checkout's file content.
+    #[test]
+    fn scoped_source_body_routes_refuse_before_reading_a_caller_selected_root() {
+        const CANARY: &str = "hidden-root-body-canary";
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/alpha.py"), format!("{CANARY}\n")).unwrap();
+
+        let read_args = json!({
+            "targets": ["sym:alpha:public"],
+            "root": root.path().to_string_lossy()
+        });
+        let unscoped = call(&store, "read_symbols", &read_args, None);
+        assert!(
+            unscoped.contains(CANARY),
+            "counterweight: the supplied root must actually reach the source-body path: {unscoped}"
+        );
+
+        for (name, args) in [
+            ("read_symbols", read_args),
+            (
+                "brain_context",
+                json!({
+                    "seeds": ["alphaPublicHelper"],
+                    "response_format": "detailed",
+                    "include_bodies": true,
+                    "root": root.path().to_string_lossy()
+                }),
+            ),
+            (
+                "brain_search",
+                json!({
+                    "query": "alphaPublicHelper",
+                    "response_format": "detailed",
+                    "include_bodies": true,
+                    "root": root.path().to_string_lossy()
+                }),
+            ),
+        ] {
+            let refused = call(&store, name, &args, Some(&visible));
+            assert!(
+                refused.contains("repository-scoped caller"),
+                "{name} must explain the authorization refusal: {refused}"
+            );
+            assert!(
+                !refused.contains(CANARY),
+                "{name} read caller-selected source before refusing: {refused}"
+            );
+        }
     }
 
     /// The redactor, exercised directly on a `regex_search`-shaped payload.

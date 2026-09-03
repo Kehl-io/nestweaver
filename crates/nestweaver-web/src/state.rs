@@ -112,6 +112,10 @@ pub struct AdminState {
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
     pub active_writes: Arc<AtomicU32>,
+    /// Once set, new admin mutations must be refused. This is the daemon's
+    /// shutdown-admission flag, paired with `active_writes` so the drain cannot
+    /// observe zero and finish while an HTTP admin mutation starts behind it.
+    pub shutdown_started: Arc<AtomicBool>,
     /// Live count of active MCP-over-HTTP sessions, shared with the MCP handler
     /// (which republishes `sessions.len()` on insert/expiry). Surfaced as the
     /// dashboard's "connected MCP clients". Zero when server mode is off.

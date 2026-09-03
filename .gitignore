@@ -40,6 +40,15 @@ id_ed25519
 # Never remove one by hand; stop the holder with `nestweaver daemon stop`.
 *.lbug.*
 
+# The shared write-namespace lock does NOT live beside the database: it is
+# created in the STABLE PARENT of the data directory, keyed by that directory's
+# name, so a restore that renames the data directory cannot swap the lock out
+# from under itself. `*.lbug.*` therefore cannot match it -- the name derives
+# from the directory, not the database. `nestweaver index --db ./nwdb/g.lbug`
+# creates `./.nwdb.nestweaver-write-namespace.lock` one level up. Same rule as
+# above: it is a LIVE lock while a writer holds it, so never delete one by hand.
+.*.nestweaver-write-namespace.lock
+
 # OS files
 Thumbs.db
 

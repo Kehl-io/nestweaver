@@ -298,6 +298,17 @@ fn merge_honesty_fields(local: &Value, server: &Value, response: &mut Value) {
 
     response["semantic_applied"] = Value::Bool(semantic_applied);
     response["degraded_components"] = serde_json::json!(degraded);
+    // The typed daemon transport carries the structured explanation beside
+    // `degraded_components`. Preserve it through the JSON merge as well;
+    // otherwise a daemon-routed MCP response would lose the actionable cause
+    // as soon as it was combined with a local tier. Local-first matches the
+    // surrounding provenance/encounter-order convention.
+    if let Some(detail) = tiers
+        .iter()
+        .find_map(|value| value.get("semantic_unavailable"))
+    {
+        response["semantic_unavailable"] = detail.clone();
+    }
 }
 
 /// Count the number of result items in a JSON response.
@@ -2282,6 +2293,28 @@ mod tests {
             merged["degraded_components"],
             json!(["semantic", "reranker", "expansion"]),
             "union in local-then-server encounter order, deduplicated"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_structured_semantic_unavailability() {
+        let local = brain_search_tier("a", false, &[]);
+        let mut server = brain_search_tier("b", false, &["semantic"]);
+        server["semantic_unavailable"] = json!({
+            "cause": "embedding_identity",
+            "reason": "embedding_identity_unreadable",
+            "error": "malformed persisted metadata",
+            "remediation": "repair the identity",
+        });
+
+        let merged = merge_json_results(&local, &server);
+        assert_eq!(
+            merged["semantic_unavailable"]["reason"],
+            "embedding_identity_unreadable"
+        );
+        assert_eq!(
+            merged["semantic_unavailable"]["error"],
+            "malformed persisted metadata"
         );
     }
 

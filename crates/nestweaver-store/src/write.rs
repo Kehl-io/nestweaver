@@ -63,6 +63,42 @@ fn validate_edge_pairs(
     Ok(())
 }
 
+fn same_materialized_note(existing: &Note, desired: &Note) -> bool {
+    existing.uid == desired.uid
+        && existing.vault_uid == desired.vault_uid
+        && existing.file_path == desired.file_path
+        && existing.title == desired.title
+        && existing.note_kind == desired.note_kind
+        && existing.word_count == desired.word_count
+        && existing.content_hash == desired.content_hash
+        && existing.frontmatter == desired.frontmatter
+        && existing.frontmatter_raw == desired.frontmatter_raw
+        && existing.created_at == desired.created_at
+        && existing.modified_at == desired.modified_at
+}
+
+fn same_materialized_heading(existing: &Heading, desired: &Heading) -> bool {
+    existing.uid == desired.uid
+        && existing.note_uid == desired.note_uid
+        && existing.level == desired.level
+        && existing.text == desired.text
+        && existing.slug == desired.slug
+        && existing.start_line == desired.start_line
+        && existing.end_line == desired.end_line
+        && existing.content_hash == desired.content_hash
+}
+
+fn same_materialized_section(existing: &Section, desired: &Section) -> bool {
+    existing.uid == desired.uid
+        && existing.note_uid == desired.note_uid
+        && existing.heading_uid == desired.heading_uid
+        && existing.start_line == desired.start_line
+        && existing.end_line == desired.end_line
+        && existing.text_hash == desired.text_hash
+        && existing.text_content == desired.text_content
+        && existing.word_count == desired.word_count
+}
+
 /// `Meta.key` prefix for the per-repo contract-derivation failure marker.
 ///
 /// The full key is `<prefix><repo_uid>`. Contract derivation is best-effort at
@@ -142,6 +178,71 @@ pub enum ProjectMutationDisposition {
     /// The database may have committed or a required rollback could not be
     /// confirmed. Callers must reconcile against graph liveness.
     Ambiguous,
+}
+
+/// Whether an atomic Project-subgraph replacement published new graph state.
+///
+/// The engine uses this proof to publish exactly one new graph generation for
+/// a committed materialization, while keeping an idempotent rerun at the
+/// current generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplaceMaterializedProjectsOutcome {
+    pub disposition: ProjectMutationDisposition,
+}
+
+impl ReplaceMaterializedProjectsOutcome {
+    pub fn changed(self) -> bool {
+        self.disposition == ProjectMutationDisposition::Changed
+    }
+}
+
+/// A failed materialized-Project replacement together with the strongest
+/// final-state proof available to publication callers.
+#[derive(Debug)]
+pub struct ReplaceMaterializedProjectsError {
+    pub disposition: ProjectMutationDisposition,
+    pub primary: StoreError,
+}
+
+impl ReplaceMaterializedProjectsError {
+    fn unchanged(primary: StoreError) -> Self {
+        Self {
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            primary,
+        }
+    }
+
+    fn restored(primary: StoreError) -> Self {
+        Self {
+            disposition: ProjectMutationDisposition::ConfirmedRolledBack,
+            primary,
+        }
+    }
+
+    fn ambiguous(primary: StoreError) -> Self {
+        Self {
+            disposition: ProjectMutationDisposition::Ambiguous,
+            primary,
+        }
+    }
+}
+
+impl std::fmt::Display for ReplaceMaterializedProjectsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Project materialization ({:?}) failed: {}",
+            self.disposition, self.primary
+        )
+    }
+}
+
+impl std::error::Error for ReplaceMaterializedProjectsError {}
+
+impl From<StoreError> for ReplaceMaterializedProjectsError {
+    fn from(primary: StoreError) -> Self {
+        Self::unchanged(primary)
+    }
 }
 
 /// Confirmed result of an atomic Project cascade.
@@ -4192,6 +4293,7 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_note_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         // A dimension-guard rejection is logged by the index; nothing was
         // inserted, so skip the flush.
         if self.add_embedding(uid, embedding.to_vec()) {
@@ -4206,6 +4308,7 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_heading_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         if self.add_embedding(uid, embedding.to_vec()) {
             self.flush_embedding_index()?;
         }
@@ -4218,6 +4321,7 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_symbol_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        self.require_verified_embedding_identity()?;
         if self.add_embedding(uid, embedding.to_vec()) {
             self.flush_embedding_index()?;
         }
@@ -5309,7 +5413,7 @@ impl GraphStore {
         symbol_edges: &[(String, String)],
         component_edges: &[(String, String)],
         parent_edges: &[(String, String)],
-    ) -> Result<(), StoreError> {
+    ) -> Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError> {
         let target_uids = projects
             .iter()
             .map(|project| project.uid.as_str())
@@ -5324,7 +5428,8 @@ impl GraphStore {
             {
                 return Err(StoreError::Query(format!(
                     "{relationship} source Project {source} is not configured"
-                )));
+                ))
+                .into());
             }
         }
         for (relationship, edges) in [
@@ -5337,7 +5442,8 @@ impl GraphStore {
             {
                 return Err(StoreError::Query(format!(
                     "{relationship} source Project {source} is not configured"
-                )));
+                ))
+                .into());
             }
             if let Some((_, target)) = edges
                 .iter()
@@ -5345,7 +5451,8 @@ impl GraphStore {
             {
                 return Err(StoreError::Query(format!(
                     "{relationship} target Project {target} is not configured"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -5374,6 +5481,389 @@ impl GraphStore {
         )
     }
 
+    /// Atomically reconcile Projects discovered from vault folders and only
+    /// their note memberships.
+    ///
+    /// Implicit detection is not authoritative for configured repository,
+    /// component, or parent topology. Feeding empty arrays for those
+    /// relationship kinds to [`Self::replace_materialized_projects`] would
+    /// therefore erase valid configured edges. This narrow entry point carries
+    /// the incumbent non-note relationships into the replacement transaction
+    /// unchanged while retaining its rollback/recovery guarantees.
+    pub fn replace_implicit_project_note_memberships(
+        &self,
+        projects: &[Project],
+        note_edges: &[(String, String)],
+    ) -> Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError> {
+        let target_uids = projects
+            .iter()
+            .map(|project| project.uid.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if let Some((source, _)) = note_edges
+            .iter()
+            .find(|(source, _)| !target_uids.contains(source.as_str()))
+        {
+            return Err(StoreError::Query(format!(
+                "PROJECT_INCLUDES_NOTE source Project {source} was not implicitly detected"
+            ))
+            .into());
+        }
+
+        let existing = self.list_projects()?;
+        // Folder detection only knows the synthetic identity it would use for
+        // a new implicit Project. When that UID is already configured, its
+        // authored metadata remains authoritative; implicit detection owns
+        // only the Project's note membership.
+        let reconciled_projects = projects
+            .iter()
+            .map(|detected| {
+                existing
+                    .iter()
+                    .find(|project| project.uid == detected.uid)
+                    .cloned()
+                    .unwrap_or_else(|| detected.clone())
+            })
+            .collect::<Vec<_>>();
+        let target_names = projects
+            .iter()
+            .map(|project| project.name.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let stale_uids = existing
+            .iter()
+            .filter(|project| {
+                target_names.contains(&project.name.to_lowercase())
+                    && !target_uids.contains(project.uid.as_str())
+            })
+            .map(|project| project.uid.clone())
+            .collect::<Vec<_>>();
+
+        // Passing the complete incumbent sets makes them desired state for
+        // this transaction, so only PROJECT_INCLUDES_NOTE is reconciled for
+        // the detected Projects.
+        let symbol_edges = self
+            .list_project_edge_pairs("PROJECT_INCLUDES_SYMBOL")?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let component_edges = self
+            .list_project_edge_pairs("PROJECT_HAS_COMPONENT")?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_edges = self
+            .list_project_edge_pairs("PROJECT_HAS_PARENT")?
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        self.replace_materialized_projects_transaction(
+            &reconciled_projects,
+            note_edges,
+            &symbol_edges,
+            &component_edges,
+            &parent_edges,
+            &stale_uids,
+            true,
+        )
+    }
+
+    /// Replace one externally-fetched wiki Note and its complete structural
+    /// topology in a single transaction, then attach it to its Project.
+    ///
+    /// The old materializer performed Note, Heading, Section, and edge writes
+    /// independently and ignored several failures. A successful return could
+    /// consequently describe a partially-published document. This operation
+    /// either leaves an already-identical topology untouched or publishes the
+    /// complete replacement atomically.
+    pub fn replace_project_wiki_note(
+        &self,
+        project_uid: &str,
+        note: &Note,
+        headings: &[Heading],
+        sections: &[Section],
+    ) -> Result<ReplaceMaterializedProjectsOutcome, StoreError> {
+        self.replace_project_wiki_note_memberships(
+            &[project_uid.to_string()],
+            note,
+            headings,
+            sections,
+        )
+    }
+
+    /// Replace one externally-fetched wiki Note and attach its complete set of
+    /// configured Project memberships in the same transaction.
+    pub fn replace_project_wiki_note_memberships(
+        &self,
+        project_uids: &[String],
+        note: &Note,
+        headings: &[Heading],
+        sections: &[Section],
+    ) -> Result<ReplaceMaterializedProjectsOutcome, StoreError> {
+        let desired_project_uid_refs = unique_uid_set(
+            "wiki Project membership",
+            project_uids.iter().map(String::as_str),
+        )?;
+        if desired_project_uid_refs.is_empty() {
+            return Err(StoreError::Query(format!(
+                "wiki Note {} has no configured Project membership",
+                note.uid
+            )));
+        }
+        let desired_project_uids = desired_project_uid_refs
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>();
+        let existing_project_uids = self
+            .list_projects()?
+            .into_iter()
+            .map(|project| project.uid)
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(project_uid) = desired_project_uids
+            .iter()
+            .find(|project_uid| !existing_project_uids.contains(*project_uid))
+        {
+            return Err(StoreError::Query(format!(
+                "wiki Note {} references missing Project {project_uid}",
+                note.uid
+            )));
+        }
+        let heading_uids = unique_uid_set(
+            "wiki Heading",
+            headings.iter().map(|heading| heading.uid.as_str()),
+        )?;
+        let _section_uids = unique_uid_set(
+            "wiki Section",
+            sections.iter().map(|section| section.uid.as_str()),
+        )?;
+        for heading in headings {
+            if heading.note_uid != note.uid {
+                return Err(StoreError::Query(format!(
+                    "wiki Heading {} belongs to {}, expected {}",
+                    heading.uid, heading.note_uid, note.uid
+                )));
+            }
+        }
+        for section in sections {
+            if section.note_uid != note.uid
+                || section
+                    .heading_uid
+                    .as_deref()
+                    .is_some_and(|uid| !heading_uids.contains(uid))
+            {
+                return Err(StoreError::Query(format!(
+                    "wiki Section {} references an endpoint outside Note {} replacement input",
+                    section.uid, note.uid
+                )));
+            }
+        }
+
+        if self.project_wiki_note_matches(&desired_project_uids, note, headings, sections)? {
+            return Ok(ReplaceMaterializedProjectsOutcome {
+                disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            });
+        }
+
+        let note_heading_edges = headings
+            .iter()
+            .map(|heading| (note.uid.as_str(), heading.uid.as_str()))
+            .collect::<Vec<_>>();
+        let note_section_edges = sections
+            .iter()
+            .map(|section| (note.uid.as_str(), section.uid.as_str()))
+            .collect::<Vec<_>>();
+        let heading_section_edges = sections
+            .iter()
+            .filter_map(|section| {
+                section
+                    .heading_uid
+                    .as_deref()
+                    .map(|heading_uid| (heading_uid, section.uid.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let project_note_edges = project_uids
+            .iter()
+            .map(|project_uid| (project_uid.as_str(), note.uid.as_str()))
+            .collect::<Vec<_>>();
+
+        let conn = self.begin_transaction()?;
+        let mutation = (|| {
+            Self::delete_note_cascade_on(&conn, &note.uid)?;
+            Self::batch_insert_notes_on(&conn, std::slice::from_ref(note))?;
+            Self::batch_insert_headings_on(&conn, headings)?;
+            Self::batch_insert_sections_on(&conn, sections)?;
+            Self::batch_insert_note_heading_edges_on(&conn, &note_heading_edges)?;
+            Self::batch_insert_note_section_edges_on(&conn, &note_section_edges)?;
+            Self::batch_insert_heading_section_edges_on(&conn, &heading_section_edges)?;
+            Self::batch_insert_project_note_edges_on(&conn, &project_note_edges)?;
+            Self::mark_regex_scope_dirty_on(&conn, &note.vault_uid, false)?;
+            Ok(())
+        })();
+        if let Err(error) = mutation {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StoreError::Query(format!(
+                    "{error}; atomic wiki Note replacement rollback failed: {rollback}"
+                ))),
+            };
+        }
+        if let Err(error) = self.commit_transaction(&conn) {
+            return Err(StoreError::Query(format!(
+                "atomic wiki Note replacement commit failed: {error}"
+            )));
+        }
+        Ok(ReplaceMaterializedProjectsOutcome {
+            disposition: ProjectMutationDisposition::Changed,
+        })
+    }
+
+    fn project_wiki_note_matches(
+        &self,
+        desired_project_uids: &std::collections::HashSet<String>,
+        desired_note: &Note,
+        desired_headings: &[Heading],
+        desired_sections: &[Section],
+    ) -> Result<bool, StoreError> {
+        let existing_note = match self.lookup_note(&desired_note.uid) {
+            Ok(note) => note,
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !same_materialized_note(&existing_note, desired_note) {
+            return Ok(false);
+        }
+
+        let mut existing_headings = self
+            .list_all_headings()?
+            .into_iter()
+            .filter(|heading| heading.note_uid == desired_note.uid)
+            .collect::<Vec<_>>();
+        let mut desired_headings = desired_headings.iter().collect::<Vec<_>>();
+        existing_headings.sort_by(|left, right| left.uid.cmp(&right.uid));
+        desired_headings.sort_by(|left, right| left.uid.cmp(&right.uid));
+        if existing_headings.len() != desired_headings.len()
+            || existing_headings
+                .iter()
+                .zip(&desired_headings)
+                .any(|(existing, desired)| !same_materialized_heading(existing, desired))
+        {
+            return Ok(false);
+        }
+
+        let mut existing_sections = self
+            .list_all_sections()?
+            .into_iter()
+            .filter(|section| section.note_uid == desired_note.uid)
+            .collect::<Vec<_>>();
+        let mut desired_sections = desired_sections.iter().collect::<Vec<_>>();
+        existing_sections.sort_by(|left, right| left.uid.cmp(&right.uid));
+        desired_sections.sort_by(|left, right| left.uid.cmp(&right.uid));
+        if existing_sections.len() != desired_sections.len()
+            || existing_sections
+                .iter()
+                .zip(&desired_sections)
+                .any(|(existing, desired)| !same_materialized_section(existing, desired))
+        {
+            return Ok(false);
+        }
+
+        let conn = self.conn()?;
+        let actual_project_notes = Self::list_string_targets_on(
+            &conn,
+            "MATCH (p:Project)-[:PROJECT_INCLUDES_NOTE]->(n:Note {uid: $uid}) RETURN p.uid",
+            &desired_note.uid,
+            "wiki Project membership",
+        )?;
+        if &actual_project_notes != desired_project_uids {
+            return Ok(false);
+        }
+        let actual_heading_uids = Self::list_string_targets_on(
+            &conn,
+            "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_HEADING]->(h:Heading) RETURN h.uid",
+            &desired_note.uid,
+            "wiki Note headings",
+        )?;
+        let desired_heading_uids = desired_headings
+            .iter()
+            .map(|heading| heading.uid.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if actual_heading_uids != desired_heading_uids {
+            return Ok(false);
+        }
+        let actual_section_uids = Self::list_string_targets_on(
+            &conn,
+            "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section) RETURN s.uid",
+            &desired_note.uid,
+            "wiki Note sections",
+        )?;
+        let desired_section_uids = desired_sections
+            .iter()
+            .map(|section| section.uid.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if actual_section_uids != desired_section_uids {
+            return Ok(false);
+        }
+
+        let actual_heading_sections = Self::list_string_pairs_on(
+            &conn,
+            "MATCH (h:Heading {note_uid: $uid})-[:HEADING_HAS_SECTION]->(s:Section) RETURN h.uid, s.uid",
+            &desired_note.uid,
+            "wiki heading sections",
+        )?;
+        let desired_heading_sections = desired_sections
+            .iter()
+            .filter_map(|section| {
+                section
+                    .heading_uid
+                    .as_ref()
+                    .map(|heading_uid| (heading_uid.clone(), section.uid.clone()))
+            })
+            .collect::<std::collections::HashSet<_>>();
+        Ok(actual_heading_sections == desired_heading_sections)
+    }
+
+    fn list_string_targets_on(
+        conn: &lbug::Connection<'_>,
+        query: &str,
+        uid: &str,
+        stage: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut statement = conn
+            .prepare(query)
+            .map_err(|error| StoreError::Query(format!("prepare {stage}: {error}")))?;
+        let rows = conn
+            .execute(
+                &mut statement,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute {stage}: {error}")))?;
+        rows.map(|row| match row.first() {
+            Some(lbug::Value::String(value)) => Ok(value.clone()),
+            _ => Err(StoreError::Query(format!("{stage}: malformed target uid"))),
+        })
+        .collect()
+    }
+
+    fn list_string_pairs_on(
+        conn: &lbug::Connection<'_>,
+        query: &str,
+        uid: &str,
+        stage: &str,
+    ) -> Result<std::collections::HashSet<(String, String)>, StoreError> {
+        let mut statement = conn
+            .prepare(query)
+            .map_err(|error| StoreError::Query(format!("prepare {stage}: {error}")))?;
+        let rows = conn
+            .execute(
+                &mut statement,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute {stage}: {error}")))?;
+        rows.map(|row| match (row.first(), row.get(1)) {
+            (Some(lbug::Value::String(source)), Some(lbug::Value::String(target))) => {
+                Ok((source.clone(), target.clone()))
+            }
+            _ => Err(StoreError::Query(format!("{stage}: malformed edge"))),
+        })
+        .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn replace_materialized_projects_transaction(
         &self,
@@ -5384,7 +5874,7 @@ impl GraphStore {
         parent_edges: &[(String, String)],
         stale_uids: &[String],
         recover_on_failure: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError> {
         let existing_note_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_NOTE")?;
         let existing_symbol_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_SYMBOL")?;
         let existing_component_edges = self.list_project_edge_pairs("PROJECT_HAS_COMPONENT")?;
@@ -5419,6 +5909,17 @@ impl GraphStore {
             .iter()
             .map(|project| project.uid.clone())
             .collect::<std::collections::HashSet<_>>();
+
+        let projects_changed = projects.iter().any(|desired| {
+            existing_projects
+                .iter()
+                .find(|existing| existing.uid == desired.uid)
+                .is_none_or(|existing| {
+                    existing.name != desired.name
+                        || existing.summary != desired.summary
+                        || existing.instance_id != desired.instance_id
+                })
+        });
 
         let note_additions = desired_note_edges
             .difference(&existing_note_edges)
@@ -5468,6 +5969,22 @@ impl GraphStore {
             })
             .cloned()
             .collect::<Vec<_>>();
+
+        if !projects_changed
+            && stale_uids.is_empty()
+            && note_additions.is_empty()
+            && symbol_additions.is_empty()
+            && component_additions.is_empty()
+            && parent_additions.is_empty()
+            && obsolete_note_edges.is_empty()
+            && obsolete_symbol_edges.is_empty()
+            && obsolete_component_edges.is_empty()
+            && obsolete_parent_edges.is_empty()
+        {
+            return Ok(ReplaceMaterializedProjectsOutcome {
+                disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            });
+        }
 
         let conn = self.begin_transaction()?;
         let mutation = (|| {
@@ -5530,11 +6047,13 @@ impl GraphStore {
             Err(error) => Err(error),
         };
         let Err(error) = publication else {
-            return Ok(());
+            return Ok(ReplaceMaterializedProjectsOutcome {
+                disposition: ProjectMutationDisposition::Changed,
+            });
         };
         let primary = Self::rollback_project_transaction(&conn, error, "Project materialization");
         if !recover_on_failure {
-            return Err(primary);
+            return Err(ReplaceMaterializedProjectsError::ambiguous(primary));
         }
 
         let snapshot_note_edges = existing_note_edges.into_iter().collect::<Vec<_>>();
@@ -5546,7 +6065,12 @@ impl GraphStore {
             .map(|project| project.uid.as_str())
             .collect::<std::collections::HashSet<_>>();
         let introduced_uids = self
-            .list_projects()?
+            .list_projects()
+            .map_err(|probe| {
+                ReplaceMaterializedProjectsError::ambiguous(StoreError::Query(format!(
+                    "{primary}; Project materialization recovery inventory failed: {probe}"
+                )))
+            })?
             .into_iter()
             .filter(|project| !snapshot_uids.contains(project.uid.as_str()))
             .map(|project| project.uid)
@@ -5560,10 +6084,13 @@ impl GraphStore {
             &introduced_uids,
             false,
         ) {
-            Ok(()) => Err(primary),
-            Err(recovery) => Err(StoreError::Query(format!(
-                "{primary}; Project materialization recovery failed: {recovery}"
-            ))),
+            Ok(_) => Err(ReplaceMaterializedProjectsError::restored(primary)),
+            Err(recovery) => Err(ReplaceMaterializedProjectsError::ambiguous(
+                StoreError::Query(format!(
+                    "{primary}; Project materialization recovery failed: {}",
+                    recovery.primary
+                )),
+            )),
         }
     }
 
@@ -7570,6 +8097,80 @@ impl GraphStore {
 
     // ── DB-level metadata ───────────────────────────────────────────────────
 
+    /// Intentionally discard an unreadable semantic space so it can be rebuilt.
+    ///
+    /// This is the only supported escape hatch from fail-closed embedding
+    /// identity degradation. It never adopts or guesses the malformed
+    /// metadata: every vector artifact is durably removed first, then the
+    /// authoritative Meta row is deleted in one transaction. If artifact
+    /// retirement fails, the unreadable database identity remains in place and
+    /// semantic reads/writes stay refused.
+    pub fn reset_embedding_space_for_identity_repair(&self) -> Result<usize, StoreError> {
+        // Sidecar retirement is an ordinary filesystem unlink and therefore
+        // is not protected by lbug's read-only connection. Refuse on the
+        // constructor-derived capability before touching any artifact; doing
+        // this only when the metadata transaction begins would return a
+        // read-only error after the durable vector index was already gone.
+        if !self.is_read_write() {
+            return Err(StoreError::Query(
+                "embedding identity repair requires a read-write store; no artifacts were modified"
+                    .to_string(),
+            ));
+        }
+        let mut embedding_index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut removed = embedding_index.len();
+
+        if let Some(db_path) = self.db_path.as_ref() {
+            for suffix in [".embeddings.journal", ".embeddings.bin", ".embeddings"] {
+                let mut path = db_path.as_os_str().to_owned();
+                path.push(suffix);
+                let path = std::path::PathBuf::from(path);
+                if suffix == ".embeddings.bin"
+                    && let Ok(index) = crate::search::EmbeddingIndex::load_binary_v2(&path)
+                {
+                    removed = removed.max(index.len());
+                }
+                crate::durable_sidecar::remove_file_durable_if_exists(&path).map_err(|error| {
+                    StoreError::Query(format!(
+                        "retire embedding artifact {} during identity repair: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
+
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION").map_err(|error| {
+            StoreError::Query(format!("begin embedding identity reset: {error}"))
+        })?;
+        let result = (|| {
+            exec_params(
+                &conn,
+                "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+                vec![("k", lbug::Value::String("embedding".to_string()))],
+            )?;
+            conn.query("COMMIT").map_err(|error| {
+                StoreError::Query(format!("commit embedding identity reset: {error}"))
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = conn.query("ROLLBACK");
+            return result.map(|()| removed);
+        }
+
+        embedding_index.clear();
+        embedding_index.set_recorded_model_id(None);
+        embedding_index.set_recorded_pipeline_fingerprint(None);
+        embedding_index.set_similarity(nestweaver_schema::EmbeddingSimilarity::Cosine);
+        embedding_index.reset_force_guard();
+        self.clear_embedding_identity_error();
+        Ok(removed)
+    }
+
     /// Persist the embedding model ID and vector dimension as a singleton
     /// `Meta` node in the database. lbug does not support MERGE or SET, so
     /// we use the established delete-then-create upsert pattern. The node
@@ -7603,23 +8204,36 @@ impl GraphStore {
         let conn = self.conn()?;
         let value = serde_json::to_string(pipeline)
             .map_err(|error| StoreError::Query(format!("serialize embedding pipeline: {error}")))?;
-        let _ = exec_params(
-            &conn,
-            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
-            vec![("k", lbug::Value::String("embedding".to_string()))],
-        );
-        let result = exec_params(
-            &conn,
-            "CREATE (:Meta {key: $k, value: $v})",
-            vec![
-                ("k", lbug::Value::String("embedding".to_string())),
-                ("v", lbug::Value::String(value)),
-            ],
-        );
+        conn.query("BEGIN TRANSACTION").map_err(|error| {
+            StoreError::Query(format!("begin embedding pipeline update: {error}"))
+        })?;
+        let result = (|| {
+            exec_params(
+                &conn,
+                "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+                vec![("k", lbug::Value::String("embedding".to_string()))],
+            )?;
+            exec_params(
+                &conn,
+                "CREATE (:Meta {key: $k, value: $v})",
+                vec![
+                    ("k", lbug::Value::String("embedding".to_string())),
+                    ("v", lbug::Value::String(value)),
+                ],
+            )?;
+            conn.query("COMMIT").map_err(|error| {
+                StoreError::Query(format!("commit embedding pipeline update: {error}"))
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = conn.query("ROLLBACK");
+        }
         if result.is_ok() {
             embedding_index.set_recorded_pipeline_fingerprint(Some(fingerprint));
             embedding_index.set_recorded_model_id(Some(pipeline.model_id.clone()));
             embedding_index.set_similarity(pipeline.similarity.clone());
+            self.clear_embedding_identity_error();
         }
         result
     }
@@ -7783,6 +8397,52 @@ impl GraphStore {
                 lbug::Value::String(format!("{CONTRACT_DERIVATION_DEBT_PREFIX}{repo_uid}")),
             )],
         )
+    }
+}
+
+#[cfg(test)]
+mod embedding_write_identity_tests {
+    use super::*;
+
+    #[test]
+    fn direct_embedding_updates_propagate_unreadable_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("embedding-write-identity.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("verified-model", 2).unwrap();
+
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String("embedding".to_string())),
+                ("value", lbug::Value::String("{not-json".to_string())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        drop(store);
+
+        let degraded = GraphStore::open(&db_path).unwrap();
+        for error in [
+            degraded
+                .update_note_embedding("note:rejected", &[1.0, 0.0])
+                .unwrap_err(),
+            degraded
+                .update_heading_embedding("heading:rejected", &[1.0, 0.0])
+                .unwrap_err(),
+            degraded
+                .update_symbol_embedding("symbol:rejected", &[1.0, 0.0])
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, StoreError::EmbeddingIdentityUnreadable { .. }),
+                "direct embedding update returned the wrong error: {error}"
+            );
+        }
     }
 }
 
@@ -10202,6 +10862,307 @@ mod tests {
     }
 
     #[test]
+    fn materialized_project_replacement_distinguishes_change_from_exact_noop() {
+        use nestweaver_schema::Project;
+
+        let store = GraphStore::in_memory().unwrap();
+        let project = Project {
+            uid: "proj:test:stable".to_string(),
+            name: "stable".to_string(),
+            summary: Some("same summary".to_string()),
+            instance_id: "test".to_string(),
+        };
+
+        let changed = store
+            .replace_materialized_projects(std::slice::from_ref(&project), &[], &[], &[], &[])
+            .unwrap();
+        assert_eq!(changed.disposition, ProjectMutationDisposition::Changed);
+
+        let unchanged = store
+            .replace_materialized_projects(std::slice::from_ref(&project), &[], &[], &[], &[])
+            .unwrap();
+        assert_eq!(
+            unchanged.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+
+        let mut revised = project;
+        revised.summary = Some("revised summary".to_string());
+        let revised = store
+            .replace_materialized_projects(std::slice::from_ref(&revised), &[], &[], &[], &[])
+            .unwrap();
+        assert_eq!(revised.disposition, ProjectMutationDisposition::Changed);
+    }
+
+    #[test]
+    fn implicit_project_replacement_preserves_configured_non_note_topology() {
+        use nestweaver_schema::{Note, NoteKind, Project, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().unwrap();
+        let detected = Project {
+            uid: "proj:test:implicit".to_string(),
+            name: "implicit".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        let implicit = Project {
+            uid: detected.uid.clone(),
+            name: "Configured display name".to_string(),
+            summary: Some("Configured summary".to_string()),
+            instance_id: "configured-instance".to_string(),
+        };
+        let related = Project {
+            uid: "proj:test:related".to_string(),
+            name: "related".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&implicit).unwrap();
+        store.insert_project(&related).unwrap();
+        for (uid, title) in [("note:old", "Old"), ("note:new", "New")] {
+            store
+                .insert_note(&Note {
+                    uid: uid.to_string(),
+                    vault_uid: "vault:test".to_string(),
+                    file_path: format!("Workspaces/implicit/{title}.md"),
+                    title: title.to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: title.to_lowercase(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        let symbol_uid = "sym:test:configured".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid.clone(),
+                name: "configured".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn configured()".to_string(),
+                summary: None,
+                content_hash: "configured".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[(&implicit.uid, "note:old")])
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                &implicit.uid,
+                std::slice::from_ref(&symbol_uid),
+                1.0,
+            )
+            .unwrap();
+        store
+            .insert_project_component_edge(&implicit.uid, &related.uid, 1.0)
+            .unwrap();
+        store
+            .insert_project_parent_edge(&implicit.uid, &related.uid, 1.0)
+            .unwrap();
+
+        let changed = store
+            .replace_implicit_project_note_memberships(
+                std::slice::from_ref(&detected),
+                &[(implicit.uid.clone(), "note:new".to_string())],
+            )
+            .unwrap();
+        assert_eq!(changed.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(
+            store.list_project_note_uids(&implicit.uid).unwrap(),
+            vec!["note:new".to_string()]
+        );
+        assert_eq!(
+            store.list_project_symbol_uids(&implicit.uid).unwrap(),
+            vec![symbol_uid]
+        );
+        assert_eq!(
+            store.list_project_component_uids(&implicit.uid).unwrap(),
+            vec![related.uid.clone()]
+        );
+        let conn = store.conn().unwrap();
+        assert_eq!(
+            conn.query(
+                "MATCH (p:Project {uid: 'proj:test:implicit'})-[:PROJECT_HAS_PARENT]->\
+                 (q:Project {uid: 'proj:test:related'}) RETURN q.uid"
+            )
+            .unwrap()
+            .count(),
+            1,
+            "implicit note discovery must preserve the configured parent relationship"
+        );
+        let preserved = store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.uid == implicit.uid)
+            .unwrap();
+        assert_eq!(preserved.name, implicit.name);
+        assert_eq!(preserved.summary, implicit.summary);
+        assert_eq!(preserved.instance_id, implicit.instance_id);
+
+        let unchanged = store
+            .replace_implicit_project_note_memberships(
+                std::slice::from_ref(&detected),
+                &[(implicit.uid.clone(), "note:new".to_string())],
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+    }
+
+    #[test]
+    fn shared_project_wiki_note_replacement_is_atomic_and_exact_noop() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Project, Section};
+
+        let store = GraphStore::in_memory().unwrap();
+        let project = Project {
+            uid: "proj:test:wiki".to_string(),
+            name: "wiki".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&project).unwrap();
+        let peer = Project {
+            uid: "proj:test:wiki-peer".to_string(),
+            name: "wiki-peer".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&peer).unwrap();
+        let project_uids = vec![project.uid.clone(), peer.uid.clone()];
+        let note = Note {
+            uid: "note:wiki:test".to_string(),
+            vault_uid: "wiki:test".to_string(),
+            file_path: "get_page/Test".to_string(),
+            title: "Test".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 2,
+            content_hash: "wiki-note-hash".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        let heading = Heading {
+            uid: "heading:wiki:test".to_string(),
+            note_uid: note.uid.clone(),
+            level: 1,
+            text: "Test".to_string(),
+            slug: "test".to_string(),
+            start_line: 1,
+            end_line: 2,
+            content_hash: "heading-hash".to_string(),
+            embedding: None,
+        };
+        let section = Section {
+            uid: "section:wiki:test".to_string(),
+            note_uid: note.uid.clone(),
+            heading_uid: Some(heading.uid.clone()),
+            start_line: 1,
+            end_line: 2,
+            text_hash: "section-hash".to_string(),
+            text_content: "# Test".to_string(),
+            word_count: 2,
+            pagerank_score: None,
+        };
+
+        let changed = store
+            .replace_project_wiki_note_memberships(
+                &project_uids,
+                &note,
+                std::slice::from_ref(&heading),
+                std::slice::from_ref(&section),
+            )
+            .unwrap();
+        assert_eq!(changed.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(
+            store.list_project_note_uids(&project.uid).unwrap(),
+            vec![note.uid.clone()]
+        );
+        assert_eq!(
+            store.list_project_note_uids(&peer.uid).unwrap(),
+            vec![note.uid.clone()],
+            "one shared wiki Note must retain every configured Project membership"
+        );
+        assert_eq!(
+            store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .filter(|candidate| candidate.uid == note.uid)
+                .count(),
+            1,
+            "shared membership must not duplicate the wiki Note"
+        );
+
+        let unchanged = store
+            .replace_project_wiki_note_memberships(
+                &project_uids,
+                &note,
+                std::slice::from_ref(&heading),
+                std::slice::from_ref(&section),
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+
+        let invalid_section = Section {
+            heading_uid: Some("heading:missing".to_string()),
+            text_content: "replacement that must not publish".to_string(),
+            ..section
+        };
+        assert!(
+            store
+                .replace_project_wiki_note_memberships(
+                    &project_uids,
+                    &note,
+                    std::slice::from_ref(&heading),
+                    std::slice::from_ref(&invalid_section),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.lookup_note(&note.uid).unwrap().content_hash,
+            note.content_hash
+        );
+        assert_eq!(
+            store
+                .list_all_sections()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.uid == "section:wiki:test")
+                .unwrap()
+                .text_content,
+            "# Test",
+            "invalid replacement input must leave the complete incumbent topology"
+        );
+    }
+
+    #[test]
     fn disk_backed_late_project_copy_failure_restores_previous_graph() {
         use nestweaver_schema::{Note, NoteKind, Project};
 
@@ -10291,6 +11252,11 @@ mod tests {
             true,
         );
         let error = result.expect_err("the late component COPY must fail");
+        assert_eq!(
+            error.disposition,
+            ProjectMutationDisposition::ConfirmedRolledBack,
+            "successful snapshot restoration must be exposed to publication callers"
+        );
         assert!(error.to_string().contains("PROJECT_HAS_COMPONENT"));
         assert!(
             !error.to_string().contains("rollback failed"),
@@ -10355,6 +11321,10 @@ mod tests {
                 &[],
             )
             .unwrap_err();
+        assert_eq!(
+            error.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
         assert!(error.to_string().contains("is not configured"));
         assert_eq!(
             store.list_project_note_uids(&project.uid).unwrap(),

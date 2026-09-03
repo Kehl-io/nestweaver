@@ -115,7 +115,7 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
     let mut next_over_ceiling_report = ceiling_at;
 
     loop {
-        let writes = signals.active_writes.load(Ordering::Relaxed);
+        let writes = signals.active_writes.load(Ordering::Acquire);
         // Index jobs bump `indexing_active`, not `active_writes`, so the
         // drain must wait on both — otherwise a shutdown could proceed
         // while the worker is mid-write.

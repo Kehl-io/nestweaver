@@ -11,6 +11,51 @@ use anyhow::Context;
 
 use crate::git_cmd::{git_net_timeout, run_git_with_timeout};
 
+/// Resolve an untrusted revision string to a commit object ID.
+///
+/// The `--end-of-options` separator is security-sensitive: callers may accept
+/// revision strings from external input, and Git otherwise interprets values
+/// such as `--output=<path>` as command-line options.  Only the validated hex
+/// object ID returned here should be passed to subsequent Git commands.
+pub(crate) fn resolve_commit_ref(
+    repo_path: &Path,
+    revision: &str,
+) -> Result<String, anyhow::Error> {
+    let commit_revision = format!("{revision}^{{commit}}");
+    let mut cmd = Command::new("git");
+    cmd.arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg("--end-of-options")
+        .arg(&commit_revision)
+        .current_dir(repo_path);
+
+    let output = run_git_with_timeout(cmd, git_net_timeout()).with_context(|| {
+        format!(
+            "failed to resolve git commit ref in {}",
+            repo_path.display()
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "invalid git commit ref in {}: {}",
+            repo_path.display(),
+            stderr.trim()
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse returned a non-UTF-8 object ID")?;
+    let oid = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("git rev-parse returned an invalid commit object ID");
+    }
+
+    Ok(oid.to_owned())
+}
+
 /// Represents a file-level change between two git commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChange {
@@ -97,19 +142,26 @@ fn parse_diff_output(output: &[u8]) -> Vec<FileChange> {
 
 /// Detects file changes between two git commits in a repository.
 ///
-/// Runs `git diff --name-status <old_sha> <new_sha>` in `repo_path` and
-/// returns the parsed list of `FileChange` values.
+/// Resolves both revisions to commit OIDs, then runs
+/// `git diff --name-status <old_oid> <new_oid>` in `repo_path` and returns the
+/// parsed list of `FileChange` values. Resolving first is security-sensitive:
+/// MCP `brain_diff.since_sha` is caller-controlled, so neither revision may
+/// reach `git diff` while it can still be interpreted as an option.
 pub fn detect_changes(
     repo_path: &Path,
     old_sha: &str,
     new_sha: &str,
 ) -> Result<Vec<FileChange>, anyhow::Error> {
+    let old_oid = resolve_commit_ref(repo_path, old_sha).context("resolve old git commit")?;
+    let new_oid = resolve_commit_ref(repo_path, new_sha).context("resolve new git commit")?;
+
     let mut cmd = Command::new("git");
     cmd.arg("diff")
         .arg("--name-status")
         .arg("-z")
-        .arg(old_sha)
-        .arg(new_sha)
+        .arg(old_oid)
+        .arg(new_oid)
+        .arg("--")
         .current_dir(repo_path);
     let output = run_git_with_timeout(cmd, git_net_timeout())
         .with_context(|| format!("failed to run git diff in {}", repo_path.display()))?;
@@ -260,6 +312,88 @@ mod tests {
         assert!(
             changes.contains(&FileChange::Added(PathBuf::from("日本語.md"))),
             "CJK path missing/quoted: {changes:?}"
+        );
+    }
+
+    /// Both revisions cross the same `git diff` option boundary. Resolve each
+    /// to a commit OID before invoking diff so a caller-controlled
+    /// `brain_diff.since_sha` cannot create or truncate an output file.
+    #[test]
+    fn detect_changes_resolves_refs_and_rejects_option_injection_without_writing() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let old_oid = current_head_sha(repo).unwrap();
+
+        std::fs::write(repo.join("added.txt"), "added\n").unwrap();
+        git(&["add", "added.txt"]);
+        git(&["commit", "-q", "-m", "tip"]);
+        let new_oid = current_head_sha(repo).unwrap();
+        git(&["branch", "base-branch", &old_oid]);
+        git(&["branch", "tip-branch", &new_oid]);
+        git(&["tag", "base-tag", &old_oid]);
+        git(&["tag", "tip-tag", &new_oid]);
+
+        // Counterweights: the security boundary still accepts the full range
+        // of commit-ish inputs callers already use, for both endpoints.
+        for (old, new) in [
+            (old_oid.as_str(), new_oid.as_str()),
+            ("HEAD~1", "HEAD"),
+            ("base-branch", "tip-branch"),
+            ("base-tag", "tip-tag"),
+        ] {
+            let changes = detect_changes(repo, old, new).unwrap();
+            assert_eq!(
+                changes,
+                vec![FileChange::Added(PathBuf::from("added.txt"))],
+                "valid revisions {old:?}..{new:?} must retain diff behavior"
+            );
+        }
+
+        let sentinel = repo.join("sentinel.bin");
+        let sentinel_contents = b"do not truncate\0or overwrite\n";
+        std::fs::write(&sentinel, sentinel_contents).unwrap();
+        let malicious_old = format!("--output={}", sentinel.display());
+        assert!(
+            detect_changes(repo, &malicious_old, "HEAD").is_err(),
+            "an option-like old revision must be rejected"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap().as_slice(),
+            sentinel_contents,
+            "a rejected old revision must not truncate or overwrite its target"
+        );
+
+        let nonexistent = repo.join("must-not-be-created.out");
+        let malicious_new = format!("--output={}", nonexistent.display());
+        assert!(
+            detect_changes(repo, "HEAD~1", &malicious_new).is_err(),
+            "an option-like new revision must be rejected"
+        );
+        assert!(
+            !nonexistent.exists(),
+            "a rejected new revision must not create its output target"
         );
     }
 }

@@ -287,10 +287,45 @@ pub fn bundle_sidecar_path(db_path: &Path) -> std::path::PathBuf {
     crate::sidecar_path(db_path, ".bundles.json")
 }
 
+/// [`load_bundle_store`] that distinguishes an ABSENT sidecar from an
+/// UNREADABLE one.
+///
+/// nw-395 leg 3. The infallible form maps every read error to an empty store,
+/// so a `chmod 000` sidecar, a directory in its place, or an I/O fault all
+/// reach the caller as `bundle '<id>' not found or expired` -- which sends the
+/// user to the TTL when their bundle store cannot be read at all. Absence is
+/// still simply empty: that is the first-run path and must stay silent.
+pub fn load_bundle_store_checked(db_path: &Path) -> Result<BundleStore, anyhow::Error> {
+    let path = bundle_sidecar_path(db_path);
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BundleStore::default());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot read the bundle store at {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    // Read ONCE and prove readability with the same call. A
+    // corrupt-but-readable sidecar is NOT a fault here -- `load_bundle_store`
+    // salvages individually parseable bundles, and that is tested behaviour.
+    std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot read the bundle store at {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(load_bundle_store(db_path))
+}
+
 /// Load the bundle store, dropping any bundles whose `created_at` is older than
-/// the TTL. Returns an empty store when the sidecar is missing. A corrupt
-/// sidecar no longer silently drops every bundle: individually
-/// parseable bundles are salvaged and a warning is emitted.
+/// the TTL. Returns an empty store when the sidecar is missing OR unreadable --
+/// see [`load_bundle_store_checked`] when that difference matters. A corrupt
+/// sidecar no longer silently drops every bundle: individually parseable
+/// bundles are salvaged and a warning is emitted.
 pub fn load_bundle_store(db_path: &Path) -> BundleStore {
     let path = bundle_sidecar_path(db_path);
     let mut store: BundleStore = match std::fs::read_to_string(&path) {
@@ -380,17 +415,70 @@ const LOCK_WAIT_SECS: u64 = 10;
 /// Age after which an existing lock file is considered abandoned.
 const LOCK_STALE_SECS: u64 = 60;
 
+/// Identity of the PID namespace this process's pids are meaningful in.
+///
+/// A pid is only comparable against `process_is_alive` inside the namespace
+/// that issued it. Without this, a containerised daemon and a host-side CLI
+/// sharing a bind-mounted database read each other's live pids as `ESRCH` and
+/// each breaks the other's lock -- reintroducing the very lost-bundle race the
+/// pid check was added to close, in a form STRICTLY worse than the old
+/// mtime-only rule, which was namespace-agnostic.
+fn pid_namespace_identity() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Exact: the pid-namespace inode, which differs per container.
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No pid namespaces; the host is the boundary. Hostname is a coarse
+        // but honest stand-in, and a mismatch only costs us the fast path.
+        let mut buffer = [0i8; 256];
+        if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len()) } != 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = buffer
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect();
+        String::from_utf8(bytes).ok()
+    }
+}
+
+/// The pid recorded in a bundle lock token, when it is BOTH parseable AND
+/// stamped with this process's pid namespace. `None` means "cannot tell",
+/// never "dead" -- the caller falls back to the namespace-agnostic mtime rule.
+///
+/// Tokens are `<pid>:<nanos>:<namespace>`. A legacy two-field token has no
+/// namespace and is deliberately NOT trusted: it may have been written from
+/// anywhere.
+fn lock_holder_pid(path: &Path) -> Option<i32> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let mut fields = token.trim().split(':');
+    let pid: i32 = fields.next()?.trim().parse().ok()?;
+    let _nanos = fields.next()?;
+    let recorded = fields.collect::<Vec<_>>().join(":");
+    if recorded.is_empty() || Some(recorded) != pid_namespace_identity() {
+        return None;
+    }
+    Some(pid)
+}
+
 impl BundleStoreLock {
     fn acquire(db_path: &Path) -> Self {
         use std::io::Write as _;
         let path = bundle_sidecar_path(db_path).with_extension("lock");
         let token = format!(
-            "{}:{}",
+            "{}:{}:{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            pid_namespace_identity().unwrap_or_default()
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LOCK_WAIT_SECS);
         loop {
@@ -434,11 +522,25 @@ impl BundleStoreLock {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break abandoned locks (holder crashed between create and
                     // Drop) so one bad exit doesn't wedge the sidecar forever.
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
+                    //
+                    // nw-395: the token records the holder's pid, and for a
+                    // long time nothing read it. Staleness was mtime-only at
+                    // LOCK_STALE_SECS (60s) while the acquisition deadline is
+                    // LOCK_WAIT_SECS (10s), so a holder that died between
+                    // create and Drop stalled EVERY caller for the full
+                    // deadline and then released all of them to proceed
+                    // unlocked at once -- which is how a bundle already handed
+                    // to the caller could be lost. A provably dead pid breaks
+                    // the lock at once; an unreadable or pid-less token falls
+                    // through to the mtime rule, and `process_is_alive` treats
+                    // an indeterminate pid as alive, so both fail safe.
+                    let stale = lock_holder_pid(&path)
+                        .is_some_and(|pid| !crate::index_publication::process_is_alive(pid))
+                        || std::fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.elapsed().ok())
+                            .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
                     if stale {
                         let _ = std::fs::remove_file(&path);
                         continue;
@@ -491,8 +593,23 @@ fn update_bundle_store<T>(
     db_path: &Path,
     f: impl FnOnce(&mut BundleStore) -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
-    let _lock = BundleStoreLock::acquire(db_path);
-    let mut store = load_bundle_store(db_path);
+    // nw-395 leg 2. Every acquisition failure used to fall through to
+    // load -> mutate -> save UNLOCKED. Under contention that is how a bundle
+    // already handed to the caller was lost: two writers each load the same
+    // store, each save their own copy, and the loser's bundle is gone while its
+    // id was already advertised as a drill-in. Failing loudly is the lesser
+    // harm -- the caller retries, instead of being told a bundle exists that
+    // does not. Reads do not take this lock and are unaffected.
+    let lock = BundleStoreLock::acquire(db_path);
+    if !lock.owned {
+        anyhow::bail!(
+            "could not acquire the bundle store lock at {} within {LOCK_WAIT_SECS}s; another \
+             process is writing it. Retry; a mutation is refused rather than performed unlocked, \
+             because an unlocked write silently discards a concurrent writer's bundle.",
+            lock.path.display()
+        );
+    }
+    let mut store = load_bundle_store_checked(db_path)?;
     let out = f(&mut store)?;
     store.version = 1;
     save_bundle_store(db_path, &store)?;
@@ -542,6 +659,10 @@ fn ensure_ranking_publication_clean(store: &GraphStore) -> Result<(), anyhow::Er
         ));
     }
     Ok(())
+}
+
+fn completed_publication_during_investigate(error: nestweaver_store::StoreError) -> anyhow::Error {
+    anyhow::Error::new(error).context("index publication completed during investigate; retry")
 }
 
 /// Whether a retrieval failure is the fail-closed publication guard rather
@@ -601,6 +722,9 @@ pub fn investigate(
     //    about the RESULT can reject both. The only thing they share is the
     //    condition, so the condition is what is tested.
     ensure_ranking_publication_clean(store)?;
+    let initial_publication_generation = store
+        .clean_published_generation_snapshot()
+        .map_err(anyhow::Error::new)?;
 
     // 1. Resolve scope into the seed inputs and an optional post-filter.
     let (seed_inputs, scope_filter) = resolve_scope(store, query, scope)?;
@@ -657,7 +781,11 @@ pub fn investigate(
             // starting mid-retrieval can surface as a benign-looking "no seeds
             // resolved" that carries no publication string to recognise.
             ensure_ranking_publication_clean(store)?;
-            bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH)
+            if is_no_seed_resolution_error(&e) {
+                bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH)
+            } else {
+                return Err(e);
+            }
         }
     };
     // nw-384, third and last site. The `Ok` branch needs its own re-check for
@@ -755,6 +883,23 @@ pub fn investigate(
         scope: scope.to_string(),
         entries: entries.clone(),
     };
+
+    // The marker checks above catch a publication that is dirty when sampled,
+    // but a fast publisher can establish and retire its marker entirely
+    // between two samples. The durable generation is monotonic across that
+    // complete lifecycle, so compare clean snapshots after every graph/body
+    // read and immediately before making the mixed result durable. Refuse
+    // before `update_bundle_store` so a retry cannot discover a bundle whose
+    // entries came from different graph generations.
+    let final_publication_generation = store
+        .clean_published_generation_snapshot()
+        .map_err(completed_publication_during_investigate)?;
+    if final_publication_generation != initial_publication_generation {
+        return Err(completed_publication_during_investigate(
+            nestweaver_store::StoreError::RankingUnavailable,
+        ));
+    }
+
     if let Some(db) = db_path {
         let id = bundle_id.clone();
         update_bundle_store(db, |bundle_store| {
@@ -1147,6 +1292,16 @@ fn bm25_fallback(
     nodes
 }
 
+/// The hybrid query's unresolved-seed outcome is the one benign failure for
+/// which `investigate` can still produce an honest lexical map. Everything
+/// else is an operational or integrity failure and must retain its typed error
+/// instead of being mistaken for an empty semantic result.
+fn is_no_seed_resolution_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("No seeds resolved."))
+}
+
 /// Whether a node survives the scope filter. Only symbol nodes are scoped;
 /// non-symbol nodes (notes/sections/tags) are vault-global and pass through
 /// unfiltered — this mirrors the long-standing `repo:` notes handling.
@@ -1478,10 +1633,255 @@ fn now_epoch() -> f64 {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod bundle_lock_tests {
+    use super::*;
+
+    /// A lock token stamped with THIS process's pid namespace, i.e. what a
+    /// real local holder writes.
+    fn local_token(pid: i32) -> String {
+        format!(
+            "{pid}:12345:{}",
+            pid_namespace_identity().unwrap_or_default()
+        )
+    }
+
+    /// A pid no live process can own. Probing upward from a high number keeps
+    /// this deterministic without depending on any particular pid_max.
+    fn dead_pid() -> i32 {
+        (90_000..99_000)
+            .find(|pid| !crate::index_publication::process_is_alive(*pid))
+            .expect("some pid in the probe range is unused")
+    }
+
+    /// A pid is only meaningful inside the namespace that issued it. A token
+    /// from ANOTHER namespace -- a containerised daemon sharing a bind-mounted
+    /// database with a host-side CLI -- must fall back to the mtime rule, not
+    /// be read as dead. Trusting it would break a LIVE holder's lock and
+    /// reintroduce the lost-bundle race in a form worse than the old
+    /// namespace-agnostic rule.
+    #[test]
+    fn a_lock_token_from_another_pid_namespace_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A dead-looking pid, but stamped with a namespace that is not ours.
+        std::fs::write(&lock_path, format!("{}:12345:pid:[999999999]", dead_pid())).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "a pid from a foreign namespace must not license breaking the lock"
+        );
+    }
+
+    /// A legacy two-field token predates the namespace stamp, so its origin is
+    /// unknown and it must fail safe the same way.
+    #[test]
+    fn a_legacy_token_without_a_namespace_stamp_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{}:12345", dead_pid())).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "a token with no namespace stamp must fail safe"
+        );
+    }
+
+    /// nw-395 leg 2: every failure arm returned `owned: false` and fell
+    /// through to load -> mutate -> save UNLOCKED. Under contention that is how
+    /// a bundle already handed to the caller was lost -- two writers each
+    /// load the same store, each save their own copy, and the loser's bundle
+    /// is gone while its id was already advertised as a drill-in.
+    #[test]
+    fn a_mutation_that_cannot_take_the_lock_fails_instead_of_writing_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A LIVE holder: not stealable, and not stale by mtime either.
+        std::fs::write(&lock_path, local_token(std::process::id() as i32)).unwrap();
+
+        let error = update_bundle_store(&db, |store| {
+            store.bundles.clear();
+            Ok(())
+        })
+        .expect_err("an unlockable mutation must fail rather than write unlocked");
+        let text = error.to_string();
+        assert!(
+            text.contains("lock"),
+            "the failure must name the lock as the cause: {text}"
+        );
+        assert!(
+            !bundle_sidecar_path(&db).exists(),
+            "nothing may be written when the lock was never held"
+        );
+    }
+
+    /// Counterweight: an uncontended mutation still succeeds.
+    #[test]
+    fn an_uncontended_mutation_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        update_bundle_store(&db, |store| {
+            store.bundles.clear();
+            Ok(())
+        })
+        .expect("an uncontended mutation must still write");
+        assert!(bundle_sidecar_path(&db).exists());
+    }
+
+    /// nw-395 leg 3: `load_bundle_store` mapped EVERY read error to an empty
+    /// store, so a `chmod 000` sidecar, a directory in its place, or an I/O
+    /// fault all surfaced as `bundle '<id>' not found or expired` -- a
+    /// diagnosis that sends the user to the TTL when the real cause is that
+    /// their bundle store cannot be read at all.
+    #[test]
+    fn an_unreadable_bundle_store_is_reported_as_unreadable_not_expired() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the mode bits.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let sidecar = bundle_sidecar_path(&db);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "{}").unwrap();
+        std::fs::set_permissions(
+            &sidecar,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        let error = update_bundle_store(&db, |_| Ok(()))
+            .expect_err("an unreadable bundle store must not look empty");
+        let text = error.to_string();
+        assert!(
+            !text.contains("not found or expired"),
+            "an unreadable store must not be diagnosed as an expired bundle: {text}"
+        );
+        assert!(
+            text.contains("read") || text.contains("unreadable"),
+            "the failure must name unreadability: {text}"
+        );
+
+        std::fs::set_permissions(
+            &sidecar,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+    }
+
+    /// Counterweight: a genuinely ABSENT sidecar is still an empty store, not
+    /// an error -- that is the first-run path and must stay silent.
+    #[test]
+    fn an_absent_bundle_store_is_still_simply_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let seen = update_bundle_store(&db, |store| Ok(store.bundles.len()))
+            .expect("an absent sidecar is a first run, not a fault");
+        assert_eq!(seen, 0);
+    }
+
+    /// nw-395: the lock token records the writer's pid and NOTHING ever read
+    /// it. Staleness was mtime-only at 60s while the acquisition deadline is
+    /// 10s, so a holder that died between create and Drop stalled every
+    /// `investigate` for the full 10.1s and then let ALL waiters proceed
+    /// unlocked -- which is how a bundle already handed to the caller was lost.
+    #[test]
+    fn a_lock_held_by_a_dead_process_is_broken_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A fresh mtime, so the 60s mtime rule cannot break it.
+        std::fs::write(&lock_path, local_token(dead_pid())).unwrap();
+
+        let started = std::time::Instant::now();
+        let lock = BundleStoreLock::acquire(&db);
+        let waited = started.elapsed();
+
+        assert!(
+            lock.owned,
+            "a lock whose recorded pid is dead must be broken and re-acquired"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(LOCK_WAIT_SECS),
+            "breaking a dead holder must not wait out the full deadline, waited {waited:?}"
+        );
+    }
+
+    /// The counterweight that keeps the above from being a licence to steal:
+    /// a LIVE holder is still respected, and the waiter still yields.
+    #[test]
+    fn a_lock_held_by_a_live_process_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // This very process is unambiguously alive.
+        std::fs::write(&lock_path, local_token(std::process::id() as i32)).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(!lock.owned, "a live holder's lock must not be stolen");
+        assert!(
+            lock_path.exists(),
+            "the live holder's lock file must survive"
+        );
+    }
+
+    /// An unparseable or pid-less lock file must fall back to the mtime rule
+    /// rather than being treated as dead. Failing the other way would let a
+    /// truncated write hand the lock to a competitor.
+    #[test]
+    fn an_unreadable_lock_token_is_not_treated_as_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, "not-a-token").unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "an unparseable token must fail safe, not break the lock"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::index_directory_in_memory;
     use std::fs;
+
+    #[test]
+    fn investigate_fallback_does_not_swallow_unreadable_embedding_identity() {
+        let no_seeds = anyhow::anyhow!(
+            "No seeds resolved. Tried as UIDs, note titles, tags, symbol names, and semantic search."
+        )
+        .context("hybrid retrieval");
+        assert!(is_no_seed_resolution_error(&no_seeds));
+
+        let identity_error =
+            anyhow::Error::new(nestweaver_store::StoreError::EmbeddingIdentityUnreadable {
+                detail: "injected malformed embedding metadata".to_string(),
+            })
+            .context("hybrid retrieval");
+        assert!(!is_no_seed_resolution_error(&identity_error));
+        assert!(
+            identity_error
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    nestweaver_store::StoreError::EmbeddingIdentityUnreadable { .. }
+                )),
+            "the fail-closed store error must remain typed through context"
+        );
+    }
 
     fn make_store() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -1626,6 +2026,36 @@ mod tests {
         (dir, db_path, store)
     }
 
+    struct CompletingPublication<'a> {
+        store: &'a GraphStore,
+        db_path: &'a std::path::Path,
+        completed: std::sync::atomic::AtomicBool,
+    }
+
+    impl EmbedQueryFn for CompletingPublication<'_> {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            let publication = crate::index::establish_index_publication_marker_with_io(
+                self.store,
+                Some(self.db_path),
+                "investigate completed-publication race test",
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .map_err(|error| anyhow::anyhow!("establish test publication: {error:#}"))?;
+            crate::index::finalize_committed_index_for_scope_with_io(
+                publication,
+                Some(self.db_path),
+                "investigate completed-publication race test",
+                &crate::index::FileSystemIndexEpilogueIo,
+                None,
+                true,
+            )
+            .map_err(|error| anyhow::anyhow!("finalize test publication: {error:#}"))?;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(vec![0.0; 4])
+        }
+    }
+
     /// Plant the same durable marker a real in-flight publication writes.
     fn begin_publication(db_path: &std::path::Path) {
         let marker = nestweaver_store::index_publication::marker_path(db_path);
@@ -1747,6 +2177,65 @@ mod tests {
         let result = run(&store, &db_path, dir.path(), "greet")
             .expect("service resumes once the publication retires");
         assert!(!result.entries.is_empty());
+    }
+
+    /// A publisher can start and finish between marker samples. The callback
+    /// executes the real marker/reservation/generation/retirement lifecycle
+    /// synchronously during semantic retrieval, making that window
+    /// deterministic without sleeps or scheduler assumptions.
+    #[test]
+    fn a_completed_publication_during_investigate_refuses_before_bundle_persistence() {
+        let (dir, db_path, store) = on_disk_store();
+        store.set_embedding_metadata("test-model", 4).unwrap();
+        assert!(store.add_embedding("sym:g0", vec![0.0; 4]));
+        store.flush_embedding_index().unwrap();
+        // Model a separate long-lived reader process: its in-memory generation
+        // is loaded before the publisher advances the durable sidecar and must
+        // remain stale throughout the callback.
+        let reader = GraphStore::open_read_only(&db_path).unwrap();
+        let reader_generation = reader.graph_generation();
+        let publisher = CompletingPublication {
+            store: &store,
+            db_path: &db_path,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let error = investigate(
+            &reader,
+            None,
+            Some(&db_path),
+            dir.path(),
+            "greet",
+            "vault",
+            Some(4000),
+            Some(&publisher),
+        )
+        .expect_err("a completed mid-query publication must invalidate the investigation");
+
+        assert!(
+            publisher
+                .completed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the semantic callback must complete the publication for the test to prove the race"
+        );
+        assert_eq!(
+            reader.graph_generation(),
+            reader_generation,
+            "the independent reader's local atomic must remain stale so only the durable sidecar can detect the publication"
+        );
+        assert_ne!(
+            reader.clean_published_generation_snapshot().unwrap(),
+            reader_generation,
+            "the independent reader must observe the publisher's new durable generation"
+        );
+        assert!(
+            format!("{error:#}").contains("index publication completed during investigate; retry"),
+            "the refusal must carry a stable retry diagnostic; got: {error:#}"
+        );
+        assert!(
+            load_bundle_store(&db_path).bundles.is_empty(),
+            "the invalid mixed-generation bundle must never be persisted"
+        );
     }
 
     #[test]

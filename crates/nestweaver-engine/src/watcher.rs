@@ -301,8 +301,26 @@ impl BrainWatcher {
     pub fn run(self) -> Result<(), anyhow::Error> {
         // nw-C1: this watcher is a writer, so it reconciles an abandoned
         // publication left by a crashed indexer instead of inheriting the wedge.
-        let store = Arc::new(crate::index::open_store_for_writing_with_recovery(
+        let authority =
+            nestweaver_store::acquire_db_write_lease(&self.db_path).map_err(|error| {
+                anyhow::anyhow!("cannot start brain watcher without writer authority: {error:?}")
+            })?;
+        let store = Arc::new(crate::index::open_store_for_writing_with_authority(
             &self.db_path,
+            &authority,
+        )?);
+        self.run_inner(store, None)
+    }
+
+    /// Run under an exact writer authority already held by the caller for the
+    /// watcher's complete lifetime.
+    pub fn run_with_write_lease(
+        self,
+        authority: &nestweaver_store::DbWriteLease,
+    ) -> Result<(), anyhow::Error> {
+        let store = Arc::new(crate::index::open_store_for_writing_with_authority(
+            &self.db_path,
+            authority,
         )?);
         self.run_inner(store, None)
     }
