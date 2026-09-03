@@ -160,6 +160,146 @@ pub fn incompatible_repos_for_store(store: &GraphStore) -> anyhow::Result<Vec<St
     Ok(load(db_path).stale_repos(repos.iter().map(|repo| repo.uid.as_str())))
 }
 
+/// A resolver-generation verdict, split by whether the operator can act on it.
+///
+/// nw-424. The gate itself was correct and its MESSAGE was not actionable: a
+/// developer whose changed files live entirely in current repositories was told
+/// `run-full-suite` because some unrelated repository was stale, with nothing
+/// saying whose problem it was. Re-indexing another team's repository is not an
+/// action they can take, and by Tricorder's definition an alert that produces no
+/// positive action is an effective false positive however true it is. A gate
+/// that fires like that teaches people to ignore `recommendation` -- the one
+/// field nw-412 exists to make trustworthy.
+///
+/// THE SAFETY PROPERTY IS UNCHANGED. Any incompatible repository anywhere still
+/// degrades the answer, because narrowing the check to repositories that own
+/// the changed files is UNSOUND for exactly the reason nw-412 exists: a MISSING
+/// cross-repo edge is precisely what would keep a stale repository out of that
+/// mapping. What changes is that the answer now says which of the two
+/// situations the caller is in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ResolverIncompatibility {
+    /// Incompatible repositories that own at least one changed file. The
+    /// caller can re-index these themselves.
+    pub owning_changed_files: Vec<String>,
+    /// Incompatible repositories elsewhere in the graph. These still degrade
+    /// the answer, and naming them separately is what lets the caller tell
+    /// "my repository is stale" from "someone else's is".
+    pub elsewhere: Vec<String>,
+}
+
+impl ResolverIncompatibility {
+    pub fn is_incompatible(&self) -> bool {
+        !self.owning_changed_files.is_empty() || !self.elsewhere.is_empty()
+    }
+
+    /// Every incompatible repository, sorted — the population that existed
+    /// before this split, kept so `resolver_stale_repos` is unchanged on the
+    /// wire.
+    pub fn all(&self) -> Vec<String> {
+        let mut all = self.owning_changed_files.clone();
+        all.extend(self.elsewhere.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// The operator-facing explanation, which states the situation rather than
+    /// listing UIDs and leaving the reader to infer which one they are in.
+    pub fn message(&self) -> String {
+        let remedy = "Re-index each with `nestweaver index --repo <path> --force` (`--force` is \
+                      required: a generation-stale repository is already at HEAD, so the \
+                      incremental path writes nothing).";
+        match (
+            self.owning_changed_files.is_empty(),
+            self.elsewhere.is_empty(),
+        ) {
+            (true, true) => String::new(),
+            // The actionable case: it is their own repository.
+            (false, true) => format!(
+                "The repositories your changed files belong to were indexed by a resolver other \
+                 than the running generation {RESOLVER_GENERATION}, so their edges cannot be \
+                 trusted and this answer is degraded: {}. {remedy}",
+                self.owning_changed_files.join(", ")
+            ),
+            // The case that read as arbitrary: name the cause, not just the UIDs.
+            (true, false) => format!(
+                "Your changed files belong only to repositories built by the running resolver \
+                 generation {RESOLVER_GENERATION}, but {} other repositor{} in this graph {} not: \
+                 {}. A MISSING cross-repo edge written by one of them could still hide an \
+                 affected symbol, and a missing edge is exactly what would keep it out of this \
+                 changed-file mapping — so the answer is degraded rather than trusted. {remedy}",
+                self.elsewhere.len(),
+                if self.elsewhere.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                if self.elsewhere.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
+                self.elsewhere.join(", ")
+            ),
+            (false, false) => format!(
+                "The repositories your changed files belong to were indexed by a resolver other \
+                 than the running generation {RESOLVER_GENERATION}: {}. {} further repositor{} \
+                 in this graph {} also incompatible and degrade this answer through possible \
+                 missing cross-repo edges: {}. {remedy}",
+                self.owning_changed_files.join(", "),
+                self.elsewhere.len(),
+                if self.elsewhere.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                if self.elsewhere.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
+                self.elsewhere.join(", ")
+            ),
+        }
+    }
+}
+
+/// The verdict for `changed_files`, split into what the caller owns and what
+/// they do not.
+///
+/// The incompatible SET is computed exactly as before — over every repository
+/// in the store — and only the presentation is partitioned. See
+/// [`ResolverIncompatibility`] for why narrowing the set would be unsound.
+pub fn incompatibility_for_changed_files(
+    store: &GraphStore,
+    changed_files: &[String],
+) -> anyhow::Result<ResolverIncompatibility> {
+    let incompatible = incompatible_repos_for_store(store)?;
+    if incompatible.is_empty() {
+        return Ok(ResolverIncompatibility::default());
+    }
+    let mut owning: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in changed_files {
+        // A file with no indexed symbols contributes no owner, which is
+        // correct: it cannot tell us whose repository it is.
+        if let Ok(symbols) = store.symbols_in_file(file) {
+            for symbol in symbols {
+                if !symbol.repo_uid.is_empty() {
+                    owning.insert(symbol.repo_uid);
+                }
+            }
+        }
+    }
+    let (owning_changed_files, elsewhere): (Vec<String>, Vec<String>) = incompatible
+        .into_iter()
+        .partition(|uid| owning.contains(uid));
+    Ok(ResolverIncompatibility {
+        owning_changed_files,
+        elsewhere,
+    })
+}
+
 /// One shared diagnostic for affected-tests, detect-changes, and blast-radius.
 pub fn incompatibility_message(repos: &[String]) -> String {
     format!(
@@ -703,6 +843,109 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(&db).stale_repos(known), vec!["repo:a"]);
+    }
+
+    /// nw-424. The gate is correct and the MESSAGE was not actionable. A
+    /// developer whose changed files live entirely in CURRENT repositories was
+    /// told `run-full-suite` because some unrelated repository was stale, with
+    /// no way to tell whose problem it was -- and re-indexing someone else's
+    /// repository is not an action they can take. By Tricorder's definition
+    /// that is an "effective false positive": the developer takes no positive
+    /// action after seeing it, and a gate that fires without one teaches people
+    /// to ignore `recommendation`, which is the field nw-412 exists to make
+    /// trustworthy.
+    ///
+    /// The SAFETY is deliberately unchanged -- any stale repository anywhere
+    /// still degrades, because a missing cross-repo edge is exactly what would
+    /// keep a stale repository out of the changed-file mapping. What changes is
+    /// that the answer says WHICH of the two situations you are in.
+    #[test]
+    fn incompatibility_separates_repos_that_own_the_change_from_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let repo = |uid: &str, root: &str| Repo {
+            uid: uid.into(),
+            url: format!("file://{root}"),
+            indexed_sha: "deadbeef".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some(root.into()),
+        };
+        for (uid, root) in [("repo:mine", "/src/mine"), ("repo:theirs", "/src/theirs")] {
+            store.insert_repo(&repo(uid, root)).unwrap();
+        }
+        let symbol = |uid: &str, repo_uid: &str, file: &str| nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: String::new(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&symbol("s_mine", "repo:mine", "src/mine.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("s_theirs", "repo:theirs", "src/theirs.rs"))
+            .unwrap();
+
+        // Neither repo has a generation record, so BOTH are incompatible.
+        let changed = vec!["src/mine.rs".to_string()];
+        let verdict = incompatibility_for_changed_files(&store, &changed).unwrap();
+
+        assert_eq!(
+            verdict.owning_changed_files,
+            vec!["repo:mine".to_string()],
+            "the repository the change lives in is the actionable one"
+        );
+        assert_eq!(
+            verdict.elsewhere,
+            vec!["repo:theirs".to_string()],
+            "an unrelated stale repository is reported separately, not merged in"
+        );
+        // The safety property is unchanged: everything still degrades.
+        assert_eq!(verdict.all().len(), 2);
+        assert!(verdict.is_incompatible());
+
+        // The message must name the situation, not just list UIDs.
+        let mine_only = ResolverIncompatibility {
+            owning_changed_files: vec!["repo:mine".to_string()],
+            elsewhere: Vec::new(),
+        };
+        assert!(
+            mine_only.message().contains("repo:mine"),
+            "{}",
+            mine_only.message()
+        );
+
+        let theirs_only = ResolverIncompatibility {
+            owning_changed_files: Vec::new(),
+            elsewhere: vec!["repo:theirs".to_string()],
+        };
+        let text = theirs_only.message();
+        assert!(
+            text.contains("repo:theirs"),
+            "the repository to chase must be named: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("cross-repo"),
+            "it must explain WHY an unrelated repository degrades this answer, \
+             or the alert is unactionable: {text}"
+        );
     }
 
     #[test]

@@ -399,12 +399,22 @@ pub fn analyze_blast_radius(
     // not. A failed/partial query must NOT be reported as "nothing affected".
     let mut status = AnalysisStatus::Complete;
     let mut notifications: Vec<Notification> = Vec::new();
-    let resolver_stale_repos = crate::resolver_generation::incompatible_repos_for_store(store)?;
-    if !resolver_stale_repos.is_empty() {
+    // nw-424: the SET is unchanged (every incompatible repository still
+    // degrades), but the message now says whether the caller owns the problem.
+    let changed_file_strings: Vec<String> = changed_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let incompatibility = crate::resolver_generation::incompatibility_for_changed_files(
+        store,
+        &changed_file_strings,
+    )?;
+    let resolver_stale_repos = incompatibility.all();
+    if incompatibility.is_incompatible() {
         status = status.max(AnalysisStatus::Degraded);
         notifications.push(Notification {
             level: NotificationLevel::Error,
-            message: crate::resolver_generation::incompatibility_message(&resolver_stale_repos),
+            message: incompatibility.message(),
             descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
         });
     }
