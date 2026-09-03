@@ -1190,15 +1190,17 @@ jobs:
             scripts/verify-release-canary-pr.sh
           uses_key=uses
           at_sign=@
-          # Strip trailing comments BEFORE testing the pin: the old check
-          # accepted a 40-hex string ANYWHERE on the line, so a version tag
-          # with a hash in its trailing comment satisfied it. Lines that are
-          # wholly comments become empty and are dropped rather than reported.
+          # Strip trailing comments BEFORE testing the pin. The old check
+          # required the 40-hex to follow an `@`, but accepted it ANYWHERE on
+          # the line -- so `uses: evil/action@v1  # see actions/checkout@<sha>`
+          # passed on the hash in its own comment. Trailing whitespace after a
+          # valid pin is still a pin, and indented comment-only lines collapse
+          # to empty and are dropped rather than reported as unpinned.
           unpinned_actions="$({
             grep -REn "${uses_key}:[[:space:]]+[^[:space:]]+${at_sign}" \
               .github/workflows || true
           } | sed -E 's/[[:space:]]+#.*$//' \
-            | grep -Ev "${at_sign}[0-9a-f]{40}$" \
+            | grep -Ev "${at_sign}[0-9a-f]{40}[[:space:]]*$" \
             | grep -Ev ':[0-9]+:[[:space:]]*$' || true)"
           if [ -n "$unpinned_actions" ]; then
             echo "::error::every external action must be pinned to a full commit SHA" >&2

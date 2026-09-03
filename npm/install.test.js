@@ -146,14 +146,71 @@ check("a rate-limited response names the token variable", () => {
 });
 
 check("a rate-limit message does not tell an authenticated caller to set a token", () => {
+  // The unauthenticated remedy is the literal string "Export GITHUB_TOKEN".
+  // A previous version of this test matched /set .*GITHUB_TOKEN/i, which
+  // appears in NEITHER message -- so it could not fail, and the whole
+  // `authenticated` branch could be deleted with all assertions still green.
+  const unauth = describeReleaseApiFailure(
+    { status: 403, body: "API rate limit exceeded" },
+    {},
+  );
+  assert.match(unauth, /Export GITHUB_TOKEN/, "the unauth remedy must be present to reject");
+
   const message = describeReleaseApiFailure(
     { status: 403, body: "API rate limit exceeded" },
     { GITHUB_TOKEN: "abc" },
   );
   assert.match(message, /rate limit/i);
   assert.ok(
-    !/set .*GITHUB_TOKEN/i.test(message),
-    `already-authenticated caller should not be told to set a token: ${message}`,
+    !/Export GITHUB_TOKEN/.test(message),
+    `already-authenticated caller should not be told to export a token: ${message}`,
+  );
+});
+
+// H2: a credential the caller did not ask us to use must not turn a request
+// that works anonymously into a hard failure.
+check("a 401 names the token as the likely cause", () => {
+  const message = describeReleaseApiFailure({ status: 401, body: "Bad credentials" }, {
+    GITHUB_TOKEN: "stale",
+  });
+  assert.match(message, /GITHUB_TOKEN|GH_TOKEN/);
+  assert.match(message, /credential/i);
+});
+
+check("a 403 that is NOT a rate limit is not reported as one", () => {
+  const message = describeReleaseApiFailure({ status: 403, body: "Forbidden" }, {});
+  assert.ok(!/rate limit/i.test(message), message);
+});
+
+// M4: an operator writing =0 to opt OUT must not be opted IN.
+check("falsey strict-mode values disable strict mode", () => {
+  for (const value of ["0", "false", "no", "off", "", "  "]) {
+    const trust = assessReleaseTrust(
+      { immutable: false, tag_name: "v9.0.5" },
+      "v9.0.5",
+      { NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE: value },
+    );
+    assert.strictEqual(trust.failure, null, `${JSON.stringify(value)} must not enable strict mode`);
+  }
+});
+
+check("truthy strict-mode values enable strict mode", () => {
+  for (const value of ["1", "true", "yes", "on"]) {
+    const trust = assessReleaseTrust(
+      { immutable: false, tag_name: "v9.0.5" },
+      "v9.0.5",
+      { NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE: value },
+    );
+    assert.match(trust.failure, /not immutable/i, `${JSON.stringify(value)} must enable strict mode`);
+  }
+});
+
+// L3: the version must be reported as the binary's OWN version, not merely
+// appear somewhere in the output.
+check("a version mentioned in prose does not satisfy the check", () => {
+  assert.notStrictEqual(
+    runtimeVersionFailure("9.0.6 is not this build; actual 1.0.0\n", "9.0.6"),
+    null,
   );
 });
 

@@ -107,6 +107,19 @@ self_test() {
     return 1
   fi
 
+  # A `needs` object that is not an object at all must fail closed AND name the
+  # job, rather than exiting non-zero with no indication of what went wrong.
+  local unreadable
+  unreadable=$(verify_required_ci 'not json' 2>&1 || true)
+  if ! grep -q "no readable result" <<< "$unreadable"; then
+    echo "self-test failed: an unreadable needs object was not diagnosed: $unreadable" >&2
+    return 1
+  fi
+  if verify_required_ci 'not json' >/dev/null 2>&1; then
+    echo "self-test failed: an unreadable needs object was accepted" >&2
+    return 1
+  fi
+
   echo "required CI verifier self-test passed"
 }
 

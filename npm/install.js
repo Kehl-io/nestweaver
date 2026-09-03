@@ -19,6 +19,16 @@ const repo = "Kehl-io/nestweaver";
 // `main()` boundary does I/O and is not directly testable; keeping the
 // judgements out here is what makes the installer assertable at all.
 
+/// Explicit boolean parsing for operator-facing env vars. `0`, `false`, `no`,
+/// `off` and blank all mean OFF; anything else non-blank means ON.
+function isTruthyEnv(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.length === 0) {
+    return false;
+  }
+  return !["0", "false", "no", "off"].includes(normalized);
+}
+
 /// Whether a GitHub Release may be trusted to anchor its own checksum.
 ///
 /// The checksum lives beside the archive in the same release, so an actor who
@@ -45,9 +55,10 @@ function assessReleaseTrust(release, tag, env) {
   if (release.immutable === true) {
     return { failure: null, warning: null };
   }
-  const strict = String((env && env.NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE) || "")
-    .trim()
-    .length > 0;
+  // Any non-blank value used to mean "strict", so an operator writing
+  // NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE=0 to opt OUT was opted IN and every
+  // build failed.
+  const strict = isTruthyEnv(env && env.NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE);
   const detail =
     `GitHub Release ${tag} is not immutable, so its published SHA-256 could have been ` +
     `replaced together with its archive. The checksum is still verified, but it is not ` +
@@ -70,12 +81,19 @@ function assessReleaseTrust(release, tag, env) {
 /// output is what proves identity, and the previous implementation piped that
 /// output straight to the terminal and compared nothing.
 function runtimeVersionFailure(versionOutput, expected) {
-  const tokens = String(versionOutput || "").trim().split(/\s+/).filter(Boolean);
+  // First line only, and the version must be reported AS the version -- i.e.
+  // `<name> <version>`. Accepting the token anywhere in the output let prose
+  // such as "9.0.6 is not this build; actual 1.0.0" pass.
+  const firstLine = String(versionOutput || "").trim().split(/\r?\n/)[0] || "";
+  const tokens = firstLine.split(/\s+/).filter(Boolean);
   if (tokens.length === 0) {
     return `the installed binary printed no version output; expected ${expected}`;
   }
+  // The version must sit where a version goes: `<name> <version>` (the shape
+  // `nestweaver --version` actually prints), or a bare version on its own.
   // Exact token match, so 9.0.60 can never satisfy a request for 9.0.6.
-  if (tokens.includes(expected)) {
+  const reported = tokens.length === 1 ? tokens[0] : tokens[1];
+  if (reported === expected) {
     return null;
   }
   return `the installed binary reports ${JSON.stringify(
@@ -88,8 +106,15 @@ function runtimeVersionFailure(versionOutput, expected) {
 /// Unauthenticated api.github.com allows 60 requests/hour/IP, so a shared CI
 /// egress or a corporate NAT exhausts it and every install behind that address
 /// fails. A token raises the ceiling to 5,000 and is already present in
-/// virtually every CI environment. The URL is a fixed api.github.com constant,
-/// so the credential cannot be directed anywhere else.
+/// virtually every CI environment.
+///
+/// TWO SEPARATE PROPERTIES, and only one of them is about the URL. The URL is a
+/// fixed api.github.com constant, so the credential cannot be sent anywhere
+/// else. But the credential must also not be EXPOSED where it is sent from:
+/// passing it as a curl argv element publishes it to every local user through
+/// the process table (`/proc/<pid>/cmdline` is world-readable on Linux, which
+/// is what CI runners are), so `fetchRelease` feeds these to curl on stdin via
+/// `--config -` rather than as `-H` arguments.
 function githubApiHeaders(env) {
   const headers = [
     "Accept: application/vnd.github+json",
@@ -113,6 +138,11 @@ function describeReleaseApiFailure(failure, env) {
   const authenticated = githubApiHeaders(env).some((header) =>
     header.startsWith("Authorization"),
   );
+  if (status === 401) {
+    return authenticated
+      ? `GitHub rejected the credential in GITHUB_TOKEN/GH_TOKEN (HTTP 401: ${body}). This endpoint needs no credential for a public repository -- unset that variable, or replace the expired or wrong-scope token.`
+      : `GitHub returned HTTP 401 for an unauthenticated request: ${body}`;
+  }
   if ((status === 403 || status === 429) && /rate limit/i.test(body)) {
     return authenticated
       ? `the GitHub API rate limit was exhausted for the credential in use; wait for the limit to reset and retry: ${body}`
@@ -133,35 +163,79 @@ module.exports = {
 
 // ── Installation ────────────────────────────────────────────────────────
 
-function fetchRelease(url, env) {
-  const args = ["-fsSL", "--write-out", "\n%{http_code}"];
-  for (const header of githubApiHeaders(env)) {
-    args.push("-H", header);
-  }
-  args.push(url);
+/// One release-metadata request. Returns `{ status, body }`; never throws for
+/// an HTTP error, so the caller can decide whether to retry.
+///
+/// `--fail-with-body`, NOT `-f`. Plain `-f` suppresses the response body on an
+/// HTTP error, which left `describeReleaseApiFailure` matching /rate limit/
+/// against a body that could only ever be the three-digit status -- so the
+/// rate-limit branch, the entire reason the token handling exists, was
+/// unreachable. Verified: with `-f` the recovered body is the literal "404".
+///
+/// Headers go over stdin via `--config -` so a bearer token never appears in
+/// this process's argv.
+function requestRelease(url, headers) {
+  const args = [
+    "--fail-with-body",
+    "-sSL",
+    "--write-out",
+    "\n%{http_code}",
+    "--config",
+    "-",
+  ];
+  const config = headers
+    .map((header) => `header = ${JSON.stringify(header)}`)
+    .concat([`url = ${JSON.stringify(url)}`])
+    .join("\n");
   let raw;
   try {
-    raw = execFileSync("curl", args, { maxBuffer: 32 * 1024 * 1024 }).toString();
+    raw = execFileSync("curl", args, {
+      input: config,
+      maxBuffer: 32 * 1024 * 1024,
+    }).toString();
   } catch (error) {
-    // `-f` makes curl exit non-zero on an HTTP error; recover the status from
-    // whatever it managed to write so the diagnosis can be specific.
     const stdout = String((error && error.stdout) || "");
-    const status = Number(stdout.trim().split("\n").pop()) || 0;
-    throw new Error(
-      describeReleaseApiFailure(
-        { status, body: stdout.trim() || String(error.message || error) },
-        env,
-      ),
-    );
+    if (stdout.length === 0) {
+      // curl never ran, or died before writing: ENOENT / timeout / DNS.
+      // `error.message` is safe to surface here because these arms carry no
+      // argv -- and argv no longer carries the token in any case.
+      return { status: 0, body: String((error && error.message) || error) };
+    }
+    raw = stdout;
   }
   const lines = raw.split("\n");
   const status = Number(lines.pop().trim()) || 0;
-  const body = lines.join("\n");
-  if (status !== 200) {
-    throw new Error(describeReleaseApiFailure({ status, body }, env));
+  return { status, body: lines.join("\n").trim() };
+}
+
+function fetchRelease(url, env) {
+  const headers = githubApiHeaders(env);
+  const authenticated = headers.some((header) => header.startsWith("Authorization"));
+  let result = requestRelease(url, headers);
+
+  // This endpoint needs no credential for a public repository, so an ambient
+  // GITHUB_TOKEN/GH_TOKEN can only ever make it worse: `gh auth login` and
+  // composite workflows routinely export a stale or wrong-scope token, which
+  // turns a request that would have succeeded anonymously into a hard 401.
+  // Retry once without it rather than failing on a credential the caller never
+  // asked us to use. Rate-limited responses are NOT retried -- dropping the
+  // token there would make the limit stricter, not looser.
+  if (
+    authenticated &&
+    (result.status === 401 || (result.status === 403 && !/rate limit/i.test(result.body)))
+  ) {
+    const anonymous = headers.filter((header) => !header.startsWith("Authorization"));
+    const retry = requestRelease(url, anonymous);
+    if (retry.status === 200) {
+      result = retry;
+    }
+  }
+
+  if (result.status !== 200) {
+    throw new Error(describeReleaseApiFailure(result, env));
   }
   try {
-    return JSON.parse(body);
+    return JSON.parse(result.body);
   } catch (error) {
     throw new Error(`GitHub Release metadata was not valid JSON: ${error.message}`);
   }
@@ -174,8 +248,10 @@ function main() {
   const binaryPath = path.join(binDir, "nestweaver");
   fs.mkdirSync(binDir, { recursive: true });
   // Never let a failed upgrade leave the newly installed wrapper executing a
-  // binary from an older package version.
+  // binary from an older package version, or a previous run's disclosure
+  // describing a release this run did not install.
   fs.rmSync(binaryPath, { force: true });
+  fs.rmSync(path.join(binDir, "RELEASE-NOT-IMMUTABLE.txt"), { force: true });
 
   if (!target) {
     console.error(`Unsupported platform: ${key}`);
@@ -209,7 +285,21 @@ function main() {
       throw new Error(trust.failure);
     }
     if (trust.warning) {
+      // npm >= 7 HIDES lifecycle-script output unless the script fails or
+      // --foreground-scripts is passed, so a console warning alone does not
+      // reach an ordinary `npm install` user -- which would make "disclosed"
+      // a claim this code does not deliver. Leave it on disk beside the binary
+      // as well, so the disclosure is greppable after the fact.
       console.warn(`Warning: ${trust.warning}`);
+      try {
+        fs.writeFileSync(
+          path.join(binDir, "RELEASE-NOT-IMMUTABLE.txt"),
+          `${trust.warning}\n\nRelease: ${tag}\nArchive: ${url}\n`,
+        );
+      } catch {
+        // Best effort: a disclosure that cannot be written must not fail an
+        // install whose checksum verified.
+      }
     }
 
     execFileSync("curl", ["-fsSL", url, "-o", archivePath], { stdio: "inherit" });
