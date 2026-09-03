@@ -837,21 +837,18 @@ fn installation_docs_only_claim_live_channels() {
     if repo_root.join("smithery.yaml").exists() {
         docs.push("smithery.yaml");
     }
-    // FLIP THESE WHEN THE PUBLISH ACTUALLY LANDS. The npm entries are listed as
-    // unsupported because `nestweaver` has never been published (registry 404 as
-    // of 9.0.0 prep) -- nw-115: the release job's publish step exits 0 when
-    // NPM_TOKEN is unset, so a green release has never implied a published
-    // package. Once `npm view nestweaver version` resolves, drop the four npm
-    // lines so the docs are free to advertise the install. `cargo install` and
-    // `brew install` stay: neither channel exists.
-    let unsupported_commands = [
-        "npm install -g nestweaver",
-        "npm install nestweaver",
-        "cargo install nestweaver",
-        "brew install nestweaver",
-        "npx nestweaver",
-        "npm exec nestweaver",
-    ];
+    // THE PUBLISH LANDED, so the four npm lines are dropped exactly as the
+    // previous comment here instructed. Evidence, because nw-115's whole point
+    // is that a green release does not imply a published package and the claim
+    // must be measured rather than assumed: `npm view nestweaver --json`
+    // resolves `name: nestweaver`, `version: 9.0.5`, `dist-tags.latest: 9.0.5`,
+    // `repository: git+https://github.com/Kehl-io/nestweaver.git` (so it is
+    // THIS package, not a namesquat), and `bin: {nestweaver: bin/nestweaver}`
+    // (so `npx`/`npm exec` resolve an executable). One version is published.
+    // Re-measure before trusting this comment; the registry is not in-tree.
+    //
+    // `cargo install` and `brew install` stay: neither channel exists.
+    let unsupported_commands = ["cargo install nestweaver", "brew install nestweaver"];
 
     for relative_path in docs {
         let contents = std::fs::read_to_string(repo_root.join(relative_path))
