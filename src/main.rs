@@ -32441,7 +32441,11 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
         } => {
             let root = root(explicit_root, db)?;
             // Serialize against rebuild / rollback / prune on this same root.
-            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
+            // nw-373: bound and USED, not discarded. Passing it into the
+            // discard routes is what proves the lock covers the root being
+            // mutated -- the same fix already applied to `prune_slots` and
+            // `rollback_current_under_lock`.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             // nw-146: request_cancel only sets `cancel_requested`; ONLY the
             // running worker calls acknowledge_cancel to reach phase Cancelled.
             // If that worker is gone, both discard paths refused — `--revision`
@@ -32480,7 +32484,7 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
             }
             if invalid {
                 nestweaver_engine::publication_operation::discard_invalid_operation(
-                    &root, &operation,
+                    &root, &operation, &root_lock,
                 )?;
                 println!(
                     "Discarded invalid publication operation {operation}; publication slots were preserved"
@@ -32490,6 +32494,7 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
                     &root,
                     &operation,
                     revision.expect("clap requires --revision unless --invalid is present"),
+                    &root_lock,
                 )?;
                 println!("Discarded publication operation {operation}");
             }

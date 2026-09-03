@@ -659,11 +659,31 @@ pub fn resume_operation(
 /// renamed out of the active UUID namespace before recursive deletion. A crash
 /// at any point therefore leaves either an inspectable active operation or an
 /// ignored `.discarded-*` tombstone, never a half-deleted selectable slot.
+/// Discard a cancelled or failed staging operation, removing its journal and
+/// any slot it staged.
+///
+/// nw-373 asked whether this route should hold the canonical DB write lease
+/// across its renames, as `backup restore` now does. IT SHOULD NOT, and the
+/// reason is recorded in `prune_slots`' own comment: an `IndexPublicationLease`
+/// "looked like exclusion but is not -- that lease is an in-process
+/// Mutex/Condvar owned by one GraphStore, so a rebuild in another process holds
+/// an unrelated one." The primitive that actually serializes rebuild, rollback
+/// AND discard is the root lock, anchored to the root being mutated.
+///
+/// What was genuinely missing is that this route took a root lock and never
+/// USED it -- the CLI bound it as `_root_lock` and it never reached here, so
+/// nothing proved the lock covered the root being mutated. That is the same
+/// dead-parameter defect already fixed in `prune_slots` and
+/// `rollback_current_under_lock`; taking the lock by reference and continuing
+/// through its canonical root closes it the same way, and keeps a symlink alias
+/// from being retargeted between the coverage check and the filesystem work.
 pub fn discard_operation(
     publication_root: &Path,
     operation_uuid: &str,
     expected_revision: u64,
+    lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
+    let publication_root = lock.ensure_authorizes(publication_root)?;
     let state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -728,7 +748,9 @@ pub fn discard_operation(
 pub fn discard_invalid_operation(
     publication_root: &Path,
     operation_uuid: &str,
+    lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
+    let publication_root = lock.ensure_authorizes(publication_root)?;
     parse_non_nil_uuid("operation_uuid", operation_uuid)?;
     let operation_dir = crate::publication::operation_path(publication_root, operation_uuid)?;
     let tombstone = publication_root.join("operations").join(format!(
@@ -1281,7 +1303,13 @@ mod tests {
             crate::publication::slot_path(dir.path(), &plan.target_publication_uuid).unwrap();
         std::fs::create_dir_all(&slot).unwrap();
         std::fs::write(slot.join("partial"), b"staging").unwrap();
-        discard_operation(dir.path(), &plan.operation_uuid, cancelled.revision).unwrap();
+        discard_operation(
+            dir.path(),
+            &plan.operation_uuid,
+            cancelled.revision,
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+        )
+        .unwrap();
         assert!(!slot.exists());
         assert!(list_operations(dir.path()).unwrap().is_empty());
     }
@@ -1321,7 +1349,12 @@ mod tests {
                 .contains("decode publication operation")
         );
 
-        discard_invalid_operation(dir.path(), &invalid_plan.operation_uuid).unwrap();
+        discard_invalid_operation(
+            dir.path(),
+            &invalid_plan.operation_uuid,
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+        )
+        .unwrap();
         assert!(
             invalid_slot.exists(),
             "an unreadable journal cannot authorize deleting an unknown target slot"
@@ -1336,7 +1369,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan();
         create_operation(dir.path(), plan.clone()).unwrap();
-        let error = discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap_err();
+        let error = discard_invalid_operation(
+            dir.path(),
+            &plan.operation_uuid,
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("journal is readable"));
     }
 
@@ -1383,8 +1421,13 @@ mod tests {
         assert_ne!(cancelled.phase, PublicationPhase::Cancelled);
 
         // Before: refused, and the message must now name the way out.
-        let error = discard_operation(root, &cancelled.plan.operation_uuid, cancelled.revision)
-            .expect_err("an unacknowledged cancel is not directly discardable");
+        let error = discard_operation(
+            root,
+            &cancelled.plan.operation_uuid,
+            cancelled.revision,
+            &crate::publication::PublicationRootLock::acquire(root).unwrap(),
+        )
+        .expect_err("an unacknowledged cancel is not directly discardable");
         let message = error.to_string();
         assert!(
             message.contains("--force"),
@@ -1399,6 +1442,7 @@ mod tests {
             root,
             &acknowledged.plan.operation_uuid,
             acknowledged.revision,
+            &crate::publication::PublicationRootLock::acquire(root).unwrap(),
         )
         .expect("an acknowledged cancellation must be discardable");
     }
@@ -1424,7 +1468,12 @@ mod tests {
                 .contains("state version 2 is incompatible")
         );
 
-        discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap();
+        discard_invalid_operation(
+            dir.path(),
+            &plan.operation_uuid,
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+        )
+        .unwrap();
         assert!(list_operations(dir.path()).unwrap().is_empty());
     }
 }

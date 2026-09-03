@@ -847,7 +847,7 @@ impl PublicationRootLock {
         std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
     }
 
-    fn ensure_authorizes(&self, publication_root: &Path) -> anyhow::Result<&Path> {
+    pub(crate) fn ensure_authorizes(&self, publication_root: &Path) -> anyhow::Result<&Path> {
         if self.authorizes(publication_root) {
             Ok(&self.root)
         } else {
@@ -2337,6 +2337,32 @@ mod tests {
         assert!(
             error.to_string().contains("does not authorize"),
             "wrong-root rollback must fail before inspecting the target: {error}"
+        );
+        // nw-373: `discard` is the third destructive publication route, and it
+        // took a root lock it never USED -- the binding was `_root_lock`, so
+        // nothing proved the lock covered the root being mutated. It must fail
+        // closed on a wrong root exactly like its two siblings above, and
+        // BEFORE it loads or inspects any journal.
+        let error = crate::publication_operation::discard_operation(
+            &unrelated,
+            "00000000-0000-4000-8000-000000000001",
+            0,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "wrong-root discard must fail before inspecting the journal: {error}"
+        );
+        let error = crate::publication_operation::discard_invalid_operation(
+            &unrelated,
+            "00000000-0000-4000-8000-000000000001",
+            &lock,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "wrong-root invalid-discard must fail closed too: {error}"
         );
         lease.release().unwrap();
     }
