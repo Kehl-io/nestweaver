@@ -149,7 +149,23 @@ jobs:
           cache-on-failure: true
           shared-key: metal-smoke
       - name: Install build dependencies
-        run: brew install protobuf
+        # nw-381: `aws/tap` ships PRE-TAPPED on GitHub's macOS runner image;
+        # nothing here taps or uses it. Homebrew's per-tap trust check then
+        # prints an "ignoring untrusted tap" warning on stderr, which GitHub
+        # renders as a warning ANNOTATION on an otherwise green job -- and one
+        # of those was already mistaken for a build failure once. `protobuf`
+        # lives in homebrew/core, so untapping something the build never uses
+        # cannot affect the install.
+        #
+        # `|| true` is load-bearing: the tap is absent on some images and
+        # `brew untap` on a missing tap exits non-zero.
+        #
+        # DELIBERATELY NOT `HOMEBREW_NO_REQUIRE_TAP_TRUST=1` -- Homebrew's own
+        # message says that is not recommended and will be removed, so it buys
+        # a silence that expires and leaves the same work to do.
+        run: |
+          brew untap aws/tap || true
+          brew install protobuf
       - name: Build Metal-enabled CLI
         run: cargo build --locked --release --features metal
       # `--features metal`, NOT `--features embed`. `metal` is additive on top

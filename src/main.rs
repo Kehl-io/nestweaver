@@ -2333,6 +2333,23 @@ impl RankingBounds {
 /// `null` when the route cannot answer — for the reason `print_repo_map_json`
 /// states about staleness: an absent key and a `false` are the same observation
 /// to an agent, and only one of them is a reason to trust the list.
+/// One cluster's payload, with the resolution that produced it.
+///
+/// nw-401: `cluster <id>` answered from a shared sidecar that any
+/// `clusters --resolution N` rewrites, and disclosed nothing -- so the
+/// byte-identical command returned different clusters before and after an
+/// unrelated invocation, and a JSON consumer had no field to detect it with.
+/// `clusters` already emits `resolution`; this is the same disclosure on the
+/// command that TAKES an id, which is the one where a silent switch actually
+/// misleads.
+fn single_cluster_payload(community: &serde_json::Value, resolution: f64) -> serde_json::Value {
+    let mut payload = community.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("resolution".to_string(), serde_json::json!(resolution));
+    }
+    payload
+}
+
 fn print_ranking_json<T: serde::Serialize>(
     key: &str,
     rows: &T,
@@ -15317,10 +15334,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             match community {
                 Some(c) => {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(c)?);
+                        // nw-401: name the resolution this answer came from.
+                        let payload =
+                            single_cluster_payload(&serde_json::to_value(c)?, output.resolution);
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
                     } else {
                         println!("Cluster [{}]: {}", c.id, c.name);
                         println!("  Members: {}  Cohesion: {:.4}", c.member_count, c.cohesion);
+                        // Cluster IDs are not stable across resolutions, so the
+                        // human surface has to say which one produced this id.
+                        println!("  Resolution: {}", output.resolution);
                         println!();
                         println!("  Key files:");
                         for f in &c.key_files {
@@ -40669,6 +40692,42 @@ mod brain_context_scope_filter_tests {
 /// Both directions matter and they are different contracts: a test selector
 /// that silently narrows drops the regression test that would have caught the
 /// change, with nothing downstream able to tell that from "no tests exist".
+#[cfg(test)]
+mod nw401_cluster_disclosure_tests {
+    /// nw-401. `clusters --resolution N` rewrites a SHARED `<db>.clusters.json`
+    /// (58 MB next to the live brain), and `cluster <id>` -- which has no
+    /// `--resolution` flag -- then answers from whatever was written last. On a
+    /// fixed scratch DB the BYTE-IDENTICAL command `cluster 0` returned
+    /// `src, Members: 2` before an unrelated `clusters --resolution 5` and
+    /// `delta, Members: 1` after it. Cluster IDs are not stable identifiers.
+    ///
+    /// The asymmetry is what made it invisible: `clusters` emits `"resolution"`
+    /// in `--json` and logs the cached resolution to stderr; `cluster` did
+    /// neither, and it is the command that TAKES an id. Disclosing the
+    /// resolution an answer came from is the item's stated minimum and removes
+    /// the silent-switch class on its own.
+    #[test]
+    fn a_single_cluster_answer_names_the_resolution_it_came_from() {
+        let community = serde_json::json!({
+            "id": 0,
+            "name": "src",
+            "cohesion": 0.5,
+            "member_count": 2,
+            "members": [],
+            "key_files": []
+        });
+        let payload = super::single_cluster_payload(&community, 0.3);
+        assert_eq!(
+            payload["resolution"],
+            serde_json::json!(0.3),
+            "a JSON consumer must be able to detect the switch: {payload}"
+        );
+        // The community's own fields survive alongside it.
+        assert_eq!(payload["id"], serde_json::json!(0));
+        assert_eq!(payload["name"], serde_json::json!("src"));
+    }
+}
+
 #[cfg(test)]
 mod nw316_route_tests {
     use super::daemon_may_serve;
