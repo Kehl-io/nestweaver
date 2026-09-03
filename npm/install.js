@@ -175,6 +175,10 @@ module.exports = {
 /// Headers go over stdin via `--config -` so a bearer token never appears in
 /// this process's argv.
 function requestRelease(url, headers) {
+  // The URL stays a normal argument: it is not a secret, and keeping it in
+  // argv is what lets tooling (and the release gate's fake curl) see which
+  // request is being made. ONLY the headers go over stdin, because that is
+  // where the bearer token lives.
   const args = [
     "--fail-with-body",
     "-sSL",
@@ -182,10 +186,10 @@ function requestRelease(url, headers) {
     "\n%{http_code}",
     "--config",
     "-",
+    url,
   ];
   const config = headers
     .map((header) => `header = ${JSON.stringify(header)}`)
-    .concat([`url = ${JSON.stringify(url)}`])
     .join("\n");
   let raw;
   try {

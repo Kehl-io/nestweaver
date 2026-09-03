@@ -28,9 +28,13 @@ const bytes = Buffer.from("verified-release-archive\\n");
 const sha = crypto.createHash("sha256").update(bytes).digest("hex");
 if (tool === "curl") {
   if (args.some((arg) => arg.includes("api.github.com/repos/") && arg.includes("/releases/tags/"))) {
-    const immutable = process.env.NW_INSTALL_TEST_MODE !== "mutable-release";
+    const immutable = !String(process.env.NW_INSTALL_TEST_MODE || "").startsWith(
+      "mutable-release",
+    );
     const version = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"))).version;
-    process.stdout.write(JSON.stringify({ immutable, tag_name: "v" + version }));
+    // The installer asks curl to append the HTTP status on its own line and
+    // parses that last line, so a fake that omits it is not modelling the call.
+    process.stdout.write(JSON.stringify({ immutable, tag_name: "v" + version }) + "\\n200");
     process.exit(0);
   }
   const outputAt = args.indexOf("-o");
@@ -51,10 +55,16 @@ if (tool === "shasum") {
 }
 if (tool === "tar") {
   const destination = args[args.indexOf("-C") + 1];
-  const exitCode = process.env.NW_INSTALL_TEST_MODE === "runtime-failure" ? 7 : 0;
+  const mode = process.env.NW_INSTALL_TEST_MODE;
+  const exitCode = mode === "runtime-failure" ? 7 : 0;
+  const version = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"))).version;
+  // The installer captures --version and matches it against the package
+  // version, so the fake binary has to report one. A fake that printed nothing
+  // would fail the success case for the wrong reason.
+  const reported = mode === "version-mismatch" ? "0.0.0-not-this-build" : version;
   fs.writeFileSync(
     path.join(destination, "nestweaver"),
-    "#!/bin/sh\\nexit " + exitCode + "\\n",
+    '#!/bin/sh\\necho "nestweaver ' + reported + '"\\nexit ' + exitCode + "\\n",
     { mode: 0o755 },
   );
   process.exit(0);
@@ -82,6 +92,8 @@ try {
         ...process.env,
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
         NW_INSTALL_TEST_MODE: mode,
+        NESTWEAVER_REQUIRE_IMMUTABLE_RELEASE:
+          mode === "mutable-release-strict" ? "1" : "",
       },
       encoding: "utf8",
     });
@@ -104,7 +116,17 @@ try {
   runCase("success", true);
   runCase("missing-checksum", false);
   runCase("checksum-mismatch", false);
-  runCase("mutable-release", false);
+  // A mutable release is DISCLOSED, not refused. Every release published
+  // before immutable releases were enabled reports `immutable: false`, and
+  // 9.0.5 -- the only published version -- is one of them, so refusing here
+  // would break the only install that exists. The checksum is still enforced,
+  // which the two cases above gate.
+  runCase("mutable-release", true);
+  // ...and the strict opt-in still refuses, so the tightened contract is
+  // gated rather than merely documented.
+  runCase("mutable-release-strict", false);
+  // The installed binary must BE the version the package claims.
+  runCase("version-mismatch", false);
   runCase("runtime-failure", false);
   process.stdout.write(`npm postinstall behavioral gate passed (${archiveSha})\n`);
 } finally {
