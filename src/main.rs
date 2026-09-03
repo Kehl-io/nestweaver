@@ -18819,7 +18819,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `include_components` came to differ between them (nw-316 leg 2).
             let direct_args = project_args.clone();
             let daemon_result = try_hybrid_json_rpc_checked(
-                use_daemon,
+                // nw-316: `--config` names an InstanceConfig the daemon cannot
+                // honour, so it reroutes rather than being forwarded.
+                daemon_may_serve(use_daemon, config.as_deref()),
                 &db_path,
                 config.as_deref(),
                 "project_context",
@@ -22726,6 +22728,33 @@ fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
             std::time::Duration::from_millis(ms).saturating_add(std::time::Duration::from_secs(30))
         });
     Some(budget.unwrap_or(RPC_TIMEOUT_DEFAULT))
+}
+
+/// Whether the daemon may serve a request that named `--config`.
+///
+/// It may not, and this is a SECURITY boundary, not a convenience. nw-316's
+/// research settled it: `InstanceConfig` carries `authz`, and
+/// `build_daemon_permission_source` derives the daemon's ENTIRE permission
+/// source from it, with `None` meaning every caller is `VisibleRepos::All`. A
+/// client that could forward its own config into request handling could supply
+/// its own authorization policy, or omit it and be promoted to see everything --
+/// a total bypass of nw-403 and nw-415. Most of the struct is also
+/// process-lifetime rather than request-scoped (`embedding` names a model the
+/// daemon loaded at BOOT, against vectors already on disk), so "forward the
+/// config" silently splits into keys that can be honoured and keys that cannot,
+/// with nothing telling the caller which half it got.
+///
+/// So `--config` joins `--no-tests` and `--prefer-instance` in forcing the
+/// direct route: the caller gets exactly the config they named, and a shared
+/// multi-client daemon can never be reconfigured by one client. A caller who
+/// genuinely needs a different config served remotely wants a second daemon
+/// INSTANCE, which the instance model already supports.
+///
+/// `tool_brain_guide` already refuses a caller-supplied `config` for the same
+/// reason and says so in its schema; this is that precedent applied to the
+/// route that has an alternative.
+fn daemon_may_serve(use_daemon: bool, config: Option<&std::path::Path>) -> bool {
+    use_daemon && config.is_none()
 }
 
 fn try_hybrid_json_rpc_checked(
@@ -40473,6 +40502,35 @@ mod brain_context_scope_filter_tests {
 /// that silently narrows drops the regression test that would have caught the
 /// change, with nothing downstream able to tell that from "no tests exist".
 #[cfg(test)]
+mod nw316_route_tests {
+    use super::daemon_may_serve;
+    use std::path::Path;
+
+    /// nw-316. `--config` must force the direct route rather than be forwarded
+    /// into the RPC: `InstanceConfig` carries the authorization policy, so a
+    /// forwarded config is a permission bypass, and most of the struct is
+    /// process-lifetime rather than request-scoped.
+    #[test]
+    fn naming_a_config_forces_the_direct_route() {
+        assert!(
+            daemon_may_serve(true, None),
+            "an ordinary request still uses the daemon"
+        );
+        assert!(
+            !daemon_may_serve(true, Some(Path::new("/tmp/instance.toml"))),
+            "--config must reroute, never forward"
+        );
+        assert!(
+            !daemon_may_serve(false, None),
+            "an explicit no-daemon request is still direct"
+        );
+        assert!(
+            !daemon_may_serve(false, Some(Path::new("/tmp/instance.toml"))),
+            "both reasons together stay direct"
+        );
+    }
+}
+
 mod resolver_generation_gate_tests {
     use super::*;
     use nestweaver_engine::blast_radius::{AnalysisStatus, BlastRadiusResult};
