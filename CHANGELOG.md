@@ -1,5 +1,48 @@
 # Changelog
 
+## [9.1.0](https://github.com/Kehl-io/nestweaver/compare/v9.0.5...v9.1.0) (2026-09-03)
+
+
+### Features
+
+* **cli:** sweep CLI flag bounds against their MCP schema twins, and write down the sibling-gap rule (nw-217b, nw-217c) ([19a995f](https://github.com/Kehl-io/nestweaver/commit/19a995fd3cd3bd767b9197194cb2d27a350e00b7))
+* **release,npm:** attempt npm provenance, and document the install-script failure users actually hit (nw-423, nw-358) ([786ab50](https://github.com/Kehl-io/nestweaver/commit/786ab50b2249a3ba1c68cf79a9bbb145e3f5e3ac))
+
+
+### Bug Fixes
+
+* **cli:** make `cluster` name the resolution its answer came from (nw-401) ([9d199d9](https://github.com/Kehl-io/nestweaver/commit/9d199d92683e0312c7a32ddba880aa93c5448425))
+* close every finding from the independent review ([8454f03](https://github.com/Kehl-io/nestweaver/commit/8454f03c77d65bd8e2e25d2186efdd742d4d1e4d))
+* close every route an independent review found still reproducing ([836b630](https://github.com/Kehl-io/nestweaver/commit/836b63024a72a17c06ab6ae0f9f3124437a6e0e9))
+* close nw-373, advance nw-316, and land nw-217's remaining legs ([1bafb3f](https://github.com/Kehl-io/nestweaver/commit/1bafb3fec701b77e5e5d70fb8a12dc0187472c2e))
+* close the CLI twins for the scope filters and the resolver-stale gate ([838943c](https://github.com/Kehl-io/nestweaver/commit/838943c9d69ec4df21d3141ff05464af923b8d42))
+* close writer-lease and consolidation-receipt gaps from PR [#352](https://github.com/Kehl-io/nestweaver/issues/352) review ([1069f1d](https://github.com/Kehl-io/nestweaver/commit/1069f1da43842977651ea2f847a2cef52c414f33))
+* correct PR [#352](https://github.com/Kehl-io/nestweaver/issues/352)'s release, writer-lease and consolidation defects ([f402870](https://github.com/Kehl-io/nestweaver/commit/f40287070b5d2a3d7e46713eaa984594f7d26f98))
+* disclosure, bounds and coverage sweep across 13 items ([37bc066](https://github.com/Kehl-io/nestweaver/commit/37bc0668d79c93ad11503b428b7c912a87a65824))
+* disclosure, bounds and coverage sweep across 13 items ([429e563](https://github.com/Kehl-io/nestweaver/commit/429e563919c511e7c61d5bcdf8661f01ec6030c6))
+* **engine,cli,mcp:** stop blast-radius degrades opening with dead-code's sentence ([5d8cc18](https://github.com/Kehl-io/nestweaver/commit/5d8cc1878a4c9977a2faee0c25fc7159edcd2d7b))
+* **engine,mcp:** break bundle locks held by dead processes; restore the resolver descriptor on the restricted route ([5307930](https://github.com/Kehl-io/nestweaver/commit/53079301c5bb72a296bc895b3c1c722e8c9f50f5))
+* **engine,store,web:** close adversarial-review findings ([057a869](https://github.com/Kehl-io/nestweaver/commit/057a869564012d08f48ba58c7f8fdfe6854ef199))
+* **engine:** finish nw-395 — refuse unlocked bundle writes, and stop calling an unreadable store expired ([558ea06](https://github.com/Kehl-io/nestweaver/commit/558ea061bd8e4010fa2a1837ff1b41d56acf0c55))
+* **engine:** tell the caller whether a resolver-stale repository is theirs (nw-424) ([aee8168](https://github.com/Kehl-io/nestweaver/commit/aee8168767d5c513f4456963446032ba3c3f8363))
+* **engine:** truncate PR comments at a char boundary, not a byte index (nw-402) ([842b208](https://github.com/Kehl-io/nestweaver/commit/842b2084aaff241893397eda58855cc843e8147f))
+* harden high-priority safety contracts ([a23ac52](https://github.com/Kehl-io/nestweaver/commit/a23ac52f7cacbc169bb012186b7ba0e441a58daa))
+* make resolver-staleness actionable, attempt npm provenance, sort stale_repos at the emitter ([c53f2e9](https://github.com/Kehl-io/nestweaver/commit/c53f2e9ee52429e656e5d351b623c0bddf90a0f5))
+* make writer leases portable across scratch roots ([c146495](https://github.com/Kehl-io/nestweaver/commit/c1464954b67f98eddee0b7c1ac524b3467568b45))
+* **npm,ci:** close review findings — dead rate-limit branch, credential in argv, vacuous test ([7c026c2](https://github.com/Kehl-io/nestweaver/commit/7c026c2f80cf86a988b632d7e1e43987f2ba93da))
+* **npm,release:** reconcile the release gate with the installer contract this branch changed ([8066e8e](https://github.com/Kehl-io/nestweaver/commit/8066e8e43e206015d16ffc0fe4f27ba455f3b631))
+* **npm:** make the installer's claims true and stop it failing every published version ([c67aaca](https://github.com/Kehl-io/nestweaver/commit/c67aaca61b845b9b6787795514c7737efdcfad12))
+* pre-release batch — truncation panic, macOS annotation noise, cluster resolution disclosure ([811935b](https://github.com/Kehl-io/nestweaver/commit/811935bb162f9188813c2bca15794ec7e92475d3))
+* **project-context:** disclose which config answered, and reroute --config instead of forwarding it (nw-316) ([cf6f3ef](https://github.com/Kehl-io/nestweaver/commit/cf6f3ef285911291bbe01b4fc00de2bce807584e))
+* **publication:** make discard prove its root lock covers what it deletes (nw-373) ([c5c956a](https://github.com/Kehl-io/nestweaver/commit/c5c956a454677a63450be9a31f8508a6c138f13c))
+* restore #[cfg(test)] on nw316_route_tests ([856177f](https://github.com/Kehl-io/nestweaver/commit/856177fdb51c7fda123676dbc30995afc68641c0))
+* **schema:** stop provenance stamping from destroying keys it does not own ([a0086c8](https://github.com/Kehl-io/nestweaver/commit/a0086c80949fe8a3a10a7684fb522bfa9824f479))
+* security, coverage-disclosure and merge-gate sweep across 12 items ([3d46ec2](https://github.com/Kehl-io/nestweaver/commit/3d46ec23fd1ef8ea79889806aa7ac2d482b3911b))
+* security, coverage-disclosure and merge-gate sweep across 12 items ([1062565](https://github.com/Kehl-io/nestweaver/commit/1062565f72c93f18897db7b524f9af3a42704a33))
+* separate portable lock authorities ([2887b14](https://github.com/Kehl-io/nestweaver/commit/2887b14468db3ffbd60fa34485dc800437f85c50))
+* stabilize safety checks under CI concurrency ([939c8af](https://github.com/Kehl-io/nestweaver/commit/939c8af9833df4763f7c35723aa6a30895389bb3))
+* **web:** make every durable admin mutation shutdown-visible ([33085e2](https://github.com/Kehl-io/nestweaver/commit/33085e2406a38d3eac164b04f8700b668ef00f69))
+
 ## [9.0.5](https://github.com/Kehl-io/nestweaver/compare/v9.0.4...v9.0.5) (2026-09-01)
 
 
