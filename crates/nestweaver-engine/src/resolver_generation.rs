@@ -369,11 +369,34 @@ impl DeadCodeRefusal {
 
     /// The paragraph a human sees, on stderr, on every route.
     pub fn message(&self) -> String {
+        self.message_with_preamble(WHY_DEAD_CODE_REFUSES)
+    }
+
+    /// The same verdict and the same pasteable remedies, for a caller that is
+    /// DEGRADING an edge-dependent analysis rather than refusing `dead-code`.
+    ///
+    /// nw-419. Both blast-radius wrappers pushed [`Self::message`] verbatim, so
+    /// a blast-radius degrade opened by explaining why `dead-code` will not
+    /// produce a list -- a command the user did not run, in front of remedies
+    /// that were otherwise exactly right. `affected_tests_refusal_payload`
+    /// already replaces its `note` for this reason; this is that fix on the
+    /// surface that still needed it, shared rather than restated so the two
+    /// blast-radius routes cannot drift.
+    pub fn edge_analysis_message(&self) -> String {
+        match self {
+            Self::OutdatedResolver { repos, .. } => {
+                let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
+                self.message_with_preamble(&incompatibility_message(&uids))
+            }
+        }
+    }
+
+    fn message_with_preamble(&self, preamble: &str) -> String {
         match self {
             Self::OutdatedResolver { repos, total } => {
                 let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
                 let note = staleness_note_for(&uids, *total).unwrap_or_default();
-                let mut message = format!("{WHY_DEAD_CODE_REFUSES} {note}");
+                let mut message = format!("{preamble} {note}");
                 for repo in repos {
                     match &repo.command {
                         Some(command) => message.push_str(&format!("\n  {command}")),
@@ -476,6 +499,44 @@ mod tests {
     fn missing_entry_reads_as_generation_zero() {
         let g = ResolverGenerations::default();
         assert_eq!(g.generation_for("repo:whatever"), 0);
+    }
+
+    /// nw-419: `message()` opens with `WHY_DEAD_CODE_REFUSES`, which is the
+    /// right sentence for `dead-code` and the wrong one in front of a
+    /// blast-radius degrade. Both blast-radius wrappers push it verbatim, so a
+    /// user degrading `blast-radius` is told about a command they did not run.
+    /// The remedies below it are correct and must survive.
+    #[test]
+    fn the_edge_analysis_message_drops_dead_codes_sentence_and_keeps_its_remedies() {
+        let refusal = DeadCodeRefusal::OutdatedResolver {
+            repos: vec![StaleRepoRemedy::new(
+                "repo:a".to_string(),
+                Some("/src/a".to_string()),
+            )],
+            total: Some(1),
+        };
+
+        // Counterweight: dead-code's own message must KEEP the sentence.
+        assert!(
+            refusal
+                .message()
+                .contains("dead-code will not produce a list"),
+            "dead-code's own refusal keeps its rationale"
+        );
+
+        let edge = refusal.edge_analysis_message();
+        assert!(
+            !edge.contains("dead-code"),
+            "an edge-analysis degrade must not open with dead-code's sentence: {edge}"
+        );
+        assert!(
+            edge.contains("/src/a"),
+            "the pasteable remedy must survive: {edge}"
+        );
+        assert!(
+            edge.contains(&RESOLVER_GENERATION.to_string()),
+            "the running generation must still be named: {edge}"
+        );
     }
 
     #[test]

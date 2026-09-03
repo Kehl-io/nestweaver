@@ -8696,7 +8696,7 @@ fn degrade_blast_radius_if_resolver_stale(
         .notifications
         .push(nestweaver_engine::blast_radius::Notification {
             level: NotificationLevel::Error,
-            message: refusal.message(),
+            message: refusal.edge_analysis_message(),
             descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
         });
     // `render_blast_summary` appends `[status: …]` for any non-Complete run

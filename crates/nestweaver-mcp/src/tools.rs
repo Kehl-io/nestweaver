@@ -12721,7 +12721,7 @@ fn tool_blast_radius(
             .notifications
             .push(nestweaver_engine::blast_radius::Notification {
                 level: nestweaver_engine::blast_radius::NotificationLevel::Error,
-                message: refusal.message(),
+                message: refusal.edge_analysis_message(),
                 descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
             });
         // `render_blast_summary` appends `[status: …]` for any non-Complete
