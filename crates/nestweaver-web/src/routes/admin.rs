@@ -46,8 +46,42 @@ impl AdminMutationAdmission {
 
 impl Drop for AdminMutationAdmission {
     fn drop(&mut self) {
-        self.active_writes.fetch_sub(1, Ordering::Release);
+        // SeqCst, matching `admit`. The type's whole argument is that the drain
+        // and this request share ONE total order; a weaker decrement here is
+        // still correct on the counter alone, but it puts the release outside
+        // the order the comment above appeals to and makes that argument
+        // unverifiable by inspection.
+        self.active_writes.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Run a durable admin mutation under an admission the TASK owns.
+///
+/// Ownership must not follow the HTTP request: dropping an axum request drops
+/// its `JoinHandle`, not the spawned task, so a disconnected or aborted client
+/// would otherwise release the admission while the mutation is still running
+/// and let the drain observe zero with durable work in flight.
+async fn run_owned_admin_mutation<F, Fut, T>(
+    state: Arc<AdminState>,
+    operation: F,
+) -> Result<T, (StatusCode, String)>
+where
+    F: FnOnce(Arc<AdminState>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, (StatusCode, String)>> + Send,
+    T: Send + 'static,
+{
+    let admission = AdminMutationAdmission::admit(&state)?;
+    tokio::spawn(async move {
+        let _admission = admission;
+        operation(state).await
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("admin mutation task panicked: {error}"),
+        )
+    })?
 }
 
 // ── Shared job-queue access ────────────────────────────────────────────
@@ -300,6 +334,13 @@ pub async fn add_repo(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<AddRepoRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, move |state| add_repo_owned(state, req)).await
+}
+
+async fn add_repo_owned(
+    state: Arc<AdminState>,
+    req: AddRepoRequest,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     // Validate the URL scheme + host to prevent SSRF (file://, internal
     // hostnames, private/loopback IPs, alternate IPv4 encodings, IPv6-embedded
     // IPv4). See `validate_repo_url` — this part is pure (no DNS).
@@ -484,18 +525,7 @@ pub async fn remove_repo(
     // the HTTP request future: dropping an axum request drops its JoinHandle,
     // not the spawned task, so a disconnected/aborted client cannot make the
     // drain counter reach zero while spawn_blocking still owns graph work.
-    let admission = AdminMutationAdmission::admit(&state)?;
-    tokio::spawn(async move {
-        let _admission = admission;
-        remove_repo_owned(state, repo_uid).await
-    })
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("admin repo removal task panicked: {error}"),
-        )
-    })?
+    run_owned_admin_mutation(state, move |state| remove_repo_owned(state, repo_uid)).await
 }
 
 async fn remove_repo_owned(
@@ -668,6 +698,13 @@ pub async fn trigger_reindex(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
     Path(repo_uid): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, move |state| trigger_reindex_owned(state, repo_uid)).await
+}
+
+async fn trigger_reindex_owned(
+    state: Arc<AdminState>,
+    repo_uid: String,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let store = state.daemon_store.clone();
     let job_queue = state.job_queue.clone();
@@ -881,6 +918,13 @@ pub async fn retry_dead_letter(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, move |state| retry_dead_letter_owned(state, id)).await
+}
+
+async fn retry_dead_letter_owned(
+    state: Arc<AdminState>,
+    id: String,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let job_queue = state.job_queue.clone();
     let db_path = state.db_path.clone();
     let job_id: i64 = id
@@ -926,6 +970,13 @@ pub async fn dismiss_dead_letter(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, move |state| dismiss_dead_letter_owned(state, id)).await
+}
+
+async fn dismiss_dead_letter_owned(
+    state: Arc<AdminState>,
+    id: String,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let job_queue = state.job_queue.clone();
     let db_path = state.db_path.clone();
@@ -973,6 +1024,12 @@ pub async fn dismiss_dead_letter(
 pub async fn reload_config(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, reload_config_owned).await
+}
+
+async fn reload_config_owned(
+    state: Arc<AdminState>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let Some(ref config_path) = state.config_path else {
         return Ok(Json(MessageResponse {
@@ -1646,6 +1703,13 @@ pub async fn device_approve(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<DeviceApproveRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    run_owned_admin_mutation(state, move |state| device_approve_owned(state, req)).await
+}
+
+async fn device_approve_owned(
+    state: Arc<AdminState>,
+    req: DeviceApproveRequest,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let wanted = normalize_user_code(&req.user_code);
     if wanted.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "user_code required".to_string()));
@@ -1729,6 +1793,74 @@ mod tests {
 
         drop(admission);
         assert_eq!(state.active_writes.load(Ordering::SeqCst), 0);
+    }
+
+    /// Every DURABLE admin mutation must be shutdown-visible, not just repo
+    /// removal. The drain counts `active_writes` and exits when it reaches
+    /// zero; a route that starts durable work without an admission is
+    /// invisible to that count and cannot be refused, so it can begin a queue,
+    /// config or graph mutation after the daemon has decided to stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_durable_admin_mutation_is_refused_once_shutdown_starts() {
+        // (method, path, body) for each durable mutation surface.
+        let routes: Vec<(&str, &str, &str)> = vec![
+            ("DELETE", "/admin/api/repos/some-repo", ""),
+            (
+                "POST",
+                "/admin/api/repos",
+                r#"{"path":"/tmp/x","url":"https://example.com/x"}"#,
+            ),
+            ("POST", "/admin/api/repos/some-repo/reindex", ""),
+            ("POST", "/admin/api/dead-letter/some-id/retry", ""),
+            ("POST", "/admin/api/dead-letter/some-id/dismiss", ""),
+            ("POST", "/admin/api/config/reload", ""),
+            (
+                "POST",
+                "/admin/api/device/approve",
+                r#"{"user_code":"ABCD-EFGH"}"#,
+            ),
+        ];
+
+        for (method, path, body) in routes {
+            let state = test_admin_state();
+            state.shutdown_started.store(true, Ordering::SeqCst);
+            let app = Router::new()
+                .route("/admin/api/repos/{id}", delete(remove_repo))
+                .route("/admin/api/repos", post(add_repo))
+                .route("/admin/api/repos/{id}/reindex", post(trigger_reindex))
+                .route("/admin/api/dead-letter/{id}/retry", post(retry_dead_letter))
+                .route(
+                    "/admin/api/dead-letter/{id}/dismiss",
+                    post(dismiss_dead_letter),
+                )
+                .route("/admin/api/config/reload", post(reload_config))
+                .route("/admin/api/device/approve", post(device_approve))
+                .with_state(Arc::clone(&state));
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("Authorization", "Bearer test-admin-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path} must be refused once shutdown has started"
+            );
+            assert_eq!(
+                state.active_writes.load(Ordering::SeqCst),
+                0,
+                "{method} {path} must not leak an admission when refused"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
