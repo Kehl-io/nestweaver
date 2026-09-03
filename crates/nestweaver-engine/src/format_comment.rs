@@ -304,7 +304,20 @@ fn enforce_char_limit(md: &mut String, _total_groups: usize, _config: &FormatCon
 
     // Strategy 2: Hard truncation
     if md.len() > HARD_CHAR_LIMIT {
-        md.truncate(HARD_CHAR_LIMIT - 20);
+        // nw-402: truncate at a CHARACTER boundary. `String::truncate` takes a
+        // BYTE index and panics if it splits a UTF-8 sequence, so the old
+        // `md.truncate(HARD_CHAR_LIMIT - 20)` crashed whenever byte 64,980
+        // happened to land mid-character. That needs only one non-ASCII
+        // character at that exact offset, which identifiers, paths and doc text
+        // supply routinely at this size. `floor_char_boundary` is still
+        // unstable, so walk back to the nearest boundary explicitly -- at most
+        // three bytes, since that is the widest a UTF-8 continuation run gets
+        // before a boundary.
+        let mut cut = HARD_CHAR_LIMIT - 20;
+        while cut > 0 && !md.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        md.truncate(cut);
         md.push_str("\n... [truncated]\n");
     }
 }
@@ -771,6 +784,58 @@ pub fn render_codequality_json(impacts: &[ImpactResult]) -> String {
         })
         .collect();
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(test)]
+mod char_boundary_tests {
+    use super::*;
+
+    /// nw-402. `enforce_char_limit` truncated at a BYTE index, so when byte
+    /// `HARD_CHAR_LIMIT - 20` landed in the middle of a multi-byte character
+    /// `String::truncate` panicked with "byte index is not a char boundary".
+    /// Rare -- it needs a multi-byte character at exactly that offset -- but it
+    /// is a panic in PR-comment formatting, reached with any non-ASCII content
+    /// at scale: identifiers, paths and doc text are all routinely non-ASCII.
+    #[test]
+    fn hard_truncation_does_not_panic_on_a_multibyte_boundary() {
+        // Place a 3-byte character so that it STRADDLES the cut. `é` is 2
+        // bytes, `—` is 3; build the string so the cut lands mid-sequence.
+        for filler_len in 0..4usize {
+            let mut md = String::new();
+            md.push_str(&"a".repeat(HARD_CHAR_LIMIT - 20 - filler_len));
+            // Push enough multi-byte characters to exceed the limit.
+            md.push_str(&"—".repeat(40));
+            let before = md.clone();
+            let config = FormatConfig::default();
+
+            enforce_char_limit(&mut md, 0, &config);
+
+            assert!(
+                md.len() <= HARD_CHAR_LIMIT,
+                "filler {filler_len}: truncation must still bound the output"
+            );
+            assert!(
+                md.ends_with("... [truncated]\n"),
+                "filler {filler_len}: the truncation marker must survive"
+            );
+            // The real property: whatever we cut, the result is still valid
+            // UTF-8 that Rust can hand back as &str without panicking.
+            assert!(
+                before.starts_with(&md[..md.len() - "\n... [truncated]\n".len()]),
+                "filler {filler_len}: the kept prefix must be a prefix of the input"
+            );
+        }
+    }
+
+    /// The counterweight: content already under the limit is untouched, so the
+    /// boundary fix cannot become an unconditional rewrite.
+    #[test]
+    fn content_under_the_limit_is_left_alone() {
+        let mut md = "— short and multi-byte —".to_string();
+        let original = md.clone();
+        enforce_char_limit(&mut md, 0, &FormatConfig::default());
+        assert_eq!(md, original);
+    }
 }
 
 #[cfg(test)]
