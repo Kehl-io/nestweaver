@@ -40728,6 +40728,7 @@ mod nw401_cluster_disclosure_tests {
     }
 }
 
+#[cfg(test)]
 mod nw316_route_tests {
     use super::daemon_may_serve;
     use std::path::Path;
