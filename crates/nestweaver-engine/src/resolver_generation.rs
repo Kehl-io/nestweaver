@@ -398,8 +398,21 @@ impl DeadCodeRefusal {
     pub fn edge_analysis_message(&self) -> String {
         match self {
             Self::OutdatedResolver { repos, .. } => {
+                // Just the verdict. `incompatibility_message` ends with its own
+                // `index --repo <path> --force` TEMPLATE, and
+                // `message_with_preamble` appends `staleness_note_for`, which
+                // ends with the same template again -- so composing them
+                // printed the remedy twice as a run-on before the pasteable
+                // command. The preamble states the cause; the remedy block
+                // below it states the fix, once.
                 let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
-                self.message_with_preamble(&incompatibility_message(&uids))
+                format!(
+                    "edge-dependent analysis cannot trust repositories whose resolver \
+                     generation differs from the running generation \
+                     {RESOLVER_GENERATION}: {}. Re-index each one:{}",
+                    uids.join(", "),
+                    self.remedy_lines()
+                )
             }
         }
     }

@@ -287,10 +287,6 @@ pub fn bundle_sidecar_path(db_path: &Path) -> std::path::PathBuf {
     crate::sidecar_path(db_path, ".bundles.json")
 }
 
-/// Load the bundle store, dropping any bundles whose `created_at` is older than
-/// the TTL. Returns an empty store when the sidecar is missing. A corrupt
-/// sidecar no longer silently drops every bundle: individually
-/// parseable bundles are salvaged and a warning is emitted.
 /// [`load_bundle_store`] that distinguishes an ABSENT sidecar from an
 /// UNREADABLE one.
 ///
@@ -313,9 +309,9 @@ pub fn load_bundle_store_checked(db_path: &Path) -> Result<BundleStore, anyhow::
         }
         Ok(_) => {}
     }
-    // Probe readability explicitly. A corrupt-but-readable sidecar is NOT a
-    // fault here -- `load_bundle_store` salvages individually parseable
-    // bundles, and that behaviour is deliberate and tested.
+    // Read ONCE and prove readability with the same call. A
+    // corrupt-but-readable sidecar is NOT a fault here -- `load_bundle_store`
+    // salvages individually parseable bundles, and that is tested behaviour.
     std::fs::read_to_string(&path).map_err(|error| {
         anyhow::anyhow!(
             "cannot read the bundle store at {}: {error}",
@@ -325,6 +321,11 @@ pub fn load_bundle_store_checked(db_path: &Path) -> Result<BundleStore, anyhow::
     Ok(load_bundle_store(db_path))
 }
 
+/// Load the bundle store, dropping any bundles whose `created_at` is older than
+/// the TTL. Returns an empty store when the sidecar is missing OR unreadable --
+/// see [`load_bundle_store_checked`] when that difference matters. A corrupt
+/// sidecar no longer silently drops every bundle: individually parseable
+/// bundles are salvaged and a warning is emitted.
 pub fn load_bundle_store(db_path: &Path) -> BundleStore {
     let path = bundle_sidecar_path(db_path);
     let mut store: BundleStore = match std::fs::read_to_string(&path) {
@@ -414,16 +415,56 @@ const LOCK_WAIT_SECS: u64 = 10;
 /// Age after which an existing lock file is considered abandoned.
 const LOCK_STALE_SECS: u64 = 60;
 
-/// The pid recorded in a bundle lock token (`<pid>:<nanos>`), when it can be
-/// read and parsed. `None` means "cannot tell", never "dead".
+/// Identity of the PID namespace this process's pids are meaningful in.
+///
+/// A pid is only comparable against `process_is_alive` inside the namespace
+/// that issued it. Without this, a containerised daemon and a host-side CLI
+/// sharing a bind-mounted database read each other's live pids as `ESRCH` and
+/// each breaks the other's lock -- reintroducing the very lost-bundle race the
+/// pid check was added to close, in a form STRICTLY worse than the old
+/// mtime-only rule, which was namespace-agnostic.
+fn pid_namespace_identity() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Exact: the pid-namespace inode, which differs per container.
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No pid namespaces; the host is the boundary. Hostname is a coarse
+        // but honest stand-in, and a mismatch only costs us the fast path.
+        let mut buffer = [0i8; 256];
+        if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len()) } != 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = buffer
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect();
+        String::from_utf8(bytes).ok()
+    }
+}
+
+/// The pid recorded in a bundle lock token, when it is BOTH parseable AND
+/// stamped with this process's pid namespace. `None` means "cannot tell",
+/// never "dead" -- the caller falls back to the namespace-agnostic mtime rule.
+///
+/// Tokens are `<pid>:<nanos>:<namespace>`. A legacy two-field token has no
+/// namespace and is deliberately NOT trusted: it may have been written from
+/// anywhere.
 fn lock_holder_pid(path: &Path) -> Option<i32> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .split(':')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    let token = std::fs::read_to_string(path).ok()?;
+    let mut fields = token.trim().split(':');
+    let pid: i32 = fields.next()?.trim().parse().ok()?;
+    let _nanos = fields.next()?;
+    let recorded = fields.collect::<Vec<_>>().join(":");
+    if recorded.is_empty() || Some(recorded) != pid_namespace_identity() {
+        return None;
+    }
+    Some(pid)
 }
 
 impl BundleStoreLock {
@@ -431,12 +472,13 @@ impl BundleStoreLock {
         use std::io::Write as _;
         let path = bundle_sidecar_path(db_path).with_extension("lock");
         let token = format!(
-            "{}:{}",
+            "{}:{}:{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            pid_namespace_identity().unwrap_or_default()
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LOCK_WAIT_SECS);
         loop {
@@ -1594,12 +1636,60 @@ fn now_epoch() -> f64 {
 mod bundle_lock_tests {
     use super::*;
 
+    /// A lock token stamped with THIS process's pid namespace, i.e. what a
+    /// real local holder writes.
+    fn local_token(pid: i32) -> String {
+        format!(
+            "{pid}:12345:{}",
+            pid_namespace_identity().unwrap_or_default()
+        )
+    }
+
     /// A pid no live process can own. Probing upward from a high number keeps
     /// this deterministic without depending on any particular pid_max.
     fn dead_pid() -> i32 {
         (90_000..99_000)
             .find(|pid| !crate::index_publication::process_is_alive(*pid))
             .expect("some pid in the probe range is unused")
+    }
+
+    /// A pid is only meaningful inside the namespace that issued it. A token
+    /// from ANOTHER namespace -- a containerised daemon sharing a bind-mounted
+    /// database with a host-side CLI -- must fall back to the mtime rule, not
+    /// be read as dead. Trusting it would break a LIVE holder's lock and
+    /// reintroduce the lost-bundle race in a form worse than the old
+    /// namespace-agnostic rule.
+    #[test]
+    fn a_lock_token_from_another_pid_namespace_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A dead-looking pid, but stamped with a namespace that is not ours.
+        std::fs::write(&lock_path, format!("{}:12345:pid:[999999999]", dead_pid())).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "a pid from a foreign namespace must not license breaking the lock"
+        );
+    }
+
+    /// A legacy two-field token predates the namespace stamp, so its origin is
+    /// unknown and it must fail safe the same way.
+    #[test]
+    fn a_legacy_token_without_a_namespace_stamp_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{}:12345", dead_pid())).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "a token with no namespace stamp must fail safe"
+        );
     }
 
     /// nw-395 leg 2: every failure arm returned `owned: false` and fell
@@ -1614,7 +1704,7 @@ mod bundle_lock_tests {
         let lock_path = bundle_sidecar_path(&db).with_extension("lock");
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         // A LIVE holder: not stealable, and not stale by mtime either.
-        std::fs::write(&lock_path, format!("{}:1", std::process::id())).unwrap();
+        std::fs::write(&lock_path, local_token(std::process::id() as i32)).unwrap();
 
         let error = update_bundle_store(&db, |store| {
             store.bundles.clear();
@@ -1708,7 +1798,7 @@ mod bundle_lock_tests {
         let lock_path = bundle_sidecar_path(&db).with_extension("lock");
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         // A fresh mtime, so the 60s mtime rule cannot break it.
-        std::fs::write(&lock_path, format!("{}:12345", dead_pid())).unwrap();
+        std::fs::write(&lock_path, local_token(dead_pid())).unwrap();
 
         let started = std::time::Instant::now();
         let lock = BundleStoreLock::acquire(&db);
@@ -1733,7 +1823,7 @@ mod bundle_lock_tests {
         let lock_path = bundle_sidecar_path(&db).with_extension("lock");
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         // This very process is unambiguously alive.
-        std::fs::write(&lock_path, format!("{}:12345", std::process::id())).unwrap();
+        std::fs::write(&lock_path, local_token(std::process::id() as i32)).unwrap();
 
         let lock = BundleStoreLock::acquire(&db);
         assert!(!lock.owned, "a live holder's lock must not be stolen");

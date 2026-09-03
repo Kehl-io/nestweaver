@@ -77,9 +77,15 @@ where
     })
     .await
     .map_err(|error| {
+        // Log the payload; do not RETURN it. These routes previously unwound
+        // into hyper, so nothing was echoed to the client. Owning the task
+        // turns a panic into a response, and a panic message can carry
+        // arbitrary internal state -- authenticated-only, but there is no
+        // reason to hand it back.
+        tracing::error!(%error, "admin mutation task panicked");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("admin mutation task panicked: {error}"),
+            "admin mutation failed unexpectedly; see the daemon log".to_string(),
         )
     })?
 }

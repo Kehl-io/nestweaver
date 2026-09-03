@@ -291,15 +291,40 @@ fn is_system_scratch_data_dir(data_dir: &Path) -> bool {
         .any(|scratch| scratch == data_dir)
 }
 
-/// Whether the stable parent refused a new entry because the directory itself
-/// is not writable by this process, rather than because of a transient or
-/// caller-correctable fault. This is deliberately narrow: a full disk, a
-/// missing intermediate path, or an I/O error must still fail the acquisition.
-fn stable_parent_is_immutable(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-    )
+/// Whether `stable_parent` genuinely refuses new entries from this process.
+///
+/// This is a POSITIVE probe of the directory, not an inference from an error.
+/// Keying on the lock file's errno was unsound: a lock file created earlier by
+/// a DIFFERENT user (a root-run daemon leaving `root:root 0644`) makes a
+/// non-root writer's open fail `EACCES` while the parent is perfectly
+/// writable -- so the writer silently dropped the namespace lock while a root
+/// restore still took `LOCK_EX` on the same file. That is exactly the
+/// uncoordinated cutover the lock exists to prevent. Only a parent this
+/// process genuinely cannot create in earns the bypass.
+fn stable_parent_refuses_new_entries(stable_parent: &Path) -> bool {
+    let probe = stable_parent.join(format!(
+        ".nestweaver-write-probe.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ),
+    }
 }
 
 fn acquire_db_write_lease_inner(
@@ -324,12 +349,13 @@ fn acquire_db_write_lease_inner(
         if is_system_scratch_data_dir(&data_dir) {
             None
         } else {
+            // No tolerance here: swallowing EACCES only meant the lock-file
+            // open failed with ENOENT a moment later, reporting "No such file
+            // or directory" for what was a permissions problem.
             if let Some(stable_parent) = data_dir.parent()
                 && !stable_parent.exists()
-                && let Err(error) = std::fs::create_dir_all(stable_parent)
-                && !stable_parent_is_immutable(&error)
             {
-                return Err(WriteLeaseError::Unavailable(error));
+                std::fs::create_dir_all(stable_parent).map_err(WriteLeaseError::Unavailable)?;
             }
             let lease_path = namespace_lease_path(&data_dir)?;
             match std::fs::OpenOptions::new()
@@ -351,9 +377,18 @@ fn acquire_db_write_lease_inner(
                 // an ordinary writer to coordinate with. Proceed on the exact
                 // database and sidecar authorities alone, exactly as a
                 // database directly under a system scratch root already does.
-                // Only an immutable parent is tolerated; every other error
-                // still fails the acquisition.
-                Err(error) if stable_parent_is_immutable(&error) => None,
+                // Only a parent this process genuinely cannot create in is
+                // tolerated. Every other error -- including EACCES on a lock
+                // file owned by another user in a writable directory -- still
+                // fails the acquisition.
+                Err(error)
+                    if data_dir
+                        .parent()
+                        .is_some_and(stable_parent_refuses_new_entries) =>
+                {
+                    let _ = error;
+                    None
+                }
                 Err(error) => return Err(WriteLeaseError::Unavailable(error)),
             }
         }
@@ -425,7 +460,14 @@ fn acquire_db_write_lease_inner(
                 // Close our descriptor first so the unlink cannot race this
                 // process's own record lock on the inode being removed.
                 drop(db_file);
-                let _ = std::fs::remove_file(&db_path);
+                if let Err(error) = std::fs::remove_file(&db_path) {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        %error,
+                        "failed acquisition could not remove the database inode it created; \
+                         an empty file may remain"
+                    );
+                }
             }
             return Err(error);
         }

@@ -925,6 +925,7 @@ fn apply_proposals(
     // same-source/same-destination batches and all current read/path failures
     // before publishing even the first Prepared checkpoint.
     let mut new_entries = Vec::new();
+    let mut obsolete: Vec<String> = Vec::new();
     for proposal in proposals {
         let note = note_by_uid
             .get(proposal.source_uid.as_str())
@@ -958,6 +959,30 @@ fn apply_proposals(
             validate_journal_for_proposal(&existing.journal, proposal, note, &path)?;
             continue;
         }
+        // A proposal whose SOURCE FILE is gone is not a validation failure --
+        // it is a proposal the graph is too stale to know is already done.
+        // Letting `prepare_consolidation_journal` raise it turned one such row
+        // into a hard `Err` from the whole preflight, which aborted EVERY other
+        // pending consolidation across EVERY vault, permanently, until the
+        // vault was re-indexed. Skipping it preserves the preflight guarantee
+        // (nothing is mutated until every remaining proposal validates) while
+        // keeping one stale row from wedging the batch.
+        let source_absent =
+            validated_vault_path(vault_root, &source_relative, "consolidation source")
+                .ok()
+                .is_some_and(|source| {
+                    matches!(
+                        std::fs::symlink_metadata(&source),
+                        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+                });
+        if source_absent {
+            obsolete.push(format!(
+                "SKIPPED: '{}' was already consolidated -- its source {} no longer exists.                  The graph still lists it, so re-index the vault to stop it being proposed:                  nestweaver brain refresh <vault-path>",
+                proposal.source_uid, proposal.source_path
+            ));
+            continue;
+        }
         let journal = prepare_consolidation_journal(proposal, note, vault_root, &note_by_uid)?;
         new_entries.push(JournalEntry {
             vault_root: vault_root.clone(),
@@ -978,7 +1003,7 @@ fn apply_proposals(
     entries.extend(new_entries);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let mut summaries = Vec::new();
+    let mut summaries = obsolete;
     let mut all_ok = true;
     let mut had_work = false;
     let mut result_proposals: Vec<_> = proposals
@@ -1010,7 +1035,22 @@ fn apply_proposals(
             // gone from the graph, so no proposal can regenerate. Without this,
             // every consolidation a vault ever performs leaves a file that is
             // re-read and re-stat'd forever.
-            let drift = validate_retained_complete_journal(&entry.vault_root, &entry.journal).err();
+            // Retire on a POSITIVE drift signal only. "validation returned
+            // Err" conflated "the user edited the vault" with "I could not
+            // READ the vault", so a transiently unavailable network mount would
+            // irrevocably delete a receipt describing work that DID complete.
+            let drift = match retained_receipt_drift(&entry.vault_root, &entry.journal) {
+                Ok(drift) => drift,
+                Err(error) => {
+                    all_ok = false;
+                    summaries.push(format!(
+                        "FAILED: cannot inspect completed consolidation '{}' in {}: {error}",
+                        entry.journal.journal_id,
+                        entry.path.display()
+                    ));
+                    continue;
+                }
+            };
             let absorbed = !note_by_uid.contains_key(entry.journal.proposal.source_uid.as_str());
             if drift.is_some() || absorbed {
                 match retire_consolidation_journal(&entry.path) {
@@ -1019,7 +1059,8 @@ fn apply_proposals(
                     Ok(()) => {
                         if let Some(error) = drift {
                             summaries.push(format!(
-                                "RETIRED: completed consolidation '{}' no longer matches the vault                                  and its receipt was removed from {}: {error}",
+                                "RETIRED: completed consolidation '{}' no longer matches the vault \
+                                 and its receipt was removed from {}: {error}",
                                 entry.journal.journal_id,
                                 entry.path.display()
                             ));
@@ -2030,6 +2071,66 @@ fn validate_consolidation_completion(
     Ok(())
 }
 
+/// Classify a retained receipt against the vault.
+///
+/// `Ok(None)`  -- the receipt still matches.
+/// `Ok(Some)`  -- POSITIVE drift: the user deleted or moved what it describes.
+/// `Err`       -- the vault could not be inspected; the receipt is untouched.
+///
+/// The distinction is load-bearing. Retiring on "validation failed" would
+/// delete a receipt describing completed work whenever the vault was merely
+/// unreadable -- a transient network mount, a permissions change -- and the
+/// retire is irreversible.
+fn retained_receipt_drift(
+    vault_root: &Path,
+    journal: &ConsolidationJournal,
+) -> Result<Option<String>> {
+    let source = validated_vault_path(
+        vault_root,
+        Path::new(&journal.source_path),
+        "consolidation source",
+    )?;
+    match std::fs::symlink_metadata(&source) {
+        // Expected: a completed consolidation removed its source.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Ok(Some(format!(
+                "its source {} exists again",
+                source.display()
+            )));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect completed consolidation source {}: {error}",
+                source.display()
+            ));
+        }
+    }
+
+    let destination = validated_vault_path(
+        vault_root,
+        Path::new(&journal.destination_path),
+        "consolidation destination",
+    )?;
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
+            "its destination {} was deleted or moved",
+            destination.display()
+        ))),
+        Err(error) => Err(anyhow::anyhow!(
+            "inspect completed consolidation destination {}: {error}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Ok(Some(format!(
+                "its destination {} is no longer a regular file",
+                destination.display()
+            )))
+        }
+        Ok(_) => Ok(None),
+    }
+}
+
 fn validate_retained_complete_journal(
     vault_root: &Path,
     journal: &ConsolidationJournal,
@@ -2577,29 +2678,57 @@ mod tests {
         // Ordinary vault hygiene: the user deletes the promoted note.
         fs::remove_file(root.join(&journal.destination_path)).unwrap();
 
-        let after_delete = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
-        assert!(
-            after_delete
+        // Runs 1..=3. The bug this pins is that the failure MOVES rather than
+        // clearing: run 1 retired the receipt, and every run after it aborted
+        // the whole preflight with `apply failed: read consolidation source
+        // ... No such file`, because the stale graph keeps re-proposing a
+        // consolidation whose source the first run had already moved.
+        //
+        // The earlier version of this assertion greped for "FAILED" and the
+        // permanent failure is spelled "apply failed" -- lowercase -- so it
+        // could not see the very thing it was named for. Match
+        // case-insensitively, and check every run, not just the first.
+        for run in 1..=3 {
+            let outcome = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+            let lowered: Vec<String> = outcome
                 .warnings
                 .iter()
-                .all(|warning| !warning.contains("FAILED")),
-            "a deleted destination is drift, not a failure: {:?}",
-            after_delete.warnings
-        );
-        assert!(
-            !journal_path.exists(),
-            "an obsolete receipt must be retired, not retained to fail again"
-        );
+                .map(|warning| warning.to_lowercase())
+                .collect();
+            assert!(
+                lowered.iter().all(|warning| !warning.contains("failed")),
+                "run {run}: a deleted destination must not fail, now or ever: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                !journal_path.exists(),
+                "run {run}: the obsolete receipt must stay retired"
+            );
+        }
 
-        // The property that matters: it does not recur.
-        let later = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+        // And the batch must still be usable: an INDEPENDENT consolidation
+        // added afterwards has to apply. The original bug aborted the entire
+        // preflight, so nothing else in any vault could proceed.
+        fs::write(
+            root.join("_logs/2025-02-02.md"),
+            "# Log Feb 2\n\nA second recurring idea worth promoting.\n",
+        )
+        .unwrap();
+        for idea in ["idea-a", "idea-b", "idea-c"] {
+            let path = root.join(format!("_ideas/{idea}.md"));
+            let body = fs::read_to_string(&path).unwrap();
+            fs::write(&path, format!("{body}\nAlso [[_logs/2025-02-02]].\n")).unwrap();
+        }
+        let (_res, reindexed) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let fresh = memory_consolidate(&reindexed, true, 4_000_000_000.0).unwrap();
         assert!(
-            later
-                .warnings
-                .iter()
-                .all(|warning| !warning.contains("FAILED")),
-            "the failure must not be permanent: {:?}",
-            later.warnings
+            fresh.applied,
+            "an independent consolidation must still apply after the drift: {:?}",
+            fresh.warnings
+        );
+        assert!(
+            root.join("_ideas/2025-02-02.md").exists(),
+            "the independent consolidation must actually have moved its file"
         );
     }
 
