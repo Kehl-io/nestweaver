@@ -70,10 +70,36 @@ pub fn provenance(scope: &str, sources: &[&str], stale_repos: &[String]) -> Valu
 /// need a bare array to become addressable.
 pub fn set(result: &mut Value, scope: &str, sources: &[&str], stale_repos: &[String]) {
     if let Some(obj) = result.as_object_mut() {
-        obj.insert(
-            META_KEY.to_string(),
-            provenance(scope, sources, stale_repos),
-        );
+        let stamped = provenance(scope, sources, stale_repos);
+        // MERGE the provenance fields into any existing `_meta`, rather than
+        // replacing the object.
+        //
+        // Replacing it silently destroyed every other key a handler had put
+        // there. nw-316 hit this first: `project_context` writes
+        // `_meta.answered_by` (which instance config produced the answer), and
+        // the daemon route stamps provenance AFTER the tool returns -- so the
+        // disclosure survived on the direct route and vanished on the daemon
+        // one. A field on one route only is exactly the drift nw-316 is about,
+        // reintroduced by the fix for it, and the parity harness caught it.
+        //
+        // Provenance still WINS on its own keys, so a federating caller's
+        // verdict is unchanged; what changes is that keys provenance does not
+        // own are no longer collateral. `ensure` already documents that not
+        // clobbering a richer verdict matters -- this gives `set` the same care
+        // for keys outside its vocabulary.
+        match (
+            obj.get_mut(META_KEY).and_then(Value::as_object_mut),
+            stamped,
+        ) {
+            (Some(existing), Value::Object(fields)) => {
+                for (key, value) in fields {
+                    existing.insert(key, value);
+                }
+            }
+            (_, stamped) => {
+                obj.insert(META_KEY.to_string(), stamped);
+            }
+        }
     }
 }
 
@@ -84,8 +110,32 @@ pub fn set(result: &mut Value, scope: &str, sources: &[&str], stale_repos: &[Str
 /// either — a payload with no `_meta` at all is the nw-315 defect.
 pub fn ensure(result: &mut Value, scope: &str, sources: &[&str], stale_repos: &[String]) {
     if let Some(obj) = result.as_object_mut() {
-        obj.entry(META_KEY)
-            .or_insert_with(|| provenance(scope, sources, stale_repos));
+        let stamped = provenance(scope, sources, stale_repos);
+        // Keyed on the provenance FIELDS, not on `_meta` existing.
+        //
+        // Testing the whole object made this skip entirely as soon as a handler
+        // put anything else under `_meta`. nw-316 tripped it: once
+        // `project_context` wrote `_meta.answered_by`, the direct route silently
+        // stopped receiving `scope`/`sources`/`stale_repos` -- a payload with no
+        // provenance at all, which is the nw-315 defect this function exists to
+        // prevent, reintroduced by an unrelated key appearing beside it.
+        //
+        // The stated contract is unchanged: a value already present WINS, so a
+        // federating caller's richer verdict is still never clobbered. What
+        // changed is that "already present" is now asked per field.
+        match (
+            obj.get_mut(META_KEY).and_then(Value::as_object_mut),
+            stamped,
+        ) {
+            (Some(existing), Value::Object(fields)) => {
+                for (key, value) in fields {
+                    existing.entry(key).or_insert(value);
+                }
+            }
+            (_, stamped) => {
+                obj.entry(META_KEY).or_insert(stamped);
+            }
+        }
     }
 }
 
@@ -128,6 +178,60 @@ pub fn set_stale_repos(result: &mut Value, stale_repos: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// nw-316: `set` REPLACED `_meta`, destroying every key a handler had
+    /// already put there. `project_context` writes `_meta.answered_by` naming
+    /// the instance config that produced the answer; the daemon route stamps
+    /// provenance after the tool returns, so the disclosure survived on the
+    /// direct route and vanished on the daemon one -- a field on one route
+    /// only, which is the exact drift nw-316 exists to fix.
+    #[test]
+    fn set_merges_rather_than_destroying_keys_it_does_not_own() {
+        let mut result = serde_json::json!({
+            "answer": 1,
+            "_meta": { "answered_by": { "instance_id": "kept" } }
+        });
+        super::set(&mut result, "local", &["local"], &[]);
+
+        assert_eq!(
+            result["_meta"]["answered_by"]["instance_id"], "kept",
+            "a key provenance does not own must survive the stamp: {result}"
+        );
+        // Provenance still wins on its own vocabulary.
+        assert_eq!(result["_meta"]["scope"], "local");
+        assert!(result["_meta"]["sources"].is_array());
+    }
+
+    /// nw-316: `ensure` keyed on `_meta` EXISTING, so the moment a handler put
+    /// any unrelated key there it stopped stamping provenance at all -- the
+    /// nw-315 defect (a payload with no provenance) reintroduced sideways. It
+    /// must fill in the fields it owns while still never clobbering a value
+    /// that is already there.
+    #[test]
+    fn ensure_stamps_alongside_an_unrelated_meta_key() {
+        let mut result = serde_json::json!({
+            "answer": 1,
+            "_meta": { "answered_by": { "instance_id": "kept" } }
+        });
+        super::ensure(&mut result, "local", &["local"], &[]);
+
+        assert_eq!(result["_meta"]["answered_by"]["instance_id"], "kept");
+        assert_eq!(
+            result["_meta"]["scope"], "local",
+            "an unrelated key must not suppress the provenance stamp: {result}"
+        );
+        assert!(result["_meta"]["sources"].is_array());
+        assert!(result["_meta"]["stale_repos"].is_array());
+    }
+
+    /// The counterweight: with no existing `_meta`, the stamp is still written
+    /// whole. A payload with no provenance at all is the nw-315 defect.
+    #[test]
+    fn set_still_stamps_a_payload_with_no_existing_meta() {
+        let mut result = serde_json::json!({ "answer": 1 });
+        super::set(&mut result, "local", &["local"], &[]);
+        assert_eq!(result["_meta"]["scope"], "local");
+    }
+
     use super::*;
 
     #[test]

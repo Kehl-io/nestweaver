@@ -21,6 +21,46 @@ For security vulnerabilities, see [SECURITY.md](.github/SECURITY.md) instead.
 PRs should be focused — one feature or fix per PR. If a change touches
 multiple crates, that's fine as long as it's one logical change.
 
+## Review rule: sibling gaps
+
+**When the same property must hold in two places, make the second place CALL
+the first, or make the property a TYPE. Do not write it twice and remember to
+check the twin.**
+
+"Remember to check the twin" has failed at least ten times in this repo. Every
+instance of this class that has stayed fixed was fixed structurally; every one
+patched by mirroring came back. This is a review rule rather than a lint
+because the two legs it covers are not syntactically expressible — "these two
+functions should agree" is not a pattern a checker can match, and a semantic
+divergence between routes is what the parity harness exists for. Where the
+property *can* be checked mechanically it already is (see the CLI/MCP bounds
+sweep in `src/main.rs`, which probes every declared bound through the real
+parser).
+
+### The canon
+
+Worked examples that shipped, so this is a canon rather than an exhortation:
+
+| Example | The shape |
+| --- | --- |
+| `render_cost` | The CLI's twin was DELETED and the function made `pub` so the CLI calls it. The copy had drifted to the wrong branch and was charging a concise response at the detailed rate. |
+| `property_matches` | The CLI calls the MCP predicate instead of restating it. |
+| `repo_head` | One implementation behind both `stale-check` routes. |
+| `DbWriteLease` | `#[must_use]` moved onto the TYPE rather than each producer, so no caller can forget it. |
+| `provenance_seam::Unstamped` | The field is private to its module, so `stamp` is the only way to construct the stamped form — the property is unforgeable rather than remembered. |
+| `PublicationRootLock` | Destructive routes take the lock BY REFERENCE and continue through its canonical root, so a route cannot hold a lock that does not cover what it deletes. |
+| `render_optional_count`, `MAX_IMPACT_DEPTH` | Shared renderer and shared constant, rather than two spellings of one number. |
+
+### The caveat that saves you from a regression
+
+**"Sibling A has a guard sibling B lacks" does not always mean B should take it.**
+Blindly mirroring a sibling's write-gate onto `brain_memory_consolidate` would
+have made every dry-run PREVIEW queue behind in-flight writes — a guard that is
+correct for the mutating path and wrong for the read-only one. Establish that
+the property genuinely belongs in both places before unifying; sometimes the
+honest answer is that the twins legitimately differ, and then the divergence
+belongs in a comment rather than in a shared function.
+
 ## Architecture
 
 See [CLAUDE.md](CLAUDE.md) for the crate dependency diagram and conventions.

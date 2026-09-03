@@ -793,6 +793,30 @@ credential_method = "gh"
         ))
         .stdout(contains("configured-project"));
 
+    // nw-316: the response must STATE which instance config answered. Three
+    // routes returned different result sets for the same project and budget and
+    // nothing disclosed it; until an answer names the config that produced it,
+    // config can be neither confirmed nor eliminated as the cause. Asserted
+    // through the real binary because the value comes from ambient dispatch
+    // state, which a unit test installs by hand and therefore cannot prove.
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args([
+            "project-context",
+            "configured-project",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(contains("\"answered_by\""))
+        .stdout(contains("\"config_installed\": true"))
+        // The instance named in `--config`, which is only reachable because
+        // `--config` REROUTES to the direct path instead of being forwarded.
+        .stdout(contains("config-db"));
+
     // Repository-scoped commands have a different final fallback
     // (`<repo>/nestweaver.lbug`), so cover their shared resolver explicitly.
     // `index` is finite; code `watch` uses the same resolver before entering

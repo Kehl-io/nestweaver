@@ -4794,8 +4794,13 @@ enum Commands {
         symbol: String,
         #[arg(
             long,
-            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
-            help = "Maximum contract links to return"
+            // nw-217b: was `1..=10000` while the MCP schema declares
+            // `maximum: 1000` (RESULT_LIMIT_MAX) -- a TEN-FOLD divergence, so
+            // `--limit 5000` was accepted without a daemon and rejected with
+            // one. Narrowed to the schema, which is the contract; the daemon
+            // route already refused anything above it.
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum contract links to return (1-1000; default 50, matching the MCP cross_repo_contracts schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -5295,16 +5300,28 @@ enum Commands {
             help = "Resolution parameter, greater than 0 (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
         )]
         resolution: Option<f64>,
+        // nw-217b: the range is COPIED from the MCP schema, not re-derived.
+        // Found by the S4 sweep, which probes each declared bound through
+        // the real parser -- this flag accepted 1001 while the schema
+        // declared maximum 1000, so the bound was a property of the
+        // TRANSPORT rather than of the contract (nw-259b's shape).
         #[arg(
             long,
             default_value_t = 50,
-            help = "Maximum communities to report; 0 = all"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1000),
+            help = "Maximum communities to report (0-1000; 0 = all, default 50; matches the MCP clusters schema)"
         )]
         limit: usize,
+        // nw-217b: the range is COPIED from the MCP schema, not re-derived.
+        // Found by the S4 sweep, which probes each declared bound through
+        // the real parser -- this flag accepted 201 while the schema
+        // declared maximum 200, so the bound was a property of the
+        // TRANSPORT rather than of the contract (nw-259b's shape).
         #[arg(
             long,
             default_value_t = 20,
-            help = "Maximum members listed per community; 0 = all"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=200),
+            help = "Maximum members listed per community (0-200; 0 = all, default 20; matches the MCP clusters schema)"
         )]
         members: usize,
         #[arg(long, help = "Output as JSON")]
@@ -7104,10 +7121,14 @@ enum BrainCommands {
         /// nw-341: rows sort unresolved-first then by ASCENDING confidence, so
         /// the 0.90/0.92/0.95 tiers are the TAIL. Without this the tiers a
         /// reviewer must inspect are exactly the ones a limit removes.
+        // nw-217b: range COPIED from the MCP schema. The S4 sweep found this
+        // flag accepting 1001 while the schema declared maximum 1000 -- the
+        // bound was a property of the TRANSPORT, not the contract (nw-259b).
         #[arg(
             long,
             default_value_t = 0,
-            help = "Skip this many rows before the page. The high-confidence tiers sort LAST, so this is how you reach them"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1000),
+            help = "Skip this many rows before the page (0-1000; default 0; matches the MCP brain_broken_links schema). The high-confidence tiers sort LAST, so this is how you reach them"
         )]
         offset: usize,
         #[arg(long, help = "Output as JSON")]
@@ -18819,7 +18840,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `include_components` came to differ between them (nw-316 leg 2).
             let direct_args = project_args.clone();
             let daemon_result = try_hybrid_json_rpc_checked(
-                use_daemon,
+                // nw-316: `--config` names an InstanceConfig the daemon cannot
+                // honour, so it reroutes rather than being forwarded.
+                daemon_may_serve(use_daemon, config.as_deref()),
                 &db_path,
                 config.as_deref(),
                 "project_context",
@@ -22726,6 +22749,33 @@ fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
             std::time::Duration::from_millis(ms).saturating_add(std::time::Duration::from_secs(30))
         });
     Some(budget.unwrap_or(RPC_TIMEOUT_DEFAULT))
+}
+
+/// Whether the daemon may serve a request that named `--config`.
+///
+/// It may not, and this is a SECURITY boundary, not a convenience. nw-316's
+/// research settled it: `InstanceConfig` carries `authz`, and
+/// `build_daemon_permission_source` derives the daemon's ENTIRE permission
+/// source from it, with `None` meaning every caller is `VisibleRepos::All`. A
+/// client that could forward its own config into request handling could supply
+/// its own authorization policy, or omit it and be promoted to see everything --
+/// a total bypass of nw-403 and nw-415. Most of the struct is also
+/// process-lifetime rather than request-scoped (`embedding` names a model the
+/// daemon loaded at BOOT, against vectors already on disk), so "forward the
+/// config" silently splits into keys that can be honoured and keys that cannot,
+/// with nothing telling the caller which half it got.
+///
+/// So `--config` joins `--no-tests` and `--prefer-instance` in forcing the
+/// direct route: the caller gets exactly the config they named, and a shared
+/// multi-client daemon can never be reconfigured by one client. A caller who
+/// genuinely needs a different config served remotely wants a second daemon
+/// INSTANCE, which the instance model already supports.
+///
+/// `tool_brain_guide` already refuses a caller-supplied `config` for the same
+/// reason and says so in its schema; this is that precedent applied to the
+/// route that has an alternative.
+fn daemon_may_serve(use_daemon: bool, config: Option<&std::path::Path>) -> bool {
+    use_daemon && config.is_none()
 }
 
 fn try_hybrid_json_rpc_checked(
@@ -27656,6 +27706,143 @@ mod cli_help_contract_tests {
         );
     }
 
+    /// Map a clap subcommand path onto its MCP tool name.
+    ///
+    /// Mostly mechanical -- `dead-code` -> `dead_code`, `brain context` ->
+    /// `brain_context` -- with an explicit alias table for the handful whose
+    /// CLI verb deliberately differs from the registry name. A path with no
+    /// match is SKIPPED, not failed: `export --top` has no MCP twin and
+    /// requiring one would turn this guard into a demand that every flag be
+    /// mirrored into the tool surface.
+    fn tool_name_for_cli_path(path: &str) -> Option<String> {
+        let aliases = [
+            ("context", "code_context"),
+            ("hubs", "hub_nodes"),
+            ("bridges", "bridge_nodes"),
+        ];
+        let stripped = path.strip_prefix("nestweaver ").unwrap_or(path);
+        if let Some((_, tool)) = aliases.iter().find(|(cli, _)| *cli == stripped) {
+            return Some((*tool).to_string());
+        }
+        Some(stripped.replace([' ', '-'], "_"))
+    }
+
+    /// nw-217b, the S4 leg of [[nw-217]]: for every CLI flag with an MCP schema
+    /// counterpart, the DECLARED bounds must actually be enforced by the CLI.
+    ///
+    /// The motivating instance is nw-259b: `context --limit` had NO
+    /// `value_parser` while `code_context`'s schema says `minimum: 1,
+    /// maximum: 5000` and the daemon proxy validates against it -- so
+    /// `--limit 6000` was ACCEPTED without a daemon and REJECTED with one.
+    /// **The bound was a property of the transport, not of the contract.**
+    ///
+    /// This probes BEHAVIOUR rather than reading clap's internals, because a
+    /// `value_parser`'s range is not introspectable: it feeds the real parser a
+    /// value one past each declared bound and requires a rejection. That is the
+    /// same thing the user would hit, and it is what a missing `value_parser`
+    /// fails.
+    #[test]
+    fn cli_flags_enforce_the_bounds_their_mcp_schema_twins_declare() {
+        let listing = nestweaver_mcp::tools::tool_list(false);
+        let mut schema_by_tool: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for tool in listing["tools"].as_array().expect("tool list") {
+            if let Some(name) = tool["name"].as_str() {
+                schema_by_tool.insert(name.to_string(), tool["inputSchema"].clone());
+            }
+        }
+        assert!(
+            schema_by_tool.len() >= 30,
+            "tool registry looks empty ({} tools) -- the guard would pass vacuously",
+            schema_by_tool.len()
+        );
+
+        let (violations, pairs, probes) = on_big_stack(move || {
+            let root = Cli::command();
+            let mut violations: Vec<String> = Vec::new();
+            let mut pairs = 0usize;
+            let mut probes = 0usize;
+            let mut queue: Vec<(&clap::Command, Vec<String>)> = vec![(&root, Vec::new())];
+
+            while let Some((cmd, path)) = queue.pop() {
+                for sub in cmd.get_subcommands() {
+                    let mut child = path.clone();
+                    child.push(sub.get_name().to_string());
+                    queue.push((sub, child));
+                }
+                if path.is_empty() {
+                    continue;
+                }
+                let Some(schema) = tool_name_for_cli_path(&path.join(" "))
+                    .and_then(|tool| schema_by_tool.get(&tool))
+                else {
+                    continue;
+                };
+                let Some(properties) = schema["properties"].as_object() else {
+                    continue;
+                };
+                pairs += 1;
+
+                // Required positionals must be satisfied or the parse fails for
+                // an unrelated reason and every probe would "pass".
+                let mut base: Vec<String> = vec!["nestweaver".to_string()];
+                base.extend(path.iter().cloned());
+                for positional in cmd.get_positionals() {
+                    if positional.is_required_set() {
+                        base.push("probe-value".to_string());
+                    }
+                }
+
+                for arg in cmd.get_arguments() {
+                    if arg.is_hide_set() || arg.is_positional() {
+                        continue;
+                    }
+                    let Some(long) = arg.get_long() else { continue };
+                    let Some(declared) = properties.get(long) else {
+                        continue;
+                    };
+                    for (key, offset) in [("minimum", -1i64), ("maximum", 1i64)] {
+                        let Some(bound) = declared[key].as_i64() else {
+                            continue;
+                        };
+                        let out_of_range = bound + offset;
+                        // A minimum of 0 makes `-1` a parse error for the TYPE
+                        // rather than the bound on unsigned flags; either way it
+                        // is rejected, which is what this asserts.
+                        let mut argv = base.clone();
+                        argv.push(format!("--{long}"));
+                        argv.push(out_of_range.to_string());
+                        probes += 1;
+                        if root.clone().try_get_matches_from(&argv).is_ok() {
+                            violations.push(format!(
+                                "`{}` accepts --{long} {out_of_range}, but the MCP schema declares \
+                                 {key} {bound}: the bound is a property of the transport, not the \
+                                 contract (nw-259b)",
+                                path.join(" ")
+                            ));
+                        }
+                    }
+                }
+            }
+            violations.sort();
+            (violations, pairs, probes)
+        });
+
+        // Anti-vacuity: a walk that matched nothing would report zero
+        // violations and read exactly like a clean result.
+        assert!(
+            pairs >= 5 && probes >= 5,
+            "bounds sweep looks vacuous -- {pairs} CLI/MCP pair(s) and {probes} probe(s); \
+             the guard is not actually comparing anything"
+        );
+        assert!(
+            violations.is_empty(),
+            "{} CLI flag(s) do not enforce their declared MCP bounds:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
     /// clap's own internal consistency check (duplicate names, conflicting
     /// short flags, invalid defaults). It panics on a malformed definition,
     /// which is otherwise only discovered at runtime by whoever runs the command.
@@ -32441,7 +32628,11 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
         } => {
             let root = root(explicit_root, db)?;
             // Serialize against rebuild / rollback / prune on this same root.
-            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
+            // nw-373: bound and USED, not discarded. Passing it into the
+            // discard routes is what proves the lock covers the root being
+            // mutated -- the same fix already applied to `prune_slots` and
+            // `rollback_current_under_lock`.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             // nw-146: request_cancel only sets `cancel_requested`; ONLY the
             // running worker calls acknowledge_cancel to reach phase Cancelled.
             // If that worker is gone, both discard paths refused — `--revision`
@@ -32480,7 +32671,7 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
             }
             if invalid {
                 nestweaver_engine::publication_operation::discard_invalid_operation(
-                    &root, &operation,
+                    &root, &operation, &root_lock,
                 )?;
                 println!(
                     "Discarded invalid publication operation {operation}; publication slots were preserved"
@@ -32490,6 +32681,7 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
                     &root,
                     &operation,
                     revision.expect("clap requires --revision unless --invalid is present"),
+                    &root_lock,
                 )?;
                 println!("Discarded publication operation {operation}");
             }
@@ -40467,6 +40659,36 @@ mod brain_context_scope_filter_tests {
 /// Both directions matter and they are different contracts: a test selector
 /// that silently narrows drops the regression test that would have caught the
 /// change, with nothing downstream able to tell that from "no tests exist".
+#[cfg(test)]
+mod nw316_route_tests {
+    use super::daemon_may_serve;
+    use std::path::Path;
+
+    /// nw-316. `--config` must force the direct route rather than be forwarded
+    /// into the RPC: `InstanceConfig` carries the authorization policy, so a
+    /// forwarded config is a permission bypass, and most of the struct is
+    /// process-lifetime rather than request-scoped.
+    #[test]
+    fn naming_a_config_forces_the_direct_route() {
+        assert!(
+            daemon_may_serve(true, None),
+            "an ordinary request still uses the daemon"
+        );
+        assert!(
+            !daemon_may_serve(true, Some(Path::new("/tmp/instance.toml"))),
+            "--config must reroute, never forward"
+        );
+        assert!(
+            !daemon_may_serve(false, None),
+            "an explicit no-daemon request is still direct"
+        );
+        assert!(
+            !daemon_may_serve(false, Some(Path::new("/tmp/instance.toml"))),
+            "both reasons together stay direct"
+        );
+    }
+}
+
 #[cfg(test)]
 mod resolver_generation_gate_tests {
     use super::*;

@@ -11801,6 +11801,10 @@ fn tool_project_context(
             "tokens_used": 0,
             "token_budget": token_budget,
             "note": "No notes or symbols are associated with this project yet.",
+            // Disclosed here too: an empty answer is still AN answer, and two
+            // routes disagreeing about whether a project has members is
+            // exactly the divergence this field exists to attribute.
+            "_meta": { "answered_by": answering_config_disclosure() },
         }));
     }
 
@@ -12197,6 +12201,10 @@ fn tool_project_context(
     if !external_refs.is_null() {
         resp["external_refs"] = external_refs;
     }
+
+    // nw-316: state which config answered, on EVERY return path, so a caller
+    // comparing two routes can attribute a divergence instead of guessing.
+    resp["_meta"]["answered_by"] = answering_config_disclosure();
 
     Ok(resp)
 }
@@ -13401,6 +13409,35 @@ pub fn set_current_instance_config(cfg: Option<std::sync::Arc<nestweaver_engine:
 pub(crate) fn current_instance_config() -> Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>
 {
     CURRENT_INSTANCE_CONFIG.with(|c| c.borrow().clone())
+}
+
+/// Which instance config answered THIS dispatch.
+///
+/// nw-316: `project-context` returned a different result set on all three
+/// routes for the same project and budget, and nothing in any response said so.
+/// Both routes now run one function, so the divergence is in the AMBIENT config
+/// it reads -- the daemon answers with the config it BOOTED with, the direct
+/// route with whatever the caller loaded. Until the answer states which config
+/// produced it, config can be neither confirmed nor eliminated as the cause,
+/// which is why the item's own recommendation puts this disclosure first: it is
+/// the diagnostic, and it is required whether or not the routing changes.
+///
+/// Identity, not path. `instance_id` is meaningful across routes and processes;
+/// a config file path would leak the operator's filesystem layout to a remote
+/// caller and would not even be comparable between them. `config_installed` is
+/// stated explicitly so an absent config is distinguishable from an old binary
+/// that never emitted the field.
+pub(crate) fn answering_config_disclosure() -> Value {
+    match current_instance_config() {
+        Some(cfg) => json!({
+            "config_installed": true,
+            "instance_id": cfg.instance_id,
+        }),
+        None => json!({
+            "config_installed": false,
+            "instance_id": Value::Null,
+        }),
+    }
 }
 
 /// Read the configured default result limit from the instance config's
@@ -15591,6 +15628,117 @@ mod project_context_bug12_tests {
             note_uids.len(),
             "all {} member notes must surface in connected; got {uids:?}",
             note_uids.len()
+        );
+    }
+
+    /// nw-316. Three routes answered the same `project-context` request
+    /// differently and NOTHING in any response said so. Both routes now run
+    /// this one function, so the divergence is in the AMBIENT config it reads:
+    /// the daemon answers with its BOOT config, the direct route with the
+    /// caller's. Until a response states which config answered, config cannot
+    /// be confirmed OR eliminated as the cause — the item's own recommendation
+    /// is that this disclosure comes first, because it is the diagnostic.
+    #[test]
+    fn project_context_discloses_which_instance_config_answered() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:disclosed".into(),
+                name: "Disclosed".into(),
+                summary: None,
+                instance_id: "inst".into(),
+            })
+            .unwrap();
+
+        let ask = || {
+            tool_project_context(
+                &store,
+                None,
+                json!({ "project": "Disclosed", "token_budget": 5000 }),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        // No config installed: the response must SAY so rather than omit the
+        // field, because an absent key is indistinguishable from an old binary.
+        set_current_instance_config(None);
+        let anonymous = ask();
+        assert_eq!(
+            anonymous["_meta"]["answered_by"]["config_installed"], false,
+            "a config-less dispatch must disclose that: {anonymous}"
+        );
+
+        // With a config installed, the response names the instance that
+        // answered. This is the value that differs between the daemon's boot
+        // config and a `--config` the CLI loaded, which is what makes the
+        // 827/829/815 divergence attributable instead of unexplained.
+        let cfg: nestweaver_engine::InstanceConfig = serde_json::from_value(json!({
+            "instance_id": "instance-under-test",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" }
+        }))
+        .expect("valid instance config");
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        let named = ask();
+        set_current_instance_config(None);
+
+        assert_eq!(named["_meta"]["answered_by"]["config_installed"], true);
+        assert_eq!(
+            named["_meta"]["answered_by"]["instance_id"], "instance-under-test",
+            "the answering instance must be named: {named}"
+        );
+
+        // BOTH return paths. The assertions above exercise the empty-project
+        // early return; the main path assembles a different object and had its
+        // own `Ok`, so a disclosure added to only one of them would leave the
+        // populated case -- the one an agent actually opens a session with --
+        // silently undisclosed. Verified by sabotage: removing either site
+        // fails this test.
+        store
+            .insert_note(&mk_note(
+                "note:member",
+                "vault:v",
+                "notes/member.md",
+                "Member Note",
+            ))
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:disclosed", "note:member")])
+            .unwrap();
+        let cfg2: nestweaver_engine::InstanceConfig = serde_json::from_value(json!({
+            "instance_id": "instance-under-test",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" }
+        }))
+        .expect("valid instance config");
+        set_current_instance_config(Some(std::sync::Arc::new(cfg2)));
+        let populated = ask();
+        set_current_instance_config(None);
+        assert!(
+            populated["connected"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty())
+                || populated["seeds_expanded"].as_u64().is_some_and(|n| n > 0),
+            "fixture must reach the POPULATED path, not the early return: {populated}"
+        );
+        assert_eq!(
+            populated["_meta"]["answered_by"]["instance_id"], "instance-under-test",
+            "the populated path must disclose too: {populated}"
+        );
+        // The disclosure must not leak a filesystem path to a remote caller;
+        // instance identity is the thing that is meaningful across routes.
+        assert!(
+            named["_meta"]["answered_by"].get("config_path").is_none(),
+            "disclose identity, not the operator's filesystem layout"
         );
     }
 
