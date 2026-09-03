@@ -291,6 +291,40 @@ pub fn bundle_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 /// the TTL. Returns an empty store when the sidecar is missing. A corrupt
 /// sidecar no longer silently drops every bundle: individually
 /// parseable bundles are salvaged and a warning is emitted.
+/// [`load_bundle_store`] that distinguishes an ABSENT sidecar from an
+/// UNREADABLE one.
+///
+/// nw-395 leg 3. The infallible form maps every read error to an empty store,
+/// so a `chmod 000` sidecar, a directory in its place, or an I/O fault all
+/// reach the caller as `bundle '<id>' not found or expired` -- which sends the
+/// user to the TTL when their bundle store cannot be read at all. Absence is
+/// still simply empty: that is the first-run path and must stay silent.
+pub fn load_bundle_store_checked(db_path: &Path) -> Result<BundleStore, anyhow::Error> {
+    let path = bundle_sidecar_path(db_path);
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BundleStore::default());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot read the bundle store at {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    // Probe readability explicitly. A corrupt-but-readable sidecar is NOT a
+    // fault here -- `load_bundle_store` salvages individually parseable
+    // bundles, and that behaviour is deliberate and tested.
+    std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot read the bundle store at {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(load_bundle_store(db_path))
+}
+
 pub fn load_bundle_store(db_path: &Path) -> BundleStore {
     let path = bundle_sidecar_path(db_path);
     let mut store: BundleStore = match std::fs::read_to_string(&path) {
@@ -517,8 +551,23 @@ fn update_bundle_store<T>(
     db_path: &Path,
     f: impl FnOnce(&mut BundleStore) -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
-    let _lock = BundleStoreLock::acquire(db_path);
-    let mut store = load_bundle_store(db_path);
+    // nw-395 leg 2. Every acquisition failure used to fall through to
+    // load -> mutate -> save UNLOCKED. Under contention that is how a bundle
+    // already handed to the caller was lost: two writers each load the same
+    // store, each save their own copy, and the loser's bundle is gone while its
+    // id was already advertised as a drill-in. Failing loudly is the lesser
+    // harm -- the caller retries, instead of being told a bundle exists that
+    // does not. Reads do not take this lock and are unaffected.
+    let lock = BundleStoreLock::acquire(db_path);
+    if !lock.owned {
+        anyhow::bail!(
+            "could not acquire the bundle store lock at {} within {LOCK_WAIT_SECS}s; another \
+             process is writing it. Retry; a mutation is refused rather than performed unlocked, \
+             because an unlocked write silently discards a concurrent writer's bundle.",
+            lock.path.display()
+        );
+    }
+    let mut store = load_bundle_store_checked(db_path)?;
     let out = f(&mut store)?;
     store.version = 1;
     save_bundle_store(db_path, &store)?;
@@ -1551,6 +1600,100 @@ mod bundle_lock_tests {
         (90_000..99_000)
             .find(|pid| !crate::index_publication::process_is_alive(*pid))
             .expect("some pid in the probe range is unused")
+    }
+
+    /// nw-395 leg 2: every failure arm returned `owned: false` and fell
+    /// through to load -> mutate -> save UNLOCKED. Under contention that is how
+    /// a bundle already handed to the caller was lost -- two writers each
+    /// load the same store, each save their own copy, and the loser's bundle
+    /// is gone while its id was already advertised as a drill-in.
+    #[test]
+    fn a_mutation_that_cannot_take_the_lock_fails_instead_of_writing_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A LIVE holder: not stealable, and not stale by mtime either.
+        std::fs::write(&lock_path, format!("{}:1", std::process::id())).unwrap();
+
+        let error = update_bundle_store(&db, |store| {
+            store.bundles.clear();
+            Ok(())
+        })
+        .expect_err("an unlockable mutation must fail rather than write unlocked");
+        let text = error.to_string();
+        assert!(
+            text.contains("lock"),
+            "the failure must name the lock as the cause: {text}"
+        );
+        assert!(
+            !bundle_sidecar_path(&db).exists(),
+            "nothing may be written when the lock was never held"
+        );
+    }
+
+    /// Counterweight: an uncontended mutation still succeeds.
+    #[test]
+    fn an_uncontended_mutation_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        update_bundle_store(&db, |store| {
+            store.bundles.clear();
+            Ok(())
+        })
+        .expect("an uncontended mutation must still write");
+        assert!(bundle_sidecar_path(&db).exists());
+    }
+
+    /// nw-395 leg 3: `load_bundle_store` mapped EVERY read error to an empty
+    /// store, so a `chmod 000` sidecar, a directory in its place, or an I/O
+    /// fault all surfaced as `bundle '<id>' not found or expired` -- a
+    /// diagnosis that sends the user to the TTL when the real cause is that
+    /// their bundle store cannot be read at all.
+    #[test]
+    fn an_unreadable_bundle_store_is_reported_as_unreadable_not_expired() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the mode bits.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let sidecar = bundle_sidecar_path(&db);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "{}").unwrap();
+        std::fs::set_permissions(
+            &sidecar,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        let error = update_bundle_store(&db, |_| Ok(()))
+            .expect_err("an unreadable bundle store must not look empty");
+        let text = error.to_string();
+        assert!(
+            !text.contains("not found or expired"),
+            "an unreadable store must not be diagnosed as an expired bundle: {text}"
+        );
+        assert!(
+            text.contains("read") || text.contains("unreadable"),
+            "the failure must name unreadability: {text}"
+        );
+
+        std::fs::set_permissions(
+            &sidecar,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+    }
+
+    /// Counterweight: a genuinely ABSENT sidecar is still an empty store, not
+    /// an error -- that is the first-run path and must stay silent.
+    #[test]
+    fn an_absent_bundle_store_is_still_simply_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let seen = update_bundle_store(&db, |store| Ok(store.bundles.len()))
+            .expect("an absent sidecar is a first run, not a fault");
+        assert_eq!(seen, 0);
     }
 
     /// nw-395: the lock token records the writer's pid and NOTHING ever read
