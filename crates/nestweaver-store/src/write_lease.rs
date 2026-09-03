@@ -291,6 +291,17 @@ fn is_system_scratch_data_dir(data_dir: &Path) -> bool {
         .any(|scratch| scratch == data_dir)
 }
 
+/// Whether the stable parent refused a new entry because the directory itself
+/// is not writable by this process, rather than because of a transient or
+/// caller-correctable fault. This is deliberately narrow: a full disk, a
+/// missing intermediate path, or an I/O error must still fail the acquisition.
+fn stable_parent_is_immutable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
 fn acquire_db_write_lease_inner(
     db_path: &Path,
     namespace: Option<&DbNamespaceLease>,
@@ -315,19 +326,36 @@ fn acquire_db_write_lease_inner(
         } else {
             if let Some(stable_parent) = data_dir.parent()
                 && !stable_parent.exists()
+                && let Err(error) = std::fs::create_dir_all(stable_parent)
+                && !stable_parent_is_immutable(&error)
             {
-                std::fs::create_dir_all(stable_parent).map_err(WriteLeaseError::Unavailable)?;
+                return Err(WriteLeaseError::Unavailable(error));
             }
             let lease_path = namespace_lease_path(&data_dir)?;
-            let file = std::fs::OpenOptions::new()
+            match std::fs::OpenOptions::new()
                 .create(true)
                 .read(true)
                 .write(true)
                 .truncate(false)
                 .open(lease_path)
-                .map_err(WriteLeaseError::Unavailable)?;
-            lock_flock_with_inheritance_retry(&file, libc::LOCK_SH)?;
-            Some(file)
+            {
+                Ok(file) => {
+                    lock_flock_with_inheritance_retry(&file, libc::LOCK_SH)?;
+                    Some(file)
+                }
+                // The shared namespace lock lives in the stable parent so it
+                // survives restore renaming `data_dir`. When that parent
+                // refuses new files, NestWeaver cannot destructively restore
+                // this directory either -- `acquire_db_namespace_lease` would
+                // fail on the identical create -- so there is no cutover for
+                // an ordinary writer to coordinate with. Proceed on the exact
+                // database and sidecar authorities alone, exactly as a
+                // database directly under a system scratch root already does.
+                // Only an immutable parent is tolerated; every other error
+                // still fails the acquisition.
+                Err(error) if stable_parent_is_immutable(&error) => None,
+                Err(error) => return Err(WriteLeaseError::Unavailable(error)),
+            }
         }
     };
     // The data directory may have been absent, or restore may have renamed it
@@ -362,24 +390,46 @@ fn acquire_db_write_lease_inner(
         }
         Err(error) => return Err(WriteLeaseError::Unavailable(error)),
     };
-    // Take the same whole-file POSIX record-lock class used by lbug itself.
-    // This is the compatibility bridge for a live pre-upgrade writer that
-    // knows nothing about the sidecar: successful authority acquisition must
-    // exclude it, not merely exclude other upgraded NestWeaver processes.
-    lock_posix_write_nonblocking(&db_file)?;
-    // Never flock this same inode as well. Linux keeps the two lock families
-    // independent, while macOS makes them cooperate and a second interface can
-    // contend with this process's own record lock. The process claim and the
-    // distinct sidecar flock below close the same-process duplicate hole.
+    // Every failure from here on must unwind the database inode this call
+    // created. Publishing an empty `.lbug` would make the caller's next
+    // `open_or_create` see a corrupt-looking database rather than an absent
+    // one -- the nw-126 shape, where a zero-length artifact made a live
+    // database look unopenable. A database we did NOT create is never removed.
+    let remaining = (|| {
+        // Take the same whole-file POSIX record-lock class used by lbug itself.
+        // This is the compatibility bridge for a live pre-upgrade writer that
+        // knows nothing about the sidecar: successful authority acquisition
+        // must exclude it, not merely exclude other upgraded NestWeaver
+        // processes.
+        lock_posix_write_nonblocking(&db_file)?;
+        // Never flock this same inode as well. Linux keeps the two lock
+        // families independent, while macOS makes them cooperate and a second
+        // interface can contend with this process's own record lock. The
+        // process claim and the distinct sidecar flock below close the
+        // same-process duplicate hole.
 
-    let lease_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lease_path)
-        .map_err(WriteLeaseError::Unavailable)?;
-    lock_flock_with_inheritance_retry(&lease_file, libc::LOCK_EX)?;
+        let lease_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lease_path)
+            .map_err(WriteLeaseError::Unavailable)?;
+        lock_flock_with_inheritance_retry(&lease_file, libc::LOCK_EX)?;
+        Ok(lease_file)
+    })();
+    let lease_file = match remaining {
+        Ok(lease_file) => lease_file,
+        Err(error) => {
+            if created_db_file {
+                // Close our descriptor first so the unlink cannot race this
+                // process's own record lock on the inode being removed.
+                drop(db_file);
+                let _ = std::fs::remove_file(&db_path);
+            }
+            return Err(error);
+        }
+    };
     // Arm only after every OS authority is held, and keep it in the lease so
     // ownership knowledge cannot become stale or disappear early.
     let self_latch = crate::note_self_held_write_lease(&db_path);
@@ -602,6 +652,94 @@ mod tests {
         drop(authority);
         await_write_lease_free(&db_path);
         std::fs::remove_file(sidecar).unwrap();
+    }
+
+    /// A data directory whose stable parent is not writable cannot host the
+    /// shared namespace lock -- and, by the same token, can never be
+    /// destructively restored by NestWeaver, because restore would fail to
+    /// create the identical file. An ordinary writer must therefore proceed on
+    /// the exact database and sidecar authorities alone, exactly as it already
+    /// does for a database directly under a system scratch root. Failing the
+    /// whole write would make `--db` unusable under any root-owned prefix.
+    #[test]
+    fn an_unwritable_stable_parent_does_not_block_an_ordinary_writer() {
+        if unsafe { libc::geteuid() } == 0 {
+            // root ignores the mode bits, so the precondition cannot be built.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stable_parent = dir.path().join("root-owned");
+        let data_dir = stable_parent.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("brain.lbug");
+        std::fs::set_permissions(
+            &stable_parent,
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
+
+        let authority = acquire_db_write_lease(&db)
+            .expect("an unwritable stable parent must not block the exact database authority");
+        assert!(authority.authorizes(&db));
+        assert_eq!(write_lease_state(&db), WriteLeaseState::Held);
+
+        // The counterweight that keeps this from being a silent downgrade:
+        // a DESTRUCTIVE namespace acquisition on the same directory must still
+        // fail loudly rather than proceed uncoordinated.
+        assert!(
+            acquire_db_namespace_lease(&data_dir).is_err(),
+            "restore must never proceed without the namespace authority"
+        );
+
+        drop(authority);
+        std::fs::set_permissions(
+            &stable_parent,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    /// A failed acquisition must not leave the database inode it created.
+    /// `acquire_db_write_lease_inner` opens the database with `create_new`
+    /// BEFORE it can take the sidecar authority, so every failure after that
+    /// point would otherwise publish an empty file where the caller's next
+    /// `open_or_create` expects either a real database or nothing at all.
+    #[test]
+    fn a_failed_acquisition_does_not_leave_the_database_inode_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        // A directory at the sidecar path makes the lease-file open fail with
+        // a non-WouldBlock error, which is the generic "cannot take the
+        // sidecar authority" arm (read-only mount, ENOSPC, permissions).
+        std::fs::create_dir(write_lease_path(&db)).unwrap();
+
+        let error = acquire_db_write_lease(&db)
+            .expect_err("an unopenable sidecar must fail the whole acquisition");
+        assert!(
+            matches!(error, WriteLeaseError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            !db.exists(),
+            "a failed acquisition must not publish the database inode it created"
+        );
+    }
+
+    /// The counterweight: a database the acquisition did NOT create must
+    /// survive the same failure untouched.
+    #[test]
+    fn a_failed_acquisition_preserves_a_database_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"pre-existing bytes").unwrap();
+        std::fs::create_dir(write_lease_path(&db)).unwrap();
+
+        acquire_db_write_lease(&db).expect_err("an unopenable sidecar must still fail");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"pre-existing bytes",
+            "a pre-existing database must never be removed by a failed acquisition"
+        );
     }
 
     #[test]

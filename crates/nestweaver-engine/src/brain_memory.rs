@@ -995,15 +995,47 @@ fn apply_proposals(
 
     for entry in &mut entries {
         if entry.journal.phase == ConsolidationPhase::Complete {
-            if let Err(error) =
-                validate_retained_complete_journal(&entry.vault_root, &entry.journal)
-            {
-                all_ok = false;
-                summaries.push(format!(
-                    "FAILED: completed consolidation '{}' is inconsistent in {}: {error}",
-                    entry.journal.journal_id,
-                    entry.path.display()
-                ));
+            // A Complete journal is a transaction receipt, and it has exactly
+            // one remaining job: keep a re-run idempotent while the graph still
+            // names the source it consolidated. Two conditions end that job.
+            //
+            // DRIFT -- the vault no longer matches the receipt. The user
+            // deleted or renamed the promoted note. Nothing can re-apply the
+            // consolidation (source and destination are both gone), so the
+            // receipt is obsolete, not broken. Reporting it as a failure made
+            // one ordinary vault edit a PERMANENT failure on every future run,
+            // clearable only by deleting journal files by hand.
+            //
+            // ABSORBED -- the vault has been re-indexed and the source uid is
+            // gone from the graph, so no proposal can regenerate. Without this,
+            // every consolidation a vault ever performs leaves a file that is
+            // re-read and re-stat'd forever.
+            let drift = validate_retained_complete_journal(&entry.vault_root, &entry.journal).err();
+            let absorbed = !note_by_uid.contains_key(entry.journal.proposal.source_uid.as_str());
+            if drift.is_some() || absorbed {
+                match retire_consolidation_journal(&entry.path) {
+                    // Only drift is worth telling the user about; an absorbed
+                    // receipt retiring on schedule is not an event.
+                    Ok(()) => {
+                        if let Some(error) = drift {
+                            summaries.push(format!(
+                                "RETIRED: completed consolidation '{}' no longer matches the vault                                  and its receipt was removed from {}: {error}",
+                                entry.journal.journal_id,
+                                entry.path.display()
+                            ));
+                        }
+                    }
+                    // Failing to REMOVE the receipt is a real filesystem fault
+                    // on this run, and is reported as one.
+                    Err(error) => {
+                        all_ok = false;
+                        summaries.push(format!(
+                            "FAILED: could not retire completed consolidation '{}' at {}: {error}",
+                            entry.journal.journal_id,
+                            entry.path.display()
+                        ));
+                    }
+                }
             }
             continue;
         }
@@ -1376,6 +1408,19 @@ fn ensure_vault_directory(vault_root: &Path, relative: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Remove a receipt that has no remaining purpose. Durable, so a crash cannot
+/// leave it half-unlinked and reappearing on the next run.
+fn retire_consolidation_journal(path: &Path) -> Result<()> {
+    match nestweaver_store::durable_sidecar::remove_file_durable(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "retire consolidation journal {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn write_consolidation_journal(
@@ -2509,6 +2554,104 @@ mod tests {
         assert!(
             !idea_a.contains("[[_logs/2025-01-01]]"),
             "idea-a.md should not have old wikilink"
+        );
+    }
+
+    /// A retained `Complete` journal is a transaction receipt. The sibling
+    /// test above pins that EDITING the destination does not fail; DELETING or
+    /// renaming it must not either. Nothing can re-apply the consolidation --
+    /// both source and destination are gone -- so the receipt is merely
+    /// obsolete. Reporting it as `FAILED` on every future run makes an
+    /// ordinary vault edit a PERMANENT failure with no way to clear it short
+    /// of deleting journal files by hand.
+    #[test]
+    fn a_deleted_destination_retires_its_receipt_instead_of_failing_forever() {
+        let (_dir, root, store, journal) = journal_fixture();
+        let journal_path = persist_test_journal(&root, &journal);
+        assert!(memory_consolidate(&store, true, 0.0).unwrap().applied);
+        assert_eq!(
+            read_test_journal(&journal_path).phase,
+            ConsolidationPhase::Complete
+        );
+
+        // Ordinary vault hygiene: the user deletes the promoted note.
+        fs::remove_file(root.join(&journal.destination_path)).unwrap();
+
+        let after_delete = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+        assert!(
+            after_delete
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("FAILED")),
+            "a deleted destination is drift, not a failure: {:?}",
+            after_delete.warnings
+        );
+        assert!(
+            !journal_path.exists(),
+            "an obsolete receipt must be retired, not retained to fail again"
+        );
+
+        // The property that matters: it does not recur.
+        let later = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+        assert!(
+            later
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("FAILED")),
+            "the failure must not be permanent: {:?}",
+            later.warnings
+        );
+    }
+
+    /// Journals are crash-recovery records, and their one live use after
+    /// `Complete` is keeping a re-run idempotent while the graph still names
+    /// the consolidated source. Once the vault has been re-indexed and that
+    /// source note is gone from the graph, no proposal can regenerate and the
+    /// receipt has no remaining purpose -- retire it, so the directory does not
+    /// grow without bound on every consolidation the vault ever performs.
+    #[test]
+    fn a_completed_journal_is_retired_once_the_graph_absorbs_it() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert!(
+            memory_consolidate(&store, true, 4_000_000_000.0)
+                .unwrap()
+                .applied
+        );
+
+        let journal_dir = root.join(CONSOLIDATION_JOURNAL_DIR);
+        assert_eq!(
+            fs::read_dir(&journal_dir).unwrap().count(),
+            1,
+            "one completed journal is retained while the graph is still stale"
+        );
+
+        // Re-index: the graph now reflects the moved note, so the source uid
+        // the receipt names no longer exists and no proposal can regenerate.
+        let (_res, reindexed) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        memory_consolidate(&reindexed, true, 4_000_000_000.0).unwrap();
+
+        assert_eq!(
+            fs::read_dir(&journal_dir).unwrap().count(),
+            0,
+            "an absorbed receipt must be retired, not retained forever"
         );
     }
 
