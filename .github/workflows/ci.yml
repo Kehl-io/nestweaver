@@ -8,6 +8,16 @@ on:
   # A PR created with the repository GITHUB_TOKEN may not emit a pull_request
   # workflow event at all. Maintainers can explicitly run CI from that PR's
   # latest branch head; the Required CI check remains bound to github.sha.
+  #
+  # TRUST BOUNDARY, recorded so it is not re-derived: workflow_dispatch reads
+  # this file from the SELECTED REF, so a dispatch against a branch runs that
+  # branch's definition of `Required CI`. That is not a widening -- the
+  # `pull_request` trigger above already runs the workflow from the PR's merge
+  # ref, so any PR that edits this file already runs its own edited copy. The
+  # control for both is the same and is NOT this trigger: CODEOWNERS requires
+  # maintainer review on `.github/workflows/**`, and branch protection requires
+  # that review before merge. Dispatch additionally requires repository write
+  # access, which already permits strictly more.
   workflow_dispatch:
 
 permissions:
