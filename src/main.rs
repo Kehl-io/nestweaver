@@ -40689,6 +40689,7 @@ mod nw316_route_tests {
     }
 }
 
+#[cfg(test)]
 mod resolver_generation_gate_tests {
     use super::*;
     use nestweaver_engine::blast_radius::{AnalysisStatus, BlastRadiusResult};
