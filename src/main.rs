@@ -2358,10 +2358,20 @@ fn ranking_json_payload<T: serde::Serialize>(
     daemon_meta: Option<serde_json::Value>,
     bounds: &RankingBounds,
 ) -> serde_json::Value {
+    // nw-358: sort HERE, not in the constructors. The same 43-element set was
+    // emitted in two orders — the daemon route sorted, the direct route did not
+    // — so one command had two byte-shapes chosen by whether a daemon happened
+    // to be running. Imposing the order at the single emitter makes it a
+    // property of the payload rather than of whichever route filled it, so the
+    // two cannot drift apart again. It was invisible to the parity harness by
+    // construction: it takes ~43 repos to surface and the fixtures have a
+    // handful, so the list is trivially ordered either way.
+    let mut stale_repos = staleness.stale_repos.clone();
+    stale_repos.sort();
     let mut payload = serde_json::json!({
         key: rows,
         "rankings_stale": staleness.rankings_stale,
-        "stale_repos": staleness.stale_repos,
+        "stale_repos": stale_repos,
         // The candidate population, and whether `--top` cut it. `total` is NOT
         // `len(list)`: it counts every symbol with at least one code edge, so
         // `returned < total` is a real completeness ratio rather than a
@@ -40952,6 +40962,46 @@ mod cli_honesty_sweep_tests {
         assert_eq!(padded_tail.header_count(1000), "1000");
 
         assert_eq!(RankingBounds::default().header_count(3), "3");
+    }
+
+    /// nw-358: `hubs` / `bridges` emitted the SAME 43-element `stale_repos`
+    /// set in two different orders — the daemon route sorted, the direct route
+    /// did not — so one command had two byte-shapes selected by whether a
+    /// daemon happened to be running. Every `parity_*_direct_vs_daemon` test
+    /// that compares stdout byte-for-byte would have caught it, except that it
+    /// takes 43 repos to surface and the fixtures have a handful, so the list
+    /// is trivially ordered either way. Invisible to fixtures BY CONSTRUCTION.
+    ///
+    /// Sorting at the single emitter is what makes the order a property of the
+    /// PAYLOAD rather than of whichever constructor filled it, so neither route
+    /// can drift again. Asserted with a deliberately unsorted input, which is
+    /// what the fixtures cannot produce at their size.
+    #[test]
+    fn a_ranking_payload_sorts_stale_repos_whatever_order_it_was_given() {
+        let unsorted = ResolverStaleness {
+            rankings_stale: true,
+            stale_repos: vec![
+                "repo:default:zeta".to_string(),
+                "repo:default:alpha".to_string(),
+                "repo:default:mike".to_string(),
+            ],
+        };
+        let payload = ranking_json_payload(
+            "hubs",
+            &Vec::<&str>::new(),
+            &unsorted,
+            None,
+            &RankingBounds::default(),
+        );
+        assert_eq!(
+            payload["stale_repos"],
+            serde_json::json!([
+                "repo:default:alpha",
+                "repo:default:mike",
+                "repo:default:zeta"
+            ]),
+            "the emitter must impose the order, or the route that filled it decides the bytes"
+        );
     }
 
     /// The payload carries the honest keys, and `total` is NOT `len(list)`.

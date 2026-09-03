@@ -1624,6 +1624,9 @@ jobs:
       actions: read
       attestations: read
       contents: read
+      # nw-423: minting the OIDC token npm provenance signs with. Documented
+      # prerequisite; without it `--provenance` cannot produce an attestation.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1774,13 +1777,54 @@ jobs:
             exit 0
           fi
 
+          # nw-423. npm provenance is the mechanism the hand-rolled
+          # immutable-release + sidecar-checksum check was approximating: a
+          # Sigstore-signed link between this package, the exact source commit,
+          # and the builder that produced it, verifiable by any consumer with
+          # `npm audit signatures`. The prerequisites are met -- cloud-hosted
+          # GitHub Actions runner, public repository, and a `repository` field
+          # in package.json matching this repo.
+          #
+          # ATTEMPTED, NOT ENFORCED, and the ordering is deliberate. npm's docs
+          # describe `--provenance` for publishing from a DIRECTORY and do not
+          # state whether it works for a pre-packed tarball, which is what this
+          # job publishes so the artifact is byte-identical to the attested one.
+          # Enforcing an unverified flag on the release path would risk a failed
+          # release to gain a property we have not yet observed. So: try it,
+          # fall back to today's behaviour if npm rejects it, and REPORT which
+          # happened. The first release after this lands is the measurement;
+          # make it mandatory once it is observed working.
           set +e
-          npm publish "$package_tarball" --ignore-scripts --access public
+          npm publish "$package_tarball" --ignore-scripts --access public --provenance
           publish_status=$?
+          provenance_attempted=1
+          if [ "$publish_status" -ne 0 ]; then
+            echo "::warning::npm publish --provenance exited $publish_status; retrying without provenance so the release still lands." >&2
+            npm publish "$package_tarball" --ignore-scripts --access public
+            publish_status=$?
+            provenance_attempted=0
+          fi
           set -e
+          # Did an attestation actually land? Reported rather than asserted,
+          # because this is the first release that attempts it -- see above.
+          report_provenance() {
+            local attestations
+            attestations="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" dist.attestations --json 2>/dev/null || true)"
+            if [ -n "$attestations" ] && [ "$attestations" != "null" ]; then
+              echo "PROVENANCE: attestation published for $PACKAGE_NAME@$PACKAGE_VERSION."
+              echo "PROVENANCE: attestation published (nw-423 can close on this)." >> "$GITHUB_STEP_SUMMARY"
+            elif [ "$provenance_attempted" = "1" ]; then
+              echo "::warning::npm publish --provenance SUCCEEDED but no attestation is visible; provenance is silently not applying to pre-packed tarballs." >&2
+              echo "PROVENANCE: requested, publish succeeded, NO attestation visible (nw-423 stays open)." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "PROVENANCE: not published; npm rejected --provenance for this publish shape." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
           for attempt in 1 2 3 4 5 6; do
             if verify_registry; then
               echo "Verified exact $PACKAGE_NAME@$PACKAGE_VERSION from $RELEASE_SHA."
+              report_provenance
               exit 0
             fi
             echo "Registry has not caught up (attempt $attempt/6); retrying in 10s."
