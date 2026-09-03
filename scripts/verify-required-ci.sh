@@ -17,7 +17,12 @@ verify_required_ci() {
   require_success() {
     local job=$1
     local actual
-    actual=$(result "$job") || return 1
+    # Name the job on an unreadable `needs` entry too; a bare non-zero from jq
+    # otherwise fails the gate with no indication of which job was at fault.
+    if ! actual=$(result "$job"); then
+      echo "required CI job '$job' has no readable result in the needs object" >&2
+      return 1
+    fi
     if [[ "$actual" != success ]]; then
       echo "required CI job '$job' was $actual, expected success" >&2
       return 1

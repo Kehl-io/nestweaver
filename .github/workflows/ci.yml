@@ -1173,16 +1173,23 @@ jobs:
           fi
 
           bash scripts/verify-required-ci.sh --self-test
+          node npm/install.test.js
           bash scripts/verify-release-bundle.sh --self-test
           bash scripts/verify-release-package.sh --self-test
           bash -n scripts/observe-release-visibility.sh \
             scripts/verify-release-canary-pr.sh
           uses_key=uses
           at_sign=@
+          # Strip trailing comments BEFORE testing the pin: the old check
+          # accepted a 40-hex string ANYWHERE on the line, so a version tag
+          # with a hash in its trailing comment satisfied it. Lines that are
+          # wholly comments become empty and are dropped rather than reported.
           unpinned_actions="$({
             grep -REn "${uses_key}:[[:space:]]+[^[:space:]]+${at_sign}" \
               .github/workflows || true
-          } | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' || true)"
+          } | sed -E 's/[[:space:]]+#.*$//' \
+            | grep -Ev "${at_sign}[0-9a-f]{40}$" \
+            | grep -Ev ':[0-9]+:[[:space:]]*$' || true)"
           if [ -n "$unpinned_actions" ]; then
             echo "::error::every external action must be pinned to a full commit SHA" >&2
             printf '%s\n' "$unpinned_actions" >&2
