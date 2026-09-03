@@ -1,6 +1,6 @@
 {
   "name": "nestweaver",
-  "version": "9.0.5",
+  "version": "9.1.0",
   "description": "Code knowledge graph for AI agents — 42 MCP tools, 32 languages, graph visualization",
   "bin": {
     "nestweaver": "bin/nestweaver"
