@@ -380,6 +380,18 @@ const LOCK_WAIT_SECS: u64 = 10;
 /// Age after which an existing lock file is considered abandoned.
 const LOCK_STALE_SECS: u64 = 60;
 
+/// The pid recorded in a bundle lock token (`<pid>:<nanos>`), when it can be
+/// read and parsed. `None` means "cannot tell", never "dead".
+fn lock_holder_pid(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .split(':')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 impl BundleStoreLock {
     fn acquire(db_path: &Path) -> Self {
         use std::io::Write as _;
@@ -434,11 +446,25 @@ impl BundleStoreLock {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break abandoned locks (holder crashed between create and
                     // Drop) so one bad exit doesn't wedge the sidecar forever.
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
+                    //
+                    // nw-395: the token records the holder's pid, and for a
+                    // long time nothing read it. Staleness was mtime-only at
+                    // LOCK_STALE_SECS (60s) while the acquisition deadline is
+                    // LOCK_WAIT_SECS (10s), so a holder that died between
+                    // create and Drop stalled EVERY caller for the full
+                    // deadline and then released all of them to proceed
+                    // unlocked at once -- which is how a bundle already handed
+                    // to the caller could be lost. A provably dead pid breaks
+                    // the lock at once; an unreadable or pid-less token falls
+                    // through to the mtime rule, and `process_is_alive` treats
+                    // an indeterminate pid as alive, so both fail safe.
+                    let stale = lock_holder_pid(&path)
+                        .is_some_and(|pid| !crate::index_publication::process_is_alive(pid))
+                        || std::fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.elapsed().ok())
+                            .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
                     if stale {
                         let _ = std::fs::remove_file(&path);
                         continue;
@@ -1514,6 +1540,84 @@ fn now_epoch() -> f64 {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod bundle_lock_tests {
+    use super::*;
+
+    /// A pid no live process can own. Probing upward from a high number keeps
+    /// this deterministic without depending on any particular pid_max.
+    fn dead_pid() -> i32 {
+        (90_000..99_000)
+            .find(|pid| !crate::index_publication::process_is_alive(*pid))
+            .expect("some pid in the probe range is unused")
+    }
+
+    /// nw-395: the lock token records the writer's pid and NOTHING ever read
+    /// it. Staleness was mtime-only at 60s while the acquisition deadline is
+    /// 10s, so a holder that died between create and Drop stalled every
+    /// `investigate` for the full 10.1s and then let ALL waiters proceed
+    /// unlocked -- which is how a bundle already handed to the caller was lost.
+    #[test]
+    fn a_lock_held_by_a_dead_process_is_broken_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // A fresh mtime, so the 60s mtime rule cannot break it.
+        std::fs::write(&lock_path, format!("{}:12345", dead_pid())).unwrap();
+
+        let started = std::time::Instant::now();
+        let lock = BundleStoreLock::acquire(&db);
+        let waited = started.elapsed();
+
+        assert!(
+            lock.owned,
+            "a lock whose recorded pid is dead must be broken and re-acquired"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(LOCK_WAIT_SECS),
+            "breaking a dead holder must not wait out the full deadline, waited {waited:?}"
+        );
+    }
+
+    /// The counterweight that keeps the above from being a licence to steal:
+    /// a LIVE holder is still respected, and the waiter still yields.
+    #[test]
+    fn a_lock_held_by_a_live_process_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // This very process is unambiguously alive.
+        std::fs::write(&lock_path, format!("{}:12345", std::process::id())).unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(!lock.owned, "a live holder's lock must not be stolen");
+        assert!(
+            lock_path.exists(),
+            "the live holder's lock file must survive"
+        );
+    }
+
+    /// An unparseable or pid-less lock file must fall back to the mtime rule
+    /// rather than being treated as dead. Failing the other way would let a
+    /// truncated write hand the lock to a competitor.
+    #[test]
+    fn an_unreadable_lock_token_is_not_treated_as_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let lock_path = bundle_sidecar_path(&db).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, "not-a-token").unwrap();
+
+        let lock = BundleStoreLock::acquire(&db);
+        assert!(
+            !lock.owned,
+            "an unparseable token must fail safe, not break the lock"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

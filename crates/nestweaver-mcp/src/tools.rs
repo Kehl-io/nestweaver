@@ -10473,16 +10473,34 @@ fn tool_detect_changes_scoped(
         let mut resolver_stale_repos =
             nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)?;
         resolver_stale_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
+        let mut notifications = vec![json!({
+            "level": "warning",
+            "descriptor": "authz.process-analysis-unavailable",
+            "message": "process impact is unavailable for repository-restricted analysis because process records lack authoritative repository ownership"
+        })];
+        // This route builds its own payload and returns before the shared
+        // preflight runs, so without this the SAME stale graph announced
+        // `resolver-generation-incompatible` on the unrestricted route and said
+        // nothing here. `status` is already hardcoded `degraded`, so the
+        // omission was invisible in the status field too -- and the descriptor
+        // is what a CI consumer keys on, because the prose is redacted for a
+        // restricted caller. The message names only the VISIBLE stale repos,
+        // since the list was filtered above.
+        if !resolver_stale_repos.is_empty() {
+            notifications.push(json!({
+                "level": "error",
+                "descriptor": nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR,
+                "message": nestweaver_engine::resolver_generation::incompatibility_message(
+                    &resolver_stale_repos,
+                ),
+            }));
+        }
         return Ok(json!({
             "files": files,
             "risk": Value::Null,
             "status": "degraded",
             "gate_state": "degraded-unknown",
-            "notifications": [{
-                "level": "warning",
-                "descriptor": "authz.process-analysis-unavailable",
-                "message": "process impact is unavailable for repository-restricted analysis because process records lack authoritative repository ownership"
-            }],
+            "notifications": notifications,
             "resolver_stale_repos": resolver_stale_repos,
             "blast_radius": total,
             "affected_symbols": affected_symbols,
@@ -19014,6 +19032,65 @@ mod blast_radius_visibility_tests {
         assert!(impact.contains("repo:visible"), "{impact}");
         assert!(!impact.contains("repo:hidden"), "{impact}");
         assert!(impact.contains("--force"), "{impact}");
+    }
+
+    /// The shared `resolver-generation-incompatible` descriptor is what a CI
+    /// consumer keys on -- the prose message is redacted for a restricted
+    /// caller, so the descriptor is the only machine-readable signal left. The
+    /// restricted `detect_changes` path returns early with its own hand-built
+    /// payload and carried only the authz notification, so the same stale graph
+    /// announced itself on the unrestricted route and stayed silent on the
+    /// restricted one.
+    #[test]
+    fn restricted_detect_changes_still_carries_the_resolver_incompatibility_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("descriptor.lbug")).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:visible".to_string(),
+                url: "https://example.test/visible".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "inst".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let descriptor = nestweaver_engine::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR;
+        let has_descriptor = |value: &Value| {
+            value["notifications"]
+                .as_array()
+                .is_some_and(|notifications| {
+                    notifications.iter().any(|n| n["descriptor"] == descriptor)
+                })
+        };
+
+        // No sidecar, so the repository is resolver-incompatible on both routes.
+        let unrestricted =
+            tool_detect_changes_scoped(&store, json!({ "changed_files": ["src/a.rs"] }), None)
+                .unwrap();
+        assert!(
+            has_descriptor(&unrestricted),
+            "precondition: the unrestricted route announces incompatibility: {unrestricted}"
+        );
+
+        let visible = VisibleRepos::Only(["repo:visible".to_string()].into_iter().collect());
+        let restricted = tool_detect_changes_scoped(
+            &store,
+            json!({ "changed_files": ["src/a.rs"] }),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            restricted["resolver_stale_repos"],
+            json!(["repo:visible"]),
+            "{restricted}"
+        );
+        assert!(
+            has_descriptor(&restricted),
+            "the restricted route must carry the same descriptor: {restricted}"
+        );
     }
 
     #[test]
