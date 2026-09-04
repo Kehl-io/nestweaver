@@ -1258,6 +1258,31 @@ fn proto_build_supports_the_declared_ubuntu_2204_baseline() {
     );
 }
 
+/// Draft GitHub releases are visible only to callers with push access. The
+/// release-context job deliberately re-reads the private draft created by
+/// Release Please before allowing any build or publication work to proceed,
+/// so `contents: read` fails closed with HTTP 403 and strands the release.
+#[test]
+fn release_context_can_read_the_private_draft_it_validates() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let release_context = workflow
+        .split_once("\n  release-context:\n")
+        .expect("release workflow must define release-context")
+        .1
+        .split_once("\n  cleanup-draft:\n")
+        .expect("release-context must precede cleanup-draft")
+        .0;
+
+    assert!(
+        release_context.contains("\n      contents: write\n")
+            && !release_context.contains("\n      contents: read\n"),
+        "release-context must retain push-level release visibility: its first \
+         independent read of a private draft otherwise fails with HTTP 403"
+    );
+}
+
 /// The release PR is the ONE pull request in this repo that receives no CI:
 /// release-please opens it with `GITHUB_TOKEN`, and GitHub deliberately does not
 /// trigger workflows for bot-token-created PRs. Everything that would otherwise
