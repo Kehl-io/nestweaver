@@ -94,7 +94,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: read
+      # `contents: write`, on a job that only ever performs GET requests.
+      #
+      # This job validates the release object release-please just created, and
+      # that object is a DRAFT by design -- the comment on the release-please
+      # step above explains why (`draft: true` means GitHub creates no tag until
+      # publication, so a single invocation cannot strand an unreachable draft).
+      # GitHub returns draft releases ONLY to callers with push access, so
+      # `contents: read` gets 403 on `GET /releases/{id}` for a draft. Verified:
+      # run 33818811691 failed with "Resource not accessible by integration
+      # (HTTP 403)" on the first real release after this job was introduced.
+      #
+      # `write` is the narrowest permission GitHub offers for draft visibility,
+      # not an intent to mutate. The alternative -- trusting release-please's
+      # own outputs without re-reading the object -- would delete the check this
+      # job exists to perform, which is binding the release to an exact,
+      # independently-observed identity.
+      contents: write
     outputs:
       active: ${{ steps.context.outputs.active }}
       mode: ${{ steps.context.outputs.mode }}
