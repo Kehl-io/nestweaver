@@ -18,6 +18,46 @@
           "type": "json",
           "path": "npm/package.json",
           "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['nestweaver-darwin-arm64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['nestweaver-darwin-x64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['nestweaver-linux-arm64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['nestweaver-linux-x64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/platforms/darwin-arm64/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "npm/platforms/darwin-x64/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "npm/platforms/linux-arm64/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "npm/platforms/linux-x64/package.json",
+          "jsonpath": "$.version"
         }
       ]
     }

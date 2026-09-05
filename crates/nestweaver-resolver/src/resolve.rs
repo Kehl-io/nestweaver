@@ -926,6 +926,23 @@ fn can_contain_code(kind: SymbolKind) -> bool {
 /// earlier symbol whose span does — or report `ModuleScope` when the reference
 /// is module-level code that belongs to no symbol.
 ///
+/// nw-435. The exact-match search below used to accept ANY symbol whose span
+/// contained `ref_line`, with no kind check — unlike the degenerate-span
+/// fallback, which nw-349 already restricted to `can_contain_code`. A
+/// module-level `name = call(...)` mints a one-line `Variable`/`Constant` for
+/// the assignment target, and that symbol's degenerate span (`start_line ==
+/// end_line == ref_line`) satisfies the exact-match condition on the SAME
+/// line as the call it sits next to. So the call resolved into the
+/// assignment target instead of module scope: measured on a real corpus,
+/// `lbug_version = _get_lbug_version()` in `scripts/pip-package/setup.py`
+/// recorded `_get_lbug_version`'s caller as the `Variable lbug_version`. A
+/// `Variable`/`Constant`/`Property`/`Field` has no body and cannot be a call
+/// site — that is a fabricated source, the same shape nw-349 already fixed
+/// for the degenerate fallback, just reached through the exact-match branch
+/// instead. The exact-match search now carries the identical restriction, so
+/// both branches treat "no body" the same way regardless of which one found
+/// the candidate span.
+///
 /// Degenerate-span fallback: some parsers still emit one-line spans while
 /// emitting Call references on later lines, so no span can contain those refs.
 /// When no span contains the line, attribute the reference to the nearest
@@ -950,7 +967,7 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enc
     if let Some(enclosing) = symbols[..idx]
         .iter()
         .rev()
-        .find(|s| ref_line <= s.end_line.max(s.start_line))
+        .find(|s| ref_line <= s.end_line.max(s.start_line) && can_contain_code(s.kind))
         .copied()
     {
         return Enclosing::Exact(enclosing);
@@ -2076,6 +2093,86 @@ mod tests {
         assert!(
             matches!(find_enclosing_symbol(&syms, 28), Enclosing::ModuleScope),
             "a Constant cannot call anything"
+        );
+    }
+
+    #[test]
+    fn an_assignment_target_on_the_call_line_is_module_scope_not_exact() {
+        // nw-435. `lbug_version = _get_lbug_version()` in
+        // scripts/pip-package/setup.py mints a one-line `Variable` for the
+        // assignment target whose degenerate span (start_line == end_line)
+        // sits on the SAME line as the call. That satisfies the EXACT-match
+        // condition (`ref_line <= s.end_line.max(s.start_line)`), which —
+        // unlike the degenerate fallback — had no kind check, so the call
+        // resolved into the Variable instead of module scope.
+        let mut target = make_symbol("lbug_version", 20);
+        target.end_line = 20; // real one-line span, not the degenerate fallback
+        target.kind = SymbolKind::Variable;
+        let syms: Vec<&RawSymbol> = vec![&target];
+
+        assert!(
+            matches!(find_enclosing_symbol(&syms, 20), Enclosing::ModuleScope),
+            "a call on the same line as an assignment target must not resolve \
+             into the target — a Variable has no body and cannot be a call site"
+        );
+    }
+
+    #[test]
+    fn an_assignment_target_does_not_shadow_a_real_enclosing_function() {
+        // Counterpart to the above: when the call line genuinely sits inside a
+        // function body, a same-line data symbol earlier in the sort order
+        // must not win the exact-match search just because it is nearer.
+        // e.g. `def helper():\n    x = 1; return foo()` — `x` is a
+        // degenerate-span Variable at the same line as a real call inside
+        // `helper`'s span.
+        let mut func = make_symbol("helper", 10);
+        func.end_line = 15;
+        let mut inline_var = make_symbol("x", 12);
+        inline_var.end_line = 12;
+        inline_var.kind = SymbolKind::Variable;
+        let syms: Vec<&RawSymbol> = {
+            let mut v = vec![&func, &inline_var];
+            v.sort_by_key(|s| s.start_line);
+            v
+        };
+
+        match find_enclosing_symbol(&syms, 12) {
+            Enclosing::Exact(s) => assert_eq!(
+                s.name, "helper",
+                "must skip the data symbol and attribute to the enclosing function"
+            ),
+            other => panic!("expected Exact(helper), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_on_an_assignment_target_line_produces_no_edge_rather_than_a_wrong_one() {
+        // End to end through resolve_references, mirroring
+        // `a_call_after_a_constant_produces_no_edge_rather_than_a_wrong_one`
+        // but for the EXACT-match branch: `lbug_version = _get_lbug_version()`
+        // at module scope must not source an edge from `lbug_version`.
+        let repo_uid = "repo:test:abc";
+        let file_path = "setup.py";
+        let mut target = make_symbol("lbug_version", 20);
+        target.end_line = 20;
+        target.kind = SymbolKind::Variable;
+        let callee = make_symbol("_get_lbug_version", 1); // spans 1..=6
+        let fabricated_source_uid =
+            symbol_uid(repo_uid, file_path, &target.name, target.start_line);
+        let files = vec![(
+            file_path.to_string(),
+            vec![callee, target],
+            vec![make_ref(
+                "_get_lbug_version",
+                ReferenceKind::Call,
+                20, // same line as the assignment target
+            )],
+        )];
+        let edges = resolve_references(&files, Language::Python, repo_uid);
+        assert!(
+            !edges.iter().any(|e| e.source_uid == fabricated_source_uid),
+            "the Variable assignment target must never be recorded as the \
+             call's source: {edges:?}"
         );
     }
 

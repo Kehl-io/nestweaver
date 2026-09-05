@@ -1,0 +1,20 @@
+{
+  "name": "nestweaver-darwin-x64",
+  "version": "9.1.0",
+  "description": "NestWeaver prebuilt binary for macOS x86_64 (Intel). Not meant to be installed directly -- installed automatically as an optional dependency of the `nestweaver` package.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kehl-io/nestweaver.git"
+  },
+  "homepage": "https://github.com/Kehl-io/nestweaver"
+}

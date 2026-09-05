@@ -7,12 +7,8 @@
   },
   "files": [
     "bin/",
-    "install.js",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node install.js"
-  },
   "os": [
     "darwin",
     "linux"
@@ -23,6 +19,12 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "nestweaver-darwin-arm64": "9.1.0",
+    "nestweaver-darwin-x64": "9.1.0",
+    "nestweaver-linux-arm64": "9.1.0",
+    "nestweaver-linux-x64": "9.1.0"
   },
   "keywords": [
     "mcp",

@@ -11,10 +11,27 @@ npm install --global nestweaver
 nestweaver --version
 ```
 
-The npm package downloads the matching release archive for macOS or Linux on
-x86_64 or arm64 and verifies its published SHA-256 checksum before installing
-the executable. See the platform baselines below when installing on Linux or
-macOS.
+The `nestweaver` package has no install-time (`postinstall`) script. It ships
+one prebuilt-binary package per platform (`nestweaver-darwin-arm64`,
+`nestweaver-darwin-x64`, `nestweaver-linux-arm64`, `nestweaver-linux-x64`) as
+an `optionalDependencies` entry -- the same pattern esbuild, swc, and Rollup
+use. npm, pnpm, and Yarn install only the one matching your machine's `os`
+and `cpu` through their own normal dependency resolution; the `nestweaver`
+executable resolves and runs whichever one landed at invocation time. This
+means:
+
+- **No lifecycle scripts to allow.** pnpm 10+ blocks `postinstall` by
+  default; there is no longer one to block, and no
+  `pnpm.onlyBuiltDependencies` configuration is needed.
+- **Nothing is downloaded from GitHub at install time.** The binary is part
+  of the platform package's own npm tarball, verified by npm's standard
+  package integrity check like any other dependency.
+- An unsupported platform, or a lockfile/flag that skipped optional
+  dependencies (`--omit=optional`, `--no-optional`), produces a clear error
+  naming the exact optional package to install, rather than a wrapper that
+  silently has no binary.
+
+See the platform baselines below when installing on Linux or macOS.
 
 ## Pre-built CLI (recommended)
 

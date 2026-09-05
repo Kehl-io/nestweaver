@@ -1,0 +1,23 @@
+{
+  "name": "nestweaver-linux-x64",
+  "version": "9.1.0",
+  "description": "NestWeaver prebuilt binary for Linux x86_64 (glibc). Not meant to be installed directly -- installed automatically as an optional dependency of the `nestweaver` package.",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kehl-io/nestweaver.git"
+  },
+  "homepage": "https://github.com/Kehl-io/nestweaver"
+}

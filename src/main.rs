@@ -237,6 +237,113 @@ fn load_cli_local_embedder(
     Ok(Box::new(model))
 }
 
+/// Load an embedding model for the DIRECT (non-daemon) query route's own
+/// semantic ranking leg — currently wired for `project-context` only.
+///
+/// nw-429: `daemon_may_serve` forces `--config` (and `--no-tests`/
+/// `--prefer-instance`) off the daemon and onto this direct route, and that
+/// reroute is deliberate — see its doc comment for why forwarding a config
+/// to a shared daemon is a security bypass, not a convenience. What that
+/// reroute did not account for is that the direct route never loaded a
+/// model at all: every call site threaded `embed_model: None`
+/// unconditionally, so a query that took this route always answered
+/// `semantic_applied: false` / `seed_tokens_charged: 0`, silently, on
+/// exactly the invocation `~/brain/CLAUDE.md` mandates
+/// (`project-context --config`).
+///
+/// The fix is not to forward the daemon's warm model — that IS the
+/// process-lifetime state nw-316's research says cannot cross a request
+/// boundary, since the loaded model must match the vectors already on disk
+/// and the daemon's is bound to ITS boot config, not the caller's named
+/// one — but to give the direct route the SAME capability the daemon has:
+/// load its own model, from the same primitive `embed --local` already uses
+/// in-process (`EmbedModel::load_with_policy_and_artifact_mode`), using
+/// `embedding_load_config`/`embedding_cache_dir_for_load_with`/
+/// `daemon_embedding_device_policy` — made `pub` in `nestweaver-daemon` so
+/// this reuses the identical model-selection rule (prefer the model the
+/// STORE's persisted vectors were embedded with) instead of a second copy
+/// that could drift from it.
+///
+/// Never a hard error: a direct query with no working semantic leg still
+/// answers — `semantic_applied: false`, `degraded_components: ["semantic"]`
+/// — exactly like a query against an un-embedded database, and exactly how
+/// the daemon itself degrades on a load failure rather than refusing the
+/// request. `ArtifactMode::CacheOnly`, not `DownloadMissing`: this load is
+/// implicit in an ordinary read, not an operator-initiated `embed`, so it
+/// must never reach the network — the same distinction
+/// `daemon_startup_artifact_mode` draws for the daemon's own boot.
+///
+/// THE COST, stated rather than left for someone to discover: this is a
+/// real per-invocation model load, not a cache hit — measured on a real
+/// store with a cached local model, `~1.3-2.0s` and `~1.5 GB` additional RSS
+/// versus the same call with `--no-embed` (`~2.6s`/`~0.8 GB` without a
+/// model, `~4.0s`/`~2.3 GB` with one; Metal). The trade is accepted here
+/// because `project-context` is typically one call per session and a
+/// correct answer is worth more than a fast wrong one — but it is a cost,
+/// and `--no-embed` exists to opt out of it for callers that would rather
+/// have the speed.
+#[cfg(feature = "embed")]
+fn load_direct_semantic_model(
+    store: &nestweaver_store::GraphStore,
+    instance_cfg: Option<&nestweaver_engine::InstanceConfig>,
+    no_embed: bool,
+) -> Option<Box<dyn nestweaver_engine::EmbedQueryFn>> {
+    if no_embed || store.embedding_count() == 0 {
+        return None;
+    }
+    let cfg = instance_cfg
+        .map(|c| c.embedding.clone())
+        .unwrap_or_default();
+    let stored_model_id = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(id, _)| id);
+    let cache_dir = match nestweaver_daemon::embedding_cache_dir_for_load_with(
+        &cfg,
+        nestweaver_engine::resolve_user_path,
+    ) {
+        Ok(cache_dir) => cache_dir,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "direct route: could not resolve the embedding cache directory for semantic \
+                 ranking; answering lexical/PPR-only instead of failing the query"
+            );
+            return None;
+        }
+    };
+    let embed_config =
+        nestweaver_daemon::embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
+    let policy = nestweaver_daemon::daemon_embedding_device_policy(cfg.accelerator);
+    match nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
+        &embed_config,
+        policy,
+        nestweaver_embed::ArtifactMode::CacheOnly,
+    ) {
+        Ok(model) => Some(Box::new(model) as Box<dyn nestweaver_engine::EmbedQueryFn>),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "direct route: could not load an embedding model for semantic ranking; \
+                 answering lexical/PPR-only instead of failing the query"
+            );
+            None
+        }
+    }
+}
+
+/// Fallback for builds without the `embed` feature: there is no model to
+/// load, so the direct route answers exactly as it always has.
+#[cfg(not(feature = "embed"))]
+fn load_direct_semantic_model(
+    _store: &nestweaver_store::GraphStore,
+    _instance_cfg: Option<&nestweaver_engine::InstanceConfig>,
+    _no_embed: bool,
+) -> Option<Box<dyn nestweaver_engine::EmbedQueryFn>> {
+    None
+}
+
 /// Fallback loader for builds without the `embed` feature: keeps
 /// `run_embed`'s signature uniform and fails only if the local path runs.
 #[cfg(not(feature = "embed"))]
@@ -5802,10 +5909,20 @@ enum Commands {
             help = "Half-life for age-decay in days (default 30.0)"
         )]
         recency_half_life_days: f64,
-        /// Disable semantic ranking for this call — the daemon's loaded
-        /// embed model is the only place this command ever reaches semantic
-        /// ranking; without a daemon it never has one regardless of this
-        /// flag.
+        /// Disable semantic ranking for this call.
+        ///
+        /// Unlike `context`/`search`, this command's direct route (forced by
+        /// `--config`/`--no-tests`/`--prefer-instance`, or a missing daemon)
+        /// loads its OWN embed model when the store has persisted vectors,
+        /// so this flag gates that load too, not only the daemon's. Loading
+        /// it costs real, unavoidable per-invocation latency and memory
+        /// (measured: ~1.3-2.0s and ~1.5 GB RSS extra on a real store with a
+        /// cached model) — pass this flag if you want lexical/PPR-only speed
+        /// instead.
+        // nw-429: see `load_direct_semantic_model`'s doc comment for the full
+        // mechanism; this `//` (not `///`) so the ticket id stays out of
+        // `--help`, which `rendered_help_never_names_an_internal_ticket`
+        // enforces.
         #[arg(long)]
         no_embed: bool,
     },
@@ -19862,15 +19979,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+            let direct_instance_cfg = load_instance_config_opt(config.as_deref());
             nestweaver_mcp::tools::set_current_instance_config(
-                load_instance_config_opt(config.as_deref()).map(std::sync::Arc::new),
+                direct_instance_cfg.clone().map(std::sync::Arc::new),
             );
+            // nw-429: this route is forced whenever `--config`/`--no-tests`/
+            // `--prefer-instance` is set, and it used to thread `None` here
+            // unconditionally — the direct route never had a model to rank
+            // with, so it silently answered `semantic_applied: false` on the
+            // one invocation CLAUDE.md mandates. Load one under the SAME named
+            // config, degrading to lexical/PPR-only (never a hard failure) if
+            // no model can be loaded.
+            let embed_model =
+                load_direct_semantic_model(&store, direct_instance_cfg.as_ref(), no_embed);
             let response = nestweaver_mcp::tools::dispatch(
                 &store,
                 tantivy.as_ref(),
                 "project_context",
                 direct_args,
-                None,
+                embed_model
+                    .as_ref()
+                    .map(|m| m.as_ref() as &dyn nestweaver_engine::EmbedQueryFn),
             );
             nestweaver_mcp::tools::set_current_instance_config(None);
 
@@ -31154,6 +31283,7 @@ mod context_json_renderer_tests {
             seed_matches_total_relation: None,
             seeds_truncated: None,
             seed_resolution_limit: None,
+            admitted_before_cap: None,
         }
     }
 

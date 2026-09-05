@@ -1111,18 +1111,18 @@ jobs:
         # nothing in CI ever ran a real `npm install` on a macOS runner to
         # catch that before it reached a release. This job is that check.
         #
-        # `--ignore-scripts`, deliberately not a full install: the
-        # `postinstall` script downloads the GitHub Release archive for the
-        # version already sitting in npm/package.json, and release-please
-        # bumps that version on its OWN pull request before the matching tag
-        # and release exist (see `extra-files` in release-please-config.json)
-        # -- a full install would then fail on an unrelated 404 on every
-        # release PR. What actually regressed, and what this guards, is npm's
-        # platform-metadata GATE: it is evaluated before any lifecycle script
-        # runs, and is unaffected by whether the release artifact itself
-        # exists yet. `npm pack` + `npm install <tarball>` (not `npm install
-        # ./npm`) so this exercises the exact package.json npm would publish,
-        # not the working-tree layout.
+        # nw-425: the wrapper's `postinstall` (which downloaded a GitHub
+        # Release archive) is retired. There is no lifecycle script left to
+        # ignore, so this is now a genuinely full `npm install` -- the
+        # optionalDependencies (nestweaver-darwin-arm64 etc., pinned to the
+        # version already sitting in npm/package.json) do not exist on the
+        # real registry until release-please's own PR bumps that version and
+        # a release publishes them, so npm resolves them as ABSENT rather
+        # than failing the install, which is exactly the "package manager
+        # skipped optional dependencies" case bin/nestweaver's own error
+        # message is written for. `npm pack` + `npm install <tarball>` (not
+        # `npm install ./npm`) so this exercises the exact package.json npm
+        # would publish, not the working-tree layout.
         #
         # No `--force` anywhere in this step -- that is the whole point: a
         # forced install is what let the original regression ship unnoticed.
@@ -1135,9 +1135,17 @@ jobs:
           (
             cd "$install_dir"
             npm init -y >/dev/null
-            npm install --ignore-scripts "$tarball"
+            npm install "$tarball"
           )
           echo "npm accepted the platform for $(uname -sm) without --force"
+          launcher_output="$(node "$install_dir/node_modules/nestweaver/bin/nestweaver" --version 2>&1 || true)"
+          if grep -q 'optional dependency' <<< "$launcher_output"; then
+            echo "bin/nestweaver correctly reports the missing (not-yet-published) platform package"
+          else
+            echo "::error::expected the missing-optional-dependency message, got:" >&2
+            echo "$launcher_output" >&2
+            exit 1
+          fi
 
   e2e:
     name: E2E Tests
@@ -1252,7 +1260,8 @@ jobs:
           fi
 
           bash scripts/verify-required-ci.sh --self-test
-          node npm/install.test.js
+          node npm/nestweaver.test.js
+          bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test
           bash scripts/verify-release-package.sh --self-test
           bash -n scripts/observe-release-visibility.sh \

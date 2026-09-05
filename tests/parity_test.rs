@@ -1323,6 +1323,17 @@ fn parity_detect_changes_direct_vs_daemon() {
 /// and `embed_model: None` — so a byte comparison would fail for a reason that
 /// is not the defect, and "the test is red for a known-benign reason" is how a
 /// suite stops being read.
+///
+/// nw-429 UPDATE: "the direct path passes `embed_model: None`" is no longer an
+/// unconditional truth — `load_direct_semantic_model` (`src/main.rs`) now loads
+/// one when the `embed` feature is compiled in AND the store holds persisted
+/// vectors. This fixture's DB has neither (`setup_project_fixture` never runs
+/// `embed`, and this workspace's default `cargo test` has no `embed` feature),
+/// so `embedding_count() == 0` still gates it off and this test's "legitimate
+/// difference" framing holds AS WRITTEN. The case where it stops holding — a
+/// fixture with real vectors, run under `--features embed` — is covered
+/// separately by `project_context_config_forces_direct_but_keeps_semantic_ranking`
+/// below, which is the one that would have caught nw-429.
 #[test]
 fn parity_project_context_direct_vs_daemon() {
     let fixture = setup_project_fixture();
@@ -1375,6 +1386,152 @@ fn parity_project_context_direct_vs_daemon() {
         roomy_direct["truncated"],
         serde_json::json!(false),
         "a budget that fits must not report truncation: {roomy_direct}"
+    );
+}
+
+/// Start a daemon bound to an explicit `--config`, so its boot config matches
+/// what the SAME `--config` names on the direct route — required for
+/// `materialize-projects` and for `project-context --config` to route through
+/// this daemon rather than being refused as a config mismatch (`daemon_may_serve`
+/// forces `--config` off an already-running, differently-configured daemon).
+fn start_daemon_with_config(db_path: &Path, config_path: &Path) {
+    daemon_action_cmd(db_path, "start")
+        .arg("--config")
+        .arg(config_path.display().to_string())
+        .assert()
+        .success();
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(db_path);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || stop_daemon(db_path),
+    )
+    .unwrap_or_else(|error| panic!("daemon socket did not accept connections: {error}"));
+}
+
+/// nw-429, permanent regression coverage. `daemon_may_serve` forces `--config`
+/// off the daemon and onto the direct route (a deliberate security boundary —
+/// see its doc comment), and until this fix the direct route never had a
+/// model to rank with regardless: `semantic_applied` silently read `false` and
+/// `seed_tokens_charged` `0` on exactly the invocation `~/brain/CLAUDE.md`
+/// mandates pinning on every vault command (`project-context --config`).
+///
+/// FIXTURE ADEQUACY, the thing the prior session's attempt at this could not
+/// establish: real embeddings (`embed --local`, not a stub) and a real daemon
+/// reaching `Embedding: State: ready` before the routes are compared. Ignored
+/// by default because both preconditions need a build this workspace's plain
+/// `cargo test` does not produce — see the `Run with` line below.
+///
+/// Run with:
+///   cargo test --release --features embed,metal --test parity_test \
+///     project_context_config_forces_direct_but_keeps_semantic_ranking -- --ignored
+#[cfg(feature = "embed")]
+#[test]
+#[ignore = "requires --release --features embed,metal and a populated local model cache"]
+fn project_context_config_forces_direct_but_keeps_semantic_ranking() {
+    let fixture = setup_project_fixture();
+    let db = &fixture.db_path;
+
+    // Real vectors, via the same command an operator runs.
+    let embed = StdCommand::new(bin_path())
+        .args(["embed", "--db", &db.display().to_string(), "--local"])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .expect("failed to run nestweaver embed");
+    assert!(
+        embed.status.success(),
+        "embed --local failed (is ~/Library/Caches/nestweaver/models populated?):\n{}",
+        String::from_utf8_lossy(&embed.stderr)
+    );
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "instance_id = \"nw429-regress\"\n\
+             repos = []\n\
+             snapshot_storage = {{ backend = \"local\", path = \"{p}\" }}\n\
+             workspace = {{ backend = \"local\", path = \"{p}\" }}\n\
+             inference = {{ endpoint = \"http://localhost:0\", embedding_model = \"none\", \
+             summary_model = \"none\" }}\n\
+             git = {{ credential_method = \"ssh\" }}\n",
+            p = config_dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon_with_config(db, &config_path);
+
+    // Fixture adequacy: a real daemon at `ready`, not merely one whose socket
+    // accepts a connection -- the model loads asynchronously AFTER the socket
+    // is already serving (see `load_embedding_model`'s doc comment in
+    // `server.rs`), so the socket becoming reachable is not evidence the
+    // embedding backend has finished loading. Poll rather than check once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = StdCommand::new(bin_path())
+            .args(["daemon", "--db", &db.display().to_string(), "status"])
+            .output()
+            .expect("failed to run daemon status");
+        let status_text = String::from_utf8_lossy(&status.stdout).to_string();
+        if status_text.contains("State:") && status_text.contains("ready") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon must reach Embedding: State: ready within 30s for this test to \
+             mean anything:\n{status_text}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let args = &["project-context", "demo", "--json", "--token-budget", "400"];
+
+    // Route A: daemon, no --config.
+    let daemon_route = parse_stdout("project-context (daemon)", &run_via_daemon(db, args));
+
+    // Route C: --config forces direct, WHILE THE DAEMON IS RUNNING (nw-429's
+    // reported hard-fail mode) -- this is the assertion the prior session
+    // could not make: a real daemon, a real model, both routes compared.
+    let mut direct_args: Vec<&str> = args.to_vec();
+    direct_args.push("--config");
+    let config_path_str = config_path.display().to_string();
+    direct_args.push(&config_path_str);
+    let direct = StdCommand::new(bin_path())
+        .args(&direct_args)
+        .arg("--db")
+        .arg(db.display().to_string())
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .output()
+        .expect("failed to run nestweaver project-context --config");
+    assert!(
+        direct.status.success(),
+        "project-context --config must succeed even with a live daemon holding the DB \
+         (nw-429's 'worse than filed' manifestation was 0/36 successes here):\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_route = parse_stdout("project-context (--config, forced direct)", &direct);
+
+    assert_eq!(
+        direct_route["semantic_applied"],
+        serde_json::json!(true),
+        "the --config route must apply semantic ranking, the same as the daemon route: {direct_route}"
+    );
+    assert_eq!(
+        daemon_route["semantic_applied"], direct_route["semantic_applied"],
+        "daemon: {daemon_route}\ndirect (--config): {direct_route}"
+    );
+    assert_eq!(
+        daemon_route["_meta"]["answer_shaping"]["embedding_model_available"],
+        direct_route["_meta"]["answer_shaping"]["embedding_model_available"],
+        "nw-316 Part B: this is the field that must disagree WHEN the routes do, and agree \
+         once they no longer do -- daemon: {daemon_route}\ndirect: {direct_route}"
     );
 }
 

@@ -21,8 +21,8 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    BrainNode, EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
-    populate_inline_bodies,
+    BrainNode, EmbedQueryFn, HybridSearchConfig, RenderCap,
+    build_brain_context_hybrid_with_aliases_capped, populate_inline_bodies,
 };
 
 /// Bundle time-to-live: entries older than this are dropped when the sidecar
@@ -31,6 +31,35 @@ const BUNDLE_TTL_SECS: f64 = 24.0 * 60.0 * 60.0;
 
 /// Default retrieval breadth — how many connected nodes we consider for the map.
 const DEFAULT_RETRIEVAL_BREADTH: usize = 30;
+
+/// nw-322 (leg 3): how many candidates PER PARTITION (seeds, connected) get
+/// hydrated (`render_brain_node`, one DB round-trip each) before this
+/// module's own scope filter and `DEFAULT_RETRIEVAL_BREADTH` truncate ever
+/// run. `project:<slug>` seeds PPR with a project's entire membership
+/// (`resolve_scope` below) and PPR includes every seed regardless of score,
+/// so on a large project `fused` is corpus-sized and hydrating all of it
+/// only to keep 30 was measured at 110-142s (nw-322) — 12-27x every other
+/// scope, comfortably over an MCP client's timeout.
+///
+/// Set above `DEFAULT_RETRIEVAL_BREADTH`, not equal to it, but the margin is
+/// no longer defending against scope-filter attrition — a REVIEWED
+/// REGRESSION in the first cut of this fix did that by capping hydration
+/// BEFORE the scope filter ran, so an out-of-scope candidate that outranked
+/// a genuine member by GLOBAL score could consume a slot the member needed.
+/// The filter (`uid_in_scope`) now runs FIRST, as `RenderCap::admit`, applied
+/// to every fused UID before either partition's cap counter increments — so
+/// every candidate a cap slot goes to is already known to be in scope, and
+/// the final `investigate` output never keeps more than
+/// `DEFAULT_RETRIEVAL_BREADTH` (30) total across BOTH partitions combined.
+/// That makes 30 PER PARTITION already provably sufficient: this is `* 4`
+/// (120) as a cheap, non-load-bearing buffer against a future pass wanting
+/// more than the bare minimum (e.g. a diversity/dedup step) without
+/// reproving this margin — not because 120 is itself required. See
+/// `tests::investigate_project_scope_stays_fast_on_a_large_project` (speed;
+/// every member is in scope, so it cannot exercise `admit`) and
+/// `tests::project_scope_render_cap_does_not_starve_members_outscored_globally`
+/// (the regression `admit` fixes).
+const RETRIEVAL_RENDER_MARGIN: usize = DEFAULT_RETRIEVAL_BREADTH * 4;
 
 /// Default token budget for the architectural map.
 const DEFAULT_TOKEN_BUDGET: usize = 4000;
@@ -183,22 +212,44 @@ pub struct InvestigateResult {
     /// ONE. `DEFAULT_RETRIEVAL_BREADTH` truncates before the token-budget loop
     /// and incremented nothing, so an undercount was presented as a count and
     /// a query whose neighbourhood exceeded 30 reported itself complete.
-    /// Captured at the `truncate` site, which is the only place the pre-cap
-    /// population still exists.
+    ///
+    /// REVISED (reviewed regression, same defect one layer down):
+    /// `RenderCap` (nw-322 leg 3) added a hydration bound of its OWN, ahead of
+    /// the `truncate` site this field used to be captured at — so "captured
+    /// at the truncate site" stopped being "captured before any cap" the
+    /// moment that cap started running earlier. This is now
+    /// `BrainContextResult::admitted_before_cap` when a render cap was in
+    /// play (the in-scope population, counted before hydration, not after) —
+    /// falling back to the post-hydration count only on the `bm25_fallback`
+    /// path, which carries no render cap to undercount against.
+    ///
+    /// An upper bound, not an exact count, in the render-cap case: see
+    /// `BrainContextResult::admitted_before_cap`'s own doc comment for why
+    /// (a rare, one-directional imprecision — it can only over-, never
+    /// under-, disclose what was dropped).
     #[serde(default)]
     pub total: usize,
     /// `returned < total`. The standard spelling, beside the standard pair.
     #[serde(default)]
     pub truncated: bool,
-    /// Why entries were dropped, counted by reason — so "retrieval breadth"
-    /// (a hard internal bound; raising the budget cannot recover a node it
-    /// threw away) is distinguishable from "token budget exhausted" (retry
-    /// with more budget).
+    /// Why entries were dropped, counted by reason — so "retrieval cap" (an
+    /// internal hydration bound, `RenderCap`), "retrieval breadth" (a hard
+    /// internal bound; raising the budget cannot recover a node it threw
+    /// away), and "token budget exhausted" (retry with more budget) are each
+    /// distinguishable, not folded into one another.
+    ///
+    /// `"retrieval_cap"` is the newer of the three (reviewed regression fix):
+    /// `RenderCap` bounds hydration BEFORE `retrieval_breadth`'s truncate ever
+    /// runs, so a candidate it drops is a DIFFERENT bound with a different
+    /// size than `retrieval_breadth`'s, and folding the two would hide which
+    /// one actually bit — the same reasoning nw-362(b) already applied to
+    /// keep `retrieval_breadth` and `token_budget` apart.
     ///
     /// Keyed rather than a single `truncated_by` scalar because these caps do
-    /// NOT compose in an order: both remedies stay independently useful when
-    /// both fire. This is `HydrateResult::skipped_reasons`' shape, and it
-    /// carries the same invariant — the values sum to `total - returned`.
+    /// NOT compose in an order: all three remedies stay independently useful
+    /// when more than one fires. This is `HydrateResult::skipped_reasons`'
+    /// shape, and it carries the same invariant — the values sum to
+    /// `total - returned`.
     ///
     /// The inline-body cap is deliberately NOT in here: it drops a BODY, not
     /// an entry, so counting it would break that invariant. See
@@ -734,12 +785,27 @@ pub fn investigate(
         prf: true,
         ..Default::default()
     };
+    // Reviewed regression fix: the scope filter must run BEFORE the render
+    // cap, not after. `fused` is scored by `GraphScope::unified()` — it knows
+    // nothing about `scope` — so capping hydration first let an out-of-scope
+    // candidate that merely outranked a genuinely in-scope one by GLOBAL
+    // score consume a slot the in-scope one needed, and the post-hydration
+    // `node_in_scope` filter below had nothing left to select from. Building
+    // the UID-only predicate here (before retrieval) and passing it as
+    // `RenderCap::admit` applies it inside the render loop, before either
+    // partition's cap counter increments.
+    let admit_uid = scope_filter
+        .as_ref()
+        .map(|filter| move |uid: &str| uid_in_scope(uid, filter));
+    let admit: Option<&dyn Fn(&str) -> bool> =
+        admit_uid.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+
     // Graceful empty handling: when no seed resolves (e.g. a natural-language
     // multi-word query like "indexing pipeline" that matches no symbol/note
     // title verbatim), hybrid retrieval bails with `No seeds resolved`. Fall
     // back to BM25-only retrieval against the query text so investigations
     // remain useful for orientation queries instead of returning an empty map.
-    let connected_result = build_brain_context_hybrid_with_aliases(
+    let connected_result = build_brain_context_hybrid_with_aliases_capped(
         store,
         &seed_inputs,
         tantivy,
@@ -749,13 +815,25 @@ pub fn investigate(
         None,
         embed_model,
         None,
+        Some(RenderCap {
+            seeds: RETRIEVAL_RENDER_MARGIN,
+            connected: RETRIEVAL_RENDER_MARGIN,
+            admit,
+        }),
     );
     // The query's own resolved seed nodes are first-class map entries,
     // ordered ahead of the graph-proximity nodes so an exact-match query for
     // an isolated symbol still returns that symbol instead of an empty map.
     let mut seed_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Reviewed disclosure fix: captured from `ctx` before it is destructured
+    // below, since `admitted_before_cap` is the TRUE pre-cap population
+    // `total` needs — `connected.len()` after this match already lost that
+    // number to `RenderCap` if the cap truncated anything. `None` on the
+    // `bm25_fallback` path (no `RenderCap` there to undercount against).
+    let mut admitted_before_cap: Option<usize> = None;
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => {
+            admitted_before_cap = ctx.admitted_before_cap;
             seed_uids = ctx.seeds.iter().map(|n| n.uid.clone()).collect();
             let mut nodes = ctx.seeds;
             nodes.extend(
@@ -797,14 +875,30 @@ pub fn investigate(
     // that it is cheaper to refuse a good answer than to serve a bad one.
     ensure_ranking_publication_clean(store)?;
     if let Some(ref filter) = scope_filter {
-        connected.retain(|n| node_in_scope(store, n, filter));
+        // Now a defence-in-depth no-op in the common case: every candidate
+        // that reached `connected` already passed the identical test as
+        // `RenderCap::admit`, pre-hydration. Left in place because it is
+        // cheap and because it is the ONLY thing that still catches a
+        // mismatch if `admit` and this filter were ever built from different
+        // state.
+        connected.retain(|n| node_in_scope(n, filter));
     }
-    // nw-362(b). The pre-cap population exists ONLY here — one line later it
-    // is gone and no downstream field could recover it, which is why
-    // `more_available` (the token-budget loop's counter, three caps further
-    // down) was the only number this function ever reported.
-    let total = connected.len();
-    let dropped_by_breadth = total.saturating_sub(DEFAULT_RETRIEVAL_BREADTH);
+    // Reviewed disclosure fix (nw-322/nw-362(b), same defect one layer down):
+    // `connected.len()` here is the RENDERED count — already smaller than the
+    // true in-scope population whenever `RenderCap` truncated something
+    // upstream. `admitted_before_cap` is what nw-362(b)'s original fix
+    // thought it was capturing "at the truncate site": the population
+    // before ANY of this function's caps, not just the ones that still ran
+    // after this line.
+    let rendered_count = connected.len();
+    let total = admitted_before_cap.unwrap_or(rendered_count);
+    // How many genuinely in-scope candidates never made it to `connected` at
+    // all, because `RenderCap` (nw-322 leg 3's own internal bound, sized by
+    // `RETRIEVAL_RENDER_MARGIN`) stopped hydrating before reaching them.
+    // Zero whenever no render cap ran (`admitted_before_cap: None`) or it
+    // never bound (`total <= rendered_count`).
+    let dropped_by_render_cap = total.saturating_sub(rendered_count);
+    let dropped_by_breadth = rendered_count.saturating_sub(DEFAULT_RETRIEVAL_BREADTH);
     connected.truncate(DEFAULT_RETRIEVAL_BREADTH);
 
     // Graceful empty handling: still persist an empty bundle so the id is valid.
@@ -909,12 +1003,22 @@ pub fn investigate(
     }
 
     let semantic_applied = embed_model.is_some();
-    // nw-362(b). The keyed map, built HERE from the two counters that were
+    // nw-362(b). The keyed map, built HERE from the counters that were
     // already in scope. `retrieval_breadth` is a hard internal bound the
     // caller never stated and cannot raise, which is precisely why it must be
     // named separately from the budget it was being silently folded into.
+    //
+    // Reviewed disclosure fix: `retrieval_cap` is a THIRD, separate bound,
+    // for the same reason — `RenderCap` (nw-322 leg 3) is also internal and
+    // also not something the caller stated or can raise, but it is a
+    // DIFFERENT size than `retrieval_breadth` and runs at a different point
+    // (before hydration, not before the token-budget loop), so folding it
+    // into either existing key would hide which bound actually cut.
     let mut dropped_reasons: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    if dropped_by_render_cap > 0 {
+        dropped_reasons.insert("retrieval_cap".to_string(), dropped_by_render_cap);
+    }
     if dropped_by_breadth > 0 {
         dropped_reasons.insert("retrieval_breadth".to_string(), dropped_by_breadth);
     }
@@ -1375,16 +1479,37 @@ fn parent_note_uid(uid: &str) -> Option<String> {
 ///    (recovered via `parent_note_uid`). Tags are unchanged (pass through):
 ///    there is no project-to-tag association to test in the first place, and
 ///    this is not the leak that was measured.
-fn node_in_scope(store: &GraphStore, node: &BrainNode, filter: &ScopeFilter) -> bool {
+fn node_in_scope(node: &BrainNode, filter: &ScopeFilter) -> bool {
+    uid_in_scope(&node.uid, filter)
+}
+
+/// The membership test `node_in_scope` actually performs — on a bare UID,
+/// never on any other `BrainNode` field. Split out (reviewed regression fix)
+/// so it can run BEFORE hydration, as the `RenderCap::admit` predicate
+/// passed to `build_brain_context_hybrid_with_aliases_capped`: `fused` is
+/// scored by `GraphScope::unified()` (scope-agnostic), so applying this test
+/// only after hydration let an out-of-scope candidate that merely outranked
+/// an in-scope one by GLOBAL score consume a render slot the in-scope one
+/// needed — silently, since the slot was gone before this filter ever ran.
+/// `node_in_scope` stays as a thin wrapper: the post-hydration
+/// `connected.retain` call below still runs it as a defence-in-depth check,
+/// now expected to be a no-op given every candidate already passed `admit`.
+///
+/// No `store` parameter (reviewed perf follow-up): the `ScopeFilter::Repos`
+/// arm used to take one via `store.lookup_symbol`, which was fine when this
+/// ran only on already-hydrated nodes but would have reintroduced an
+/// unbounded per-candidate DB hit now that it runs on every `fused`
+/// candidate as `admit`. See `repo_uid_of_symbol`.
+fn uid_in_scope(uid: &str, filter: &ScopeFilter) -> bool {
     match filter {
         ScopeFilter::Project { symbols, notes } => {
-            if node.uid.starts_with("sym:") {
-                return symbols.contains(&node.uid);
+            if uid.starts_with("sym:") {
+                return symbols.contains(uid);
             }
-            if node.uid.starts_with("note:") {
-                return notes.contains(&node.uid);
+            if uid.starts_with("note:") {
+                return notes.contains(uid);
             }
-            if let Some(parent) = parent_note_uid(&node.uid) {
+            if let Some(parent) = parent_note_uid(uid) {
                 return notes.contains(&parent);
             }
             // Tag (or anything else unattributable): no project-tag
@@ -1392,15 +1517,41 @@ fn node_in_scope(store: &GraphStore, node: &BrainNode, filter: &ScopeFilter) -> 
             true
         }
         ScopeFilter::Repos(repo_uids) => {
-            if !node.uid.starts_with("sym:") {
-                return false;
-            }
-            let Ok(sym) = store.lookup_symbol(&node.uid) else {
+            let Some(repo_uid) = repo_uid_of_symbol(uid) else {
                 return false;
             };
-            repo_uids.contains(&sym.repo_uid)
+            repo_uids.iter().any(|r| r == repo_uid)
         }
     }
+}
+
+/// The repo a symbol belongs to, recovered from the symbol UID itself.
+///
+/// `store.lookup_symbol` (a DB round-trip) used to answer this. Fine when
+/// `uid_in_scope` only ran on already-hydrated nodes — at most
+/// `DEFAULT_RETRIEVAL_BREADTH` of them, or (before this fix's admit-first
+/// reorder) at most a `RenderCap`. Now that it also runs as `RenderCap::admit`
+/// — BEFORE hydration, on every `fused` candidate, so `project:`'s
+/// corpus-sized seed set doesn't silently starve `repo:`'s own scope filter
+/// the same way it starved `project:`'s — a DB call per candidate would
+/// reintroduce exactly the unbounded per-candidate cost nw-322 exists to
+/// remove, just moved from `render_brain_node` to here.
+///
+/// `symbol_uid` mints `sym:{repo_uid}:{file_hash}:{name_hash}:{line}`
+/// (`nestweaver_schema::uid`), where `repo_uid` itself contains colons and
+/// `file_hash`/`name_hash` are fixed-width 12-hex-char hashes and `line` is
+/// numeric (`symbol_uid_format` pins the shape). Peeling those three
+/// known-shaped segments off the RIGHT and keeping whatever remains — the
+/// same technique `parent_note_uid` uses for headings — recovers `repo_uid`
+/// from the UID alone, with no store access, and it CANNOT disagree with a
+/// DB lookup: `repo_uid` is baked into the hash inputs at construction, not
+/// stored as separate mutable state a UID could drift from.
+fn repo_uid_of_symbol(uid: &str) -> Option<&str> {
+    let rest = uid.strip_prefix("sym:")?;
+    let (without_line, _line) = rest.rsplit_once(':')?;
+    let (without_name_hash, _name_hash) = without_line.rsplit_once(':')?;
+    let (repo_uid, _file_hash) = without_name_hash.rsplit_once(':')?;
+    (!repo_uid.is_empty()).then_some(repo_uid)
 }
 
 // ── Domain grouping ──────────────────────────────────────────────────────
@@ -2459,12 +2610,36 @@ mod tests {
             "the BUDGET did not cut here — `more_available` must stay honest \
              about its own scope rather than absorb the other caps: {result:?}"
         );
+        // Reviewed disclosure fix: `RenderCap` (nw-322 leg 3) is a SECOND
+        // internal bound, ahead of `retrieval_breadth`, and this fixture's
+        // ~123 candidates (41 notes + 41 headings + 41 sections) sit close
+        // enough to `RETRIEVAL_RENDER_MARGIN` (120) that it can genuinely
+        // fire too — it must not be folded into `retrieval_breadth`, or a
+        // caller can no longer tell an internal hydration bound from an
+        // internal display bound, which is the exact fold this item exists
+        // to prevent one level up. Assert on the SUM of both internal-bound
+        // keys rather than assuming either alone accounts for the whole cut.
+        assert!(
+            result.dropped_reasons.contains_key("retrieval_breadth"),
+            "the display bound must still be named, not merely accounted for \
+             inside another key: {:?}",
+            result.dropped_reasons
+        );
         assert_eq!(
-            result.dropped_reasons.get("retrieval_breadth").copied(),
-            Some(result.total - result.returned),
+            result
+                .dropped_reasons
+                .get("retrieval_cap")
+                .copied()
+                .unwrap_or(0)
+                + result
+                    .dropped_reasons
+                    .get("retrieval_breadth")
+                    .copied()
+                    .unwrap_or(0),
+            result.total - result.returned,
             "the caller cannot tell WHICH cap cut, and the remedies differ: \
-             raising the budget cannot recover a node the breadth bound threw \
-             away: {:?}",
+             raising the budget cannot recover a node either internal bound \
+             threw away: {:?}",
             result.dropped_reasons
         );
         assert_eq!(
@@ -2923,6 +3098,306 @@ mod tests {
         assert!(
             resolve_scope(&store, "anything", "project:does-not-exist").is_err(),
             "an unresolvable project scope must error rather than silently match everything"
+        );
+    }
+
+    /// nw-322 (leg 3), fixture-adequacy AND the performance counterweight in
+    /// one: this project is large enough to REPRODUCE the reported mechanism
+    /// -- `resolve_scope`'s `project:` branch seeds PPR with the project's
+    /// entire membership, PPR includes every seed regardless of score
+    /// (`personalized_pagerank`'s own contract), so before this fix `fused`
+    /// was corpus-sized and every single one of those 5,000 candidates paid
+    /// a `render_brain_node` DB round-trip BEFORE `DEFAULT_RETRIEVAL_BREADTH`
+    /// (30) threw away all but a handful. nw-322 measured 110-142s on a
+    /// comparable real project (12-27x every other scope); this fixture is
+    /// the same shape at smaller absolute scale.
+    ///
+    /// COUNTERWEIGHT, run by hand rather than committed as a second test
+    /// (committing a temporarily-reverted line would itself be the
+    /// regression this guards against): with the call site's
+    /// `Some(RenderCap { .. })` changed to `None` (i.e. calling
+    /// `build_brain_context_hybrid_with_aliases` unbounded, as before this
+    /// fix), this exact test measured 17.07s against this exact fixture
+    /// (vs. 1.09s capped) and its elapsed-time assertion FAILED — confirmed
+    /// before restoring the cap.
+    #[test]
+    fn investigate_project_scope_stays_fast_on_a_large_project() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        // Large enough to dwarf `RETRIEVAL_RENDER_MARGIN` (120) by more than
+        // an order of magnitude, so a render-per-member regression cannot
+        // hide inside CI noise. Built via `batch_insert_symbols` (one
+        // transaction) rather than 5,000 individual `insert_symbol` calls —
+        // this test times RETRIEVAL, not fixture-setup I/O.
+        const MEMBER_COUNT: usize = 5_000;
+        let setup_started = std::time::Instant::now();
+        let symbols: Vec<Symbol> = (0..MEMBER_COUNT)
+            .map(|i| Symbol {
+                uid: format!("sym:big{i:06}"),
+                name: format!("fn{i}"),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:big".to_string(),
+                file_path: format!("src/f{i}.js"),
+                start_line: 1,
+                end_line: 2,
+                signature: format!("function fn{i}()"),
+                summary: None,
+                content_hash: format!("h{i}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+        let member_uids: Vec<String> = symbols.into_iter().map(|s| s.uid).collect();
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:big".to_string(),
+            name: "big".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, &member_uids, 1.0)
+            .unwrap();
+        eprintln!(
+            "fixture setup ({MEMBER_COUNT} members): {:?}",
+            setup_started.elapsed()
+        );
+
+        let started = std::time::Instant::now();
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            dir.path(),
+            "fn1",
+            "project:big",
+            Some(4000),
+            None,
+        )
+        .expect("investigate against a large project must still succeed");
+        let elapsed = started.elapsed();
+        eprintln!("investigate(project:big, {MEMBER_COUNT} members): {elapsed:?}");
+
+        assert!(
+            !result.entries.is_empty(),
+            "a {MEMBER_COUNT}-member project must still return an architectural map"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "investigate --scope project: took {elapsed:?} for a {MEMBER_COUNT}-member \
+             project; nw-322 measured 110-142s on a comparable real project because every \
+             fused candidate was hydrated before DEFAULT_RETRIEVAL_BREADTH discarded all \
+             but 30 of them. This threshold is deliberately generous (CI-noise headroom, \
+             not a performance target) -- the point is bounded-and-fast, not fastest-possible."
+        );
+
+        // Reviewed disclosure fix: `total` must report the TRUE in-scope
+        // population (every one of the {MEMBER_COUNT} members is admitted,
+        // since all are project members and therefore seeds), not the
+        // render-cap-truncated count that used to leak through here. Before
+        // this fix, `total` pinned at no more than `RETRIEVAL_RENDER_MARGIN`
+        // per partition no matter how large the real population was.
+        assert!(
+            result.total > RETRIEVAL_RENDER_MARGIN,
+            "total ({}) must reflect the true {MEMBER_COUNT}-member population, not a count \
+             the render cap already truncated to at most {RETRIEVAL_RENDER_MARGIN} per \
+             partition",
+            result.total
+        );
+        assert!(
+            result
+                .dropped_reasons
+                .get("retrieval_cap")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "retrieval_cap must disclose that the render cap dropped candidates, separately \
+             from retrieval_breadth: {:?}",
+            result.dropped_reasons
+        );
+        // The invariant the internal `debug_assert_eq!` also checks --
+        // pinned here too, at the public return value, not only inside the
+        // function that computed it.
+        assert_eq!(
+            result.dropped_reasons.values().sum::<usize>(),
+            result.total - result.returned,
+            "dropped_reasons must fully account for total - returned: {:?}",
+            result.dropped_reasons
+        );
+    }
+
+    /// REVIEWED REGRESSION, fixed by reordering rather than by tuning the
+    /// margin. `investigate_project_scope_stays_fast_on_a_large_project`
+    /// above cannot exhibit this: every one of its 5,000 symbols is a
+    /// project member, so `uid_in_scope` never rejects anything and there is
+    /// no non-member competitor to crowd one out. This fixture is built
+    /// specifically so there IS one: 200 out-of-scope headings (more than
+    /// `RETRIEVAL_RENDER_MARGIN`, 120) that outrank the project's own
+    /// in-scope heading by GLOBAL BM25 score, because `fused` is scored by
+    /// `GraphScope::unified()` and knows nothing about `project:` scope.
+    ///
+    /// The member's heading is the ONLY conduit tested here on purpose: a
+    /// Heading is never itself a project member or a seed (`resolve_scope`
+    /// seeds only the project's own notes/symbols directly) — it reaches
+    /// `connected` exclusively via non-seed retrieval (PPR graph walk from
+    /// its note, or here, a BM25 hit on its own text), which is exactly the
+    /// class `RenderCap::admit` exists to protect once a cap is in play.
+    ///
+    /// COUNTERWEIGHT: with `RenderCap::admit` reverted to always `None` (the
+    /// pre-review-fix behaviour — cap first, filter after), this test's
+    /// membership assertion FAILS: none of the 120 rendered `connected`
+    /// candidates is the member's heading, because all 120 slots go to
+    /// higher-BM25-scoring noise before the scope filter ever runs. Verified
+    /// by hand before restoring `admit`.
+    #[test]
+    fn project_scope_render_cap_does_not_starve_members_outscored_globally() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Vault};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        let vault_uid = "vlt:test:crowd";
+        store
+            .upsert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "crowd".to_string(),
+                root_path: "/crowd".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:crowded".to_string(),
+            name: "crowded".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+
+        // The ONE genuinely in-scope piece of content, reachable only
+        // through its heading (see doc comment above).
+        let member_note_uid = format!("note:{vault_uid}:member");
+        store
+            .insert_note(&Note {
+                uid: member_note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "member.md".to_string(),
+                title: "Member Note".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "h-member".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_vault_note_edge(vault_uid, &member_note_uid)
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[(project.uid.as_str(), member_note_uid.as_str())])
+            .unwrap();
+        let member_heading_uid = nestweaver_schema::uid::heading_uid(&member_note_uid, "widget", 1);
+        store
+            .insert_heading(&Heading {
+                uid: member_heading_uid.clone(),
+                note_uid: member_note_uid.clone(),
+                level: 1,
+                // Low term frequency -- one mention, deliberately outranked.
+                text: "widget".to_string(),
+                slug: "widget".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "h-member-head".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_note_heading_edges(&[(
+                member_note_uid.as_str(),
+                member_heading_uid.as_str(),
+            )])
+            .unwrap();
+
+        // NOISE: more than `RETRIEVAL_RENDER_MARGIN` (120) out-of-scope
+        // headings, each with high query-term repetition so BM25 ranks
+        // every one of them above the member's single-mention heading.
+        const NOISE_COUNT: usize = 200;
+        for i in 0..NOISE_COUNT {
+            let note_uid = format!("note:{vault_uid}:noise{i:04}");
+            store
+                .insert_note(&Note {
+                    uid: note_uid.clone(),
+                    vault_uid: vault_uid.to_string(),
+                    file_path: format!("noise{i:04}.md"),
+                    title: format!("Noise Note {i}"),
+                    note_kind: NoteKind::General,
+                    word_count: 20,
+                    content_hash: format!("h-noise{i}"),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            store.insert_vault_note_edge(vault_uid, &note_uid).unwrap();
+            let heading_uid = nestweaver_schema::uid::heading_uid(&note_uid, "widget", 1);
+            store
+                .insert_heading(&Heading {
+                    uid: heading_uid.clone(),
+                    note_uid: note_uid.clone(),
+                    level: 1,
+                    text: "widget ".repeat(20),
+                    slug: "widget".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_hash: format!("h-noise-head{i}"),
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .batch_insert_note_heading_edges(&[(note_uid.as_str(), heading_uid.as_str())])
+                .unwrap();
+        }
+
+        let tantivy_dir = tempfile::tempdir().unwrap();
+        let tantivy = nestweaver_store::TantivyIndex::open_or_create(tantivy_dir.path()).unwrap();
+        tantivy.reindex_from_store(&store).unwrap();
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            "widget",
+            "project:crowded",
+            Some(16000),
+            None,
+        )
+        .unwrap();
+
+        let uids: Vec<&String> = result.entries.iter().map(|e| &e.uid).collect();
+        assert!(
+            uids.contains(&&member_heading_uid),
+            "the project member's own heading must survive {NOISE_COUNT} higher-scoring \
+             out-of-scope competitors -- if this fails, RenderCap's admit predicate is not \
+             running before the per-partition cap; entries: {uids:?}"
         );
     }
 
