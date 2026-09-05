@@ -321,7 +321,35 @@ pub fn resolve_repo_selector<'a>(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [repo] => Ok(*repo),
-        [] => anyhow::bail!("repo '{selector}' not found in graph"),
+        // nw-428/nw-334: a bare "not found" names no remedy, and 29 of 44
+        // real repos have no explicit `name` at all — a caller who tried the
+        // name `list-repos` prints has no way to learn that the repo_uid was
+        // the only key that could ever have worked. Name the remedy command
+        // AND enumerate what is actually indexed (bounded, so a 44-repo graph
+        // doesn't turn a one-line error into a wall of text) — the same shape
+        // `resolve_vault_filter`'s not-found arm already uses.
+        [] => {
+            const MAX_LISTED: usize = 15;
+            let known: Vec<String> = repos
+                .iter()
+                .take(MAX_LISTED)
+                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+                .collect();
+            let suffix = if repos.len() > MAX_LISTED {
+                format!(", and {} more", repos.len() - MAX_LISTED)
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "repo '{selector}' not found in graph; run `nestweaver list-repos` to see \
+                 indexed repos by name/uid{}{suffix}",
+                if known.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — known repos: {}", known.join(", "))
+                }
+            );
+        }
         _ => {
             let candidates = matches
                 .iter()

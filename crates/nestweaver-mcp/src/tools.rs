@@ -151,6 +151,13 @@ use nestweaver_engine::node_scope::{
 // warn about an import used only under `#[cfg(test)]`.
 #[cfg(test)]
 use nestweaver_engine::node_scope::{NodeOwner, node_owner};
+// The fail-closed-on-empty-UID repo-visibility predicate used at 20+ call
+// sites in this file. Lives in `nestweaver_engine::authz` (not restated
+// here) for the same nw-217/nw-421 reason as the imports above — it is the
+// exact single predicate `node_scope::resolve_repo_filter` now calls too, so
+// the two crates cannot independently drift on what "visible" means for a
+// repo candidate.
+use nestweaver_engine::authz::repo_is_visible;
 
 /// Resolve authoritative symbol ownership only when repository scoping is
 /// active. Restricted impact/test-selection responses fail closed if this
@@ -228,17 +235,11 @@ fn restricted_repo_identities(
     Ok(identities)
 }
 
-fn repo_is_visible(
-    repo_uid: &str,
-    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
-) -> bool {
-    match visible {
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_)) => {
-            !repo_uid.is_empty() && visible.is_some_and(|scope| scope.allows(repo_uid))
-        }
-        _ => true,
-    }
-}
+// `repo_is_visible` is `nestweaver_engine::authz::repo_is_visible`, imported
+// at this crate's top-level `use` block (near `node_scope`) rather than
+// restated here — this predicate's own fail-closed-on-empty-UID behavior is
+// exactly what nw-421's lift almost silently dropped by re-deriving it from
+// `VisibleRepos::allows` instead of reusing it; see that import site.
 
 /// Resolve only inside the caller's visible repositories. Hidden and unknown
 /// UIDs deliberately collapse to the same not-found error.
@@ -19017,11 +19018,15 @@ mod blast_radius_visibility_tests {
     /// nw-428's companion half: a `repo` value that resolves to nothing must
     /// REFUSE (the tool call errors) rather than silently answering a
     /// confident `affected_symbol_count: 0` / `gate_state: degraded-unknown`
-    /// that reads as "nothing depends on this file, safe to change".
+    /// that reads as "nothing depends on this file, safe to change" — AND
+    /// the refusal must name a remedy (nw-334's standard), not just fail.
     ///
     /// COUNTERWEIGHT: the pre-fix passthrough behavior returns `Ok(_)` here
     /// with `affected_symbol_count: 0`, so asserting `.is_err()` fails against
-    /// the un-fixed code — confirmed by hand before committing.
+    /// the un-fixed code — confirmed by hand before committing. Asserting on
+    /// the message text (not just `.is_err()`) is itself a fix: the original
+    /// version of this test only checked `is_err()`, which would have passed
+    /// against a refusal that named no remedy at all.
     #[test]
     fn tool_blast_radius_unresolvable_repo_filter_refuses_rather_than_answering_zero() {
         let store = named_repo_store();
@@ -19034,9 +19039,24 @@ mod blast_radius_visibility_tests {
             None,
             None,
         );
+        let error = format!(
+            "{:#}",
+            result.expect_err(
+                "an unresolvable `repo` filter must refuse the analysis, not answer 0 affected"
+            )
+        );
         assert!(
-            result.is_err(),
-            "an unresolvable `repo` filter must refuse the analysis, not answer 0 affected; got {result:?}"
+            error.contains("this-repo-does-not-exist"),
+            "the refusal must name the selector that failed; got {error:?}"
+        );
+        assert!(
+            error.contains("list-repos"),
+            "the refusal must name a remedy the caller can execute (nw-334); got {error:?}"
+        );
+        assert!(
+            error.contains("bx-react-native-client") && error.contains("unnamed"),
+            "the refusal should help a caller pick the right key by naming what IS indexed; \
+             got {error:?}"
         );
     }
 

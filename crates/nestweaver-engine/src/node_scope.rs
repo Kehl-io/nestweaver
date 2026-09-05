@@ -115,7 +115,7 @@ pub fn resolve_repo_filter(
         .list_repos(None)
         .context("listing repositories to resolve the repo filter")?
         .into_iter()
-        .filter(|repo| visible.is_none_or(|scope| scope.allows(&repo.uid)))
+        .filter(|repo| crate::authz::repo_is_visible(&repo.uid, visible))
         .collect();
     selectors
         .iter()

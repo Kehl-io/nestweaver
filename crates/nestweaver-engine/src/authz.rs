@@ -62,6 +62,29 @@ impl VisibleRepos {
     }
 }
 
+/// Whether a *repo itself* (not one of its unresolved-ownership rows) is
+/// visible to `visible`.
+///
+/// Deliberately NOT `visible.is_none_or(|scope| scope.allows(repo_uid))`,
+/// even though that reads as equivalent: [`VisibleRepos::allows`]'s
+/// empty-`repo_uid` early return is a design for unresolved SYMBOL/EDGE
+/// ownership rows (a blast-radius affected row with no known owner still
+/// passes), not for a candidate REPO in a resolver's own list — a real
+/// `Repo.uid` is never empty, so the two spellings agree in practice, but
+/// this one fails closed on that case instead of silently reproducing
+/// `allows`'s row-level exemption for a repo-level question. One predicate,
+/// reused by every repo-candidate filter (`node_scope::resolve_repo_filter`
+/// and the 20+ dispatch-time call sites in `nestweaver-mcp`) rather than two
+/// spellings of the same intent drifting apart.
+pub fn repo_is_visible(repo_uid: &str, visible: Option<&VisibleRepos>) -> bool {
+    match visible {
+        Some(VisibleRepos::Only(_)) => {
+            !repo_uid.is_empty() && visible.is_some_and(|scope| scope.allows(repo_uid))
+        }
+        _ => true,
+    }
+}
+
 /// The permission source (policy decision point).
 ///
 /// Implementations MUST fail closed: an unknown identity under an *enabled*

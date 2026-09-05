@@ -1156,8 +1156,20 @@ pub fn investigate_hydrate(
 enum ScopeFilter {
     /// Keep only symbols belonging to one of these repos (`repo:` scope).
     Repos(Vec<String>),
-    /// Keep only symbols that are members of the project (`project:` scope).
-    ProjectSymbols(std::collections::HashSet<String>),
+    /// `project:` scope. Membership is tested separately for symbols and
+    /// notes (see `node_in_scope`) rather than trusting arrival: `resolve_scope`
+    /// seeds the raw query text unconditionally, and hybrid seed resolution's
+    /// note-title lookup is vault-wide with no project filter, so an
+    /// unrelated note whose title happens to match a query token can reach
+    /// `connected` without ever having been added to either member set here.
+    Project {
+        /// UIDs of symbols that are members of the project.
+        symbols: std::collections::HashSet<String>,
+        /// UIDs of notes that are members of the project (seeded from its
+        /// `vault_folder`). A Section/Heading is in scope when the note that
+        /// contains it is in this set.
+        notes: std::collections::HashSet<String>,
+    },
 }
 
 /// Strip a `project:`/`repo:` scope prefix case-insensitively (so
@@ -1222,15 +1234,30 @@ fn resolve_scope(
             .lookup_project_by_name(slug)
             .map_err(|e| anyhow::anyhow!("lookup project '{slug}': {e}"))?
             .ok_or_else(|| anyhow::anyhow!("unknown scope '{scope}': no project named '{slug}'"))?;
+        // Recorded as a MEMBER SET, not just seeded: a note UID here is also
+        // seeded (below) so it is a first-class retrieval hit, but membership
+        // is what `node_in_scope` tests against — a note that reaches
+        // `connected` some OTHER way (the raw query text is always seeded
+        // too, and its hybrid seed resolution does a vault-wide note-title
+        // lookup with no project filter) must not be admitted just because it
+        // arrived.
+        let mut member_notes = std::collections::HashSet::new();
         if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
-            seeds.extend(note_uids);
+            seeds.extend(note_uids.iter().cloned());
+            member_notes.extend(note_uids);
         }
         let mut member_symbols = std::collections::HashSet::new();
         if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid) {
             seeds.extend(sym_uids.iter().cloned());
             member_symbols.extend(sym_uids);
         }
-        return Ok((seeds, Some(ScopeFilter::ProjectSymbols(member_symbols))));
+        return Ok((
+            seeds,
+            Some(ScopeFilter::Project {
+                symbols: member_symbols,
+                notes: member_notes,
+            }),
+        ));
     }
 
     if let Some(name) = strip_scope_prefix(scope, "repo:") {
@@ -1302,39 +1329,67 @@ fn is_no_seed_resolution_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().starts_with("No seeds resolved."))
 }
 
+/// The note UID that owns a Section/Heading UID, recovered from the UID
+/// itself. `nestweaver_schema::uid::note_uid_of_heading` already inverts
+/// `head:{note_uid}:{slug_hash}:{line}`; there is no public equivalent for
+/// `sec:{note_uid}:{start_line}:{content_hash_short}`, so this inverts that
+/// grammar the same way (split off the RIGHT, since `note_uid` itself
+/// contains colons) rather than adding a second copy of the technique in a
+/// crate outside this batch's file set. Returns `None` for anything that is
+/// not a Section or Heading UID.
+fn parent_note_uid(uid: &str) -> Option<String> {
+    if let Some(note_uid) = nestweaver_schema::uid::note_uid_of_heading(uid) {
+        return Some(note_uid.to_string());
+    }
+    let rest = uid.strip_prefix("sec:")?;
+    let (without_hash, _content_hash_short) = rest.rsplit_once(':')?;
+    let (note_uid, _start_line) = without_hash.rsplit_once(':')?;
+    (!note_uid.is_empty()).then(|| note_uid.to_string())
+}
+
 /// Whether a node survives the scope filter.
 ///
 /// nw-378. The two scopes DELIBERATELY disagree about non-symbol
 /// (note/section/heading/tag) nodes, and the disagreement is the fix, not a
 /// bug to unify away:
 ///
-///  * `project:` passes every non-symbol node through unfiltered. That is
-///    correct and load-bearing: `resolve_scope` seeds the project's own note
-///    UIDs from its `vault_folder`, so a note reaching this filter under a
-///    project scope is genuinely a project member — there is a real
-///    project-to-note association in the schema to test, even though this
-///    function does not re-test it here.
-///  * `repo:` used to do the SAME pass-through ("mirrors the long-standing
-///    `repo:` notes handling"), but there is NO repo-to-note association in
-///    the schema at all — a Note/Section/Heading/Tag belongs to a vault, not
-///    a repo, so "in repo X" cannot be answered for it under any reading.
-///    MEASURED CONSEQUENCE: notes routinely outrank symbols in hybrid
-///    retrieval, the truncate-to-`DEFAULT_RETRIEVAL_BREADTH` cap runs AFTER
-///    this filter, and an unfiltered kind can consume the entire cap — a
-///    `repo:`-scoped investigation returned a 30-entry map of vault notes
-///    from UNRELATED workspaces and zero symbols from the named repo, while
-///    still reporting `scope_filtered: true`. Vault content is now dropped
-///    (not passed through) under `repo:` scope, which is the SAME decision
-///    nw-405 already made for `retain_nodes_in_repos` (`brain_context`'s
-///    `repos:` filter) — applying it here rather than inventing a second
-///    reading of the same question.
+///  * `repo:` — there is NO repo-to-note association in the schema at all, a
+///    Note/Section/Heading/Tag belongs to a vault, not a repo, so "in repo X"
+///    cannot be answered for it under any reading. Vault content is dropped
+///    entirely, the SAME decision nw-405 already made for
+///    `retain_nodes_in_repos` (`brain_context`'s `repos:` filter).
+///  * `project:` DOES have a real project-to-note association
+///    (`list_project_note_uids`, seeded into `ScopeFilter::Project::notes`),
+///    so unlike `repo:` a note CAN genuinely be in scope. But "the pass-through
+///    is correct because membership is real" does not license an
+///    UNCONDITIONAL pass-through: `resolve_scope` seeds the raw query text (and
+///    its per-token splits) regardless of scope, and hybrid seed resolution's
+///    `lookup_note_uids_by_title` is vault-wide with NO project filter — so a
+///    query token that happens to exact-match an unrelated note's title seeds
+///    it into `connected` without that note ever entering the member set.
+///    Measured: a `project:onlyhello` investigation whose query token exactly
+///    matched an off-project note's title returned that note alongside the
+///    project's own member symbol. The fix is a MEMBERSHIP TEST, not a second
+///    blanket drop — a Note is in scope iff its UID is a member; a
+///    Section/Heading is in scope iff the note that contains it is a member
+///    (recovered via `parent_note_uid`). Tags are unchanged (pass through):
+///    there is no project-to-tag association to test in the first place, and
+///    this is not the leak that was measured.
 fn node_in_scope(store: &GraphStore, node: &BrainNode, filter: &ScopeFilter) -> bool {
     match filter {
-        ScopeFilter::ProjectSymbols(members) => {
-            if !node.uid.starts_with("sym:") {
-                return true;
+        ScopeFilter::Project { symbols, notes } => {
+            if node.uid.starts_with("sym:") {
+                return symbols.contains(&node.uid);
             }
-            members.contains(&node.uid)
+            if node.uid.starts_with("note:") {
+                return notes.contains(&node.uid);
+            }
+            if let Some(parent) = parent_note_uid(&node.uid) {
+                return notes.contains(&parent);
+            }
+            // Tag (or anything else unattributable): no project-tag
+            // association exists to test, so this stays a pass-through.
+            true
         }
         ScopeFilter::Repos(repo_uids) => {
             if !node.uid.starts_with("sym:") {
@@ -3350,6 +3405,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// nw-378, second half: `project:` scope's note pass-through was never a
+    /// blanket "notes are fine here" — it relied on the CLAIM that a note
+    /// reaching `node_in_scope` under `project:` is necessarily a member,
+    /// because `resolve_scope` seeds the project's own notes. That claim is
+    /// false: `resolve_scope` ALSO seeds the raw query text (and its
+    /// per-token splits) unconditionally, regardless of scope, and hybrid
+    /// seed resolution's `lookup_note_uids_by_title` is vault-wide with no
+    /// project filter. A query token that exact-matches an UNRELATED note's
+    /// title reaches `connected` without that note ever entering
+    /// `list_project_note_uids`'s member set — the SAME mechanism that
+    /// produced the measured `repo:` leak, on the scope the original fix
+    /// declared safe.
+    ///
+    /// Both halves in one test, because they are the same claim from two
+    /// directions: a project's own member note MUST still be admitted (the
+    /// counterweight nw-378 explicitly requires — this is the pass-through
+    /// that is genuinely correct), and a note that only coincidentally
+    /// shares a title with a query token MUST NOT be, even though both
+    /// arrive in `connected` the same way (as a `note:` UID seed).
+    ///
+    /// COUNTERWEIGHT: reverting `node_in_scope`'s `ScopeFilter::Project` arm
+    /// to the pre-fix unconditional `if !node.uid.starts_with("sym:") {
+    /// return true; }` makes the "foreign note excluded" assertion below
+    /// FAIL — the foreign note survives exactly as measured. Verified by
+    /// hand before committing.
+    #[test]
+    fn project_scope_admits_member_notes_but_excludes_notes_reached_only_via_global_title_seed() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let hello_uid = store
+            .lookup_symbols_by_name("hello")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "hello")
+            .expect("hello symbol exists")
+            .uid;
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:onlyhello".to_string(),
+            name: "onlyhello".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&hello_uid), 1.0)
+            .unwrap();
+
+        let vault_uid = "vlt:test:probevault";
+        store
+            .upsert_vault(&nestweaver_schema::Vault {
+                uid: vault_uid.to_string(),
+                name: "probevault".to_string(),
+                root_path: "/probevault".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let mk_note = |slug: &str, title: &str| nestweaver_schema::Note {
+            uid: format!("note:{vault_uid}:{slug}"),
+            vault_uid: vault_uid.to_string(),
+            file_path: format!("{slug}.md"),
+            title: title.to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+
+        // A note that genuinely IS a project member.
+        let member_note = mk_note("memberdoc", "onlyhello project doc");
+        let member_note_uid = member_note.uid.clone();
+        store.insert_note(&member_note).unwrap();
+        store
+            .insert_vault_note_edge(vault_uid, &member_note_uid)
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[(project.uid.as_str(), member_note_uid.as_str())])
+            .unwrap();
+
+        // A note that is NOT a project member, titled to exact-match a query
+        // token — the leak vector.
+        let foreign_note = mk_note("globalnote", "globalnote");
+        let foreign_note_uid = foreign_note.uid.clone();
+        store.insert_note(&foreign_note).unwrap();
+        store
+            .insert_vault_note_edge(vault_uid, &foreign_note_uid)
+            .unwrap();
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet globalnote",
+            "project:onlyhello",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        let uids: Vec<&String> = result.entries.iter().map(|e| &e.uid).collect();
+
+        assert!(
+            uids.contains(&&member_note_uid),
+            "the project's own member note must still be admitted \
+             (nw-378's required counterweight); entries: {uids:?}"
+        );
+        assert!(
+            !uids.contains(&&foreign_note_uid),
+            "a note that is NOT a project member must not leak through just \
+             because a query token happened to match its title; entries: {uids:?}"
+        );
+        assert!(
+            uids.iter().any(|u| u.as_str() == hello_uid),
+            "the project's own member symbol must still be admitted; entries: {uids:?}"
+        );
     }
 
     /// nw-378, on a genuine multi-repo graph (two separately-indexed repos in
