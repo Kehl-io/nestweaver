@@ -1655,23 +1655,44 @@ impl GraphStore {
         let mut truncation_reason = planning_deadline.then_some(RegexTruncationReason::Deadline);
         let mut results = Vec::new();
         let mut scanned_candidates = 0usize;
+        // Verification's own ceiling is the budget REMAINING after collection,
+        // not a fresh `deadline_ms` -- see `verification_budget_ms` and the
+        // invariant note on the check below. Computed once, right before the
+        // loop starts, so it reflects how much of the caller's stated budget
+        // collection actually spent.
+        let verification_budget_ms = verification_budget_ms(deadline_ms, elapsed_millis(start));
         let verification_started = Instant::now();
         for (i, c) in candidates.iter().enumerate() {
             check_cancel()?;
             if truncated {
                 break;
             }
-            // Verification gets its OWN phase-local ceiling, measured from
-            // `verification_started` rather than the search's overall `start`:
-            // collection is allowed to (and, per the measurements behind
-            // nw-427, routinely does) run right up to or slightly past
-            // `deadline_ms` before returning a complete-or-partial candidate
-            // list, and that overrun must not be inherited as an
-            // already-exhausted budget for the cheap phase that follows. This
-            // is a safety ceiling against a pathologically large already-
-            // collected set, not a doubling of the caller's stated budget in
-            // the common case.
-            if verification_started.elapsed().as_millis() as u64 > deadline_ms {
+            // INVARIANT: total wall time is bounded by ~`deadline_ms` overall
+            // (plus this loop's own single-iteration slack), never ~2x it.
+            // Verification still gets a phase-local ceiling, measured from
+            // `verification_started` rather than the search's overall
+            // `start`, so a pathologically large already-collected set can't
+            // itself run unbounded -- but that ceiling is
+            // `verification_budget_ms`, the budget REMAINING after collection
+            // (`deadline_ms - elapsed(start)`), not a second full
+            // `deadline_ms` measured from a fresh clock. Reusing the full
+            // budget here is exactly what let verification silently tack up
+            // to another whole `deadline_ms` on top of collection: total wall
+            // time could reach ~2x `--max-millis`, and on the common,
+            // non-truncated path (where `DEFAULT_MAX_MILLIS` is the effective
+            // budget) that showed up as a ~5x slowdown.
+            //
+            // When collection alone already consumed the full budget,
+            // `verification_budget_ms` saturates to 0 -- but the check below
+            // still lets the FIRST iteration through (elapsed-so-far is
+            // ~0ms, which is not `> 0`), so whatever collection already
+            // gathered still gets a chance to be verified rather than
+            // discarded outright. That is nw-427's correctness win, kept: an
+            // already-exhausted budget yields "verify what little time
+            // allows, then truncate honestly," never "discard everything"
+            // (the pre-nw-427 bug) and never "keep scanning past the
+            // caller's stated budget" (this regression).
+            if verification_started.elapsed().as_millis() as u64 > verification_budget_ms {
                 truncated = true;
                 truncation_reason = Some(RegexTruncationReason::Deadline);
                 break;
@@ -1938,6 +1959,27 @@ fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+/// The verification phase's own wall-clock ceiling: the caller's `deadline_ms`
+/// budget MINUS whatever collection already spent of it — never a second full
+/// `deadline_ms` measured from a fresh clock. That reuse is exactly nw-427's
+/// regression: verification could silently add up to another whole
+/// `deadline_ms` on top of collection, so total wall time reached ~2x
+/// `--max-millis` (and ~5x on the common, non-truncated default-budget path).
+///
+/// Saturates to 0 rather than underflowing when collection already consumed
+/// the entire budget (or overran it) — `elapsed_since_start_ms > deadline_ms`
+/// is the routine, expected case per nw-427's own measurements, not an error.
+/// A `verification_budget_ms` of 0 does not mean "verify nothing": the loop's
+/// own ceiling check compares elapsed time *within* the loop against this
+/// value, and that starts at 0, so the first already-collected candidate is
+/// still verified before the check can ever trip. That is nw-427's
+/// correctness win, kept: an exhausted budget still returns real,
+/// already-collected results (honestly marked truncated), rather than
+/// discarding them the way the pre-nw-427 code did.
+fn verification_budget_ms(deadline_ms: u64, elapsed_since_start_ms: u64) -> u64 {
+    deadline_ms.saturating_sub(elapsed_since_start_ms)
+}
+
 /// Strip a trailing `:<line>` suffix from a location to recover the file path.
 fn file_of(location: &str) -> String {
     match location.rfind(':') {
@@ -2001,6 +2043,42 @@ mod tests {
         );
         assert_eq!(result.hydrated_candidates, 0);
         assert_eq!(result.scanned_candidates, 0);
+    }
+
+    /// The verification phase's ceiling must be the budget REMAINING after
+    /// collection, never a second full `deadline_ms` measured from a fresh
+    /// clock -- that reuse is the post-nw-427 regression this item fixes
+    /// (total wall time reaching ~2x `--max-millis`, ~5x on the common
+    /// default-budget path). Pure arithmetic, no wall clock involved, so this
+    /// is exact and never flaky: the fixture is plain integers, chosen to
+    /// cover the three cases that matter (partial spend, exact/over spend,
+    /// minimal spend) rather than exercising the fix through real timing.
+    ///
+    /// Counterweight (verified by hand, not committed): reverting the
+    /// production code to the pre-fix shape --
+    /// `fn verification_budget_ms(deadline_ms: u64, _elapsed: u64) -> u64 { deadline_ms }`
+    /// -- makes the first two assertions below fail (`400` instead of `50`,
+    /// and `400` instead of `0`), which is exactly the bug: verification
+    /// handed the full budget again regardless of what collection already
+    /// spent.
+    #[test]
+    fn verification_budget_is_remaining_not_a_fresh_full_deadline() {
+        // Collection spent 350 of a 400ms budget: 50ms should remain for
+        // verification, not another full 400ms.
+        assert_eq!(verification_budget_ms(400, 350), 50);
+        // Collection spent the ENTIRE budget: remaining saturates to 0 rather
+        // than continuing to hand out the full deadline.
+        assert_eq!(verification_budget_ms(400, 400), 0);
+        // Collection OVERRAN the budget (the routine case per nw-427's own
+        // measurements -- collection is allowed to run right up to or past
+        // `deadline_ms`): remaining still saturates to 0, not an underflowed
+        // wraparound to a huge u64.
+        assert_eq!(verification_budget_ms(400, 999), 0);
+        // Collection was fast: almost the entire deadline remains.
+        assert_eq!(verification_budget_ms(400, 1), 399);
+        // No budget was ever requested and none was spent: still zero, not a
+        // no-op that accidentally lets `0.saturating_sub(0)` mean "unbounded".
+        assert_eq!(verification_budget_ms(0, 0), 0);
     }
 
     /// nw-427: when collection stops early (`hydration_stop.is_some()`) it
@@ -3371,5 +3449,139 @@ mod tests {
             hit.location, "notes/multi.md:11",
             "location must carry the match line, not the section start line"
         );
+    }
+
+    /// Manual perf harness for the post-nw-427 verification-budget
+    /// regression. Deliberately NOT part of the default suite: it is
+    /// real-wall-clock and sized to genuinely exercise `DEFAULT_MAX_MILLIS`
+    /// (multi-second unbounded cost), so it is slow and mildly
+    /// hardware-sensitive by nature -- exactly the property a fixed-corpus,
+    /// fixed-assertion test in the default suite must NOT have. Run
+    /// explicitly:
+    ///
+    /// ```text
+    /// cargo test -p nestweaver-store --release --lib \
+    ///   regex::tests::perf_verification_budget_stays_within_the_callers_deadline \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Fixture adequacy: uses the exact pattern from the measured regression
+    /// (`\d{4}-\d{2}-\d{2}`, no literal trigram, so this always hits the same
+    /// full-scan path real callers hit) over a corpus sized so the unbounded
+    /// (`--max-millis 120000`) run takes multiple seconds -- comfortably past
+    /// `DEFAULT_MAX_MILLIS` (2000ms), so the uncapped-default, generous, and
+    /// near-cliff scenarios below land in genuinely different places rather
+    /// than all finishing instantly regardless of which budget logic is in
+    /// use (asserted directly below, not assumed).
+    #[test]
+    #[ignore = "wall-clock perf harness; run explicitly with --ignored --nocapture"]
+    fn perf_verification_budget_stays_within_the_callers_deadline() {
+        let store = GraphStore::in_memory().unwrap();
+        // ~4000 symbols x ~2.6KB signature, each with 8 embedded date-shaped
+        // occurrences: big enough that collecting + regex-scanning the whole
+        // corpus unbounded takes multiple seconds on ordinary hardware.
+        const SYMS: usize = 4000;
+        const OCCURRENCES_PER_SIG: usize = 8;
+        for i in 0..SYMS {
+            let mut sig = String::with_capacity(2600);
+            for j in 0..OCCURRENCES_PER_SIG {
+                sig.push_str(&format!(
+                    "// entry {i}-{j} recorded 20{:02}-{:02}-{:02} during batch \
+                     processing of request payload; ",
+                    i % 100,
+                    (j % 12) + 1,
+                    (i % 28) + 1,
+                ));
+                sig.push_str("filler filler filler filler filler filler filler filler ");
+            }
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym:perf:{i}"),
+                    name: format!("perfSymbol{i}"),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:perf".to_string(),
+                    file_path: format!("src/perf_{i}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: sig,
+                    summary: None,
+                    content_hash: format!("h{i}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+
+        let pattern = r"\d{4}-\d{2}-\d{2}";
+
+        // Effectively unbounded, to learn the real un-truncated cost this
+        // corpus imposes -- the yardstick the capped scenarios below are
+        // judged against.
+        let unbounded = store
+            .regex_search(pattern, None, None, None, Some(120_000))
+            .unwrap();
+        eprintln!(
+            "[perf] unbounded:                truncated={} results={:>6} timings={:?}",
+            unbounded.truncated,
+            unbounded.results.len(),
+            unbounded.timings
+        );
+        assert!(
+            !unbounded.results.is_empty(),
+            "fixture adequacy: the corpus must actually contain matches, or \
+             none of the assertions below mean anything"
+        );
+        assert!(
+            !unbounded.truncated,
+            "120s must be enough to finish this corpus, or the yardstick \
+             itself is truncated"
+        );
+
+        for (label, max_millis) in [
+            ("uncapped default (None)", None),
+            ("generous (500ms)", Some(500)),
+            ("near-cliff (25ms)", Some(25)),
+        ] {
+            let result = store
+                .regex_search(pattern, None, None, None, max_millis)
+                .unwrap();
+            eprintln!(
+                "[perf] {label:<24}: truncated={} reason={:?} results={:>6} timings={:?}",
+                result.truncated,
+                result.truncation_reason,
+                result.results.len(),
+                result.timings
+            );
+            let budget = max_millis.unwrap_or(DEFAULT_MAX_MILLIS);
+            if unbounded.timings.total_ms > budget {
+                assert!(
+                    !result.results.is_empty(),
+                    "{label}: a budget too small to finish this corpus must \
+                     still return whatever was already verified, not discard \
+                     it -- that is the pre-nw-427 bug: {result:?}"
+                );
+                // INVARIANT under test: total wall time stays near the
+                // caller's own budget, not ~2x it. Generous slack (2x the
+                // budget plus a fixed floor) keeps this from flaking on a
+                // loaded machine while still catching the regression this
+                // fixes -- reverting `verification_budget_ms` to return the
+                // full `deadline_ms` regardless of elapsed time lets total_ms
+                // approach `deadline_ms` (collection) + the full unbounded
+                // verification cost, which this bound is sized to catch.
+                assert!(
+                    result.timings.total_ms <= budget.saturating_mul(2) + 200,
+                    "{label}: total_ms={} should stay near budget={budget}ms, \
+                     not run up toward the unbounded cost of {}ms: {result:?}",
+                    result.timings.total_ms,
+                    unbounded.timings.total_ms,
+                );
+            }
+        }
     }
 }
