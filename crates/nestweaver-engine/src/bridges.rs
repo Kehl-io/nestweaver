@@ -46,9 +46,17 @@ fn load_graph(store: &GraphStore) -> Result<Option<LoadedGraph>> {
         return Ok(None);
     }
 
+    // nw-308(a): restricted to CALLABLE kinds — see
+    // `crate::hubs::is_callable_kind`'s doc comment for why. An edge naming a
+    // Module/TypeAlias/Constant/Property/Variable endpoint fails this lookup
+    // and is silently dropped for BOTH endpoints, so a non-callable node
+    // cannot itself be a bridge (empty adjacency excludes it downstream) and
+    // cannot inflate a real neighbor's betweenness by sitting on a phantom
+    // shortest path either.
     let uid_to_idx: HashMap<String, usize> = symbols
         .iter()
         .enumerate()
+        .filter(|(_, s)| crate::hubs::is_callable_kind(&s.kind))
         .map(|(i, s)| (s.uid.clone(), i))
         .collect();
 
@@ -131,6 +139,23 @@ impl BridgeNodes {
 /// reproducible rather than self-cancelling across calls — which is precisely
 /// why the estimate has to be labelled as one rather than left to average out.
 pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<BridgeNodes> {
+    // nw-439. `hubs` fails closed during a dirty index publication because
+    // `pagerank_scores()` (the ranking.rs module contract, in
+    // nestweaver-store) refuses to serve ranks that might predate the
+    // committed graph. `bridges` computes betweenness directly from
+    // `load_code_symbols_and_edges` and never consulted that contract at
+    // all, so it kept answering — measured on production returning a full,
+    // byte-identical ranked payload on every one of three rounds during a
+    // genuine 7-plus-minute publication, while `hubs` refused every time in
+    // the same window. `brain status` documents ONE policy for ranked
+    // queries ("fail closed until the writer commits"); `bridges` is a
+    // ranked query, so it must actually follow it. This check is the same
+    // check `pagerank_scores()` makes, called from here because this
+    // function is the one that skips the contract it depends on, not
+    // because the contract itself needs to change.
+    if store.is_index_publication_dirty() {
+        anyhow::bail!("betweenness centrality unavailable during dirty index publication");
+    }
     let graph = match load_graph(store)? {
         Some(g) => g,
         None => {
@@ -384,6 +409,13 @@ mod tests {
             type_info: None,
             framework_hint: None,
             canonical_id: None,
+        }
+    }
+
+    fn make_symbol_with_kind(uid: &str, name: &str, file_path: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            kind,
+            ..make_symbol(uid, name, file_path)
         }
     }
 
@@ -681,6 +713,147 @@ mod tests {
         assert!(
             cut.bridges.len() <= cut.candidate_total,
             "`returned` may never exceed `total` — that ratio is meaningless to a consumer"
+        );
+    }
+
+    /// nw-308(a). Barbell topology (two cliques joined by one connector) is
+    /// this module's own canonical bridge fixture
+    /// (`bridge_in_barbell_graph_ranks_highest`). Here the connector, `X`, is
+    /// a `TypeAlias` — the exact kind of the real `ImageSize` defect, the #1
+    /// bridge on the live 44-repo graph despite 0 callers. It must not be
+    /// reported as a bridge, and — the harder claim — it must not have
+    /// inflated some OTHER node's betweenness by acting as a phantom
+    /// via-point, since the edges through it are simply dropped rather than
+    /// rerouted through a real node.
+    #[test]
+    fn a_non_callable_kind_cannot_be_a_bridge_regardless_of_raw_betweenness() {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["A", "B", "C", "D", "E", "F"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}"), "src/lib.rs"))
+                .unwrap();
+        }
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "X",
+                "ImageSize",
+                "src/types.rs",
+                SymbolKind::TypeAlias,
+            ))
+            .unwrap();
+
+        store.insert_edge(&make_edge("A", "B")).unwrap();
+        store.insert_edge(&make_edge("B", "C")).unwrap();
+        store.insert_edge(&make_edge("A", "C")).unwrap();
+        store.insert_edge(&make_edge("C", "X")).unwrap();
+        store.insert_edge(&make_edge("X", "D")).unwrap();
+        store.insert_edge(&make_edge("D", "E")).unwrap();
+        store.insert_edge(&make_edge("E", "F")).unwrap();
+        store.insert_edge(&make_edge("D", "F")).unwrap();
+
+        let found = find_bridge_nodes_bounded(&store, 10).unwrap();
+        assert!(
+            !found.bridges.iter().any(|b| b.uid == "X"),
+            "a TypeAlias node must never appear as a bridge: {:?}",
+            found.bridges.iter().map(|b| &b.uid).collect::<Vec<_>>()
+        );
+        // C and D each lost their only edge to the other clique (both ran
+        // through the excluded phantom), so neither can reach the other
+        // clique at all any more — betweenness 0.0 for both, not an inflated
+        // score standing in for the dropped path.
+        for uid in ["C", "D"] {
+            let node = found.bridges.iter().find(|b| b.uid == uid).unwrap();
+            assert_eq!(
+                node.betweenness_score, 0.0,
+                "{uid} must not inherit betweenness from the excluded phantom's paths"
+            );
+        }
+
+        // COUNTERWEIGHT: the same topology with X as a genuine callable kind
+        // (Function) is exactly this module's own
+        // `bridge_in_barbell_graph_ranks_highest` fixture, which already
+        // asserts X ranks first. Re-run it here to show the filter — not
+        // some other change — is what makes the difference.
+        let store2 = GraphStore::in_memory().unwrap();
+        for uid in ["A", "B", "C", "X", "D", "E", "F"] {
+            store2
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}"), "src/lib.rs"))
+                .unwrap();
+        }
+        store2.insert_edge(&make_edge("A", "B")).unwrap();
+        store2.insert_edge(&make_edge("B", "C")).unwrap();
+        store2.insert_edge(&make_edge("A", "C")).unwrap();
+        store2.insert_edge(&make_edge("C", "X")).unwrap();
+        store2.insert_edge(&make_edge("X", "D")).unwrap();
+        store2.insert_edge(&make_edge("D", "E")).unwrap();
+        store2.insert_edge(&make_edge("E", "F")).unwrap();
+        store2.insert_edge(&make_edge("D", "F")).unwrap();
+        let found2 = find_bridge_nodes_bounded(&store2, 3).unwrap();
+        assert_eq!(
+            found2.bridges.first().map(|b| b.uid.as_str()),
+            Some("X"),
+            "the identical topology over a callable kind must rank X first"
+        );
+    }
+
+    /// nw-439. `hubs` fails closed during a dirty index publication (via
+    /// `pagerank_scores()`'s own check); `bridges` did not, and measured on
+    /// production served a full, byte-identical ranked payload on every one
+    /// of three rounds during a genuine 7-plus-minute publication while
+    /// `hubs` refused every time in the same window — the exact asymmetry
+    /// `brain status`'s documented "ranked queries fail closed" contradicts.
+    /// This requires an ON-DISK store: `is_index_publication_dirty` is
+    /// file-marker-based and always reads `false` for an in-memory store
+    /// (no `db_path`), which is why this test cannot reuse the in-memory
+    /// fixtures the rest of this module uses.
+    #[test]
+    fn a_dirty_index_publication_fails_closed_like_hubs_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        for uid in ["A", "B"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}"), "src/lib.rs"))
+                .unwrap();
+        }
+        store.insert_edge(&make_edge("A", "B")).unwrap();
+
+        // Sanity: a clean store answers normally.
+        assert!(find_bridge_nodes_bounded(&store, 5).is_ok());
+
+        // Leave the same file-based marker a real indexing writer leaves
+        // mid-publication (the marker `wait_out_index_publication` and
+        // `classify_index_publication_error` in nestweaver-mcp already know
+        // how to wait on and explain).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            nestweaver_store::index_publication::marker_path(&db_path),
+            nestweaver_store::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let err = find_bridge_nodes_bounded(&store, 5).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("index publication"),
+            "must fail with a message the shared classifier (nestweaver-mcp's \
+             `classify_index_publication_error`) recognizes, so bridges gets \
+             the SAME marker-pid/age/remedy disclosure hubs already gets: {err:#}"
+        );
+
+        // COUNTERWEIGHT: remove the marker and the SAME store answers again —
+        // proving the check keys on the marker's presence, not on some other
+        // state the fixture happened to change along the way.
+        std::fs::remove_file(nestweaver_store::index_publication::marker_path(&db_path)).unwrap();
+        assert!(
+            find_bridge_nodes_bounded(&store, 5).is_ok(),
+            "a cleared marker must let bridges answer again"
         );
     }
 }
