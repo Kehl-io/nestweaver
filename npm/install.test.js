@@ -229,16 +229,27 @@ check("a 404 is reported as a missing release, not a rate limit", () => {
 // `isMuslLinux` is what replaces it: a Linux-only check performed in code,
 // where that scoping is actually expressible.
 check("darwin is never musl, regardless of glibcVersionRuntime", () => {
-  assert.strictEqual(isMuslLinux("darwin", undefined), false);
-  assert.strictEqual(isMuslLinux("darwin", "2.31"), false);
+  assert.strictEqual(isMuslLinux("darwin", undefined, false), false);
+  assert.strictEqual(isMuslLinux("darwin", "2.31", true), false);
 });
 
 check("linux with a reported glibc version is not musl", () => {
-  assert.strictEqual(isMuslLinux("linux", "2.31"), false);
+  assert.strictEqual(isMuslLinux("linux", "2.31", true), false);
 });
 
-check("linux with no reported glibc version is treated as musl", () => {
-  assert.strictEqual(isMuslLinux("linux", undefined), true);
+check("linux with a report that reads no glibc version IS musl", () => {
+  assert.strictEqual(isMuslLinux("linux", undefined, true), true);
+});
+
+// Review finding: the first version of this check collapsed "the report
+// could not be produced" and "the report was produced and shows no glibc"
+// into the same `undefined`, so a working glibc-Linux box whose Node could
+// not generate a report (hardened/sandboxed container, unusual build, a
+// future Node where this API moves) was REFUSED as unsupported -- the exact
+// confidently-wrong-rejection class this whole sweep exists to fix. An
+// unavailable report must fail OPEN.
+check("linux with an UNAVAILABLE report is NOT treated as musl (fails open)", () => {
+  assert.strictEqual(isMuslLinux("linux", undefined, false), false);
 });
 
 check("an unclassified failure still reports its cause", () => {
