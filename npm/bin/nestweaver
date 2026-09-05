@@ -1,29 +1,172 @@
-#!/usr/bin/env bash
-set -e
+#!/usr/bin/env node
+"use strict";
 
-# Resolve to the REAL script location, following symlinks. npm always installs
-# bins as a symlink -- node_modules/.bin/nestweaver for a local install, and
-# the global bin dir for `npm install -g` -- and `$0`/`dirname "$0"` there
-# resolve relative to the SYMLINK's own location, not this script's. That
-# silently pointed BINARY at a directory that never existed for any
-# npm-managed invocation (`npx nestweaver`, a bare `nestweaver` on PATH after
-# a global install, or `node_modules/.bin/nestweaver` directly); only calling
-# this file by its real path -- which no real install path does -- worked.
-source="${BASH_SOURCE[0]}"
-while [ -h "$source" ]; do
-  dir="$(cd -P "$(dirname "$source")" && pwd)"
-  source="$(readlink "$source")"
-  case "$source" in
-    /*) ;;
-    *) source="$dir/$source" ;;
-  esac
-done
-DIR="$(cd -P "$(dirname "$source")/.." && pwd)"
-BINARY="$DIR/.nestweaver-bin/nestweaver"
+const path = require("path");
 
-if [ ! -x "$BINARY" ]; then
-  echo "NestWeaver binary not found. Install a verified GitHub Release archive, or from a source checkout run: cargo install --locked --path ." >&2
-  exit 1
-fi
+// ── Decision logic ──────────────────────────────────────────────────────
+// Pure, exported, and covered by nestweaver.test.js. Everything below the
+// `main()` boundary does I/O (module resolution, process spawn) and is not
+// directly testable; keeping the judgements out here is what makes the
+// launcher assertable at all.
+//
+// nw-425 / nw-433: this package used to have a `postinstall` that downloaded
+// the matching GitHub Release archive at install time. pnpm 10+ blocks
+// lifecycle scripts by default, so `pnpm add nestweaver` silently produced a
+// wrapper with no binary and no indication why -- the documented workaround
+// (`"pnpm": {"onlyBuiltDependencies": ["nestweaver"]}`) required knowing the
+// failure existed in the first place. There is now no lifecycle script at
+// all. Each supported platform ships as its own optionalDependency (the
+// esbuild/@rollup/swc pattern): npm/pnpm/yarn install ONLY the one whose
+// package.json `os`/`cpu` match the current machine, entirely through their
+// own normal dependency resolution -- nothing here runs at install time.
+// This file is what runs at INVOCATION time: it resolves which platform
+// package actually landed and execs its binary.
 
-exec "$BINARY" "$@"
+const PLATFORM_PACKAGES = {
+  "darwin-x64": "nestweaver-darwin-x64",
+  "darwin-arm64": "nestweaver-darwin-arm64",
+  "linux-x64": "nestweaver-linux-x64",
+  "linux-arm64": "nestweaver-linux-arm64",
+};
+
+function platformKey(platform, arch) {
+  return `${platform}-${arch}`;
+}
+
+/// Which optional platform package this machine should have installed, or
+/// `null` if none is published for it.
+function platformPackageName(platform, arch) {
+  return PLATFORM_PACKAGES[platformKey(platform, arch)] || null;
+}
+
+/// Whether the running system is musl (Alpine and similar), not glibc.
+///
+/// Ported from the retired install.js unchanged (nw-433): `glibcVersionRuntime`
+/// is populated by Node's own `process.report` only when Node itself is linked
+/// against glibc, so a musl-linked Node (Alpine's system Node, every
+/// `node:*-alpine`/`node:*-musl` image) never has it. THREE states, not two:
+/// `reportAvailable` is separate from `glibcVersionRuntime` so "the report
+/// could not be produced at all" (sandboxed container, unusual build) and
+/// "the report WAS produced and shows no glibc" (genuine musl) cannot
+/// collapse into the same `undefined` -- that collapse would refuse a working
+/// glibc-Linux box whenever the report merely couldn't be read. An
+/// unavailable report fails OPEN (false, i.e. "not musl, proceed"); only a
+/// report that was actually read and shows no glibc fails closed.
+function isMuslLinux(platform, glibcVersionRuntime, reportAvailable) {
+  if (platform !== "linux" || !reportAvailable) {
+    return false;
+  }
+  return !glibcVersionRuntime;
+}
+
+function unsupportedPlatformMessage(platform, arch) {
+  return [
+    `Unsupported platform: ${platform}-${arch}`,
+    "Supported: darwin-x64, darwin-arm64, linux-x64, linux-arm64",
+    "Install from a source checkout instead: cargo install --locked --path .",
+  ].join("\n");
+}
+
+function muslMessage(platform, arch) {
+  return [
+    `Unsupported platform: ${platform}-${arch} (musl libc)`,
+    "NestWeaver's published Linux packages are glibc-only (nestweaver-linux-x64, nestweaver-linux-arm64). musl/Alpine is not currently supported.",
+    "Build from a source checkout instead: cargo install --locked --path .",
+  ].join("\n");
+}
+
+/// Why `require.resolve` on the platform package's binary failed. This is
+/// reached only when `platformPackageName` already matched a real target --
+/// the package manager should have installed it -- so the likely causes are
+/// operator-controlled (optional dependencies were explicitly skipped) rather
+/// than "wrong platform", and the message says so instead of guessing.
+function missingPlatformPackageMessage(pkgName, version) {
+  return [
+    `NestWeaver binary not found: optional dependency "${pkgName}@${version}" is not installed.`,
+    "This usually means your package manager skipped optional dependencies",
+    "(npm/yarn --omit=optional or --no-optional, or a lockfile resolved without it).",
+    `Install it explicitly: npm install ${pkgName}@${version}`,
+    "Or install from a source checkout instead: cargo install --locked --path .",
+  ].join("\n");
+}
+
+/// Resolve the platform package's binary via Node's own module resolution
+/// (`resolveFn`, ordinarily `require.resolve`) rather than constructing a
+/// path by hand. Module resolution is what makes this correct under every
+/// package manager's node_modules layout -- including pnpm's strict,
+/// symlinked store, which is exactly the layout a hand-built relative path
+/// would get wrong and the reason nw-425 existed. Takes `resolveFn` as a
+/// parameter so this is testable without a real installed dependency tree.
+function resolveBinaryPath(pkgName, resolveFn) {
+  try {
+    return { binaryPath: resolveFn(`${pkgName}/bin/nestweaver`), error: null };
+  } catch (err) {
+    return { binaryPath: null, error: err };
+  }
+}
+
+module.exports = {
+  PLATFORM_PACKAGES,
+  platformKey,
+  platformPackageName,
+  isMuslLinux,
+  unsupportedPlatformMessage,
+  muslMessage,
+  missingPlatformPackageMessage,
+  resolveBinaryPath,
+};
+
+// ── Execution ────────────────────────────────────────────────────────────
+
+function main() {
+  const { spawnSync } = require("child_process");
+  const platform = process.platform;
+  const arch = process.arch;
+
+  if (platform === "linux") {
+    let glibcVersionRuntime;
+    let reportAvailable = false;
+    try {
+      if (process.report && typeof process.report.getReport === "function") {
+        glibcVersionRuntime = process.report.getReport().header.glibcVersionRuntime;
+        reportAvailable = true;
+      }
+    } catch {
+      reportAvailable = false;
+    }
+    if (isMuslLinux(platform, glibcVersionRuntime, reportAvailable)) {
+      console.error(muslMessage(platform, arch));
+      process.exit(1);
+    }
+  }
+
+  const pkgName = platformPackageName(platform, arch);
+  if (!pkgName) {
+    console.error(unsupportedPlatformMessage(platform, arch));
+    process.exit(1);
+  }
+
+  const version = require(path.join(__dirname, "..", "package.json")).version;
+  const { binaryPath, error } = resolveBinaryPath(pkgName, (specifier) =>
+    require.resolve(specifier),
+  );
+  if (error) {
+    console.error(missingPlatformPackageMessage(pkgName, version));
+    process.exit(1);
+  }
+
+  const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });
+  if (result.error) {
+    console.error(
+      `Failed to execute NestWeaver binary at ${binaryPath}: ${result.error.message}`,
+    );
+    process.exit(1);
+  }
+  process.exit(result.status === null ? 1 : result.status);
+}
+
+// Only run when executed as the npm bin entry point; `require` must be free
+// of side effects so the decision logic above can be tested at all.
+if (require.main === module) {
+  main();
+}

@@ -3,36 +3,43 @@
 Code knowledge graph for AI agents — 42 MCP tools, 32 languages, graph
 visualization.
 
-This package is a thin wrapper. Its `postinstall` downloads the NestWeaver
-binary matching this package's version from the project's GitHub Releases,
-verifies it against the SHA-256 published alongside the archive, and puts a
-`nestweaver` executable on your PATH.
+This package is a thin wrapper with **no install-time (`postinstall`) script**.
+It ships one prebuilt-binary package per platform —
+`nestweaver-darwin-arm64`, `nestweaver-darwin-x64`, `nestweaver-linux-arm64`,
+`nestweaver-linux-x64` — as an `optionalDependencies` entry, the same pattern
+esbuild, swc, and Rollup use. npm, pnpm, and Yarn each install only the one
+matching your machine's `os`/`cpu` through their own ordinary dependency
+resolution; the `nestweaver` executable on your PATH resolves and runs
+whichever one actually landed, at invocation time.
 
-**Lifecycle scripts must be enabled.** The binary is fetched in `postinstall`,
-so `npm install --ignore-scripts` — and **pnpm 10+, which blocks lifecycle
-scripts by default** — leave you with a wrapper and no binary. `nestweaver` then
-exits 1 saying the binary was not found. With pnpm, allow it explicitly:
+**No lifecycle scripts to allow.** There is nothing for
+`npm install --ignore-scripts` to skip, and pnpm 10+'s default block on
+lifecycle scripts (which used to leave a wrapper with no binary and no
+`pnpm.onlyBuiltDependencies` clue why) no longer applies — there is no script
+to block.
 
-```jsonc
-// package.json
-{ "pnpm": { "onlyBuiltDependencies": ["nestweaver"] } }
-```
-
-If your organisation disallows install scripts outright, install a release
-archive from GitHub or build from source (`cargo install --locked --path .`)
-instead.
+If your package manager skipped optional dependencies entirely
+(`--omit=optional`, `--no-optional`, or a lockfile resolved without one),
+`nestweaver` exits 1 and names the exact optional package to install instead
+of silently doing nothing. If your organisation disallows this platform
+package entirely, install a release archive from GitHub or build from source
+(`cargo install --locked --path .`) instead.
 
 ## Platforms
 
-macOS and Linux, on x86_64 and arm64. On any other platform the install step
-FAILS and prints the supported targets, rather than leaving you with a wrapper
-that cannot run; use a release archive or a source build instead.
+macOS and Linux, on x86_64 and arm64. Every other platform has no published
+optional package, so `nestweaver` FAILS with the supported-targets list at
+invocation time rather than leaving you with a wrapper that silently cannot
+run; use a release archive or a source build instead. The two Linux platform
+packages additionally declare `libc: ["glibc"]` (musl/Alpine is not
+currently supported) — this is safe to declare on a Linux-only package in a
+way it never was on the combined macOS+Linux wrapper (see nw-433 below).
 
 Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer and
-Debian 12. The archive includes the GCC 13 runtime LadybugDB needs and the npm
-installer preserves it beside the binary. Check your glibc with `ldd --version`;
-on anything older the binary will not start and the error names a missing
-`GLIBC_` symbol. macOS builds target **13.3**.
+Debian 12. The platform package includes the GCC 13 runtime LadybugDB needs
+beside the binary. Check your glibc with `ldd --version`; on anything older
+the binary will not start and the error names a missing `GLIBC_` symbol.
+macOS builds target **13.3**.
 
 ## Upgrading an existing graph
 

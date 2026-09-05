@@ -387,6 +387,86 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           skip-github-release: true
+      # nw-096: release-please's commit walk is NOT restricted to first-parent
+      # history (verified live against this repo's own GraphQL `history`
+      # response), so a real merge commit AND the branch commit(s) it brought
+      # in are both visible to it, and its `splitMessages()` extracts the
+      # merge commit's "Merge pull request #N from branch\n\n<title>" body as
+      # its own synthetic conventional commit. When that title matches or
+      # duplicates a commit already walked directly, the SAME deliverable
+      # renders twice. Confirmed recurring (2.6.3, 7.0.0, 8.0.0, 9.1.0);
+      # checked upstream (googleapis/release-please#2476) -- the maintainers'
+      # position is "we recommend squash-merge and do not have current plans
+      # to attempt to handle merge commits", and there is no
+      # release-please-config.json field that suppresses it. Squashing the
+      # merges that land PRs on this branch is not available either: staging
+      # -> main must land as a real merge commit or the conventional commits
+      # release-please reads are destroyed. So this runs release-please's own
+      # generated CHANGELOG.md back through a dedup pass instead of trying to
+      # stop it from double-counting upstream.
+      - name: Check out dedup script from the trusted policy commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            scripts/dedupe-changelog-entries.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Deduplicate CHANGELOG.md on the release PR branch (nw-096)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          BRANCH="release-please--branches--${DEFAULT_BRANCH}--components--nestweaver"
+
+          # The branch may not exist yet -- e.g. the very first push after a
+          # config change, before release-please has ever opened a release
+          # PR. Absence here is not an error.
+          set +e
+          current="$(gh api "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md?ref=$BRANCH" 2> contents-error.txt)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            if grep -q 'HTTP 404' contents-error.txt; then
+              echo "no release PR branch ($BRANCH) yet; nothing to deduplicate"
+              exit 0
+            fi
+            cat contents-error.txt >&2
+            exit 1
+          fi
+
+          # Same trust shape as "Locate the open release PR" below (open,
+          # based on the default branch, authored by github-actions[bot], not
+          # a fork) before mutating anything on that branch.
+          pr_json="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --head "$BRANCH" --json number,baseRefName,author,isCrossRepository)"
+          if ! jq -e --arg base "$DEFAULT_BRANCH" '
+            length == 1 and
+            .[0].baseRefName == $base and
+            .[0].author.login == "github-actions[bot]" and
+            .[0].isCrossRepository == false
+          ' <<< "$pr_json" >/dev/null; then
+            echo "no single trusted open release PR found for branch $BRANCH; skipping dedup" >&2
+            exit 0
+          fi
+
+          original_sha="$(jq -er '.sha' <<< "$current")"
+          jq -r '.content' <<< "$current" | base64 -d > CHANGELOG.md.orig
+          bash scripts/dedupe-changelog-entries.sh CHANGELOG.md.orig > CHANGELOG.md.deduped
+
+          if cmp -s CHANGELOG.md.orig CHANGELOG.md.deduped; then
+            echo "no duplicate changelog entries found"
+            exit 0
+          fi
+
+          echo "duplicate changelog entries found; rewriting CHANGELOG.md on $BRANCH"
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md" \
+            -f message='fix(release): deduplicate merge-commit changelog entries (nw-096)' \
+            -f content="$(base64 -w 0 CHANGELOG.md.deduped)" \
+            -f sha="$original_sha" \
+            -f branch="$BRANCH" >/dev/null
+          rm -f -- CHANGELOG.md.orig CHANGELOG.md.deduped contents-error.txt
       # Find the open release PR by LABEL, not by `prs_created`.
       #
       # `prs_created` is true only when release-please CREATES the PR. When it
@@ -1200,12 +1280,13 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      name: ${{ steps.package.outputs.name }}
-      version: ${{ steps.package.outputs.version }}
-      integrity: ${{ steps.package.outputs.integrity }}
-      filename: ${{ steps.package.outputs.filename }}
-      sha256: ${{ steps.package.outputs.sha256 }}
-      already_published: ${{ steps.registry.outputs.already_published }}
+      # A JSON array of {name, version, integrity, filename, sha256}, one
+      # entry per published package: the main "nestweaver" wrapper plus its
+      # four per-platform optionalDependencies (nw-425). Job outputs are
+      # string-only, and five packages x five fields does not fit the
+      # flat-named-output shape the single-package job used; downstream jobs
+      # `jq` this instead.
+      packages: ${{ steps.package.outputs.packages }}
     steps:
       - name: Check out exact release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1223,14 +1304,56 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - name: Recover exact package from the bound source run
+      - name: Recover exact packages from the bound source run
         if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: release-npm-package
+          name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
           run-id: ${{ needs.release-context.outputs.source_run_id }}
           github-token: ${{ github.token }}
+      - name: Download built release archives
+        if: ${{ needs.release-context.outputs.mode == 'publish' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-bundle-*
+          path: ${{ runner.temp }}/release-bundle
+          merge-multiple: true
+      - name: Stage each target's built binary into its npm platform package
+        # nw-425: each platform package ships the REAL compiled binary from
+        # the build matrix, mirroring the release archive's own layout
+        # (`nestweaver` plus, on Linux, the bundled `lib/` GCC runtime whose
+        # $ORIGIN/lib rpath the "Verify release binary" step in `build`
+        # already enforces) so nothing about how the binary resolves its
+        # runtime changes between the tar.gz and the npm package.
+        if: ${{ needs.release-context.outputs.mode == 'publish' }}
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          declare -A TARGET_TO_KEY=(
+            [x86_64-apple-darwin]=darwin-x64
+            [aarch64-apple-darwin]=darwin-arm64
+            [x86_64-unknown-linux-gnu]=linux-x64
+            [aarch64-unknown-linux-gnu]=linux-arm64
+          )
+          for target in "${!TARGET_TO_KEY[@]}"; do
+            key="${TARGET_TO_KEY[$target]}"
+            archive="$RUNNER_TEMP/release-bundle/nestweaver-${RELEASE_TAG}-${target}.tar.gz"
+            test -f "$archive"
+            extract_dir="$(mktemp -d)"
+            tar -xzf "$archive" -C "$extract_dir"
+            test -x "$extract_dir/nestweaver"
+            dest="npm/platforms/$key/bin"
+            rm -rf -- "$dest"
+            mkdir -p "$dest"
+            cp "$extract_dir/nestweaver" "$dest/nestweaver"
+            chmod 755 "$dest/nestweaver"
+            if [ -d "$extract_dir/lib" ]; then
+              cp -R "$extract_dir/lib" "$dest/lib"
+            fi
+            rm -rf -- "$extract_dir"
+          done
       - name: Verify Cargo, manifest, npm, tag, and package contents
         id: package
         env:
@@ -1242,85 +1365,76 @@ jobs:
           if [ "$RELEASE_MODE" = resume ] || [ "$RELEASE_MODE" = recover-npm ]; then
             policy_root="$GITHUB_WORKSPACE/.release-policy"
           fi
+          verify_script="$policy_root/scripts/verify-release-package.sh"
           package_dir="$RUNNER_TEMP/npm-package"
           mkdir -p "$package_dir"
+          packages_json="[]"
+
           if [ "$RELEASE_MODE" = publish ]; then
-            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
-              "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
-            printf '%s\n' "$package" > "$package_dir/release-package.json"
-            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
-              --verify-artifact "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
+            # Contract-checks all five package.json files AND packs the main
+            # "nestweaver" wrapper. verify-artifact needs its own directory
+            # per package (each holds exactly one .tgz), so the main
+            # package's tarball, checksum, and manifest move into their own
+            # subdirectory before being re-verified the identical way every
+            # platform package is below.
+            main_dir="$package_dir/nestweaver"
+            mkdir -p "$main_dir"
+            main_package="$(bash "$verify_script" "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$main_dir")"
+            printf '%s\n' "$main_package" > "$main_dir/release-package.json"
+            main_package="$(bash "$verify_script" --verify-artifact "$main_dir" "$RELEASE_TAG" nestweaver)"
+            packages_json="$(jq -c --argjson pkg "$main_package" '. + [$pkg]' <<< "$packages_json")"
+
+            for key in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+              plat_dir="$package_dir/nestweaver-$key"
+              mkdir -p "$plat_dir"
+              plat_package="$(bash "$verify_script" --pack \
+                "$GITHUB_WORKSPACE/npm/platforms/$key" "$RELEASE_TAG" "$plat_dir")"
+              printf '%s\n' "$plat_package" > "$plat_dir/release-package.json"
+              plat_package="$(bash "$verify_script" --verify-artifact \
+                "$plat_dir" "$RELEASE_TAG" "nestweaver-$key")"
+              packages_json="$(jq -c --argjson pkg "$plat_package" '. + [$pkg]' <<< "$packages_json")"
+            done
           else
-            package="$(bash "$policy_root/scripts/verify-release-package.sh" \
-              --verify-artifact "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$package_dir")"
+            for name in nestweaver nestweaver-darwin-arm64 nestweaver-darwin-x64 \
+              nestweaver-linux-arm64 nestweaver-linux-x64; do
+              pkg_dir="$RUNNER_TEMP/npm-package/$name"
+              test -d "$pkg_dir"
+              pkg="$(bash "$verify_script" --verify-artifact "$pkg_dir" "$RELEASE_TAG" "$name")"
+              packages_json="$(jq -c --argjson pkg "$pkg" '. + [$pkg]' <<< "$packages_json")"
+            done
           fi
-          for field in name version integrity filename sha256; do
-            echo "$field=$(jq -er --arg field "$field" '.[$field]' <<< "$package")" \
-              >> "$GITHUB_OUTPUT"
-          done
-      - name: Attest the exact npm tarball
+
+          {
+            echo "packages<<PACKAGES_EOF"
+            jq -c . <<< "$packages_json"
+            echo "PACKAGES_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest the exact npm tarballs
         if: ${{ needs.release-context.outputs.mode == 'publish' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: ${{ runner.temp }}/npm-package/${{ steps.package.outputs.filename }}
-      - name: Revalidate recovered package provenance
+          subject-path: ${{ runner.temp }}/npm-package/*/*.tgz
+      - name: Revalidate recovered packages' provenance
         if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_FILENAME: ${{ steps.package.outputs.filename }}
           RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
         run: |
           set -euo pipefail
-          gh attestation verify "$RUNNER_TEMP/npm-package/$PACKAGE_FILENAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
-            --source-digest "$RELEASE_SHA"
-      - name: Preserve the exact package for publication or recovery
+          for tgz in "$RUNNER_TEMP"/npm-package/*/*.tgz; do
+            gh attestation verify "$tgz" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+              --source-digest "$RELEASE_SHA"
+          done
+      - name: Preserve the exact packages for publication or recovery
         if: ${{ needs.release-context.outputs.mode == 'publish' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-npm-package
+          name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
           if-no-files-found: error
           retention-days: 7
-      - name: Prove npm authorization and exact-version visibility
-        id: registry
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PACKAGE_INTEGRITY: ${{ steps.package.outputs.integrity }}
-          PACKAGE_NAME: ${{ steps.package.outputs.name }}
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
-          RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN is unavailable in the protected release environment" >&2
-            exit 1
-          fi
-          npm whoami --registry=https://registry.npmjs.org >/dev/null
-
-          set +e
-          npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
-            name version gitHead dist.integrity --json \
-            > registry-version.json 2> registry-error.txt
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            jq -e \
-              --arg name "$PACKAGE_NAME" \
-              --arg version "$PACKAGE_VERSION" \
-              --arg sha "$RELEASE_SHA" \
-              --arg integrity "$PACKAGE_INTEGRITY" \
-              '.name == $name and .version == $version and .gitHead == $sha and
-               .["dist.integrity"] == $integrity' registry-version.json >/dev/null
-            echo "already_published=true" >> "$GITHUB_OUTPUT"
-          elif grep -Eq 'E404|404 Not Found' registry-error.txt; then
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
-          else
-            cat registry-error.txt >&2
-            echo "::error::could not establish npm version visibility" >&2
-            exit 1
-          fi
 
   publish-release:
     name: Publish complete release
@@ -1737,10 +1851,10 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - name: Download the exact attested npm package
+      - name: Download the exact attested npm packages
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: release-npm-package
+          name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
           run-id: ${{ needs.release-context.outputs.source_run_id }}
           github-token: ${{ github.token }}
@@ -1822,15 +1936,10 @@ jobs:
       # how the package reached 8.0.0 having never been published at all
       # (nw-115). A release job that cannot publish must say so.
       - name: Publish to npm
-        working-directory: npm
         env:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PACKAGE_INTEGRITY: ${{ needs.preflight-package.outputs.integrity }}
-          PACKAGE_FILENAME: ${{ needs.preflight-package.outputs.filename }}
-          PACKAGE_NAME: ${{ needs.preflight-package.outputs.name }}
-          PACKAGE_SHA256: ${{ needs.preflight-package.outputs.sha256 }}
-          PACKAGE_VERSION: ${{ needs.preflight-package.outputs.version }}
+          PACKAGES_JSON: ${{ needs.preflight-package.outputs.packages }}
           RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
           RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
           RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
@@ -1841,88 +1950,109 @@ jobs:
             '.draft == false and .immutable == true and .tag_name == $tag and .target_commitish == $sha' \
             <<< "$release" >/dev/null
 
-          [[ "$PACKAGE_FILENAME" =~ ^nestweaver-[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?\.tgz$ ]]
-          package_tarball="$RUNNER_TEMP/npm-package/$PACKAGE_FILENAME"
-          test -f "$package_tarball"
-          test -f "$package_tarball.sha256"
-          (cd "$RUNNER_TEMP/npm-package" && sha256sum -c "$PACKAGE_FILENAME.sha256")
-          actual_sha256="$(sha256sum "$package_tarball" | awk '{print $1}')"
-          [ "$actual_sha256" = "$PACKAGE_SHA256" ]
-          gh attestation verify "$package_tarball" \
-            --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
-            --source-digest "$RELEASE_SHA"
+          # nw-425: one package per platform triple (the esbuild/@rollup/swc
+          # pattern) instead of a single wrapper with a postinstall download,
+          # so this loop publishes the main "nestweaver" wrapper and its four
+          # optionalDependencies. Each iteration is independently idempotent
+          # -- a healthy rerun of an already-published package must report
+          # SUCCESS, not the raw `npm publish` conflict error, or a green
+          # release trains a maintainer to ignore the one signal that would
+          # have caught a REAL publish failure. Any package that never
+          # matches its intended content after retrying stays a hard failure;
+          # this does not swallow that case to make the run look green.
+          overall_status=0
+          while IFS= read -r pkg; do
+            PACKAGE_NAME="$(jq -er '.name' <<< "$pkg")"
+            PACKAGE_VERSION="$(jq -er '.version' <<< "$pkg")"
+            PACKAGE_INTEGRITY="$(jq -er '.integrity' <<< "$pkg")"
+            PACKAGE_FILENAME="$(jq -er '.filename' <<< "$pkg")"
+            PACKAGE_SHA256="$(jq -er '.sha256' <<< "$pkg")"
+            echo "::group::Publish $PACKAGE_NAME@$PACKAGE_VERSION"
 
-          verify_registry() {
-            local metadata
-            metadata="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
-              name version gitHead dist.integrity --json 2>/dev/null)" || return 1
-            jq -e \
-              --arg name "$PACKAGE_NAME" \
-              --arg version "$PACKAGE_VERSION" \
-              --arg sha "$RELEASE_SHA" \
-              --arg integrity "$PACKAGE_INTEGRITY" \
-              '.name == $name and .version == $version and .gitHead == $sha and
-               .["dist.integrity"] == $integrity' <<< "$metadata" >/dev/null
-          }
+            [[ "$PACKAGE_FILENAME" =~ ^nestweaver(-[a-z0-9]+-[a-z0-9]+)?-[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?\.tgz$ ]]
+            package_dir="$RUNNER_TEMP/npm-package/$PACKAGE_NAME"
+            package_tarball="$package_dir/$PACKAGE_FILENAME"
+            test -f "$package_tarball"
+            test -f "$package_tarball.sha256"
+            (cd "$package_dir" && sha256sum -c "$PACKAGE_FILENAME.sha256")
+            actual_sha256="$(sha256sum "$package_tarball" | awk '{print $1}')"
+            [ "$actual_sha256" = "$PACKAGE_SHA256" ]
+            gh attestation verify "$package_tarball" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
+              --source-digest "$RELEASE_SHA"
 
-          if verify_registry; then
-            echo "Verified existing immutable $PACKAGE_NAME@$PACKAGE_VERSION; nothing to republish."
-            exit 0
-          fi
+            verify_registry() {
+              local metadata
+              metadata="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
+                name version gitHead dist.integrity --json 2>/dev/null)" || return 1
+              jq -e \
+                --arg name "$PACKAGE_NAME" \
+                --arg version "$PACKAGE_VERSION" \
+                --arg sha "$RELEASE_SHA" \
+                --arg integrity "$PACKAGE_INTEGRITY" \
+                '.name == $name and .version == $version and .gitHead == $sha and
+                 .["dist.integrity"] == $integrity' <<< "$metadata" >/dev/null
+            }
 
-          # nw-423. npm provenance is the mechanism the hand-rolled
-          # immutable-release + sidecar-checksum check was approximating: a
-          # Sigstore-signed link between this package, the exact source commit,
-          # and the builder that produced it, verifiable by any consumer with
-          # `npm audit signatures`. The prerequisites are met -- cloud-hosted
-          # GitHub Actions runner, public repository, and a `repository` field
-          # in package.json matching this repo.
-          #
-          # ATTEMPTED, NOT ENFORCED, and the ordering is deliberate. npm's docs
-          # describe `--provenance` for publishing from a DIRECTORY and do not
-          # state whether it works for a pre-packed tarball, which is what this
-          # job publishes so the artifact is byte-identical to the attested one.
-          # Enforcing an unverified flag on the release path would risk a failed
-          # release to gain a property we have not yet observed. So: try it,
-          # fall back to today's behaviour if npm rejects it, and REPORT which
-          # happened. The first release after this lands is the measurement;
-          # make it mandatory once it is observed working.
-          set +e
-          npm publish "$package_tarball" --ignore-scripts --access public --provenance
-          publish_status=$?
-          provenance_attempted=1
-          if [ "$publish_status" -ne 0 ]; then
-            echo "::warning::npm publish --provenance exited $publish_status; retrying without provenance so the release still lands." >&2
-            npm publish "$package_tarball" --ignore-scripts --access public
-            publish_status=$?
-            provenance_attempted=0
-          fi
-          set -e
-          # Did an attestation actually land? Reported rather than asserted,
-          # because this is the first release that attempts it -- see above.
-          report_provenance() {
-            local attestations
-            attestations="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" dist.attestations --json 2>/dev/null || true)"
-            if [ -n "$attestations" ] && [ "$attestations" != "null" ]; then
-              echo "PROVENANCE: attestation published for $PACKAGE_NAME@$PACKAGE_VERSION."
-              echo "PROVENANCE: attestation published (nw-423 can close on this)." >> "$GITHUB_STEP_SUMMARY"
-            elif [ "$provenance_attempted" = "1" ]; then
-              echo "::warning::npm publish --provenance SUCCEEDED but no attestation is visible; provenance is silently not applying to pre-packed tarballs." >&2
-              echo "PROVENANCE: requested, publish succeeded, NO attestation visible (nw-423 stays open)." >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "PROVENANCE: not published; npm rejected --provenance for this publish shape." >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
-
-          for attempt in 1 2 3 4 5 6; do
             if verify_registry; then
-              echo "Verified exact $PACKAGE_NAME@$PACKAGE_VERSION from $RELEASE_SHA."
-              report_provenance
-              exit 0
+              echo "Verified existing immutable $PACKAGE_NAME@$PACKAGE_VERSION; nothing to republish."
+              echo "::endgroup::"
+              continue
             fi
-            echo "Registry has not caught up (attempt $attempt/6); retrying in 10s."
-            sleep 10
-          done
-          echo "::error::npm publish status $publish_status did not produce the exact expected immutable package." >&2
-          exit 1
+
+            # nw-423. npm provenance is the mechanism the hand-rolled
+            # immutable-release + sidecar-checksum check was approximating: a
+            # Sigstore-signed link between this package, the exact source
+            # commit, and the builder that produced it, verifiable by any
+            # consumer with `npm audit signatures`. ATTEMPTED, NOT ENFORCED:
+            # npm's docs describe `--provenance` for publishing from a
+            # DIRECTORY and do not state whether it works for a pre-packed
+            # tarball, which is what this job publishes so the artifact is
+            # byte-identical to the attested one. Try it, fall back to
+            # unsigned if npm rejects it, and REPORT which happened.
+            set +e
+            npm publish "$package_tarball" --ignore-scripts --access public --provenance
+            publish_status=$?
+            provenance_attempted=1
+            if [ "$publish_status" -ne 0 ]; then
+              echo "::warning::npm publish --provenance exited $publish_status for $PACKAGE_NAME; retrying without provenance so the release still lands." >&2
+              npm publish "$package_tarball" --ignore-scripts --access public
+              publish_status=$?
+              provenance_attempted=0
+            fi
+            set -e
+
+            report_provenance() {
+              local attestations
+              attestations="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" dist.attestations --json 2>/dev/null || true)"
+              if [ -n "$attestations" ] && [ "$attestations" != "null" ]; then
+                echo "PROVENANCE: attestation published for $PACKAGE_NAME@$PACKAGE_VERSION."
+                echo "PROVENANCE: attestation published for $PACKAGE_NAME (nw-423 can close on this)." >> "$GITHUB_STEP_SUMMARY"
+              elif [ "$provenance_attempted" = "1" ]; then
+                echo "::warning::npm publish --provenance SUCCEEDED for $PACKAGE_NAME but no attestation is visible; provenance is silently not applying to pre-packed tarballs." >&2
+                echo "PROVENANCE: requested for $PACKAGE_NAME, publish succeeded, NO attestation visible (nw-423 stays open)." >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "PROVENANCE: not published for $PACKAGE_NAME; npm rejected --provenance for this publish shape." >> "$GITHUB_STEP_SUMMARY"
+              fi
+            }
+
+            published=0
+            for attempt in 1 2 3 4 5 6; do
+              if verify_registry; then
+                echo "Verified exact $PACKAGE_NAME@$PACKAGE_VERSION from $RELEASE_SHA."
+                report_provenance
+                published=1
+                break
+              fi
+              echo "Registry has not caught up for $PACKAGE_NAME (attempt $attempt/6); retrying in 10s."
+              sleep 10
+            done
+            if [ "$published" -ne 1 ]; then
+              echo "::error::npm publish status $publish_status for $PACKAGE_NAME did not produce the exact expected immutable package." >&2
+              overall_status=1
+            fi
+            echo "::endgroup::"
+          done < <(jq -c '.[]' <<< "$PACKAGES_JSON")
+
+          exit "$overall_status"
