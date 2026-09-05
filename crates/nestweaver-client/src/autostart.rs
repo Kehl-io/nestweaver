@@ -593,6 +593,20 @@ pub fn is_process_alive(pid: i32) -> bool {
 /// 3600s default.
 pub const EPHEMERAL_IDLE_TIMEOUT_ENV: &str = "NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS";
 
+/// Review follow-up on nw-088 leg (2) (FIX 4). `is_temp_db_path` is a path
+/// HEURISTIC — it was already trusted for macOS launchd-vs-foreground
+/// routing and gc reclaimability, where a wrong answer costs nothing worse
+/// than cosmetics. Reusing it here changes what a false positive COSTS: a
+/// real, long-lived database that happens to live under `$TMPDIR`,
+/// `/var/folders`, or a container whose working root IS `/tmp` now gets its
+/// daemon's idle budget silently cut to ~60s, with no way for the operator
+/// to say "this one is real" — the false-positive case is worse than the bug
+/// leg (2) exists to fix. Setting this to any non-empty value makes
+/// `daemon_start_command` treat `db_path` as real regardless of what
+/// `is_temp_db_path` would answer, so the explicit signal always wins over
+/// the heuristic.
+pub const REAL_DB_UNDER_TEMP_ROOT_ENV: &str = "NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT";
+
 /// nw-088 leg (2). `daemon start`'s `--idle-timeout` default (3600s) is sized
 /// for an interactive session against a REAL database. Autostart never
 /// overrode it, so a one-shot command against a scratch `--db` under `/tmp` —
@@ -613,6 +627,14 @@ fn ephemeral_idle_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS)
 }
 
+/// Is the caller EXPLICITLY telling us `db_path`, however it is classified by
+/// [`nestweaver_daemon::lifecycle::is_temp_db_path`], is a real database that
+/// must keep the normal idle-timeout budget? See
+/// [`REAL_DB_UNDER_TEMP_ROOT_ENV`] for why this override must exist at all.
+fn caller_asserts_real_db_under_temp_root() -> bool {
+    std::env::var_os(REAL_DB_UNDER_TEMP_ROOT_ENV).is_some_and(|value| !value.is_empty())
+}
+
 fn daemon_start_command(
     exe: &Path,
     db_path: &Path,
@@ -625,7 +647,13 @@ fn daemon_start_command(
     // and the gc sweep's reclaimability already use
     // `nestweaver_daemon::lifecycle::is_temp_db_path`; using it here too is
     // the same guard, not a second guess that can drift from the other two.
-    if nestweaver_daemon::lifecycle::is_temp_db_path(db_path) {
+    //
+    // The explicit escape (FIX 4) is checked FIRST and short-circuits the
+    // heuristic entirely — an operator's assertion about their own database
+    // always outranks a path-shape guess.
+    if !caller_asserts_real_db_under_temp_root()
+        && nestweaver_daemon::lifecycle::is_temp_db_path(db_path)
+    {
         cmd.arg("--idle-timeout")
             .arg(ephemeral_idle_timeout_secs().to_string());
     }
@@ -1344,6 +1372,68 @@ credential_method = "gh"
         assert_eq!(
             args,
             ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from)
+        );
+    }
+
+    /// Review follow-up on nw-088 leg (2) (FIX 4). The path heuristic alone
+    /// cannot tell a real database that happens to live under a temp root
+    /// from a genuinely throwaway one — `NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT`
+    /// is the operator's explicit override, and it must win even though the
+    /// path itself is unambiguously temp-shaped.
+    #[test]
+    fn daemon_start_command_honours_the_real_db_under_temp_root_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert!(
+            nestweaver_daemon::lifecycle::is_temp_db_path(&db),
+            "precondition: this path must be classified as ephemeral"
+        );
+
+        // SAFETY: single-threaded test; the override is read only here.
+        unsafe { std::env::set_var(REAL_DB_UNDER_TEMP_ROOT_ENV, "1") };
+        let command = daemon_start_command(Path::new("/opt/nestweaver"), &db, None);
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from),
+            "an explicit override must suppress --idle-timeout even for a \
+             path the heuristic alone would call ephemeral"
+        );
+    }
+
+    /// The counterweight: with the override ABSENT, the same temp-shaped
+    /// path must still get the shortened timeout — otherwise the escape-hatch
+    /// test above could pass because `daemon_start_command` stopped adding
+    /// `--idle-timeout` for temp paths altogether, override or not.
+    #[test]
+    fn daemon_start_command_still_shortens_the_timeout_without_the_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+        let command = daemon_start_command(Path::new("/opt/nestweaver"), &db, None);
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--idle-timeout",
+                &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 
