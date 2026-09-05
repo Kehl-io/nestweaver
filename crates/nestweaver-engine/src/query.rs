@@ -2867,49 +2867,109 @@ fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
-/// Generate a structural repo-map skeleton, ordered by PageRank (highest first).
+/// [`generate_repo_map`]'s text, plus enough to tell a COMPLETE map from a
+/// CUT one and to attribute each file to the repo it came from.
 ///
-/// The output groups symbols by file path:
-/// ```text
-/// src/main.js
-///   function greet(name)
-///   function hello(name)
-/// src/utils.js
-///   function formatDate(date)
-/// ```
-///
-/// Generation stops when the estimated token count of the accumulated output
-/// would exceed `token_budget`.
-pub fn generate_repo_map(store: &GraphStore, token_budget: usize) -> Result<String, anyhow::Error> {
+/// nw-397. `--token-budget 3000/20000/999999999` all returned only
+/// `token_count`: no `truncated`, `files_returned` or `files_total`, so a
+/// caller could not distinguish a map that fit from one that stopped
+/// mid-listing — the same shape as nw-357/nw-362, both already fixed on
+/// other surfaces by adding exactly these fields. `truncated()` mirrors
+/// [`crate::hubs::HubNodes::truncated`]/[`crate::bridges::BridgeNodes::truncated`]'s
+/// `>` (not `!=`) definition for the same reason: a caller who asked for more
+/// than exists was given everything, which is not a cut.
+pub struct RepoMap {
+    pub map: String,
+    /// Files whose full symbol listing made it into `map` before the budget
+    /// was exhausted. A file whose HEADER was written but whose symbol list
+    /// was cut mid-way does not count — this is "how many files you can
+    /// trust are complete", not "how many headers appear".
+    pub files_returned: usize,
+    /// Files that had at least one symbol and were therefore candidates for
+    /// inclusion — the population `files_returned` was cut from.
+    pub files_total: usize,
+}
+
+impl RepoMap {
+    pub fn truncated(&self) -> bool {
+        self.files_total > self.files_returned
+    }
+}
+
+/// [`generate_repo_map`], with truncation counts and repo attribution
+/// retained. Prefer this on any surface that publishes a `truncated`, a
+/// `files_returned`/`files_total`, or attributes a file to a repo.
+pub fn generate_repo_map_bounded(
+    store: &GraphStore,
+    token_budget: usize,
+) -> Result<RepoMap, anyhow::Error> {
     let symbols = store
         .symbols_by_pagerank(None)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Group symbols by file path while preserving the PageRank order of files.
-    // The first occurrence of a file path determines the file's position.
-    let mut file_order: Vec<String> = Vec::new();
-    let mut file_symbols: std::collections::HashMap<String, Vec<&Symbol>> =
+    // Group symbols by (repo_uid, file_path) — NOT file_path alone — while
+    // preserving the PageRank order of files. The first occurrence of a key
+    // determines its position.
+    //
+    // nw-369(b). A file_path-only key silently MERGED two repos' symbols
+    // under one header whenever they shared a bare path: `src/server.ts`
+    // exists in both `coyote-server` and `shot-insights-service` on the live
+    // 44-repo graph, so this was not a hypothetical — it was ALSO a
+    // correctness bug (one file's contents shown as the union of two
+    // unrelated files), not just an attribution gap.
+    let mut file_order: Vec<(String, String)> = Vec::new();
+    let mut file_symbols: std::collections::HashMap<(String, String), Vec<&Symbol>> =
         std::collections::HashMap::new();
 
     for sym in &symbols {
-        let file = &sym.file_path;
-        if !file_symbols.contains_key(file) {
-            file_order.push(file.clone());
+        let key = (sym.repo_uid.clone(), sym.file_path.clone());
+        if !file_symbols.contains_key(&key) {
+            file_order.push(key.clone());
         }
-        file_symbols.entry(file.clone()).or_default().push(sym);
+        file_symbols.entry(key).or_default().push(sym);
     }
+    let files_total = file_order.len();
+
+    // Resolve repo_uid -> display name ONCE, using the same convention
+    // `repo_display_name` applies everywhere else in this binary, rather than
+    // re-deriving a second naming rule here. Only consulted when the map
+    // actually spans more than one repo: a single-repo map's file paths are
+    // already unambiguous, so prefixing them would add noise with no
+    // disambiguating value.
+    let repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
+    let repo_names: std::collections::HashMap<&str, String> = repos
+        .iter()
+        .map(|r| (r.uid.as_str(), repo_display_name(r)))
+        .collect();
+    let multi_repo = file_order
+        .iter()
+        .map(|(repo_uid, _)| repo_uid.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1;
 
     let mut output = String::new();
     let mut tokens_used = 0usize;
+    let mut files_returned = 0usize;
 
-    'outer: for file_path in &file_order {
-        let syms = match file_symbols.get(file_path) {
+    'outer: for key @ (repo_uid, file_path) in &file_order {
+        let syms = match file_symbols.get(key) {
             Some(s) => s,
             None => continue,
         };
 
-        // Build the file header line.
-        let header = format!("{file_path}\n");
+        // Build the file header line, attributed to its repo on a multi-repo
+        // map so `src/server.ts` in two different repos cannot be confused
+        // for the same file.
+        let header = if multi_repo {
+            let repo_name = repo_names
+                .get(repo_uid.as_str())
+                .map(String::as_str)
+                .unwrap_or("unknown-repo");
+            format!("[{repo_name}] {file_path}\n")
+        } else {
+            format!("{file_path}\n")
+        };
         let header_tokens = estimate_tokens(&header);
         if tokens_used + header_tokens > token_budget {
             break;
@@ -2926,9 +2986,40 @@ pub fn generate_repo_map(store: &GraphStore, token_budget: usize) -> Result<Stri
             output.push_str(&line);
             tokens_used += line_tokens;
         }
+        // Only reached when every symbol of this file was written — a file
+        // cut mid-listing (the `break 'outer` above) never increments this,
+        // so `files_returned` counts complete files, not headers printed.
+        files_returned += 1;
     }
 
-    Ok(output)
+    Ok(RepoMap {
+        map: output,
+        files_returned,
+        files_total,
+    })
+}
+
+/// Generate a structural repo-map skeleton, ordered by PageRank (highest first).
+///
+/// The output groups symbols by file path:
+/// ```text
+/// src/main.js
+///   function greet(name)
+///   function hello(name)
+/// src/utils.js
+///   function formatDate(date)
+/// ```
+/// On a map spanning more than one repo, each header is attributed:
+/// `[repo-name] src/main.js` (nw-369(b)) — see [`generate_repo_map_bounded`]
+/// for the reason a single-repo map is left unprefixed.
+///
+/// Generation stops when the estimated token count of the accumulated output
+/// would exceed `token_budget`. This wrapper DISCARDS the truncation counts
+/// and repo attribution now tracked internally — use
+/// [`generate_repo_map_bounded`] on any surface that needs to say whether the
+/// map it returned was complete, or which repo a file came from.
+pub fn generate_repo_map(store: &GraphStore, token_budget: usize) -> Result<String, anyhow::Error> {
+    generate_repo_map_bounded(store, token_budget).map(|result| result.map)
 }
 
 /// Expand a search query by appending canonical names for any taxonomy alias
@@ -3653,10 +3744,46 @@ mod inline_body_tests {
 mod repo_map_tests {
     use std::fs;
 
-    use nestweaver_store::GraphScope;
+    use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphScope, GraphStore};
 
-    use super::generate_repo_map;
+    use super::{generate_repo_map, generate_repo_map_bounded};
     use crate::index::index_directory_in_memory;
+
+    fn make_repo(uid: &str, name: &str) -> Repo {
+        Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.com/{name}"),
+            indexed_sha: "abc123".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: Some(name.to_string()),
+            root_path: None,
+        }
+    }
+
+    fn make_symbol(uid: &str, name: &str, repo_uid: &str, file_path: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
 
     fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -3709,6 +3836,138 @@ mod repo_map_tests {
         assert!(
             map.contains("greet") || map.contains("hello") || map.contains("formatDate"),
             "repo map should contain a function name; got:\n{map}"
+        );
+    }
+
+    /// nw-397 LEG 2. A budget too small for the whole map must say so:
+    /// `truncated`, and `files_returned < files_total`. The prior shape
+    /// (`generate_repo_map`, a bare `String`) made a cut map byte-identical
+    /// on its face to a complete one — `token_count` was the only signal.
+    #[test]
+    fn a_budget_cut_repo_map_discloses_truncation() {
+        let (_dir, src) = make_test_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        // Two files exist (main.js, utils.js). A budget that fits only the
+        // first file's header must cut the second.
+        let cut = generate_repo_map_bounded(&store, 20).unwrap();
+        assert!(
+            cut.truncated(),
+            "a 20-token budget over two files' worth of symbols must be cut: \
+             files_returned={} files_total={}",
+            cut.files_returned,
+            cut.files_total
+        );
+        assert!(
+            cut.files_returned < cut.files_total,
+            "files_returned ({}) must be less than files_total ({}) when truncated",
+            cut.files_returned,
+            cut.files_total
+        );
+
+        // COUNTERWEIGHT: a generous budget over the SAME graph is NOT
+        // truncated, and returns every file — proving the assertion above
+        // depends on the budget, not on some property of the fixture that is
+        // always true.
+        let whole = generate_repo_map_bounded(&store, 16_000).unwrap();
+        assert!(
+            !whole.truncated(),
+            "a 16000-token budget must fit this two-file fixture whole"
+        );
+        assert_eq!(whole.files_returned, whole.files_total);
+        assert_eq!(whole.files_total, 2, "the fixture has exactly two files");
+    }
+
+    /// nw-369(b). Two DIFFERENT repos that happen to share a bare file path
+    /// must not be merged under one header — that is a correctness bug, not
+    /// just an attribution gap, since it would present the union of two
+    /// unrelated files' symbols as though they were one file's contents. On a
+    /// multi-repo map each header must additionally be attributed to its
+    /// repo, so a reader can tell them apart.
+    #[test]
+    fn distinct_repos_sharing_a_bare_path_are_not_merged_and_are_attributed() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&make_repo("repo:a", "coyote-server"))
+            .unwrap();
+        store
+            .insert_repo(&make_repo("repo:b", "shot-insights-service"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:a:1",
+                "handleA",
+                "repo:a",
+                "src/server.ts",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:b:1",
+                "handleB",
+                "repo:b",
+                "src/server.ts",
+            ))
+            .unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        let result = generate_repo_map_bounded(&store, 16_000).unwrap();
+        assert_eq!(
+            result.files_total, 2,
+            "two repos' src/server.ts are two DIFFERENT files, not one: {}",
+            result.map
+        );
+        assert!(
+            result.map.contains("handleA"),
+            "repo A's symbol must be present: {}",
+            result.map
+        );
+        assert!(
+            result.map.contains("handleB"),
+            "repo B's symbol must be present: {}",
+            result.map
+        );
+        assert!(
+            result.map.contains("[coyote-server] src/server.ts"),
+            "repo A's header must be attributed by name: {}",
+            result.map
+        );
+        assert!(
+            result.map.contains("[shot-insights-service] src/server.ts"),
+            "repo B's header must be attributed by name: {}",
+            result.map
+        );
+
+        // COUNTERWEIGHT: a SINGLE-repo map over the same file path is left
+        // unprefixed — the attribution prefix is a multi-repo disambiguation,
+        // not decoration added unconditionally.
+        let single = GraphStore::in_memory().unwrap();
+        single
+            .insert_repo(&make_repo("repo:a", "coyote-server"))
+            .unwrap();
+        single
+            .insert_symbol(&make_symbol(
+                "sym:a:1",
+                "handleA",
+                "repo:a",
+                "src/server.ts",
+            ))
+            .unwrap();
+        single
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let single_result = generate_repo_map_bounded(&single, 16_000).unwrap();
+        assert!(
+            single_result.map.contains("src/server.ts")
+                && !single_result.map.contains("[coyote-server]"),
+            "a single-repo map must not carry an attribution prefix: {}",
+            single_result.map
         );
     }
 }
