@@ -2934,7 +2934,12 @@ fn index_publication_wait() -> std::time::Duration {
 /// * It does NOT acquire the publication lease. Acquisition is exclusive and
 ///   blocking, so a waiting reader would serialize every other reader behind
 ///   the writer, turning a latency blip into a real outage.
-fn wait_out_index_publication(
+///
+/// nw-439: `pub` so a command with no MCP/daemon twin at all (`repo-map`) can
+/// call the SAME wait every tool routed through [`dispatch_cancellable`]
+/// already gets, rather than the CLI growing a second, drifting copy of this
+/// polling loop.
+pub fn wait_out_index_publication(
     store: &GraphStore,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -2971,7 +2976,13 @@ fn wait_out_index_publication(
 /// — crucially — that "dirty" here means an index PUBLICATION, not a dirty git
 /// working tree. A user who hit this concluded that NestWeaver is useless while
 /// you work in a repo; that wrong conclusion is itself part of the bug.
-fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) -> anyhow::Error {
+///
+/// nw-439: `pub` for the same reason as [`wait_out_index_publication`] —
+/// `repo-map` has no MCP/daemon twin, so it never passes through
+/// [`dispatch_cancellable`]'s generic classification. Calling this directly
+/// gives it the identical marker-pid/age/remedy disclosure `hubs`/`bridges`
+/// get, rather than leaving it with the bare, un-actionable `StoreError` text.
+pub fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) -> anyhow::Error {
     // Covers both fail-closed strings: "PageRank unavailable during dirty
     // index publication" and "graph generation exhausted during index
     // publication".
@@ -3028,12 +3039,39 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
             }
         )
     } else {
-        anyhow!(
-            "index publication TRANSIENT: an index publication is in flight ({writer}, marker \
-             age {age}) and did not finish within the {waited_ms}ms wait, so ranked queries are \
-             failing closed. {preamble} Retry shortly; raise \
-             NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to wait longer."
-        )
+        // nw-439 (second leg). `is_wedged()` never escalates on age alone — a
+        // canonical writer lease genuinely held for a large re-index (7+
+        // minutes, observed on the live 44-repo graph) is NOT stuck, so
+        // relabeling it WEDGED would be its own false claim. But calling
+        // EVERY not-yet-wedged window "TRANSIENT" and telling the reader to
+        // "retry shortly" is also a claim, and it stops being true long
+        // before the marker clears: the same window was observed at 66s,
+        // then 550s, still climbing. Past the point this codebase already
+        // treats as the nominal wedge-consideration age
+        // ([`nestweaver_engine::index_publication::WEDGED_MARKER_AGE`]), name
+        // the elapsed time against that expectation instead of asserting a
+        // fixed adjective the reader cannot verify.
+        let expected_s = nestweaver_engine::index_publication::WEDGED_MARKER_AGE.as_secs();
+        let longer_than_expected = status.marker_age_s.is_some_and(|age| age > expected_s);
+        if longer_than_expected {
+            anyhow!(
+                "index publication IN PROGRESS (longer than expected): an index publication has \
+                 been in flight for {age}, which is past the {expected_s}s window most \
+                 publications finish within, and did not finish within the {waited_ms}ms wait, so \
+                 ranked queries are failing closed. {writer}; {ownership}. {preamble} A live \
+                 writer can legitimately hold the lease this long for a large re-index — this is \
+                 NOT necessarily stuck — but do not assume it clears immediately: check \
+                 `brain status` for progress, or raise NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to \
+                 wait longer."
+            )
+        } else {
+            anyhow!(
+                "index publication TRANSIENT: an index publication is in flight ({writer}, marker \
+                 age {age}) and did not finish within the {waited_ms}ms wait, so ranked queries are \
+                 failing closed. {preamble} Retry shortly; raise \
+                 NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to wait longer."
+            )
+        }
     }
 }
 
@@ -9165,13 +9203,14 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n- Each row carries `repo` (the OTHER symbol's repo UID); optionally pass `repo` (a UID or display name) to scope rows to one repo\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n- `link_type: \"contract\"` rows always carry `repo: null` — contract UIDs carry no repo component, so they cannot be attributed and are EXCLUDED (not guessed) whenever a `repo` filter is set\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
+                "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
                     "Max contract links to return (1-1000, default 50). The total count is always reported.",
                     DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
@@ -9231,6 +9270,28 @@ fn tool_cross_repo_contracts(
         .cross_repo_links(&uid)
         .map_err(|e| anyhow!("cross_repo_links: {e}"))?;
 
+    // nw-369(a). `--repo` here is a SELECTOR for the row filter below —
+    // distinct from `cross-repo-refs --repo`, which disambiguates an
+    // ambiguous SYMBOL NAME before this tool is ever reached (that command
+    // bypasses this tool's RPC entirely once its own `--repo` is set, so
+    // there is no argument collision). Resolved with the same
+    // `resolve_repo_selector` every other `--repo` flag in this binary uses,
+    // rather than a bespoke string-equality check that would drift from it.
+    let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
+        Some(selector) => {
+            let repos = store
+                .list_repos(None)
+                .map_err(|e| anyhow!("list_repos: {e}"))?;
+            Some(
+                nestweaver_engine::resolve_repo_selector(&repos, selector)
+                    .map_err(|e| anyhow!("{e}"))?
+                    .uid
+                    .clone(),
+            )
+        }
+        None => None,
+    };
+
     let owners = restricted_symbol_owners(store, visible)?;
     let uid_is_visible = |candidate: &str| {
         owners.as_ref().is_none_or(|owners| {
@@ -9239,20 +9300,40 @@ fn tool_cross_repo_contracts(
                 .is_some_and(|repo_uid| repo_is_visible(repo_uid, visible))
         })
     };
+    // nw-369(a). `cross_repo_links(uid)` queries `(s:Symbol {uid})-[...]->
+    // (t:Symbol)`, so `uid` is ALWAYS the source and `target_uid` is always
+    // the OTHER symbol — the one whose repo a caller actually wants
+    // attributed (their own symbol's repo is what they passed in). Symbol
+    // UIDs carry a repo component (`sym:{repo_uid}:...`), so this is
+    // derivable from data already on the row without touching the store: no
+    // edge-construction or schema change needed, only reading what the UID
+    // already names.
+    let target_repo = |target_uid: &str| match nestweaver_engine::node_scope::node_owner(target_uid)
+    {
+        nestweaver_engine::node_scope::NodeOwner::Repo(repo_uid) => Some(repo_uid),
+        _ => None,
+    };
     let mut rows: Vec<Value> = refs
         .iter()
         // Scope both endpoints before totals/truncation. Unknown ownership is
         // dropped under restriction rather than treated as globally visible.
         .filter(|r| uid_is_visible(&r.source_uid) && uid_is_visible(&r.target_uid))
-        .map(|r| {
-            json!({
+        .filter_map(|r| {
+            let repo = target_repo(&r.target_uid);
+            if let Some(wanted) = &repo_filter
+                && repo.as_deref() != Some(wanted.as_str())
+            {
+                return None;
+            }
+            Some(json!({
                 "source_uid": r.source_uid,
                 "source_name": r.source_name,
                 "target_uid": r.target_uid,
                 "target_name": r.target_name,
                 "link_type": r.link_type,
                 "confidence": r.confidence,
-            })
+                "repo": repo,
+            }))
         })
         .collect();
 
@@ -9263,14 +9344,27 @@ fn tool_cross_repo_contracts(
     let contract_links = store
         .contracts_implemented_by(&uid)
         .map_err(|e| anyhow!("contracts_implemented_by: {e}"))?;
-    for (contract_uid, confidence) in &contract_links {
-        rows.push(json!({
-            "source_uid": uid,
-            "target_uid": contract_uid,
-            "link_type": "contract",
-            "confidence": confidence,
-        }));
-    }
+    // nw-369(a). Contract UIDs carry NO repo component at all (confirmed in
+    // `node_owner`'s own match: `UidKind::Contract => NodeOwner::
+    // Unattributable`) — this is a genuine data-model limit, not a missing
+    // lookup. `repo: null` says so explicitly rather than omitting the field,
+    // and `--repo` cannot keep a row it cannot prove matches: these are
+    // excluded (never silently mis-included) whenever a filter is active,
+    // with the count disclosed rather than the exclusion happening quietly.
+    let contract_rows_excluded_by_filter = if repo_filter.is_some() {
+        contract_links.len()
+    } else {
+        for (contract_uid, confidence) in &contract_links {
+            rows.push(json!({
+                "source_uid": uid,
+                "target_uid": contract_uid,
+                "link_type": "contract",
+                "confidence": confidence,
+                "repo": Value::Null,
+            }));
+        }
+        0
+    };
 
     let total = rows.len();
     rows.truncate(limit);
@@ -9292,12 +9386,28 @@ fn tool_cross_repo_contracts(
         "degraded"
     };
 
+    let note = if contract_rows_excluded_by_filter > 0 {
+        format!(
+            "Links are hypotheses, not ground truth — check confidence. \
+             link_type \"contract\" denotes an implemented API contract. \
+             {contract_rows_excluded_by_filter} contract-implementation row(s) omitted under \
+             --repo: contract UIDs carry no repo component, so they cannot be proven to match \
+             the filter and are excluded rather than guessed into or out of scope."
+        )
+    } else {
+        "Links are hypotheses, not ground truth — check confidence. \
+         link_type \"contract\" denotes an implemented API contract. Rows carry a `repo` field \
+         attributing the OTHER symbol's repo; contract-implementation rows always carry \
+         `repo: null` because contract UIDs carry no repo component."
+            .to_string()
+    };
+
     Ok(json!({
         "uid": uid,
+        "repo_filter": repo_filter,
         "total": total,
         "returned": rows.len(),
-        "note": "Links are hypotheses, not ground truth — check confidence. \
-                 link_type \"contract\" denotes an implemented API contract.",
+        "note": note,
         "contracts_status": contracts_status,
         "degraded_repos": degraded_repos,
         "contracts": rows,
@@ -16874,9 +16984,23 @@ mod cache_dispatch_tests {
     }
 
     fn write_marker(db_path: &std::path::Path, pid: u32, reason: Option<&str>) {
+        write_marker_aged(db_path, pid, reason, std::time::Duration::ZERO);
+    }
+
+    /// Like [`write_marker`], but backdates the marker's own timestamp by
+    /// `age` so `marker_age_s` reads as (approximately) `age` rather than
+    /// ~0 — needed to exercise the nw-439 "longer than expected" branch,
+    /// which only fires once the marker is genuinely old.
+    fn write_marker_aged(
+        db_path: &std::path::Path,
+        pid: u32,
+        reason: Option<&str>,
+        age: std::time::Duration,
+    ) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
+            .saturating_sub(age)
             .as_nanos();
         fs::write(
             nestweaver_engine::sidecar_path(db_path, ".index-dirty"),
@@ -16931,6 +17055,63 @@ mod cache_dispatch_tests {
             message.contains("not a dirty git working tree"),
             "{message}"
         );
+    }
+
+    /// nw-439 (second leg). A canonical writer lease genuinely held for
+    /// longer than [`nestweaver_engine::index_publication::WEDGED_MARKER_AGE`]
+    /// is not wedged — `is_wedged()` correctly says so, because ownership is
+    /// proven — but it is also not "transient" in the sense the old fixed
+    /// message asserted: on the live graph this was observed at 66s, then
+    /// 550s, still climbing. The message must name elapsed-vs-expected
+    /// instead of asserting an adjective and telling the reader to "retry
+    /// shortly" when it cannot back that up.
+    #[test]
+    fn a_long_but_authority_held_publication_names_elapsed_vs_expected_not_a_fixed_adjective() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker_aged(
+            &db_path,
+            std::process::id(),
+            None,
+            nestweaver_engine::index_publication::WEDGED_MARKER_AGE
+                + std::time::Duration::from_secs(30),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(
+                &store,
+                anyhow!("PageRank unavailable during dirty index publication"),
+            )
+        );
+        assert!(
+            message.contains("IN PROGRESS"),
+            "must report the elapsed-vs-expected state: {message}"
+        );
+        assert!(
+            !message.contains("TRANSIENT"),
+            "past the expected window, must not assert the adjective it cannot back up: {message}"
+        );
+        assert!(
+            !message.contains("Retry shortly"),
+            "must not imply near-term resolution once it has run this long: {message}"
+        );
+        assert!(
+            message.contains("60s"),
+            "must name the expected window it exceeded: {message}"
+        );
+        assert!(
+            !message.contains("nestweaver repair"),
+            "authority is held, so this is not wedged and must name no repair: {message}"
+        );
+
+        // COUNTERWEIGHT is `a_live_publication_error_reads_as_transient_and_names_no_repair`
+        // above: the identical setup with a FRESH marker (age ~0s) still reads
+        // TRANSIENT and still says "retry shortly" — so this test is exercising
+        // the age threshold, not some other change to the held-authority path.
     }
 
     #[test]
@@ -18645,6 +18826,238 @@ mod blast_radius_visibility_tests {
             })
             .unwrap();
         store
+    }
+
+    /// nw-369(a) fixture. `cross_repo_store()` above uses bare uids ("api",
+    /// "client") that carry no `sym:` prefix, so `node_owner` cannot attribute
+    /// them — fine for the visibility test it serves, but useless for
+    /// proving attribution, which depends on a UID actually shaped like the
+    /// ones the indexer emits (`sym:{repo_uid}:{file_hash}:{n}`).
+    fn attributable_cross_repo_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let mk_repo = |uid: &str, name: &str| Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.com/{name}"),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: Some(name.to_string()),
+            root_path: None,
+        };
+
+        store
+            .insert_repo(&mk_repo("repo:inst:apiowner", "api-service"))
+            .unwrap();
+        store
+            .insert_repo(&mk_repo("repo:inst:clientowner", "client-service"))
+            .unwrap();
+        store
+            .insert_repo(&mk_repo("repo:inst:otherowner", "other-service"))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "sym:repo:inst:apiowner:filehash1:1",
+                "Handler",
+                "repo:inst:apiowner",
+                "src/api.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "sym:repo:inst:clientowner:filehash2:1",
+                "Caller",
+                "repo:inst:clientowner",
+                "src/client.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "sym:repo:inst:otherowner:filehash3:1",
+                "OtherCaller",
+                "repo:inst:otherowner",
+                "src/other.rs",
+            ))
+            .unwrap();
+        // The queried symbol (api-owner) is the SOURCE of each cross-repo
+        // link: `cross_repo_links(uid)` matches `(s:Symbol {uid})-[r]->(t)`,
+        // so `uid` must be the source for any row to be found at all — the
+        // "other repo" a caller cares about is therefore always on the
+        // TARGET side, which is exactly what `target_repo` in
+        // `tool_cross_repo_contracts` attributes.
+        for target in [
+            "sym:repo:inst:clientowner:filehash2:1",
+            "sym:repo:inst:otherowner:filehash3:1",
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: "sym:repo:inst:apiowner:filehash1:1".to_string(),
+                    target_uid: target.to_string(),
+                    edge_type: EdgeType::CrossRepoLink,
+                    confidence: 0.9,
+                    link_type: Some(CrossRepoLinkType::SharedImport),
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-369(a). Every cross-repo-links row must carry `repo` — the OTHER
+    /// symbol's repo, derived from its UID rather than a store lookup — and
+    /// `--repo`/`repo` must scope rows to the requested repo without
+    /// disturbing rows for a DIFFERENT repo (the counterweight below).
+    #[test]
+    fn cross_repo_contracts_attributes_rows_and_filters_by_repo() {
+        let store = attributable_cross_repo_store();
+
+        // No filter: both referencing repos are present and attributed.
+        let all = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1" }),
+            None,
+        )
+        .unwrap();
+        let rows = all["contracts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{all}");
+        let repos: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r["repo"].as_str().unwrap()).collect();
+        assert_eq!(
+            repos,
+            ["repo:inst:clientowner", "repo:inst:otherowner"]
+                .into_iter()
+                .collect(),
+            "each row must be attributed to the OTHER symbol's repo: {all}"
+        );
+
+        // Filtered to one repo: only that repo's row survives.
+        let filtered = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1", "repo": "repo:inst:clientowner" }),
+            None,
+        )
+        .unwrap();
+        let filtered_rows = filtered["contracts"].as_array().unwrap();
+        assert_eq!(filtered_rows.len(), 1, "{filtered}");
+        assert_eq!(filtered_rows[0]["repo"], json!("repo:inst:clientowner"));
+        assert_eq!(filtered["repo_filter"], json!("repo:inst:clientowner"));
+
+        // COUNTERWEIGHT: filtering to the OTHER repo returns the OTHER row,
+        // not the same one — proving the filter actually discriminates
+        // rather than passing everything through regardless of the value.
+        let filtered_other = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1", "repo": "repo:inst:otherowner" }),
+            None,
+        )
+        .unwrap();
+        let other_rows = filtered_other["contracts"].as_array().unwrap();
+        assert_eq!(other_rows.len(), 1, "{filtered_other}");
+        assert_eq!(other_rows[0]["repo"], json!("repo:inst:otherowner"));
+
+        // Filtering to a repo with NO reference to this symbol returns nothing,
+        // not an error and not everything.
+        let filtered_none = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1", "repo": "repo:inst:apiowner" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered_none["contracts"].as_array().unwrap().len(),
+            0,
+            "{filtered_none}"
+        );
+    }
+
+    /// nw-369(a). A `link_type: "contract"` row's `target_uid` is a CONTRACT
+    /// UID, which `node_owner` (see `node_scope.rs`) classifies as
+    /// `Unattributable` by design — this is a genuine data-model limit, not a
+    /// missed lookup. Such a row must carry `repo: null` explicitly (never
+    /// omit the field, never guess), and must be EXCLUDED — with the
+    /// exclusion counted in `note` — whenever a `--repo` filter is active,
+    /// since it cannot be proven to match or fail to match.
+    #[test]
+    fn contract_rows_are_unattributable_and_excluded_under_a_repo_filter() {
+        let store = attributable_cross_repo_store();
+        store
+            .insert_contract(&nestweaver_schema::Contract {
+                uid: "ctr:openapi:abc123".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/handler".to_string()),
+                operation_id: None,
+                repo_uid: "repo:inst:apiowner".to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:repo:inst:apiowner:filehash1:1".to_string(),
+                target_uid: "ctr:openapi:abc123".to_string(),
+                edge_type: EdgeType::ImplementsContract,
+                confidence: 1.0,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let unfiltered = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1" }),
+            None,
+        )
+        .unwrap();
+        let contract_row = unfiltered["contracts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["link_type"] == json!("contract"))
+            .expect("the contract row must be present when no filter is set");
+        assert_eq!(
+            contract_row["repo"],
+            serde_json::Value::Null,
+            "a contract row's repo must be explicit null, not omitted: {unfiltered}"
+        );
+
+        let filtered = tool_cross_repo_contracts(
+            &store,
+            json!({ "uid": "sym:repo:inst:apiowner:filehash1:1", "repo": "repo:inst:clientowner" }),
+            None,
+        )
+        .unwrap();
+        assert!(
+            filtered["contracts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["link_type"] != json!("contract")),
+            "a contract row must never survive a --repo filter: {filtered}"
+        );
+        assert!(
+            filtered["note"].as_str().unwrap().contains('1'),
+            "the exclusion must be disclosed by count, not silently dropped: {filtered}"
+        );
     }
 
     fn mixed_visibility_store() -> GraphStore {
