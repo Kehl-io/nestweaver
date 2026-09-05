@@ -214,11 +214,18 @@ pub struct DbWriteLease {
 #[must_use = "the namespace lease must be held across enumeration and cutover"]
 #[derive(Debug)]
 pub struct DbNamespaceLease {
+    // Declared first so the registry clears BEFORE the OS `flock` releases.
+    // The reverse order leaves a window where the flock is already free but
+    // the registry still reports "held" — a caller trusting the registry
+    // (see `current_process_claims_namespace_lease`) would then wrongly
+    // treat an unprotected moment as protected. Clearing the registry first
+    // only risks the safe direction: a caller sees "not held" a moment
+    // before the flock actually releases and, if it tries to acquire fresh,
+    // correctly conflicts and fails closed rather than proceeding
+    // unprotected.
+    _process_claim: ProcessNamespaceLeaseClaim,
     _file: std::fs::File,
     data_dir: PathBuf,
-    // Declared last so the OS `flock` closes before another thread in this
-    // process can observe the registry as clear.
-    _process_claim: ProcessNamespaceLeaseClaim,
 }
 
 impl DbNamespaceLease {
@@ -303,9 +310,9 @@ pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, W
     lock_flock_with_inheritance_retry(&file, libc::LOCK_EX)?;
     let process_claim = ProcessNamespaceLeaseClaim::acquire(&data_dir);
     Ok(DbNamespaceLease {
+        _process_claim: process_claim,
         _file: file,
         data_dir,
-        _process_claim: process_claim,
     })
 }
 
