@@ -72,7 +72,8 @@ pub use write::{
 pub use write_lease::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
     acquire_db_write_lease, acquire_db_write_lease_under_namespace, canonical_db_path,
-    current_process_claims_write_lease, write_lease_path, write_lease_state,
+    current_process_claims_namespace_lease, current_process_claims_write_lease, write_lease_path,
+    write_lease_state,
 };
 
 #[cfg(test)]

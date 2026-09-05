@@ -61,6 +61,61 @@ impl Drop for ProcessDbLeaseClaim {
     }
 }
 
+/// Advisory (non-gating) record of which destructive-replacement namespaces
+/// this process currently holds. Unlike [`PROCESS_DB_LEASES`], duplicate
+/// claims are tolerated rather than rejected: `flock` is scoped to the open
+/// file description, not the process, so a genuine same-process double
+/// acquisition already fails on its own (the second `flock` call blocks
+/// against the first and eventually reports `Held`) without help from this
+/// registry. Its only purpose is to let a caller such as `backup_restore`
+/// answer "do I already hold this" cheaply and correctly, so it can skip
+/// re-acquiring a namespace lease its own caller secured, rather than
+/// stalling for the retry window and then failing with a misleading
+/// "another writer holds this" refusal against itself.
+static PROCESS_NAMESPACE_LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct ProcessNamespaceLeaseClaim {
+    data_dir: PathBuf,
+}
+
+impl ProcessNamespaceLeaseClaim {
+    fn acquire(data_dir: &Path) -> Self {
+        PROCESS_NAMESPACE_LEASES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(data_dir.to_path_buf());
+        Self {
+            data_dir: data_dir.to_path_buf(),
+        }
+    }
+
+    fn is_held(data_dir: &Path) -> bool {
+        PROCESS_NAMESPACE_LEASES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(data_dir)
+    }
+}
+
+impl Drop for ProcessNamespaceLeaseClaim {
+    fn drop(&mut self) {
+        PROCESS_NAMESPACE_LEASES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.data_dir);
+    }
+}
+
+/// Whether this process already holds the destructive-replacement namespace
+/// authority for `data_dir` (see [`acquire_db_namespace_lease`]).
+pub fn current_process_claims_namespace_lease(data_dir: &Path) -> bool {
+    ProcessNamespaceLeaseClaim::is_held(&canonical_db_path(data_dir))
+}
+
 /// Canonicalize a database path even before the file exists.
 pub fn canonical_db_path(db_path: &Path) -> PathBuf {
     let absolute = if db_path.is_relative() {
@@ -161,6 +216,9 @@ pub struct DbWriteLease {
 pub struct DbNamespaceLease {
     _file: std::fs::File,
     data_dir: PathBuf,
+    // Declared last so the OS `flock` closes before another thread in this
+    // process can observe the registry as clear.
+    _process_claim: ProcessNamespaceLeaseClaim,
 }
 
 impl DbNamespaceLease {
@@ -243,9 +301,11 @@ pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, W
     // onto this same inode: macOS makes flock/fcntl locks cooperate and
     // explicitly permits only one of those interfaces per file in a process.
     lock_flock_with_inheritance_retry(&file, libc::LOCK_EX)?;
+    let process_claim = ProcessNamespaceLeaseClaim::acquire(&data_dir);
     Ok(DbNamespaceLease {
         _file: file,
         data_dir,
+        _process_claim: process_claim,
     })
 }
 
@@ -846,6 +906,37 @@ mod tests {
         assert!(first.authorizes(&first_dir.join("brain.lbug")));
         assert!(!first.authorizes(&second_db));
         assert!(second_writer.authorizes(&second_db));
+    }
+
+    /// nw-375: `backup_restore` must be able to tell "I already hold this
+    /// namespace" (the CLI choke point acquired it before calling in) from
+    /// "nobody holds it" (a bare library caller), so it knows whether to
+    /// self-acquire or trust an existing outer authority. Re-acquiring when
+    /// already held would self-conflict (flock is per open file description,
+    /// not per process) rather than degrade gracefully.
+    #[test]
+    fn namespace_claim_tracker_reflects_only_this_process_own_live_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let other_dir = root.path().join("other");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+
+        assert!(!current_process_claims_namespace_lease(&data_dir));
+        assert!(!current_process_claims_namespace_lease(&other_dir));
+
+        let namespace = acquire_db_namespace_lease(&data_dir).unwrap();
+        assert!(current_process_claims_namespace_lease(&data_dir));
+        assert!(
+            !current_process_claims_namespace_lease(&other_dir),
+            "an unrelated directory must not read as claimed"
+        );
+
+        drop(namespace);
+        assert!(
+            !current_process_claims_namespace_lease(&data_dir),
+            "dropping the lease must clear the claim"
+        );
     }
 
     #[test]

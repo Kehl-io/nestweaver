@@ -984,12 +984,182 @@ fn maybe_corrupt_after_copy_for_test(dest: &Path) {
 #[cfg(not(test))]
 fn maybe_corrupt_after_copy_for_test(_dest: &Path) {}
 
+/// Enumerate every canonical `.lbug` database directly beneath `data_dir` and
+/// its `.restoring` rename-aside sibling — the exact set a restore is about to
+/// destroy or has just destroyed, and therefore the exact set that needs a
+/// held write lease for the whole operation.
+fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+
+    for dir in [data_dir.to_path_buf(), restoring_dir_for(data_dir)] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                anyhow::bail!(
+                    "cannot enumerate incumbent databases in {} before destructive restore: {error}",
+                    dir.display()
+                )
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "cannot enumerate every incumbent database in {} before destructive restore",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("lbug") {
+                continue;
+            }
+
+            let metadata = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "cannot inspect possible incumbent database {} before destructive restore",
+                    path.display()
+                )
+            })?;
+            if metadata.is_file() {
+                targets.push(nestweaver_store::canonical_db_path(&path));
+            }
+        }
+    }
+
+    // Every restore takes leases in the same canonical order, so two recovery
+    // attempts cannot deadlock by discovering directory entries differently.
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+/// The exclusive restore authority for one `data_dir`, held for the whole
+/// destructive operation.
+///
+/// `Owned` means this call acquired the namespace and per-database write
+/// leases itself and releases them when dropped. `Borrowed` means the
+/// calling process already held every namespace this restore needs — the CLI
+/// choke point (`with_exclusive_restore_access`) acquires exactly this
+/// authority before calling in — so re-acquiring here would self-conflict:
+/// the underlying primitives are scoped to the open file description /
+/// process-local claim registry, not to "some other call in this process
+/// already has it", and neither tolerates a same-process duplicate. Trusting
+/// an already-held claim is therefore correct, not merely convenient: the
+/// authority these leases represent is already in force for the duration of
+/// this call either way.
+#[must_use = "dropping this immediately reopens the window this authority closes"]
+enum RestoreAuthority {
+    Owned {
+        _namespaces: Vec<nestweaver_store::DbNamespaceLease>,
+        _leases: Vec<nestweaver_store::DbWriteLease>,
+    },
+    Borrowed,
+}
+
+/// Acquire (or recognize an already-held) exclusive restore authority over
+/// every incumbent database beneath `data_dir` and its `.restoring` sibling.
+///
+/// This is the invariant [`backup_restore`] establishes by construction: a
+/// destructive restore never runs without SOME process-held authority
+/// excluding every other writer to the exact databases it is about to
+/// destroy. Before this, that authority lived only at the CLI choke point —
+/// `nestweaver_engine::backup_restore` itself took no lease and was `pub`, so
+/// any caller reaching the engine directly (skipping the CLI) bypassed
+/// exclusion entirely (nw-375). Acquiring it here closes that gap for every
+/// caller, library or CLI, without changing what the CLI already does
+/// correctly.
+fn acquire_restore_authority(data_dir: &Path) -> anyhow::Result<RestoreAuthority> {
+    let restoring_dir = restoring_dir_for(data_dir);
+    let namespace_dirs = [data_dir.to_path_buf(), restoring_dir];
+
+    // If this process already holds every namespace this restore needs, an
+    // outer caller (the CLI choke point, or an equivalent) has already
+    // established the authority for the exact same directories. Trust it
+    // instead of re-acquiring: `flock` does not know "this process already
+    // has an equivalent lock" and would simply retry against itself for the
+    // duration of the bounded retry window before failing closed.
+    if namespace_dirs
+        .iter()
+        .all(|dir| nestweaver_store::current_process_claims_namespace_lease(dir))
+    {
+        return Ok(RestoreAuthority::Borrowed);
+    }
+
+    let targets = restore_lease_targets(data_dir)?;
+
+    let mut namespaces = Vec::with_capacity(namespace_dirs.len());
+    for namespace_dir in &namespace_dirs {
+        match nestweaver_store::acquire_db_namespace_lease(namespace_dir) {
+            Ok(lease) => namespaces.push(lease),
+            Err(nestweaver_store::WriteLeaseError::Held) => anyhow::bail!(
+                "cannot restore a backup over {}: a writer holds the database namespace write lease for {}; stop every writer and retry",
+                data_dir.display(),
+                namespace_dir.display()
+            ),
+            Err(nestweaver_store::WriteLeaseError::Unavailable(error)) => anyhow::bail!(
+                "cannot prove exclusive ownership of the database namespace containing {}: {error}; refusing destructive restore",
+                namespace_dir.display()
+            ),
+        }
+    }
+
+    // Re-enumerate as an invariant check now that the exclusive namespace
+    // authority is held: an upgraded late creator cannot enter after this
+    // point, so a changed set here means one raced the first enumeration and
+    // this run must not proceed against a stale target list.
+    let observed = restore_lease_targets(data_dir)?;
+    anyhow::ensure!(
+        observed == targets,
+        "the incumbent database set changed while restore write leases were being acquired — refusing destructive restore; stop every writer and retry"
+    );
+
+    let leases = observed
+        .iter()
+        .map(|db| {
+            let namespace = namespaces
+                .iter()
+                .find(|namespace| namespace.authorizes(db))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no held restore namespace covers incumbent database {}",
+                        db.display()
+                    )
+                })?;
+            match nestweaver_store::acquire_db_write_lease_under_namespace(db, namespace) {
+                Ok(lease) => Ok(lease),
+                Err(nestweaver_store::WriteLeaseError::Held) => anyhow::bail!(
+                    "cannot restore a backup over this data directory: another process holds the write lease for {}. Stop the holder first, then retry.",
+                    db.display()
+                ),
+                Err(nestweaver_store::WriteLeaseError::Unavailable(error)) => anyhow::bail!(
+                    "cannot take the write lease for {} before destructive restore: {error}",
+                    db.display()
+                ),
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(RestoreAuthority::Owned {
+        _namespaces: namespaces,
+        _leases: leases,
+    })
+}
+
 /// Restore a backup archive into a target directory.
 ///
 /// Extracts to a temporary directory first, verifies integrity, then
 /// atomically renames to the target. If verification fails, the temp
 /// directory is cleaned up and the target is left untouched.
+///
+/// This holds exclusive restore authority over `config.data_dir` (and its
+/// `.restoring` sibling) for the ENTIRE call — acquired first, before
+/// [`recover_interrupted_restore`] runs, and released only when this function
+/// returns. A caller that already holds that authority (the CLI choke point)
+/// is recognized rather than fought; a caller that does not gets it taken out
+/// from under it here, by construction, rather than never at all (nw-375).
 pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
+    let _authority = acquire_restore_authority(&config.data_dir)?;
     let start = Instant::now();
 
     let restoring_dir = restoring_dir_for(&config.data_dir);
@@ -3307,5 +3477,202 @@ mod tests {
         assert_eq!(y, 2026);
         assert_eq!(mo, 6);
         // Exact day/time verified by calculation.
+    }
+
+    // -------------------------------------------------------------------
+    // nw-375: `backup_restore` takes its own exclusive restore authority.
+    // -------------------------------------------------------------------
+
+    /// Re-invoked as a CHILD PROCESS by
+    /// [`backup_restore_refuses_while_another_process_holds_the_target_write_lease`];
+    /// a no-op in a normal run. Holds a REAL cross-process write lease on the
+    /// named database, signals readiness by creating a file, then waits for a
+    /// release signal before exiting — so the parent's `backup_restore` call
+    /// races a genuinely external holder, not an in-process fake.
+    #[test]
+    fn restore_lease_holder_child() {
+        let (Ok(db), Ok(ready_file), Ok(release_file)) = (
+            std::env::var("NW_HOLD_LEASE_DB"),
+            std::env::var("NW_HOLD_LEASE_READY_FILE"),
+            std::env::var("NW_HOLD_LEASE_RELEASE_FILE"),
+        ) else {
+            return;
+        };
+        let authority = nestweaver_store::acquire_db_write_lease(Path::new(&db))
+            .expect("holder child must acquire the write lease");
+        std::fs::write(&ready_file, b"ready").expect("signal readiness");
+        let release_file = PathBuf::from(release_file);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(authority);
+    }
+
+    fn spawn_restore_lease_holder(
+        db: &Path,
+        ready_file: &Path,
+        release_file: &Path,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "backup::tests::restore_lease_holder_child",
+            ])
+            .env("NW_HOLD_LEASE_DB", db)
+            .env("NW_HOLD_LEASE_READY_FILE", ready_file)
+            .env("NW_HOLD_LEASE_RELEASE_FILE", release_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the lease-holder child")
+    }
+
+    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        path.exists()
+    }
+
+    /// THE CORE nw-375 CLAIM, demonstrated rather than only asserted:
+    /// `nestweaver_engine::backup_restore` is `pub` and previously took no
+    /// lease at all, so a caller reaching the engine directly — skipping the
+    /// CLI's `with_exclusive_restore_access` choke point entirely — bypassed
+    /// exclusion. This calls `backup_restore` exactly that way: bare, with no
+    /// CLI wrapper anywhere in the call stack. A REAL other process holds the
+    /// target database's write lease throughout. The invariant under test is
+    /// that `backup_restore` now establishes its own authority by
+    /// construction, so this refusal cannot be skipped by a caller that
+    /// forgets or declines to take the lease itself.
+    #[test]
+    fn backup_restore_refuses_while_another_process_holds_the_target_write_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source_db = tmp.path().join("source").join("test.lbug");
+        std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        drop(nestweaver_store::GraphStore::create(&source_db).unwrap());
+        let snapshot = tmp.path().join("test.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: source_db,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "lease-race".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let target_db = data_dir.join("test.lbug");
+        drop(nestweaver_store::GraphStore::create(&target_db).unwrap());
+        std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+
+        let ready_file = tmp.path().join("holder-ready");
+        let release_file = tmp.path().join("holder-release");
+        let mut holder = spawn_restore_lease_holder(&target_db, &ready_file, &release_file);
+        assert!(
+            wait_for_file(&ready_file, Duration::from_secs(5)),
+            "the external holder must signal it acquired the write lease"
+        );
+
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+        })
+        .expect_err(
+            "a bare engine call must be refused while another process holds the target's \
+             write lease — this is the nw-375 invariant, not the CLI's",
+        );
+        // The external holder's plain `acquire_db_write_lease` also takes a
+        // SHARED namespace lock as part of its own acquisition (see
+        // `acquire_db_write_lease_inner`), so `backup_restore`'s EXCLUSIVE
+        // namespace acquisition is the first thing to conflict and refuse —
+        // it need not reach the per-database lease step to be excluded.
+        // Either failure point is a correct refusal; assert the message names
+        // a concrete path and an actionable remedy either way.
+        let message = error.to_string();
+        assert!(
+            message.contains("write lease") && message.contains(&data_dir.display().to_string()),
+            "the refusal must name the write lease and a concrete path, not just fail \
+             silently: {message}"
+        );
+        assert!(
+            message.contains("stop every writer and retry")
+                || message.contains("Stop the holder first, then retry"),
+            "the refusal must name a remedy the operator can execute: {message}"
+        );
+
+        std::fs::write(&release_file, b"go").expect("signal release");
+        let status = holder.wait().expect("holder child exits");
+        assert!(status.success(), "holder child must exit cleanly");
+
+        // Exclusion, not just an error message: the incumbent data must be
+        // completely untouched by the refused attempt.
+        assert!(
+            data_dir.join("INCUMBENT").exists(),
+            "a refused restore must not have touched the incumbent data at all"
+        );
+        assert!(
+            nestweaver_store::GraphStore::open_read_only(&target_db).is_ok(),
+            "the incumbent database must remain exactly as it was"
+        );
+    }
+
+    /// The other half: a caller that ALREADY holds the exact authority
+    /// `backup_restore` would otherwise take itself — exactly what the CLI's
+    /// `with_exclusive_restore_access` choke point does before calling in —
+    /// must not be fought. Re-acquiring here would self-conflict (the
+    /// underlying primitives are scoped to the open file description / a
+    /// process-local claim registry, not "another equivalent call in this
+    /// process already has it"), which would break the one caller that
+    /// already does this correctly.
+    #[test]
+    fn backup_restore_recognizes_an_already_held_outer_authority_and_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source_db = tmp.path().join("source").join("test.lbug");
+        std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        drop(nestweaver_store::GraphStore::create(&source_db).unwrap());
+        let snapshot = tmp.path().join("test.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: source_db,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "outer-authority".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        let data_dir = tmp.path().join("data");
+
+        // Exactly what the CLI choke point does before calling in: acquire
+        // the namespace authority for the target and its `.restoring`
+        // sibling, held across the call.
+        let namespace = nestweaver_store::acquire_db_namespace_lease(&data_dir).unwrap();
+        let restoring_namespace =
+            nestweaver_store::acquire_db_namespace_lease(&restoring_dir_for(&data_dir)).unwrap();
+        assert!(nestweaver_store::current_process_claims_namespace_lease(
+            &data_dir
+        ));
+
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+        })
+        .expect(
+            "a caller that already holds the outer authority must not be fought by \
+             backup_restore's own acquisition",
+        );
+
+        drop(namespace);
+        drop(restoring_namespace);
+        assert!(nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok());
     }
 }
