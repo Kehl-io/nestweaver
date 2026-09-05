@@ -554,12 +554,17 @@ enum CliDiagnostic {
     /// refused with a bare `anyhow::bail!`, which is invisible to
     /// `diagnostic_inventory` for the same reason `repair`'s `eprintln!` was.
     ///
-    /// Exit code stays 1, deliberately. `d565547f` decided one round ago, with
-    /// its rationale preserved in the item, that this is a SEMANTIC refusal
-    /// rather than a usage error; reversing that without new evidence would
-    /// leave two rounds of contradictory reasoning in the record. The defect
-    /// nw-360 names is the SHAPE of the refusal, and a named condition with a
-    /// followable remedy fixes exactly that.
+    /// Exit code is `EXIT_USAGE` (64), superseding `d565547f`'s one-round-old
+    /// call to keep it at 1. That decision reasoned this is a SEMANTIC
+    /// refusal rather than a usage error; nw-360's own closing note leaves
+    /// either exit code "defensible" and asks only that the whole codebase
+    /// AGREE on one, and the 2026-09-04 regression sweep settled that
+    /// question for `search --limit`, `blast-radius --limit`, and the empty-
+    /// query guards (nw-431/nw-432/nw-379) by standardising on 64 for every
+    /// "the value(s) you passed cannot be honoured" refusal this sweep
+    /// touches. Two individually-valid enum values whose COMBINATION is
+    /// unsupported is exactly that shape: nothing failed at runtime, the
+    /// invocation itself cannot be honoured, which is what 64 means.
     #[error("`--format {format}` cannot represent `--scope {scope}`")]
     #[diagnostic(
         code(nestweaver::export_scope_unsupported),
@@ -1880,6 +1885,34 @@ fn parse_unit_interval_f32(value: &str) -> Result<f32, String> {
         return Err("must be in 0.0..=1.0".to_string());
     }
     Ok(parsed)
+}
+
+/// nw-379: an empty (or whitespace-only) query/pattern means "match
+/// everything" on `search`, `investigate`, MCP `brain_search`, and MCP
+/// `brain_context` -- while `regex-search`/`count-patterns` and their MCP
+/// twins already refuse it BY NAME as a scan-cost/response-amplification
+/// lever, not a query. Shares `nestweaver_mcp::tools::is_blank_query`
+/// (rather than restating `.trim().is_empty()` here) so the CLI and the MCP
+/// tools cannot re-diverge one at a time the way they arrived here, and
+/// rejects at PARSE TIME so all four affected CLI/MCP surfaces settle on one
+/// exit code (64) instead of `regex-search`'s prior 1.
+fn parse_non_blank_query(value: &str) -> Result<String, String> {
+    if nestweaver_mcp::tools::is_blank_query(value) {
+        Err("empty query strings are not allowed".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// [`parse_non_blank_query`] with `regex_search`/`count_patterns`'s existing
+/// wording, so `--help` and the parse-time rejection state the same noun the
+/// MCP tools already use for these two.
+fn parse_non_blank_pattern(value: &str) -> Result<String, String> {
+    if nestweaver_mcp::tools::is_blank_query(value) {
+        Err("empty pattern strings are not allowed".to_string())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 /// `f64` counterpart of [`parse_unit_interval_f32`].
@@ -4471,10 +4504,20 @@ enum Commands {
     )]
     Search {
         /// Text to search for in symbol names
+        #[arg(value_parser = parse_non_blank_query)]
         query: String,
+        // nw-431: this carried NO `value_parser`, so it enforced neither of
+        // `brain_search`'s declared bounds (`limit`'s schema says
+        // `minimum: 1, maximum: 1000`) -- `--limit 0` returned an empty
+        // result set at exit 0, indistinguishable from "no matches", and
+        // `--limit 1001` silently returned 442 rows. The range is COPIED
+        // from the schema, matching the `hubs --top` / `bridges --top`
+        // idiom (nw-251) and this binary's own `brain search --limit`,
+        // which already carries this exact range and wording.
         #[arg(
             long,
-            help = "Maximum number of results (default: 10, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum number of results (1-1000; default: 10, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -4552,6 +4595,14 @@ enum Commands {
     )]
     RegexSearch {
         /// Rust regex pattern to search for
+        // nw-379: an empty pattern is a valid regex (it matches everything),
+        // so without this the DIRECT route's `compile_pattern` accepted it
+        // silently at exit 0, while the DAEMON route's `tool_regex_search`
+        // already refused it -- but as a generic error bubbled through `?`,
+        // landing at exit 1 rather than the exit-64 usage error every other
+        // rejected value in this command gets. Parse-time rejection makes
+        // both routes agree, and agree with `count-patterns`.
+        #[arg(value_parser = parse_non_blank_pattern)]
         pattern: String,
         #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
         path_prefix: Option<String>,
@@ -4593,7 +4644,10 @@ enum Commands {
     )]
     CountPatterns {
         /// One or more regex patterns to count
-        #[arg(required = true)]
+        // nw-379: same policy as `regex-search --pattern`, applied per
+        // element -- an empty pattern in the list matches everything, and
+        // the MCP `count_patterns` twin already refuses it BY NAME.
+        #[arg(required = true, value_parser = parse_non_blank_pattern)]
         patterns: Vec<String>,
         #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
         path_prefix: Option<String>,
@@ -4797,10 +4851,30 @@ enum Commands {
     /// to fit within the specified token budget. Designed for AI agent
     /// context windows.
     RepoMap {
+        // nw-397: had no `value_parser` at all -- `--token-budget 0`
+        // returned `"map": "", "token_count": 0` at exit 0, indistinguishable
+        // from an unindexed repo (every sibling budget rejects 0: `context`/
+        // `investigate --token-budget 0` -> exit 64, `0 is not in
+        // 1..=16000`), and `--token-budget 999999999` returned the whole
+        // graph -- 2.5 MILLION tokens -- for a flag whose entire purpose is
+        // to bound output. Every OTHER `--token-budget` flag in this binary
+        // (`context`, `investigate`, `investigate-hydrate`,
+        // `project-context`) already caps at 16000; this adopts that same
+        // ceiling rather than inventing a new number repo-map alone would
+        // have to justify.
+        //
+        // NOT FIXED HERE, and out of this change's file scope: `--json`
+        // still carries no `truncated`/`files_returned`/`files_total` (LEG 2
+        // of nw-397), because `generate_repo_map` returns a bare `String`
+        // with no companion counts (`crates/nestweaver-engine/src/query.rs`)
+        // -- a signature change outside `nestweaver-engine`, which this
+        // change does not touch. The same gap reaches `generate-guide`'s
+        // `## Architecture` section (LEG 3) for the same reason.
         #[arg(
             long,
             default_value = "4096",
-            help = "Approximate token limit for output"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token limit for output (1-16000; default 4096)"
         )]
         token_budget: usize,
         #[arg(long, help = "Output as JSON")]
@@ -5564,6 +5638,7 @@ enum Commands {
     )]
     Investigate {
         /// Topic / feature / subsystem to orient on
+        #[arg(value_parser = parse_non_blank_query)]
         query: String,
         #[arg(
             long,
@@ -5811,10 +5886,16 @@ enum Commands {
             help = "Also follow data-dependence edges (type refs, field access) — higher recall, noisier"
         )]
         include_data_edges: bool,
+        // nw-432: help advertised "(1-10000)" while the enforced bound was
+        // this same 1..=10000 -- but the MCP `blast_radius` schema caps
+        // `limit` at `RESULT_LIMIT_MAX` (1000, `tools.rs`), so every value
+        // in 1001-10000 parsed here and then failed at exit 1 with a raw
+        // JSON-Schema keyword error the moment a daemon validated it. Help
+        // and enforcement now state the same number the schema does.
         #[arg(
             long,
-            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
-            help = "Cap affected symbols returned, most-impactful first (1-10000)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Cap affected symbols returned, most-impactful first (1-1000; matches the MCP blast_radius schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -15970,11 +16051,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // business and already exits 64 at parse time (`d565547f`), so
             // matching the accepted string keeps this check about the
             // combination and nothing else.
-            if format == "msgpack" && scope == "vault" {
-                return Err(anyhow::Error::new(CliDiagnostic::ExportScopeUnsupported {
+            //
+            // `graphml` is the only format that honours `--scope vault` (the
+            // help text above already says so); the other three are
+            // code-only. This used to check `format == "msgpack"` alone --
+            // msgpack got the named diagnostic below, while `cypher` and
+            // `mermaid` fell through to the daemon and came back as a raw
+            // `export_graph RPC failed: ...` (or, on the direct route, an
+            // empty file reported as success). Checking `!= "graphml"`
+            // instead of enumerating the other three means a fifth
+            // code-only format added later inherits the refusal instead of
+            // silently reopening this gap.
+            //
+            // Exit code is `EXIT_USAGE`, not the generic `Err` path's
+            // `EXIT_ERROR` -- see the variant's doc comment for why this
+            // round settled the question the previous one left open.
+            if format != "graphml" && scope == "vault" {
+                let diagnostic = CliDiagnostic::ExportScopeUnsupported {
                     format: format.clone(),
                     scope: scope.clone(),
-                }));
+                };
+                let report: miette::Report = diagnostic.into();
+                eprintln!("{report:?}");
+                return Ok((EXIT_USAGE, None));
             }
 
             // Route through daemon when available.
@@ -27739,25 +27838,297 @@ mod cli_help_contract_tests {
         );
     }
 
-    /// Map a clap subcommand path onto its MCP tool name.
+    /// nw-217b's repaired mapping from a CLI path to its MCP twin -- a
+    /// DECLARATION rather than a guess.
     ///
-    /// Mostly mechanical -- `dead-code` -> `dead_code`, `brain context` ->
-    /// `brain_context` -- with an explicit alias table for the handful whose
-    /// CLI verb deliberately differs from the registry name. A path with no
-    /// match is SKIPPED, not failed: `export --top` has no MCP twin and
-    /// requiring one would turn this guard into a demand that every flag be
-    /// mirrored into the tool surface.
-    fn tool_name_for_cli_path(path: &str) -> Option<String> {
-        let aliases = [
-            ("context", "code_context"),
-            ("hubs", "hub_nodes"),
-            ("bridges", "bridge_nodes"),
-        ];
-        let stripped = path.strip_prefix("nestweaver ").unwrap_or(path);
-        if let Some((_, tool)) = aliases.iter().find(|(cli, _)| *cli == stripped) {
-            return Some((*tool).to_string());
-        }
-        Some(stripped.replace([' ', '-'], "_"))
+    /// The prior version was `stripped.replace([' ', '-'], "_")` with a
+    /// three-entry alias table on top, falling through to `continue` on any
+    /// miss. That could not distinguish "this genuinely has no MCP twin"
+    /// (`export --top`) from "the transform guessed wrong" (`search` ->
+    /// `"search"`, real twin `brain_search`) -- and the second case is
+    /// [[nw-431]]: the mapping silently dropped `search`, `impact`,
+    /// `summary`, and `contracts drift` (see below), so their declared
+    /// bounds were never enforced by this sweep at all.
+    ///
+    /// This is nw-334/G1's shape applied here: every path is DECLARED, not
+    /// derived, and completeness is enforced by
+    /// `every_cli_path_is_declared_in_the_mcp_mapping`, which walks the same
+    /// tree and asserts every visited path has an arm here. G1 got
+    /// compile-time completeness from an enum match; a clap tree is not an
+    /// enum, so this gets the same guarantee at test time instead -- an
+    /// undeclared path is a test FAILURE, not a `continue`.
+    enum CliMcpTwin {
+        /// This CLI command's MCP counterpart, by registry name.
+        Tool(&'static str),
+        /// Genuinely no MCP twin, and why -- so a reviewer can tell a
+        /// documented absence from an oversight.
+        NoTwin(&'static str),
+    }
+
+    fn declared_cli_mcp_twin(path: &str) -> Option<CliMcpTwin> {
+        use CliMcpTwin::{NoTwin, Tool};
+        Some(match path {
+            // ── real MCP twins ───────────────────────────────────────────
+            // Most of these are the mechanical transform's correct guesses
+            // (`dead-code` -> `dead_code`) plus the three long-standing
+            // aliases (`context`, `hubs`, `bridges`); the rest are the holes
+            // nw-431 reopened this item on -- the CLI verb the mechanical
+            // transform could never have found because it differs from the
+            // tool name by more than punctuation.
+            "affected-tests" => Tool("affected_tests"),
+            "backlinks" => Tool("backlinks"),
+            "blast-radius" => Tool("blast_radius"),
+            "brain broken-links" => Tool("brain_broken_links"),
+            "brain context" => Tool("brain_context"),
+            "brain doc-stats" => Tool("brain_doc_stats"),
+            // nw-217b hole: mechanical guess was "brain_orphans"; the real
+            // tool is `brain_orphan_documents`. `brain orphans --limit` was
+            // already correctly bounded (nw-400) -- declaring the pair adds
+            // real regression coverage rather than fixing a bug.
+            "brain orphans" => Tool("brain_orphan_documents"),
+            "brain search" => Tool("brain_search"),
+            "brain status" => Tool("brain_status"),
+            "brain tag-graph" => Tool("brain_tag_graph"),
+            "brain topic-clusters" => Tool("brain_topic_clusters"),
+            "bridges" => Tool("bridge_nodes"),
+            "clusters" => Tool("clusters"),
+            "compact-embeddings" => Tool("compact_embeddings"),
+            "context" => Tool("code_context"),
+            // nw-217b hole: mechanical guess was "contracts_drift"; the real
+            // tool is `contract_drift` (singular). The CLI has no `--limit`
+            // flag to test against the schema's bounded `limit`, so
+            // declaring this correctly adds zero new probes today -- it is
+            // still the honest mapping, not a guess that happens to miss.
+            "contracts drift" => Tool("contract_drift"),
+            "count-patterns" => Tool("count_patterns"),
+            "cross-repo-contracts" => Tool("cross_repo_contracts"),
+            "dead-code" => Tool("dead_code"),
+            "detect-changes" => Tool("detect_changes"),
+            // nw-217b hole: CLI groups `set_extension`'s read-side under
+            // `extensions list`/`extensions unset` rather than exposing a
+            // literal `extensions_list`/`extensions_unset` tool pair.
+            "extensions list" => Tool("query_extensions"),
+            "extensions unset" => Tool("set_extension"),
+            "flow-trace" => Tool("flow_trace"),
+            // nw-217b hole: `brain_guide`'s own description names this exact
+            // CLI command as its local-path equivalent.
+            "generate-guide" => Tool("brain_guide"),
+            "hubs" => Tool("hub_nodes"),
+            // nw-217b hole, one of the four cited when this item reopened:
+            // mechanical guess was "impact"; no such tool exists, real twin
+            // is `brain_impact`. `impact --depth`/`--limit` were already
+            // correctly bounded by hand (nw-357) -- declaring the pair adds
+            // coverage, it does not fix a bug.
+            "impact" => Tool("brain_impact"),
+            "investigate" => Tool("investigate"),
+            "investigate-expand" => Tool("investigate_expand"),
+            "investigate-hydrate" => Tool("investigate_hydrate"),
+            // nw-217b hole: mechanical guesses were "memory_consolidate" /
+            // "memory_lint" / "memory_related"; the real tools all carry a
+            // `brain_` prefix the CLI verb does not. `memory related
+            // --depth` was already correctly bounded (nw-411).
+            "memory consolidate" => Tool("brain_memory_consolidate"),
+            "memory lint" => Tool("brain_memory_lint"),
+            "memory related" => Tool("brain_memory_related"),
+            "project-context" => Tool("project_context"),
+            "prune-stale" => Tool("prune_stale"),
+            "read-symbols" => Tool("read_symbols"),
+            "regex-search" => Tool("regex_search"),
+            // nw-431, the escape this item reopened on: mechanical guess was
+            // "search"; no such tool exists, real twin is `brain_search`.
+            // `search --limit` enforces NOTHING today -- see nw-431.
+            "search" => Tool("brain_search"),
+            "stale-check" => Tool("stale_check"),
+            // nw-217b hole: mechanical guess was "summary"; no such tool
+            // exists, real twin is `get_summary`. The CLI has no
+            // `--max-summaries` flag and its `--token-budget` has no upper
+            // bound on either side, so declaring this correctly adds zero
+            // new probes today.
+            "summary" => Tool("get_summary"),
+
+            // ── genuinely no MCP twin ────────────────────────────────────
+            // Administrative, mutating, or purely local operations. The MCP
+            // registry exposes a small, deliberate mutating surface
+            // (`brain_add_source`, `brain_remove_source`, `set_extension`,
+            // `brain_memory_consolidate`) and nothing below shares an
+            // operation, an argument shape, or a code path with those or any
+            // read tool -- these are daemon/process control, local
+            // backup/restore, instance/config administration, or dev-only
+            // tooling with no MCP surface at all.
+            "admin"
+            | "admin install-hook"
+            | "admin instructions"
+            | "backup"
+            | "backup inspect"
+            | "backup list"
+            | "backup restore"
+            | "backup save"
+            | "brain"
+            | "brain add"
+            | "brain list"
+            | "brain refresh"
+            | "brain reindex-search"
+            | "brain remove"
+            | "brain stale-check"
+            | "brain watch"
+            | "completions"
+            | "config"
+            | "config validate"
+            | "connect"
+            | "contracts"
+            | "contracts diff"
+            | "contracts list"
+            | "cross-repo-refs"
+            | "daemon"
+            | "daemon gc"
+            | "daemon restart"
+            | "daemon run"
+            | "daemon start"
+            | "daemon status"
+            | "daemon stop"
+            | "detect-implicit-projects"
+            | "diagnostics"
+            | "diagnostics capabilities"
+            | "embed"
+            | "eval"
+            | "eval compare"
+            | "eval run"
+            | "export"
+            | "extensions"
+            | "format-comment"
+            | "hooks"
+            | "index"
+            | "info"
+            | "instance"
+            | "instance abort-migration"
+            | "instance adopt-identity"
+            | "instance identity"
+            | "instance list"
+            | "instance merge"
+            | "instance pull"
+            | "instance register"
+            | "instance remove"
+            | "interactions"
+            | "interactions clear"
+            | "interactions forget"
+            | "interactions show"
+            | "interactions status"
+            | "list-features"
+            | "list-links"
+            | "list-projects"
+            | "list-repos"
+            | "list-services"
+            | "materialize-projects"
+            | "mcp"
+            | "memory"
+            | "pr-impact"
+            | "pre-push-impact"
+            | "publication"
+            | "publication cancel"
+            | "publication discard"
+            | "publication prune"
+            | "publication rebuild"
+            | "publication rollback"
+            | "publication status"
+            | "pull"
+            | "ranking"
+            | "ranking explain"
+            | "ranking rank"
+            | "remove-project"
+            | "remove-repo"
+            | "repair"
+            | "rerank"
+            | "rerank export-training"
+            | "rts-eval"
+            | "rts-eval record-truth"
+            | "rts-eval report"
+            | "server"
+            | "server backup"
+            | "server backup inspect"
+            | "server backup list"
+            | "server backup restore"
+            | "server backup save"
+            | "server init-tls"
+            | "server status"
+            | "setup"
+            | "snapshot"
+            | "snapshot build"
+            | "snapshot push"
+            | "snapshot verify"
+            | "suggest-links"
+            | "ui"
+            | "watch"
+            | "watch-stop" => NoTwin(
+                "administrative/mutating/local-only CLI surface; no MCP tool shares its operation",
+            ),
+
+            // Near-misses worth their own line so the absence reads as a
+            // decision, not an oversight.
+            "cluster" => NoTwin(
+                "MCP exposes only the bulk `clusters` listing; no single-cluster lookup tool exists",
+            ),
+            "symbol" => NoTwin(
+                "MCP's read_symbols reads source spans; no MCP tool performs a name/UID lookup returning ambiguous-match candidates",
+            ),
+            "service-summary" => NoTwin(
+                "get_summary's `level` enum has no \"service\" granularity; a distinct, unmapped concept",
+            ),
+            "repo-map" => NoTwin("nw-397: no MCP tool generates a repo map"),
+
+            _ => return None,
+        })
+    }
+
+    /// nw-217b: completeness for [`declared_cli_mcp_twin`]. Walks the same
+    /// tree the bounds sweep walks and asserts every visited path has an
+    /// arm -- an undeclared command (new or renamed) FAILS this test rather
+    /// than silently falling through the old mechanical guess.
+    #[test]
+    fn every_cli_path_is_declared_in_the_mcp_mapping() {
+        let undeclared = on_big_stack(|| {
+            let root = Cli::command();
+            let mut queue: Vec<(&clap::Command, Vec<String>)> = vec![(&root, Vec::new())];
+            let mut undeclared = Vec::new();
+            let mut visited = 0usize;
+            while let Some((cmd, path)) = queue.pop() {
+                for sub in cmd.get_subcommands() {
+                    let mut child = path.clone();
+                    child.push(sub.get_name().to_string());
+                    queue.push((sub, child));
+                }
+                if path.is_empty() {
+                    continue;
+                }
+                visited += 1;
+                let joined = path.join(" ");
+                match declared_cli_mcp_twin(&joined) {
+                    None => undeclared.push(joined),
+                    // A `NoTwin` with an empty reason is indistinguishable
+                    // from an oversight -- reading the field here is what
+                    // keeps it a real assertion instead of dead weight the
+                    // bounds test below never touches (it only matches
+                    // `Tool`).
+                    Some(CliMcpTwin::NoTwin(reason)) => assert!(
+                        !reason.trim().is_empty(),
+                        "`{joined}` is declared NoTwin with an empty reason"
+                    ),
+                    Some(CliMcpTwin::Tool(_)) => {}
+                }
+            }
+            assert!(
+                visited >= 100,
+                "CLI walk looks vacuous -- only {visited} path(s) visited"
+            );
+            undeclared.sort();
+            undeclared
+        });
+        assert!(
+            undeclared.is_empty(),
+            "{} CLI command(s) have no entry in `declared_cli_mcp_twin` -- \
+             classify each as `Tool(\"...\")` or `NoTwin(\"...\")`:\n{}",
+            undeclared.len(),
+            undeclared.join("\n")
+        );
     }
 
     /// nw-217b, the S4 leg of [[nw-217]]: for every CLI flag with an MCP schema
@@ -27774,6 +28145,29 @@ mod cli_help_contract_tests {
     /// value one past each declared bound and requires a rejection. That is the
     /// same thing the user would hit, and it is what a missing `value_parser`
     /// fails.
+    ///
+    /// REPAIRED 2026-09-04 (nw-217b reopened by nw-431/nw-432): two holes
+    /// fixed alongside the mapping above.
+    ///
+    /// HOLE 2 -- a required argument declared as a LONG FLAG (`blast-radius
+    /// --files`, `detect-changes --files`) could never be satisfied, because
+    /// the old loop only filled in `cmd.get_positionals()`. Every probe argv
+    /// then failed to parse for the UNRELATED reason of a missing `--files`,
+    /// `is_ok()` was false either way, and no bound could ever be asserted --
+    /// this is exactly how nw-432 (`blast-radius --limit` accepting 10000
+    /// against a declared MCP maximum of 1000) went unnoticed. Required
+    /// flags are now filled in the same way required positionals already
+    /// were.
+    ///
+    /// ANTI-VACUITY -- the old guard was `pairs >= 5 && probes >= 5`, and
+    /// both counters incremented on every ATTEMPT regardless of whether the
+    /// attempt asserted anything real. Hole 2 shows why that is not enough:
+    /// a probe against `blast-radius --limit` incremented `probes` and then
+    /// failed to parse for the missing `--files`, "passing" the way a
+    /// correctly-enforced bound would have -- so the counter looked healthy
+    /// while measuring nothing. `asserted_pairs` now only counts a pair once
+    /// it produces a probe that reached `try_get_matches_from`, which after
+    /// the Hole 2 fix means the parse genuinely turned on the bound.
     #[test]
     fn cli_flags_enforce_the_bounds_their_mcp_schema_twins_declare() {
         let listing = nestweaver_mcp::tools::tool_list(false);
@@ -27790,10 +28184,12 @@ mod cli_help_contract_tests {
             schema_by_tool.len()
         );
 
-        let (violations, pairs, probes) = on_big_stack(move || {
+        let (violations, pairs, asserted_pairs, probes) = on_big_stack(move || {
             let root = Cli::command();
             let mut violations: Vec<String> = Vec::new();
             let mut pairs = 0usize;
+            let mut asserted_pairs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut probes = 0usize;
             let mut queue: Vec<(&clap::Command, Vec<String>)> = vec![(&root, Vec::new())];
 
@@ -27806,24 +28202,39 @@ mod cli_help_contract_tests {
                 if path.is_empty() {
                     continue;
                 }
-                let Some(schema) = tool_name_for_cli_path(&path.join(" "))
-                    .and_then(|tool| schema_by_tool.get(&tool))
-                else {
+                let joined = path.join(" ");
+                let Some(CliMcpTwin::Tool(tool)) = declared_cli_mcp_twin(&joined) else {
                     continue;
+                };
+                let Some(schema) = schema_by_tool.get(tool) else {
+                    panic!(
+                        "`{joined}` is declared as MCP tool `{tool}`, but no such tool is \
+                         registered -- fix the declaration in `declared_cli_mcp_twin`"
+                    );
                 };
                 let Some(properties) = schema["properties"].as_object() else {
                     continue;
                 };
                 pairs += 1;
 
-                // Required positionals must be satisfied or the parse fails for
-                // an unrelated reason and every probe would "pass".
+                // Required positionals AND required long flags must both be
+                // satisfied, or the parse fails for a reason that has
+                // nothing to do with the bound under test and every probe
+                // "passes" whether or not the bound is enforced (Hole 2).
                 let mut base: Vec<String> = vec!["nestweaver".to_string()];
                 base.extend(path.iter().cloned());
                 for positional in cmd.get_positionals() {
                     if positional.is_required_set() {
                         base.push("probe-value".to_string());
                     }
+                }
+                for arg in cmd.get_arguments() {
+                    if arg.is_positional() || arg.is_hide_set() || !arg.is_required_set() {
+                        continue;
+                    }
+                    let Some(long) = arg.get_long() else { continue };
+                    base.push(format!("--{long}"));
+                    base.push("probe-value".to_string());
                 }
 
                 for arg in cmd.get_arguments() {
@@ -27846,27 +28257,37 @@ mod cli_help_contract_tests {
                         argv.push(format!("--{long}"));
                         argv.push(out_of_range.to_string());
                         probes += 1;
+                        asserted_pairs.insert(joined.clone());
                         if root.clone().try_get_matches_from(&argv).is_ok() {
                             violations.push(format!(
-                                "`{}` accepts --{long} {out_of_range}, but the MCP schema declares \
-                                 {key} {bound}: the bound is a property of the transport, not the \
-                                 contract (nw-259b)",
-                                path.join(" ")
+                                "`{joined}` accepts --{long} {out_of_range}, but the MCP schema \
+                                 declares {key} {bound}: the bound is a property of the \
+                                 transport, not the contract (nw-259b)"
                             ));
                         }
                     }
                 }
             }
             violations.sort();
-            (violations, pairs, probes)
+            (violations, pairs, asserted_pairs, probes)
         });
 
         // Anti-vacuity: a walk that matched nothing would report zero
-        // violations and read exactly like a clean result.
+        // violations and read exactly like a clean result. `pairs` counts
+        // every mapped CLI/MCP pair with a schema (attempted); `asserted_pairs`
+        // counts only those where a probe actually ran `try_get_matches_from`
+        // against a real declared bound (asserted) -- the distinction Hole 2
+        // showed matters.
         assert!(
-            pairs >= 5 && probes >= 5,
-            "bounds sweep looks vacuous -- {pairs} CLI/MCP pair(s) and {probes} probe(s); \
-             the guard is not actually comparing anything"
+            pairs >= 25,
+            "bounds sweep looks vacuous -- only {pairs} CLI/MCP pair(s) mapped; \
+             the declaration table is not actually being reached"
+        );
+        assert!(
+            asserted_pairs.len() >= 8 && probes >= 10,
+            "bounds sweep looks vacuous -- {} pair(s) produced a real probe and {probes} \
+             probe(s) ran; the guard is not actually comparing anything",
+            asserted_pairs.len()
         );
         assert!(
             violations.is_empty(),

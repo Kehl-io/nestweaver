@@ -1917,6 +1917,13 @@ mod tool_schema_validation_tests {
             ("detect_changes", json!({ "changed_files": [""] })),
             ("affected_tests", json!({ "changed_files": [""] })),
             ("blast_radius", json!({ "changed_files": [""] })),
+            // nw-379: the fourth surface -- `brain_context`/`code_context`
+            // already reject an empty `seeds` ARRAY in the handler, but
+            // declared no `minLength` on the ELEMENT, so `seeds: [""]`
+            // sailed through the schema and returned arbitrary notes at a
+            // flat `relevance: 0.4`.
+            ("brain_context", json!({ "seeds": [""] })),
+            ("code_context", json!({ "seeds": [""] })),
         ] {
             assert_invalid(name, args);
         }
@@ -4401,6 +4408,20 @@ fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// nw-379: an empty (or whitespace-only) query/pattern means "match
+/// everything", which is a scan-cost/response-amplification lever, not a
+/// request. `regex_search` and `count_patterns` already enforced this;
+/// `brain_search`, `investigate`, and the CLI's `search`/`investigate`/
+/// `regex-search`/`count-patterns` did not all agree -- some accepted an
+/// empty needle and returned arbitrary rows at exit 0, the same class of
+/// defect `brain_context`'s `seeds: [""]` gap shares one entry down. One
+/// predicate, shared by every surface this reaches (`pub` so the CLI in
+/// `src/main.rs` calls the same check rather than restating it), so the six
+/// surfaces cannot re-diverge the way they arrived here.
+pub fn is_blank_query(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
 fn tool_regex_search(
     store: &GraphStore,
     args: Value,
@@ -4411,7 +4432,7 @@ fn tool_regex_search(
         .or_else(|| args.get("query"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
-    if pattern.trim().is_empty() {
+    if is_blank_query(pattern) {
         // Same policy as count_patterns: an empty pattern matches everything,
         // which is a scan-cost/response-amplification lever, not a query.
         return Err(anyhow!("empty pattern strings are not allowed"));
@@ -4494,7 +4515,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
             patterns.len()
         );
     }
-    if patterns.iter().any(|p| p.trim().is_empty()) {
+    if patterns.iter().any(|p| is_blank_query(p)) {
         anyhow::bail!("empty pattern strings are not allowed");
     }
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
@@ -5075,7 +5096,11 @@ fn tool_schema_code_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    // nw-379: an empty-string ELEMENT is a different axis
+                    // than an empty ARRAY (the handler already rejects that
+                    // one) -- `minLength` closes the one the handler cannot
+                    // see, matching `read_symbols`' `targets`/`uids_or_fqns`.
+                    "items": { "type": "string", "minLength": 1 },
                     "description": "Symbol names or `sym:` UIDs to seed the traversal."
                 },
                 "limit": {
@@ -5110,7 +5135,15 @@ fn tool_schema_brain_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    // nw-379: `brain_context(seeds: [""])` returned arbitrary
+                    // notes at a flat `relevance: 0.4` -- the handler already
+                    // rejects an empty ARRAY ('seeds' must contain at least
+                    // one string) but declared no `minLength` on the
+                    // ELEMENT, so a blank string inside a non-empty array
+                    // sailed through. `read_symbols`' `targets`/
+                    // `uids_or_fqns` already declare this; the fix here is
+                    // the same declaration, not new code.
+                    "items": { "type": "string", "minLength": 1 },
                     "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, free-text terms, or UIDs (sym:/note:/head:/sec:/tag:)."
                 },
                 "token_budget": {
@@ -6073,6 +6106,15 @@ fn tool_brain_search(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'query' must be a string"))?
         .to_string();
+    // nw-379: above `expand_query_with_aliases` on purpose. An empty query
+    // means "match everything" here (and in `investigate`), the same
+    // amplification `regex_search`/`count_patterns` already refuse -- and
+    // alias expansion runs on the raw string, so checking after it would let
+    // an alias table turn `""` into a non-empty expansion and slip past a
+    // check placed below it.
+    if is_blank_query(&raw_query) {
+        return Err(anyhow!("empty query strings are not allowed"));
+    }
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -14878,6 +14920,12 @@ fn tool_investigate(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'query' must be a string"))?;
+    // nw-379: an empty query returned a fully populated bundle at a flat
+    // relevance -- see `is_blank_query`'s doc comment for why that is the
+    // same defect `regex_search`/`count_patterns` already refuse.
+    if is_blank_query(query) {
+        return Err(anyhow!("empty query strings are not allowed"));
+    }
     // nw-189: "all", not "vault". The result echoes this string back, and
     // defaulting to "vault" told an agent that supplied NO scope that its
     // results were vault-scoped while code symbols from every repo came back.
@@ -18691,6 +18739,36 @@ mod arg_alias_tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("empty pattern"), "{err}");
+        }
+    }
+
+    /// nw-379: `brain_search` used to treat an empty query as "match
+    /// everything" and return real rows at `total_matches: 100000` -- the
+    /// same amplification `regex_search` already refuses. This must fail
+    /// BEFORE `expand_query_with_aliases` runs, or an alias table could turn
+    /// `""` into a non-empty expansion and slip past a check placed after it.
+    #[test]
+    fn brain_search_rejects_empty_query() {
+        let store = GraphStore::in_memory().unwrap();
+        for args in [json!({ "query": "" }), json!({ "query": "   " })] {
+            let err = tool_brain_search(&store, None, args, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("empty query"), "{err}");
+        }
+    }
+
+    /// nw-379: `investigate ""` used to return a fully populated bundle with
+    /// a real `bundle_id` -- an empty query hitting hybrid PPR+BM25
+    /// retrieval is the same "match everything" defect as `brain_search`'s.
+    #[test]
+    fn investigate_rejects_empty_query() {
+        let store = GraphStore::in_memory().unwrap();
+        for args in [json!({ "query": "" }), json!({ "query": "   " })] {
+            let err = tool_investigate(&store, None, args, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("empty query"), "{err}");
         }
     }
 }
