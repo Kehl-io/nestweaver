@@ -1262,7 +1262,9 @@ pub async fn two_tier_query(
         Err(error) => {
             let has_healthy_upstream = client.upstreams.iter().any(|u| u.is_healthy());
             match has_healthy_upstream
-                .then(|| degraded_local_impact_for_unresolved_repo_filter(tool_name, &error))
+                .then(|| {
+                    degraded_local_impact_for_unresolved_repo_filter(tool_name, &error, params)
+                })
                 .flatten()
             {
                 Some(degraded) => degraded,
@@ -1318,9 +1320,22 @@ const UNRESOLVED_REPO_FILTER_SIGNAL: &str = "repo filter entry ";
 /// (`status`, `gate_state`, `coverage`, `notifications`) rather than
 /// inventing a new disclosure vocabulary, so a caller already reading that
 /// contract sees the familiar fields instead of a bespoke sentinel.
+///
+/// `changed_files`, `max_depth`, `blind_spots` and `analysis_direction` are
+/// UNCONDITIONALLY present in every real `tool_blast_radius` response
+/// (success or a genuine degrade — see `tools.rs`'s response builder), so
+/// this stand-in fills them too rather than silently departing from the
+/// documented shape: `changed_files`/`max_depth` echo the request the same
+/// way the real tool does, `blind_spots` uses the same four ALWAYS-present
+/// inherent gaps plus `not-indexed` (this run has, by construction, zero
+/// local coverage of the named repo — the same blind spot
+/// `analyze_blast_radius` itself adds whenever `repos_not_indexed` is
+/// non-empty), and `analysis_direction` is the one value this codebase ever
+/// produces for it.
 fn degraded_local_impact_for_unresolved_repo_filter(
     tool_name: &str,
     error: &anyhow::Error,
+    params: &Value,
 ) -> Option<Value> {
     if tool_name != "blast_radius" {
         return None;
@@ -1329,7 +1344,14 @@ fn degraded_local_impact_for_unresolved_repo_filter(
     if !rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL) {
         return None;
     }
+    let changed_files = params
+        .get("changed_files")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let max_depth = params.get("max_depth").and_then(Value::as_u64).unwrap_or(3);
     Some(serde_json::json!({
+        "changed_files": changed_files,
+        "max_depth": max_depth,
         "status": "partial",
         "gate_state": "degraded-unknown",
         "affected_symbol_count": 0,
@@ -1350,6 +1372,18 @@ fn degraded_local_impact_for_unresolved_repo_filter(
         "cochanged_files": [],
         "resolver_stale_repos": [],
         "risk": "low",
+        // The four inherent gaps every real response carries, plus
+        // "not-indexed" — this stand-in exists BECAUSE the local index has
+        // no coverage of the named repo, the exact condition
+        // `analyze_blast_radius` itself flags with this same blind spot.
+        "blind_spots": [
+            "dynamic-dispatch",
+            "reflection",
+            "config-wiring",
+            "codegen",
+            "not-indexed",
+        ],
+        "analysis_direction": "over-approximate",
         "notifications": [{
             "level": "error",
             "descriptor": "repo-filter-unresolved-locally",
@@ -1397,14 +1431,56 @@ mod tests {
         );
         let daemon_wrapped = anyhow::anyhow!("tool blast_radius failed: {inner:#}")
             .context("blast_radius RPC failed");
+        let params = json!({
+            "changed_files": ["src/theme/ThemeContext.tsx"],
+            "max_depth": 5,
+            "repo": "bx-react-native-client",
+        });
 
-        let degraded =
-            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &daemon_wrapped)
-                .expect("the wrapped daemon error must still be recognized");
+        let degraded = degraded_local_impact_for_unresolved_repo_filter(
+            "blast_radius",
+            &daemon_wrapped,
+            &params,
+        )
+        .expect("the wrapped daemon error must still be recognized");
 
         assert_eq!(degraded["status"], "partial");
         assert_eq!(degraded["gate_state"], "degraded-unknown");
         assert_eq!(degraded["affected_symbol_count"], 0);
+        // nw-428 review round 4: a real tool_blast_radius response
+        // UNCONDITIONALLY carries changed_files/max_depth/blind_spots/
+        // analysis_direction, success or degrade — a stand-in that omitted
+        // them would silently depart from the documented response shape.
+        assert_eq!(
+            degraded["changed_files"],
+            json!(["src/theme/ThemeContext.tsx"]),
+            "must echo the request's changed_files, not omit the field"
+        );
+        assert_eq!(
+            degraded["max_depth"], 5,
+            "must echo the request's max_depth"
+        );
+        assert_eq!(
+            degraded["analysis_direction"], "over-approximate",
+            "must carry the same analysis_direction every real response does"
+        );
+        let blind_spots: Vec<&str> = degraded["blind_spots"]
+            .as_array()
+            .expect("blind_spots must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for inherent in ["dynamic-dispatch", "reflection", "config-wiring", "codegen"] {
+            assert!(
+                blind_spots.contains(&inherent),
+                "the four inherent blind spots must always be present; got {blind_spots:?}"
+            );
+        }
+        assert!(
+            blind_spots.contains(&"not-indexed"),
+            "this stand-in exists BECAUSE the repo has no local coverage, so \
+             not-indexed must be flagged; got {blind_spots:?}"
+        );
         let notifications = degraded["notifications"]
             .as_array()
             .expect("notifications must be an array");
@@ -1422,6 +1498,25 @@ mod tests {
         );
     }
 
+    /// COUNTERWEIGHT: `changed_files`/`max_depth` must come from the
+    /// request, not a hardcoded default, or a caller reading the degraded
+    /// stand-in back would see the wrong file list. Omitting `max_depth`
+    /// from the request must still fall back to the real tool's own
+    /// default (3), not a missing field.
+    #[test]
+    fn degraded_stand_in_echoes_request_fields_and_defaults_missing_max_depth() {
+        let error = anyhow::anyhow!("repo filter entry \"x\": repo 'x' not found in graph");
+        let params = json!({ "changed_files": ["a.rs", "b.rs"] });
+        let degraded =
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &params)
+                .expect("recognized signal must still produce a stand-in");
+        assert_eq!(degraded["changed_files"], json!(["a.rs", "b.rs"]));
+        assert_eq!(
+            degraded["max_depth"], 3,
+            "an omitted max_depth must default to 3, matching tool_blast_radius's own default"
+        );
+    }
+
     /// COUNTERWEIGHT: an unrelated local failure (transport outage, a real
     /// bug — anything that doesn't carry the recognized signal) must NOT be
     /// absorbed into a degraded stand-in; it has to keep propagating as a
@@ -1431,7 +1526,8 @@ mod tests {
     fn degraded_stand_in_ignores_unrelated_local_failures() {
         let error = anyhow::anyhow!("connection refused").context("blast_radius RPC failed");
         assert!(
-            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error).is_none(),
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &json!({}))
+                .is_none(),
             "an unrelated failure must not be reinterpreted as an unresolved repo filter"
         );
     }
@@ -1445,7 +1541,8 @@ mod tests {
     fn degraded_stand_in_is_scoped_to_blast_radius_only() {
         let error = anyhow::anyhow!("repo filter entry \"x\": repo 'x' not found in graph");
         assert!(
-            degraded_local_impact_for_unresolved_repo_filter("brain_impact", &error).is_none(),
+            degraded_local_impact_for_unresolved_repo_filter("brain_impact", &error, &json!({}))
+                .is_none(),
             "the same message signal must not be reinterpreted for a different tool"
         );
     }

@@ -299,4 +299,52 @@ mod tests {
         assert!(nodes.iter().any(|n| n.uid.starts_with("tag:")));
         assert!(nodes.iter().any(|n| n.location == "Workspaces/a.rs"));
     }
+
+    /// nw-428 review round 4: `nestweaver-client/src/hybrid.rs`'s two-tier
+    /// federation fix recognizes an unresolved `repo` filter SOLELY by
+    /// matching the literal prefix this function wraps its error in. That
+    /// match lives in a different crate and, until now, nothing pinned the
+    /// literal at its SOURCE — a rename here would leave both the
+    /// `tools.rs` tests (which only assert `contains("not found")` /
+    /// `contains("ambiguous")`, never the wrapper) and `hybrid.rs`'s tests
+    /// (which hand-construct the fixture string rather than calling this
+    /// function) green while silently reverting federation to the exact
+    /// regression nw-428 review round 3 fixed: a bogus/not-locally-indexed
+    /// `--repo` would once again kill the entire two-tier response, because
+    /// `hybrid.rs` would never recognize the new wording.
+    ///
+    /// COUNTERWEIGHT: change the wrapper string below (e.g. drop the
+    /// trailing space, or reword "repo filter entry" to something else) and
+    /// this test fails immediately — verified by hand before committing.
+    #[test]
+    fn resolve_repo_filter_not_found_error_is_pinned_to_the_literal_hybrid_rs_matches_on() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: REPO_A.to_string(),
+                url: "https://example.test/repo-a".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let error = resolve_repo_filter(&store, &["this-repo-does-not-exist".to_string()], None)
+            .unwrap_err()
+            .to_string();
+
+        // This exact prefix, with the trailing space, is the literal
+        // `nestweaver-client/src/hybrid.rs`'s `UNRESOLVED_REPO_FILTER_SIGNAL`
+        // constant matches against across the daemon/gRPC boundary. If this
+        // assertion needs to change, `UNRESOLVED_REPO_FILTER_SIGNAL` (and its
+        // own test fixtures) must change with it in the same commit.
+        assert!(
+            error.starts_with("repo filter entry "),
+            "resolve_repo_filter's not-found error must start with the literal \
+             \"repo filter entry \" prefix nestweaver-client's federation fix \
+             matches on; got {error:?}"
+        );
+    }
 }
