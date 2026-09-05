@@ -9,6 +9,6 @@
 /release-please-config.json @kory-io
 /scripts/observe-release-visibility.sh @kory-io
 /scripts/verify-release-*.sh @kory-io
-/scripts/verify-release-install.js @kory-io
+/scripts/dedupe-changelog-entries.sh @kory-io
 /scripts/verify-required-ci.sh @kory-io
 /CONTRIBUTING.md @kory-io

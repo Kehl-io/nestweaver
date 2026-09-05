@@ -455,6 +455,23 @@ jobs:
           jq -r '.content' <<< "$current" | base64 -d > CHANGELOG.md.orig
           bash scripts/dedupe-changelog-entries.sh CHANGELOG.md.orig > CHANGELOG.md.deduped
 
+          # Explicit floor guard, independent of the dedup script's own
+          # internal ones: a rewrite of generated content that nobody diffs
+          # by hand before it overwrites a live file must fail closed here
+          # too, not rely solely on the script never having a bug. An
+          # earlier version of this pipeline lacked this and would have
+          # accepted an empty CHANGELOG.md.deduped as "different from the
+          # original" and pushed it.
+          test -s CHANGELOG.md.deduped
+          bullet_re='^\* .*\(\[[0-9a-f]{7,40}\]\(https://github\.com/[^)]+/commit/[0-9a-f]{7,40}\)\)$'
+          orig_bullets=$(grep -cE "$bullet_re" CHANGELOG.md.orig)
+          deduped_bullets=$(grep -cE "$bullet_re" CHANGELOG.md.deduped)
+          removed_bullets=$((orig_bullets - deduped_bullets))
+          if [ "$removed_bullets" -lt 0 ] || [ "$removed_bullets" -gt 10 ]; then
+            echo "::error::dedup changed the bullet count by $removed_bullets (orig=$orig_bullets, deduped=$deduped_bullets), outside the safe bound for one release's merge-commit duplicates; refusing to overwrite CHANGELOG.md" >&2
+            exit 1
+          fi
+
           if cmp -s CHANGELOG.md.orig CHANGELOG.md.deduped; then
             echo "no duplicate changelog entries found"
             exit 0
@@ -1982,16 +1999,29 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
               --source-digest "$RELEASE_SHA"
 
+            # NOT gitHead. `npm publish <tarball-path>` -- what this step does,
+            # deliberately, so the published bytes are exactly the attested
+            # ones -- never attaches `gitHead` at all; npm only populates it
+            # when publishing a DIRECTORY inside a clean git working tree.
+            # Requiring `.gitHead == $sha` was checked against a real `npm
+            # view` response for a tarball-path publish and the field is
+            # simply absent, so that comparison is permanently false: even a
+            # publish that succeeded on the very first attempt (exit 0,
+            # provenance signed) would run all six retries and still report
+            # failure. `dist.integrity` is the SHA-512 of the exact packed
+            # bytes and is what the registry actually returns for any publish
+            # method -- a stronger, content-addressed proof of "this is
+            # precisely the artifact we attested", not a weaker substitute
+            # for the SHA it used to compare against.
             verify_registry() {
               local metadata
               metadata="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
-                name version gitHead dist.integrity --json 2>/dev/null)" || return 1
+                name version dist.integrity --json 2>/dev/null)" || return 1
               jq -e \
                 --arg name "$PACKAGE_NAME" \
                 --arg version "$PACKAGE_VERSION" \
-                --arg sha "$RELEASE_SHA" \
                 --arg integrity "$PACKAGE_INTEGRITY" \
-                '.name == $name and .version == $version and .gitHead == $sha and
+                '.name == $name and .version == $version and
                  .["dist.integrity"] == $integrity' <<< "$metadata" >/dev/null
             }
 

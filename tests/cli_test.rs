@@ -865,7 +865,6 @@ fn installation_docs_only_claim_live_channels() {
         "docs/architecture/project-brain.md",
         "CLAUDE.md",
         "npm/README.md",
-        "npm/install.js",
         "npm/bin/nestweaver",
     ];
     if repo_root.join("smithery.yaml").exists() {
