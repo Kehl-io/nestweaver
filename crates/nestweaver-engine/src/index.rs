@@ -2070,7 +2070,14 @@ const UNDISCLOSED_PRUNES: &[&str] = &[".git"];
 /// exclude case gets the remedy that actually works (drop or narrow the
 /// pattern), and its row exists at all only because a pruned tree is invisible
 /// either way — see the KNOWN ASYMMETRY note at the scan-phase drain.
-fn disclose_pruned_dir(pruned: crate::content_reader::SkippedDir) -> Option<SkippedFile> {
+///
+/// `pub(crate)`, not private: nw-436 gives `index_md.rs` (the vault indexer) a
+/// second drain site, and this is the ONE BUILDER above's whole point — a
+/// second, private copy of this match would be exactly the drifted twin nw-217
+/// describes.
+pub(crate) fn disclose_pruned_dir(
+    pruned: crate::content_reader::SkippedDir,
+) -> Option<SkippedFile> {
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
     }
@@ -2116,6 +2123,22 @@ fn disclose_pruned_dir(pruned: crate::content_reader::SkippedDir) -> Option<Skip
         "directory pruned before enumeration by a configured `[[repos]] exclude` \
          glob; drop or narrow that pattern to index it"
             .to_string()
+    } else if pruned.reason == crate::content_reader::CONFIGURED_FILE_EXCLUDE_REASON {
+        // nw-437. Same remedy as the directory case above (drop or narrow the
+        // pattern) but named at FILE granularity, and — unlike the directory
+        // case — the specific pattern is usually known, because this match
+        // runs against `self.excludes` directly rather than through the
+        // directory-only `dir_excludes` GlobSet. Name it when present; fall
+        // back to the generic wording rather than fail if it is ever absent.
+        match pruned.matched_pattern {
+            Some(pattern) => format!(
+                "file pruned during enumeration by the configured `[[repos]] exclude` \
+                 glob `{pattern}`; drop or narrow that pattern to index it"
+            ),
+            None => "file pruned during enumeration by a configured `[[repos]] exclude` \
+                      glob; drop or narrow that pattern to index it"
+                .to_string(),
+        }
     } else {
         format!(
             "directory pruned before enumeration by skip-dir policy ({}); \
