@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6323
+assertion_line: 6442
 expression: "parsed_references(\"simple.cpp\", &source)"
 ---
 - name: iostream
@@ -37,4 +37,19 @@ expression: "parsed_references(\"simple.cpp\", &source)"
   kind: Call
   start_line: 35
   context: logValue(temp);
+  receiver: ~
+- name: logGeneric
+  kind: Call
+  start_line: 42
+  context: logGeneric<double>(temp);
+  receiver: ~
+- name: logGeneric
+  kind: Call
+  start_line: 43
+  context: "sensors::logGeneric<double>(temp);"
+  receiver: sensors
+- name: logReading
+  kind: Call
+  start_line: 44
+  context: mgr.logReading<int>(temp);
   receiver: ~
