@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -e
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Resolve to the REAL script location, following symlinks. npm always installs
+# bins as a symlink -- node_modules/.bin/nestweaver for a local install, and
+# the global bin dir for `npm install -g` -- and `$0`/`dirname "$0"` there
+# resolve relative to the SYMLINK's own location, not this script's. That
+# silently pointed BINARY at a directory that never existed for any
+# npm-managed invocation (`npx nestweaver`, a bare `nestweaver` on PATH after
+# a global install, or `node_modules/.bin/nestweaver` directly); only calling
+# this file by its real path -- which no real install path does -- worked.
+source="${BASH_SOURCE[0]}"
+while [ -h "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  source="$(readlink "$source")"
+  case "$source" in
+    /*) ;;
+    *) source="$dir/$source" ;;
+  esac
+done
+DIR="$(cd -P "$(dirname "$source")/.." && pwd)"
 BINARY="$DIR/.nestweaver-bin/nestweaver"
 
 if [ ! -x "$BINARY" ]; then
