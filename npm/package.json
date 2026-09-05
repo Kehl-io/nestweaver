@@ -22,7 +22,7 @@
     "arm64"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
   "keywords": [
     "mcp",
