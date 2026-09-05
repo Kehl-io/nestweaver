@@ -299,7 +299,7 @@ jobs:
         run: |
           set -euo pipefail
           BIN="$PWD/target/release/nestweaver"
-          "$BIN" --no-daemon --no-embed index \
+          "$BIN" --no-daemon index \
             --repo testdata/js --db "$SETUP_DB"
           "$BIN" --no-daemon embed --local --accelerator cpu \
             --cache-dir "$MODEL_CACHE" --db "$SETUP_DB" \

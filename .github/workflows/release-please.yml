@@ -1121,7 +1121,6 @@ jobs:
               --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
               --name release-artifact-smoke \
               --db "$SMOKE_DIR/smoke.lbug" \
-              --no-embed \
               --with-trigrams \
               --json; then
             :
@@ -1137,7 +1136,6 @@ jobs:
                     --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
                     --name release-artifact-debug \
                     --db "$DEBUG_DIR/debug.lbug" \
-                    --no-embed \
                     --with-trigrams \
                     --json || true
             fi
