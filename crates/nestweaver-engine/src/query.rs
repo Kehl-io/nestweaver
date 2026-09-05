@@ -1571,6 +1571,29 @@ pub struct BrainContextResult {
     /// in force, matching `ContextResult::seed_resolution_limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_resolution_limit: Option<usize>,
+    /// Reviewed disclosure fix, nw-322/nw-362(b): when a [`RenderCap`] bounded
+    /// hydration, how many `fused` candidates passed `RenderCap::admit` (or
+    /// existed at all, when no `admit` was supplied) BEFORE either
+    /// partition's cap truncated them. This is the number `investigate`'s
+    /// `total` needs — `seeds.len() + connected.len()` alone silently
+    /// undercounts once a cap is in play, which is exactly the "undercount
+    /// presented as a count" defect nw-362(b) fixed one layer up, reintroduced
+    /// here by the SAME shape of bug: a caller computing its pre-cap
+    /// population from the post-cap result.
+    ///
+    /// `None` when no [`RenderCap`] was supplied (every caller but
+    /// `investigate`): `seeds.len() + connected.len()` already IS the
+    /// complete population there, so a separate count would be redundant.
+    ///
+    /// An upper bound on the true in-scope population, not an exact count:
+    /// counted at the `admit` check, before `render_brain_node` runs, and
+    /// that call can still return `None` for a UID that no longer resolves
+    /// (a stale/orphaned entry — see its own doc comment). That is rare, and
+    /// erring toward over-disclosing a drop rather than under-disclosing one
+    /// is the safe direction, but it means this number can be very slightly
+    /// higher than the count of candidates that could actually be rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_before_cap: Option<usize>,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -1851,21 +1874,53 @@ pub fn build_brain_context_hybrid_with_aliases(
 /// SEEDS ALONE still clears a caller's final cut (PPR's "seed nodes always
 /// included regardless of score" contract, which `project_context` and
 /// `brain_context` callers rely on, says nothing about a seed's score
-/// relative to non-seed nodes). Capping each partition independently and
-/// preserving each partition's existing fused-score order reproduces
-/// exactly what an uncapped call would have returned for any caller whose
-/// own final cut (like `investigate`'s) does not need more than the cap from
-/// either partition — see
-/// `investigate::tests::investigate_project_scope_stays_fast_on_a_large_project`,
-/// whose counterweight (reverting to `None`) fails its own timing assertion.
+/// relative to non-seed nodes).
+///
+/// `admit`, added after review caught a correctness regression the first cut
+/// of this type introduced: `fused` is scored by `GraphScope::unified()` —
+/// scope-agnostic — so without a pre-hydration filter, a caller with its OWN
+/// post-hydration scope filter (`investigate`'s `node_in_scope`) could have
+/// its cap's slots consumed by out-of-scope candidates that outrank the
+/// genuinely in-scope ones by GLOBAL score, and would be discarded by that
+/// filter anyway. That silently starved the filter of candidates it would
+/// otherwise have kept, and — because the filter runs after this cap —
+/// nothing downstream could tell the two apart from "nothing else was
+/// relevant". `admit`, when supplied, is applied to every fused UID BEFORE
+/// either partition's counter increments, so an out-of-scope candidate never
+/// occupies a slot a lower-ranked in-scope one needed. It takes a bare UID
+/// (no hydration): `investigate`'s `uid_in_scope` needs nothing else.
+///
+/// With `admit` filtering first, capping each partition independently and
+/// preserving each partition's existing fused-score order reproduces exactly
+/// what an uncapped call would have returned for any caller whose own final
+/// cut (like `investigate`'s) does not need more than the cap from either
+/// partition — see
+/// `investigate::tests::investigate_project_scope_stays_fast_on_a_large_project`
+/// (speed; every member is in scope, so it cannot exercise `admit`) and
+/// `investigate::tests::project_scope_render_cap_does_not_starve_members_outscored_globally`
+/// (the regression `admit` fixes: out-of-scope candidates that outrank every
+/// in-scope one by global score).
 ///
 /// `None` (via [`build_brain_context_hybrid_with_aliases`]) hydrates every
 /// fused entry, unchanged from before this existed — every caller but
 /// `investigate` still gets that.
-#[derive(Debug, Clone, Copy)]
-pub struct RenderCap {
+#[derive(Clone, Copy)]
+pub struct RenderCap<'a> {
     pub seeds: usize,
     pub connected: usize,
+    /// Pre-hydration admission test over a bare UID. `None` admits
+    /// everything (today's only other caller, none, needs a filter at all).
+    pub admit: Option<&'a dyn Fn(&str) -> bool>,
+}
+
+impl std::fmt::Debug for RenderCap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderCap")
+            .field("seeds", &self.seeds)
+            .field("connected", &self.connected)
+            .field("admit", &self.admit.map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 /// Like [`build_brain_context_hybrid_with_aliases`], but bounds hydration
@@ -1882,7 +1937,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     intent: Option<QueryIntent>,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    render_cap: Option<RenderCap>,
+    render_cap: Option<RenderCap<'_>>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -2198,16 +2253,42 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<BrainNode> = Vec::new();
     let mut connected: Vec<BrainNode> = Vec::new();
+    // Reviewed disclosure fix: counts every fused candidate that passes
+    // `admit` (or exists at all, when `admit` is `None`), BEFORE either
+    // partition's cap decides whether to hydrate it. This is the TRUE
+    // pre-cap population `BrainContextResult::admitted_before_cap` reports —
+    // `seeds.len() + connected.len()` after this loop already lost that
+    // number the moment the cap truncated anything.
+    let mut admitted_before_cap: usize = 0;
 
     for (uid, score) in &fused {
+        // Reviewed regression fix: `admit` runs BEFORE either partition's cap
+        // counter, on the bare UID, so a scope-agnostic global score cannot
+        // let an out-of-scope candidate consume a slot a lower-ranked
+        // in-scope one needed. `fused` is scope-agnostic
+        // (`GraphScope::unified()`), so without this an out-of-scope
+        // candidate that merely outranks an in-scope one by global score
+        // would fill the cap first, and the caller's OWN post-hydration
+        // scope filter — which runs strictly after this function returns —
+        // would then have nothing left to select from.
+        if let Some(cap) = render_cap
+            && let Some(admit) = cap.admit
+            && !admit(uid.as_str())
+        {
+            continue;
+        }
+        if render_cap.is_some() {
+            admitted_before_cap += 1;
+        }
         let is_seed = seed_set.contains(uid.as_str());
         // nw-322 (leg 3): skip the `render_brain_node` round-trip entirely
         // once THIS partition (seeds or connected, capped independently —
         // see `RenderCap`) has as many hydrated nodes as the caller asked
         // for. `fused` is already sorted by descending score, so each
-        // partition's cap keeps exactly its own highest-scoring members;
-        // scanning continues (rather than breaking) because the other
-        // partition may still be under its own cap.
+        // partition's cap keeps exactly its own highest-scoring members
+        // among candidates `admit` let through; scanning continues (rather
+        // than breaking) because the other partition may still be under its
+        // own cap.
         if let Some(cap) = render_cap {
             let (bucket_len, bucket_cap) = if is_seed {
                 (seeds.len(), cap.seeds)
@@ -2250,6 +2331,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         seed_matches_total_relation: seed_name_tally.total_relation(),
         seeds_truncated: seed_name_tally.truncated(),
         seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
+        admitted_before_cap: render_cap.map(|_| admitted_before_cap),
     })
 }
 

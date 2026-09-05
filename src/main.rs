@@ -272,6 +272,16 @@ fn load_cli_local_embedder(
 /// implicit in an ordinary read, not an operator-initiated `embed`, so it
 /// must never reach the network — the same distinction
 /// `daemon_startup_artifact_mode` draws for the daemon's own boot.
+///
+/// THE COST, stated rather than left for someone to discover: this is a
+/// real per-invocation model load, not a cache hit — measured on a real
+/// store with a cached local model, `~1.3-2.0s` and `~1.5 GB` additional RSS
+/// versus the same call with `--no-embed` (`~2.6s`/`~0.8 GB` without a
+/// model, `~4.0s`/`~2.3 GB` with one; Metal). The trade is accepted here
+/// because `project-context` is typically one call per session and a
+/// correct answer is worth more than a fast wrong one — but it is a cost,
+/// and `--no-embed` exists to opt out of it for callers that would rather
+/// have the speed.
 #[cfg(feature = "embed")]
 fn load_direct_semantic_model(
     store: &nestweaver_store::GraphStore,
@@ -5899,10 +5909,20 @@ enum Commands {
             help = "Half-life for age-decay in days (default 30.0)"
         )]
         recency_half_life_days: f64,
-        /// Disable semantic ranking for this call — the daemon's loaded
-        /// embed model is the only place this command ever reaches semantic
-        /// ranking; without a daemon it never has one regardless of this
-        /// flag.
+        /// Disable semantic ranking for this call.
+        ///
+        /// Unlike `context`/`search`, this command's direct route (forced by
+        /// `--config`/`--no-tests`/`--prefer-instance`, or a missing daemon)
+        /// loads its OWN embed model when the store has persisted vectors,
+        /// so this flag gates that load too, not only the daemon's. Loading
+        /// it costs real, unavoidable per-invocation latency and memory
+        /// (measured: ~1.3-2.0s and ~1.5 GB RSS extra on a real store with a
+        /// cached model) — pass this flag if you want lexical/PPR-only speed
+        /// instead.
+        // nw-429: see `load_direct_semantic_model`'s doc comment for the full
+        // mechanism; this `//` (not `///`) so the ticket id stays out of
+        // `--help`, which `rendered_help_never_names_an_internal_ticket`
+        // enforces.
         #[arg(long)]
         no_embed: bool,
     },
@@ -31263,6 +31283,7 @@ mod context_json_renderer_tests {
             seed_matches_total_relation: None,
             seeds_truncated: None,
             seed_resolution_limit: None,
+            admitted_before_cap: None,
         }
     }
 
