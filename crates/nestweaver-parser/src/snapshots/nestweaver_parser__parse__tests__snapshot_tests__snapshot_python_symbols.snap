@@ -1,20 +1,7 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6362
 expression: "parsed_symbols(\"simple.py\", &source)"
 ---
-- name: "<module>"
-  kind: Function
-  start_line: 1
-  end_line: 38
-  signature: "<python module top level>"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: true
-  entry_point_kind: Main
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-  scope_chain: ~
 - name: standalone_function
   kind: Function
   start_line: 4
