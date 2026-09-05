@@ -2043,10 +2043,49 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 /// real repositories, which is the entire reason `FilesystemReader::unskipping`
 /// exists — and a guess is precisely the thing that has to be disclosed.
 ///
-/// DO NOT grow this list to quiet a noisy repo. The supported answers are
-/// `[[repos]] unskip` (re-admit the directory) or accepting the degraded
-/// status as the true statement it is.
-const UNDISCLOSED_PRUNES: &[&str] = &[".git"];
+/// `.obsidian` and `.trash` (nw-436 review) meet the SAME bar for the vault
+/// caller. `.obsidian` is Obsidian's own app-config directory — never a place
+/// the user writes notes, by construction, exactly like `.git` — and `.trash`
+/// is where Obsidian's own delete lands files, not first-party content the
+/// operator authored. Both are present in EVERY Obsidian vault, so once the
+/// vault drain (nw-436) was wired, leaving them disclosed would degrade
+/// `coverage_status` on literally every vault forever — the same
+/// always-fires failure this comment already explains for `.git`, just
+/// arrived at through a second caller instead of a second repo.
+///
+/// DO NOT grow this list to quiet a noisy repo/vault. The supported answers
+/// are `[[repos]] unskip` for a repo (re-admit the directory), or accepting
+/// the degraded status as the true statement it is. A vault has no `unskip`
+/// equivalent — see [`SkipDirCaller::Vault`]'s remedy in
+/// [`disclose_pruned_dir`] for what a vault operator can actually do instead.
+const UNDISCLOSED_PRUNES: &[&str] = &[".git", ".obsidian", ".trash"];
+
+/// Which population of `SKIP_DIRS`-style prunes a [`disclose_pruned_dir`] call
+/// is describing — changes ONLY the generic (non-`exclude`, non-`.gitignore`)
+/// branch's remedy.
+///
+/// nw-436 review: extending `disclose_pruned_dir` to a second caller
+/// (`index_md.rs`, the vault indexer) without adapting its remedy is exactly
+/// the class of bug this function's own doc comment already describes for
+/// `exclude` vs `unskip` — a fresh nw-334 instance (a remedy nobody can
+/// execute) on the very code path whose comment congratulates itself for
+/// having fixed that once. `[[repos]] unskip` is a field on `RepoConfig`,
+/// matched by `[[repos]] url`; there is no vault equivalent, so telling a
+/// vault operator to "re-admit it with `[[repos]] unskip`" is inert advice —
+/// worse than useless for `.obsidian`/`.trash`, which is why those two are
+/// carved out of disclosure entirely instead (see [`UNDISCLOSED_PRUNES`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipDirCaller {
+    /// A code repo indexed via `nestweaver index` (any of the three drain
+    /// sites in this file). `[[repos]] unskip` genuinely re-admits a
+    /// `SKIP_DIRS` name here.
+    Repo,
+    /// A markdown vault indexed via `index_md.rs`. There is currently no
+    /// per-vault re-admission surface for a default-skipped directory name —
+    /// the remedy has to say so rather than name a config field that does
+    /// not exist for vaults.
+    Vault,
+}
 
 /// Turn one recorded prune into the `SkippedFile` row the coverage gate reads,
 /// or `None` when that prune is deliberately not disclosed.
@@ -2074,9 +2113,11 @@ const UNDISCLOSED_PRUNES: &[&str] = &[".git"];
 /// `pub(crate)`, not private: nw-436 gives `index_md.rs` (the vault indexer) a
 /// second drain site, and this is the ONE BUILDER above's whole point — a
 /// second, private copy of this match would be exactly the drifted twin nw-217
-/// describes.
+/// describes. `caller` is what lets the two sites share the builder without
+/// sharing a remedy that is only true for one of them — see [`SkipDirCaller`].
 pub(crate) fn disclose_pruned_dir(
     pruned: crate::content_reader::SkippedDir,
+    caller: SkipDirCaller,
 ) -> Option<SkippedFile> {
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
@@ -2140,11 +2181,30 @@ pub(crate) fn disclose_pruned_dir(
                 .to_string(),
         }
     } else {
-        format!(
-            "directory pruned before enumeration by skip-dir policy ({}); \
-             re-admit it with `[[repos]] unskip`",
-            pruned.reason
-        )
+        match caller {
+            SkipDirCaller::Repo => format!(
+                "directory pruned before enumeration by skip-dir policy ({}); \
+                 re-admit it with `[[repos]] unskip`",
+                pruned.reason
+            ),
+            // nw-436 review: vaults have no `[[repos]] unskip` equivalent, so
+            // telling a vault operator to use it is an instruction that does
+            // nothing — exactly the nw-387 defect this function exists to
+            // avoid, just for a second caller. Renaming the directory IS
+            // something the operator can actually do (SKIP_DIRS matches an
+            // exact component name, so a rename genuinely un-prunes it), and
+            // `.brainignore` is named because it is the real, existing vault
+            // indexing config surface — even though it narrows coverage
+            // further rather than restoring what this specific policy pruned.
+            SkipDirCaller::Vault => format!(
+                "directory pruned by vault indexing's default skip-dir policy \
+                 ({}); there is no `[[repos]] unskip` for vaults — that config \
+                 governs code repos only. Rename the directory if it holds \
+                 notes you want indexed; vault-specific indexing exclusions \
+                 are otherwise configured via `.brainignore`",
+                pruned.reason
+            ),
+        }
     };
     Some(SkippedFile::new(
         pruned.path,
@@ -3061,19 +3121,20 @@ where
     // `Ignored` is the reason code because this is a POLICY skip, the same
     // class as the minified-bundle skip below, not a read or parse defect.
     //
-    // KNOWN ASYMMETRY, stated rather than hidden: the recorder also captures
-    // `[[repos]] exclude` patterns that prune a whole DIRECTORY, so those are
-    // disclosed here too, while the same feature's per-FILE matches are still
-    // dropped silently in `FilesystemReader::list_files`. Disclosing the half
-    // that is recorded is strictly better than disclosing neither, and this
-    // channel is deliberately not scoped to `SKIP_DIRS` alone — nw-394 (the
-    // git-tracked/gitignored divergence) is sequenced behind this item and
-    // needs to add its own rows to exactly this list.
+    // FORMER KNOWN ASYMMETRY, CLOSED BY nw-437: the recorder captures
+    // `[[repos]] exclude` patterns that prune a whole DIRECTORY, disclosed
+    // here, and — as of nw-437 — a per-FILE match now reaches this SAME
+    // channel too (`FilesystemReader::list_files`'s main loop records a
+    // `CONFIGURED_FILE_EXCLUDE_REASON` row instead of a bare `continue`), so
+    // there is no longer a silently-dropped half. This channel remains
+    // deliberately not scoped to `SKIP_DIRS` alone — nw-394 (the
+    // git-tracked/gitignored divergence) and nw-436 (the vault caller) both
+    // add their own rows to exactly this list.
     // The row itself — reason code, message and the `.git` carve-out — is built
     // by `disclose_pruned_dir`, shared with the incremental drains so the two
     // commands cannot disagree about the same repo.
     for pruned in reader.skipped_dirs() {
-        if let Some(skipped) = disclose_pruned_dir(pruned) {
+        if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             scan_skipped_files.push(skipped);
         }
     }
@@ -5516,7 +5577,7 @@ fn drain_pruned_dirs_into_incremental(
     result: &mut IncrementalResult,
 ) {
     for pruned in reader.skipped_dirs() {
-        if let Some(skipped) = disclose_pruned_dir(pruned) {
+        if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             record_incremental_file_outcome(result, IncrementalFileOutcome::PolicySkipped(skipped));
         }
     }
