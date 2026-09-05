@@ -884,8 +884,43 @@ impl DaemonClient {
     /// After connecting, performs a version check. If the running daemon's
     /// version doesn't match this binary's version, it asks the daemon to
     /// gracefully drain active writes and shut down, then restarts.
+    ///
+    /// Autostarts with [`autostart::DaemonUsage::OneShot`] — the daemon this
+    /// spawns gets the shortened ephemeral idle-timeout when `db_path` looks
+    /// temporary. Use [`Self::connect_long_running`] for a foreground session
+    /// (`ui`, `watch`, `mcp`) that is expected to hold the connection open for
+    /// an unbounded, human-paced duration; see nw-088 leg (2) FOLLOW-UP.
     pub async fn connect(db_path: &Path, config_path: Option<&Path>) -> Result<Self> {
-        let sock_path = autostart::ensure_daemon_for_client_async(db_path, config_path).await?;
+        Self::connect_with_usage(db_path, config_path, autostart::DaemonUsage::OneShot).await
+    }
+
+    /// Connect the way [`Self::connect`] does, but DECLARE this session as
+    /// long-running: the daemon autostarted (or restarted mid-session, on a
+    /// version mismatch) here always gets the normal idle-timeout budget,
+    /// regardless of where `db_path` lives.
+    ///
+    /// nw-088 leg (2) FOLLOW-UP. Reproduced three times: `ui --db <path
+    /// under /tmp>` autostarted with the same 60s ephemeral idle-timeout a
+    /// one-shot `index` correctly gets, and the daemon self-terminated out
+    /// from under the live UI session ~55-100s later — every daemon-routed
+    /// endpoint (`/api/v1/search`, `/api/v1/symbol/{uid}`,
+    /// `/api/v1/brain/context`, `/api/v1/events`) then 503s until the
+    /// operator restarts it. `ui`, `watch` (blocks on Ctrl-C while the
+    /// daemon indexes in the background) and `mcp` (an agent's stdio
+    /// session) are the three commands in this binary that hold a
+    /// connection open indefinitely rather than issuing an RPC and exiting;
+    /// each calls this instead of `connect`.
+    pub async fn connect_long_running(db_path: &Path, config_path: Option<&Path>) -> Result<Self> {
+        Self::connect_with_usage(db_path, config_path, autostart::DaemonUsage::LongRunning).await
+    }
+
+    async fn connect_with_usage(
+        db_path: &Path,
+        config_path: Option<&Path>,
+        usage: autostart::DaemonUsage,
+    ) -> Result<Self> {
+        let sock_path =
+            autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
 
         // Version check. Bounded so a connected-but-unresponsive daemon can't hang connect().
@@ -983,6 +1018,7 @@ impl DaemonClient {
                         db_path,
                         restart_config.as_path(),
                         spawn_lock,
+                        usage,
                     )
                     .await?;
                     let verified =

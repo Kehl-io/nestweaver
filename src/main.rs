@@ -3544,6 +3544,38 @@ fn render_dead_code_text(payload: &serde_json::Value) {
                  recognised.\n"
             );
         }
+        // nw-435: the whole-corpus check above is blind to a MIXED-language
+        // corpus, where one language's real entry point (e.g. a Rust `main`)
+        // keeps the global `entry_points` count above zero while a different
+        // language in the SAME repo contributed analysed symbols but no entry
+        // point of its own — that language's reachability numbers are just as
+        // vacuous as the whole-corpus case above, and polyglot repos are the
+        // norm, not the exception, so this is the common case degraded runs
+        // hit. Name the languages, or "which one do I fix" has no answer.
+        let langs = payload
+            .get("languages_without_entry_points")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if !langs.is_empty() {
+            println!(
+                "Coverage DEGRADED: no entry point was found for: {langs}. Every symbol \
+                 analysed in {} is unreachable BY CONSTRUCTION, not because it is dead — add \
+                 an entry-point rule for {} or exclude {} from this analysis.\n",
+                if langs.contains(", ") {
+                    "these languages"
+                } else {
+                    "this language"
+                },
+                if langs.contains(", ") { "them" } else { "it" },
+                if langs.contains(", ") { "them" } else { "it" },
+            );
+        }
     };
     coverage_note();
 
@@ -14021,46 +14053,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // nw-397 LEG 3: gated on `!json`, the same shape `Summary` uses
+            // above ("the daemon tool returns the rendered text ... not
+            // structured data, so it can only serve human mode").
+            //
+            // The comment this replaces claimed the daemon route was "dead
+            // in practice today — no daemon answers repo_map". That was
+            // false: `nestweaver-daemon/src/server.rs`'s `repo_map_json` RPC
+            // handler DOES answer, every time a daemon is up (i.e. by
+            // default) — it just calls the bare `generate_repo_map`, which
+            // returns only a `String`. It has no `truncated`/
+            // `files_returned`/`files_total` to give back, so
+            // `value.get("truncated")` etc. below were reliably `None` and
+            // `repo-map --json` shipped a 5-key payload — no `truncated`, no
+            // `files_returned`, no `files_total` — with no error either:
+            // exactly the bug this leg fixes. Text mode never reads those
+            // three keys, so it keeps the daemon's (faster, lock-free) path;
+            // `--json` now always falls through to the direct path below,
+            // the one place that actually computes the bound.
+            if use_daemon && !json {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
                     // nw-370: read the daemon's own verdict, the same way
-                    // `hubs`/`bridges` do. Hoisted out of `if json` on purpose
-                    // — that is precisely the mistake nw-365 fixed on `hubs`,
-                    // where the verdict was built inside the JSON branch and
-                    // the plain-text route (the one users run) had nothing to
-                    // print.
+                    // `hubs`/`bridges` do.
                     let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
-                    if json {
-                        // nw-370: through `print_json_payload`, which stamps
-                        // `_meta`. This branch hand-rolled a struct and printed
-                        // it directly, so `repo-map --json` was the one payload
-                        // on this route with no provenance at all.
-                        //
-                        // nw-397: echo whatever the daemon said about
-                        // truncation, rather than re-deriving it from a
-                        // response that does not carry the file counts (this
-                        // route is dead in practice today — no daemon answers
-                        // "repo_map" — but is kept honest for when one does).
-                        print_repo_map_json(
-                            map,
-                            &staleness,
-                            value.get(nestweaver_schema::provenance::META_KEY).cloned(),
-                            value.get("truncated").and_then(serde_json::Value::as_bool),
-                            value
-                                .get("files_returned")
-                                .and_then(serde_json::Value::as_u64)
-                                .map(|n| n as usize),
-                            value
-                                .get("files_total")
-                                .and_then(serde_json::Value::as_u64)
-                                .map(|n| n as usize),
-                        )?;
-                    } else {
-                        print!("{map}");
-                    }
+                    print!("{map}");
                     warn_stale_resolver_rankings_no_store(&staleness);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -14068,17 +14087,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(db.as_deref())?;
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            // nw-439: `repo-map` has no MCP/daemon twin (the "repo_map" RPC
-            // name above never resolves on the daemon side, so this direct
-            // path is the ONLY path), which meant it never passed through
-            // `dispatch_cancellable`'s wait-then-classify handling — the
-            // same generic machinery `hubs`/`bridges` get for free via the
-            // daemon route. That left it with a bare `PageRank unavailable
-            // during dirty index publication` and no marker pid, no age, no
-            // remedy: an [[nw-334]] instance (an error naming no remedy) on
-            // top of the policy gap. Calling the SAME two functions directly
-            // gives it the identical wait and the identical disclosure,
-            // rather than growing a second, drifting copy of either.
+            // nw-439: `repo-map --json` has no MCP/daemon twin that can
+            // answer the full shape (the daemon's `repo_map_json` RPC exists
+            // but cannot supply `truncated`/`files_returned`/`files_total` —
+            // see the daemon-guard comment above), which meant it never
+            // passed through `dispatch_cancellable`'s wait-then-classify
+            // handling — the same generic machinery `hubs`/`bridges` get for
+            // free via the daemon route. That left it with a bare `PageRank
+            // unavailable during dirty index publication` and no marker pid,
+            // no age, no remedy: an [[nw-334]] instance (an error naming no
+            // remedy) on top of the policy gap. Calling the SAME two
+            // functions directly gives it the identical wait and the
+            // identical disclosure, rather than growing a second, drifting
+            // copy of either.
             nestweaver_mcp::tools::wait_out_index_publication(&store, None);
             // nw-397 LEG 2: the `_bounded` variant, because this is the ONE
             // route that can actually compute `truncated`/`files_returned`/
@@ -16726,6 +16747,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 /// the BFS never started, so "N of M unreachable" is the
                 /// absence of a finding rather than one (nw-351).
                 entry_points: usize,
+                /// nw-435, surfaced. `coverage_is_complete()` already reads
+                /// this field to decide "complete" vs "degraded" — it was
+                /// consulted but never serialized, so a polyglot repo (the
+                /// normal case, not the exception) degraded with
+                /// `undecodable_symbols: 0` and a healthy `entry_points`
+                /// count both looking fine, and no field naming which
+                /// language actually caused it.
+                languages_without_entry_points: Vec<String>,
                 min_confidence: String,
                 unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
             }
@@ -16753,6 +16782,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 },
                 undecodable_symbols: result.undecodable_symbols,
                 entry_points: result.entry_points,
+                languages_without_entry_points: result.languages_without_entry_points.clone(),
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;
@@ -17515,10 +17545,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let daemon_attempt = (|| {
                     let rt =
                         tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-                    let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
-                        &db_path,
-                        config.as_deref(),
-                    ))?;
+                    // nw-088 leg (2) FOLLOW-UP: `watch` blocks on Ctrl-C below
+                    // while the daemon does the actual indexing in the
+                    // background — a foreground session exactly like `ui`'s,
+                    // not a one-shot RPC. Declare it so the daemon this
+                    // autostarts (or the DB already has running) keeps its
+                    // normal idle-timeout budget rather than the shortened
+                    // ephemeral one a `/tmp` scratch db would otherwise get.
+                    let mut client =
+                        rt.block_on(nestweaver_client::DaemonClient::connect_long_running(
+                            &db_path,
+                            config.as_deref(),
+                        ))?;
                     let resp = rt.block_on(
                         client.watch_code_with_force(
                             // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
@@ -17749,12 +17787,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
                 let cwd = std::env::current_dir().unwrap_or_default();
+                // nw-088 leg (2) FOLLOW-UP: an MCP stdio session is a
+                // foreground server for the caller's whole agent session,
+                // not a one-shot RPC — it can idle far longer than 60s
+                // between tool calls while the agent/human reads or thinks.
+                // Declare it so the autostarted daemon keeps its normal
+                // idle-timeout budget.
                 let hybrid = rt
-                    .block_on(nestweaver_client::hybrid::HybridClient::connect(
-                        &db_path,
-                        config.as_deref().map(std::path::Path::new),
-                        &cwd,
-                    ))
+                    .block_on(
+                        nestweaver_client::hybrid::HybridClient::connect_long_running(
+                            &db_path,
+                            config.as_deref().map(std::path::Path::new),
+                            &cwd,
+                        ),
+                    )
                     .context("connect to daemon (hybrid)")?;
                 if hybrid.has_upstreams() {
                     tracing::info!(
@@ -17821,24 +17867,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let daemon_connection = if use_daemon {
                 match tokio::runtime::Runtime::new() {
-                    Ok(rt) => match rt.block_on(nestweaver_client::DaemonClient::connect(
-                        &db_path,
-                        config.as_deref().map(std::path::Path::as_ref),
-                    )) {
-                        Ok(client) => Some((rt, client)),
-                        Err(error) => {
-                            ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                    // nw-088 leg (2) FOLLOW-UP: `ui` serves until the operator
+                    // closes it — the interactive, foreground session this
+                    // whole leg exists for. Declare it so the daemon it
+                    // autostarts keeps its normal idle-timeout budget instead
+                    // of the shortened ephemeral one, even when `--db` points
+                    // under `/tmp` (a scratch/test database, exactly where a
+                    // `ui` session legitimately lives).
+                    Ok(rt) => {
+                        match rt.block_on(nestweaver_client::DaemonClient::connect_long_running(
+                            &db_path,
+                            config.as_deref().map(std::path::Path::as_ref),
+                        )) {
+                            Ok(client) => Some((rt, client)),
+                            Err(error) => {
+                                ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
                                 .with_context(|| {
                                     format!(
                                         "daemon UI connection failed ({error:#}); refusing direct fallback"
                                     )
                                 })?;
-                            tracing::warn!(
-                                "daemon UI connection failed, falling back to direct: {error:#}"
-                            );
-                            None
+                                tracing::warn!(
+                                    "daemon UI connection failed, falling back to direct: {error:#}"
+                                );
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(error) => {
                         ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
                             .with_context(|| {

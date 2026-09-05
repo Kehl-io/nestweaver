@@ -9800,3 +9800,200 @@ fn hubs_bridges_and_repo_map_refuse_identically_during_a_dirty_publication() {
             .success();
     }
 }
+
+/// nw-435, surfaced. `languages_without_entry_points` is a `pub` field on
+/// `DeadCodeResult`, consulted by `coverage_is_complete()` to decide
+/// "complete" vs "degraded" (see `language_with_zero_entry_points_degrades_coverage_even_with_another_languages_entry`
+/// in `nestweaver-engine/src/dead_code.rs`, which proves the FIELD is
+/// computed correctly) — but it was never serialized into either the CLI's
+/// `DeadCodeJson` or the MCP tool's JSON, so a caller had no way to learn
+/// WHICH language caused a degrade it could plainly see (`coverage:
+/// "degraded"` with `undecodable_symbols: 0` and a healthy `entry_points`
+/// count, both looking fine). Polyglot repos are the norm, so this is the
+/// common case a degraded run hits, not an edge case.
+///
+/// Asserted on the ACTUAL COMMAND OUTPUT (the CLI's `--json`, the CLI's
+/// plain-text rendering, and the MCP tool's `structuredContent`) — the
+/// engine-level test above already proves the field is computed; this one
+/// proves it actually reaches a caller on every surface, which is where the
+/// prior struct-level test could not have caught the omission.
+#[test]
+fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    // Rust contributes a REAL entry point (`fn main`), keeping the
+    // whole-corpus `entry_points` count healthy. Bash contributes analysed
+    // symbols (two functions) but no entry point of its own — the exact
+    // shape nw-435 leg 1 fixed at the struct level.
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() -> i32 { 42 }\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("deploy.sh"),
+        "#!/bin/bash\ndeploy_app() {\n  echo deploying\n}\n\ncleanup() {\n  echo cleanup\n}\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // ── JSON surface.
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(
+        payload["coverage"],
+        serde_json::json!("degraded"),
+        "fixture-adequacy check: this fixture must genuinely degrade, or \
+         everything below is vacuous: {payload}"
+    );
+    assert_eq!(
+        payload["undecodable_symbols"],
+        serde_json::json!(0),
+        "the degrade here must come from the entry-point gap, not a store \
+         decode failure — otherwise this is not exercising nw-435's case: {payload}"
+    );
+    assert!(
+        payload["entry_points"].as_u64().unwrap_or(0) > 0,
+        "the whole-corpus entry_points count must stay healthy (rust has a \
+         real main) — a zero here would mean nw-351's OLDER check caught it \
+         instead, which is a different bug: {payload}"
+    );
+    assert_eq!(
+        payload["languages_without_entry_points"],
+        serde_json::json!(["bash"]),
+        "the one field this fix adds must actually be present and name bash: {payload}"
+    );
+
+    // ── Plain-text surface: the human-readable output must say WHICH
+    // language, not just that something degraded.
+    let text_output = nestweaver_cmd()
+        .args(["dead-code", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        text.contains("bash"),
+        "the text rendering must name the responsible language, not just \
+         say something is degraded: {text}"
+    );
+    assert!(
+        text.contains("DEGRADED"),
+        "the text rendering must still carry its DEGRADED banner: {text}"
+    );
+
+    // ── MCP surface, over stdio, the same route an agent actually calls.
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "dead_code", "arguments": {} }
+        }),
+    ];
+    let input = frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nestweaver"))
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .args(["mcp", "--db"])
+        .arg(&db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let mcp_output = child.wait_with_output().expect("failed to read mcp output");
+    let mcp_stdout = String::from_utf8_lossy(&mcp_output.stdout).to_string();
+    let frame: serde_json::Value = mcp_stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("no tools/call frame in MCP stdout:\n{mcp_stdout}"));
+    assert!(
+        frame["result"]["isError"] != serde_json::json!(true),
+        "MCP dead_code returned an error: {}",
+        frame["result"]
+    );
+    let mcp_payload = &frame["result"]["structuredContent"];
+    assert_eq!(
+        mcp_payload["languages_without_entry_points"],
+        serde_json::json!(["bash"]),
+        "the MCP tool's own JSON must carry the same field the CLI does: {mcp_payload}"
+    );
+
+    // ── COUNTERWEIGHT: give bash an entry point too (a `main` function, the
+    // convention bash's `detect_entry_point` recognises), and the degrade must
+    // clear on every surface — proving the assertions above depend on the
+    // gap this fixture built, not on some property of bash files in general.
+    std::fs::write(
+        repo_dir.join("deploy.sh"),
+        "#!/bin/bash\ndeploy_app() {\n  echo deploying\n}\n\nmain() {\n  deploy_app\n}\n\nmain\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--force")
+        .assert()
+        .success();
+    let cleared_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        cleared_output.status.success(),
+        "dead-code --json (counterweight) failed: {}",
+        String::from_utf8_lossy(&cleared_output.stderr)
+    );
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared_output.stdout).unwrap();
+    assert_eq!(
+        cleared["languages_without_entry_points"],
+        serde_json::json!([]),
+        "once bash has its own entry point the field must go empty, not \
+         merely stay unread: {cleared}"
+    );
+    assert_eq!(
+        cleared["coverage"],
+        serde_json::json!("complete"),
+        "and the degrade this whole field exists to explain must clear too: {cleared}"
+    );
+}

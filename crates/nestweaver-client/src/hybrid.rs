@@ -127,12 +127,43 @@ impl HybridClient {
     /// `.nestweaver/server.toml`, checks `~/.config/nestweaver/upstreams.toml`,
     /// honors the `NESTWEAVER_UPSTREAM` env var, and reads any `[[upstream]]`
     /// entries from the instance config file (`config_path`).
+    ///
+    /// Autostarts the local daemon as ONE-SHOT (see
+    /// `DaemonClient::connect`/`autostart::DaemonUsage`) — the shortened
+    /// ephemeral idle-timeout applies when `db_path` looks temporary. This is
+    /// correct for every CLI command that issues its RPC(s) and exits, which
+    /// is every caller of this function except `mcp`'s daemon-proxy route;
+    /// that one calls [`Self::connect_long_running`] instead.
     pub async fn connect(
         db_path: &Path,
         config_path: Option<&Path>,
         start_dir: &Path,
     ) -> Result<Self> {
         let local = DaemonClient::connect(db_path, config_path).await?;
+        Self::finish_connect(local, config_path, start_dir)
+    }
+
+    /// Connect the way [`Self::connect`] does, but declare the CALLER as a
+    /// long-running foreground session (`mcp`'s daemon-proxy stdio server) —
+    /// see `DaemonClient::connect_long_running` for why this must be a
+    /// distinct, explicit entrypoint rather than a cleverer path check.
+    pub async fn connect_long_running(
+        db_path: &Path,
+        config_path: Option<&Path>,
+        start_dir: &Path,
+    ) -> Result<Self> {
+        let local = DaemonClient::connect_long_running(db_path, config_path).await?;
+        Self::finish_connect(local, config_path, start_dir)
+    }
+
+    /// Upstream discovery, shared by both connect entrypoints above — the
+    /// only thing that differs between them is which `DaemonClient`
+    /// constructor spawned `local`.
+    fn finish_connect(
+        local: DaemonClient,
+        config_path: Option<&Path>,
+        start_dir: &Path,
+    ) -> Result<Self> {
         let upstream_configs = discover_upstreams_with_config(start_dir, config_path);
 
         let mut upstreams = Vec::new();
