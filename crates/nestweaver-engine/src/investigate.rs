@@ -1302,16 +1302,44 @@ fn is_no_seed_resolution_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().starts_with("No seeds resolved."))
 }
 
-/// Whether a node survives the scope filter. Only symbol nodes are scoped;
-/// non-symbol nodes (notes/sections/tags) are vault-global and pass through
-/// unfiltered — this mirrors the long-standing `repo:` notes handling.
+/// Whether a node survives the scope filter.
+///
+/// nw-378. The two scopes DELIBERATELY disagree about non-symbol
+/// (note/section/heading/tag) nodes, and the disagreement is the fix, not a
+/// bug to unify away:
+///
+///  * `project:` passes every non-symbol node through unfiltered. That is
+///    correct and load-bearing: `resolve_scope` seeds the project's own note
+///    UIDs from its `vault_folder`, so a note reaching this filter under a
+///    project scope is genuinely a project member — there is a real
+///    project-to-note association in the schema to test, even though this
+///    function does not re-test it here.
+///  * `repo:` used to do the SAME pass-through ("mirrors the long-standing
+///    `repo:` notes handling"), but there is NO repo-to-note association in
+///    the schema at all — a Note/Section/Heading/Tag belongs to a vault, not
+///    a repo, so "in repo X" cannot be answered for it under any reading.
+///    MEASURED CONSEQUENCE: notes routinely outrank symbols in hybrid
+///    retrieval, the truncate-to-`DEFAULT_RETRIEVAL_BREADTH` cap runs AFTER
+///    this filter, and an unfiltered kind can consume the entire cap — a
+///    `repo:`-scoped investigation returned a 30-entry map of vault notes
+///    from UNRELATED workspaces and zero symbols from the named repo, while
+///    still reporting `scope_filtered: true`. Vault content is now dropped
+///    (not passed through) under `repo:` scope, which is the SAME decision
+///    nw-405 already made for `retain_nodes_in_repos` (`brain_context`'s
+///    `repos:` filter) — applying it here rather than inventing a second
+///    reading of the same question.
 fn node_in_scope(store: &GraphStore, node: &BrainNode, filter: &ScopeFilter) -> bool {
-    if !node.uid.starts_with("sym:") {
-        return true;
-    }
     match filter {
-        ScopeFilter::ProjectSymbols(members) => members.contains(&node.uid),
+        ScopeFilter::ProjectSymbols(members) => {
+            if !node.uid.starts_with("sym:") {
+                return true;
+            }
+            members.contains(&node.uid)
+        }
         ScopeFilter::Repos(repo_uids) => {
+            if !node.uid.starts_with("sym:") {
+                return false;
+            }
             let Ok(sym) = store.lookup_symbol(&node.uid) else {
                 return false;
             };
@@ -3321,6 +3349,182 @@ mod tests {
                     "non-member symbol leaked through the project scope filter"
                 );
             }
+        }
+    }
+
+    /// nw-378, on a genuine multi-repo graph (two separately-indexed repos in
+    /// one store, per the filed item's demand for "a measurement against a
+    /// real multi-repo graph, not only a fixture").
+    ///
+    /// A vault note titled "greet" is a legitimate retrieval hit for the
+    /// query "greet" under NO restriction, so its absence under `repo:`
+    /// scope is the filter working, not the note failing to qualify in the
+    /// first place. `repo:repo-a` must still surface repo A's own `greet`
+    /// symbol — the filter drops vault content, not everything.
+    ///
+    /// COUNTERWEIGHT: reverting `node_in_scope`'s `ScopeFilter::Repos` arm to
+    /// the pre-fix unconditional `if !node.uid.starts_with("sym:") { return
+    /// true; }` makes the "notes excluded" assertion below FAIL — the note
+    /// then survives the `repo:repo-a` filter exactly as measured in the
+    /// filed bug. Verified by hand before committing this test.
+    #[test]
+    fn repo_scope_excludes_vault_notes_while_admitting_the_named_repos_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Repo A: same `greet`/`hello` shape as `make_store`.
+        let repo_a = dir.path().join("repo-a");
+        fs::create_dir_all(repo_a.join("greet")).unwrap();
+        fs::write(
+            repo_a.join("greet").join("main.js"),
+            "function greet(name) { return hello(name); }\n\
+             function hello(name) { return name; }",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&repo_a, "test", "https://example.com/repo-a", "sha-a")
+                .unwrap();
+
+        // Repo B: unrelated code, indexed into the SAME store as a second
+        // repo — this is what makes the graph genuinely multi-repo rather
+        // than a single-repo fixture with a bolted-on vault.
+        let repo_b = dir.path().join("repo-b");
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(
+            repo_b.join("other.js"),
+            "function unrelatedThing() { return 1; }",
+        )
+        .unwrap();
+        let reader_b = crate::content_reader::FilesystemReader::new(&repo_b);
+        crate::index::index_with_reader(
+            &reader_b,
+            &store,
+            "test",
+            "https://example.com/repo-b",
+            "sha-b",
+            None,
+        )
+        .unwrap();
+
+        // A vault note living in NEITHER repo, titled to exact-match the
+        // query so it is a genuine seed candidate (via
+        // `lookup_note_uids_by_title`, independent of tantivy/BM25 — no
+        // tantivy index is wired into this test, matching every other
+        // `investigate` unit test in this module).
+        let vault_uid = "vlt:test:aaaa";
+        store
+            .upsert_vault(&nestweaver_schema::Vault {
+                uid: vault_uid.to_string(),
+                name: "notes".to_string(),
+                root_path: "/vault".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let note_uid = format!("note:{vault_uid}:greet-notes");
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "greet-notes.md".to_string(),
+                title: "greetnotes".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 2,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store.insert_vault_note_edge(vault_uid, &note_uid).unwrap();
+
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        // Control: under no restriction, the note IS a legitimate hit.
+        let unrestricted = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &repo_a,
+            "greet greetnotes",
+            "all",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(
+            unrestricted.entries.iter().any(|e| e.uid == note_uid),
+            "the note must be a genuine hit under no scope, or its absence \
+             under repo: scope proves nothing; entries: {:?}",
+            unrestricted
+                .entries
+                .iter()
+                .map(|e| &e.uid)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            unrestricted.entries.iter().any(|e| e.title == "greet"),
+            "the `greet` symbol must also be a genuine hit under no scope, \
+             or its absence under repo: scope proves nothing; entries: {:?}",
+            unrestricted
+                .entries
+                .iter()
+                .map(|e| &e.uid)
+                .collect::<Vec<_>>()
+        );
+
+        // repo:repo-a resolves by the URL-derived display name (neither repo
+        // was given an explicit `name`, so `repo_display_name` falls back to
+        // the URL basename — the SAME 29-of-44-repos-have-no-name shape
+        // nw-428 measured on the live graph).
+        let scoped = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &repo_a,
+            "greet greetnotes",
+            "repo:repo-a",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(
+            scoped.scope_filtered,
+            "repo: scope must report itself as applied"
+        );
+        assert!(
+            !scoped.entries.iter().any(|e| e.uid == note_uid),
+            "repo: scope must exclude vault notes entirely — a note has no \
+             repo_uid and cannot be attributed to the named repo; got \
+             entries: {:?}",
+            scoped.entries.iter().map(|e| &e.uid).collect::<Vec<_>>()
+        );
+        assert!(
+            scoped.entries.iter().any(|e| e.uid.starts_with("sym:")),
+            "repo: scope must still surface the named repo's own symbols, \
+             not filter down to nothing; entries: {:?}",
+            scoped.entries.iter().map(|e| &e.uid).collect::<Vec<_>>()
+        );
+        let repo_a_uid = store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.contains("repo-a"))
+            .expect("repo A is indexed")
+            .uid;
+        for e in &scoped.entries {
+            if !e.uid.starts_with("sym:") {
+                continue;
+            }
+            let sym = store.lookup_symbol(&e.uid).expect("symbol resolves");
+            assert!(
+                sym.repo_uid == repo_a_uid,
+                "every symbol entry under repo:repo-a must belong to repo A; \
+                 got {} owned by {}",
+                e.uid,
+                sym.repo_uid
+            );
         }
     }
 
