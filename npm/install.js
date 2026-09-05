@@ -154,11 +154,34 @@ function describeReleaseApiFailure(failure, env) {
   return `could not read GitHub Release metadata${status ? ` (HTTP ${status})` : ""}: ${body}`;
 }
 
+/// Whether the running system is musl (Alpine and similar), not glibc.
+///
+/// nw-433: npm's package-level `libc` field cannot express "glibc-only on
+/// Linux, unconstrained everywhere else" -- it constrains the WHOLE package,
+/// so declaring `libc: ["glibc"]` to gate the two Linux targets also refused
+/// every macOS install, where `libc` is not a concept at all and npm reports
+/// `Actual libc: undefined`. The field has been removed from package.json;
+/// this function is what replaces it, checked here in code where "Linux, and
+/// only Linux" is expressible, instead of in metadata where it is not.
+///
+/// `glibcVersionRuntime` is populated by Node's own `process.report` only when
+/// Node itself is linked against glibc (using glibc's `gnu_get_libc_version`
+/// at compile time); a musl-linked Node -- the system Node.js on Alpine, and
+/// every `node:*-alpine` / `node:*-musl` image -- never has it. Node running
+/// under musl is a reliable proxy for the host being musl: nothing supported
+/// here runs a glibc Node atop a musl userland. Takes the already-extracted
+/// value rather than `process.report` itself so it is testable without
+/// stubbing a global.
+function isMuslLinux(platform, glibcVersionRuntime) {
+  return platform === "linux" && !glibcVersionRuntime;
+}
+
 module.exports = {
   assessReleaseTrust,
   runtimeVersionFailure,
   githubApiHeaders,
   describeReleaseApiFailure,
+  isMuslLinux,
 };
 
 // ── Installation ────────────────────────────────────────────────────────
@@ -262,6 +285,36 @@ function main() {
     console.error("Supported: darwin-x64, darwin-arm64, linux-x64, linux-arm64");
     console.error(
       "Unsupported platform. Install a verified GitHub Release archive for a supported target, or from a source checkout: cargo install --locked --path .",
+    );
+    process.exit(1);
+  }
+
+  // The two Linux targets published (see PLATFORM_MAP above) are both
+  // `-unknown-linux-gnu`: glibc-linked. There is no musl target, so
+  // downloading one for a musl system (Alpine, `node:*-alpine`) would fetch a
+  // binary that cannot dynamically link and fail confusingly, well after this
+  // point, with no indication the platform was the problem. Reject it here,
+  // before any network call, with the same actionable shape as the `!target`
+  // case above -- this is the check that used to live (incorrectly, for every
+  // platform including macOS) in package.json's `libc` field. See nw-433.
+  let glibcVersionRuntime;
+  try {
+    glibcVersionRuntime =
+      process.report && typeof process.report.getReport === "function"
+        ? process.report.getReport().header.glibcVersionRuntime
+        : undefined;
+  } catch {
+    // Report generation is best-effort; an environment where it throws gets
+    // the benefit of the doubt rather than a false rejection.
+    glibcVersionRuntime = undefined;
+  }
+  if (isMuslLinux(process.platform, glibcVersionRuntime)) {
+    console.error(`Unsupported platform: ${key} (musl libc)`);
+    console.error(
+      "NestWeaver's published Linux releases are glibc-only (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu). musl/Alpine is not currently supported.",
+    );
+    console.error(
+      "Build from a source checkout instead: cargo install --locked --path .",
     );
     process.exit(1);
   }

@@ -17,6 +17,7 @@ const {
   runtimeVersionFailure,
   githubApiHeaders,
   describeReleaseApiFailure,
+  isMuslLinux,
 } = require("./install.js");
 
 let passed = 0;
@@ -218,6 +219,26 @@ check("a 404 is reported as a missing release, not a rate limit", () => {
   const message = describeReleaseApiFailure({ status: 404, body: "Not Found" }, {});
   assert.match(message, /not found/i);
   assert.ok(!/rate limit/i.test(message));
+});
+
+// ── libc detection (nw-433) ─────────────────────────────────────────────
+// The npm-level `libc` field was removed from package.json because it cannot
+// express "glibc-only on Linux, unconstrained elsewhere" -- it constrains the
+// whole package, so it refused every macOS install too (npm reports
+// `Actual libc: undefined` there, since libc is not a concept on macOS).
+// `isMuslLinux` is what replaces it: a Linux-only check performed in code,
+// where that scoping is actually expressible.
+check("darwin is never musl, regardless of glibcVersionRuntime", () => {
+  assert.strictEqual(isMuslLinux("darwin", undefined), false);
+  assert.strictEqual(isMuslLinux("darwin", "2.31"), false);
+});
+
+check("linux with a reported glibc version is not musl", () => {
+  assert.strictEqual(isMuslLinux("linux", "2.31"), false);
+});
+
+check("linux with no reported glibc version is treated as musl", () => {
+  assert.strictEqual(isMuslLinux("linux", undefined), true);
 });
 
 check("an unclassified failure still reports its cause", () => {

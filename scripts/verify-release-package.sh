@@ -58,13 +58,24 @@ verify_release_package() {
     return 1
   fi
 
+  # nw-433: `libc` is deliberately ABSENT, not `["glibc"]`. npm's `libc` field
+  # constrains the WHOLE package, and this package legitimately supports
+  # macOS (no libc concept at all) as well as glibc Linux -- there is no way
+  # to declare "glibc-only on Linux, unconstrained elsewhere" in that one
+  # field. Declaring `["glibc"]` refused every macOS install with EBADPLATFORM
+  # ("Actual libc: undefined"), and THIS assertion is what would silently
+  # re-ship that regression: it required the very value that broke every
+  # macOS install, so a release gate built to catch defects was instead
+  # enforcing one. The musl-vs-glibc distinction that field was standing in
+  # for is now checked in code (`isMuslLinux` in install.js), where "Linux,
+  # and only Linux" is actually expressible.
   jq -e '
     .bin.nestweaver == "bin/nestweaver" and
     .scripts.postinstall == "node install.js" and
     (.files | sort) == ["README.md", "bin/", "install.js"] and
     (.os | sort) == ["darwin", "linux"] and
     (.cpu | sort) == ["arm64", "x64"] and
-    .libc == ["glibc"]
+    (has("libc") | not)
   ' "$repo_root/npm/package.json" >/dev/null
 
   node "$(dirname "$0")/verify-release-install.js" "$repo_root/npm" >&2
