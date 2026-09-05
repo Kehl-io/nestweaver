@@ -27906,6 +27906,17 @@ mod cli_help_contract_tests {
             "affected-tests" => Tool("affected_tests"),
             "backlinks" => Tool("backlinks"),
             "blast-radius" => Tool("blast_radius"),
+            // Reclassified from a blanket `NoTwin` (2026-09 review): this
+            // genuinely shares an operation with `brain_add_source` --
+            // "Index a new vault, code repo, or markdown folder" is the
+            // same job `brain add` does. `brain_add_source`'s schema
+            // declares no `minimum`/`maximum`/enum on either `path` or
+            // `name`, so this adds zero probes today; it is declared
+            // because a wrong `NoTwin` here would have read as a reasoned
+            // exclusion and left the day someone bounds `name`'s length
+            // silently unguarded -- precisely the rot this item exists to
+            // prevent.
+            "brain add" => Tool("brain_add_source"),
             "brain broken-links" => Tool("brain_broken_links"),
             "brain context" => Tool("brain_context"),
             "brain doc-stats" => Tool("brain_doc_stats"),
@@ -27914,6 +27925,11 @@ mod cli_help_contract_tests {
             // already correctly bounded (nw-400) -- declaring the pair adds
             // real regression coverage rather than fixing a bug.
             "brain orphans" => Tool("brain_orphan_documents"),
+            // Reclassified alongside `brain add` (2026-09 review): shares
+            // `brain_remove_source`'s operation exactly. Same zero-probe,
+            // still-worth-declaring reasoning -- its schema is a bare `path`
+            // string with no bound to check.
+            "brain remove" => Tool("brain_remove_source"),
             "brain search" => Tool("brain_search"),
             "brain status" => Tool("brain_status"),
             "brain tag-graph" => Tool("brain_tag_graph"),
@@ -27982,7 +27998,12 @@ mod cli_help_contract_tests {
             // operation, an argument shape, or a code path with those or any
             // read tool -- these are daemon/process control, local
             // backup/restore, instance/config administration, or dev-only
-            // tooling with no MCP surface at all.
+            // tooling with no MCP surface at all. `brain add`/`brain remove`
+            // are declared separately below, as `Tool`, precisely because
+            // they DO share an operation with `brain_add_source`/
+            // `brain_remove_source` -- lumping them in here was itself an
+            // instance of the class this item exists to close: a `NoTwin`
+            // that reads as a reasoned exclusion but is false.
             "admin"
             | "admin install-hook"
             | "admin instructions"
@@ -27992,11 +28013,9 @@ mod cli_help_contract_tests {
             | "backup restore"
             | "backup save"
             | "brain"
-            | "brain add"
             | "brain list"
             | "brain refresh"
             | "brain reindex-search"
-            | "brain remove"
             | "brain stale-check"
             | "brain watch"
             | "completions"
