@@ -274,4 +274,85 @@ const launcherSource = fs.readFileSync(path.join(__dirname, "bin", "nestweaver")
   });
 })();
 
+
+// ── Release version lockstep ────────────────────────────────────────────
+// nw-425/nw-433 replaced a `postinstall` downloader with one
+// optionalDependency per platform. That moves a whole class of breakage
+// from install time to PUBLISH time: the root package and all four platform
+// packages must be published at the SAME version, because the root pins its
+// optionalDependencies to an exact version. release-please does that via
+// ten `extra-files` entries in release-please-config.json.
+//
+// The failure mode if one entry is missing is silent and only visible in
+// production: the root bumps to N+1 while a platform package stays at N, so
+// `npm i nestweaver` either resolves an optionalDependency version that was
+// never published (hard failure for that platform only) or, if it happens to
+// exist, installs a STALE BINARY under a new version number. Neither shows
+// up in CI, because CI never publishes.
+//
+// These checks derive everything from the filesystem rather than a hardcoded
+// list, so ADDING a platform without wiring its config entries fails here
+// instead of in someone's install.
+const repoRoot = path.join(__dirname, "..");
+const rootPkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+const platformDirs = fs
+  .readdirSync(path.join(__dirname, "platforms"), { withFileTypes: true })
+  .filter((e) => e.isDirectory())
+  .map((e) => e.name)
+  .sort();
+
+check("every platform dir on disk is a known target (no orphan dirs)", () => {
+  assert.deepStrictEqual(platformDirs, Object.keys(PLATFORM_PACKAGES).sort());
+});
+
+check("every platform package is named and versioned in lockstep with the root", () => {
+  for (const dir of platformDirs) {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "platforms", dir, "package.json"), "utf8"),
+    );
+    assert.strictEqual(pkg.name, `nestweaver-${dir}`, `${dir}: name must be nestweaver-${dir}`);
+    assert.strictEqual(
+      pkg.version,
+      rootPkg.version,
+      `${dir}: version ${pkg.version} != root ${rootPkg.version} — a release would publish a stale binary under a new version`,
+    );
+  }
+});
+
+check("root optionalDependencies are exactly the platform packages, pinned to the root version", () => {
+  const optional = rootPkg.optionalDependencies || {};
+  assert.deepStrictEqual(
+    Object.keys(optional).sort(),
+    platformDirs.map((d) => `nestweaver-${d}`),
+  );
+  for (const [name, range] of Object.entries(optional)) {
+    assert.strictEqual(
+      range,
+      rootPkg.version,
+      `${name} must be pinned to the exact root version, not a range (${range})`,
+    );
+  }
+});
+
+check("release-please bumps every version this package publishes", () => {
+  const cfg = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "release-please-config.json"), "utf8"),
+  );
+  const extra = cfg.packages["."]["extra-files"] || [];
+  const covered = new Set(extra.map((e) => `${e.path}::${e.jsonpath}`));
+
+  const required = ["npm/package.json::$.version"];
+  for (const dir of platformDirs) {
+    required.push(`npm/platforms/${dir}/package.json::$.version`);
+    required.push(`npm/package.json::$.optionalDependencies['nestweaver-${dir}']`);
+  }
+
+  const missing = required.filter((r) => !covered.has(r));
+  assert.deepStrictEqual(
+    missing,
+    [],
+    `release-please-config.json does not bump: ${missing.join(", ")} — a release would leave these at the previous version`,
+  );
+});
+
 console.log(`\nbin/nestweaver self-test passed (${passed} assertions)`);
