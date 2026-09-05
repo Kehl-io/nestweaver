@@ -4438,8 +4438,23 @@ enum Commands {
     /// crash, or created by hand) and one whose state cannot be read at all.
     /// --force overrides exactly that conservatism. A marker PID alone is not
     /// ownership because PIDs are recyclable.
+    ///
+    /// Also reclaims a crashed SCHEMA MIGRATION's orphaned Tantivy staging
+    /// directory (`.nestweaver-tantivy-reindex-*`, beside `<db>.tantivy`),
+    /// reporting exactly what was removed — or, under --dry-run, what would
+    /// be. This is unconditional and independent of the publication-marker
+    /// check above; it never takes the database's write lock. See
+    /// `nestweaver-engine`'s `backup::SIDECAR_SUFFIXES` doc comment for the
+    /// full twelve-file sidecar set a database directory can hold.
+    ///
+    /// Also reclaims resolution-keyed cluster sidecars
+    /// (`<db>.clusters.<resolution>.json`) other than the one the canonical
+    /// `<db>.clusters.json` currently points at — one accumulates per
+    /// distinct `--resolution` a caller has ever passed to `cluster`. Never
+    /// removes the canonical sidecar or the keyed copy matching its current
+    /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold twelve sidecar artifacts in total\n(.filemeta.json, .generation, .manifests.json, .pagerank.json,\n.parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -5365,6 +5380,13 @@ enum Commands {
     /// Hub nodes have the highest degree centrality (most incoming + outgoing
     /// edges) and tend to be central abstractions that many parts of the
     /// codebase depend on. Useful for understanding the architectural core.
+    ///
+    /// Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored,
+    /// however connected: these kinds are not callable, and edges into them
+    /// are typically the resolver crediting a receiver rather than the
+    /// method actually invoked (nw-308). A genuinely central config constant
+    /// or shared registry property will not appear here no matter how many
+    /// places reference it.
     #[command(after_help = "Examples:\n  nestweaver hubs\n  nestweaver hubs --top 20 --json")]
     Hubs {
         #[arg(
@@ -5389,6 +5411,13 @@ enum Commands {
     /// Bridge nodes have high betweenness centrality: many shortest paths
     /// between other nodes pass through them. Changing a bridge node has
     /// outsized blast radius. Useful for identifying fragile connectors.
+    ///
+    /// Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored,
+    /// however connected: these kinds are not callable, and edges into them
+    /// are typically the resolver crediting a receiver rather than the
+    /// method actually invoked (nw-308). A genuinely central config constant
+    /// or shared registry property will not appear here no matter how many
+    /// places reference it.
     #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
     Bridges {
         // nw-251: bounded like `hubs --top`, which has carried
@@ -11495,6 +11524,75 @@ fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
     })
 }
 
+/// nw-396 leg (2). `daemon status` reaches this only after EVERY
+/// process-level check above it — launchd, pidfile, socket, lock holder, the
+/// pre-6.4 selected-slot identity — has already come back empty, which used
+/// to mean one thing: print "Daemon is not running." at exit 0. But a
+/// corrupt-WAL database, a nonexistent path, a 0-byte file and a directory
+/// all reach this exact point too, and printed the byte-identical sentence —
+/// so a typo'd `--db` was indistinguishable from a healthy, merely-stopped
+/// database (the nw-334 instance-5 shape: a message that makes recovery
+/// harder, in the one command an operator reaches for first during an
+/// outage).
+///
+/// Returns `None` for the two states that really do mean "there is nothing
+/// wrong here, there is just no daemon": a path that does not exist yet
+/// (before this call every location a fresh install could be pointed at
+/// would otherwise be flagged) is handled by its own arm below instead, and
+/// an openable database is not this function's business at all.
+///
+/// `is_error` in the returned tuple distinguishes an ACTIONABLE database
+/// defect (corrupt WAL, a directory, an empty file — something a remedy can
+/// fix) from a merely-informative note (the path does not exist, which is
+/// not wrong, only worth saying out loud) — the caller uses it to choose the
+/// exit code.
+fn daemon_status_db_problem(db_path: &Path) -> Option<(bool, String)> {
+    if !db_path.exists() {
+        return Some((
+            false,
+            format!(
+                "note: {} does not exist yet, so nothing has ever indexed \
+                 there. If you expected an existing database here, check \
+                 --db for a typo.",
+                db_path.display()
+            ),
+        ));
+    }
+    if db_path.is_dir() {
+        return Some((
+            true,
+            format!(
+                "{} is a directory, not a NestWeaver database.",
+                db_path.display()
+            ),
+        ));
+    }
+    if std::fs::metadata(db_path).is_ok_and(|meta| meta.len() == 0) {
+        return Some((
+            true,
+            format!(
+                "{} is 0 bytes and has never been indexed. Run `nestweaver \
+                 index --repo <path> --db {}` to create it.",
+                db_path.display(),
+                db_path.display()
+            ),
+        ));
+    }
+    if let Some(error) = nestweaver_daemon::lifecycle::db_wal_unreadable(db_path) {
+        return Some((
+            true,
+            format!(
+                "{} has an unreadable write-ahead log ({error:#}). Do NOT \
+                 start a daemon against it — run `nestweaver repair --db {}` \
+                 for the recovery runbook.",
+                db_path.display(),
+                db_path.display()
+            ),
+        ));
+    }
+    None
+}
+
 /// Stable machine name for a recovery outcome, for `--json` consumers.
 fn repair_outcome_name(
     outcome: &nestweaver_engine::index::IndexPublicationRecovery,
@@ -11610,6 +11708,191 @@ fn repair_probe_failure(db_path: &Path, error: nestweaver_store::StoreError) -> 
     ))
 }
 
+/// What [`repair_tantivy_staging`] found or reclaimed. Kept separate from
+/// [`nestweaver_store::StagingReclaimReport`] so a `--dry-run` preview (which
+/// never touches disk and therefore never calls the destructive store
+/// function at all) can be reported through the same shape as a real reclaim.
+#[derive(Debug, Default)]
+struct TantivyStagingRepairReport {
+    /// Staging directories actually removed (only non-empty outside
+    /// `--dry-run`).
+    removed: Vec<PathBuf>,
+    /// Staging directories a `--dry-run` found and would remove. Disjoint
+    /// from `removed` by construction: exactly one of the two is ever
+    /// populated by a given call.
+    found_dry_run: Vec<PathBuf>,
+    /// One line per directory this call could not remove.
+    failures: Vec<String>,
+    /// A migration or recovery for this index's Tantivy sidecar currently
+    /// holds the recovery lock, so nothing was inspected — retry later
+    /// rather than read this as "nothing to reclaim".
+    deferred: bool,
+}
+
+/// nw-368. Reclaim `.nestweaver-tantivy-reindex-*` staging directories a
+/// crashed schema migration left beside `db_path`'s Tantivy sidecar, and say
+/// exactly what was found or removed.
+///
+/// `81f685eb` disclosed this residue rather than fixing it:
+/// `nestweaver_store::reclaim_orphaned_tantivy_staging` existed, but nothing
+/// in the CLI ever called it, so three separate recovery routes tried against
+/// a live repro — a full `reindex-search`, `repair`, and a daemon
+/// start/stop cycle — all left an orphaned staging directory behind. This is
+/// the wiring that was missing, on the one command an operator already runs
+/// for hygiene.
+///
+/// `--dry-run` deliberately does NOT call the store's reclaim function at
+/// all: that function is destructive by design (it takes the recovery lock
+/// and removes every candidate it finds), and a dry run must change nothing
+/// on disk. Instead this lists directories bearing the exact
+/// [`nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX`] beside the sidecar,
+/// which is read-only.
+fn repair_tantivy_staging(
+    db_path: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<TantivyStagingRepairReport> {
+    let tantivy_path = tantivy_sidecar_path_for(db_path);
+    let parent = tantivy_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if dry_run {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX)
+                }) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            })
+            .map(|entry| entry.path())
+            .collect();
+        found.sort();
+        return Ok(TantivyStagingRepairReport {
+            found_dry_run: found,
+            ..Default::default()
+        });
+    }
+
+    let report = nestweaver_store::reclaim_orphaned_tantivy_staging(&tantivy_path)
+        .context("reclaim orphaned tantivy migration staging directories")?;
+    Ok(TantivyStagingRepairReport {
+        removed: report.removed,
+        failures: report
+            .failures
+            .into_iter()
+            .map(|issue| format!("{}: {}", issue.path.display(), issue.error))
+            .collect(),
+        deferred: report.deferred,
+        ..Default::default()
+    })
+}
+
+/// What [`repair_cluster_sidecars`] found or reclaimed.
+#[derive(Debug, Default)]
+struct ClusterSidecarRepairReport {
+    /// Resolution-keyed sidecars actually removed (only non-empty outside
+    /// `--dry-run`).
+    removed: Vec<PathBuf>,
+    /// Resolution-keyed sidecars a `--dry-run` found and would remove.
+    found_dry_run: Vec<PathBuf>,
+    /// One line per sidecar this call could not remove.
+    failures: Vec<String>,
+}
+
+/// nw-401. Reclaim resolution-keyed cluster sidecars
+/// (`<db>.clusters.<resolution:e>.json`, written by
+/// `nestweaver_engine::cluster_dispatch::save_clusters`) that no longer
+/// correspond to the canonical, most-recently-computed clustering — one
+/// accumulates per distinct `--resolution` a caller has ever passed, forever,
+/// beside the database, with no prune/gc/repair reference anywhere before
+/// this.
+///
+/// "Orphaned" is defined conservatively, and deliberately narrower than "not
+/// the newest": every resolution-keyed file EXCEPT the one the canonical
+/// `<db>.clusters.json` currently points at. The canonical sidecar is
+/// load-bearing (`hubs`, `bridges`, `blast_radius`, and a no-flag `cluster`
+/// all read it) and is never touched here, and its own resolution's keyed
+/// twin is spared with it — an explicit `cluster --resolution R` run at the
+/// most recent `R` must still find its data. If the canonical sidecar cannot
+/// be loaded at all (absent, or fails to parse), this reclaims NOTHING: with
+/// no current resolution to protect, guessing which keyed file is safe to
+/// remove risks deleting one a caller is about to read, which is worse than
+/// leaving the whole set alone for one more `repair` pass.
+///
+/// `--dry-run` never deletes; it only lists candidates using the same
+/// filename shape (`sidecar_path_for_resolution` with a real f64 sanitized to
+/// finite-and-positive at compute time, so `{:e}` output cannot contain a
+/// path separator).
+fn repair_cluster_sidecars(
+    db_path: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<ClusterSidecarRepairReport> {
+    let canonical_path = nestweaver_engine::cluster_dispatch::sidecar_path(db_path);
+    let keep_path = match nestweaver_engine::cluster_dispatch::load_clusters(db_path) {
+        Ok(Some(output)) => Some(
+            nestweaver_engine::cluster_dispatch::sidecar_path_for_resolution(
+                db_path,
+                output.resolution,
+            ),
+        ),
+        // No canonical sidecar (nothing computed yet) or it failed to load
+        // (cannot prove what is current): spare everything rather than guess.
+        Ok(None) | Err(_) => None,
+    };
+    let Some(keep_path) = keep_path else {
+        return Ok(ClusterSidecarRepairReport::default());
+    };
+    let keep_name = keep_path.file_name().map(std::ffi::OsStr::to_owned);
+    let canonical_name = canonical_path.file_name().map(std::ffi::OsStr::to_owned);
+
+    let Some(db_file_name) = db_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(ClusterSidecarRepairReport::default());
+    };
+    let prefix = format!("{db_file_name}.clusters.");
+    let parent = db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            if Some(&name) == canonical_name.as_ref() || Some(&name) == keep_name.as_ref() {
+                return false;
+            }
+            name.to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    candidates.sort();
+
+    if dry_run {
+        return Ok(ClusterSidecarRepairReport {
+            found_dry_run: candidates,
+            ..Default::default()
+        });
+    }
+
+    let mut report = ClusterSidecarRepairReport::default();
+    for candidate in candidates {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => report.removed.push(candidate),
+            Err(error) => report
+                .failures
+                .push(format!("{}: {error}", candidate.display())),
+        }
+    }
+    Ok(report)
+}
+
 fn run_repair_index_publication(
     db_path: &std::path::Path,
     json: bool,
@@ -11641,6 +11924,17 @@ fn run_repair_index_publication(
     let recovered = outcome.as_ref().is_some_and(|o| o.recovered());
     let after = pubstat::status(db_path);
 
+    // nw-368. Independent of everything above: this is Tantivy sidecar
+    // hygiene, not the LMDB publication marker, so it runs regardless of
+    // `status.dirty` or the store's own open state and never takes the
+    // database's write lock.
+    let staging = repair_tantivy_staging(db_path, dry_run)?;
+
+    // nw-401. Same shape, same reasoning, a different sidecar: resolution-
+    // keyed cluster sidecars accumulate with no prune/gc anywhere in the
+    // tree. Also unconditional and read-only against the database itself.
+    let clusters = repair_cluster_sidecars(db_path, dry_run)?;
+
     // nw-359 leg (2). If we never opened the database, we have not established
     // anything about it — and `exit` below is about to say `EXIT_SUCCESS`.
     //
@@ -11669,7 +11963,17 @@ fn run_repair_index_publication(
         open_error = Some(repair_probe_failure(db_path, error));
     }
 
-    let exit = if !after.dirty && open_error.is_none() {
+    // nw-368. A staging directory this call could not remove is a real
+    // failure an operator must act on, so it flips the exit code exactly
+    // like `open_error` does. A DEFERRED reclaim is not a failure — a
+    // migration or recovery legitimately holds the lock right now — and
+    // `--dry-run` finding candidates it correctly did not touch is not one
+    // either.
+    let exit = if !after.dirty
+        && open_error.is_none()
+        && staging.failures.is_empty()
+        && clusters.failures.is_empty()
+    {
         EXIT_SUCCESS
     } else {
         EXIT_ERROR
@@ -11698,6 +12002,17 @@ fn run_repair_index_publication(
             "outcome": outcome.as_ref().map(repair_outcome_name),
             "message": outcome.as_ref().map(|o| o.describe()),
             "error": open_error.as_ref().map(|error| format!("{error:#}")),
+            "tantivy_staging": {
+                "removed": staging.removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "found_dry_run": staging.found_dry_run.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "failures": staging.failures,
+                "deferred": staging.deferred,
+            },
+            "cluster_sidecars": {
+                "removed": clusters.removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "found_dry_run": clusters.found_dry_run.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "failures": clusters.failures,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(exit);
@@ -11705,6 +12020,63 @@ fn run_repair_index_publication(
 
     println!("Database: {}", db_path.display());
     println!("Marker:   {}", status.marker_path);
+    // nw-368. Reported up front, before the publication marker's own
+    // clean/dirty story, because staging reclaim is unconditional — it must
+    // still be visible even when the function returns early on `open_error`
+    // just below.
+    if !staging.removed.is_empty() {
+        println!(
+            "Reclaimed {} orphaned Tantivy migration staging director(ies):",
+            staging.removed.len()
+        );
+        for path in &staging.removed {
+            println!("  removed: {}", path.display());
+        }
+    } else if !staging.found_dry_run.is_empty() {
+        println!(
+            "--dry-run: {} orphaned Tantivy migration staging director(ies) would be reclaimed:",
+            staging.found_dry_run.len()
+        );
+        for path in &staging.found_dry_run {
+            println!("  {}", path.display());
+        }
+    }
+    if !staging.failures.is_empty() {
+        eprintln!("Failed to reclaim some Tantivy migration staging directories:");
+        for failure in &staging.failures {
+            eprintln!("  {failure}");
+        }
+    }
+    if staging.deferred {
+        println!(
+            "Tantivy migration staging reclaim deferred: a migration or recovery for this \
+             database's Tantivy sidecar currently holds the recovery lock. Retry later."
+        );
+    }
+    // nw-401. Same reporting shape as the Tantivy staging block above.
+    if !clusters.removed.is_empty() {
+        println!(
+            "Reclaimed {} orphaned resolution-keyed cluster sidecar(s):",
+            clusters.removed.len()
+        );
+        for path in &clusters.removed {
+            println!("  removed: {}", path.display());
+        }
+    } else if !clusters.found_dry_run.is_empty() {
+        println!(
+            "--dry-run: {} orphaned resolution-keyed cluster sidecar(s) would be reclaimed:",
+            clusters.found_dry_run.len()
+        );
+        for path in &clusters.found_dry_run {
+            println!("  {}", path.display());
+        }
+    }
+    if !clusters.failures.is_empty() {
+        eprintln!("Failed to reclaim some resolution-keyed cluster sidecars:");
+        for failure in &clusters.failures {
+            eprintln!("  {failure}");
+        }
+    }
     // nw-359 leg (2). Before declaring anything clean, surrender to the probe
     // above. "The marker is clean" is true and is not the same claim as "there
     // is nothing to repair", which is what exit 0 conveys.
@@ -12640,6 +13012,24 @@ fn run_daemon_gc() -> Result<(i32, Option<String>), anyhow::Error> {
             "  spared (pidfile lock held): {}",
             report.spared_pidfile_lock.len()
         );
+    }
+    // nw-088 leg (1). These are ALREADY counted in `spared` and, usually,
+    // `spared_pidfile_lock` above — this line adds the one fact those could
+    // not state: the process gc is correctly declining to touch is serving a
+    // database that no longer exists, so sparing it is not "healthy daemon,
+    // leave it alone" but "leaked daemon, and here is how to reclaim it".
+    if !report.spared_daemon_database_gone.is_empty() {
+        println!(
+            "  spared (daemon alive, but its database is gone): {}",
+            report.spared_daemon_database_gone.len()
+        );
+        for (instance, db_path) in &report.spared_daemon_database_gone {
+            println!(
+                "    {instance}: {} no longer exists — reclaim with `nestweaver daemon --db {} stop`",
+                db_path.display(),
+                db_path.display()
+            );
+        }
     }
     // NOT evidence of ownership — evidence that we could not
     // tell. Kept on its own line so it can never be read as
@@ -20363,6 +20753,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
 
+                    // nw-359 leg (1). Client autostart
+                    // (`ensure_daemon_with_spawn_lock_impl`, `autostart.rs`)
+                    // already refuses to spawn against a WAL no open can
+                    // replay — the exact state the corruption runbook's own
+                    // step 0 says to stop everything against. This EXPLICIT
+                    // `daemon start` handler built and spawned its child
+                    // directly and never called that guard, so the same
+                    // command the runbook tells an operator to run next was
+                    // the one route that ignored it. Rather than add a
+                    // second copy of the check — the class this repo keeps
+                    // re-finding (nw-217) — every direct-spawn site below
+                    // calls this ONE closure, which calls the SAME
+                    // `db_wal_unreadable` autostart already uses.
+                    //
+                    // Placed here, after directories are created but before
+                    // any of the three spawn routes (launchd install,
+                    // macOS temp-daemon fork, non-macOS double-fork) decide
+                    // what to do, and each route invokes it immediately
+                    // before it actually creates a process — mirroring
+                    // autostart's own placement, "the last moment before a
+                    // process is created". It must not run any earlier: the
+                    // "already running, no-op" returns above a genuine cold
+                    // start are exactly the case where a live daemon may
+                    // have the database open, and probing a WAL a live
+                    // writer is actively extending is not this guard's
+                    // business.
+                    let refuse_if_wal_unreadable = || -> anyhow::Result<()> {
+                        if let Some(error) =
+                            nestweaver_daemon::lifecycle::db_wal_unreadable(&db_path)
+                        {
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "refusing to start a daemon against the database at {}",
+                                db_path.display()
+                            )));
+                        }
+                        Ok(())
+                    };
+
                     // On macOS, launchd owns persistent daemons. Temporary
                     // databases are intentionally not registered as persistent
                     // agents; a fresh foreground child owns those instead.
@@ -20638,6 +21066,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // before installing the new plist
                             let _ = nestweaver_daemon::launchd::stop_and_uninstall(&instance_id);
 
+                            // nw-359 leg (1). Nothing above this point proved
+                            // ownership of a LIVE incumbent — every path that
+                            // did returned already — so this is the cold
+                            // start about to install a fresh plist against
+                            // `db_path`, and the last moment before that
+                            // process exists.
+                            refuse_if_wal_unreadable()?;
+
                             if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
                                 && let Ok(pid) = pid_str.trim().parse::<i32>()
                                 && unsafe { libc::kill(pid, 0) } == 0
@@ -20745,6 +21181,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let db_path_abs = abs_for_daemon(&db_path);
                         let config_abs = effective_config.as_deref().map(abs_for_daemon);
                         let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
+                        // nw-359 leg (1). This IS the bug's original repro:
+                        // `daemon start --db <corrupt-wal>` used to print
+                        // `Child PID: ...` and spawn against it before the
+                        // health wait failed. Refuse before the child exists.
+                        refuse_if_wal_unreadable()?;
                         let mut child_command = macos_temp_daemon_command(
                             &executable,
                             &db_path_abs,
@@ -20959,6 +21400,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // pidfile; the race window between release and reacquire
                         // is microseconds, far smaller than the prior TOCTOU
                         // window of the kill(pid, 0) check.
+
+                        // nw-359 leg (1). Same guard as the two macOS routes,
+                        // called at the equivalent point: we have just proven
+                        // no daemon holds this pidfile, so this is a cold
+                        // start and the double-fork below is the last step
+                        // before a process exists.
+                        refuse_if_wal_unreadable()?;
 
                         let stdout_file = std::fs::OpenOptions::new()
                             .create(true)
@@ -21671,6 +22119,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             db_path.display()
                         );
                         return Ok((EXIT_SUCCESS, None));
+                    }
+                    // nw-396 leg (2). Every process-level check above this
+                    // point came back empty — no launchd job, no pidfile, no
+                    // socket, no lock holder, no legacy identity. Before
+                    // saying so, ask whether `--db` even names something a
+                    // daemon COULD run against: a corrupt-WAL database, a
+                    // directory, and a 0-byte file all used to report the
+                    // exact same "Daemon is not running." a healthy, merely
+                    // stopped database reports, and a typo'd path could not
+                    // be told apart from either.
+                    if let Some((is_error, problem)) = daemon_status_db_problem(&db_path) {
+                        println!(
+                            "{}",
+                            format_daemon_not_running_status(&format!(
+                                "Daemon is not running. {problem}"
+                            ))
+                        );
+                        return Ok((if is_error { EXIT_ERROR } else { EXIT_SUCCESS }, None));
                     }
                     println!(
                         "{}",

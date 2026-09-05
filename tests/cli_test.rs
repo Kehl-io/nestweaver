@@ -7928,6 +7928,400 @@ fn instance_merge_says_nothing_when_no_bypass_was_granted() {
         .output();
 }
 
+/// nw-359 leg (1) / nw-396 leg (1). The explicit `daemon start` handler
+/// (`src/main.rs`'s `DaemonAction::Start` arm) built and spawned its child
+/// directly and never consulted the `db_wal_unreadable` guard client
+/// autostart already uses — so `daemon start --db <corrupt-wal>` printed
+/// `Child PID: ...` and spawned a daemon against the exact state the
+/// corruption runbook's own step 0 says to stop everything against, then
+/// failed with a spawn-shaped message that named nothing about the database.
+/// Fixing leg (1) — refusing BEFORE any child exists — also closes nw-396 leg
+/// (1) for this route: with no child ever spawned, there is no
+/// "did not become healthy" message to improve, because it never happens.
+#[test]
+fn daemon_start_refuses_an_unreadable_wal_before_spawning_a_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("start")
+        // A direct daemon-lifecycle subcommand, not a query/write route
+        // NESTWEAVER_NO_DAEMON could redirect — pinned anyway so the
+        // suite-wide routing lint (`every_cli_invocation_pins_its_daemon_routing`)
+        // can see that explicitly, same as every other --db invocation.
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_ne!(output.status.code(), Some(0), "{combined}");
+    assert!(
+        !combined.contains("Child PID"),
+        "the ORIGINAL bug: a daemon child was spawned before the refusal ran: \
+         {combined}"
+    );
+    assert!(
+        !combined.contains("did not become healthy")
+            && !combined.contains("exited before becoming healthy"),
+        "must refuse before spawning, not report a spawn that was never \
+         allowed to happen: {combined}"
+    );
+    assert!(
+        combined.contains("db_wal_corrupt"),
+        "must carry the corrupt-WAL classification so the CLI renders the \
+         runbook rather than a transport/spawn error: {combined}"
+    );
+
+    // Nothing must be left running or registered — a refusal before spawn
+    // means there is nothing to clean up.
+    let status = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("status")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .output()
+        .unwrap();
+    let status_combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status_combined.contains("Daemon is not running."),
+        "no daemon may have been left running: {status_combined}"
+    );
+}
+
+/// nw-396 leg (2). Four states that used to be byte-identical at the CLI —
+/// `daemon status` never opened or stat'd `--db` at all, so a typo'd path was
+/// indistinguishable from a healthy, merely-stopped database.
+#[test]
+fn daemon_status_distinguishes_an_unusable_db_from_a_stopped_daemon() {
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+    let run_status = |db: &std::path::Path| -> (bool, String) {
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args(["daemon", "--db"])
+            .arg(db)
+            .arg("status")
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    // Corrupt WAL: actionable, must fail, must name the remedy.
+    let dir = tempfile::tempdir().unwrap();
+    let corrupt = dir.path().join("corrupt.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&corrupt).unwrap();
+    }
+    std::fs::write(dir.path().join("corrupt.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("corrupt.lbug.shadow"));
+    let (ok, out) = run_status(&corrupt);
+    assert!(!ok, "a corrupt WAL is an actionable defect: {out}");
+    assert!(out.contains("unreadable write-ahead log"), "{out}");
+    assert!(out.contains("nestweaver repair --db"), "{out}");
+
+    // Directory: actionable, must fail.
+    let as_dir = dir.path().join("a-directory.lbug");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    let (ok, out) = run_status(&as_dir);
+    assert!(!ok, "a directory is not a database: {out}");
+    assert!(out.contains("is a directory"), "{out}");
+
+    // 0-byte file: actionable, must fail.
+    let zero_byte = dir.path().join("zero.lbug");
+    std::fs::write(&zero_byte, b"").unwrap();
+    let (ok, out) = run_status(&zero_byte);
+    assert!(!ok, "a 0-byte file has never been indexed: {out}");
+    assert!(out.contains("0 bytes"), "{out}");
+
+    // Nonexistent path: NOT an error — merely worth a note distinguishing it
+    // from a healthy, stopped daemon at a real path.
+    let missing = dir.path().join("does-not-exist.lbug");
+    let (ok, out) = run_status(&missing);
+    assert!(ok, "a fresh, never-indexed path is not a defect: {out}");
+    assert!(out.contains("does not exist yet"), "{out}");
+
+    // The counterweight: a genuinely healthy, merely-stopped database must
+    // keep the plain, unembellished sentence with no defect note at all —
+    // otherwise every state above could pass by making every `daemon status`
+    // output "actionable", including a perfectly fine one.
+    let healthy = dir.path().join("healthy.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&healthy).unwrap();
+    }
+    let (ok, out) = run_status(&healthy);
+    assert!(ok, "{out}");
+    assert!(out.contains("Daemon is not running."), "{out}");
+    for marker in [
+        "is a directory",
+        "0 bytes",
+        "unreadable write-ahead log",
+        "does not exist yet",
+    ] {
+        assert!(
+            !out.contains(marker),
+            "a healthy, stopped database must not carry any defect note ({marker}): {out}"
+        );
+    }
+}
+
+/// nw-368. `nestweaver_store::reclaim_orphaned_tantivy_staging` existed but
+/// nothing in the CLI ever called it: three separate recovery routes tried
+/// against a live repro (a full `reindex-search`, `repair`, a daemon
+/// start/stop cycle) all left an orphaned migration staging directory
+/// behind. This test does not re-derive the store's own crash-reproduction
+/// (that lives in `nestweaver-store`'s own suite); it proves the WIRING —
+/// `repair` finds and reports a directory in the exact recognized shape
+/// (the staging prefix, containing `meta.json`).
+#[test]
+fn repair_reclaims_an_orphaned_tantivy_migration_staging_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    // The reclaim takes a recovery lock under `reindex_lock_root()`, which
+    // honours `XDG_STATE_HOME` — isolate it from the operator's real
+    // `~/.local/state/nestweaver` rather than leaving a lock file there.
+    let state = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("scratch.lbug.tantivy")).unwrap();
+    let staging = dir.path().join(format!(
+        "{}orphan",
+        nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX
+    ));
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("meta.json"), b"{}").unwrap();
+
+    // --dry-run must find it, report it, and not touch it.
+    let dry = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .arg("--dry-run")
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        staging.exists(),
+        "--dry-run must never delete anything: {dry_out}"
+    );
+    assert!(dry_out.contains("would be reclaimed"), "{dry_out}");
+    assert!(dry_out.contains("orphan"), "{dry_out}");
+
+    // The real run reclaims it and says so.
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !staging.exists(),
+        "the orphaned staging directory must be removed: {combined}"
+    );
+    assert!(
+        combined.contains("Reclaimed 1 orphaned Tantivy migration staging director"),
+        "{combined}"
+    );
+}
+
+/// The counterweight: a database with no staging directory at all must not
+/// mention Tantivy staging reclaim anywhere in `repair`'s output — otherwise
+/// the test above could pass on a build that always prints the sentence.
+#[test]
+fn repair_says_nothing_about_tantivy_staging_when_there_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Tantivy migration staging"),
+        "{combined}"
+    );
+    assert!(!combined.contains("Reclaimed"), "{combined}");
+}
+
+/// nw-401. `save_clusters` writes both the canonical `<db>.clusters.json` and
+/// a resolution-keyed `<db>.clusters.<resolution>.json`, and nothing in the
+/// tree pruned the keyed copies: one accumulates per distinct `--resolution`
+/// a caller has ever used, forever. This proves `repair` reclaims every keyed
+/// sidecar EXCEPT the one matching the canonical file's current resolution,
+/// and never touches the canonical file itself.
+#[test]
+fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let stale = nestweaver_engine::ClusteringOutput {
+        resolution: 0.5,
+        modularity: 0.42,
+        communities: vec![nestweaver_engine::CommunityInfo {
+            id: 1,
+            name: "stale".to_string(),
+            cohesion: 0.9,
+            member_count: 3,
+            members: vec![],
+            key_files: vec![],
+        }],
+    };
+    nestweaver_engine::save_clusters(&db, &stale).unwrap();
+
+    let current = nestweaver_engine::ClusteringOutput {
+        resolution: 5.0,
+        modularity: 0.9,
+        communities: vec![nestweaver_engine::CommunityInfo {
+            id: 1,
+            name: "current".to_string(),
+            cohesion: 0.3,
+            member_count: 9,
+            members: vec![],
+            key_files: vec![],
+        }],
+    };
+    nestweaver_engine::save_clusters(&db, &current).unwrap();
+
+    let canonical_path = dir.path().join("scratch.lbug.clusters.json");
+    let stale_path = nestweaver_engine::sidecar_path_for_resolution(&db, 0.5);
+    let current_path = nestweaver_engine::sidecar_path_for_resolution(&db, 5.0);
+    assert!(canonical_path.exists(), "precondition");
+    assert!(stale_path.exists(), "precondition");
+    assert!(current_path.exists(), "precondition");
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !stale_path.exists(),
+        "the stale (0.5) keyed sidecar must be reclaimed: {combined}"
+    );
+    assert!(
+        current_path.exists(),
+        "the CURRENT (5.0) keyed sidecar must survive — it matches the \
+         canonical file's resolution: {combined}"
+    );
+    assert!(
+        canonical_path.exists(),
+        "the canonical sidecar itself must never be touched: {combined}"
+    );
+    assert!(
+        combined.contains("Reclaimed 1 orphaned resolution-keyed cluster sidecar"),
+        "{combined}"
+    );
+
+    // The canonical (last-writer-wins) and pinned-current loads must both
+    // still work after reclaim.
+    let canonical = nestweaver_engine::load_clusters(&db).unwrap().unwrap();
+    assert_eq!(canonical.communities[0].name, "current");
+    let pinned = nestweaver_engine::load_clusters_for_resolution(&db, 5.0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pinned.communities[0].name, "current");
+}
+
+/// The counterweight: a database with only ONE resolution ever computed must
+/// not have `repair` remove anything — the keyed sidecar for the only
+/// (therefore current) resolution must survive, and `repair` must say
+/// nothing about cluster sidecar reclaim at all.
+#[test]
+fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let only = nestweaver_engine::ClusteringOutput {
+        resolution: 1.0,
+        modularity: 0.5,
+        communities: vec![],
+    };
+    nestweaver_engine::save_clusters(&db, &only).unwrap();
+    let only_path = nestweaver_engine::sidecar_path_for_resolution(&db, 1.0);
+    assert!(only_path.exists(), "precondition");
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        only_path.exists(),
+        "the only resolution ever computed must survive: {combined}"
+    );
+    assert!(!combined.contains("cluster sidecar"), "{combined}");
+}
+
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
 /// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
 /// preserved this case as a SEMANTIC refusal. That reasoning stands and the
