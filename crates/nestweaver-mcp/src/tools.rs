@@ -10287,7 +10287,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -10535,7 +10535,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -10954,7 +10954,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff",
+        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff\n- `stale_repos` on THIS tool is behind-HEAD git URLs (matching `any_stale`/`is_stale`) — a different population from the SAME-NAMED `stale_repos` on `hub_nodes`/`bridge_nodes` (generation-mismatch repo UIDs) or `blast_radius`'s `_meta.stale_repos` (federation lag). This tool's OWN generation-stale set is the differently-named `resolver_stale_repos` above, precisely to avoid deepening that collision (nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11577,7 +11577,12 @@ fn tool_schema_project_context() -> Value {
                     "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
-                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." },
+                "no_embed": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable semantic ranking for this call by zeroing the semantic weight. `semantic_applied` reports `false` and it is not counted as a degraded component (you asked for this, it is not a fallback)."
+                }
             },
             "required": ["project"],
             "additionalProperties": false
@@ -11785,7 +11790,7 @@ fn tool_project_context(
 
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
-    let config = match current_instance_config() {
+    let mut config = match current_instance_config() {
         Some(cfg) => HybridSearchConfig {
             weight_ppr: cfg.embedding.weight_ppr,
             weight_bm25: cfg.embedding.weight_bm25,
@@ -11797,6 +11802,21 @@ fn tool_project_context(
         },
         None => HybridSearchConfig::default(),
     };
+    // nw-430: `no_embed` zeroes the SAME `weight_semantic` knob
+    // `tool_brain_context` already exposes over the wire (see its
+    // `weight_semantic` arg a few hundred lines up) rather than inventing a
+    // second mechanism. Zeroing it here — not passing `None` for
+    // `embed_model` — keeps `semantic_requested` (below) honest too: it is
+    // computed from this same field, so a caller who asked to disable
+    // semantic ranking is not then told the answer is "degraded" for
+    // getting exactly what it asked for.
+    if args
+        .get("no_embed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        config.weight_semantic = 0.0;
+    }
     let mut result = build_brain_context_hybrid_with_aliases(
         store,
         &ppr_seeds,
@@ -12287,7 +12307,7 @@ fn tool_dead_code(
 fn tool_schema_hub_nodes() -> Value {
     json!({
         "name": "hub_nodes",
-        "description": "Identify the most connected symbols in the codebase ranked by total degree (incoming + outgoing edges). These are the architectural core.\n\nGuidelines:\n- Use for quick orientation on which abstractions are most central\n- Includes optional cluster membership when clustering sidecar exists\n- For chokepoints between communities use bridge_nodes instead\n\nLimitations:\n- Degree centrality only — does not account for path importance (use bridge_nodes for betweenness)\n- For specific symbol dependencies use brain_impact or flow_trace\n- Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored, however connected: these kinds are not callable, and edges into them are typically the resolver crediting a receiver rather than the method actually invoked (nw-308). A genuinely central config constant or shared registry property will not appear here no matter how many places reference it\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them",
+        "description": "Identify the most connected symbols in the codebase ranked by total degree (incoming + outgoing edges). These are the architectural core.\n\nGuidelines:\n- Use for quick orientation on which abstractions are most central\n- Includes optional cluster membership when clustering sidecar exists\n- For chokepoints between communities use bridge_nodes instead\n\nLimitations:\n- Degree centrality only — does not account for path importance (use bridge_nodes for betweenness)\n- For specific symbol dependencies use brain_impact or flow_trace\n- Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored, however connected: these kinds are not callable, and edges into them are typically the resolver crediting a receiver rather than the method actually invoked (nw-308). A genuinely central config constant or shared registry property will not appear here no matter how many places reference it\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them\n- `stale_repos` here is the GENERATION-mismatch population (repo UIDs, e.g. `repo:kory-brain:<hash>`) explaining `rankings_stale` — NOT the same population as `stale_check`'s `stale_repos` (git URLs, behind-HEAD) or `blast_radius`'s `_meta.stale_repos` (federation lag). Same key name, three different meanings across this API — read the one attached to the tool you called (nw-371)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12398,7 +12418,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_bridge_nodes() -> Value {
     json!({
         "name": "bridge_nodes",
-        "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact\n- Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored, however connected: these kinds are not callable, and edges into them are typically the resolver crediting a receiver rather than the method actually invoked (nw-308). A genuinely central config constant or shared registry property will not appear here no matter how many places reference it\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them",
+        "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact\n- Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored, however connected: these kinds are not callable, and edges into them are typically the resolver crediting a receiver rather than the method actually invoked (nw-308). A genuinely central config constant or shared registry property will not appear here no matter how many places reference it\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them\n- `stale_repos` here is the GENERATION-mismatch population (repo UIDs, e.g. `repo:kory-brain:<hash>`) explaining `rankings_stale` — NOT the same population as `stale_check`'s `stale_repos` (git URLs, behind-HEAD) or `blast_radius`'s `_meta.stale_repos` (federation lag). Same key name, three different meanings across this API — read the one attached to the tool you called (nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -12501,7 +12521,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14818,7 +14838,12 @@ fn tool_schema_investigate() -> Value {
                 "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
                 "scope": { "type": "string", "description": "Optional scope. \"project:<slug>\" and \"repo:<name>\" genuinely restrict results; \"vault\" and \"all\" are PASS-THROUGHS that restrict nothing (default: \"all\"). Read `scope_filtered` in the response to know whether a filter was actually applied — `scope` only echoes what you asked for. NOTE on vault notes: a repo has no note-to-repo association in the schema, so \"repo:<name>\" EXCLUDES vault notes/sections/tags from the map entirely (symbols are restricted to the named repo). \"project:<slug>\" is different: it genuinely admits the project's own member notes (seeded from its vault_folder) alongside its member symbols." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
-                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
+                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." },
+                "no_embed": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable semantic ranking for this call. `semantic_applied` reports `false`. NOTE: `degraded_components` will still list \"semantic\" — this tool does not yet distinguish 'disabled by request' from 'unavailable'."
+                }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -14836,6 +14861,23 @@ fn tool_investigate(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'query' must be a string"))?;
+    // nw-430: `investigate`'s engine core has no per-call weight override (its
+    // `HybridSearchConfig` is built internally, unlike `brain_context`'s), so
+    // the only lever this layer has is withholding the model entirely. That
+    // correctly zeroes `semantic_applied`, but `degraded_components` (set in
+    // `investigate.rs`) does not distinguish "asked for none" from
+    // "unavailable" — it always lists "semantic" when no model was applied.
+    // Left as-is rather than reshaping that struct's contract as a rider on
+    // this item; the schema says so above.
+    let embed_model = if args
+        .get("no_embed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        None
+    } else {
+        embed_model
+    };
     // nw-379: an empty query returned a fully populated bundle at a flat
     // relevance -- see `is_blank_query`'s doc comment for why that is the
     // same defect `regex_search`/`count_patterns` already refuse.
@@ -17570,6 +17612,164 @@ mod cache_dispatch_tests {
             2,
             "project_context inference failure must be retried, never cached"
         );
+    }
+
+    /// nw-430. A deterministic, CALL-COUNTING embed model — proves not just
+    /// that `semantic_applied` flips, but that the embed call itself is
+    /// skipped when `no_embed` is set (rather than being called and its
+    /// result discarded, which would still flip `semantic_applied` but pay
+    /// the cost `--no-embed` exists to avoid).
+    struct CountingFixedEmbed {
+        vector: Vec<f32>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl EmbedQueryFn for CountingFixedEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.vector.clone())
+        }
+    }
+
+    /// nw-430. FIXTURE ADEQUACY: this store carries a REAL embedding vector
+    /// (`add_embedding`), not a vector-deficient copy — on a store with zero
+    /// vectors, `semantic_applied` is already `false` regardless of
+    /// `no_embed` (see `store_has_embeddings` in `nestweaver-engine`), which
+    /// would make this test pass without exercising the fix at all. The
+    /// control run below proves the fixture CAN exhibit the bug (semantic
+    /// genuinely fires without the flag) before the `no_embed` run proves the
+    /// flag turns it off.
+    #[test]
+    fn project_context_no_embed_disables_semantic_without_false_degradation() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        let project = nestweaver_schema::Project {
+            uid: "proj:no-embed".to_string(),
+            name: "No Embed Project".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&project).unwrap();
+        let symbol_uid = store.lookup_symbols_by_name("greet").unwrap()[0]
+            .uid
+            .clone();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&symbol_uid), 1.0)
+            .unwrap();
+        assert!(store.add_embedding(&symbol_uid, vec![1.0, 0.0, 0.0]));
+        let model = CountingFixedEmbed {
+            vector: vec![1.0, 0.0, 0.0],
+            calls: 0.into(),
+        };
+
+        // Control: no `no_embed` — semantic genuinely fires on this fixture.
+        let control = dispatch(
+            &store,
+            None,
+            "project_context",
+            json!({ "project": "No Embed Project", "token_budget": 2000, "no_cache": true }),
+            Some(&model),
+        )
+        .unwrap();
+        assert_eq!(control["semantic_applied"], true);
+        assert_eq!(control["degraded_components"], json!([]));
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "control run must actually call the embed model"
+        );
+
+        // `no_embed: true` — semantic must be OFF, and NOT reported as a
+        // degradation: the caller asked for exactly this, so `semantic`
+        // appearing in `degraded_components` here would be a false alarm.
+        let disabled = dispatch(
+            &store,
+            None,
+            "project_context",
+            json!({
+                "project": "No Embed Project",
+                "token_budget": 2000,
+                "no_cache": true,
+                "no_embed": true,
+            }),
+            Some(&model),
+        )
+        .unwrap();
+        assert_eq!(disabled["semantic_applied"], false);
+        assert_eq!(
+            disabled["degraded_components"],
+            json!([]),
+            "no_embed is a deliberate disable, not a degradation"
+        );
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no_embed must skip the embed call entirely, not call it and discard the result"
+        );
+    }
+
+    /// nw-430. Same fixture-adequacy discipline as the `project_context`
+    /// sibling above: real embeddings, a control run that proves the flag
+    /// has something to disable, then the `no_embed` run.
+    ///
+    /// `investigate`'s own `degraded_components` logic (see `investigate.rs`)
+    /// does not distinguish "disabled by request" from "unavailable" — it
+    /// always lists "semantic" whenever no model was applied. That is a
+    /// pre-existing property of that struct, not introduced here, and the
+    /// schema documents it; this test asserts the (documented) actual
+    /// behaviour rather than papering over it.
+    #[test]
+    fn investigate_no_embed_disables_semantic_ranking() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        let symbol_uid = store.lookup_symbols_by_name("greet").unwrap()[0]
+            .uid
+            .clone();
+        assert!(store.add_embedding(&symbol_uid, vec![1.0, 0.0, 0.0]));
+        let model = CountingFixedEmbed {
+            vector: vec![1.0, 0.0, 0.0],
+            calls: 0.into(),
+        };
+
+        let control = dispatch(
+            &store,
+            None,
+            "investigate",
+            json!({ "query": "greet", "token_budget": 2000 }),
+            Some(&model),
+        )
+        .unwrap();
+        assert_eq!(control["semantic_applied"], true);
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "control run must actually call the embed model"
+        );
+
+        let disabled = dispatch(
+            &store,
+            None,
+            "investigate",
+            json!({ "query": "greet", "token_budget": 2000, "no_embed": true }),
+            Some(&model),
+        )
+        .unwrap();
+        assert_eq!(disabled["semantic_applied"], false);
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no_embed must skip the embed call entirely, not call it and discard the result"
+        );
+        assert_eq!(disabled["degraded_components"], json!(["semantic"]));
     }
 
     #[test]

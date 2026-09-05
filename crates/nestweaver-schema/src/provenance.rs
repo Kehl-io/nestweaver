@@ -52,6 +52,16 @@ pub fn derived_scope<'a>(sources: &[&'a str]) -> &'a str {
 }
 
 /// Build the provenance object itself.
+///
+/// nw-371: the `stale_repos` this writes under `_meta` is FEDERATION
+/// staleness — upstream servers whose contributed data is behind — and is
+/// one of (at least) four populations across this API that share the bare
+/// key name `stale_repos`. See the glossary on `ResolverStaleness` in
+/// `src/main.rs` for the other three (`hub_nodes`/`bridge_nodes`/`repo-map`'s
+/// generation-mismatch repo UIDs, `stale_check`'s behind-HEAD git URLs, and
+/// `resolver_stale_repos`, a differently-named repo-UID population added
+/// later specifically to avoid deepening this collision). Nothing here
+/// decodes one as another; keep it that way.
 pub fn provenance(scope: &str, sources: &[&str], stale_repos: &[String]) -> Value {
     serde_json::json!({
         "scope": scope,

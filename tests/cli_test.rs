@@ -3273,6 +3273,93 @@ fn search_limit_enforces_the_brain_search_schema_bound() {
         .stdout(contains("brain_search"));
 }
 
+/// nw-430. `--no-embed` used to be accepted and silently ignored on `search`
+/// and plain-seed `context` — the item was filed from a byte-identical
+/// before/after measurement on exactly these two commands, because neither
+/// has a semantic leg on any route (`search` is a substring match over
+/// symbol names; seed-mode `context` is code-only PPR with no BM25/semantic
+/// fusion). Both now refuse the flag instead. No db needs to exist for
+/// either assertion — the refusal fires before any store is opened.
+#[test]
+fn search_rejects_no_embed_since_it_has_no_semantic_leg() {
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["search", "anything"])
+        .assert()
+        .code(64)
+        .stderr(contains("never runs semantic ranking"));
+
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["search", "anything", "--json"])
+        .assert()
+        .code(64)
+        .stdout(contains("\"error\":\"invalid argument\""))
+        .stdout(contains("\"argument\":\"--no-embed\""));
+}
+
+/// nw-430's twin refusal, for `context` without `--feature`. `context
+/// --feature <name> --config <file>` is the one shape of `context` that
+/// DOES reach a semantic leg (it calls the real `brain_context` tool) and is
+/// deliberately NOT covered by this refusal — see the wiring in
+/// `Commands::Context`'s feature-mode arm.
+#[test]
+fn context_seed_mode_rejects_no_embed_since_it_has_no_semantic_leg() {
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["context", "anything"])
+        .assert()
+        .code(64)
+        .stderr(contains("no BM25 or semantic leg"));
+
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["context", "anything", "--json"])
+        .assert()
+        .code(64)
+        .stdout(contains("\"error\":\"invalid argument\""))
+        .stdout(contains("\"argument\":\"--no-embed\""));
+}
+
+/// nw-430. Counterpart to the two refusals above: `project-context` and
+/// `investigate` DO have a genuine semantic leg (via the daemon's loaded
+/// embed model — see nw-316's Part A finding that the direct/no-daemon route
+/// never has one), so `--no-embed` must be ACCEPTED on them, not refused.
+/// This only proves the flag is not rejected at the CLI-parsing/dispatch
+/// layer; the actual semantic-disabling behaviour is proven with a real
+/// embed-model fixture in `crates/nestweaver-mcp/src/tools.rs`
+/// (`project_context_no_embed_disables_semantic_without_false_degradation`,
+/// `investigate_no_embed_disables_semantic_ranking`), because this
+/// `NESTWEAVER_NO_DAEMON=1` harness has no embed model to disable in the
+/// first place.
+#[test]
+fn project_context_and_investigate_still_accept_no_embed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["project-context", "nonexistent-project"])
+        .args(["--db", &db_path.display().to_string()])
+        .assert()
+        .code(2) // NOT_FOUND, never EXIT_USAGE (64) — the flag itself is accepted.
+        .stderr(contains("not found"));
+
+    let investigate_output = nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["investigate", "anything"])
+        .args(["--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    assert_ne!(
+        investigate_output.status.code(),
+        Some(64),
+        "--no-embed must not be refused on investigate (it has a genuine semantic leg via the daemon): {}",
+        String::from_utf8_lossy(&investigate_output.stderr)
+    );
+}
+
 /// nw-432 / nw-217b: `blast-radius --limit` help advertised "(1-10000)" and
 /// enforced exactly that range, while the MCP `blast_radius` schema caps
 /// `limit` at 1000 (`RESULT_LIMIT_MAX`) -- every value in 1001-10000 parsed
@@ -8056,12 +8143,17 @@ fn daemon_status_distinguishes_an_unusable_db_from_a_stopped_daemon() {
     assert!(out.contains("unreadable write-ahead log"), "{out}");
     assert!(out.contains("nestweaver repair --db"), "{out}");
 
-    // Directory: actionable, must fail.
+    // Directory: actionable, must fail, and (review follow-up, FIX 2) must
+    // name a remedy like the other three actionable arms do.
     let as_dir = dir.path().join("a-directory.lbug");
     std::fs::create_dir_all(&as_dir).unwrap();
     let (ok, out) = run_status(&as_dir);
     assert!(!ok, "a directory is not a database: {out}");
     assert!(out.contains("is a directory"), "{out}");
+    assert!(
+        out.contains("nestweaver index --repo"),
+        "the directory refusal must name a remedy, not just the problem: {out}"
+    );
 
     // 0-byte file: actionable, must fail.
     let zero_byte = dir.path().join("zero.lbug");
@@ -8195,6 +8287,66 @@ fn repair_says_nothing_about_tantivy_staging_when_there_is_none() {
         "{combined}"
     );
     assert!(!combined.contains("Reclaimed"), "{combined}");
+}
+
+/// Review follow-up (FIX 5). `--dry-run` used to filter only by name-prefix
+/// + `is_dir()`, while the real reclaim additionally requires
+/// `looks_like_tantivy_staging` (empty, or containing `meta.json`) — so a
+/// directory that merely shares the staging prefix by coincidence (a
+/// person's own directory, not a crash artifact) would show as "would be
+/// reclaimed" in the preview and then survive a real run untouched. This
+/// proves the preview now applies the same narrowing.
+#[test]
+fn repair_dry_run_does_not_overstate_a_prefix_coincidence_as_reclaimable() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("scratch.lbug.tantivy")).unwrap();
+    // Shares the exact staging prefix, but is neither empty nor carries a
+    // `meta.json` marker — a coincidence, not migration residue.
+    let coincidence = dir
+        .path()
+        .join(format!("{}not-a-migration", nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX));
+    std::fs::create_dir_all(&coincidence).unwrap();
+    std::fs::write(coincidence.join("my_own_file.txt"), b"do not touch").unwrap();
+
+    let dry = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .arg("--dry-run")
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        !dry_out.contains("would be reclaimed"),
+        "a prefix coincidence must not be previewed as reclaimable: {dry_out}"
+    );
+
+    // Confirm the real path agrees: it must ALSO refuse to touch it.
+    let real = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let real_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&real.stdout),
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        coincidence.exists(),
+        "the real run must agree with the preview and leave it alone: {real_out}"
+    );
+    assert!(!real_out.contains("Reclaimed"), "{real_out}");
 }
 
 /// nw-401. `save_clusters` writes both the canonical `<db>.clusters.json` and

@@ -1544,7 +1544,13 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     no_daemon: bool,
 
-    /// Disable semantic embedding for this invocation
+    /// Disable semantic embedding for this invocation, on the commands that
+    /// have a semantic leg to disable: `brain context`, `brain search`
+    /// (which is already lexical-only and unaffected), `project-context`,
+    /// `investigate`, and `context --feature`. Refused with an error on
+    /// `search` and plain-seed `context`, which have no semantic leg on any
+    /// route — nw-430 was filed because this flag used to be silently
+    /// accepted and ignored there instead.
     #[arg(long, global = true)]
     no_embed: bool,
 }
@@ -2184,13 +2190,37 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
 /// marks every already-indexed repo stale at a stroke, which turns "an agent
 /// might miss the warning" into "every repo in the graph returns pre-fix
 /// rankings and nothing on stdout says so".
+///
+/// nw-371: THIS `stale_repos` (repo UIDs, e.g. `repo:kory-brain:<hash>`,
+/// generation-mismatch) is ONE of (at least) four populations that share the
+/// bare key name `stale_repos` across this API. [`ResolverStaleness::from_daemon_response`]
+/// is the exact seam where decoding one as another would happen, which is why
+/// this glossary lives here rather than being reconstructed at the point of
+/// confusion:
+///   1. THIS struct's `stale_repos` — `hubs`/`bridges`/`repo-map`. Repo UIDs.
+///      Generation mismatch (edges built by a resolver older, or now also
+///      newer, than `RESOLVER_GENERATION`).
+///   2. `stale-check`'s own top-level `stale_repos` (`crates/nestweaver-mcp/src/tools.rs`,
+///      `tool_stale_check`). Git URLs (`git@...`, `file:///...`). Commits-behind-HEAD,
+///      unrelated to resolver generation — that tool's OWN generation-stale set is the
+///      differently-named `resolver_stale_repos`, precisely to avoid a second collision.
+///   3. `blast_radius`'s `_meta.stale_repos` (`crates/nestweaver-schema/src/provenance.rs`).
+///      FEDERATION staleness — an upstream server's data being behind, nothing to do with
+///      git or resolver generation.
+///   4. `resolver_stale_repos` (`affected_tests`/`detect_changes`/`blast_radius`,
+///      `crates/nestweaver-engine/src/affected_tests.rs`, `blast_radius.rs`). Repo UIDs,
+///      same MEANING as population 1 but under a different key, added later specifically
+///      so it would not deepen this collision.
+/// Nothing currently decodes one as another; keeping this list current is what keeps it
+/// that way the next time one of these four call sites is touched.
 struct ResolverStaleness {
     /// True when at least one repo's edges are known to predate the current
     /// resolver, or when no generation record exists at all.
     rankings_stale: bool,
     /// The repos that can be PROVEN stale, so the caller knows what to
     /// re-index. May be empty while `rankings_stale` is true — see
-    /// [`ResolverStaleness::from_sidecar`].
+    /// [`ResolverStaleness::from_sidecar`]. Population 1 of 4 — see the
+    /// struct-level doc comment above (nw-371).
     stale_repos: Vec<String>,
 }
 
@@ -4488,6 +4518,11 @@ enum Commands {
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
+    ///
+    /// `--json`'s `stale_repos` is behind-HEAD git URLs — a different
+    /// population from `hubs`/`bridges`/`repo-map`'s same-named field
+    /// (generation-mismatch repo UIDs). This command's own generation-stale
+    /// set is the differently-named `resolver_stale_repos` (nw-371).
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -4890,6 +4925,10 @@ enum Commands {
     /// Outputs the highest-PageRank symbols organized by file, truncated
     /// to fit within the specified token budget. Designed for AI agent
     /// context windows.
+    ///
+    /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs — the
+    /// same population as `hubs`/`bridges`, and a different one from
+    /// `stale-check`'s same-named field (nw-371).
     RepoMap {
         // nw-397: had no `value_parser` at all -- `--token-budget 0`
         // returned `"map": "", "token_count": 0` at exit 0, indistinguishable
@@ -5387,6 +5426,10 @@ enum Commands {
     /// method actually invoked (nw-308). A genuinely central config constant
     /// or shared registry property will not appear here no matter how many
     /// places reference it.
+    ///
+    /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs
+    /// (explaining `rankings_stale`) — a different population from
+    /// `stale-check`'s same-named field (nw-371; see `nestweaver stale-check --help`).
     #[command(after_help = "Examples:\n  nestweaver hubs\n  nestweaver hubs --top 20 --json")]
     Hubs {
         #[arg(
@@ -5418,6 +5461,10 @@ enum Commands {
     /// method actually invoked (nw-308). A genuinely central config constant
     /// or shared registry property will not appear here no matter how many
     /// places reference it.
+    ///
+    /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs
+    /// (explaining `rankings_stale`) — a different population from
+    /// `stale-check`'s same-named field (nw-371; see `nestweaver stale-check --help`).
     #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
     Bridges {
         // nw-251: bounded like `hubs --top`, which has carried
@@ -6481,7 +6528,19 @@ fn format_server_status(url: &str, status: &ServerStatusResponse) -> String {
 enum DaemonAction {
     /// Start the daemon (usually auto-started on first use)
     Start {
-        /// Idle timeout in seconds
+        /// Idle timeout in seconds.
+        ///
+        /// This default governs an explicit `daemon start` only. Autostart
+        /// (triggered by `index`/`search`/etc. against a `--db` it decides
+        /// looks ephemeral — under `/tmp`, `$TMPDIR`, or `/var/folders`)
+        /// instead passes a much shorter timeout of its own (currently 60s,
+        /// tunable via `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS`), so a
+        /// one-shot command against a scratch database does not leave an
+        /// hour-long resident daemon behind. If a REAL, long-lived database
+        /// happens to live under one of those paths — e.g. a container whose
+        /// working root is `/tmp` — set
+        /// `NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT=1` to make autostart use this
+        /// normal default for it instead of guessing from the path.
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
         /// Optional path to `nestweaver-instance.toml`. When supplied, the
@@ -6924,6 +6983,11 @@ enum BrainCommands {
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
+    ///
+    /// `--json`'s `stale_repos` is behind-HEAD git URLs — a different
+    /// population from `hubs`/`bridges`/`repo-map`'s same-named field
+    /// (generation-mismatch repo UIDs). This command's own generation-stale
+    /// set is the differently-named `resolver_stale_repos` (nw-371).
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -11430,7 +11494,9 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     require_existing_db(db_path)?;
     if db_path.is_dir() {
         anyhow::bail!(
-            "{} is a directory, not a NestWeaver database",
+            "{} is a directory, not a NestWeaver database. Point --db at a \
+             `.lbug` file, or run `nestweaver index --repo <path> --db <new \
+             path>` to create one.",
             db_path.display()
         );
     }
@@ -11562,7 +11628,9 @@ fn daemon_status_db_problem(db_path: &Path) -> Option<(bool, String)> {
         return Some((
             true,
             format!(
-                "{} is a directory, not a NestWeaver database.",
+                "{} is a directory, not a NestWeaver database. Point --db at \
+                 a `.lbug` file, or run `nestweaver index --repo <path> --db \
+                 <new path>` to create one.",
                 db_path.display()
             ),
         ));
@@ -11747,6 +11815,22 @@ struct TantivyStagingRepairReport {
 /// on disk. Instead this lists directories bearing the exact
 /// [`nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX`] beside the sidecar,
 /// which is read-only.
+/// Mirrors `nestweaver_store::tantivy_index`'s private `looks_like_tantivy_staging`
+/// exactly (empty directory, or one containing a `meta.json` marker — nothing
+/// else, so a directory that merely shares the staging prefix by coincidence
+/// is never reported as reclaimable). That predicate is not exported, and
+/// re-implementing four lines here is a smaller surface than exposing a
+/// destructive-adjacent internal across the crate boundary for one
+/// `--dry-run` preview. If the two predicates are ever changed independently,
+/// this is the seam nw-217 would have flagged — but the underlying function
+/// is otherwise unavailable outside its crate.
+fn looks_like_tantivy_staging_preview(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none() || path.join("meta.json").is_file(),
+        Err(_) => false,
+    }
+}
+
 fn repair_tantivy_staging(
     db_path: &std::path::Path,
     dry_run: bool,
@@ -11758,6 +11842,15 @@ fn repair_tantivy_staging(
         .unwrap_or_else(|| PathBuf::from("."));
 
     if dry_run {
+        // Review follow-up (FIX 5). Must match the REAL path's predicate
+        // exactly, not just the name-prefix + is_dir() check this used to
+        // stop at: `reclaim_orphaned_tantivy_staging` additionally requires
+        // `looks_like_tantivy_staging` (empty, or containing `meta.json`) —
+        // deliberately narrow so a directory that merely shares the prefix
+        // by coincidence is never removed. Without the same narrowing here,
+        // `--dry-run` could show a coincidental directory as "would be
+        // reclaimed" when a real run would refuse to touch it, overstating
+        // what repair will do.
         let mut found: Vec<PathBuf> = std::fs::read_dir(&parent)
             .into_iter()
             .flatten()
@@ -11768,6 +11861,7 @@ fn repair_tantivy_staging(
                 }) && entry.file_type().is_ok_and(|kind| kind.is_dir())
             })
             .map(|entry| entry.path())
+            .filter(|path| looks_like_tantivy_staging_preview(path))
             .collect();
         found.sort();
         return Ok(TantivyStagingRepairReport {
@@ -11831,22 +11925,39 @@ fn repair_cluster_sidecars(
     dry_run: bool,
 ) -> anyhow::Result<ClusterSidecarRepairReport> {
     let canonical_path = nestweaver_engine::cluster_dispatch::sidecar_path(db_path);
-    let keep_path = match nestweaver_engine::cluster_dispatch::load_clusters(db_path) {
-        Ok(Some(output)) => Some(
-            nestweaver_engine::cluster_dispatch::sidecar_path_for_resolution(
-                db_path,
-                output.resolution,
-            ),
-        ),
-        // No canonical sidecar (nothing computed yet) or it failed to load
-        // (cannot prove what is current): spare everything rather than guess.
-        Ok(None) | Err(_) => None,
+    let canonical_name = canonical_path.file_name().map(std::ffi::OsStr::to_owned);
+
+    // Review follow-up (FIX 3). A closure, and called again immediately
+    // before EACH delete below, rather than resolved once at the top of this
+    // function: a concurrent `cluster --resolution B` — a documented,
+    // ordinary workflow — can flip the canonical resolution between this
+    // function's candidate listing and its deletion loop. `repair_tantivy_staging`
+    // closes the equivalent window by re-listing under
+    // `try_acquire_reindex_lock`; no analogous lock exists for cluster
+    // sidecars (`save_clusters` is deliberately lock-free and last-writer-
+    // wins, and adding one to `cluster_dispatch.rs` is out of scope for this
+    // batch). Re-checking right before the destructive action shrinks the
+    // race to the width of a single syscall instead of the whole repair
+    // invocation.
+    let current_keep_name = || -> Option<std::ffi::OsString> {
+        match nestweaver_engine::cluster_dispatch::load_clusters(db_path) {
+            Ok(Some(output)) => {
+                nestweaver_engine::cluster_dispatch::sidecar_path_for_resolution(
+                    db_path,
+                    output.resolution,
+                )
+                .file_name()
+                .map(std::ffi::OsStr::to_owned)
+            }
+            // No canonical sidecar (nothing computed yet) or it failed to load
+            // (cannot prove what is current): spare everything rather than guess.
+            Ok(None) | Err(_) => None,
+        }
     };
-    let Some(keep_path) = keep_path else {
+
+    let Some(keep_name) = current_keep_name() else {
         return Ok(ClusterSidecarRepairReport::default());
     };
-    let keep_name = keep_path.file_name().map(std::ffi::OsStr::to_owned);
-    let canonical_name = canonical_path.file_name().map(std::ffi::OsStr::to_owned);
 
     let Some(db_file_name) = db_path.file_name().and_then(|name| name.to_str()) else {
         return Ok(ClusterSidecarRepairReport::default());
@@ -11863,7 +11974,7 @@ fn repair_cluster_sidecars(
         .flatten()
         .filter(|entry| {
             let name = entry.file_name();
-            if Some(&name) == canonical_name.as_ref() || Some(&name) == keep_name.as_ref() {
+            if Some(&name) == canonical_name.as_ref() || Some(&name) == Some(&keep_name) {
                 return false;
             }
             name.to_str()
@@ -11883,6 +11994,12 @@ fn repair_cluster_sidecars(
 
     let mut report = ClusterSidecarRepairReport::default();
     for candidate in candidates {
+        // Re-check immediately before the destructive action — see
+        // `current_keep_name`'s doc above for why this is called again here
+        // instead of reusing `keep_name` from the listing pass.
+        if candidate.file_name() == current_keep_name().as_deref() {
+            continue;
+        }
         match std::fs::remove_file(&candidate) {
             Ok(()) => report.removed.push(candidate),
             Err(error) => report
@@ -14400,13 +14517,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .as_ref()
                         .and_then(|fs| fs.iter().find(|f| f.name == *feature_name))
                     {
-                        let hybrid_args = serde_json::json!({
+                        let mut hybrid_args = serde_json::json!({
                             "seeds": fc.entry_points,
                             "token_budget": token_budget.unwrap_or(0),
                             "repos": fc.repos,
                             "intent": intent.clone().unwrap_or_default(),
                             "include_seeds": true,
                         });
+                        // nw-430: `--feature` mode is the one shape of
+                        // `context` that genuinely reaches a semantic leg —
+                        // it calls the real `brain_context` tool, which reads
+                        // `weight_semantic` off the wire (see that tool's
+                        // schema). Seed-mode below has no such leg and
+                        // refuses the flag instead of silently eating it.
+                        if no_embed {
+                            hybrid_args["weight_semantic"] = serde_json::json!(0.0);
+                        }
                         if let Some(result_json) = try_hybrid_json_rpc_checked(
                             use_daemon,
                             &db_path,
@@ -14539,6 +14665,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
                 }
+            }
+
+            // nw-430: reached only when `--feature` was not given (that arm
+            // always returns above). This seed-based path routes to
+            // `code_context` below — pure structural PPR over code, with no
+            // BM25 or semantic leg at all on either the daemon or direct
+            // route. `--no-embed` therefore has nothing to disable here;
+            // refuse it instead of accepting and silently ignoring it (the
+            // exact defect this item was filed for — measured byte-identical
+            // output with and without the flag).
+            if no_embed {
+                let message = "`context` (without `--feature`) runs code-only PPR with no BM25 or semantic leg, so `--no-embed` cannot apply to it. Remove the flag, or use `nestweaver brain context <seed>` for the hybrid PPR+BM25+semantic retrieval this flag controls.";
+                if json {
+                    print_json_argument_error("--no-embed", "true", message);
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                return Ok((EXIT_USAGE, None));
             }
 
             // ── Seed-based context: daemon first, same algorithm either way ──
@@ -17830,6 +17974,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            // nw-430: `search` (`search_symbols`) matches symbol names by
+            // substring on both the daemon and direct routes — no BM25, no
+            // PPR, no semantic leg anywhere in it. `--no-embed` was
+            // previously accepted here and silently discarded (the item was
+            // filed from a byte-identical before/after measurement on this
+            // exact command). Refuse rather than repeat that.
+            if no_embed {
+                let message = "`search` matches symbol names by substring and never runs semantic ranking, so `--no-embed` cannot apply to it. Remove the flag, or use `nestweaver brain context <seed>` for PPR+BM25+semantic retrieval.";
+                if json {
+                    print_json_argument_error("--no-embed", "true", message);
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                return Ok((EXIT_USAGE, None));
+            }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 10);
@@ -19534,6 +19693,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // so the request does not depend on who reads it.
                     "recency_weight": recency_weight,
                     "recency_half_life_days": recency_half_life_days,
+                    // nw-430: `project-context` has a genuine semantic leg
+                    // (the daemon's loaded embed model), unlike `search` and
+                    // `context` above, which are rejected outright rather than
+                    // silently ignoring this flag. Sent on both routes from
+                    // the same `project_args`/`direct_args` clone, so the
+                    // direct path is future-proofed for whenever it gains its
+                    // own embed model.
+                    "no_embed": no_embed,
             });
             if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
                 project_args["since"] = serde_json::json!(since);
@@ -19677,6 +19844,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // the DAEMON's cwd, not the caller's, so inline bodies come
                 // back empty from a response that otherwise looks fine.
                 args["root"] = serde_json::json!(client_source_root(root.as_deref()));
+                // nw-430: the daemon holds the only embed model this command
+                // ever sees (the direct fallback below always passes `None`
+                // already, so `--no-embed` is inherently inert there — there
+                // is nothing for it to disable). Forwarding it here is what
+                // makes `semantic_applied` finally answer honestly on the
+                // route where it was previously ignored.
+                args["no_embed"] = serde_json::json!(no_embed);
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)?
                 {
                     if json {
@@ -21063,8 +21237,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             );
 
                             // Clean up any existing agent or fork-based daemon
-                            // before installing the new plist
-                            let _ = nestweaver_daemon::launchd::stop_and_uninstall(&instance_id);
+                            // before installing the new plist.
+                            //
+                            // Review follow-up on nw-417 (FIX 1). This used
+                            // to discard the result: if the previous
+                            // registration never confirmed it stopped —
+                            // launchd wedged, teardown still in flight —
+                            // this proceeded to bootstrap a NEW plist over it
+                            // anyway. Surface it instead of silently
+                            // overlaying a second registration on a job that
+                            // may still be alive.
+                            nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)
+                                .with_context(|| {
+                                    format!(
+                                        "cannot install a new launchd agent for {} while the \
+                                         previous registration has not confirmed it stopped — \
+                                         verify with `launchctl print gui/{}/{}`, then retry \
+                                         `daemon start`",
+                                        db_path.display(),
+                                        unsafe { libc::getuid() },
+                                        nestweaver_daemon::lifecycle::launchd_label(&instance_id),
+                                    )
+                                })?;
 
                             // nw-359 leg (1). Nothing above this point proved
                             // ownership of a LIVE incumbent — every path that
@@ -21699,16 +21893,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // job next to a forked daemon). Fall through to the
                     // pidfile/socket check so `stop` only reports success when
                     // nothing is left serving.
+                    // Review follow-up on nw-417 (FIX 1). `launchd_stopped`
+                    // used to be set to `true` UNCONDITIONALLY after this
+                    // retry loop, whose own result was thrown away — so a
+                    // wedged launchd job that never actually went away still
+                    // made `daemon stop` print "Daemon stopped." and exit 0.
+                    // `stop_and_uninstall` now performs this exact bounded
+                    // wait itself and returns `Err` when it cannot confirm
+                    // absence, so `?` is the only signal this arm needs:
+                    // reaching `true` below is now proof, not an assumption.
                     #[cfg(target_os = "macos")]
                     let launchd_stopped = if nestweaver_daemon::launchd::is_running(&instance_id) {
                         eprintln!("Stopping daemon via launchd...");
                         nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)?;
-                        for _ in 0..50 {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            if !nestweaver_daemon::launchd::is_running(&instance_id) {
-                                break;
-                            }
-                        }
                         true
                     } else {
                         false
