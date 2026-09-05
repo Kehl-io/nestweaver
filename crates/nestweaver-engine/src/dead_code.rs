@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use nestweaver_parser::language::detect_language;
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::GraphStore;
 use serde::Serialize;
@@ -104,6 +105,23 @@ pub struct DeadCodeResult {
     /// Measured on a real C++ corpus: 0 of 11,730 reachable, 1,523 called dead
     /// at medium confidence, `coverage: "complete"`.
     pub entry_points: usize,
+    /// Languages present in this corpus (by file extension) whose symbols
+    /// include ZERO entry points, even though the language contributed at
+    /// least one analysed symbol.
+    ///
+    /// nw-435. nw-351 caught the WHOLE-CORPUS case: `entry_points == 0`
+    /// degrades `coverage_is_complete`. That check is blind to a mixed-
+    /// language corpus where one language's entry-point rule never fires
+    /// while a DIFFERENT language's real `main` keeps the global count above
+    /// zero — e.g. a repo with a Rust binary (real entry points) alongside
+    /// bash or Python scripts whose entry-point surface silently sits at
+    /// zero. That language's reachability numbers are exactly as vacuous as
+    /// the whole-corpus case nw-351 already covers: its BFS never had a seed,
+    /// so every symbol in it falls out unreachable and nothing about that is
+    /// disclosed unless it is checked per language rather than in aggregate.
+    /// This is the same defect shape nw-351 closed for C++ specifically,
+    /// generalised to every language rather than re-discovered one at a time.
+    pub languages_without_entry_points: Vec<String>,
 }
 
 impl DeadCodeResult {
@@ -120,7 +138,9 @@ impl DeadCodeResult {
         // `total_symbols == 0` is the one honest zero-seed case: there was
         // nothing to walk to, so nothing was concluded and nothing is offered
         // for deletion. Every other zero-seed run reports 100% dead.
-        self.undecodable_symbols == 0 && (self.entry_points > 0 || self.total_symbols == 0)
+        self.undecodable_symbols == 0
+            && (self.entry_points > 0 || self.total_symbols == 0)
+            && self.languages_without_entry_points.is_empty()
     }
 }
 
@@ -358,6 +378,7 @@ fn detect_dead_code_inner(
             // discloses too.
             undecodable_symbols,
             entry_points: 0,
+            languages_without_entry_points: vec![],
         });
     }
 
@@ -400,20 +421,41 @@ fn detect_dead_code_inner(
         .collect();
 
     // 4. Identify entry points (flag + manifest-driven).
+    //
+    // nw-435, the honesty half. nw-351 degrades `coverage_is_complete` when
+    // the WHOLE corpus has zero entry points, but that check is blind to a
+    // mixed-language corpus: a Rust binary's real `main` keeps the global
+    // count above zero while a bash or Python (or any future language) whose
+    // entry-point rule never fires sits at zero and nothing discloses it.
+    // Tracked per language, by file extension, alongside the existing
+    // per-symbol pass so it costs no extra traversal.
     let mut entry_point_uids: Vec<String> = Vec::new();
+    let mut lang_totals: HashMap<String, usize> = HashMap::new();
+    let mut lang_entries: HashMap<String, usize> = HashMap::new();
     for sym in &all_symbols {
-        if sym.is_entry_point {
-            entry_point_uids.push(sym.uid.clone());
-            continue;
-        }
         // Manifest-driven: exported symbols in manifest entry files.
-        if !manifest_entry_files.is_empty() {
-            let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
-            if manifest_entry_files.contains(normalized) {
-                entry_point_uids.push(sym.uid.clone());
+        let is_entry = sym.is_entry_point
+            || (!manifest_entry_files.is_empty() && {
+                let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
+                manifest_entry_files.contains(normalized)
+            });
+        if is_entry {
+            entry_point_uids.push(sym.uid.clone());
+        }
+        if let Some(lang) = detect_language(std::path::Path::new(&sym.file_path)) {
+            let label = format!("{lang:?}").to_lowercase();
+            *lang_totals.entry(label.clone()).or_insert(0) += 1;
+            if is_entry {
+                *lang_entries.entry(label).or_insert(0) += 1;
             }
         }
     }
+    let mut languages_without_entry_points: Vec<String> = lang_totals
+        .into_iter()
+        .filter(|(lang, _)| lang_entries.get(lang).copied().unwrap_or(0) == 0)
+        .map(|(lang, _)| lang)
+        .collect();
+    languages_without_entry_points.sort();
 
     // 5. Confidence-aware BFS from all entry points.
     //
@@ -630,6 +672,7 @@ fn detect_dead_code_inner(
         excluded_count,
         undecodable_symbols,
         entry_points: entry_point_uids.len(),
+        languages_without_entry_points,
     })
 }
 
@@ -2072,5 +2115,312 @@ mod tests {
              and its deadness is its own: {:?}",
             result.unreachable_symbols
         );
+    }
+
+    // ── nw-435: script-executed-directly entry points ──────────────────────
+    //
+    // These run the REAL parser and resolver, not a hand-built graph, because
+    // the defect nw-435 names is specifically that a script's bare top-level
+    // call never became a CALLS edge in the first place -- a hand-built
+    // fixture could only assert the fix's OUTPUT, not that the pipeline
+    // actually produces it end to end.
+
+    /// Convert a freshly parsed file into the `Symbol` rows and `ResolvedEdge`
+    /// edges `detect_dead_code` reads from the store, using the identical uid
+    /// scheme `nestweaver_resolver::resolve_references` used to build its
+    /// edges (`symbol_uid(repo_uid, file_path, name, start_line)`), so the two
+    /// line up without a second resolution pass.
+    fn parse_and_resolve(
+        file_path: &str,
+        source: &str,
+        language: nestweaver_schema::Language,
+    ) -> (Vec<Symbol>, Vec<ResolvedEdge>) {
+        let repo_uid = "repo-1";
+        let parsed = nestweaver_parser::parse_source(std::path::Path::new(file_path), source)
+            .expect("parse_source");
+        let edges = nestweaver_resolver::resolve_references(
+            &[(
+                file_path.to_string(),
+                parsed.symbols.clone(),
+                parsed.references.clone(),
+            )],
+            language,
+            repo_uid,
+        );
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|raw| Symbol {
+                uid: nestweaver_schema::symbol_uid(repo_uid, file_path, &raw.name, raw.start_line),
+                name: raw.name.clone(),
+                kind: raw.kind,
+                repo_uid: repo_uid.to_string(),
+                file_path: file_path.to_string(),
+                start_line: raw.start_line,
+                end_line: raw.end_line,
+                signature: raw.signature.clone(),
+                summary: None,
+                content_hash: raw.content_hash.clone(),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: raw.is_entry_point,
+                entry_point_kind: raw.entry_point_kind,
+                visibility: raw.visibility,
+                type_info: raw.type_info.clone(),
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .collect();
+        (symbols, edges)
+    }
+
+    fn store_from_source(
+        file_path: &str,
+        source: &str,
+        language: nestweaver_schema::Language,
+    ) -> GraphStore {
+        let (symbols, edges) = parse_and_resolve(file_path, source, language);
+        let store = GraphStore::in_memory().unwrap();
+        for sym in &symbols {
+            store.insert_symbol(sym).unwrap();
+        }
+        for edge in &edges {
+            // A file's own IMPORTS edges (e.g. no-op here, no `#include`/`source`)
+            // and any unresolved-target edge are still safe to insert; only
+            // resolved CALLS/etc. edges matter for this test's assertions.
+            store.insert_edge(edge).unwrap();
+        }
+        store
+    }
+
+    /// A bash function called from bare top-level statements, with no `main`
+    /// wrapper and no `source` involved -- the controlled reproduction from
+    /// nw-435 itself. Before the fix, module-level code has no enclosing
+    /// symbol at all (`Enclosing::ModuleScope`), the reference is dropped,
+    /// and `helper` is 100% dead with `entry_points: 0`.
+    #[test]
+    fn nw435_bash_top_level_call_makes_callee_reachable() {
+        let source = "#!/bin/bash\nhelper() {\n    echo \"hi\"\n}\n\nhelper\n";
+        let store = store_from_source("script.sh", source, nestweaver_schema::Language::Bash);
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.entry_points > 0,
+            "a bash file's top level must yield at least one entry point"
+        );
+        assert!(
+            !result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper"),
+            "helper is called from the script's own top level and must be \
+             reachable: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// The counterweight for the test above: `helper` defined but called from
+    /// NOWHERE, in the same kind of file. The synthetic top-level entry point
+    /// this fix adds must not make every function in a bash file reachable by
+    /// existing at all -- only ones actually referenced from top-level code.
+    #[test]
+    fn nw435_bash_uncalled_function_still_reported_dead() {
+        let source = "#!/bin/bash\nhelper() {\n    echo \"hi\"\n}\n";
+        let store = store_from_source("script.sh", source, nestweaver_schema::Language::Bash);
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper"),
+            "helper is never called anywhere and must still be reported dead: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// A python module calling one of its own functions from a bare
+    /// module-level statement, with no `if __name__ == "__main__":` guard and
+    /// no wrapping function -- the "module-level executable statements" half
+    /// of nw-435's Python model.
+    #[test]
+    fn nw435_python_module_top_level_call_makes_callee_reachable() {
+        let source = "def helper():\n    return \"hi\"\n\nhelper()\n";
+        let store = store_from_source("setup.py", source, nestweaver_schema::Language::Python);
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.entry_points > 0,
+            "a python module's top level must yield at least one entry point"
+        );
+        assert!(
+            !result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper"),
+            "helper is called from the module's own top level and must be \
+             reachable: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// The counterweight for the test above: `helper` defined but called from
+    /// NOWHERE. The synthetic top-level entry point this fix adds must not
+    /// make every function in a python module reachable by existing at all --
+    /// only ones actually referenced from module-level code.
+    #[test]
+    fn nw435_python_uncalled_function_still_reported_dead() {
+        let source = "def helper():\n    return \"hi\"\n";
+        let store = store_from_source("setup.py", source, nestweaver_schema::Language::Python);
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper"),
+            "helper is never called anywhere and must still be reported dead: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// The other half of nw-435's Python model: a call made inside an
+    /// `if __name__ == "__main__":` guard, with no wrapping function. The
+    /// guard body is not itself a function/class/etc, so without the
+    /// synthetic module-top-level symbol this call is also `ModuleScope` and
+    /// dropped exactly like the bare-statement case above.
+    #[test]
+    fn nw435_python_dunder_main_guard_call_makes_callee_reachable() {
+        let source =
+            "def helper():\n    return \"hi\"\n\nif __name__ == \"__main__\":\n    helper()\n";
+        let store = store_from_source("setup.py", source, nestweaver_schema::Language::Python);
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            !result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper"),
+            "helper is called from inside the `if __name__` guard and must be \
+             reachable: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    // KNOWN GAP, discovered while proving the above and NOT fixed here: when
+    // a module-level call's return value is bound to a name --
+    // `lbug_version = _get_lbug_version()`, nw-435's own measured instance in
+    // `scripts/pip-package/setup.py` -- python.scm captures `lbug_version` as
+    // a `Variable` symbol whose span is exactly that one line. In
+    // `find_enclosing_symbol` (nestweaver-resolver, out of this fix's
+    // permitted scope), the EXACT-match branch accepts any symbol whose span
+    // contains the reference line with NO kind check at all (the
+    // `can_contain_code` restriction guards only the DEGENERATE fallback
+    // branch, added for nw-349's `Constant`/`Property`/`Variable`
+    // mis-attribution but never extended to this branch) -- so the call
+    // resolves to `lbug_version` instead of to this fix's wider
+    // always-reachable module symbol, `lbug_version` is itself never called
+    // by anything, and `_get_lbug_version` is still reported dead. The
+    // bare-statement and `if __name__` forms above are unaffected because
+    // neither leaves a same-line Variable/Constant symbol for the resolver to
+    // prefer. Fixing the assignment form needs a resolver change (restrict
+    // the Exact branch the same way the Degenerate one already is, or a
+    // narrower carve-out for module-level `name = call(...)`) and belongs
+    // with nw-349's reference-capture class, not this parser-only fix.
+
+    // ── nw-435: per-language coverage honesty ───────────────────────────────
+    //
+    // nw-351 degrades `coverage_is_complete` when the WHOLE corpus has zero
+    // entry points. These hand-built-graph tests exercise the GENERALISATION:
+    // a corpus can have a healthy global `entry_points` count from one
+    // language while a second language's entry-point rule never fires, and
+    // that must degrade the claim too. This is deliberately independent of
+    // the bash/python parser fix above -- it is the same protection for any
+    // OTHER language whose entry-point surface is still a gap.
+
+    #[test]
+    fn language_with_zero_entry_points_degrades_coverage_even_with_another_languages_entry() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:a",
+                "a",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+        // A second language contributes a symbol but no entry point at all --
+        // as if its `detect_*` rule has the same gap nw-435 fixed for bash and
+        // python.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:helper",
+                "helper",
+                SymbolKind::Function,
+                "scripts/deploy.sh",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.entry_points > 0,
+            "the whole-corpus count is NOT zero -- rust has a real entry point"
+        );
+        assert_eq!(result.languages_without_entry_points, vec!["bash"]);
+        assert!(
+            !result.coverage_is_complete(),
+            "bash contributed a symbol but zero entry points; the claim must \
+             degrade even though the global entry_points count is healthy"
+        );
+    }
+
+    /// The counterweight: give the second language's symbol an entry point
+    /// too, and the claim must read complete again -- the new check is not
+    /// permanently jammed off.
+    #[test]
+    fn language_with_an_entry_point_keeps_complete_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:a",
+                "a",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:helper",
+                "helper",
+                SymbolKind::Function,
+                "scripts/deploy.sh",
+                true,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(result.languages_without_entry_points.is_empty());
+        assert!(result.coverage_is_complete());
     }
 }

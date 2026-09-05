@@ -1,7 +1,20 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6574
 expression: "parsed_symbols(\"simple.sh\", &source)"
 ---
+- name: "<script>"
+  kind: Function
+  start_line: 1
+  end_line: 24
+  signature: "<bash script top level>"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Function
   start_line: 6
