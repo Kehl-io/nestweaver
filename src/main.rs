@@ -99,9 +99,8 @@ use nestweaver_engine::{
     changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
     filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
-    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
-    generate_summaries, get_last_indexed_at,
-    index_markdown_directory_since_with_ignore_and_write_lease,
+    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_summaries,
+    get_last_indexed_at, index_markdown_directory_since_with_ignore_and_write_lease,
     index_markdown_directory_with_ignore,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease,
     index_markdown_directory_with_ignore_and_write_lease, list_repos, list_services,
@@ -2494,6 +2493,14 @@ fn print_repo_map_json(
     map: &str,
     staleness: &ResolverStaleness,
     daemon_meta: Option<serde_json::Value>,
+    // nw-397 LEG 2. All three `None` when the route cannot say (today: the
+    // daemon route, since no daemon actually answers a "repo_map" RPC and an
+    // older/hypothetical one would not carry these fields) — an ABSENT key,
+    // same as `rankings_stale`'s own rule two lines up: silence is not the
+    // same claim as `false`/`0`, and must not be rendered as one.
+    truncated: Option<bool>,
+    files_returned: Option<usize>,
+    files_total: Option<usize>,
 ) -> anyhow::Result<()> {
     let mut payload = serde_json::json!({
         "map": map,
@@ -2505,6 +2512,17 @@ fn print_repo_map_json(
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
     });
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(t) = truncated {
+            obj.insert("truncated".to_string(), serde_json::json!(t));
+        }
+        if let Some(r) = files_returned {
+            obj.insert("files_returned".to_string(), serde_json::json!(r));
+        }
+        if let Some(t) = files_total {
+            obj.insert("files_total".to_string(), serde_json::json!(t));
+        }
+    }
     if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
         obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
     }
@@ -4911,6 +4929,20 @@ enum Commands {
             help = "Maximum contract links to return (1-1000; default 50, matching the MCP cross_repo_contracts schema)"
         )]
         limit: Option<usize>,
+        // nw-369(a). Scopes ROWS to links whose OTHER symbol lives in this
+        // repo (a UID or display name, resolved the same way every other
+        // `--repo` flag in this binary is). Distinct from `cross-repo-refs
+        // --repo`, which disambiguates an ambiguous SYMBOL NAME before this
+        // command's own resolution runs -- that ambiguity does not exist
+        // here in the same way `symbol` already accepts an explicit `sym:`
+        // UID. `link_type: "contract"` rows are always excluded when this is
+        // set: contract UIDs carry no repo component, so they cannot be
+        // proven to match.
+        #[arg(
+            long,
+            help = "Scope rows to links whose OTHER symbol is in this repo (UID or display name); excludes contract-implementation rows, which carry no repo component"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -5505,6 +5537,21 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        // nw-401. Without this, `cluster <id>` could only ever answer from
+        // whichever resolution `clusters --resolution` happened to compute
+        // LAST — cluster IDs are assignment-dependent, so an unrelated
+        // `--resolution` run silently reinterpreted every subsequent
+        // `cluster <id>` call, byte-identical command and all. Pinning a
+        // resolution here reads (or computes) the resolution-KEYED sidecar,
+        // which a later run at a DIFFERENT resolution never touches. Same
+        // parser as `clusters --resolution`, so the two commands agree on
+        // what a valid resolution is.
+        #[arg(
+            long,
+            value_parser = parse_cluster_resolution,
+            help = "Answer from this exact resolution, computing it first if needed; refuses to guess if omitted and no cache matches [default: whichever resolution was computed most recently]"
+        )]
+        resolution: Option<f64>,
     },
     /// List all projects from the store
     #[command(
@@ -13466,10 +13513,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // `_meta`. This branch hand-rolled a struct and printed
                         // it directly, so `repo-map --json` was the one payload
                         // on this route with no provenance at all.
+                        //
+                        // nw-397: echo whatever the daemon said about
+                        // truncation, rather than re-deriving it from a
+                        // response that does not carry the file counts (this
+                        // route is dead in practice today — no daemon answers
+                        // "repo_map" — but is kept honest for when one does).
                         print_repo_map_json(
                             map,
                             &staleness,
                             value.get(nestweaver_schema::provenance::META_KEY).cloned(),
+                            value.get("truncated").and_then(serde_json::Value::as_bool),
+                            value
+                                .get("files_returned")
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|n| n as usize),
+                            value
+                                .get("files_total")
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|n| n as usize),
                         )?;
                     } else {
                         print!("{map}");
@@ -13481,7 +13543,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(db.as_deref())?;
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            let map = generate_repo_map(&store, token_budget)?;
+            // nw-439: `repo-map` has no MCP/daemon twin (the "repo_map" RPC
+            // name above never resolves on the daemon side, so this direct
+            // path is the ONLY path), which meant it never passed through
+            // `dispatch_cancellable`'s wait-then-classify handling — the
+            // same generic machinery `hubs`/`bridges` get for free via the
+            // daemon route. That left it with a bare `PageRank unavailable
+            // during dirty index publication` and no marker pid, no age, no
+            // remedy: an [[nw-334]] instance (an error naming no remedy) on
+            // top of the policy gap. Calling the SAME two functions directly
+            // gives it the identical wait and the identical disclosure,
+            // rather than growing a second, drifting copy of either.
+            nestweaver_mcp::tools::wait_out_index_publication(&store, None);
+            // nw-397 LEG 2: the `_bounded` variant, because this is the ONE
+            // route that can actually compute `truncated`/`files_returned`/
+            // `files_total` — the daemon branch above has no RPC that
+            // supplies them. `generate_repo_map` (the bare-`String` wrapper)
+            // discards exactly the counts this surface needs to publish.
+            let found = nestweaver_engine::query::generate_repo_map_bounded(&store, token_budget)
+                .map_err(|e| {
+                nestweaver_mcp::tools::classify_index_publication_error(&store, e)
+            })?;
 
             // nw-370: `generate_repo_map` orders by `symbols_by_pagerank`, so
             // on a generation-stale graph the ORDERING — the whole content of
@@ -13491,9 +13573,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                print_repo_map_json(&map, &ResolverStaleness::from_store(&store, &db_path), None)?;
+                print_repo_map_json(
+                    &found.map,
+                    &ResolverStaleness::from_store(&store, &db_path),
+                    None,
+                    Some(found.truncated()),
+                    Some(found.files_returned),
+                    Some(found.files_total),
+                )?;
             } else {
-                print!("{map}");
+                print!("{}", found.map);
+                // nw-397 LEG 2, text mode. Without this, a map that stopped
+                // 1% in is byte-identical on stdout to one that fit — the
+                // token count was the only signal, and nothing told a human
+                // reader it was a cut. On stderr, matching `read-symbols
+                // --token-budget`'s precedent, so stdout stays exactly the
+                // map a caller might pipe onward.
+                if found.truncated() {
+                    eprintln!(
+                        "... {} of {} files omitted (token budget)",
+                        found.files_total - found.files_returned,
+                        found.files_total
+                    );
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -13501,6 +13603,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::CrossRepoContracts {
             symbol,
             limit,
+            repo,
             json,
             db,
             config,
@@ -13514,6 +13617,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             if let Some(limit) = limit {
                 args["limit"] = serde_json::json!(limit);
+            }
+            if let Some(repo) = &repo {
+                args["repo"] = serde_json::json!(repo);
             }
             // nw-399: BOTH routes classified in one place, so the answer to
             // "does this symbol exist?" cannot depend on whether a daemon was
@@ -13569,8 +13675,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
                 if let Some(contracts) = payload["contracts"].as_array() {
                     for contract in contracts {
+                        // nw-369(a): attribute each row to the OTHER symbol's
+                        // repo when known; a `contract` row (or a symbol
+                        // whose owner could not be resolved) prints "?" rather
+                        // than a silently-omitted column, so a multi-repo
+                        // listing does not read as though every row were
+                        // equally attributable.
+                        let repo = contract["repo"].as_str().unwrap_or("?");
                         println!(
-                            "  {} -> {} [{}] ({:.2})",
+                            "  [{repo}] {} -> {} [{}] ({:.2})",
                             contract["source_name"]
                                 .as_str()
                                 .or_else(|| contract["source_uid"].as_str())
@@ -13583,6 +13696,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             contract["confidence"].as_f64().unwrap_or(0.0)
                         );
                     }
+                }
+                if let Some(note) = payload["note"].as_str() {
+                    println!("{note}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -14695,11 +14811,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(Some(&db_path))?;
 
+            // nw-439: same wait+classify the daemon route gets, for the
+            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // command reads identically regardless of which route answered.
+            nestweaver_mcp::tools::wait_out_index_publication(&store, None);
+
             // nw-398: the `_bounded` variant, because this surface publishes a
             // `total` and a `truncated`. `find_hub_nodes` discards
             // `candidate_total`, which is why `hubs --json` used to carry
             // nothing but a list.
-            let found = nestweaver_engine::hubs::find_hub_nodes_bounded(&store, top)?;
+            let found = nestweaver_engine::hubs::find_hub_nodes_bounded(&store, top)
+                .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_hubs(&found);
             let mut hubs = found.hubs;
 
@@ -14849,13 +14971,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(Some(&db_path))?;
 
+            // nw-439: same wait+classify the daemon route gets, for the
+            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // command reads identically regardless of which route answered —
+            // and, now that `find_bridge_nodes_bounded` fails closed on a
+            // dirty publication (below), it produces the SAME disclosure
+            // `hubs` does rather than a bare `StoreError`-shaped string.
+            nestweaver_mcp::tools::wait_out_index_publication(&store, None);
+
             out.status("Computing betweenness centrality...");
             // nw-398: the `_bounded` variant, for both halves of this item at
             // once — `candidate_total` says how much `--top` hid, and
             // `sampled`/`sources_sampled` say that every `betweenness_score`
             // below is a SAMPLE-based estimate rendered at full f64 precision.
             // `find_bridge_nodes` discards all three.
-            let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(&store, top)?;
+            let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(&store, top)
+                .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_bridges(&found);
             let mut bridges = found.bridges;
             warn_stale_resolver_rankings(&store, &db_path);
@@ -15405,6 +15536,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             id_or_name,
             json,
             db,
+            resolution,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
@@ -15417,20 +15549,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // daemon. A live daemon does not block this: the sidecar read
             // needs no store, and the fallback store open is read-only.
 
-            // Load cached clusters from sidecar. If none exist, compute them.
-            let output = match load_clusters(&db_path)? {
-                Some(cached) => cached,
-                None => {
-                    out.status("No cached clusters found; computing with default resolution...");
-                    let store = open_store(Some(&db_path))?;
-                    // F-DC-7: the same single authority `clusters` uses. This
-                    // is the command that RESOLVES the IDs the others emit, so
-                    // a private copy of the rule here is the one that decides
-                    // whether their output is addressable at all.
-                    let default_res = nestweaver_engine::default_cluster_resolution(&store);
-                    let computed = compute_clusters(&store, default_res)?;
-                    save_clusters(&db_path, &computed)?;
-                    computed
+            // nw-401: an explicit `--resolution` is a PIN, not a hint. It
+            // reads (or, if this exact resolution has never been computed for
+            // this database, computes and saves) the resolution-KEYED
+            // sidecar, so a later `clusters --resolution` at a DIFFERENT
+            // resolution can never reinterpret this answer out from under the
+            // caller the way the unkeyed sidecar could.
+            let output = if let Some(pinned) = resolution {
+                match nestweaver_engine::load_clusters_for_resolution(&db_path, pinned)? {
+                    Some(cached) => cached,
+                    None => {
+                        out.status(&format!(
+                            "No cached clusters at resolution={pinned}; computing..."
+                        ));
+                        let store = open_store(Some(&db_path))?;
+                        let computed = compute_clusters(&store, pinned)?;
+                        save_clusters(&db_path, &computed)?;
+                        computed
+                    }
+                }
+            } else {
+                // Load cached clusters from the canonical (unkeyed, last-writer-wins)
+                // sidecar. If none exist, compute them.
+                match load_clusters(&db_path)? {
+                    Some(cached) => cached,
+                    None => {
+                        out.status(
+                            "No cached clusters found; computing with default resolution...",
+                        );
+                        let store = open_store(Some(&db_path))?;
+                        // F-DC-7: the same single authority `clusters` uses. This
+                        // is the command that RESOLVES the IDs the others emit, so
+                        // a private copy of the rule here is the one that decides
+                        // whether their output is addressable at all.
+                        let default_res = nestweaver_engine::default_cluster_resolution(&store);
+                        let computed = compute_clusters(&store, default_res)?;
+                        save_clusters(&db_path, &computed)?;
+                        computed
+                    }
                 }
             };
 
