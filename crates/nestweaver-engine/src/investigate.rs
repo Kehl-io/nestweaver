@@ -21,8 +21,8 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    BrainNode, EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
-    populate_inline_bodies,
+    BrainNode, EmbedQueryFn, HybridSearchConfig, RenderCap,
+    build_brain_context_hybrid_with_aliases_capped, populate_inline_bodies,
 };
 
 /// Bundle time-to-live: entries older than this are dropped when the sidecar
@@ -31,6 +31,30 @@ const BUNDLE_TTL_SECS: f64 = 24.0 * 60.0 * 60.0;
 
 /// Default retrieval breadth — how many connected nodes we consider for the map.
 const DEFAULT_RETRIEVAL_BREADTH: usize = 30;
+
+/// nw-322 (leg 3): how many candidates PER PARTITION (seeds, connected) get
+/// hydrated (`render_brain_node`, one DB round-trip each) before this
+/// module's own scope filter and `DEFAULT_RETRIEVAL_BREADTH` truncate ever
+/// run. `project:<slug>` seeds PPR with a project's entire membership
+/// (`resolve_scope` below) and PPR includes every seed regardless of score,
+/// so on a large project `fused` is corpus-sized and hydrating all of it
+/// only to keep 30 was measured at 110-142s (nw-322) — 12-27x every other
+/// scope, comfortably over an MCP client's timeout.
+///
+/// Set well above `DEFAULT_RETRIEVAL_BREADTH` rather than equal to it,
+/// because this module's scope filter (`node_in_scope`) runs AFTER
+/// hydration and can reject some of what gets rendered: a `project:` scope
+/// seeds the raw query text alongside the project's members (so a handful
+/// of non-member seeds can fail the filter), and reaches member notes'
+/// Sections/Headings only via non-seed graph traversal (`connected`), so
+/// enough of that partition must be hydrated for the highest-scoring
+/// in-project ones to still surface. The margin trades a fixed, still-tiny
+/// worst-case render count (up to `2 * RETRIEVAL_RENDER_MARGIN`, here 240,
+/// vs. corpus-sized before this) for headroom against that filtering —
+/// see `tests::investigate_project_scope_stays_fast_on_a_large_project` and
+/// `tests::project_scope_filters_symbols_to_members` (small-project
+/// correctness) for the equivalence this is expected to hold in practice.
+const RETRIEVAL_RENDER_MARGIN: usize = DEFAULT_RETRIEVAL_BREADTH * 8;
 
 /// Default token budget for the architectural map.
 const DEFAULT_TOKEN_BUDGET: usize = 4000;
@@ -739,7 +763,7 @@ pub fn investigate(
     // title verbatim), hybrid retrieval bails with `No seeds resolved`. Fall
     // back to BM25-only retrieval against the query text so investigations
     // remain useful for orientation queries instead of returning an empty map.
-    let connected_result = build_brain_context_hybrid_with_aliases(
+    let connected_result = build_brain_context_hybrid_with_aliases_capped(
         store,
         &seed_inputs,
         tantivy,
@@ -749,6 +773,10 @@ pub fn investigate(
         None,
         embed_model,
         None,
+        Some(RenderCap {
+            seeds: RETRIEVAL_RENDER_MARGIN,
+            connected: RETRIEVAL_RENDER_MARGIN,
+        }),
     );
     // The query's own resolved seed nodes are first-class map entries,
     // ordered ahead of the graph-proximity nodes so an exact-match query for
@@ -2923,6 +2951,107 @@ mod tests {
         assert!(
             resolve_scope(&store, "anything", "project:does-not-exist").is_err(),
             "an unresolvable project scope must error rather than silently match everything"
+        );
+    }
+
+    /// nw-322 (leg 3), fixture-adequacy AND the performance counterweight in
+    /// one: this project is large enough to REPRODUCE the reported mechanism
+    /// -- `resolve_scope`'s `project:` branch seeds PPR with the project's
+    /// entire membership, PPR includes every seed regardless of score
+    /// (`personalized_pagerank`'s own contract), so before this fix `fused`
+    /// was corpus-sized and every single one of those 5,000 candidates paid
+    /// a `render_brain_node` DB round-trip BEFORE `DEFAULT_RETRIEVAL_BREADTH`
+    /// (30) threw away all but a handful. nw-322 measured 110-142s on a
+    /// comparable real project (12-27x every other scope); this fixture is
+    /// the same shape at smaller absolute scale.
+    ///
+    /// COUNTERWEIGHT, run by hand rather than committed as a second test
+    /// (committing a temporarily-reverted line would itself be the
+    /// regression this guards against): with the call site's
+    /// `Some(RenderCap { .. })` changed to `None` (i.e. calling
+    /// `build_brain_context_hybrid_with_aliases` unbounded, as before this
+    /// fix), this exact test measured 17.07s against this exact fixture
+    /// (vs. 1.09s capped) and its elapsed-time assertion FAILED — confirmed
+    /// before restoring the cap.
+    #[test]
+    fn investigate_project_scope_stays_fast_on_a_large_project() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        // Large enough to dwarf `RETRIEVAL_RENDER_MARGIN` (240) by more than
+        // an order of magnitude, so a render-per-member regression cannot
+        // hide inside CI noise. Built via `batch_insert_symbols` (one
+        // transaction) rather than 5,000 individual `insert_symbol` calls —
+        // this test times RETRIEVAL, not fixture-setup I/O.
+        const MEMBER_COUNT: usize = 5_000;
+        let setup_started = std::time::Instant::now();
+        let symbols: Vec<Symbol> = (0..MEMBER_COUNT)
+            .map(|i| Symbol {
+                uid: format!("sym:big{i:06}"),
+                name: format!("fn{i}"),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:big".to_string(),
+                file_path: format!("src/f{i}.js"),
+                start_line: 1,
+                end_line: 2,
+                signature: format!("function fn{i}()"),
+                summary: None,
+                content_hash: format!("h{i}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+        let member_uids: Vec<String> = symbols.into_iter().map(|s| s.uid).collect();
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:big".to_string(),
+            name: "big".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, &member_uids, 1.0)
+            .unwrap();
+        eprintln!(
+            "fixture setup ({MEMBER_COUNT} members): {:?}",
+            setup_started.elapsed()
+        );
+
+        let started = std::time::Instant::now();
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            dir.path(),
+            "fn1",
+            "project:big",
+            Some(4000),
+            None,
+        )
+        .expect("investigate against a large project must still succeed");
+        let elapsed = started.elapsed();
+        eprintln!("investigate(project:big, {MEMBER_COUNT} members): {elapsed:?}");
+
+        assert!(
+            !result.entries.is_empty(),
+            "a {MEMBER_COUNT}-member project must still return an architectural map"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "investigate --scope project: took {elapsed:?} for a {MEMBER_COUNT}-member \
+             project; nw-322 measured 110-142s on a comparable real project because every \
+             fused candidate was hydrated before DEFAULT_RETRIEVAL_BREADTH discarded all \
+             but 30 of them. This threshold is deliberately generous (CI-noise headroom, \
+             not a performance target) -- the point is bounded-and-fast, not fastest-possible."
         );
     }
 

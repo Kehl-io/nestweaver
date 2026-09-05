@@ -1822,6 +1822,68 @@ pub fn build_brain_context_hybrid_with_aliases(
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<BrainContextResult, anyhow::Error> {
+    build_brain_context_hybrid_with_aliases_capped(
+        store,
+        inputs,
+        tantivy,
+        config,
+        aliases,
+        db_path,
+        intent,
+        embed_model,
+        cancel,
+        None,
+    )
+}
+
+/// Bounds how many fused candidates [`build_brain_context_hybrid_with_aliases_capped`]
+/// hydrates via `render_brain_node` (one DB round-trip each).
+///
+/// nw-322 (leg 3): `investigate --scope project:<slug>` seeds PPR with the
+/// project's ENTIRE membership (`resolve_scope`), and PPR includes every
+/// seed regardless of score, so `fused` — and therefore the render loop —
+/// is corpus-sized for exactly this scope. `investigate` then keeps only its
+/// own `DEFAULT_RETRIEVAL_BREADTH` after truncating `seeds ++ connected`, so
+/// on a large project almost every hydrated node is thrown away unread.
+///
+/// Capped **per partition**, not as one combined fused-order cutoff: a
+/// combined cutoff would silently drop a low-scoring SEED whose rank AMONG
+/// SEEDS ALONE still clears a caller's final cut (PPR's "seed nodes always
+/// included regardless of score" contract, which `project_context` and
+/// `brain_context` callers rely on, says nothing about a seed's score
+/// relative to non-seed nodes). Capping each partition independently and
+/// preserving each partition's existing fused-score order reproduces
+/// exactly what an uncapped call would have returned for any caller whose
+/// own final cut (like `investigate`'s) does not need more than the cap from
+/// either partition — see
+/// `investigate::tests::investigate_project_scope_stays_fast_on_a_large_project`,
+/// whose counterweight (reverting to `None`) fails its own timing assertion.
+///
+/// `None` (via [`build_brain_context_hybrid_with_aliases`]) hydrates every
+/// fused entry, unchanged from before this existed — every caller but
+/// `investigate` still gets that.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderCap {
+    pub seeds: usize,
+    pub connected: usize,
+}
+
+/// Like [`build_brain_context_hybrid_with_aliases`], but bounds hydration
+/// via an optional [`RenderCap`]. `pub(crate)`: this is a perf escape hatch
+/// for one caller (`investigate`), not a new public retrieval knob.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
+    store: &GraphStore,
+    inputs: &[String],
+    tantivy: Option<&TantivyIndex>,
+    config: &HybridSearchConfig,
+    aliases: &std::collections::HashMap<String, Vec<String>>,
+    db_path: Option<&std::path::Path>,
+    intent: Option<QueryIntent>,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    render_cap: Option<RenderCap>,
+) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
     let alias_to_canonical: std::collections::HashMap<String, Vec<String>> = {
@@ -2138,10 +2200,28 @@ pub fn build_brain_context_hybrid_with_aliases(
     let mut connected: Vec<BrainNode> = Vec::new();
 
     for (uid, score) in &fused {
+        let is_seed = seed_set.contains(uid.as_str());
+        // nw-322 (leg 3): skip the `render_brain_node` round-trip entirely
+        // once THIS partition (seeds or connected, capped independently —
+        // see `RenderCap`) has as many hydrated nodes as the caller asked
+        // for. `fused` is already sorted by descending score, so each
+        // partition's cap keeps exactly its own highest-scoring members;
+        // scanning continues (rather than breaking) because the other
+        // partition may still be under its own cap.
+        if let Some(cap) = render_cap {
+            let (bucket_len, bucket_cap) = if is_seed {
+                (seeds.len(), cap.seeds)
+            } else {
+                (connected.len(), cap.connected)
+            };
+            if bucket_len >= bucket_cap {
+                continue;
+            }
+        }
         let Some(node) = render_brain_node(store, uid, *score)? else {
             continue;
         };
-        if seed_set.contains(uid.as_str()) {
+        if is_seed {
             seeds.push(node);
         } else {
             connected.push(node);

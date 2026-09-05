@@ -11744,7 +11744,10 @@ fn tool_project_context(
             // Disclosed here too: an empty answer is still AN answer, and two
             // routes disagreeing about whether a project has members is
             // exactly the divergence this field exists to attribute.
-            "_meta": { "answered_by": answering_config_disclosure() },
+            "_meta": {
+                "answered_by": answering_config_disclosure(),
+                "answer_shaping": answer_shaping_disclosure(store, embed_model),
+            },
         }));
     }
 
@@ -12160,6 +12163,10 @@ fn tool_project_context(
     // nw-316: state which config answered, on EVERY return path, so a caller
     // comparing two routes can attribute a divergence instead of guessing.
     resp["_meta"]["answered_by"] = answering_config_disclosure();
+    // nw-316 Part B (round 2): `answered_by` alone was proven insufficient —
+    // it is byte-identical across routes that answer differently. Carry the
+    // answer-shaping state that actually explains a divergence alongside it.
+    resp["_meta"]["answer_shaping"] = answer_shaping_disclosure(store, embed_model);
 
     Ok(resp)
 }
@@ -13423,6 +13430,52 @@ pub(crate) fn answering_config_disclosure() -> Value {
             "instance_id": Value::Null,
         }),
     }
+}
+
+/// The answer-SHAPING state `answered_by` was missing.
+///
+/// nw-316's own discriminating experiment refuted `answered_by` as a
+/// disclosure: run against the shipped 9.1.0 binary, all three
+/// `project-context` routes returned `answered_by` BYTE-IDENTICAL while
+/// returning three different answers. Naming which config process answered
+/// is not the same as naming what made two answers differ — and the
+/// mechanism nw-316 found (nw-429) is exactly a fact `answered_by` cannot
+/// carry: whether THIS dispatch had a semantic model to rank with at all.
+/// The direct route `--config` forces (`daemon_may_serve`) used to thread
+/// `embed_model: None` unconditionally, so `semantic_applied` silently read
+/// `false` on that route regardless of what the daemon route did for the
+/// identical request — and nothing before this told a caller that was even
+/// a possible source of divergence.
+///
+/// Three fields, the minimum nw-316 named:
+/// * `embedding_model_available` — whether THIS dispatch was handed a query
+///   embedder at all (nw-429's mechanism, directly).
+/// * `embedding_model_id` — the STORE's recorded embedding identity (the
+///   model its persisted vectors were embedded with). Route-invariant by
+///   construction (same store, same file), so it is a stable anchor a
+///   caller can compare against its own expectation rather than a signal
+///   that discriminates routes on its own.
+/// * `track_interactions` — nw-429's own measurements needed a single burst
+///   to dodge this: `more_available` creeps a few counts per query when it
+///   is on, which a caller comparing two routes taken seconds apart would
+///   otherwise blame on the routes rather than on this feeding queries back
+///   into PPR.
+pub(crate) fn answer_shaping_disclosure(
+    store: &GraphStore,
+    embed_model: Option<&dyn EmbedQueryFn>,
+) -> Value {
+    let embedding_model_id = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _dimension)| model_id);
+    json!({
+        "embedding_model_available": embed_model.is_some(),
+        "embedding_model_id": embedding_model_id,
+        "track_interactions": current_instance_config()
+            .map(|cfg| cfg.ranking.track_interactions)
+            .unwrap_or(false),
+    })
 }
 
 /// Read the configured default result limit from the instance config's
@@ -15763,6 +15816,107 @@ mod project_context_bug12_tests {
         assert!(
             named["_meta"]["answered_by"].get("config_path").is_none(),
             "disclose identity, not the operator's filesystem layout"
+        );
+    }
+
+    /// nw-316 Part B (round 2). `answered_by` was proven insufficient: run
+    /// against the shipped 9.1.0 binary, it came back BYTE-IDENTICAL across
+    /// three `project-context` routes that returned three different answers.
+    /// The mechanism nw-429 named for one of those routes is exactly a fact
+    /// `answered_by` cannot carry — whether THIS dispatch had a semantic
+    /// model to rank with at all. This test reproduces that: same store,
+    /// same project, same instance config (so `answered_by` is provably
+    /// IDENTICAL, as it was on the real routes), but two different
+    /// `embed_model` arguments — the one variable that actually distinguished
+    /// the routes in the field. `_meta.answer_shaping` must disagree where
+    /// `answered_by` cannot.
+    #[test]
+    fn project_context_answer_shaping_discloses_what_answered_by_cannot() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:shaped".into(),
+                name: "Shaped".into(),
+                summary: None,
+                instance_id: "inst".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&mk_note(
+                "note:shaped-member",
+                "vault:v",
+                "notes/shaped-member.md",
+                "Shaped Member Note",
+            ))
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:shaped", "note:shaped-member")])
+            .unwrap();
+
+        let cfg: nestweaver_engine::InstanceConfig = serde_json::from_value(json!({
+            "instance_id": "same-config-both-routes",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" },
+            "ranking": { "track_interactions": true }
+        }))
+        .expect("valid instance config");
+
+        let ask = |embed_model: Option<&dyn EmbedQueryFn>| {
+            set_current_instance_config(Some(std::sync::Arc::new(cfg.clone())));
+            let resp = tool_project_context(
+                &store,
+                None,
+                json!({ "project": "Shaped", "token_budget": 5000 }),
+                embed_model,
+                None,
+                None,
+            )
+            .unwrap();
+            set_current_instance_config(None);
+            resp
+        };
+
+        struct StubEmbed(Vec<f32>);
+        impl EmbedQueryFn for StubEmbed {
+            fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(self.0.clone())
+            }
+        }
+        let embed = StubEmbed(vec![0.1, 0.2, 0.3]);
+        let with_model = ask(Some(&embed));
+        let without_model = ask(None);
+
+        // The SAME config answered both -- exactly the byte-identical
+        // `answered_by` nw-316 found in the field, reproduced here rather
+        // than merely asserted.
+        assert_eq!(
+            with_model["_meta"]["answered_by"], without_model["_meta"]["answered_by"],
+            "both calls share one instance config, so `answered_by` must be identical -- \
+             this is the nw-316 finding this test reproduces before checking the fix"
+        );
+
+        // `answer_shaping` is what tells the two routes apart.
+        assert_eq!(
+            with_model["_meta"]["answer_shaping"]["embedding_model_available"], true,
+            "a dispatch handed a real embed_model must disclose it: {with_model}"
+        );
+        assert_eq!(
+            without_model["_meta"]["answer_shaping"]["embedding_model_available"], false,
+            "a dispatch handed no embed_model (nw-429's direct-route mechanism) must \
+             disclose that too, not just stay silent: {without_model}"
+        );
+        assert_ne!(
+            with_model["_meta"]["answer_shaping"], without_model["_meta"]["answer_shaping"],
+            "answer_shaping must be the seam that disagrees when answered_by cannot"
+        );
+
+        // The ranking-noise input nw-316 named must also be surfaced.
+        assert_eq!(
+            with_model["_meta"]["answer_shaping"]["track_interactions"], true,
+            "the [ranking] track_interactions input must be disclosed: {with_model}"
         );
     }
 

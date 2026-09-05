@@ -11241,8 +11241,13 @@ mod embedding_load_config_tests {
     }
 }
 
+/// `pub` (nw-429): the direct/non-daemon CLI route needs the identical
+/// accelerator mapping to load its OWN model when `--config` (or
+/// `--no-tests`/`--prefer-instance`) forces it off the daemon. Reusing this
+/// rather than a second copy keeps the two routes' device selection from
+/// drifting the way `render_cost`'s two copies did (nw-217/nw-316).
 #[cfg(feature = "embed")]
-fn daemon_embedding_device_policy(
+pub fn daemon_embedding_device_policy(
     accelerator: nestweaver_engine::config::EmbeddingAccelerator,
 ) -> nestweaver_embed::DevicePolicy {
     match accelerator {
@@ -11355,8 +11360,13 @@ where
     load(config, policy, mode)
 }
 
+/// `pub` (nw-429): shared with the direct/non-daemon CLI route so it selects
+/// a model the same way the daemon does at boot — prefer whatever model the
+/// STORE's persisted vectors were embedded with over the configured default,
+/// so a direct load never picks a dimension-mismatched model out of the two
+/// candidates.
 #[cfg(feature = "embed")]
-fn embedding_load_config(
+pub fn embedding_load_config(
     cfg: &nestweaver_engine::config::EmbeddingConfig,
     cache_dir: std::path::PathBuf,
     stored_model_id: Option<&str>,
@@ -11543,8 +11553,10 @@ fn embedding_cache_dir_resolution_failure_status(
     )
 }
 
+/// `pub` (nw-429): shared with the direct/non-daemon CLI route's own model
+/// load, for the same reason as `embedding_load_config` above.
 #[cfg(feature = "embed")]
-fn embedding_cache_dir_for_load_with<E, Resolve>(
+pub fn embedding_cache_dir_for_load_with<E, Resolve>(
     cfg: &nestweaver_engine::config::EmbeddingConfig,
     resolve: Resolve,
 ) -> Result<std::path::PathBuf, E>
