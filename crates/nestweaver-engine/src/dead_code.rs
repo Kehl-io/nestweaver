@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use nestweaver_parser::entry_points::language_has_entry_point_model;
 use nestweaver_parser::language::detect_language;
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::GraphStore;
@@ -429,6 +430,21 @@ fn detect_dead_code_inner(
     // entry-point rule never fires sits at zero and nothing discloses it.
     // Tracked per language, by file extension, alongside the existing
     // per-symbol pass so it costs no extra traversal.
+    //
+    // Gated on `language_has_entry_point_model`: "zero entry points" is only
+    // evidence of a coverage GAP for a language that has a detection rule to
+    // come up empty. SQL, HCL, SystemVerilog, Vue, Svelte and Astro have no
+    // model at all (declarative, unimplemented, or routed around
+    // `detect_entry_point` entirely -- see that function's doc comment), so
+    // their entry-point count is ALWAYS zero and folding them in here would
+    // degrade `coverage_is_complete` permanently for any corpus containing
+    // even one such file, with no user action able to clear it. A probe
+    // confirmed this: `languages_without_entry_points = ["hcl", "sql",
+    // "systemverilog", "vue"]` on a corpus that also has real bash/python
+    // gaps, degrading coverage for a reason no fix can address. Excluding
+    // them here, rather than filtering the OUTPUT, keeps the field itself
+    // honest: a language only ever appears when its absence is a real,
+    // actionable gap.
     let mut entry_point_uids: Vec<String> = Vec::new();
     let mut lang_totals: HashMap<String, usize> = HashMap::new();
     let mut lang_entries: HashMap<String, usize> = HashMap::new();
@@ -442,7 +458,9 @@ fn detect_dead_code_inner(
         if is_entry {
             entry_point_uids.push(sym.uid.clone());
         }
-        if let Some(lang) = detect_language(std::path::Path::new(&sym.file_path)) {
+        if let Some(lang) = detect_language(std::path::Path::new(&sym.file_path))
+            && language_has_entry_point_model(lang)
+        {
             let label = format!("{lang:?}").to_lowercase();
             *lang_totals.entry(label.clone()).or_insert(0) += 1;
             if is_entry {
@@ -2211,5 +2229,50 @@ mod tests {
         let result = detect_dead_code(&store).unwrap();
         assert!(result.languages_without_entry_points.is_empty());
         assert!(result.coverage_is_complete());
+    }
+
+    /// A language with NO entry-point model at all (SQL: declarative, no
+    /// concept of "entry" to detect) must never appear in
+    /// `languages_without_entry_points`, no matter how many of its symbols
+    /// exist or how few are entry points -- there are zero here, on purpose.
+    /// Without `language_has_entry_point_model` gating this, ANY corpus
+    /// containing one `.sql` file would degrade `coverage_is_complete`
+    /// permanently, with no fix available: a gate that always fires carries
+    /// the same information as one that never does. Proven on a probe before
+    /// this test existed: `languages_without_entry_points = ["hcl", "sql",
+    /// "systemverilog", "vue"]` on a corpus that also had a real bash gap,
+    /// which made the real gap indistinguishable from the unfixable one.
+    #[test]
+    fn language_with_no_entry_point_model_never_degrades_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:migration",
+                "migration",
+                SymbolKind::Function,
+                "db/001_init.sql",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.languages_without_entry_points.is_empty(),
+            "sql has no entry-point model and must never be named here: {:?}",
+            result.languages_without_entry_points
+        );
+        assert!(
+            result.coverage_is_complete(),
+            "a language with no entry-point model must not degrade coverage"
+        );
     }
 }

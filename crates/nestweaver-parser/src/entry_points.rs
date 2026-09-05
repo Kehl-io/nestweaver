@@ -1,4 +1,4 @@
-use nestweaver_schema::EntryPointKind;
+use nestweaver_schema::{EntryPointKind, Language};
 
 /// Determine whether a file path looks like a test file, based purely on
 /// filename and directory heuristics (no parsing, no symbol context).
@@ -117,6 +117,77 @@ fn ends_with_test_stem(file_name: &str, ext: &str) -> bool {
     file_name
         .strip_suffix(ext)
         .is_some_and(|stem| stem.ends_with("_test"))
+}
+
+/// Whether `language` has an entry-point detection model AT ALL.
+///
+/// "Zero entry points found" conflates two different facts, and a caller
+/// (`dead_code.rs`'s `languages_without_entry_points`, nw-435) that cannot
+/// tell them apart cannot report honestly:
+///
+/// - The language HAS a model and it found nothing -- a real coverage gap.
+///   Bash and Python are this case: `detect_bash`/`detect_python` exist and
+///   run, and a corpus that defines functions but trips neither rule has a
+///   genuinely empty entry-point surface worth flagging.
+/// - The language has NO model at all -- not a gap, a known limitation.
+///   `detect_entry_point` below returns `"sql" | "hcl" => None`
+///   unconditionally (SQL/HCL are declarative; there is no "entry" to
+///   detect), SystemVerilog has no arm and falls through the wildcard, and
+///   Vue/Svelte/Astro construct every symbol with `is_entry_point: false`
+///   hardcoded in their own parse functions -- `detect_entry_point` is never
+///   even CALLED for them. Folding this case into "coverage gap" would
+///   degrade `coverage_is_complete` PERMANENTLY for any corpus containing
+///   one `.sql`, `.tf`, `.sv`, `.vue`, `.svelte` or `.astro` file, with no
+///   user action able to clear it -- the same failure shape as a check that
+///   never fires: a gate that always fires carries the same amount of
+///   information as one that never does.
+///
+/// This match has NO wildcard arm ON PURPOSE. A hand-maintained "languages
+/// without a model" list rots the moment someone adds a 33rd language or
+/// implements a `detect_*` for one of the six below -- exactly the failure
+/// shape the CLI/MCP twin sweep and the `.claude` prune disclosure both hit
+/// today. Adding a `Language` variant without extending this match is a
+/// compile error instead.
+pub fn language_has_entry_point_model(language: Language) -> bool {
+    match language {
+        Language::JavaScript
+        | Language::TypeScript
+        | Language::Java
+        | Language::Go
+        | Language::Python
+        | Language::Cpp
+        | Language::Rust
+        | Language::Kotlin
+        | Language::CSharp
+        | Language::Php
+        | Language::Ruby
+        | Language::Swift
+        | Language::C
+        | Language::Dart
+        | Language::Cobol
+        | Language::Lua
+        | Language::Bash
+        | Language::Scala
+        | Language::Elixir
+        | Language::Zig
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Fortran
+        | Language::Pascal => true,
+        // No entry-point model. SQL/HCL: declarative, unconditional `None`
+        // below. SystemVerilog: no arm below, falls through `_ => None`.
+        // Vue/Svelte/Astro: `is_entry_point: false` is hardcoded where their
+        // symbols are constructed (vue.rs/svelte.rs/astro.rs) -- this
+        // function's caller never runs for them at all.
+        Language::Sql
+        | Language::Hcl
+        | Language::SystemVerilog
+        | Language::Vue
+        | Language::Svelte
+        | Language::Astro => false,
+    }
 }
 
 /// Detect whether a symbol is an entry point based on its name, file path,
@@ -962,6 +1033,74 @@ fn detect_powershell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── nw-435 follow-up: the entry-point-model capability predicate ────
+
+    /// The six languages with NO entry-point model at all -- pinned by name
+    /// so a future `detect_*` implementation (or a new `Language` variant)
+    /// has to touch this test, not silently inherit a stale exclusion.
+    #[test]
+    fn languages_with_no_entry_point_model_are_exactly_these_six() {
+        let without_model: Vec<Language> = [
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Java,
+            Language::Go,
+            Language::Python,
+            Language::Cpp,
+            Language::Rust,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Php,
+            Language::Ruby,
+            Language::Swift,
+            Language::C,
+            Language::Dart,
+            Language::Cobol,
+            Language::Lua,
+            Language::Bash,
+            Language::Scala,
+            Language::Elixir,
+            Language::Zig,
+            Language::ObjectiveC,
+            Language::Groovy,
+            Language::PowerShell,
+            Language::Julia,
+            Language::Sql,
+            Language::Hcl,
+            Language::Fortran,
+            Language::Pascal,
+            Language::Vue,
+            Language::Svelte,
+            Language::Astro,
+            Language::SystemVerilog,
+        ]
+        .into_iter()
+        .filter(|&lang| !language_has_entry_point_model(lang))
+        .collect();
+
+        assert_eq!(
+            without_model,
+            vec![
+                Language::Sql,
+                Language::Hcl,
+                Language::Vue,
+                Language::Svelte,
+                Language::Astro,
+                Language::SystemVerilog,
+            ],
+            "exactly these six languages have no entry-point model: {without_model:?}"
+        );
+    }
+
+    /// Counterweight: bash and python -- the two languages nw-435's honesty
+    /// half exists to police -- DO have a model, so a genuine zero from
+    /// either is a real gap and must still be reportable.
+    #[test]
+    fn bash_and_python_have_an_entry_point_model() {
+        assert!(language_has_entry_point_model(Language::Bash));
+        assert!(language_has_entry_point_model(Language::Python));
+    }
 
     // ── nw-351: the C++ entry-point surface ─────────────────────────────
 
