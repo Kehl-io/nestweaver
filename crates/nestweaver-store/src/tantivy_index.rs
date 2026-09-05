@@ -1765,11 +1765,34 @@ fn list_tantivy_staging_candidates(parent: &Path) -> Result<Vec<PathBuf>, Tantiv
             continue;
         }
         if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            candidates.push(entry.path());
+            let candidate = entry.path();
+            if looks_like_tantivy_staging(&candidate) {
+                candidates.push(candidate);
+            }
         }
     }
     candidates.sort();
     Ok(candidates)
+}
+
+/// Cheap sanity check that `path` genuinely looks like a Tantivy staging
+/// directory before reclaim removes it wholesale, rather than trusting the
+/// name prefix alone.
+///
+/// `rebuild_current_schema_atomically` can die before writing anything at
+/// all — an empty directory is exactly the shape a crash immediately after
+/// `tempdir_in` leaves, and is what the real-crash reproduction in this
+/// module's tests actually produces — or after `Index::create_in_dir` wrote
+/// its `meta.json` marker. Anything else sharing the prefix by coincidence
+/// (a directory a person happened to create with a similar name) is refused
+/// rather than guessed at: deleting a user's own directory because its name
+/// happened to match is a bad outcome for a hygiene feature. An inspection
+/// failure is treated the same conservative way.
+fn looks_like_tantivy_staging(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none() || path.join("meta.json").is_file(),
+        Err(_) => false,
+    }
 }
 
 /// Reclaim staging directories orphaned by a crashed schema migration for the
@@ -3408,6 +3431,39 @@ mod tests {
 
         let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
         assert_eq!(report, StagingReclaimReport::default());
+    }
+
+    /// nw-368 review fix 4: a directory that merely SHARES the staging
+    /// prefix by coincidence — a person's own directory, non-empty and
+    /// holding none of the markers a real (even partial) Tantivy build
+    /// leaves — must not be reclaimed. Trusting the name prefix alone would
+    /// make a hygiene feature delete a user's own data.
+    #[test]
+    fn reclaim_orphaned_tantivy_staging_refuses_a_prefix_coincidence() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        seed_recoverable_index(&index_path);
+
+        let impostor = index_path.parent().unwrap().join(format!(
+            "{TANTIVY_REINDEX_STAGING_PREFIX}not-tantivy-at-all"
+        ));
+        std::fs::create_dir_all(&impostor).unwrap();
+        std::fs::write(
+            impostor.join("my-notes.txt"),
+            b"definitely not a Tantivy index",
+        )
+        .unwrap();
+
+        let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
+        assert_eq!(
+            report,
+            StagingReclaimReport::default(),
+            "a prefix coincidence must not be treated as a candidate at all"
+        );
+        assert!(
+            impostor.join("my-notes.txt").exists(),
+            "the impostor directory and its contents must survive untouched"
+        );
     }
 
     /// A staging directory that IS still being built (recovery lock held) is
