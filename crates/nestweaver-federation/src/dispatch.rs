@@ -249,13 +249,15 @@ async fn dispatch_typed_brain_search(
     Ok(brain_search_response_to_json(&resp, concise))
 }
 
-/// Typed dispatch for `brain_context` -> `GetContext` RPC.
-/// Response is `BrainContextResponse { result_json }`.
-async fn dispatch_typed_brain_context(
-    client: &mut NestWeaverDaemonClient<Channel>,
-    params: &Value,
-    auth_token: Option<&str>,
-) -> Result<Value> {
+/// Build the typed `brain_context` request from JSON params.
+///
+/// Extracted for the same reason as [`project_context_request`]: the
+/// argument contract can then be asserted without a live daemon. nw-430 FIX
+/// 2 turned on exactly this boundary for `weight_semantic` (an explicit 0.0
+/// vs. absent), and it had no test because the mapping was buried inside an
+/// `async fn` that needs a gRPC channel — the same gap `project_context_request`
+/// closed for nw-316.
+fn brain_context_request(params: &Value) -> nestweaver_proto::BrainContextRequest {
     let seeds = params
         .get("seeds")
         .and_then(|v| v.as_array())
@@ -265,7 +267,7 @@ async fn dispatch_typed_brain_context(
                 .collect()
         })
         .unwrap_or_default();
-    let req = nestweaver_proto::BrainContextRequest {
+    nestweaver_proto::BrainContextRequest {
         seeds,
         token_budget: params
             .get("token_budget")
@@ -317,10 +319,11 @@ async fn dispatch_typed_brain_context(
             .get("rerank")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        weight_semantic: params
-            .get("weight_semantic")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
+        // nw-430 FIX 2: `Option`, not `.unwrap_or(0.0)`. An explicit 0.0 (what
+        // `--no-embed` sends) and "never set" both used to collapse to the
+        // same wire value, and the server-side `if weight_semantic > 0.0`
+        // guard could not tell them apart — see the field's proto comment.
+        weight_semantic: params.get("weight_semantic").and_then(|v| v.as_f64()),
         since: params
             .get("since")
             .and_then(|v| v.as_str())
@@ -334,7 +337,17 @@ async fn dispatch_typed_brain_context(
             .get("recency_half_life_days")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0),
-    };
+    }
+}
+
+/// Typed dispatch for `brain_context` -> `GetContext` RPC.
+/// Response is `BrainContextResponse { result_json }`.
+async fn dispatch_typed_brain_context(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = brain_context_request(params);
     let mut request = tonic::Request::new(req);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
@@ -416,6 +429,14 @@ fn project_context_request(params: &Value) -> nestweaver_proto::ProjectContextRe
             .to_string(),
         tags: json_str_array(params, "tags"),
         exclude_tags: json_str_array(params, "exclude_tags"),
+        // nw-430 FIX 1. Previously absent from this struct literal entirely
+        // — the field did not exist on `ProjectContextRequest` at all, so a
+        // caller's `no_embed: true` was silently dropped at exactly this
+        // conversion, however carefully the JSON side of the CLI wired it.
+        no_embed: params
+            .get("no_embed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -650,5 +671,71 @@ mod tests {
         );
         let explicit_true = serde_json::json!({ "include_body": true });
         assert_eq!(note_get_request(&explicit_true).include_body, Some(true));
+    }
+
+    /// nw-430 FIX 1 (review follow-up). `no_embed` did not exist on
+    /// `ProjectContextRequest` at all until this fix — the CLI put
+    /// `"no_embed": true` into a JSON blob, and this exact conversion
+    /// dropped the key on the floor because there was nowhere on the typed
+    /// message to put it. Pinning the SEAM that broke (not a semantic-ranking
+    /// observation, which a debug build without a working embedding backend
+    /// cannot produce either way — see the sibling investigation): the
+    /// caller's `no_embed: true` must arrive on the typed request as
+    /// `no_embed == true`, and an absent/false caller value must arrive as
+    /// `false`, so a future refactor of this mapping cannot silently drop it
+    /// again without a red test.
+    #[test]
+    fn no_embed_survives_the_project_context_wire_conversion() {
+        let absent = serde_json::json!({ "project": "p" });
+        assert!(
+            !project_context_request(&absent).no_embed,
+            "an absent no_embed must arrive false, not panic or default true"
+        );
+
+        let explicit_true = serde_json::json!({ "project": "p", "no_embed": true });
+        assert!(
+            project_context_request(&explicit_true).no_embed,
+            "no_embed: true must survive the JSON -> ProjectContextRequest conversion \
+             (nw-430 FIX 1: this field did not exist on the wire at all before this fix, \
+             so the caller's flag was silently dropped in transit)"
+        );
+
+        let explicit_false = serde_json::json!({ "project": "p", "no_embed": false });
+        assert!(!project_context_request(&explicit_false).no_embed);
+    }
+
+    /// nw-430 FIX 2 (review follow-up). `weight_semantic` was a plain proto3
+    /// `double`, so an explicit 0.0 (exactly what `--no-embed` sends via
+    /// `BrainCommands::Context`'s wiring) was indistinguishable on the wire
+    /// from "never set" — both decode to `0.0`, and `get_context`'s
+    /// `if weight_semantic > 0.0` guard treated them identically, silently
+    /// falling back to `tool_brain_context`'s config default. `optional`
+    /// fixes exactly this, mirroring `include_components`'s precedent above:
+    /// the assertion is that a real 0.0 and a real absence are now
+    /// DISTINGUISHABLE after the JSON -> BrainContextRequest conversion, not
+    /// that a ranking changed.
+    #[test]
+    fn explicit_zero_weight_semantic_survives_as_distinct_from_absent() {
+        let absent = serde_json::json!({ "seeds": ["x"] });
+        assert_eq!(
+            brain_context_request(&absent).weight_semantic,
+            None,
+            "an absent weight_semantic must arrive as None, so the tool's config default governs"
+        );
+
+        let explicit_zero = serde_json::json!({ "seeds": ["x"], "weight_semantic": 0.0 });
+        assert_eq!(
+            brain_context_request(&explicit_zero).weight_semantic,
+            Some(0.0),
+            "an explicit 0.0 (what --no-embed sends) must survive as Some(0.0), distinct \
+             from None — a plain (non-optional) double could not tell these apart, which \
+             is exactly how --no-embed was silently ignored on this route"
+        );
+
+        let explicit_nonzero = serde_json::json!({ "seeds": ["x"], "weight_semantic": 0.5 });
+        assert_eq!(
+            brain_context_request(&explicit_nonzero).weight_semantic,
+            Some(0.5)
+        );
     }
 }

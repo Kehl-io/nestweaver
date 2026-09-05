@@ -1543,16 +1543,6 @@ struct Cli {
     /// a daemon-owned database is refused, not silently doubled.
     #[arg(long, global = true, hide = true)]
     no_daemon: bool,
-
-    /// Disable semantic embedding for this invocation, on the commands that
-    /// have a semantic leg to disable: `brain context`, `brain search`
-    /// (which is already lexical-only and unaffected), `project-context`,
-    /// `investigate`, and `context --feature`. Refused with an error on
-    /// `search` and plain-seed `context`, which have no semantic leg on any
-    /// route — nw-430 was filed because this flag used to be silently
-    /// accepted and ignored there instead.
-    #[arg(long, global = true)]
-    no_embed: bool,
 }
 
 // ── Output configuration ─────────────────────────────────────────────────────
@@ -5195,6 +5185,14 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        /// Disable semantic ranking for this call. Only takes effect with
+        /// `--feature` (which routes through the real `brain_context` tool,
+        /// the one shape of this command with a semantic leg); without
+        /// `--feature` this command is code-only PPR with no semantic leg on
+        /// any route, and passing this flag is refused rather than silently
+        /// ignored (nw-430).
+        #[arg(long)]
+        no_embed: bool,
     },
     /// List declared cross-repo links from an instance config
     #[command(after_help = "Examples:\n  nestweaver list-links --config ./instance.toml")]
@@ -5756,6 +5754,12 @@ enum Commands {
             help = "Half-life for age-decay in days (default 30.0)"
         )]
         recency_half_life_days: f64,
+        /// Disable semantic ranking for this call — the daemon's loaded
+        /// embed model is the only place this command ever reaches semantic
+        /// ranking; without a daemon it never has one regardless of this
+        /// flag (nw-430).
+        #[arg(long)]
+        no_embed: bool,
     },
     /// F10: orient on a topic in one call — architectural map + bundle_id
     ///
@@ -5791,6 +5795,12 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        /// Disable semantic ranking for this call — the daemon's loaded
+        /// embed model is the only place this command ever reaches semantic
+        /// ranking; without a daemon it never has one regardless of this
+        /// flag (nw-430).
+        #[arg(long)]
+        no_embed: bool,
     },
 
     /// F10: drill into investigate bundle entries (full body + neighbors)
@@ -7341,6 +7351,10 @@ enum BrainCommands {
             help = "Scope ranking to nodes registered under this instance_id"
         )]
         prefer_instance: Option<String>,
+        /// Disable semantic ranking for this call (forces --weight-semantic to
+        /// 0 regardless of config or --weight-semantic).
+        #[arg(long)]
+        no_embed: bool,
     },
     /// List wikilinks that resolved below full confidence or not at all.
     ///
@@ -7797,8 +7811,8 @@ enum SnapshotCommands {
 enum PublicationCommands {
     /// Build, validate, and optionally activate a complete fresh publication.
     ///
-    /// Includes embeddings by contract; the global --no-embed flag is rejected
-    /// before any operation or slot is created.
+    /// Includes embeddings by contract; --no-embed is rejected before any
+    /// operation or slot is created.
     Rebuild {
         #[arg(
             long,
@@ -7824,6 +7838,13 @@ enum PublicationCommands {
         no_activate: bool,
         #[arg(long, help = "Output the terminal operation state as JSON")]
         json: bool,
+        /// Rejected outright: a complete publication must contain a
+        /// validated embedding artifact, so there is no semantic leg here to
+        /// disable. Accepted at parse time (rather than removed) so the
+        /// refusal can carry an explanation instead of a bare clap
+        /// "unexpected argument" error.
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Show one operation or list every active operation journal
     Status {
@@ -13380,7 +13401,6 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
-    let no_embed = cli.no_embed;
     let use_daemon = resolve_use_daemon(
         cli.no_daemon,
         !matches!(cli.command, Commands::Daemon { .. }),
@@ -14493,6 +14513,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             token_budget,
             json,
             db,
+            no_embed,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let parsed_intent: Option<QueryIntent> = intent
@@ -14673,6 +14694,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // refuse it instead of accepting and silently ignoring it (the
             // exact defect this item was filed for — measured byte-identical
             // output with and without the flag).
+            //
+            // FIX 3 (review): unlike `search`, this stays a RUNTIME check —
+            // `--no-embed` could not be removed from `Commands::Context`
+            // entirely, because `--feature` mode (above) genuinely needs it.
+            // Both modes share one clap variant, so the flag is structurally
+            // present on the whole command; only the seed-mode BRANCH lacks a
+            // semantic leg, and only a branch can be refused at runtime.
             if no_embed {
                 let message = "`context` (without `--feature`) runs code-only PPR with no BM25 or semantic leg, so `--no-embed` cannot apply to it. Remove the flag, or use `nestweaver brain context <seed>` for the hybrid PPR+BM25+semantic retrieval this flag controls.";
                 if json {
@@ -16322,7 +16350,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
-        Commands::Publication { command } => run_publication(command, no_embed).map(|c| (c, None)),
+        Commands::Publication { command } => run_publication(command).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         // nw-359 leg (3). `use_daemon` is resolved ONCE, at the top of `run`,
         // and this arm used to drop it — so every `instance` subcommand that
@@ -16330,15 +16358,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         // granted.
         Commands::Instance { command } => run_instance(command, use_daemon).map(|c| (c, None)),
         Commands::Config { command } => run_config(command),
-        Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
+        Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
         Commands::RtsEval { command } => run_rts_eval(command),
-        Commands::StaleCheck { json, db } => run_brain(
-            BrainCommands::StaleCheck { json, db },
-            out,
-            t0,
-            use_daemon,
-            no_embed,
-        ),
+        Commands::StaleCheck { json, db } => {
+            run_brain(BrainCommands::StaleCheck { json, db }, out, t0, use_daemon)
+        }
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
         Commands::Ranking { command } => run_ranking(command, t0, use_daemon),
         Commands::Eval { command } => run_eval_cmd(command, use_daemon).map(|c| (c, None)),
@@ -17972,21 +17996,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
-            // nw-430: `search` (`search_symbols`) matches symbol names by
-            // substring on both the daemon and direct routes — no BM25, no
-            // PPR, no semantic leg anywhere in it. `--no-embed` was
-            // previously accepted here and silently discarded (the item was
-            // filed from a byte-identical before/after measurement on this
-            // exact command). Refuse rather than repeat that.
-            if no_embed {
-                let message = "`search` matches symbol names by substring and never runs semantic ranking, so `--no-embed` cannot apply to it. Remove the flag, or use `nestweaver brain context <seed>` for PPR+BM25+semantic retrieval.";
-                if json {
-                    print_json_argument_error("--no-embed", "true", message);
-                } else {
-                    eprintln!("Error: {message}");
-                }
-                return Ok((EXIT_USAGE, None));
-            }
+            // nw-430 FIX 3: `search` (`search_symbols`) matches symbol names
+            // by substring on both the daemon and direct routes — no BM25,
+            // no PPR, no semantic leg anywhere in it. `--no-embed` is no
+            // longer a field on this variant at all (it was demoted from a
+            // `global = true` `Cli` flag to a per-command field on only the
+            // commands with a genuine semantic leg), so clap itself refuses
+            // `nestweaver search --no-embed` as an unknown argument at parse
+            // time, at the same EXIT_USAGE (64) every other clap-rejected
+            // value in this binary already uses — a structural "absent from
+            // this command" rather than a runtime check that could bitrot.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 10);
@@ -19663,6 +19682,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             since,
             recency_weight,
             recency_half_life_days,
+            no_embed,
         } => {
             // An empty name would fall through to the UID-substring match and silently resolve
             // to the first project — reject it up front (guards both the daemon and direct paths).
@@ -19813,6 +19833,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             root,
             json,
             db,
+            no_embed,
         } => {
             // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
             let (db_path, db_source) = match db {
@@ -24224,7 +24245,6 @@ fn run_brain(
     out: &OutputConfig,
     t0: std::time::Instant,
     use_daemon: bool,
-    no_embed: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         BrainCommands::Add {
@@ -26386,6 +26406,7 @@ fn run_brain(
             intent,
             no_tests,
             prefer_instance,
+            no_embed,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let cfg = load_instance_config_opt(config_path.as_deref());
@@ -33700,7 +33721,7 @@ fn format_bytes(bytes: u64) -> String {
 // `snapshot build` never routes through a daemon: it guards for a quiesced DB
 // and reads the store directly (autospawning a RW daemon would trip that
 // guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
-fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Result<i32> {
+fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
     fn root(root: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         if root.is_some() && db.is_some() {
             anyhow::bail!("pass either --root or --db, not both");
@@ -33724,6 +33745,7 @@ fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Resu
             batch_size,
             no_activate,
             json,
+            no_embed,
         } => {
             if no_embed {
                 anyhow::bail!(

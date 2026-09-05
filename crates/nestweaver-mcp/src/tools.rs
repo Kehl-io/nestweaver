@@ -14171,7 +14171,12 @@ fn dispatch_via_daemon_inner(
                     root: str_field("root"),
                     prf: bool_field("prf"),
                     rerank: bool_field("rerank"),
-                    weight_semantic: f64_field("weight_semantic"),
+                    // nw-430 FIX 2: presence, not `f64_field`'s `.unwrap_or(0.0)`.
+                    // An explicit 0.0 (what --no-embed sends) and "never set"
+                    // must stay distinguishable across this hop too — see the
+                    // field's proto comment and the sibling fix in
+                    // `nestweaver-federation::dispatch`.
+                    weight_semantic: args.get("weight_semantic").and_then(|v| v.as_f64()),
                     since: str_field("since"),
                     recency_weight: f64_field("recency_weight"),
                     recency_half_life_days: f64_field("recency_half_life_days"),
@@ -14213,6 +14218,12 @@ fn dispatch_via_daemon_inner(
                     path_prefix: str_field("path_prefix"),
                     tags: str_array("tags"),
                     exclude_tags: str_array("exclude_tags"),
+                    // nw-430 FIX 1: this site builds the same
+                    // `ProjectContextRequest` the CLI's hybrid client builds
+                    // in `nestweaver-federation::dispatch::project_context_request`,
+                    // and was missing the same field for the same reason —
+                    // it did not exist on the message at all until this fix.
+                    no_embed: bool_field("no_embed"),
                 });
                 let resp = client
                     .get_project_context(req)

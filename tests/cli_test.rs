@@ -54,9 +54,15 @@ fn publication_rebuild_rejects_no_embed_before_config_or_operation_setup() {
     let db = dir.path().join("brain.lbug");
     let missing_config = dir.path().join("missing.toml");
 
+    // nw-430 FIX 3 (review follow-up): `--no-embed` was demoted from a
+    // `global = true` `Cli` flag to a field declared locally on only the
+    // handful of variants with something to honor it — `PublicationCommands::
+    // Rebuild` is one of them (to keep this refusal working), so the flag
+    // must now appear AFTER `rebuild`, where clap parses that variant's own
+    // arguments, not before `publication` where the removed global used to
+    // live.
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["publication", "rebuild", "--config"])
+        .args(["publication", "rebuild", "--no-embed", "--config"])
         .arg(&missing_config)
         .arg("--db")
         .arg(&db)
@@ -69,16 +75,20 @@ fn publication_rebuild_rejects_no_embed_before_config_or_operation_setup() {
     assert!(!db.exists());
     assert!(!nestweaver_engine::publication::default_publication_root(&db).exists());
 
-    // The global flag is irrelevant to read-only publication commands. This
-    // guards against attaching the validation to the wrong match arm.
+    // `PublicationCommands::Status` never had (and still does not have) a
+    // `no_embed` field of its own — it was only ever reachable there via the
+    // now-removed global flag. So the assertion this guarded ("read-only
+    // publication commands are unaffected") is now a STRONGER, structural
+    // one: `--no-embed` is not a recognized argument on `publication status`
+    // at all, refused by clap itself rather than accepted-and-ignored.
     let root = dir.path().join("empty-publications");
     std::fs::create_dir_all(&root).unwrap();
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["publication", "status", "--root"])
+        .args(["publication", "status", "--no-embed", "--root"])
         .arg(&root)
         .assert()
-        .success();
+        .code(64)
+        .stderr(contains("unexpected argument '--no-embed'"));
 }
 
 #[test]
@@ -3273,48 +3283,71 @@ fn search_limit_enforces_the_brain_search_schema_bound() {
         .stdout(contains("brain_search"));
 }
 
-/// nw-430. `--no-embed` used to be accepted and silently ignored on `search`
-/// and plain-seed `context` — the item was filed from a byte-identical
-/// before/after measurement on exactly these two commands, because neither
-/// has a semantic leg on any route (`search` is a substring match over
-/// symbol names; seed-mode `context` is code-only PPR with no BM25/semantic
-/// fusion). Both now refuse the flag instead. No db needs to exist for
-/// either assertion — the refusal fires before any store is opened.
+/// nw-430 FIX 3 (review follow-up). `--no-embed` used to be a `global = true`
+/// `Cli` flag, accepted (and silently ignored) by EVERY subcommand — `search`,
+/// `hubs`, `bridges`, `blast-radius`, `dead-code`, `flow-trace`, `repo-map`,
+/// `stale-check`, `daemon *`, all of them. It is now a field declared LOCALLY
+/// on only the five variants with something to honor it (`project-context`,
+/// `investigate`, `context`, `brain context`, `publication rebuild`), so
+/// every other command refuses it as an UNKNOWN ARGUMENT at clap's own parse
+/// time — the structural "absent from this command" branch of nw-430's own
+/// Definition of Done, rather than a runtime check per command that could
+/// bitrot. Because the flag is no longer global, it must now appear AFTER
+/// the subcommand (clap does not recognize a subcommand's own flags before
+/// the subcommand name), which is also the position a real caller would put
+/// it in. Same clap parse-error exit code (64) either way — `EXIT_USAGE`,
+/// the code every clap-rejected value in this binary already uses.
 #[test]
 fn search_rejects_no_embed_since_it_has_no_semantic_leg() {
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["search", "anything"])
+        .args(["search", "anything", "--no-embed"])
         .assert()
         .code(64)
-        .stderr(contains("never runs semantic ranking"));
+        .stderr(contains("unexpected argument '--no-embed'"));
+}
 
-    nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["search", "anything", "--json"])
-        .assert()
-        .code(64)
-        .stdout(contains("\"error\":\"invalid argument\""))
-        .stdout(contains("\"argument\":\"--no-embed\""));
+/// nw-430 FIX 3 sweep: a sample of the OTHER commands that used to silently
+/// accept-and-ignore `--no-embed` under the old global flag (verified
+/// byte-identical output with and without it in the review that filed this
+/// follow-up) now refuse it the same structural way `search` does above.
+/// `daemon status` stands in for the whole `daemon` subtree — `daemon start
+/// --no-embed` appeared throughout this codebase's OWN daemon-startup test
+/// helpers (as an unrelated, always-inert flag), which is exactly the
+/// "accepted everywhere, honored nowhere" shape this fix removes.
+#[test]
+fn other_commands_no_longer_accept_no_embed_at_all() {
+    for args in [
+        ["hubs", "--no-embed"].as_slice(),
+        ["bridges", "--no-embed"].as_slice(),
+        ["daemon", "--no-embed"].as_slice(),
+    ] {
+        nestweaver_cmd()
+            .args(args)
+            .assert()
+            .code(64)
+            .stderr(contains("unexpected argument '--no-embed'"));
+    }
 }
 
 /// nw-430's twin refusal, for `context` without `--feature`. `context
 /// --feature <name> --config <file>` is the one shape of `context` that
 /// DOES reach a semantic leg (it calls the real `brain_context` tool) and is
 /// deliberately NOT covered by this refusal — see the wiring in
-/// `Commands::Context`'s feature-mode arm.
+/// `Commands::Context`'s feature-mode arm. Unlike `search`, `--no-embed` is
+/// still a real (locally-declared) field on this variant — feature-mode
+/// needs it — so this stays a RUNTIME refusal, not a parse-time one; see the
+/// comment on this exact `if` in `src/main.rs` for why a single clap variant
+/// serving two modes cannot be split at parse time.
 #[test]
 fn context_seed_mode_rejects_no_embed_since_it_has_no_semantic_leg() {
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["context", "anything"])
+        .args(["context", "anything", "--no-embed"])
         .assert()
         .code(64)
         .stderr(contains("no BM25 or semantic leg"));
 
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["context", "anything", "--json"])
+        .args(["context", "anything", "--no-embed", "--json"])
         .assert()
         .code(64)
         .stdout(contains("\"error\":\"invalid argument\""))
@@ -3329,9 +3362,12 @@ fn context_seed_mode_rejects_no_embed_since_it_has_no_semantic_leg() {
 /// layer; the actual semantic-disabling behaviour is proven with a real
 /// embed-model fixture in `crates/nestweaver-mcp/src/tools.rs`
 /// (`project_context_no_embed_disables_semantic_without_false_degradation`,
-/// `investigate_no_embed_disables_semantic_ranking`), because this
-/// `NESTWEAVER_NO_DAEMON=1` harness has no embed model to disable in the
-/// first place.
+/// `investigate_no_embed_disables_semantic_ranking`), and the field crossing
+/// the proto wire is pinned directly (without any model) in
+/// `crates/nestweaver-federation/src/dispatch.rs` and
+/// `crates/nestweaver-daemon/src/server.rs` — this
+/// `NESTWEAVER_NO_DAEMON=1` harness never reaches the daemon at all, so it
+/// cannot exercise that seam.
 #[test]
 fn project_context_and_investigate_still_accept_no_embed() {
     let dir = tempfile::tempdir().unwrap();
@@ -3339,16 +3375,14 @@ fn project_context_and_investigate_still_accept_no_embed() {
     drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
 
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["project-context", "nonexistent-project"])
+        .args(["project-context", "nonexistent-project", "--no-embed"])
         .args(["--db", &db_path.display().to_string()])
         .assert()
         .code(2) // NOT_FOUND, never EXIT_USAGE (64) — the flag itself is accepted.
         .stderr(contains("not found"));
 
     let investigate_output = nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["investigate", "anything"])
+        .args(["investigate", "anything", "--no-embed"])
         .args(["--db", &db_path.display().to_string()])
         .output()
         .unwrap();

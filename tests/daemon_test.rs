@@ -823,7 +823,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut start = normal_daemon_cmd();
     start
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "start"])
         .assert()
         .success();
@@ -837,7 +836,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
         || {
             let mut stop = normal_daemon_cmd();
             let _ = stop
-                .arg("--no-embed")
                 .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
                 .output();
         },
@@ -849,7 +847,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut second = normal_daemon_cmd();
     second
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "start"])
         .assert()
         .success()
@@ -862,15 +859,13 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut status = normal_daemon_cmd();
     status
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "status"])
         .assert()
         .success()
         .stdout(contains("running"));
 
     let mut stop = normal_daemon_cmd();
-    stop.arg("--no-embed")
-        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+    stop.args(["daemon", "--db", &db_path.display().to_string(), "stop"])
         .assert()
         .success();
 
@@ -934,7 +929,6 @@ credential_method = "gh"
 
     let mut start = normal_daemon_cmd();
     start
-        .arg("--no-embed")
         .args([
             "daemon",
             "--db",
@@ -977,8 +971,7 @@ credential_method = "gh"
     );
 
     let mut stop = normal_daemon_cmd();
-    stop.arg("--no-embed")
-        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+    stop.args(["daemon", "--db", &db_path.display().to_string(), "stop"])
         .assert()
         .success();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1006,7 +999,7 @@ fn macos_temp_start_reports_child_failure_promptly() {
     let started = std::time::Instant::now();
 
     let mut command = normal_daemon_cmd();
-    command.arg("--no-embed").args([
+    command.args([
         "daemon",
         "--db",
         &db_path.display().to_string(),
