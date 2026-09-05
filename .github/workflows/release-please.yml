@@ -496,10 +496,74 @@ jobs:
             echo "head_sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
 
+  release-pr-output-diagnostic:
+    name: Diagnose release-pr output propagation
+    needs: release-pr
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # nw-426: on run 33815362862, `release-pr` completed with conclusion
+      # success and its own step log read `located release PR: 353 (...)`
+      # followed by `Set output 'number'` -- yet `prepare-release-lockfile`,
+      # gated on `needs.release-pr.outputs.number != ''`, still showed
+      # skipped, completing in the same second. GitHub's ordinary log line
+      # ("Set output 'number'") prints whether the resolved value is
+      # populated or empty, and job output VALUES are not retrievable via the
+      # API after a run finishes -- so that run's actual cause (a step that
+      # wrote the value correctly vs. a job-output mapping that lost it)
+      # could not be distinguished after the fact.
+      #
+      # This job exists so the NEXT occurrence cannot hide the same way: it
+      # prints the value THIS (downstream) job actually sees, bracketed so an
+      # empty string is visually obvious in the log and in the job summary,
+      # and it fails loudly -- a clearly separate red job, not a silent skip
+      # -- when release-pr succeeded but produced no usable output. It has no
+      # write permissions and is not a dependency of anything else, so it can
+      # never affect whether a release proceeds; it exists purely to make
+      # this failure self-evident instead of requiring another manual
+      # rediscovery.
+      - name: Report what a downstream job actually resolves
+        env:
+          RESULT: ${{ needs.release-pr.result }}
+          NUMBER: ${{ needs.release-pr.outputs.number }}
+          BRANCH: ${{ needs.release-pr.outputs.branch }}
+          HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          echo "release-pr.result=[$RESULT]"
+          echo "release-pr.outputs.number=[$NUMBER]"
+          echo "release-pr.outputs.branch=[$BRANCH]"
+          echo "release-pr.outputs.head_sha=[$HEAD_SHA]"
+          {
+            echo "### release-pr output propagation (nw-426)"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| \`result\` | \`$RESULT\` |"
+            echo "| \`outputs.number\` | \`$NUMBER\` |"
+            echo "| \`outputs.branch\` | \`$BRANCH\` |"
+            echo "| \`outputs.head_sha\` | \`$HEAD_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$RESULT" = "success" ] && [ -z "$NUMBER" ]; then
+            echo "::error::release-pr succeeded but its 'number' output reads empty here -- this is nw-426's job-output propagation failure reproducing. prepare-release-lockfile will skip and a manual Cargo.lock sync will be needed again." >&2
+            exit 1
+          fi
+
   prepare-release-lockfile:
     name: Prepare release lockfile without write authority
     needs: release-pr
-    if: ${{ needs.release-pr.outputs.number != '' }}
+    # `always() &&` plus an explicit `.result == 'success'` check, not just
+    # the output test alone: nw-426 named the interaction between an
+    # `always()`-gated producer (release-pr's own `if` opens with `always()`)
+    # and a consumer gated ONLY on that producer's output as one of the two
+    # plausible faults behind the job-output propagation failure measured on
+    # run 33815362862. This does not depend on which of the two was the
+    # actual cause -- it is a strict tightening either way, and it is exactly
+    # the shape the item itself proposed ("a consumer that also carries
+    # `always() &&` would sidestep it").
+    if: ${{ always() && needs.release-pr.result == 'success' && needs.release-pr.outputs.number != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
