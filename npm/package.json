@@ -21,6 +21,9 @@
     "x64",
     "arm64"
   ],
+  "engines": {
+    "node": ">=22"
+  },
   "keywords": [
     "mcp",
     "code-graph",
