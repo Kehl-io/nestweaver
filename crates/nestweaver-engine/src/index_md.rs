@@ -119,18 +119,72 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
     summary
 }
 
-/// Directory names skipped when walking a vault. Includes `.obsidian` (config),
-/// `.trash` (Obsidian's recycle bin), and common synthetic dirs.
+/// Directory names skipped when walking a vault.
+///
+/// nw-436 review (FIX 1): this used to be a 9-entry list, and switching vault
+/// walks from `crate::index::SKIP_DIRS` (the code list, 32 entries) to THIS
+/// list — the nw-436 fix — admitted `.claude` (intended) and 24 OTHER
+/// directory names that were never evaluated (`.venv`, `venv`, `vendor`,
+/// `Pods`, `coverage`, `__pycache__`, `.tox`, `.mypy_cache`, `.ruff_cache`,
+/// `playwright-report`, `test-results`, `.expo`, `.wrangler`, `.astro`,
+/// `public`, `out`, `.output`, `storybook-static`, `.gradle`, `env`, `.pio`,
+/// `.superpowers`, ...). Measured: a vault with one `.md` planted under each
+/// of 16 such directories reported `Indexed 17 notes` — all of them. A vault
+/// living near a Python/Node project, or a home directory doubling as a vault
+/// root, would silently ingest thousands of vendored `README.md`s into a
+/// personal knowledge graph — a WORSE version of the defect nw-436 exists to
+/// fix: instead of silently dropping content, silently ingesting noise.
+///
+/// So this list is now `crate::index::SKIP_DIRS` VERBATIM, minus the two
+/// directories that hold user-authored content in a vault (`.claude`,
+/// `.superpowers` — both are agent skills/instructions the operator wrote,
+/// the nw-436 population), plus the two vault-only entries code repos never
+/// have (`.obsidian`, `.trash`). The principle: a vault should still skip
+/// build output, vendored dependencies and tool artefacts (that noise is not
+/// notes, in a vault or a repo) while admitting user-authored agent content.
+/// `.claude`/`.superpowers` and `.obsidian`/`.trash` are decided explicitly,
+/// not defaulted: the former look user-authored (skills/instructions the
+/// operator wrote); the latter are Obsidian's own app config and recycle
+/// bin — never notes, by construction — which is also why both are in
+/// `index::UNDISCLOSED_PRUNES` rather than degrading every vault's coverage
+/// forever (see that constant's doc comment).
+///
+/// DO NOT hand-curate this list again without checking it against
+/// `crate::index::SKIP_DIRS` — the whole point of nw-436's review is that a
+/// list built independently drifts silently, in either direction.
 const SKIP_DIRS: &[&str] = &[
     ".obsidian",
     ".trash",
     ".git",
     "node_modules",
     "target",
-    ".next",
-    ".nuxt",
+    "__pycache__",
+    "vendor",
     "dist",
     "build",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".astro",
+    ".wrangler",
+    "test-results",
+    "playwright-report",
+    ".expo",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "env",
+    ".env",
+    ".pio",
+    "Pods",
+    ".gradle",
+    "public",
+    "out",
+    ".output",
+    "storybook-static",
 ];
 
 /// Returns true if any component of `rel_path` matches one of the vault
@@ -1631,7 +1685,9 @@ where
     // IMMEDIATELY AFTER `list_files`, for the same reason `index.rs`'s drain
     // does: the recorder is cleared at the top of every `list_files` call.
     for pruned in reader.skipped_dirs() {
-        if let Some(sf) = crate::index::disclose_pruned_dir(pruned) {
+        if let Some(sf) =
+            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
+        {
             skipped.push(sf);
         }
     }
@@ -4181,6 +4237,19 @@ sub b body
 
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "x").unwrap();
         assert_eq!(result.notes_count, 1, "only real.md should be indexed");
+        // nw-436 review, FIX 2: `.obsidian` is present in EVERY Obsidian vault.
+        // Now that the vault drain (nw-436) is wired, disclosing it would
+        // degrade `coverage_status` on literally every vault forever — a gate
+        // that always fires carries no information, exactly the failure
+        // `index::UNDISCLOSED_PRUNES`'s doc comment explains for `.git`. It is
+        // Obsidian's own app config, never notes, by construction, so it earns
+        // the same carve-out `.git` does rather than a vault-unaware remedy.
+        assert!(
+            result.skipped.is_empty(),
+            "`.obsidian` must be pruned SILENTLY, not reported as degraded \
+             coverage on every vault: {:?}",
+            result.skipped
+        );
     }
 
     #[test]
@@ -4248,14 +4317,67 @@ sub b body
 
         let (result, _store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.notes_count, 1, "only real.md should be indexed");
+        let row = result
+            .skipped
+            .iter()
+            .find(|sf| sf.path == "node_modules")
+            .unwrap_or_else(|| panic!("pruned directory must be disclosed: {:?}", result.skipped));
+        // nw-436 review, FIX 2: `[[repos]] unskip` is a `RepoConfig` field with
+        // no vault equivalent, so a vault's remedy must not tell the operator
+        // to use it as if it worked — that was a fresh nw-334 instance (a
+        // remedy nobody can execute) introduced by sharing `disclose_pruned_dir`
+        // with the vault caller without adapting its generic-branch message.
         assert!(
-            result
-                .skipped
-                .iter()
-                .any(|sf| sf.path == "node_modules" && sf.reason.contains("unskip")),
-            "the pruned directory must be disclosed with an actionable remedy: {:?}",
+            !row.reason.contains("re-admit it with `[[repos]] unskip`"),
+            "a vault has no [[repos]] unskip surface to re-admit anything with: {row:?}"
+        );
+        // The remedy must instead be something the operator can actually do
+        // (rename the directory), and it should orient them at the vault's
+        // real indexing config surface (`.brainignore`).
+        assert!(
+            row.reason.contains("Rename the directory") && row.reason.contains(".brainignore"),
+            "the vault remedy must be executable and name the real config surface: {row:?}"
+        );
+    }
+
+    #[test]
+    fn vault_indexing_still_skips_build_and_dependency_directories_it_admits_dot_claude_from() {
+        // nw-436 review, FIX 1 (the finding that blocked the first pass):
+        // switching vault walks from `crate::index::SKIP_DIRS` (32 entries) to
+        // `index_md.rs`'s OWN list (originally 9 entries) admitted `.claude`
+        // (intended) AND 24 other directory names nobody decided to admit —
+        // `.venv`, `vendor`, `coverage`, `playwright-report`, `Pods`, and more.
+        // A vault living near a Python/Node project would have silently
+        // ingested thousands of vendored README/CHANGELOG files into a
+        // personal knowledge graph — a WORSE version of the defect nw-436
+        // exists to fix. This pins the NEGATIVE case the two `.claude` tests
+        // above do not: these names must still be pruned (and disclosed) in a
+        // vault, even though `.claude` now is not.
+        let (_dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            (".venv/lib/README.md", "# Should not count\n"),
+            ("vendor/some_pkg/CHANGELOG.md", "# Should not count\n"),
+            ("coverage/lcov-report/README.md", "# Should not count\n"),
+            ("playwright-report/data/README.md", "# Should not count\n"),
+        ]);
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.notes_count, 1,
+            "only real.md should be indexed — build/dependency dirs must stay pruned: {:?}",
             result.skipped
         );
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Real");
+
+        for name in [".venv", "vendor", "coverage", "playwright-report"] {
+            assert!(
+                result.skipped.iter().any(|sf| sf.path == name),
+                "{name} must be disclosed as pruned, not merely absent: {:?}",
+                result.skipped
+            );
+        }
     }
 
     #[test]
