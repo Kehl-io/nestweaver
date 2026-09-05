@@ -11941,14 +11941,12 @@ fn repair_cluster_sidecars(
     // invocation.
     let current_keep_name = || -> Option<std::ffi::OsString> {
         match nestweaver_engine::cluster_dispatch::load_clusters(db_path) {
-            Ok(Some(output)) => {
-                nestweaver_engine::cluster_dispatch::sidecar_path_for_resolution(
-                    db_path,
-                    output.resolution,
-                )
-                .file_name()
-                .map(std::ffi::OsStr::to_owned)
-            }
+            Ok(Some(output)) => nestweaver_engine::cluster_dispatch::sidecar_path_for_resolution(
+                db_path,
+                output.resolution,
+            )
+            .file_name()
+            .map(std::ffi::OsStr::to_owned),
             // No canonical sidecar (nothing computed yet) or it failed to load
             // (cannot prove what is current): spare everything rather than guess.
             Ok(None) | Err(_) => None,

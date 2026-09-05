@@ -8307,9 +8307,10 @@ fn repair_dry_run_does_not_overstate_a_prefix_coincidence_as_reclaimable() {
     std::fs::create_dir_all(dir.path().join("scratch.lbug.tantivy")).unwrap();
     // Shares the exact staging prefix, but is neither empty nor carries a
     // `meta.json` marker — a coincidence, not migration residue.
-    let coincidence = dir
-        .path()
-        .join(format!("{}not-a-migration", nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX));
+    let coincidence = dir.path().join(format!(
+        "{}not-a-migration",
+        nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX
+    ));
     std::fs::create_dir_all(&coincidence).unwrap();
     std::fs::write(coincidence.join("my_own_file.txt"), b"do not touch").unwrap();
 
