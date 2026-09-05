@@ -487,7 +487,8 @@ pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
     LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, compute_clusters,
-    default_cluster_resolution, load_clusters, save_clusters,
+    default_cluster_resolution, load_clusters, load_clusters_for_resolution, save_clusters,
+    sidecar_path_for_resolution,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
