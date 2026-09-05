@@ -299,7 +299,7 @@ jobs:
         run: |
           set -euo pipefail
           BIN="$PWD/target/release/nestweaver"
-          "$BIN" --no-daemon --no-embed index \
+          "$BIN" --no-daemon index \
             --repo testdata/js --db "$SETUP_DB"
           "$BIN" --no-daemon embed --local --accelerator cpu \
             --cache-dir "$MODEL_CACHE" --db "$SETUP_DB" \
@@ -1087,6 +1087,58 @@ jobs:
       - name: Scan repository history
         run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose
 
+  npm-install-smoke:
+    name: npm install smoke (macOS)
+    needs: changes
+    # `npm/**` is already in the `rust` filter above (it feeds the release
+    # process), so this shares that gate rather than adding a new one.
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+      - name: Real npm install of the wrapper package (nw-433 regression guard)
+        # nw-433: `libc: ["glibc"]` in npm/package.json refused EVERY macOS
+        # install with EBADPLATFORM ("Actual libc: undefined" -- libc is not a
+        # concept on macOS). `os` and `cpu` matched; only `libc` failed, and
+        # nothing in CI ever ran a real `npm install` on a macOS runner to
+        # catch that before it reached a release. This job is that check.
+        #
+        # `--ignore-scripts`, deliberately not a full install: the
+        # `postinstall` script downloads the GitHub Release archive for the
+        # version already sitting in npm/package.json, and release-please
+        # bumps that version on its OWN pull request before the matching tag
+        # and release exist (see `extra-files` in release-please-config.json)
+        # -- a full install would then fail on an unrelated 404 on every
+        # release PR. What actually regressed, and what this guards, is npm's
+        # platform-metadata GATE: it is evaluated before any lifecycle script
+        # runs, and is unaffected by whether the release artifact itself
+        # exists yet. `npm pack` + `npm install <tarball>` (not `npm install
+        # ./npm`) so this exercises the exact package.json npm would publish,
+        # not the working-tree layout.
+        #
+        # No `--force` anywhere in this step -- that is the whole point: a
+        # forced install is what let the original regression ship unnoticed.
+        run: |
+          set -euo pipefail
+          pack_dir="$(mktemp -d)"
+          (cd npm && npm pack --pack-destination "$pack_dir")
+          tarball="$(ls "$pack_dir"/nestweaver-*.tgz)"
+          install_dir="$(mktemp -d)"
+          (
+            cd "$install_dir"
+            npm init -y >/dev/null
+            npm install --ignore-scripts "$tarball"
+          )
+          echo "npm accepted the platform for $(uname -sm) without --force"
+
   e2e:
     name: E2E Tests
     needs: changes
@@ -1178,6 +1230,7 @@ jobs:
       - daemon-tests
       - audit
       - secret-scan
+      - npm-install-smoke
       - e2e
     runs-on: ubuntu-latest
     steps:

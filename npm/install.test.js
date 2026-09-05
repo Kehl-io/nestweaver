@@ -17,6 +17,7 @@ const {
   runtimeVersionFailure,
   githubApiHeaders,
   describeReleaseApiFailure,
+  isMuslLinux,
 } = require("./install.js");
 
 let passed = 0;
@@ -218,6 +219,37 @@ check("a 404 is reported as a missing release, not a rate limit", () => {
   const message = describeReleaseApiFailure({ status: 404, body: "Not Found" }, {});
   assert.match(message, /not found/i);
   assert.ok(!/rate limit/i.test(message));
+});
+
+// ── libc detection (nw-433) ─────────────────────────────────────────────
+// The npm-level `libc` field was removed from package.json because it cannot
+// express "glibc-only on Linux, unconstrained elsewhere" -- it constrains the
+// whole package, so it refused every macOS install too (npm reports
+// `Actual libc: undefined` there, since libc is not a concept on macOS).
+// `isMuslLinux` is what replaces it: a Linux-only check performed in code,
+// where that scoping is actually expressible.
+check("darwin is never musl, regardless of glibcVersionRuntime", () => {
+  assert.strictEqual(isMuslLinux("darwin", undefined, false), false);
+  assert.strictEqual(isMuslLinux("darwin", "2.31", true), false);
+});
+
+check("linux with a reported glibc version is not musl", () => {
+  assert.strictEqual(isMuslLinux("linux", "2.31", true), false);
+});
+
+check("linux with a report that reads no glibc version IS musl", () => {
+  assert.strictEqual(isMuslLinux("linux", undefined, true), true);
+});
+
+// Review finding: the first version of this check collapsed "the report
+// could not be produced" and "the report was produced and shows no glibc"
+// into the same `undefined`, so a working glibc-Linux box whose Node could
+// not generate a report (hardened/sandboxed container, unusual build, a
+// future Node where this API moves) was REFUSED as unsupported -- the exact
+// confidently-wrong-rejection class this whole sweep exists to fix. An
+// unavailable report must fail OPEN.
+check("linux with an UNAVAILABLE report is NOT treated as musl (fails open)", () => {
+  assert.strictEqual(isMuslLinux("linux", undefined, false), false);
 });
 
 check("an unclassified failure still reports its cause", () => {

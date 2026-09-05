@@ -42,6 +42,11 @@ pub struct ChangeImpact {
     pub status: AnalysisStatus,
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// nw-371: repo UIDs with generation-mismatched edges — distinct from
+    /// `_meta.stale_repos` (federation lag) and from `stale_check`'s/
+    /// `hub_nodes`'s own `stale_repos` (different tools, different
+    /// populations under the same key name). See the glossary on
+    /// `ResolverStaleness` in `src/main.rs` for the full list.
     #[serde(default)]
     pub resolver_stale_repos: Vec<String>,
     #[serde(default)]

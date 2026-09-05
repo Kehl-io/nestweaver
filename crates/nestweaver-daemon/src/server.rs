@@ -5350,6 +5350,228 @@ fn materialize_projects_terminal_progress(
     }
 }
 
+/// Build `brain_context` tool args from a typed `BrainContextRequest`.
+///
+/// Extracted out of `get_context` so the reconstruction can be asserted
+/// without a live gRPC connection or daemon state — the same testability
+/// idiom `nestweaver-federation`'s `project_context_request` /
+/// `brain_context_request` already use on the CLIENT side of this same
+/// boundary. nw-430 FIX 2 turned on exactly this seam (an explicit 0.0 vs.
+/// absent `weight_semantic`), and it had no test because the mapping was
+/// buried inside an `async fn` needing a live `Request<BrainContextRequest>`.
+fn brain_context_args_from_request(req: &BrainContextRequest) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "seeds": req.seeds,
+        "include_seeds": req.include_seeds,
+        "include_bodies": req.include_bodies,
+        "prf": req.prf,
+        "rerank": req.rerank,
+    });
+    if req.token_budget > 0 {
+        args["token_budget"] = serde_json::json!(req.token_budget);
+    }
+    if !req.response_format.is_empty() {
+        args["response_format"] = serde_json::json!(req.response_format);
+    }
+    if !req.repos.is_empty() {
+        args["repos"] = serde_json::json!(req.repos);
+    }
+    if !req.vaults.is_empty() {
+        args["vaults"] = serde_json::json!(req.vaults);
+    }
+    if !req.kinds.is_empty() {
+        args["kinds"] = serde_json::json!(req.kinds);
+    }
+    if !req.path_prefix.is_empty() {
+        args["path_prefix"] = serde_json::json!(req.path_prefix);
+    }
+    if !req.tags.is_empty() {
+        args["tags"] = serde_json::json!(req.tags);
+    }
+    if !req.exclude_tags.is_empty() {
+        args["exclude_tags"] = serde_json::json!(req.exclude_tags);
+    }
+    if req.weight_ppr != 0.0 {
+        args["weight_ppr"] = serde_json::json!(req.weight_ppr);
+    }
+    if req.weight_bm25 != 0.0 {
+        args["weight_bm25"] = serde_json::json!(req.weight_bm25);
+    }
+    if !req.intent.is_empty() {
+        args["intent"] = serde_json::json!(req.intent);
+    }
+    if !req.root.is_empty() {
+        args["root"] = serde_json::json!(req.root);
+    }
+    if !req.since.is_empty() {
+        args["since"] = serde_json::json!(req.since);
+    }
+    // nw-430 FIX 2: presence check, not `> 0.0`. `weight_semantic` is
+    // `optional double` precisely so an explicit 0.0 (what `--no-embed`
+    // sends) survives this hop instead of being indistinguishable from
+    // "never set" and silently falling back to `tool_brain_context`'s
+    // config default.
+    if let Some(weight_semantic) = req.weight_semantic {
+        args["weight_semantic"] = serde_json::json!(weight_semantic);
+    }
+    if req.recency_weight > 0.0 {
+        args["recency_weight"] = serde_json::json!(req.recency_weight);
+    }
+    if req.recency_half_life_days > 0.0 {
+        args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
+    }
+    args
+}
+
+/// Build `project_context` tool args from a typed `ProjectContextRequest`.
+/// Same extraction, same reason, as [`brain_context_args_from_request`].
+fn project_context_args_from_request(req: &ProjectContextRequest) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "project": req.project,
+        "include_seeds": req.include_seeds,
+        // nw-430 FIX 1. Previously absent from this message entirely, so a
+        // caller's `--no-embed` was silently dropped in transit: the CLI put
+        // it in a JSON blob that never survived conversion into this typed
+        // request. Sent unconditionally (plain bool, no third state to
+        // preserve) rather than gated behind a conditional, matching
+        // `include_seeds` above.
+        "no_embed": req.no_embed,
+    });
+    // nw-316: only when the caller actually said so. Injecting it
+    // unconditionally re-erased the absence the `optional` field exists to
+    // carry, so the tool's documented default of `true` stayed unreachable.
+    if let Some(include_components) = req.include_components {
+        args["include_components"] = serde_json::json!(include_components);
+    }
+    if req.token_budget > 0 {
+        args["token_budget"] = serde_json::json!(req.token_budget);
+    }
+    if !req.kinds.is_empty() {
+        args["kinds"] = serde_json::json!(req.kinds);
+    }
+    if !req.intent.is_empty() {
+        args["intent"] = serde_json::json!(req.intent);
+    }
+    if !req.since.is_empty() {
+        args["since"] = serde_json::json!(req.since);
+    }
+    if req.recency_weight > 0.0 {
+        args["recency_weight"] = serde_json::json!(req.recency_weight);
+    }
+    if req.recency_half_life_days > 0.0 {
+        args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
+    }
+    if !req.response_format.is_empty() {
+        args["response_format"] = serde_json::json!(req.response_format);
+    }
+    if !req.repos.is_empty() {
+        args["repos"] = serde_json::json!(req.repos);
+    }
+    if !req.path_prefix.is_empty() {
+        args["path_prefix"] = serde_json::json!(req.path_prefix);
+    }
+    if !req.tags.is_empty() {
+        args["tags"] = serde_json::json!(req.tags);
+    }
+    if !req.exclude_tags.is_empty() {
+        args["exclude_tags"] = serde_json::json!(req.exclude_tags);
+    }
+    args
+}
+
+/// nw-430 (FIX 1 / FIX 2, review follow-up). Pins the SERVER side of the
+/// same seam `nestweaver-federation::dispatch`'s
+/// `no_embed_survives_the_project_context_wire_conversion` /
+/// `explicit_zero_weight_semantic_survives_as_distinct_from_absent` pin on
+/// the CLIENT side: a typed request the caller already built must
+/// reconstruct into `args` faithfully, with no live gRPC connection, daemon
+/// state, or embedding model required.
+#[cfg(test)]
+mod context_request_args_tests {
+    use super::*;
+
+    #[test]
+    fn project_context_no_embed_reaches_args_both_ways() {
+        let mut req = ProjectContextRequest {
+            project: "p".to_string(),
+            token_budget: 0,
+            kinds: vec![],
+            include_components: None,
+            intent: String::new(),
+            include_seeds: false,
+            since: String::new(),
+            recency_weight: 0.0,
+            recency_half_life_days: 0.0,
+            response_format: String::new(),
+            repos: vec![],
+            path_prefix: String::new(),
+            tags: vec![],
+            exclude_tags: vec![],
+            no_embed: false,
+        };
+        assert_eq!(
+            project_context_args_from_request(&req)["no_embed"],
+            serde_json::json!(false),
+            "false must reach args as false, not be omitted and read as absent"
+        );
+
+        req.no_embed = true;
+        assert_eq!(
+            project_context_args_from_request(&req)["no_embed"],
+            serde_json::json!(true),
+            "nw-430 FIX 1: no_embed: true must reach `project_context`'s args — \
+             before this fix the field did not exist on ProjectContextRequest at \
+             all, so this reconstruction had nothing to read and the caller's \
+             flag was dropped in transit"
+        );
+    }
+
+    #[test]
+    fn brain_context_explicit_zero_weight_semantic_reaches_args_distinct_from_absent() {
+        let mut req = BrainContextRequest {
+            seeds: vec!["x".to_string()],
+            token_budget: 0,
+            response_format: String::new(),
+            repos: vec![],
+            vaults: vec![],
+            kinds: vec![],
+            path_prefix: String::new(),
+            tags: vec![],
+            exclude_tags: vec![],
+            weight_ppr: 0.0,
+            weight_bm25: 0.0,
+            intent: String::new(),
+            include_seeds: false,
+            include_bodies: false,
+            root: String::new(),
+            prf: false,
+            rerank: false,
+            weight_semantic: None,
+            since: String::new(),
+            recency_weight: 0.0,
+            recency_half_life_days: 0.0,
+        };
+        assert!(
+            brain_context_args_from_request(&req)
+                .get("weight_semantic")
+                .is_none(),
+            "an absent weight_semantic must not appear in args at all, so the \
+             tool's config default governs"
+        );
+
+        req.weight_semantic = Some(0.0);
+        assert_eq!(
+            brain_context_args_from_request(&req)["weight_semantic"],
+            serde_json::json!(0.0),
+            "nw-430 FIX 2: an explicit Some(0.0) (what --no-embed sends) must reach \
+             args as weight_semantic: 0.0 — before this fix weight_semantic was a \
+             plain (non-optional) double and the `if weight_semantic > 0.0` guard \
+             this replaced could not tell an explicit 0.0 from an absent one, so \
+             the caller's disable was silently dropped"
+        );
+    }
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -7575,61 +7797,7 @@ impl NestWeaverDaemon for DaemonService {
         // omits the very uids attribution needs — is refused rather than
         // served unfiltered.
         let (_, extensions, req) = r.into_parts();
-        let mut args = serde_json::json!({
-            "seeds": req.seeds,
-            "include_seeds": req.include_seeds,
-            "include_bodies": req.include_bodies,
-            "prf": req.prf,
-            "rerank": req.rerank,
-        });
-        if req.token_budget > 0 {
-            args["token_budget"] = serde_json::json!(req.token_budget);
-        }
-        if !req.response_format.is_empty() {
-            args["response_format"] = serde_json::json!(req.response_format);
-        }
-        if !req.repos.is_empty() {
-            args["repos"] = serde_json::json!(req.repos);
-        }
-        if !req.vaults.is_empty() {
-            args["vaults"] = serde_json::json!(req.vaults);
-        }
-        if !req.kinds.is_empty() {
-            args["kinds"] = serde_json::json!(req.kinds);
-        }
-        if !req.path_prefix.is_empty() {
-            args["path_prefix"] = serde_json::json!(req.path_prefix);
-        }
-        if !req.tags.is_empty() {
-            args["tags"] = serde_json::json!(req.tags);
-        }
-        if !req.exclude_tags.is_empty() {
-            args["exclude_tags"] = serde_json::json!(req.exclude_tags);
-        }
-        if req.weight_ppr != 0.0 {
-            args["weight_ppr"] = serde_json::json!(req.weight_ppr);
-        }
-        if req.weight_bm25 != 0.0 {
-            args["weight_bm25"] = serde_json::json!(req.weight_bm25);
-        }
-        if !req.intent.is_empty() {
-            args["intent"] = serde_json::json!(req.intent);
-        }
-        if !req.root.is_empty() {
-            args["root"] = serde_json::json!(req.root);
-        }
-        if !req.since.is_empty() {
-            args["since"] = serde_json::json!(req.since);
-        }
-        if req.weight_semantic > 0.0 {
-            args["weight_semantic"] = serde_json::json!(req.weight_semantic);
-        }
-        if req.recency_weight > 0.0 {
-            args["recency_weight"] = serde_json::json!(req.recency_weight);
-        }
-        if req.recency_half_life_days > 0.0 {
-            args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
-        }
+        let args = brain_context_args_from_request(&req);
 
         let value = self
             .dispatch_tool_json("brain_context", args, &extensions)
@@ -7668,49 +7836,7 @@ impl NestWeaverDaemon for DaemonService {
         // all is refused rather than handed uid-free rows that nothing
         // downstream can attribute to a repo.
         let (_, extensions, req) = r.into_parts();
-        let mut args = serde_json::json!({
-            "project": req.project,
-            "include_seeds": req.include_seeds,
-        });
-        // nw-316: only when the caller actually said so. Injecting it
-        // unconditionally re-erased the absence the `optional` field exists to
-        // carry, so the tool's documented default of `true` stayed unreachable.
-        if let Some(include_components) = req.include_components {
-            args["include_components"] = serde_json::json!(include_components);
-        }
-        if req.token_budget > 0 {
-            args["token_budget"] = serde_json::json!(req.token_budget);
-        }
-        if !req.kinds.is_empty() {
-            args["kinds"] = serde_json::json!(req.kinds);
-        }
-        if !req.intent.is_empty() {
-            args["intent"] = serde_json::json!(req.intent);
-        }
-        if !req.since.is_empty() {
-            args["since"] = serde_json::json!(req.since);
-        }
-        if req.recency_weight > 0.0 {
-            args["recency_weight"] = serde_json::json!(req.recency_weight);
-        }
-        if req.recency_half_life_days > 0.0 {
-            args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
-        }
-        if !req.response_format.is_empty() {
-            args["response_format"] = serde_json::json!(req.response_format);
-        }
-        if !req.repos.is_empty() {
-            args["repos"] = serde_json::json!(req.repos);
-        }
-        if !req.path_prefix.is_empty() {
-            args["path_prefix"] = serde_json::json!(req.path_prefix);
-        }
-        if !req.tags.is_empty() {
-            args["tags"] = serde_json::json!(req.tags);
-        }
-        if !req.exclude_tags.is_empty() {
-            args["exclude_tags"] = serde_json::json!(req.exclude_tags);
-        }
+        let args = project_context_args_from_request(&req);
 
         let value = self
             .dispatch_tool_json("project_context", args, &extensions)

@@ -54,8 +54,9 @@ pub use search::{
 };
 pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K,
-    SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, SearchLogicalIdentity, TantivyError, TantivyIndex,
-    reindex_lock_path,
+    SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, SearchLogicalIdentity, StagingReclaimIssue,
+    StagingReclaimReport, TANTIVY_REINDEX_STAGING_PREFIX, TantivyError, TantivyIndex,
+    reclaim_orphaned_tantivy_staging, reindex_lock_path,
 };
 pub use traverse::{
     DEFAULT_IMPACT_THRESHOLD, IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult,
@@ -72,7 +73,8 @@ pub use write::{
 pub use write_lease::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
     acquire_db_write_lease, acquire_db_write_lease_under_namespace, canonical_db_path,
-    current_process_claims_write_lease, write_lease_path, write_lease_state,
+    current_process_claims_namespace_lease, current_process_claims_write_lease, write_lease_path,
+    write_lease_state,
 };
 
 #[cfg(test)]

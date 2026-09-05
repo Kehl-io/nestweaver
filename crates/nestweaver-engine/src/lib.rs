@@ -321,7 +321,35 @@ pub fn resolve_repo_selector<'a>(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [repo] => Ok(*repo),
-        [] => anyhow::bail!("repo '{selector}' not found in graph"),
+        // nw-428/nw-334: a bare "not found" names no remedy, and 29 of 44
+        // real repos have no explicit `name` at all — a caller who tried the
+        // name `list-repos` prints has no way to learn that the repo_uid was
+        // the only key that could ever have worked. Name the remedy command
+        // AND enumerate what is actually indexed (bounded, so a 44-repo graph
+        // doesn't turn a one-line error into a wall of text) — the same shape
+        // `resolve_vault_filter`'s not-found arm already uses.
+        [] => {
+            const MAX_LISTED: usize = 15;
+            let known: Vec<String> = repos
+                .iter()
+                .take(MAX_LISTED)
+                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+                .collect();
+            let suffix = if repos.len() > MAX_LISTED {
+                format!(", and {} more", repos.len() - MAX_LISTED)
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "repo '{selector}' not found in graph; run `nestweaver list-repos` to see \
+                 indexed repos by name/uid{}{suffix}",
+                if known.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — known repos: {}", known.join(", "))
+                }
+            );
+        }
         _ => {
             let candidates = matches
                 .iter()
@@ -386,6 +414,7 @@ pub mod investigate;
 pub mod jobs;
 pub mod manifest;
 pub mod mcp_client;
+pub mod node_scope;
 pub mod parse_pool;
 pub mod parsed_cache;
 pub mod process;
@@ -458,7 +487,8 @@ pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
     LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, compute_clusters,
-    default_cluster_resolution, load_clusters, save_clusters,
+    default_cluster_resolution, load_clusters, load_clusters_for_resolution, save_clusters,
+    sidecar_path_for_resolution,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{

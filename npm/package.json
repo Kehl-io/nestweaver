@@ -21,9 +21,9 @@
     "x64",
     "arm64"
   ],
-  "libc": [
-    "glibc"
-  ],
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [
     "mcp",
     "code-graph",

@@ -127,12 +127,43 @@ impl HybridClient {
     /// `.nestweaver/server.toml`, checks `~/.config/nestweaver/upstreams.toml`,
     /// honors the `NESTWEAVER_UPSTREAM` env var, and reads any `[[upstream]]`
     /// entries from the instance config file (`config_path`).
+    ///
+    /// Autostarts the local daemon as ONE-SHOT (see
+    /// `DaemonClient::connect`/`autostart::DaemonUsage`) — the shortened
+    /// ephemeral idle-timeout applies when `db_path` looks temporary. This is
+    /// correct for every CLI command that issues its RPC(s) and exits, which
+    /// is every caller of this function except `mcp`'s daemon-proxy route;
+    /// that one calls [`Self::connect_long_running`] instead.
     pub async fn connect(
         db_path: &Path,
         config_path: Option<&Path>,
         start_dir: &Path,
     ) -> Result<Self> {
         let local = DaemonClient::connect(db_path, config_path).await?;
+        Self::finish_connect(local, config_path, start_dir)
+    }
+
+    /// Connect the way [`Self::connect`] does, but declare the CALLER as a
+    /// long-running foreground session (`mcp`'s daemon-proxy stdio server) —
+    /// see `DaemonClient::connect_long_running` for why this must be a
+    /// distinct, explicit entrypoint rather than a cleverer path check.
+    pub async fn connect_long_running(
+        db_path: &Path,
+        config_path: Option<&Path>,
+        start_dir: &Path,
+    ) -> Result<Self> {
+        let local = DaemonClient::connect_long_running(db_path, config_path).await?;
+        Self::finish_connect(local, config_path, start_dir)
+    }
+
+    /// Upstream discovery, shared by both connect entrypoints above — the
+    /// only thing that differs between them is which `DaemonClient`
+    /// constructor spawned `local`.
+    fn finish_connect(
+        local: DaemonClient,
+        config_path: Option<&Path>,
+        start_dir: &Path,
+    ) -> Result<Self> {
         let upstream_configs = discover_upstreams_with_config(start_dir, config_path);
 
         let mut upstreams = Vec::new();
@@ -1230,6 +1261,26 @@ fn trace_id() -> String {
 /// `local_impact` and `org_wide_impact` sections.
 ///
 /// Used for blast_radius, brain_impact, and affected_tests.
+///
+/// nw-428 review round 3: `query_local` used to be `?`-propagated
+/// unconditionally, so `blast_radius`'s hard refusal on an unresolvable
+/// `repo` filter (nw-428's fix) killed the ENTIRE two-tier response — local
+/// AND org-wide — before upstream was ever asked. A repo that is real
+/// org-wide and simply not indexed by THIS daemon is, from the local tier's
+/// point of view, indistinguishable from a typo: both fail to resolve
+/// locally. Which one it was can only be learned by actually asking
+/// upstream, so DETECTION (recognizing "the local tier could not resolve
+/// `repo`") is separated from POLICY (deciding that's fatal):
+/// [`degraded_local_impact_for_unresolved_repo_filter`] only recognizes and
+/// discloses; this function decides whether recognizing it is enough reason
+/// to keep going.
+///
+/// The property this preserves, both halves: with NO healthy upstream (the
+/// single-tier / no-federation case — the common deployment), the original
+/// error propagates completely unchanged, so a bogus `--repo` still refuses
+/// loudly exactly as before this change. With a healthy upstream, the local
+/// failure degrades into a disclosed stand-in and upstream is still
+/// consulted, so its `org_wide_impact` can still reach the caller.
 pub async fn two_tier_query(
     client: &mut HybridClient,
     tool_name: &str,
@@ -1237,7 +1288,27 @@ pub async fn two_tier_query(
 ) -> Result<Value> {
     // The LOCAL tier is computed here — the federation crate only ever sees
     // its result as data (the parameterized seam from nw-017 Phase B).
-    let local_result = client.query_local(tool_name, params).await?;
+    let local_result = match client.query_local(tool_name, params).await {
+        Ok(value) => value,
+        Err(error) => {
+            let has_healthy_upstream = client.upstreams.iter().any(|u| u.is_healthy());
+            match has_healthy_upstream
+                .then(|| {
+                    degraded_local_impact_for_unresolved_repo_filter(tool_name, &error, params)
+                })
+                .flatten()
+            {
+                Some(degraded) => degraded,
+                // No healthy upstream to fall back to (this IS the
+                // single-tier case), or the error isn't the recognized
+                // unresolved-`repo`-filter signal (a real local failure —
+                // DB corruption, an RPC transport outage, a genuine bug —
+                // must still propagate as a hard error, not be silently
+                // absorbed).
+                None => return Err(error),
+            }
+        }
+    };
     Ok(nestweaver_federation::two_tier::two_tier_query(
         local_result,
         &client.upstreams,
@@ -1248,6 +1319,115 @@ pub async fn two_tier_query(
     .await)
 }
 
+/// The stable, narrow substring that identifies "the local `repo` filter
+/// could not be resolved" among every other possible local failure.
+///
+/// `nestweaver-daemon`'s `dispatch_err_to_status` wraps a tool's error as
+/// `Status::internal("tool {tool} failed: {e}")`, and
+/// `dispatch_json_rpc_authed` adds its own `"{tool_name} RPC failed"`
+/// context on top — both preserve the original message text verbatim, so
+/// `nestweaver_engine::node_scope::resolve_repo_filter`'s own wrapping
+/// (`"repo filter entry {selector:?}: {error:#}"`, in both its "not found"
+/// and "ambiguous" outcomes) survives across the gRPC boundary intact. This
+/// text is emitted ONLY by that one function today, so matching on it
+/// cannot mistake an unrelated failure for an unresolved `repo` filter.
+const UNRESOLVED_REPO_FILTER_SIGNAL: &str = "repo filter entry ";
+
+/// Build a degraded, disclosure-shaped stand-in for a two-tier LOCAL result
+/// whose `repo` filter did not resolve against the local index.
+///
+/// Scoped to `blast_radius` specifically (the only one of the three
+/// two-tier tools whose `repo` filter currently routes through
+/// `node_scope::resolve_repo_filter`) rather than trusting the message
+/// signal alone — belt and suspenders, so a future brain_impact/
+/// affected_tests error that happened to contain the same substring could
+/// not be silently reinterpreted as this condition.
+///
+/// Returns `None` for any tool other than `blast_radius`, or any error that
+/// doesn't carry [`UNRESOLVED_REPO_FILTER_SIGNAL`] — in both cases the
+/// original error must propagate unchanged.
+///
+/// The shape mirrors `tool_blast_radius`'s own trust-contract fields
+/// (`status`, `gate_state`, `coverage`, `notifications`) rather than
+/// inventing a new disclosure vocabulary, so a caller already reading that
+/// contract sees the familiar fields instead of a bespoke sentinel.
+///
+/// `changed_files`, `max_depth`, `blind_spots` and `analysis_direction` are
+/// UNCONDITIONALLY present in every real `tool_blast_radius` response
+/// (success or a genuine degrade — see `tools.rs`'s response builder), so
+/// this stand-in fills them too rather than silently departing from the
+/// documented shape: `changed_files`/`max_depth` echo the request the same
+/// way the real tool does, `blind_spots` uses the same four ALWAYS-present
+/// inherent gaps plus `not-indexed` (this run has, by construction, zero
+/// local coverage of the named repo — the same blind spot
+/// `analyze_blast_radius` itself adds whenever `repos_not_indexed` is
+/// non-empty), and `analysis_direction` is the one value this codebase ever
+/// produces for it.
+fn degraded_local_impact_for_unresolved_repo_filter(
+    tool_name: &str,
+    error: &anyhow::Error,
+    params: &Value,
+) -> Option<Value> {
+    if tool_name != "blast_radius" {
+        return None;
+    }
+    let rendered = format!("{error:#}");
+    if !rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL) {
+        return None;
+    }
+    let changed_files = params
+        .get("changed_files")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let max_depth = params.get("max_depth").and_then(Value::as_u64).unwrap_or(3);
+    Some(serde_json::json!({
+        "changed_files": changed_files,
+        "max_depth": max_depth,
+        "status": "partial",
+        "gate_state": "degraded-unknown",
+        "affected_symbol_count": 0,
+        "returned_affected_symbol_count": 0,
+        "affected_symbols": [],
+        "affected_symbols_truncated": false,
+        "affected_clusters": [],
+        "affected_cluster_count": 0,
+        "changed_symbol_count": 0,
+        "changed_symbols": [],
+        "coverage": {
+            "repos_in_scope": [],
+            "repos_not_indexed": [],
+            "stale_repos": [],
+            "traversal_truncated": false,
+        },
+        "org_wide": null,
+        "cochanged_files": [],
+        "resolver_stale_repos": [],
+        "risk": "low",
+        // The four inherent gaps every real response carries, plus
+        // "not-indexed" — this stand-in exists BECAUSE the local index has
+        // no coverage of the named repo, the exact condition
+        // `analyze_blast_radius` itself flags with this same blind spot.
+        "blind_spots": [
+            "dynamic-dispatch",
+            "reflection",
+            "config-wiring",
+            "codegen",
+            "not-indexed",
+        ],
+        "analysis_direction": "over-approximate",
+        "notifications": [{
+            "level": "error",
+            "descriptor": "repo-filter-unresolved-locally",
+            "message": format!(
+                "blast_radius's `repo` filter did not resolve against the LOCAL index \
+                 (not indexed here, or a typo) — see org_wide_impact for an upstream \
+                 answer: {rendered}"
+            ),
+        }],
+        "summary": "local tier degraded: `repo` filter did not resolve locally — see org_wide_impact",
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1256,6 +1436,147 @@ pub async fn two_tier_query(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// nw-428 review round 3 (federation regression). The full
+    /// `two_tier_query` async path needs a live daemon connection to
+    /// exercise (`HybridClient::query_local` calls a real gRPC channel; see
+    /// `fallback_mode_overrides_merge_to_local_first`'s comment on the same
+    /// limitation for `query()`), so this covers the pure detection+build
+    /// logic in isolation instead of faking a federated round trip.
+    ///
+    /// COUNTERWEIGHT: asserting the returned `Value`'s specific fields
+    /// (rather than just `is_some()`) matters here — a version of this
+    /// function that recognized the signal but built an empty `{}` stand-in
+    /// would still pass an `is_some()`-only check while giving a caller
+    /// nothing to read.
+    #[test]
+    fn degraded_stand_in_recognizes_the_daemon_wrapped_signal_and_discloses_it() {
+        // Mirrors the ACTUAL wrapping chain: node_scope::resolve_repo_filter's
+        // message, then nestweaver-daemon's dispatch_err_to_status prefix,
+        // then dispatch_json_rpc_authed's own RPC-failed context — so this
+        // proves the signal survives realistic wrapping, not just a bare
+        // string.
+        let inner = anyhow::anyhow!(
+            "repo filter entry \"bx-react-native-client\": repo 'bx-react-native-client' not \
+             found in graph; run `nestweaver list-repos` to see indexed repos by name/uid"
+        );
+        let daemon_wrapped = anyhow::anyhow!("tool blast_radius failed: {inner:#}")
+            .context("blast_radius RPC failed");
+        let params = json!({
+            "changed_files": ["src/theme/ThemeContext.tsx"],
+            "max_depth": 5,
+            "repo": "bx-react-native-client",
+        });
+
+        let degraded = degraded_local_impact_for_unresolved_repo_filter(
+            "blast_radius",
+            &daemon_wrapped,
+            &params,
+        )
+        .expect("the wrapped daemon error must still be recognized");
+
+        assert_eq!(degraded["status"], "partial");
+        assert_eq!(degraded["gate_state"], "degraded-unknown");
+        assert_eq!(degraded["affected_symbol_count"], 0);
+        // nw-428 review round 4: a real tool_blast_radius response
+        // UNCONDITIONALLY carries changed_files/max_depth/blind_spots/
+        // analysis_direction, success or degrade — a stand-in that omitted
+        // them would silently depart from the documented response shape.
+        assert_eq!(
+            degraded["changed_files"],
+            json!(["src/theme/ThemeContext.tsx"]),
+            "must echo the request's changed_files, not omit the field"
+        );
+        assert_eq!(
+            degraded["max_depth"], 5,
+            "must echo the request's max_depth"
+        );
+        assert_eq!(
+            degraded["analysis_direction"], "over-approximate",
+            "must carry the same analysis_direction every real response does"
+        );
+        let blind_spots: Vec<&str> = degraded["blind_spots"]
+            .as_array()
+            .expect("blind_spots must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for inherent in ["dynamic-dispatch", "reflection", "config-wiring", "codegen"] {
+            assert!(
+                blind_spots.contains(&inherent),
+                "the four inherent blind spots must always be present; got {blind_spots:?}"
+            );
+        }
+        assert!(
+            blind_spots.contains(&"not-indexed"),
+            "this stand-in exists BECAUSE the repo has no local coverage, so \
+             not-indexed must be flagged; got {blind_spots:?}"
+        );
+        let notifications = degraded["notifications"]
+            .as_array()
+            .expect("notifications must be an array");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0]["descriptor"],
+            "repo-filter-unresolved-locally"
+        );
+        assert!(
+            notifications[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bx-react-native-client"),
+            "the disclosure must name the selector that failed to resolve; got {degraded}"
+        );
+    }
+
+    /// COUNTERWEIGHT: `changed_files`/`max_depth` must come from the
+    /// request, not a hardcoded default, or a caller reading the degraded
+    /// stand-in back would see the wrong file list. Omitting `max_depth`
+    /// from the request must still fall back to the real tool's own
+    /// default (3), not a missing field.
+    #[test]
+    fn degraded_stand_in_echoes_request_fields_and_defaults_missing_max_depth() {
+        let error = anyhow::anyhow!("repo filter entry \"x\": repo 'x' not found in graph");
+        let params = json!({ "changed_files": ["a.rs", "b.rs"] });
+        let degraded =
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &params)
+                .expect("recognized signal must still produce a stand-in");
+        assert_eq!(degraded["changed_files"], json!(["a.rs", "b.rs"]));
+        assert_eq!(
+            degraded["max_depth"], 3,
+            "an omitted max_depth must default to 3, matching tool_blast_radius's own default"
+        );
+    }
+
+    /// COUNTERWEIGHT: an unrelated local failure (transport outage, a real
+    /// bug — anything that doesn't carry the recognized signal) must NOT be
+    /// absorbed into a degraded stand-in; it has to keep propagating as a
+    /// hard error, or a genuine local outage would be silently downgraded to
+    /// "partial" results.
+    #[test]
+    fn degraded_stand_in_ignores_unrelated_local_failures() {
+        let error = anyhow::anyhow!("connection refused").context("blast_radius RPC failed");
+        assert!(
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &json!({}))
+                .is_none(),
+            "an unrelated failure must not be reinterpreted as an unresolved repo filter"
+        );
+    }
+
+    /// COUNTERWEIGHT: even a message carrying the exact signal must not be
+    /// absorbed for a DIFFERENT tool — `brain_impact`/`affected_tests` don't
+    /// route their `repo` filter through `node_scope::resolve_repo_filter`
+    /// today, so treating the same substring as this condition for them
+    /// would be inventing a guarantee this batch never established.
+    #[test]
+    fn degraded_stand_in_is_scoped_to_blast_radius_only() {
+        let error = anyhow::anyhow!("repo filter entry \"x\": repo 'x' not found in graph");
+        assert!(
+            degraded_local_impact_for_unresolved_repo_filter("brain_impact", &error, &json!({}))
+                .is_none(),
+            "the same message signal must not be reinterpreted for a different tool"
+        );
+    }
 
     #[test]
     fn local_only_has_no_upstreams() {

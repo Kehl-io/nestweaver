@@ -471,6 +471,19 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Review follow-up on nw-417 (FIX 1). The bounded wait below is correctly
+/// placed and correctly bounded, but its FIRST version discarded the
+/// timeout outcome — `stop_and_uninstall` returned `Ok(())` whether the job
+/// was confirmed gone or merely never checked again. Both call sites relied
+/// on that: `daemon start`'s reinstall-over-an-incumbent path discarded the
+/// `Result` outright, and `DaemonAction::Stop` set its own success flag
+/// unconditionally after calling this, rather than from the confirmation.
+/// That is exactly the class this whole batch exists to close: a recovery
+/// command reporting success while the thing it claims to have stopped is
+/// still alive, precisely when launchd is wedged — the case this function's
+/// own history is about. `stop_and_uninstall` now returns `Err` when it
+/// cannot confirm absence within the bound, so every caller's `?` (or an
+/// explicit check) surfaces it instead of silently discarding it.
 pub fn stop_and_uninstall(instance_id: &str) -> Result<()> {
     let plist_path = lifecycle::launchd_plist_path(instance_id);
     let label = lifecycle::launchd_label(instance_id);
@@ -480,9 +493,71 @@ pub fn stop_and_uninstall(instance_id: &str) -> Result<()> {
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
 
+    // nw-417. `bootout`'s subprocess exiting only means launchd ACCEPTED the
+    // teardown request, not that the job is gone: reproduced live, an
+    // immediate `launchctl print` on the SAME label right after `bootout`
+    // returns exit 0, `state = SIGTERMed` — the job is still tearing down. A
+    // poll confirmed it clears within about a second. `is_running` used to be
+    // a single, unretried `print`, so every caller of this function —
+    // including this one's own test — was asserting on kernel state the
+    // instant after releasing it, which is a race, not a flake. Waiting HERE,
+    // in the product, means every caller downstream (the plist removal right
+    // below, `daemon start`'s reinstall-over-an-incumbent path, `daemon
+    // stop`) observes a genuinely absent job instead of a launchd job mid-exit
+    // — fixing the teardown's correctness rather than adding a retry to each
+    // caller separately.
+    let confirmed_absent = wait_for_launchd_absence(instance_id, std::time::Duration::from_secs(5));
+
+    // Best-effort regardless of confirmation: a stale plist left behind is
+    // its own hazard (it would make a later `install_and_start` think an
+    // update needs bootstrapping over a job that never existed), and
+    // removing it does not itself claim the JOB is gone — that claim is the
+    // `anyhow::ensure!` below, which fires independently of this cleanup.
     let _ = std::fs::remove_file(&plist_path);
 
+    anyhow::ensure!(
+        confirmed_absent,
+        "launchd did not confirm {label} stopped within 5s of `bootout` — it may still be \
+         tearing down, or genuinely wedged. Do not treat it as stopped: check with \
+         `launchctl print gui/{uid}/{label}` before retrying."
+    );
     Ok(())
+}
+
+/// Bounded poll for `is_running(instance_id)` to report the job truly gone.
+///
+/// Returns `true` once absence is confirmed, `false` if `timeout` elapsed
+/// with the job still reporting present — never blocks past the bound
+/// either way. The caller decides what a timeout means; this function only
+/// answers the yes/no question honestly instead of returning early as if it
+/// had.
+fn wait_for_launchd_absence(instance_id: &str, timeout: std::time::Duration) -> bool {
+    wait_for_absence_with_probe(timeout, || !is_running(instance_id))
+}
+
+/// The bounded-poll core of [`wait_for_launchd_absence`], parameterized over
+/// the presence probe so a test can drive the TIMEOUT path deterministically.
+///
+/// A real launchd job wedged for the whole bound is not something a test can
+/// safely manufacture — this repo's own shared launchd domain holds ~15-20
+/// live daemons at any time, and hand-registering a stuck job to race against
+/// is the wrong kind of risk for a unit test. A fake probe closure exercises
+/// the identical bounded-loop logic (poll, check deadline, sleep) with zero
+/// real launchd interaction and zero timing flakiness.
+fn wait_for_absence_with_probe(
+    timeout: std::time::Duration,
+    mut probe: impl FnMut() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if probe() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn is_running(instance_id: &str) -> bool {
@@ -499,6 +574,61 @@ pub fn is_running(instance_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-417 FIX 1. The bound is real: a probe that never reports absence
+    /// must not block past `timeout`, and the caller must be TOLD it timed
+    /// out (`false`) rather than getting the same `()`-shaped nothing a
+    /// success would have produced.
+    #[test]
+    fn wait_for_absence_with_probe_reports_false_on_timeout() {
+        let calls = std::cell::Cell::new(0u32);
+        let start = std::time::Instant::now();
+        let result = wait_for_absence_with_probe(std::time::Duration::from_millis(150), || {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert!(!result, "a probe that never reports absence must time out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must never block substantially past the bound: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            calls.get() >= 2,
+            "must poll more than once inside the bound, not give up after the first check: {}",
+            calls.get()
+        );
+    }
+
+    /// The counterweight: a probe that reports absence immediately must
+    /// return `true` without waiting out the bound at all — otherwise the
+    /// timeout test above could pass because EVERY call takes the full
+    /// timeout regardless of what the probe says.
+    #[test]
+    fn wait_for_absence_with_probe_returns_true_immediately_when_already_absent() {
+        let start = std::time::Instant::now();
+        let result = wait_for_absence_with_probe(std::time::Duration::from_secs(5), || true);
+        assert!(result);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "an immediately-true probe must not wait out any part of the bound: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The middle case: absence confirmed after a few false polls, well
+    /// inside the bound — proves the loop actually re-polls rather than
+    /// deciding on the first call alone.
+    #[test]
+    fn wait_for_absence_with_probe_returns_true_once_the_probe_flips() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = wait_for_absence_with_probe(std::time::Duration::from_secs(5), || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        });
+        assert!(result);
+        assert_eq!(calls.get(), 3);
+    }
 
     #[test]
     fn parse_db_path_from_plist_extracts_db_arg() {

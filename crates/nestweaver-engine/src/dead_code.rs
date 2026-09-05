@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use nestweaver_parser::entry_points::language_has_entry_point_model;
+use nestweaver_parser::language::detect_language;
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::GraphStore;
 use serde::Serialize;
@@ -104,6 +106,23 @@ pub struct DeadCodeResult {
     /// Measured on a real C++ corpus: 0 of 11,730 reachable, 1,523 called dead
     /// at medium confidence, `coverage: "complete"`.
     pub entry_points: usize,
+    /// Languages present in this corpus (by file extension) whose symbols
+    /// include ZERO entry points, even though the language contributed at
+    /// least one analysed symbol.
+    ///
+    /// nw-435. nw-351 caught the WHOLE-CORPUS case: `entry_points == 0`
+    /// degrades `coverage_is_complete`. That check is blind to a mixed-
+    /// language corpus where one language's entry-point rule never fires
+    /// while a DIFFERENT language's real `main` keeps the global count above
+    /// zero — e.g. a repo with a Rust binary (real entry points) alongside
+    /// bash or Python scripts whose entry-point surface silently sits at
+    /// zero. That language's reachability numbers are exactly as vacuous as
+    /// the whole-corpus case nw-351 already covers: its BFS never had a seed,
+    /// so every symbol in it falls out unreachable and nothing about that is
+    /// disclosed unless it is checked per language rather than in aggregate.
+    /// This is the same defect shape nw-351 closed for C++ specifically,
+    /// generalised to every language rather than re-discovered one at a time.
+    pub languages_without_entry_points: Vec<String>,
 }
 
 impl DeadCodeResult {
@@ -120,7 +139,9 @@ impl DeadCodeResult {
         // `total_symbols == 0` is the one honest zero-seed case: there was
         // nothing to walk to, so nothing was concluded and nothing is offered
         // for deletion. Every other zero-seed run reports 100% dead.
-        self.undecodable_symbols == 0 && (self.entry_points > 0 || self.total_symbols == 0)
+        self.undecodable_symbols == 0
+            && (self.entry_points > 0 || self.total_symbols == 0)
+            && self.languages_without_entry_points.is_empty()
     }
 }
 
@@ -358,6 +379,7 @@ fn detect_dead_code_inner(
             // discloses too.
             undecodable_symbols,
             entry_points: 0,
+            languages_without_entry_points: vec![],
         });
     }
 
@@ -400,20 +422,58 @@ fn detect_dead_code_inner(
         .collect();
 
     // 4. Identify entry points (flag + manifest-driven).
+    //
+    // nw-435, the honesty half. nw-351 degrades `coverage_is_complete` when
+    // the WHOLE corpus has zero entry points, but that check is blind to a
+    // mixed-language corpus: a Rust binary's real `main` keeps the global
+    // count above zero while a bash or Python (or any future language) whose
+    // entry-point rule never fires sits at zero and nothing discloses it.
+    // Tracked per language, by file extension, alongside the existing
+    // per-symbol pass so it costs no extra traversal.
+    //
+    // Gated on `language_has_entry_point_model`: "zero entry points" is only
+    // evidence of a coverage GAP for a language that has a detection rule to
+    // come up empty. SQL, HCL, SystemVerilog, Vue, Svelte and Astro have no
+    // model at all (declarative, unimplemented, or routed around
+    // `detect_entry_point` entirely -- see that function's doc comment), so
+    // their entry-point count is ALWAYS zero and folding them in here would
+    // degrade `coverage_is_complete` permanently for any corpus containing
+    // even one such file, with no user action able to clear it. A probe
+    // confirmed this: `languages_without_entry_points = ["hcl", "sql",
+    // "systemverilog", "vue"]` on a corpus that also has real bash/python
+    // gaps, degrading coverage for a reason no fix can address. Excluding
+    // them here, rather than filtering the OUTPUT, keeps the field itself
+    // honest: a language only ever appears when its absence is a real,
+    // actionable gap.
     let mut entry_point_uids: Vec<String> = Vec::new();
+    let mut lang_totals: HashMap<String, usize> = HashMap::new();
+    let mut lang_entries: HashMap<String, usize> = HashMap::new();
     for sym in &all_symbols {
-        if sym.is_entry_point {
-            entry_point_uids.push(sym.uid.clone());
-            continue;
-        }
         // Manifest-driven: exported symbols in manifest entry files.
-        if !manifest_entry_files.is_empty() {
-            let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
-            if manifest_entry_files.contains(normalized) {
-                entry_point_uids.push(sym.uid.clone());
+        let is_entry = sym.is_entry_point
+            || (!manifest_entry_files.is_empty() && {
+                let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
+                manifest_entry_files.contains(normalized)
+            });
+        if is_entry {
+            entry_point_uids.push(sym.uid.clone());
+        }
+        if let Some(lang) = detect_language(std::path::Path::new(&sym.file_path))
+            && language_has_entry_point_model(lang)
+        {
+            let label = format!("{lang:?}").to_lowercase();
+            *lang_totals.entry(label.clone()).or_insert(0) += 1;
+            if is_entry {
+                *lang_entries.entry(label).or_insert(0) += 1;
             }
         }
     }
+    let mut languages_without_entry_points: Vec<String> = lang_totals
+        .into_iter()
+        .filter(|(lang, _)| lang_entries.get(lang).copied().unwrap_or(0) == 0)
+        .map(|(lang, _)| lang)
+        .collect();
+    languages_without_entry_points.sort();
 
     // 5. Confidence-aware BFS from all entry points.
     //
@@ -630,6 +690,7 @@ fn detect_dead_code_inner(
         excluded_count,
         undecodable_symbols,
         entry_points: entry_point_uids.len(),
+        languages_without_entry_points,
     })
 }
 
@@ -2071,6 +2132,147 @@ mod tests {
             "a same-named function in a DIFFERENT file is a different symbol \
              and its deadness is its own: {:?}",
             result.unreachable_symbols
+        );
+    }
+
+    // ── nw-435: per-language coverage honesty ───────────────────────────────
+    //
+    // nw-351 degrades `coverage_is_complete` when the WHOLE corpus has zero
+    // entry points. These hand-built-graph tests exercise the GENERALISATION:
+    // a corpus can have a healthy global `entry_points` count from one
+    // language while a second language's entry-point rule never fires, and
+    // that must degrade the claim too. This is deliberately independent of
+    // the bash/python parser fix above -- it is the same protection for any
+    // OTHER language whose entry-point surface is still a gap.
+
+    #[test]
+    fn language_with_zero_entry_points_degrades_coverage_even_with_another_languages_entry() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:a",
+                "a",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+        // A second language contributes a symbol but no entry point at all --
+        // as if its `detect_*` rule has the same gap nw-435 fixed for bash and
+        // python.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:helper",
+                "helper",
+                SymbolKind::Function,
+                "scripts/deploy.sh",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.entry_points > 0,
+            "the whole-corpus count is NOT zero -- rust has a real entry point"
+        );
+        assert_eq!(result.languages_without_entry_points, vec!["bash"]);
+        assert!(
+            !result.coverage_is_complete(),
+            "bash contributed a symbol but zero entry points; the claim must \
+             degrade even though the global entry_points count is healthy"
+        );
+    }
+
+    /// The counterweight: give the second language's symbol an entry point
+    /// too, and the claim must read complete again -- the new check is not
+    /// permanently jammed off.
+    #[test]
+    fn language_with_an_entry_point_keeps_complete_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:a",
+                "a",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:helper",
+                "helper",
+                SymbolKind::Function,
+                "scripts/deploy.sh",
+                true,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(result.languages_without_entry_points.is_empty());
+        assert!(result.coverage_is_complete());
+    }
+
+    /// A language with NO entry-point model at all (SQL: declarative, no
+    /// concept of "entry" to detect) must never appear in
+    /// `languages_without_entry_points`, no matter how many of its symbols
+    /// exist or how few are entry points -- there are zero here, on purpose.
+    /// Without `language_has_entry_point_model` gating this, ANY corpus
+    /// containing one `.sql` file would degrade `coverage_is_complete`
+    /// permanently, with no fix available: a gate that always fires carries
+    /// the same information as one that never does. Proven on a probe before
+    /// this test existed: `languages_without_entry_points = ["hcl", "sql",
+    /// "systemverilog", "vue"]` on a corpus that also had a real bash gap,
+    /// which made the real gap indistinguishable from the unfixable one.
+    #[test]
+    fn language_with_no_entry_point_model_never_degrades_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:main",
+                "main",
+                SymbolKind::Function,
+                "src/lib.rs",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:migration",
+                "migration",
+                SymbolKind::Function,
+                "db/001_init.sql",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result.languages_without_entry_points.is_empty(),
+            "sql has no entry-point model and must never be named here: {:?}",
+            result.languages_without_entry_points
+        );
+        assert!(
+            result.coverage_is_complete(),
+            "a language with no entry-point model must not degrade coverage"
         );
     }
 }

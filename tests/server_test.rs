@@ -2619,6 +2619,132 @@ async fn hybrid_blast_radius_two_tier_populates_both_tiers() {
     );
 }
 
+/// nw-428 review round 4. `hybrid_blast_radius_two_tier_populates_both_tiers`
+/// (above) proves the two-tier merge works for a `repo` filter that resolves
+/// on BOTH sides; this is the exact scenario that regressed and the fix's
+/// whole point — a `repo` selector that resolves at the SERVER (real,
+/// org-wide) but NOT at the local daemon (simply not indexed here). Before
+/// nw-428 review round 3's fix, `client.query_local(...).await?` propagated
+/// the local daemon's refusal unconditionally, killing the entire two-tier
+/// response (local AND org-wide) before upstream was ever asked — this test
+/// drives that exact failure over REAL gRPC (real local daemon, real
+/// authenticated upstream server) rather than only the standalone-detector
+/// unit tests in `nestweaver-client/src/hybrid.rs`, which prove the string/
+/// tool-name matching logic but not that the `match ... Err(error) => ...`
+/// wiring in `two_tier_query` is reachable and produces a well-formed merge
+/// under real gRPC conditions.
+///
+/// Reuses the same two-repo layout as the sibling test above (server indexes
+/// `repo_a`, local indexes `repo_b`), but scopes the query to `repo_a`'s own
+/// absolute path — which only the SERVER'S index actually contains, so the
+/// LOCAL daemon's `resolve_repo_filter` fails while the SERVER'S succeeds.
+#[tokio::test]
+async fn hybrid_blast_radius_two_tier_degrades_local_when_repo_only_resolves_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[("server/main.js", "function serverimpactfn(x) { return x; }")],
+    );
+    index_repo(&server_repo, &db_server);
+
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("local/main.js", "function localimpactfn(x) { return x; }")],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+
+    let local = connect_local(&db_local).await;
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    // `repo_a`'s absolute path resolves via `resolve_repo_selector`'s
+    // exact-root-path leg — real and resolvable at the SERVER (which indexed
+    // it), absent from the LOCAL daemon's index (which only has `repo_b`).
+    let repo_a_path = server_repo.display().to_string();
+    let resp = hybrid
+        .query(
+            "blast_radius",
+            &json!({
+                "changed_files": ["server/main.js"],
+                "max_depth": 3,
+                "repo": repo_a_path,
+            }),
+        )
+        .await
+        .expect(
+            "an unresolvable-LOCALLY repo filter must still produce a two-tier response, \
+             not a hard error — the whole point of this fix",
+        );
+
+    assert_eq!(
+        resp["tier"], "two_tier",
+        "the local resolution failure must degrade-and-continue to a two-tier merge, \
+         not collapse to a bare error; got {resp}"
+    );
+
+    // LOCAL tier: degraded and disclosed, not silently empty and not a
+    // fully-populated "0 affected, safe to change" answer.
+    let local_impact = &resp["local_impact"];
+    assert_eq!(
+        local_impact["status"], "partial",
+        "the local tier could not resolve `repo` at all, so it must self-report partial, \
+         not complete; got {local_impact}"
+    );
+    assert_eq!(
+        local_impact["gate_state"], "degraded-unknown",
+        "got {local_impact}"
+    );
+    let local_notifications = local_impact["notifications"]
+        .as_array()
+        .expect("local_impact.notifications array");
+    assert!(
+        local_notifications
+            .iter()
+            .any(|n| n["descriptor"] == "repo-filter-unresolved-locally"),
+        "local_impact must name WHY it degraded; got {local_impact}"
+    );
+
+    // ORG tier: genuinely reached and populated — the property this fix
+    // exists to preserve. Before the fix, the request never left the
+    // process: `query_local`'s `Err` was `?`-propagated, so `two_tier_query`
+    // returned before upstream was ever asked.
+    assert_eq!(
+        resp["org_wide_impact"]["source_server"], "server",
+        "org_wide_impact must be attributed to the 'server' upstream; got {}",
+        resp["org_wide_impact"]
+    );
+    assert!(
+        resp["org_wide_impact"].get("status").is_none(),
+        "org_wide_impact must NOT be the 'unavailable' fallback — the server tier \
+         must actually have been reached; got {}",
+        resp["org_wide_impact"]
+    );
+    let org_changed = resp["org_wide_impact"]["results"]["changed_symbols"]
+        .as_array()
+        .expect("org_wide_impact.results.changed_symbols array");
+    assert!(
+        !org_changed.is_empty(),
+        "org_wide_impact.results must contain the server's real changed symbol — \
+         `repo_a` resolves there even though it never resolved locally; got {}",
+        resp["org_wide_impact"]
+    );
+    assert!(
+        resp["org_wide_impact"]
+            .to_string()
+            .contains("serverimpactfn"),
+        "org_wide_impact should reference the server-only 'serverimpactfn'; got {}",
+        resp["org_wide_impact"]
+    );
+}
+
 /// ATTEMPT: cross-boundary `flow_trace` continuation. The same repo is indexed
 /// into both daemons so symbol `canonical_id`s line up across them (they are
 /// URL-derived). `flow_trace_with_stitching` runs the trace locally, then sends

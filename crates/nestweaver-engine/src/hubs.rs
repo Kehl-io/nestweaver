@@ -11,6 +11,83 @@ use anyhow::{Context, Result};
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 
+/// Whether a symbol of this `kind` can legitimately be the target of a
+/// call/reference edge in the sense `hubs`/`bridges` claim to measure —
+/// "central abstractions many parts of the codebase depend on" and
+/// "architectural chokepoints", not "things the resolver happened to attach
+/// an edge to".
+///
+/// nw-308(a). Ground-truthed on the live 44-repo graph: 9 of the top 15
+/// `hubs` and 6 of 7 checked top `bridges` were artifacts, and the majority
+/// were NOT callable at all yet carried huge scores with zero real callers —
+/// `ImageSize` (`TypeAlias`, 0 callers) was the #1 bridge in the entire
+/// graph; `write_gate` (`Module`, literally `pub mod write_gate;`, 0
+/// callers); `logger`/`THEMES`/`TEST_PROJECT_ID` (`Constant`) and
+/// `prisma`/`error`/`success` (`Property`) were all credited hundreds of
+/// "callers" while never being called. In every one of these cases the
+/// resolver attributed a member-access call (`logger.info(...)`,
+/// `prisma.user.findMany(...)`) to the RECEIVER rather than to the method
+/// actually invoked — a real defect, but one this crate cannot fix: edge
+/// construction is owned by the resolver (a different crate, out of scope
+/// for this change) and this crate can only see the finished, untyped
+/// `(src, dst, confidence)` edge list `load_code_symbols_and_edges` returns —
+/// no edge-type discrimination survives that far.
+///
+/// So the fix is at the RANKING layer, and it decides the question `hubs`/
+/// `bridges` doc comments ask directly: a node kind that cannot be called
+/// does not accrue in-degree/betweenness AT ALL. This is enforced by
+/// excluding non-callable symbols from the UID→index map both modules build
+/// before counting degree/adjacency — not just from the printed results — so
+/// a phantom edge into `write_gate` cannot inflate ITS neighbors' scores
+/// either, the same way removing a node from a graph removes it as a
+/// via-point for everyone else's shortest paths.
+///
+/// This is a DENYLIST, not an allowlist, deliberately: only kinds with direct
+/// ground-truthed evidence of this failure mode are excluded, so a
+/// [`nestweaver_schema::nodes::SymbolKind`] variant this fix never
+/// considered defaults to being counted, exactly as it was before this
+/// change, rather than silently vanishing from every future ranking.
+/// `Interface`/`Trait`/`Enum` are NOT excluded: no evidence surfaced them as
+/// artifacts, and excluding them speculatively risks hiding a genuinely
+/// central trait/interface with no offsetting evidence that it is wrong to
+/// keep.
+///
+/// `Extension` is RULED ON explicitly, not left implicit: it is a Rust `impl`
+/// block (`nestweaver-parser/src/parse.rs`: `"impl" => SymbolKind::Extension`),
+/// which superficially looks like the same shape of container-declaration
+/// phantom as `Module`/`write_gate`. It is kept CALLABLE (not denylisted)
+/// because this codebase already draws that exact line three separate times,
+/// independently of this fix: `nestweaver-resolver/src/resolve.rs`'s MRO map
+/// (`nw-330`: "an `impl Trait for Type` block IS the symbol... it used to be
+/// `SymbolKind::Class`"), `dead_code.rs`'s unreachable-class suppression
+/// (`SymbolKind::Class | SymbolKind::Extension`, "it used to BE
+/// `SymbolKind::Class`"), and `tools.rs`'s `flow` handler's class-to-methods
+/// expansion (same pairing, same reasoning). All three treat `Extension` as
+/// `Class` under a different name — a type-level container whose MEMBERS
+/// hold the calls, resolved the same way a class's methods are — not a
+/// namespace-level container like `Module`. Since `Class` is kept callable
+/// (and ground-truthed genuine: `GraphStore`), consistency requires `Extension`
+/// stay callable too; denylisting it would contradict three existing,
+/// independent architectural decisions for no offsetting evidence — the
+/// reviewer indexed an impl-block-heavy repo and found no `Extension`
+/// phantom in the top 20.
+///
+/// A useful SIDE EFFECT, not this function's job: nw-308(b)'s name-collision
+/// artifacts that happen to be `require`-bound local aliases (`const parse =
+/// require('url-parse')`, `knex`) are typically parsed as `Constant` or
+/// `Variable` and are suppressed by this filter too. That does not fix the
+/// collision — the mis-resolved edges are still in the graph, merely no
+/// longer surfaced at the top of these two rankings — so it is reported as
+/// an observed side effect, not claimed as (b)'s fix. Method-name collisions
+/// on genuinely callable kinds (`contains`, `len`) are unaffected and remain
+/// open.
+pub(crate) fn is_callable_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "Module" | "TypeAlias" | "Constant" | "Property" | "Variable"
+    )
+}
+
 /// A node identified as a hub in the code graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubNode {
@@ -91,10 +168,16 @@ pub fn find_hub_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<HubNod
         });
     }
 
-    // Build UID -> index mapping.
+    // Build UID -> index mapping. nw-308(a): restricted to CALLABLE kinds, so
+    // an edge naming a Module/TypeAlias/Constant/Property/Variable endpoint
+    // fails this lookup and is dropped rather than counted — for BOTH
+    // endpoints, not just the printed results. A non-callable node therefore
+    // cannot accrue in/out degree itself, and cannot inflate a neighbor's
+    // degree either.
     let uid_to_idx: HashMap<&str, usize> = symbols
         .iter()
         .enumerate()
+        .filter(|(_, s)| is_callable_kind(&s.kind))
         .map(|(i, s)| (s.uid.as_str(), i))
         .collect();
 
@@ -269,6 +352,13 @@ mod tests {
             type_info: None,
             framework_hint: None,
             canonical_id: None,
+        }
+    }
+
+    fn make_symbol_with_kind(uid: &str, name: &str, file_path: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            kind,
+            ..make_symbol(uid, name, file_path)
         }
     }
 
@@ -532,5 +622,207 @@ mod tests {
         assert_eq!(center.in_degree, 1);
         assert_eq!(center.out_degree, 1);
         assert_eq!(center.total_degree, 2);
+    }
+
+    /// nw-308(a). A `Module` node — the shape of the real `write_gate` defect
+    /// (`pub mod write_gate;`, 0 real callers, huge betweenness/degree from
+    /// misattributed edges) — must not rank as a hub no matter how many
+    /// edges point at it, and must not inflate a caller's own degree beyond
+    /// what it would have anyway.
+    #[test]
+    fn a_non_callable_kind_cannot_be_a_hub_regardless_of_raw_degree() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "phantom",
+                "write_gate",
+                "src/write_gate.rs",
+                SymbolKind::Module,
+            ))
+            .unwrap();
+        // A modest genuine function, deliberately given FEWER raw edges than
+        // the phantom so a degree-only ranking would still rank the phantom
+        // first if the kind filter did nothing.
+        store
+            .insert_symbol(&make_symbol("real", "GraphStore", "src/store.rs"))
+            .unwrap();
+        for i in 0..20 {
+            let caller = format!("caller{i}");
+            store
+                .insert_symbol(&make_symbol(&caller, &format!("fn_{i}"), "src/caller.rs"))
+                .unwrap();
+            // 20 callers "into" the phantom module — the misattribution shape.
+            store.insert_edge(&make_edge(&caller, "phantom")).unwrap();
+        }
+        store.insert_edge(&make_edge("caller0", "real")).unwrap();
+
+        // `top_n` is deliberately exactly the count of symbols with a REAL
+        // (non-dropped) edge, so the assertion below cannot be satisfied by
+        // hubs' documented zero-degree padding (asking for more slots than
+        // there are candidates pads the tail with insertion-order zero-degree
+        // symbols, and `phantom` — inserted first — would legitimately win
+        // that unrelated tie-break). `candidate_total` pins the same claim
+        // from the other side: only `real` and `caller0` ever accrued degree.
+        let found = find_hub_nodes_bounded(&store, 2).unwrap();
+        assert_eq!(
+            found.candidate_total, 2,
+            "the phantom and its 20 dropped-edge callers must not be candidates"
+        );
+        assert!(
+            !found.hubs.iter().any(|h| h.uid == "phantom"),
+            "a Module node must never appear as a hub: {:?}",
+            found.hubs.iter().map(|h| &h.uid).collect::<Vec<_>>()
+        );
+        assert!(
+            found.hubs.iter().any(|h| h.uid == "real"),
+            "a genuine Function must still be found"
+        );
+        // The 20 edges into the phantom must not have inflated any caller's
+        // own degree either — each caller made exactly one (dropped) call.
+        let caller0 = found.hubs.iter().find(|h| h.uid == "caller0").unwrap();
+        assert_eq!(
+            caller0.out_degree, 1,
+            "caller0's real edge to `real` must count, but its edge to the \
+             phantom module must not"
+        );
+
+        // COUNTERWEIGHT: invert the kind to something callable and the SAME
+        // topology now DOES surface it as the top hub — proving the filter
+        // keys on kind, not on some other property of the fixture (name,
+        // file path, edge count).
+        let store2 = GraphStore::in_memory().unwrap();
+        store2
+            .insert_symbol(&make_symbol(
+                "not_phantom",
+                "write_gate",
+                "src/write_gate.rs",
+            ))
+            .unwrap();
+        for i in 0..20 {
+            let caller = format!("caller{i}");
+            store2
+                .insert_symbol(&make_symbol(&caller, &format!("fn_{i}"), "src/caller.rs"))
+                .unwrap();
+            store2
+                .insert_edge(&make_edge(&caller, "not_phantom"))
+                .unwrap();
+        }
+        let found2 = find_hub_nodes_bounded(&store2, 5).unwrap();
+        assert_eq!(
+            found2.hubs.first().map(|h| h.uid.as_str()),
+            Some("not_phantom"),
+            "the identical topology over a callable kind must rank first"
+        );
+    }
+}
+
+/// nw-308 FIX 1(b), a separate module so it reads as its own enforcement
+/// mechanism rather than one more case in `tests`.
+///
+/// `is_callable_kind` matches on `&str` rather than on
+/// [`nestweaver_schema::nodes::SymbolKind`] because `Symbol.kind` is already
+/// stringified at the store layer before it ever reaches this crate — there
+/// is no enum to match on without a larger refactor this fix does not make.
+/// That is a real gap: a THIRTEENTH `SymbolKind` variant would silently
+/// classify as "callable" (the denylist's default) with no compile error and
+/// no failing test, unless something is checked against the real enum.
+///
+/// `expected_classification` closes it the same way nw-334's G1 closed the
+/// diagnostic-remedy class, and the same way `language_has_entry_point_model`
+/// closed it a second time: an EXHAUSTIVE match with no `_` arm over the real
+/// enum. Add a 13th `SymbolKind` variant and this match fails to COMPILE
+/// until a human decides which side of the line it falls on — the test
+/// below then asserts that decision agrees with what `is_callable_kind`
+/// actually does at runtime, so the two cannot drift apart silently either.
+#[cfg(test)]
+mod is_callable_kind_classification_tests {
+    use nestweaver_schema::nodes::SymbolKind;
+
+    use super::is_callable_kind;
+
+    /// The exhaustive match. No wildcard arm — see the module doc comment.
+    fn expected_classification(kind: SymbolKind) -> bool {
+        match kind {
+            // Callable: see `is_callable_kind`'s doc comment for
+            // Function/Method/Class/Enum, and its `Extension` note (ruled
+            // callable — treated as `Class` under a different name by
+            // resolve.rs's MRO map, dead_code.rs's suppression, and tools.rs's
+            // `flow` expansion, all independently of this fix). Interface/
+            // Trait: no evidence either way; kept callable rather than
+            // denylisted speculatively.
+            SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Extension
+            | SymbolKind::Interface
+            | SymbolKind::Trait => true,
+            // Denylisted: containers/bindings, not call targets. See
+            // `is_callable_kind`'s doc comment for the ground-truthed
+            // evidence per kind.
+            SymbolKind::Module
+            | SymbolKind::TypeAlias
+            | SymbolKind::Constant
+            | SymbolKind::Property
+            | SymbolKind::Variable => false,
+        }
+    }
+
+    /// Every `SymbolKind` variant, hand-listed because the enum has no
+    /// `ALL` constant (unlike `EntryPointKind::ALL`). This list is NOT
+    /// compile-enforced to stay complete — `expected_classification`'s
+    /// exhaustive match is the enforcement; a variant missing from THIS
+    /// list only fails to be exercised, whereas a variant missing from
+    /// `expected_classification`'s match fails to compile at all. Both
+    /// exist because either alone is incomplete: the match alone could
+    /// still drift from the runtime `&str` classification, and this list
+    /// alone would let an unlisted variant pass by never being asked about.
+    const ALL_KINDS: &[SymbolKind] = &[
+        SymbolKind::Function,
+        SymbolKind::Class,
+        SymbolKind::Method,
+        SymbolKind::Interface,
+        SymbolKind::Trait,
+        SymbolKind::Enum,
+        SymbolKind::Module,
+        SymbolKind::Extension,
+        SymbolKind::Constant,
+        SymbolKind::Property,
+        SymbolKind::TypeAlias,
+        SymbolKind::Variable,
+    ];
+
+    #[test]
+    fn every_symbol_kind_is_explicitly_classified() {
+        assert_eq!(
+            ALL_KINDS.len(),
+            12,
+            "a SymbolKind variant was added or removed — update ALL_KINDS \
+             (this list) AND expected_classification's exhaustive match \
+             (compile-enforced already; this assertion just makes the drift \
+             visible in the failure message)"
+        );
+        for &kind in ALL_KINDS {
+            assert_eq!(
+                is_callable_kind(kind.as_str()),
+                expected_classification(kind),
+                "is_callable_kind({:?}) disagrees with this test's explicit, \
+                 exhaustively-matched classification for {kind:?} — the \
+                 runtime denylist in `is_callable_kind` and the compile-time \
+                 match in `expected_classification` must agree",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT: this test module cannot be trivially satisfied by
+    /// `expected_classification` returning `true` for everything (which
+    /// would make `is_callable_kind` always agree with a match that never
+    /// disagrees with the default). Pin at least one denylisted kind's
+    /// expected value directly.
+    #[test]
+    fn a_denylisted_kind_is_expected_non_callable_not_vacuously_true() {
+        assert!(!expected_classification(SymbolKind::Module));
+        assert!(!is_callable_kind(SymbolKind::Module.as_str()));
     }
 }

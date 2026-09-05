@@ -54,9 +54,15 @@ fn publication_rebuild_rejects_no_embed_before_config_or_operation_setup() {
     let db = dir.path().join("brain.lbug");
     let missing_config = dir.path().join("missing.toml");
 
+    // nw-430 FIX 3 (review follow-up): `--no-embed` was demoted from a
+    // `global = true` `Cli` flag to a field declared locally on only the
+    // handful of variants with something to honor it — `PublicationCommands::
+    // Rebuild` is one of them (to keep this refusal working), so the flag
+    // must now appear AFTER `rebuild`, where clap parses that variant's own
+    // arguments, not before `publication` where the removed global used to
+    // live.
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["publication", "rebuild", "--config"])
+        .args(["publication", "rebuild", "--no-embed", "--config"])
         .arg(&missing_config)
         .arg("--db")
         .arg(&db)
@@ -69,16 +75,20 @@ fn publication_rebuild_rejects_no_embed_before_config_or_operation_setup() {
     assert!(!db.exists());
     assert!(!nestweaver_engine::publication::default_publication_root(&db).exists());
 
-    // The global flag is irrelevant to read-only publication commands. This
-    // guards against attaching the validation to the wrong match arm.
+    // `PublicationCommands::Status` never had (and still does not have) a
+    // `no_embed` field of its own — it was only ever reachable there via the
+    // now-removed global flag. So the assertion this guarded ("read-only
+    // publication commands are unaffected") is now a STRONGER, structural
+    // one: `--no-embed` is not a recognized argument on `publication status`
+    // at all, refused by clap itself rather than accepted-and-ignored.
     let root = dir.path().join("empty-publications");
     std::fs::create_dir_all(&root).unwrap();
     nestweaver_cmd()
-        .arg("--no-embed")
-        .args(["publication", "status", "--root"])
+        .args(["publication", "status", "--no-embed", "--root"])
         .arg(&root)
         .assert()
-        .success();
+        .code(64)
+        .stderr(contains("unexpected argument '--no-embed'"));
 }
 
 #[test]
@@ -3242,6 +3252,259 @@ fn cli_limit_help_states_the_default_the_code_actually_applies() {
         limit_help.contains("default 50") && limit_help.contains("1-1000"),
         "`impact --limit` help must state its default and range: {limit_help}"
     );
+}
+
+/// nw-431 / nw-217b: `search --limit` carried no `value_parser`, so it
+/// enforced NEITHER of `brain_search`'s declared bounds (schema:
+/// `minimum: 1, maximum: 1000`) -- `--limit 0` returned an empty result set
+/// at exit 0, indistinguishable from "no matches", and `--limit 1001`
+/// silently returned extra rows. Both ends are now a clap usage error at
+/// exit 64, matching `blast-radius --depth`'s shape, and the help states the
+/// bound and names the schema it matches.
+#[test]
+fn search_limit_enforces_the_brain_search_schema_bound() {
+    nestweaver_cmd()
+        .args(["search", "anything", "--limit", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["search", "anything", "--limit", "1001"])
+        .assert()
+        .code(64)
+        .stderr(contains("1001 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("1-1000"))
+        .stdout(contains("brain_search"));
+}
+
+/// nw-430 FIX 3 (review follow-up). `--no-embed` used to be a `global = true`
+/// `Cli` flag, accepted (and silently ignored) by EVERY subcommand — `search`,
+/// `hubs`, `bridges`, `blast-radius`, `dead-code`, `flow-trace`, `repo-map`,
+/// `stale-check`, `daemon *`, all of them. It is now a field declared LOCALLY
+/// on only the five variants with something to honor it (`project-context`,
+/// `investigate`, `context`, `brain context`, `publication rebuild`), so
+/// every other command refuses it as an UNKNOWN ARGUMENT at clap's own parse
+/// time — the structural "absent from this command" branch of nw-430's own
+/// Definition of Done, rather than a runtime check per command that could
+/// bitrot. Because the flag is no longer global, it must now appear AFTER
+/// the subcommand (clap does not recognize a subcommand's own flags before
+/// the subcommand name), which is also the position a real caller would put
+/// it in. Same clap parse-error exit code (64) either way — `EXIT_USAGE`,
+/// the code every clap-rejected value in this binary already uses.
+#[test]
+fn search_rejects_no_embed_since_it_has_no_semantic_leg() {
+    nestweaver_cmd()
+        .args(["search", "anything", "--no-embed"])
+        .assert()
+        .code(64)
+        .stderr(contains("unexpected argument '--no-embed'"));
+}
+
+/// nw-430 FIX 3 sweep: a sample of the OTHER commands that used to silently
+/// accept-and-ignore `--no-embed` under the old global flag (verified
+/// byte-identical output with and without it in the review that filed this
+/// follow-up) now refuse it the same structural way `search` does above.
+/// `daemon status` stands in for the whole `daemon` subtree — `daemon start
+/// --no-embed` appeared throughout this codebase's OWN daemon-startup test
+/// helpers (as an unrelated, always-inert flag), which is exactly the
+/// "accepted everywhere, honored nowhere" shape this fix removes.
+#[test]
+fn other_commands_no_longer_accept_no_embed_at_all() {
+    for args in [
+        ["hubs", "--no-embed"].as_slice(),
+        ["bridges", "--no-embed"].as_slice(),
+        ["daemon", "--no-embed"].as_slice(),
+    ] {
+        nestweaver_cmd()
+            .args(args)
+            .assert()
+            .code(64)
+            .stderr(contains("unexpected argument '--no-embed'"));
+    }
+}
+
+/// nw-430's twin refusal, for `context` without `--feature`. `context
+/// --feature <name> --config <file>` is the one shape of `context` that
+/// DOES reach a semantic leg (it calls the real `brain_context` tool) and is
+/// deliberately NOT covered by this refusal — see the wiring in
+/// `Commands::Context`'s feature-mode arm. Unlike `search`, `--no-embed` is
+/// still a real (locally-declared) field on this variant — feature-mode
+/// needs it — so this stays a RUNTIME refusal, not a parse-time one; see the
+/// comment on this exact `if` in `src/main.rs` for why a single clap variant
+/// serving two modes cannot be split at parse time.
+#[test]
+fn context_seed_mode_rejects_no_embed_since_it_has_no_semantic_leg() {
+    nestweaver_cmd()
+        .args(["context", "anything", "--no-embed"])
+        .assert()
+        .code(64)
+        .stderr(contains("no BM25 or semantic leg"));
+
+    nestweaver_cmd()
+        .args(["context", "anything", "--no-embed", "--json"])
+        .assert()
+        .code(64)
+        .stdout(contains("\"error\":\"invalid argument\""))
+        .stdout(contains("\"argument\":\"--no-embed\""));
+}
+
+/// nw-430. Counterpart to the two refusals above: `project-context` and
+/// `investigate` DO have a genuine semantic leg (via the daemon's loaded
+/// embed model — see nw-316's Part A finding that the direct/no-daemon route
+/// never has one), so `--no-embed` must be ACCEPTED on them, not refused.
+/// This only proves the flag is not rejected at the CLI-parsing/dispatch
+/// layer; the actual semantic-disabling behaviour is proven with a real
+/// embed-model fixture in `crates/nestweaver-mcp/src/tools.rs`
+/// (`project_context_no_embed_disables_semantic_without_false_degradation`,
+/// `investigate_no_embed_disables_semantic_ranking`), and the field crossing
+/// the proto wire is pinned directly (without any model) in
+/// `crates/nestweaver-federation/src/dispatch.rs` and
+/// `crates/nestweaver-daemon/src/server.rs` — this
+/// `NESTWEAVER_NO_DAEMON=1` harness never reaches the daemon at all, so it
+/// cannot exercise that seam.
+#[test]
+fn project_context_and_investigate_still_accept_no_embed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    nestweaver_cmd()
+        .args(["project-context", "nonexistent-project", "--no-embed"])
+        .args(["--db", &db_path.display().to_string()])
+        .assert()
+        .code(2) // NOT_FOUND, never EXIT_USAGE (64) — the flag itself is accepted.
+        .stderr(contains("not found"));
+
+    let investigate_output = nestweaver_cmd()
+        .args(["investigate", "anything", "--no-embed"])
+        .args(["--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    assert_ne!(
+        investigate_output.status.code(),
+        Some(64),
+        "--no-embed must not be refused on investigate (it has a genuine semantic leg via the daemon): {}",
+        String::from_utf8_lossy(&investigate_output.stderr)
+    );
+}
+
+/// nw-432 / nw-217b: `blast-radius --limit` help advertised "(1-10000)" and
+/// enforced exactly that range, while the MCP `blast_radius` schema caps
+/// `limit` at 1000 (`RESULT_LIMIT_MAX`) -- every value in 1001-10000 parsed
+/// here and then failed at exit 1 with a raw JSON-Schema keyword error the
+/// moment a daemon validated it. Help and enforcement now state the same
+/// number the schema does, and the refusal is a clap usage error at exit 64.
+#[test]
+fn blast_radius_limit_enforces_the_blast_radius_schema_bound() {
+    nestweaver_cmd()
+        .args(["blast-radius", "--files", "src/lib.rs", "--limit", "1001"])
+        .assert()
+        .code(64)
+        .stderr(contains("1001 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["blast-radius", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("1-1000"))
+        .stdout(contains("blast_radius"))
+        .stdout(contains("1-10000").not());
+}
+
+/// nw-397: `repo-map --token-budget` had no `value_parser` at all --
+/// `--token-budget 0` returned an empty map at exit 0 (indistinguishable
+/// from an unindexed repo) and there was no upper ceiling either. Bounded to
+/// 1..=16000, the same range every other `--token-budget` flag in this
+/// binary (`context`, `investigate`, `investigate-hydrate`,
+/// `project-context`) already enforces.
+#[test]
+fn repo_map_token_budget_enforces_the_codebase_wide_range() {
+    nestweaver_cmd()
+        .args(["repo-map", "--token-budget", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=16000"));
+
+    nestweaver_cmd()
+        .args(["repo-map", "--token-budget", "16001"])
+        .assert()
+        .code(64)
+        .stderr(contains("16001 is not in 1..=16000"));
+}
+
+/// nw-217b's third hole (2026-09-04): the bounds sweep's schema-key lookup
+/// compared the CLI's kebab-case long-flag name against the JSON schema's
+/// snake_case property key with exact string equality, so `--max-suggestions`
+/// never matched `max_suggestions` and this flag was never probed despite
+/// having no bound at all -- `--max-suggestions 0` and `--max-suggestions 51`
+/// both parsed while the MCP `brain_broken_links` schema declares
+/// `minimum: 1, maximum: 50`.
+#[test]
+fn broken_links_max_suggestions_enforces_the_brain_broken_links_schema_bound() {
+    nestweaver_cmd()
+        .args(["brain", "broken-links", "--max-suggestions", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=50"));
+
+    nestweaver_cmd()
+        .args(["brain", "broken-links", "--max-suggestions", "51"])
+        .assert()
+        .code(64)
+        .stderr(contains("51 is not in 1..=50"));
+}
+
+/// The same hole, the same day, a different command: `--top-tags-limit`
+/// never matched the MCP `brain_doc_stats` schema's `top_tags_limit`
+/// property for the same kebab/snake reason, and had no bound at all
+/// (schema declares `minimum: 1, maximum: 1000`).
+#[test]
+fn doc_stats_top_tags_limit_enforces_the_brain_doc_stats_schema_bound() {
+    nestweaver_cmd()
+        .args(["brain", "doc-stats", "--top-tags-limit", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["brain", "doc-stats", "--top-tags-limit", "1001"])
+        .assert()
+        .code(64)
+        .stderr(contains("1001 is not in 1..=1000"));
+}
+
+/// nw-379: an empty query used to mean "match everything" on `search` and
+/// `investigate` while `regex-search`/`count-patterns` already refused it BY
+/// NAME -- the project had already decided an empty query is invalid on two
+/// commands and not the other two. All four now agree at exit 64.
+#[test]
+fn an_empty_query_or_pattern_is_a_usage_error_on_every_swept_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    for args in [
+        vec!["search", ""],
+        vec!["investigate", ""],
+        vec!["regex-search", ""],
+        vec!["count-patterns", ""],
+    ] {
+        nestweaver_cmd()
+            .args(&args)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(64)
+            .stderr(contains("empty").and(contains("not allowed")));
+    }
 }
 
 /// The help text used to advertise "orphaned daemon state directories" on
@@ -7786,6 +8049,466 @@ fn instance_merge_says_nothing_when_no_bypass_was_granted() {
         .output();
 }
 
+/// nw-359 leg (1) / nw-396 leg (1). The explicit `daemon start` handler
+/// (`src/main.rs`'s `DaemonAction::Start` arm) built and spawned its child
+/// directly and never consulted the `db_wal_unreadable` guard client
+/// autostart already uses — so `daemon start --db <corrupt-wal>` printed
+/// `Child PID: ...` and spawned a daemon against the exact state the
+/// corruption runbook's own step 0 says to stop everything against, then
+/// failed with a spawn-shaped message that named nothing about the database.
+/// Fixing leg (1) — refusing BEFORE any child exists — also closes nw-396 leg
+/// (1) for this route: with no child ever spawned, there is no
+/// "did not become healthy" message to improve, because it never happens.
+#[test]
+fn daemon_start_refuses_an_unreadable_wal_before_spawning_a_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("start")
+        // A direct daemon-lifecycle subcommand, not a query/write route
+        // NESTWEAVER_NO_DAEMON could redirect — pinned anyway so the
+        // suite-wide routing lint (`every_cli_invocation_pins_its_daemon_routing`)
+        // can see that explicitly, same as every other --db invocation.
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_ne!(output.status.code(), Some(0), "{combined}");
+    assert!(
+        !combined.contains("Child PID"),
+        "the ORIGINAL bug: a daemon child was spawned before the refusal ran: \
+         {combined}"
+    );
+    assert!(
+        !combined.contains("did not become healthy")
+            && !combined.contains("exited before becoming healthy"),
+        "must refuse before spawning, not report a spawn that was never \
+         allowed to happen: {combined}"
+    );
+    assert!(
+        combined.contains("db_wal_corrupt"),
+        "must carry the corrupt-WAL classification so the CLI renders the \
+         runbook rather than a transport/spawn error: {combined}"
+    );
+
+    // Nothing must be left running or registered — a refusal before spawn
+    // means there is nothing to clean up.
+    let status = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("status")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .output()
+        .unwrap();
+    let status_combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status_combined.contains("Daemon is not running."),
+        "no daemon may have been left running: {status_combined}"
+    );
+}
+
+/// nw-396 leg (2). Four states that used to be byte-identical at the CLI —
+/// `daemon status` never opened or stat'd `--db` at all, so a typo'd path was
+/// indistinguishable from a healthy, merely-stopped database.
+#[test]
+fn daemon_status_distinguishes_an_unusable_db_from_a_stopped_daemon() {
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+    let run_status = |db: &std::path::Path| -> (bool, String) {
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args(["daemon", "--db"])
+            .arg(db)
+            .arg("status")
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    // Corrupt WAL: actionable, must fail, must name the remedy.
+    let dir = tempfile::tempdir().unwrap();
+    let corrupt = dir.path().join("corrupt.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&corrupt).unwrap();
+    }
+    std::fs::write(dir.path().join("corrupt.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("corrupt.lbug.shadow"));
+    let (ok, out) = run_status(&corrupt);
+    assert!(!ok, "a corrupt WAL is an actionable defect: {out}");
+    assert!(out.contains("unreadable write-ahead log"), "{out}");
+    assert!(out.contains("nestweaver repair --db"), "{out}");
+
+    // Directory: actionable, must fail, and (review follow-up, FIX 2) must
+    // name a remedy like the other three actionable arms do.
+    let as_dir = dir.path().join("a-directory.lbug");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    let (ok, out) = run_status(&as_dir);
+    assert!(!ok, "a directory is not a database: {out}");
+    assert!(out.contains("is a directory"), "{out}");
+    assert!(
+        out.contains("nestweaver index --repo"),
+        "the directory refusal must name a remedy, not just the problem: {out}"
+    );
+
+    // 0-byte file: actionable, must fail.
+    let zero_byte = dir.path().join("zero.lbug");
+    std::fs::write(&zero_byte, b"").unwrap();
+    let (ok, out) = run_status(&zero_byte);
+    assert!(!ok, "a 0-byte file has never been indexed: {out}");
+    assert!(out.contains("0 bytes"), "{out}");
+
+    // Nonexistent path: NOT an error — merely worth a note distinguishing it
+    // from a healthy, stopped daemon at a real path.
+    let missing = dir.path().join("does-not-exist.lbug");
+    let (ok, out) = run_status(&missing);
+    assert!(ok, "a fresh, never-indexed path is not a defect: {out}");
+    assert!(out.contains("does not exist yet"), "{out}");
+
+    // The counterweight: a genuinely healthy, merely-stopped database must
+    // keep the plain, unembellished sentence with no defect note at all —
+    // otherwise every state above could pass by making every `daemon status`
+    // output "actionable", including a perfectly fine one.
+    let healthy = dir.path().join("healthy.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&healthy).unwrap();
+    }
+    let (ok, out) = run_status(&healthy);
+    assert!(ok, "{out}");
+    assert!(out.contains("Daemon is not running."), "{out}");
+    for marker in [
+        "is a directory",
+        "0 bytes",
+        "unreadable write-ahead log",
+        "does not exist yet",
+    ] {
+        assert!(
+            !out.contains(marker),
+            "a healthy, stopped database must not carry any defect note ({marker}): {out}"
+        );
+    }
+}
+
+/// nw-368. `nestweaver_store::reclaim_orphaned_tantivy_staging` existed but
+/// nothing in the CLI ever called it: three separate recovery routes tried
+/// against a live repro (a full `reindex-search`, `repair`, a daemon
+/// start/stop cycle) all left an orphaned migration staging directory
+/// behind. This test does not re-derive the store's own crash-reproduction
+/// (that lives in `nestweaver-store`'s own suite); it proves the WIRING —
+/// `repair` finds and reports a directory in the exact recognized shape
+/// (the staging prefix, containing `meta.json`).
+#[test]
+fn repair_reclaims_an_orphaned_tantivy_migration_staging_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    // The reclaim takes a recovery lock under `reindex_lock_root()`, which
+    // honours `XDG_STATE_HOME` — isolate it from the operator's real
+    // `~/.local/state/nestweaver` rather than leaving a lock file there.
+    let state = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("scratch.lbug.tantivy")).unwrap();
+    let staging = dir.path().join(format!(
+        "{}orphan",
+        nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX
+    ));
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("meta.json"), b"{}").unwrap();
+
+    // --dry-run must find it, report it, and not touch it.
+    let dry = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .arg("--dry-run")
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        staging.exists(),
+        "--dry-run must never delete anything: {dry_out}"
+    );
+    assert!(dry_out.contains("would be reclaimed"), "{dry_out}");
+    assert!(dry_out.contains("orphan"), "{dry_out}");
+
+    // The real run reclaims it and says so.
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !staging.exists(),
+        "the orphaned staging directory must be removed: {combined}"
+    );
+    assert!(
+        combined.contains("Reclaimed 1 orphaned Tantivy migration staging director"),
+        "{combined}"
+    );
+}
+
+/// The counterweight: a database with no staging directory at all must not
+/// mention Tantivy staging reclaim anywhere in `repair`'s output — otherwise
+/// the test above could pass on a build that always prints the sentence.
+#[test]
+fn repair_says_nothing_about_tantivy_staging_when_there_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Tantivy migration staging"),
+        "{combined}"
+    );
+    assert!(!combined.contains("Reclaimed"), "{combined}");
+}
+
+/// Review follow-up (FIX 5). `--dry-run` used to filter only by name-prefix
+/// and `is_dir()`, while the real reclaim additionally requires
+/// `looks_like_tantivy_staging` (empty, or containing `meta.json`) — so a
+/// directory that merely shares the staging prefix by coincidence (a
+/// person's own directory, not a crash artifact) would show as "would be
+/// reclaimed" in the preview and then survive a real run untouched. This
+/// proves the preview now applies the same narrowing.
+#[test]
+fn repair_dry_run_does_not_overstate_a_prefix_coincidence_as_reclaimable() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("scratch.lbug.tantivy")).unwrap();
+    // Shares the exact staging prefix, but is neither empty nor carries a
+    // `meta.json` marker — a coincidence, not migration residue.
+    let coincidence = dir.path().join(format!(
+        "{}not-a-migration",
+        nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX
+    ));
+    std::fs::create_dir_all(&coincidence).unwrap();
+    std::fs::write(coincidence.join("my_own_file.txt"), b"do not touch").unwrap();
+
+    let dry = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .arg("--dry-run")
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        !dry_out.contains("would be reclaimed"),
+        "a prefix coincidence must not be previewed as reclaimable: {dry_out}"
+    );
+
+    // Confirm the real path agrees: it must ALSO refuse to touch it.
+    let real = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    let real_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&real.stdout),
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        coincidence.exists(),
+        "the real run must agree with the preview and leave it alone: {real_out}"
+    );
+    assert!(!real_out.contains("Reclaimed"), "{real_out}");
+}
+
+/// nw-401. `save_clusters` writes both the canonical `<db>.clusters.json` and
+/// a resolution-keyed `<db>.clusters.<resolution>.json`, and nothing in the
+/// tree pruned the keyed copies: one accumulates per distinct `--resolution`
+/// a caller has ever used, forever. This proves `repair` reclaims every keyed
+/// sidecar EXCEPT the one matching the canonical file's current resolution,
+/// and never touches the canonical file itself.
+#[test]
+fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let stale = nestweaver_engine::ClusteringOutput {
+        resolution: 0.5,
+        modularity: 0.42,
+        communities: vec![nestweaver_engine::CommunityInfo {
+            id: 1,
+            name: "stale".to_string(),
+            cohesion: 0.9,
+            member_count: 3,
+            members: vec![],
+            key_files: vec![],
+        }],
+    };
+    nestweaver_engine::save_clusters(&db, &stale).unwrap();
+
+    let current = nestweaver_engine::ClusteringOutput {
+        resolution: 5.0,
+        modularity: 0.9,
+        communities: vec![nestweaver_engine::CommunityInfo {
+            id: 1,
+            name: "current".to_string(),
+            cohesion: 0.3,
+            member_count: 9,
+            members: vec![],
+            key_files: vec![],
+        }],
+    };
+    nestweaver_engine::save_clusters(&db, &current).unwrap();
+
+    let canonical_path = dir.path().join("scratch.lbug.clusters.json");
+    let stale_path = nestweaver_engine::sidecar_path_for_resolution(&db, 0.5);
+    let current_path = nestweaver_engine::sidecar_path_for_resolution(&db, 5.0);
+    assert!(canonical_path.exists(), "precondition");
+    assert!(stale_path.exists(), "precondition");
+    assert!(current_path.exists(), "precondition");
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !stale_path.exists(),
+        "the stale (0.5) keyed sidecar must be reclaimed: {combined}"
+    );
+    assert!(
+        current_path.exists(),
+        "the CURRENT (5.0) keyed sidecar must survive — it matches the \
+         canonical file's resolution: {combined}"
+    );
+    assert!(
+        canonical_path.exists(),
+        "the canonical sidecar itself must never be touched: {combined}"
+    );
+    assert!(
+        combined.contains("Reclaimed 1 orphaned resolution-keyed cluster sidecar"),
+        "{combined}"
+    );
+
+    // The canonical (last-writer-wins) and pinned-current loads must both
+    // still work after reclaim.
+    let canonical = nestweaver_engine::load_clusters(&db).unwrap().unwrap();
+    assert_eq!(canonical.communities[0].name, "current");
+    let pinned = nestweaver_engine::load_clusters_for_resolution(&db, 5.0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pinned.communities[0].name, "current");
+}
+
+/// The counterweight: a database with only ONE resolution ever computed must
+/// not have `repair` remove anything — the keyed sidecar for the only
+/// (therefore current) resolution must survive, and `repair` must say
+/// nothing about cluster sidecar reclaim at all.
+#[test]
+fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let only = nestweaver_engine::ClusteringOutput {
+        resolution: 1.0,
+        modularity: 0.5,
+        communities: vec![],
+    };
+    nestweaver_engine::save_clusters(&db, &only).unwrap();
+    let only_path = nestweaver_engine::sidecar_path_for_resolution(&db, 1.0);
+    assert!(only_path.exists(), "precondition");
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        only_path.exists(),
+        "the only resolution ever computed must survive: {combined}"
+    );
+    assert!(!combined.contains("cluster sidecar"), "{combined}");
+}
+
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
 /// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
 /// preserved this case as a SEMANTIC refusal. That reasoning stands and the
@@ -7797,7 +8520,12 @@ fn instance_merge_says_nothing_when_no_bypass_was_granted() {
 /// daemon's own good sentence arrived as a `tonic::Status` wrapped in
 /// `.context("export_graph RPC failed")`, and `into_diagnostic` had no arm for
 /// it — so it fell to `CliDiagnostic::General` and printed the transport's
-/// words instead of the condition's.
+/// words instead of the condition's. Measured 2026-09-04: this held for
+/// `msgpack` (a named diagnostic already, but at exit 1) while `cypher` and
+/// `mermaid` still fell through to the raw RPC error — the same refusal, two
+/// different shapes depending on which code-only format asked. All three now
+/// get the same named diagnostic, at the same exit code `msgpack` already
+/// used.
 #[test]
 fn an_unsupported_format_scope_pair_is_named_not_relayed() {
     let dir = tempfile::tempdir().unwrap();
@@ -7806,35 +8534,41 @@ fn an_unsupported_format_scope_pair_is_named_not_relayed() {
         let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
     }
 
-    let output = nestweaver_cmd()
-        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
-        .arg(&db)
-        .output()
-        .unwrap();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // All three code-only formats must be named identically -- `msgpack` was
+    // already fixed; `cypher` and `mermaid` are the divergence this test now
+    // closes.
+    for format in ["msgpack", "cypher", "mermaid"] {
+        let output = nestweaver_cmd()
+            .args(["export", "--format", format, "--scope", "vault", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    assert!(
-        !combined.contains("RPC failed") && !combined.contains("invalid argument"),
-        "the transport's words are not this condition's words: {combined}"
-    );
-    assert!(
-        combined.contains("export_scope_unsupported"),
-        "an unsupported COMBINATION must be a named condition: {combined}"
-    );
-    assert!(
-        combined.contains("graphml"),
-        "and the remedy must name a format that DOES satisfy --scope vault, or \
-         it is a refusal with no next step: {combined}"
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "semantic refusal, per d565547f — not a usage error: {combined}"
-    );
+        assert!(
+            !combined.contains("RPC failed") && !combined.contains("invalid argument"),
+            "the transport's words are not this condition's words ({format}): {combined}"
+        );
+        assert!(
+            combined.contains("export_scope_unsupported"),
+            "an unsupported COMBINATION must be a named condition ({format}): {combined}"
+        );
+        assert!(
+            combined.contains("graphml"),
+            "and the remedy must name a format that DOES satisfy --scope vault, or \
+             it is a refusal with no next step ({format}): {combined}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "semantic refusal of a correctly-spelled combination, per d565547f \
+             ({format}): {combined}"
+        );
+    }
 }
 
 /// The parity half, and the reason the check is a client-side PRE-FLIGHT rather
@@ -8872,5 +9606,394 @@ fn the_json_error_contract_holds_as_behaviour_not_only_as_documentation() {
         String::from_utf8_lossy(&bad.stderr).contains("1..=1000"),
         "the usage error must name the bound, not an MCP tool: {:?}",
         String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+// ── nw-439: hubs/bridges/repo-map/count-patterns under a dirty publication ──
+
+/// A pid guaranteed not to name a live process: spawn a child and reap it.
+/// Same technique as the engine's and MCP's own copies of this helper — a
+/// third copy here rather than sharing one across crates, because this file
+/// is an integration test binary with no visibility into either crate's
+/// private test modules.
+fn nw439_reaped_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// Real measurement, not a mock: index a genuine two-symbol repo into a
+/// scratch DB, then leave the SAME file-based `.index-dirty` marker a real
+/// indexing writer leaves mid-publication, and prove `hubs`, `bridges` and
+/// `repo-map` now refuse IDENTICALLY (same exit code, same WEDGED framing,
+/// same marker/remedy disclosure) while `count-patterns` keeps answering with
+/// its stale-scope disclosure — the parity nw-439 was filed over.
+///
+/// Before this change: `bridges` alone answered with a full ranked payload at
+/// exit 0 (it never consulted the dirty-publication contract at all), and
+/// `repo-map` failed with a bare, remedyless `StoreError` string (it has no
+/// MCP/daemon twin, so it never passed through the wait+classify machinery
+/// `hubs` benefits from via the daemon route). Both are asserted against
+/// directly below.
+///
+/// COVERAGE NOTE: `nestweaver_cmd()` forces the `--no-daemon` direct path
+/// (see its `NESTWEAVER_NO_DAEMON`/`NESTWEAVER_ALLOW_NO_DAEMON` env vars), so
+/// this only exercises that route's WEDGED framing. The daemon route's
+/// `classify_index_publication_error` reads the SAME marker but escalates to
+/// WEDGED only past `is_wedged()`'s own criteria, and a fresh-enough marker
+/// there reports the milder TRANSIENT text instead — pre-existing behavior,
+/// untouched by this fix, and not exercised here.
+#[test]
+fn hubs_bridges_and_repo_map_refuse_identically_during_a_dirty_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() -> i32 { 42 }\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Sanity: all four commands answer cleanly before the marker exists.
+    for args in [
+        vec!["hubs", "--top", "2", "--json"],
+        vec!["bridges", "--top", "2", "--json"],
+        vec!["repo-map", "--json"],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--db"]);
+        nestweaver_cmd()
+            .args(&full)
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+
+    // Leave the marker: a dead writer pid and a free canonical lease, so
+    // `is_wedged()` reads `true` deterministically (no live process, no
+    // background indexer to race) — the same WEDGED shape the CLI's own
+    // `nestweaver-mcp` tests exercise.
+    let dead_pid = nw439_reaped_child_pid();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        sidecar_path(&db_path, ".index-dirty"),
+        nestweaver_store::index_publication::format_marker_payload(dead_pid, nanos, None),
+    )
+    .unwrap();
+
+    let hubs = nestweaver_cmd()
+        .args(["hubs", "--top", "2", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let bridges = nestweaver_cmd()
+        .args(["bridges", "--top", "2", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let repo_map = nestweaver_cmd()
+        .args(["repo-map", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let count_patterns = nestweaver_cmd()
+        .args([
+            "count-patterns",
+            "helper",
+            "--kinds",
+            "Symbol",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+
+    for (name, output) in [
+        ("hubs", &hubs),
+        ("bridges", &bridges),
+        ("repo-map", &repo_map),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name} must fail closed on a dirty publication like its siblings: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("WEDGED"),
+            "{name} must carry the same WEDGED framing hubs always had: {stderr}"
+        );
+        assert!(
+            stderr.contains(&dead_pid.to_string()),
+            "{name} must name the marker's writer pid: {stderr}"
+        );
+        assert!(
+            stderr.contains("nestweaver repair"),
+            "{name} must name an executable remedy (nw-334), not just refuse: {stderr}"
+        );
+        assert!(
+            stderr.contains("not a dirty git working tree"),
+            "{name} must correct the wrong conclusion a reader could draw: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{name} must not emit a payload alongside a hard failure: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // count-patterns is the model this item asks the other three to match
+    // POLICY with, not OUTPUT with: it degrades-with-disclosure rather than
+    // failing closed, because an approximate text-count answer remains
+    // meaningful mid-publication in a way a PageRank-derived ranking does not.
+    // Its own `stale_index`/`ready_scopes`/`dirty_scopes` bookkeeping tracks
+    // TRIGRAM SCOPE readiness, a different subsystem from the generic
+    // `.index-dirty` publication marker this fixture plants by hand (it only
+    // moves under a REAL concurrent indexing writer, which this test does not
+    // run) — so this asserts the parity claim nw-439 is actually about
+    // (count-patterns keeps answering while its siblings refuse), not the
+    // specific field values, which the ticket's own live-graph evidence
+    // already covers.
+    assert_eq!(
+        count_patterns.status.code(),
+        Some(0),
+        "count-patterns must keep answering rather than fail closed like its \
+         ranked siblings, even while a dirty publication marker is present: {:?}",
+        String::from_utf8_lossy(&count_patterns.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&count_patterns.stdout).unwrap();
+    assert!(
+        payload[0].get("stale_index").is_some(),
+        "count-patterns must still carry its staleness-disclosure field: {payload}"
+    );
+
+    // COUNTERWEIGHT: remove the marker and all four answer normally again —
+    // proving every assertion above keyed on the marker's presence, not on
+    // some other state the fixture happened to change along the way.
+    std::fs::remove_file(sidecar_path(&db_path, ".index-dirty")).unwrap();
+    for args in [
+        vec!["hubs", "--top", "2", "--json"],
+        vec!["bridges", "--top", "2", "--json"],
+        vec!["repo-map", "--json"],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--db"]);
+        nestweaver_cmd()
+            .args(&full)
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+}
+
+/// nw-435, surfaced. `languages_without_entry_points` is a `pub` field on
+/// `DeadCodeResult`, consulted by `coverage_is_complete()` to decide
+/// "complete" vs "degraded" (see `language_with_zero_entry_points_degrades_coverage_even_with_another_languages_entry`
+/// in `nestweaver-engine/src/dead_code.rs`, which proves the FIELD is
+/// computed correctly) — but it was never serialized into either the CLI's
+/// `DeadCodeJson` or the MCP tool's JSON, so a caller had no way to learn
+/// WHICH language caused a degrade it could plainly see (`coverage:
+/// "degraded"` with `undecodable_symbols: 0` and a healthy `entry_points`
+/// count, both looking fine). Polyglot repos are the norm, so this is the
+/// common case a degraded run hits, not an edge case.
+///
+/// Asserted on the ACTUAL COMMAND OUTPUT (the CLI's `--json`, the CLI's
+/// plain-text rendering, and the MCP tool's `structuredContent`) — the
+/// engine-level test above already proves the field is computed; this one
+/// proves it actually reaches a caller on every surface, which is where the
+/// prior struct-level test could not have caught the omission.
+#[test]
+fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    // Rust contributes a REAL entry point (`fn main`), keeping the
+    // whole-corpus `entry_points` count healthy. Bash contributes analysed
+    // symbols (two functions) but no entry point of its own — the exact
+    // shape nw-435 leg 1 fixed at the struct level.
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() -> i32 { 42 }\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("deploy.sh"),
+        "#!/bin/bash\ndeploy_app() {\n  echo deploying\n}\n\ncleanup() {\n  echo cleanup\n}\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // ── JSON surface.
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(
+        payload["coverage"],
+        serde_json::json!("degraded"),
+        "fixture-adequacy check: this fixture must genuinely degrade, or \
+         everything below is vacuous: {payload}"
+    );
+    assert_eq!(
+        payload["undecodable_symbols"],
+        serde_json::json!(0),
+        "the degrade here must come from the entry-point gap, not a store \
+         decode failure — otherwise this is not exercising nw-435's case: {payload}"
+    );
+    assert!(
+        payload["entry_points"].as_u64().unwrap_or(0) > 0,
+        "the whole-corpus entry_points count must stay healthy (rust has a \
+         real main) — a zero here would mean nw-351's OLDER check caught it \
+         instead, which is a different bug: {payload}"
+    );
+    assert_eq!(
+        payload["languages_without_entry_points"],
+        serde_json::json!(["bash"]),
+        "the one field this fix adds must actually be present and name bash: {payload}"
+    );
+
+    // ── Plain-text surface: the human-readable output must say WHICH
+    // language, not just that something degraded.
+    let text_output = nestweaver_cmd()
+        .args(["dead-code", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        text.contains("bash"),
+        "the text rendering must name the responsible language, not just \
+         say something is degraded: {text}"
+    );
+    assert!(
+        text.contains("DEGRADED"),
+        "the text rendering must still carry its DEGRADED banner: {text}"
+    );
+
+    // ── MCP surface, over stdio, the same route an agent actually calls.
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "dead_code", "arguments": {} }
+        }),
+    ];
+    let input = frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nestweaver"))
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .args(["mcp", "--db"])
+        .arg(&db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let mcp_output = child.wait_with_output().expect("failed to read mcp output");
+    let mcp_stdout = String::from_utf8_lossy(&mcp_output.stdout).to_string();
+    let frame: serde_json::Value = mcp_stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("no tools/call frame in MCP stdout:\n{mcp_stdout}"));
+    assert!(
+        frame["result"]["isError"] != serde_json::json!(true),
+        "MCP dead_code returned an error: {}",
+        frame["result"]
+    );
+    let mcp_payload = &frame["result"]["structuredContent"];
+    assert_eq!(
+        mcp_payload["languages_without_entry_points"],
+        serde_json::json!(["bash"]),
+        "the MCP tool's own JSON must carry the same field the CLI does: {mcp_payload}"
+    );
+
+    // ── COUNTERWEIGHT: give bash an entry point too (a `main` function, the
+    // convention bash's `detect_entry_point` recognises), and the degrade must
+    // clear on every surface — proving the assertions above depend on the
+    // gap this fixture built, not on some property of bash files in general.
+    std::fs::write(
+        repo_dir.join("deploy.sh"),
+        "#!/bin/bash\ndeploy_app() {\n  echo deploying\n}\n\nmain() {\n  deploy_app\n}\n\nmain\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--force")
+        .assert()
+        .success();
+    let cleared_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        cleared_output.status.success(),
+        "dead-code --json (counterweight) failed: {}",
+        String::from_utf8_lossy(&cleared_output.stderr)
+    );
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared_output.stdout).unwrap();
+    assert_eq!(
+        cleared["languages_without_entry_points"],
+        serde_json::json!([]),
+        "once bash has its own entry point the field must go empty, not \
+         merely stay unread: {cleared}"
+    );
+    assert_eq!(
+        cleared["coverage"],
+        serde_json::json!("complete"),
+        "and the degrade this whole field exists to explain must clear too: {cleared}"
     );
 }

@@ -102,6 +102,46 @@
   function: (qualified_identifier
     name: (identifier) @name)) @reference.call
 
+; Calls with an explicit template-argument list between the callee name and
+; the argument list -- `f<T>(args)`, `ns::f<T>(args)` / `Base::f<T>(args)`,
+; and `obj.f<T>(args)` / `ptr->f<T>(args)`. tree-sitter-cpp does not fold the
+; template arguments into `identifier`/`qualified_identifier`/`field_expression`
+; the way it does for a plain call -- the callee field becomes a distinct
+; `template_function` (free/qualified form) or `template_method` (member-access
+; form) node, so none of the three patterns above match it and the call is
+; dropped entirely rather than resolved. Confirmed missed edge: nw-434,
+; `Trees::findAllNodes` -> `_findAllNodes<ParseTree *>(...)` in
+; third_party/antlr4_runtime/src/tree/Trees.cpp. Explicit template arguments
+; are routine (required whenever the argument can't be deduced), so this is
+; not an exotic case -- generic container/visitor/serialization code hits it
+; constantly, and a missed CALLS edge here silently understates `impact`,
+; `blast-radius` and `flow-trace` too, not just `dead-code`.
+;
+; Free function / static call, explicit template args: f<T>(...)
+(call_expression
+  function: (template_function
+    name: (identifier) @name)) @reference.call
+
+; Qualified call, explicit template args: ns::f<T>(...) / Base::f<T>(...).
+; tree-sitter-cpp parses BOTH the namespace-qualified free function and the
+; class-qualified static/inherited method through this same node shape --
+; `qualified_identifier`'s `name` field is `template_function` in either case,
+; never `template_method` (that variant is reserved for member access below) --
+; so one rule covers both.
+(call_expression
+  function: (qualified_identifier
+    name: (template_function
+      name: (identifier) @name))) @reference.call
+
+; Member call, explicit template args: obj.f<T>(...) / ptr->f<T>(...).
+; `field_expression` covers both `.` and `->` (distinguished by its `operator`
+; field, which this rule doesn't need); its `field` is `template_method` when
+; the call site supplies explicit template arguments.
+(call_expression
+  function: (field_expression
+    field: (template_method
+      name: (field_identifier) @name))) @reference.call
+
 ; #include directives.
 ;
 ; `@reference.includes`, not `@reference.import`: `#include` is ONE construct

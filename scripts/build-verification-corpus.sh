@@ -130,7 +130,7 @@ for dest in "$CORPUS_DIR"/src/*/; do
   [ -d "$dest" ] || continue
   name=$(basename "$dest")
   printf 'index   %-28s ' "$name"
-  if $NW index --repo "$dest" --db "$DB" --no-embed >/dev/null 2>&1; then
+  if $NW index --repo "$dest" --db "$DB" >/dev/null 2>&1; then
     echo ok
     indexed=$((indexed + 1))
   else

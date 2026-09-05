@@ -323,13 +323,14 @@ fn attest_requested_config_on_held_pidfile(
 /// already exists, and spawns one if not. Uses exponential-backoff polling
 /// to wait for the socket to accept connections.
 pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
-    ensure_daemon_impl(db_path, config_path, true)
+    ensure_daemon_impl(db_path, config_path, true, DaemonUsage::OneShot)
 }
 
 fn ensure_daemon_impl(
     db_path: &Path,
     config_path: Option<&Path>,
     attest_existing: bool,
+    usage: DaemonUsage,
 ) -> Result<PathBuf> {
     // An explicit path is a security-relevant assertion, not a child-process
     // hint. Validate it before creating runtime directories, taking locks,
@@ -423,11 +424,17 @@ fn ensure_daemon_impl(
         config_path,
         &spawn_lock,
         ColdStartSelection::Automatic,
+        usage,
     )
 }
 
 /// Async-safe wrapper around the synchronous pidfile/spawn/socket-readiness
 /// protocol. All filesystem flocks and polling sleeps run off the executor.
+///
+/// No caller in this workspace declares itself LONG-RUNNING through this
+/// entrypoint (see [`ensure_daemon_for_client_async`] for the one that
+/// matters, `DaemonClient::connect`'s autostart) — kept at [`DaemonUsage::OneShot`]
+/// rather than growing a parameter nothing yet threads through.
 pub async fn ensure_daemon_async(db_path: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
     let db_path = db_path.to_path_buf();
     let config_path = config_path.map(Path::to_path_buf);
@@ -439,15 +446,23 @@ pub async fn ensure_daemon_async(db_path: &Path, config_path: Option<&Path>) -> 
 /// Preserve an explicit config as a possible spawn argument, but defer
 /// incumbent attestation until DaemonClient has checked its protocol version.
 /// This keeps the verified old-version upgrade path available.
+///
+/// `usage`: nw-088 leg (2) FOLLOW-UP. Threaded straight from
+/// `DaemonClient::connect`/`connect_long_running` — this is the one call
+/// that decides whether the daemon THIS invocation autostarts gets the
+/// shortened ephemeral idle-timeout or the normal one. See [`DaemonUsage`].
 pub(crate) async fn ensure_daemon_for_client_async(
     db_path: &Path,
     config_path: Option<&Path>,
+    usage: DaemonUsage,
 ) -> Result<PathBuf> {
     let db_path = db_path.to_path_buf();
     let config_path = config_path.map(Path::to_path_buf);
-    tokio::task::spawn_blocking(move || ensure_daemon_impl(&db_path, config_path.as_deref(), false))
-        .await
-        .context("daemon ensure task failed")?
+    tokio::task::spawn_blocking(move || {
+        ensure_daemon_impl(&db_path, config_path.as_deref(), false, usage)
+    })
+    .await
+    .context("daemon ensure task failed")?
 }
 
 /// Start a daemon while the caller retains the instance's spawn lock.
@@ -455,12 +470,23 @@ pub(crate) async fn ensure_daemon_for_client_async(
 /// This is the commit half of a version-mismatch restart. The caller acquires
 /// the guard before shutting down the old daemon and passes the same guard
 /// through replacement readiness.
+///
+/// `usage` must be the SAME usage the original `DaemonClient::connect` call
+/// declared: a version-mismatch restart mid-`ui`-session must not silently
+/// downgrade the replacement daemon back to the ephemeral timeout.
 pub fn ensure_daemon_with_spawn_lock(
     db_path: &Path,
     config_path: Option<&Path>,
     spawn_lock: &SpawnLock,
+    usage: DaemonUsage,
 ) -> Result<PathBuf> {
-    ensure_daemon_with_spawn_lock_impl(db_path, config_path, spawn_lock, ColdStartSelection::Exact)
+    ensure_daemon_with_spawn_lock_impl(
+        db_path,
+        config_path,
+        spawn_lock,
+        ColdStartSelection::Exact,
+        usage,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +502,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     config_path: Option<&Path>,
     spawn_lock: &SpawnLock,
     selection: ColdStartSelection,
+    usage: DaemonUsage,
 ) -> Result<PathBuf> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     anyhow::ensure!(
@@ -535,7 +562,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     }
 
     // Spawn the daemon as a detached child.
-    let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock)?;
+    let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock, usage)?;
 
     // Poll until the socket accepts connections, then release the spawn-lock so the next
     // waiter's re-check observes a ready daemon instead of spawning another.
@@ -557,11 +584,13 @@ pub async fn ensure_daemon_with_spawn_lock_async(
     db_path: &Path,
     config_path: Option<&Path>,
     spawn_lock: SpawnLock,
+    usage: DaemonUsage,
 ) -> Result<(PathBuf, SpawnLock)> {
     let db_path = db_path.to_path_buf();
     let config_path = config_path.map(Path::to_path_buf);
     tokio::task::spawn_blocking(move || {
-        let socket = ensure_daemon_with_spawn_lock(&db_path, config_path.as_deref(), &spawn_lock)?;
+        let socket =
+            ensure_daemon_with_spawn_lock(&db_path, config_path.as_deref(), &spawn_lock, usage)?;
         Ok((socket, spawn_lock))
     })
     .await
@@ -588,13 +617,118 @@ pub fn is_process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Override for how long an autostarted EPHEMERAL (temp-path) daemon idles
+/// before self-terminating, distinct from `daemon start --idle-timeout`'s own
+/// 3600s default.
+pub const EPHEMERAL_IDLE_TIMEOUT_ENV: &str = "NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS";
+
+/// Review follow-up on nw-088 leg (2) (FIX 4). `is_temp_db_path` is a path
+/// HEURISTIC — it was already trusted for macOS launchd-vs-foreground
+/// routing and gc reclaimability, where a wrong answer costs nothing worse
+/// than cosmetics. Reusing it here changes what a false positive COSTS: a
+/// real, long-lived database that happens to live under `$TMPDIR`,
+/// `/var/folders`, or a container whose working root IS `/tmp` now gets its
+/// daemon's idle budget silently cut to ~60s, with no way for the operator
+/// to say "this one is real" — the false-positive case is worse than the bug
+/// leg (2) exists to fix. Setting this to any non-empty value makes
+/// `daemon_start_command` treat `db_path` as real regardless of what
+/// `is_temp_db_path` would answer, so the explicit signal always wins over
+/// the heuristic.
+pub const REAL_DB_UNDER_TEMP_ROOT_ENV: &str = "NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT";
+
+/// nw-088 leg (2). `daemon start`'s `--idle-timeout` default (3600s) is sized
+/// for an interactive session against a REAL database. Autostart never
+/// overrode it, so a one-shot command against a scratch `--db` under `/tmp` —
+/// every test, every throwaway repro — left an hour-long resident daemon
+/// behind it: proven live in the 2026-09-04 QA pass, which watched a plain
+/// `index --repo <scratch> --db /tmp/.../s.lbug` do exactly that.
+const DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Resolve the ephemeral idle timeout, clamped to 1s or more. An unparseable
+/// or zero override falls back to the default rather than failing the
+/// command — this is a patience knob, not a correctness input, mirroring
+/// [`daemon_boot_timeout`]'s own fallback discipline.
+fn ephemeral_idle_timeout_secs() -> u64 {
+    std::env::var(EPHEMERAL_IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS)
+}
+
+/// Is the caller EXPLICITLY telling us `db_path`, however it is classified by
+/// [`nestweaver_daemon::lifecycle::is_temp_db_path`], is a real database that
+/// must keep the normal idle-timeout budget? See
+/// [`REAL_DB_UNDER_TEMP_ROOT_ENV`] for why this override must exist at all.
+fn caller_asserts_real_db_under_temp_root() -> bool {
+    std::env::var_os(REAL_DB_UNDER_TEMP_ROOT_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// nw-088 leg (2) FOLLOW-UP (this leg). Whether the code asking for a daemon
+/// is a ONE-SHOT command (issues its RPC(s) and exits) or a LONG-RUNNING
+/// interactive session that is expected to hold the daemon open for an
+/// unbounded, human-paced duration (`ui`, `watch`, `mcp`).
+///
+/// This exists because the leg it follows up on inferred "ephemeral" from
+/// `db_path`'s LOCATION (`is_temp_db_path`), and that is a property of the
+/// database, not of what the caller is about to DO with it. Reproduced three
+/// times: `nestweaver ui --db <path under /tmp>` autostarts with the
+/// shortened 60s idle timeout — the same one a one-shot `index` against the
+/// same path correctly gets — and the daemon exits out from under the live
+/// UI session ~55-100s later, taking every daemon-routed endpoint with it.
+/// `/tmp` is exactly where a `ui` session against a scratch/test database
+/// legitimately lives, so the fix is not a longer number (that only moves
+/// the same race further out) — it is asking the CALLER, which is the one
+/// party that actually knows its own shape, rather than re-guessing from the
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonUsage {
+    /// A single command that issues its RPC(s) and exits — `search`,
+    /// `context`, `repo-map`, `impact`, every `--json` route, etc. Gets the
+    /// shortened ephemeral idle-timeout when `db_path` also looks temporary
+    /// (`is_temp_db_path`), exactly as before this leg.
+    OneShot,
+    /// A foreground session that holds a connection open indefinitely —
+    /// `ui` (serves until the operator closes it), `watch` (blocks on
+    /// Ctrl-C while the daemon indexes in the background), `mcp` (an agent's
+    /// stdio session, which can idle far longer than 60s between tool
+    /// calls while the human/agent reads or thinks). Always gets the
+    /// daemon's normal idle-timeout budget, regardless of where `db_path`
+    /// happens to live — the shortened timeout was never about the path,
+    /// it was about a command that would not be there to notice the daemon
+    /// leaving.
+    LongRunning,
+}
+
 fn daemon_start_command(
     exe: &Path,
     db_path: &Path,
     config_path: Option<&Path>,
+    usage: DaemonUsage,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
+    // nw-088 leg (2). One predicate governs "is this path ephemeral" across
+    // the whole daemon lifecycle — macOS launchd-vs-foreground-child routing
+    // and the gc sweep's reclaimability already use
+    // `nestweaver_daemon::lifecycle::is_temp_db_path`; using it here too is
+    // the same guard, not a second guess that can drift from the other two.
+    //
+    // The explicit escape (FIX 4) is checked FIRST and short-circuits the
+    // heuristic entirely — an operator's assertion about their own database
+    // always outranks a path-shape guess.
+    //
+    // `usage == LongRunning` short-circuits the heuristic ENTIRELY, checked
+    // before it: a declared long-running caller is not a path-shape guess
+    // either, it is the strongest signal available, and it applies
+    // regardless of where `db_path` lives.
+    if matches!(usage, DaemonUsage::OneShot)
+        && !caller_asserts_real_db_under_temp_root()
+        && nestweaver_daemon::lifecycle::is_temp_db_path(db_path)
+    {
+        cmd.arg("--idle-timeout")
+            .arg(ephemeral_idle_timeout_secs().to_string());
+    }
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }
@@ -647,12 +781,13 @@ fn spawn_daemon(
     db_path: &Path,
     config_path: Option<&Path>,
     spawn_lock: &SpawnLock,
+    usage: DaemonUsage,
 ) -> Result<SpawnedLauncher> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
-    let mut cmd = daemon_start_command(&exe, db_path, config_path);
+    let mut cmd = daemon_start_command(&exe, db_path, config_path, usage);
     spawn_lock.configure_child_handoff(&mut cmd)?;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
@@ -1235,6 +1370,7 @@ credential_method = "gh"
             Path::new("/opt/nestweaver"),
             Path::new("/tmp/brain.lbug"),
             None,
+            DaemonUsage::OneShot,
         );
 
         assert!(
@@ -1247,6 +1383,10 @@ credential_method = "gh"
 
     #[test]
     fn daemon_start_command_forwards_db_and_config() {
+        // `tempfile::tempdir()` lives under the OS temp root by construction,
+        // so this exercises the SAME `is_temp_db_path(db)` branch nw-088 leg
+        // (2) added — the assertion below expects `--idle-timeout` for
+        // exactly that reason, not despite it.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         let spawn_lock = SpawnLock::acquire(&db).unwrap();
@@ -1254,6 +1394,7 @@ credential_method = "gh"
             Path::new("/opt/nestweaver"),
             &db,
             Some(Path::new("/tmp/nestweaver-instance.toml")),
+            DaemonUsage::OneShot,
         );
         spawn_lock.configure_child_handoff(&mut command).unwrap();
 
@@ -1268,6 +1409,8 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--idle-timeout",
+                &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
                 "--config",
                 "/tmp/nestweaver-instance.toml",
             ]
@@ -1282,6 +1425,178 @@ credential_method = "gh"
             .parse::<RawFd>()
             .unwrap();
         assert!(fd >= 3);
+    }
+
+    /// nw-088 leg (2)'s counterweight: a REAL (non-temp) database must keep
+    /// today's behaviour exactly — no `--idle-timeout` override at all, so
+    /// `daemon start`'s own 3600s default governs an interactive session.
+    /// Without this, the ephemeral-path branch above could satisfy its own
+    /// test by adding the flag unconditionally.
+    #[test]
+    fn daemon_start_command_does_not_override_idle_timeout_for_a_real_db() {
+        let db = Path::new("/home/kory/projects/brain/brain.lbug");
+        assert!(
+            !nestweaver_daemon::lifecycle::is_temp_db_path(db),
+            "precondition: this path must not be classified as ephemeral"
+        );
+        let command =
+            daemon_start_command(Path::new("/opt/nestweaver"), db, None, DaemonUsage::OneShot);
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from)
+        );
+    }
+
+    /// Review follow-up on nw-088 leg (2) (FIX 4). The path heuristic alone
+    /// cannot tell a real database that happens to live under a temp root
+    /// from a genuinely throwaway one — `NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT`
+    /// is the operator's explicit override, and it must win even though the
+    /// path itself is unambiguously temp-shaped.
+    #[test]
+    fn daemon_start_command_honours_the_real_db_under_temp_root_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert!(
+            nestweaver_daemon::lifecycle::is_temp_db_path(&db),
+            "precondition: this path must be classified as ephemeral"
+        );
+
+        // SAFETY: single-threaded test; the override is read only here.
+        unsafe { std::env::set_var(REAL_DB_UNDER_TEMP_ROOT_ENV, "1") };
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            &db,
+            None,
+            DaemonUsage::OneShot,
+        );
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from),
+            "an explicit override must suppress --idle-timeout even for a \
+             path the heuristic alone would call ephemeral"
+        );
+    }
+
+    /// The counterweight: with the override ABSENT, the same temp-shaped
+    /// path must still get the shortened timeout — otherwise the escape-hatch
+    /// test above could pass because `daemon_start_command` stopped adding
+    /// `--idle-timeout` for temp paths altogether, override or not.
+    #[test]
+    fn daemon_start_command_still_shortens_the_timeout_without_the_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            &db,
+            None,
+            DaemonUsage::OneShot,
+        );
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--idle-timeout",
+                &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    /// nw-088 leg (2) FOLLOW-UP (this fix). A LONG-RUNNING caller must NOT
+    /// get the shortened idle-timeout no matter how temp-shaped `db_path`
+    /// is — the exact case `ui --db <path under /tmp>` hits, and the exact
+    /// case the path heuristic alone cannot distinguish from a genuine
+    /// one-shot `index` against the same path.
+    #[test]
+    fn daemon_start_command_never_shortens_the_timeout_for_a_long_running_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert!(
+            nestweaver_daemon::lifecycle::is_temp_db_path(&db),
+            "precondition: this path must be classified as ephemeral — the \
+             point of this test is that DaemonUsage overrides that, not that \
+             the path stopped looking temporary"
+        );
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            &db,
+            None,
+            DaemonUsage::LongRunning,
+        );
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from),
+            "a declared long-running caller must suppress --idle-timeout \
+             over a temp-shaped path exactly as the explicit env-var escape \
+             does — usage, not path, decides this now"
+        );
+    }
+
+    /// The counterweight: the SAME temp-shaped path, declared `OneShot`
+    /// instead, must still get the shortened timeout — otherwise the test
+    /// above could pass because `daemon_start_command` stopped shortening
+    /// the timeout for temp paths at all, `DaemonUsage` or not.
+    #[test]
+    fn daemon_start_command_still_shortens_the_timeout_for_a_one_shot_caller_on_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+
+        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            &db,
+            None,
+            DaemonUsage::OneShot,
+        );
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--idle-timeout",
+                &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
+            ]
+            .map(std::ffi::OsString::from),
+            "the SAME path, declared OneShot, must still shorten the timeout \
+             — proving the test above depends on DaemonUsage, not on some \
+             property of this path"
+        );
     }
 
     /// nw-114: a daemon that has already exited must be reported immediately,

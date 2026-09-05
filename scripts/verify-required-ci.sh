@@ -53,6 +53,7 @@ verify_required_ci() {
     require_success clippy || return 1
     require_success daemon-tests || return 1
     require_success audit || return 1
+    require_success npm-install-smoke || return 1
   fi
   if [[ "$metal" == true ]]; then
     require_success metal-smoke || return 1
@@ -73,6 +74,7 @@ self_test() {
     "daemon-tests": {"result":"success"},
     "audit": {"result":"success"},
     "metal-smoke": {"result":"success"},
+    "npm-install-smoke": {"result":"success"},
     "e2e": {"result":"success"}
   }'
 
@@ -87,6 +89,7 @@ self_test() {
     | .["daemon-tests"].result = "skipped"
     | .audit.result = "skipped"
     | .["metal-smoke"].result = "skipped"
+    | .["npm-install-smoke"].result = "skipped"
     | .e2e.result = "skipped"' <<< "$baseline")"
 
   failed=$(jq '.clippy.result = "failure"' <<< "$baseline")
@@ -98,6 +101,21 @@ self_test() {
   missing=$(jq 'del(.e2e)' <<< "$baseline")
   if verify_required_ci "$missing" >/dev/null 2>&1; then
     echo "self-test failed: a missing required job was accepted" >&2
+    return 1
+  fi
+
+  # nw-433: the macOS npm-install regression guard must actually be wired into
+  # the gate, not merely present in the workflow. A skipped/missing result
+  # here while rust==true must reject, the same as any other required job.
+  npm_missing=$(jq 'del(.["npm-install-smoke"])' <<< "$baseline")
+  if verify_required_ci "$npm_missing" >/dev/null 2>&1; then
+    echo "self-test failed: a missing npm-install-smoke result was accepted" >&2
+    return 1
+  fi
+
+  npm_failed=$(jq '.["npm-install-smoke"].result = "failure"' <<< "$baseline")
+  if verify_required_ci "$npm_failed" >/dev/null 2>&1; then
+    echo "self-test failed: a failed npm-install-smoke result was accepted" >&2
     return 1
   fi
 

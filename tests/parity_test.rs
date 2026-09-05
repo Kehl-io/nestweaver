@@ -3746,6 +3746,107 @@ fn repo_map_and_ranking_rank_disclose_stale_rankings_on_every_route() {
     }
 }
 
+/// nw-397 LEG 3. `repo-map --json` computed `truncated`/`files_returned`/
+/// `files_total` in `generate_repo_map_bounded` and had a place to put them in
+/// `print_repo_map_json`, yet a genuinely truncated run through a LIVE DAEMON
+/// (the default: a bare `repo-map --json` autostarts one) came back with
+/// exactly `['_meta','map','rankings_stale','stale_repos','token_count']` —
+/// no `truncated`, no `files_returned`, no `files_total`. The struct-level
+/// counterpart (`a_budget_cut_repo_map_discloses_truncation` in
+/// `nestweaver-engine/src/query.rs`) called `generate_repo_map_bounded`
+/// directly and always passed, which is exactly why it never caught this: the
+/// value was computed and then dropped one layer up, in the daemon's own
+/// `repo_map_json` RPC handler (`nestweaver-daemon/src/server.rs`), which
+/// calls the bare `generate_repo_map` (a `String`, no counts) and never
+/// attaches the three keys to its reply. The CLI's `Commands::RepoMap` arm
+/// then read `value.get("truncated")` etc. off that reply and got `None`
+/// every time, indistinguishable on the wire from "the route cannot say".
+///
+/// Asserted on the ACTUAL COMMAND OUTPUT of the daemon route (`run_via_daemon`
+/// spawns a real `nestweaver` process against a real running daemon), not on
+/// `RepoMap`/`generate_repo_map_bounded` directly — three prior defects in
+/// this sweep passed a struct-level test while the user-facing seam stayed
+/// broken, and this is the same shape of bug.
+#[test]
+fn repo_map_json_discloses_truncation_through_a_live_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Two files, mirroring the struct-level fixture exactly (same file
+    // contents, same budgets: 20 cuts, 16000 does not) so the two tests can
+    // be compared line for line if this one ever regresses again.
+    write_repo_files(
+        &repo_dir,
+        &[
+            (
+                "main.js",
+                "function greet(name) { return hello(name); }\n\
+                 function hello(name) { return name; }\n",
+            ),
+            ("utils.js", "function formatDate(date) { return date; }\n"),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // ── Genuinely truncated: budget 20 fits only the first file's header,
+    // the same number the struct-level test pins as a cut over this fixture
+    // shape.
+    let cut_output = run_via_daemon(&db_path, &["repo-map", "--token-budget", "20", "--json"]);
+    assert!(
+        cut_output.status.success(),
+        "repo-map --json (daemon, cut) failed: {}",
+        String::from_utf8_lossy(&cut_output.stderr)
+    );
+    let cut = parse_stdout("repo-map --json (daemon, cut)", &cut_output);
+    assert_eq!(
+        cut.get("truncated"),
+        Some(&serde_json::json!(true)),
+        "a 20-token budget over two files must disclose the cut on the DAEMON \
+         route, not just the direct one: {cut}"
+    );
+    let files_returned = cut["files_returned"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("files_returned missing from {cut}"));
+    let files_total = cut["files_total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("files_total missing from {cut}"));
+    assert!(
+        files_returned < files_total,
+        "files_returned ({files_returned}) must be less than files_total \
+         ({files_total}) when truncated: {cut}"
+    );
+    assert_eq!(files_total, 2, "the fixture has exactly two files: {cut}");
+
+    // ── COUNTERWEIGHT: the same fixture, same daemon, a budget generous
+    // enough to fit both files whole. `truncated` must flip to `false` and
+    // the counts must be equal — proving the assertions above depend on the
+    // budget genuinely cutting the map, not on some fixed shape of this
+    // daemon's reply.
+    let whole_output = run_via_daemon(&db_path, &["repo-map", "--token-budget", "16000", "--json"]);
+    assert!(
+        whole_output.status.success(),
+        "repo-map --json (daemon, whole) failed: {}",
+        String::from_utf8_lossy(&whole_output.stderr)
+    );
+    let whole = parse_stdout("repo-map --json (daemon, whole)", &whole_output);
+    assert_eq!(
+        whole.get("truncated"),
+        Some(&serde_json::json!(false)),
+        "a 16000-token budget must fit this two-file fixture whole, on the \
+         daemon route: {whole}"
+    );
+    assert_eq!(
+        whole["files_returned"], whole["files_total"],
+        "files_returned must equal files_total when untruncated: {whole}"
+    );
+    assert_eq!(whole["files_total"], serde_json::json!(2), "{whole}");
+}
+
 /// nw-372. `dead-code` REFUSES on a resolver-generation-stale graph — every
 /// route, exit `2` — where every other generation-aware surface discloses and
 /// prints anyway.

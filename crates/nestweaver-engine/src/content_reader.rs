@@ -244,6 +244,29 @@ fn dir_is_excluded(dir_excludes: Option<&GlobSet>, rel: &Path) -> bool {
     dir_excludes.is_some_and(|gs| gs.is_match(rel))
 }
 
+/// Whether any component of `path` is one of `skip_dirs` and has NOT been
+/// re-admitted by `unskip`.
+///
+/// nw-436: a reader-local twin of [`crate::index::path_in_skip_dir_with_unskip`]
+/// that takes the blocklist as a parameter instead of hardcoding
+/// `crate::index::SKIP_DIRS`, so [`FilesystemReader::record_tracked_but_ignored`]
+/// stays consistent with WHATEVER list this particular reader's walk was
+/// configured with ([`FilesystemReader::skip_dirs`]). `crate::index`'s version
+/// is left untouched and still governs its own callers (the incremental code
+/// route, `watch_code.rs`, `GitBareReader`) — none of which vary their
+/// blocklist per-reader today, so they have no need of this parameter.
+fn path_in_configured_skip_dir(
+    path: &Path,
+    skip_dirs: &'static [&'static str],
+    unskip: &HashSet<String>,
+) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|name| skip_dirs.contains(&name) && !unskip.contains(name))
+    })
+}
+
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
 pub struct FilesystemReader {
     repo_path: PathBuf,
@@ -251,6 +274,13 @@ pub struct FilesystemReader {
     /// Configured `[[repos]] exclude` globs, matched against repo-relative
     /// paths. `None` when the repo declares none — the common case.
     excludes: Option<GlobSet>,
+    /// The raw glob strings `excludes` was built from, same order as passed to
+    /// [`Self::excluding`]. `GlobSet::matches` reports WHICH pattern(s) matched
+    /// by index into that original order — kept here so a file-level prune
+    /// (nw-437) can name the exact pattern in its disclosure instead of the
+    /// generic "a configured exclude glob" the directory case is stuck with
+    /// (a `GlobSet::is_match` alone reports only that something matched).
+    exclude_patterns: Vec<String>,
     /// Directory-level companion to [`Self::excludes`], used to prune the walk
     /// instead of filtering after descent. A pattern like `big/**` names only
     /// the CONTENTS of `big`, so it never matches `big` itself; without this
@@ -261,6 +291,19 @@ pub struct FilesystemReader {
     /// to. nw-325: the blocklist is a DEFAULT, not a law — a repo whose
     /// `public/` or `build/` holds first-party source has to be able to say so.
     unskip: std::collections::HashSet<String>,
+    /// The directory blocklist this reader's walk prunes by.
+    ///
+    /// nw-436: DEFAULTS to [`crate::index::SKIP_DIRS`], preserving the exact
+    /// behaviour every existing (code-indexing) caller already had. A
+    /// NON-DEFAULT caller (the vault indexer, `index_md.rs`) can override it
+    /// with [`Self::with_skip_dirs`] instead of silently inheriting a list
+    /// tuned for source repos. See that constant's doc comment for why
+    /// `.claude`/`.superpowers` belong there for CODE but not for a vault: a
+    /// vault's `.claude/skills/*.md` are notes the user wrote, not tooling
+    /// config, and `index_md.rs` already maintains its OWN, smaller
+    /// `SKIP_DIRS` for exactly this reason — the defect was that this reader
+    /// ignored that list and pruned by the code one regardless of caller.
+    skip_dirs: &'static [&'static str],
     /// Directories the last [`Self::list_files`] pruned, for disclosure.
     ///
     /// nw-325: the prune happens inside `WalkBuilder::filter_entry`, which cuts
@@ -322,6 +365,24 @@ pub const CONFIGURED_EXCLUDE_REASON: &str = "configured exclude";
 /// `index::disclose_pruned_dir`.
 pub const TRACKED_BUT_IGNORED_REASON: &str = "tracked by git but gitignored";
 
+/// The `reason` a [`SkippedDir`] carries when a configured `[[repos]] exclude`
+/// glob matched a single FILE during enumeration, rather than pruning a
+/// directory before it.
+///
+/// nw-437. `filter_entry` (directory prune, [`CONFIGURED_EXCLUDE_REASON`]) and
+/// this site are the SAME feature hitting two different granularities:
+/// `exclude = ["vendor2/**"]` prunes a directory before descent and was
+/// already disclosed; `exclude = ["other.rs"]` matches one file INSIDE the
+/// per-entry filter below `filter_entry`, which never reaches the recorder —
+/// so the file vanished from the graph while `skipped_files` and
+/// `coverage_status` stayed silent about it. Kept as a distinct constant
+/// (rather than reusing `CONFIGURED_EXCLUDE_REASON`) because unlike the
+/// directory case, [`SkippedDir::matched_pattern`] IS available here — the
+/// per-file match runs against `self.excludes` directly, so `GlobSet::matches`
+/// can be asked which pattern fired, whereas the directory prune only ever
+/// tests `dir_excludes.is_match` (a boolean) — see that field's doc comment.
+pub const CONFIGURED_FILE_EXCLUDE_REASON: &str = "configured exclude (file)";
+
 /// A path the walk did not hand to the indexer, and why.
 ///
 /// Named for its original and still dominant case — nw-325/nw-387 record
@@ -330,19 +391,30 @@ pub const TRACKED_BUT_IGNORED_REASON: &str = "tracked by git but gitignored";
 /// survives. nw-394 adds rows whose `path` is a single FILE
 /// ([`TRACKED_BUT_IGNORED_REASON`]): there the directory may well have been
 /// walked normally and only the one committed-but-ignored file inside it was
-/// dropped, so the file IS the finest artefact available. The type is kept
-/// rather than renamed because it is crate-internal, and `reason` already
-/// discriminates the cases for `index::disclose_pruned_dir`.
+/// dropped, so the file IS the finest artefact available. nw-437 adds a
+/// second single-FILE case ([`CONFIGURED_FILE_EXCLUDE_REASON`]) for the same
+/// structural reason. The type is kept rather than renamed because it is
+/// crate-internal, and `reason` already discriminates the cases for
+/// `index::disclose_pruned_dir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedDir {
     /// Repo-relative path of the pruned directory, or of the single dropped
-    /// file for [`TRACKED_BUT_IGNORED_REASON`].
+    /// file for [`TRACKED_BUT_IGNORED_REASON`] / [`CONFIGURED_FILE_EXCLUDE_REASON`].
     pub path: String,
     /// The `SKIP_DIRS` entry that matched, or [`CONFIGURED_EXCLUDE_REASON`]
     /// when a `[[repos]] exclude` glob did. That second value is a MARKER, not
     /// the glob itself: `filter_entry` matches against a compiled `GlobSet`,
     /// which reports THAT something matched and not WHICH pattern.
     pub reason: String,
+    /// The specific `[[repos]] exclude` pattern that matched, when known.
+    ///
+    /// nw-437: only populated for [`CONFIGURED_FILE_EXCLUDE_REASON`] rows,
+    /// where the match is tested against `self.excludes` directly and
+    /// `GlobSet::matches` (not just `is_match`) can name which of the
+    /// configured patterns fired. `None` for every other reason, including the
+    /// directory-prune `CONFIGURED_EXCLUDE_REASON` case — see that constant's
+    /// sibling doc comment on why the directory path cannot recover this.
+    pub matched_pattern: Option<String>,
 }
 
 impl FilesystemReader {
@@ -351,8 +423,10 @@ impl FilesystemReader {
             repo_path: repo_path.to_path_buf(),
             limits: IndexLimits::default(),
             excludes: None,
+            exclude_patterns: Vec::new(),
             dir_excludes: None,
             unskip: std::collections::HashSet::new(),
+            skip_dirs: crate::index::SKIP_DIRS,
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
@@ -363,11 +437,30 @@ impl FilesystemReader {
             repo_path: repo_path.to_path_buf(),
             limits,
             excludes: None,
+            exclude_patterns: Vec::new(),
             dir_excludes: None,
             unskip: std::collections::HashSet::new(),
+            skip_dirs: crate::index::SKIP_DIRS,
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Override the directory blocklist this reader's walk prunes by.
+    ///
+    /// nw-436: `list_files` used to prune EVERY caller's walk by
+    /// [`crate::index::SKIP_DIRS`] unconditionally — a list curated for source
+    /// repos (`.claude`, `.superpowers`, `node_modules`, `vendor`, ...). The
+    /// vault indexer shares this reader but is not a source repo: a vault's
+    /// `.claude/skills/*.md` are notes the user wrote. `index_md.rs` already
+    /// maintained its own, smaller `SKIP_DIRS` for exactly this reason, but the
+    /// reader ignored it, so a vault's `.claude/` was pruned before
+    /// `index_md.rs`'s post-filter ever ran, silently and with no disclosure.
+    /// Call this with that vault-specific list so the walk — and therefore the
+    /// disclosure it now feeds — reflects vault semantics instead of code ones.
+    pub fn with_skip_dirs(mut self, skip_dirs: &'static [&'static str]) -> Self {
+        self.skip_dirs = skip_dirs;
+        self
     }
 
     /// Opt this repo back in to directory names the default blocklist prunes.
@@ -392,6 +485,7 @@ impl FilesystemReader {
         if globs.is_empty() {
             return Ok(self);
         }
+        self.exclude_patterns = globs.to_vec();
         let mut builder = GlobSetBuilder::new();
         let mut dir_builder = GlobSetBuilder::new();
         for g in globs {
@@ -465,7 +559,14 @@ impl FilesystemReader {
             .iter()
             .filter(|rel| !seen.contains(rel.as_path()))
             .filter(|rel| crate::index::is_parseable(rel))
-            .filter(|rel| !crate::index::path_in_skip_dir_with_unskip(rel, &self.unskip))
+            // nw-436: consult THIS reader's own `skip_dirs` (which may be the
+            // vault list, not `crate::index::SKIP_DIRS`) rather than the
+            // hardcoded code blocklist — otherwise a name this reader was
+            // configured to NOT prune (e.g. `.claude` for a vault) would still
+            // suppress its nw-394 disclosure here, on the theory that it was
+            // "already disclosed at directory granularity", when for this
+            // reader it was never pruned at all.
+            .filter(|rel| !path_in_configured_skip_dir(rel, self.skip_dirs, &self.unskip))
             .filter(|rel| !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel)))
             .filter(|rel| {
                 !rel.ancestors().skip(1).any(|dir| {
@@ -479,6 +580,7 @@ impl FilesystemReader {
             .map(|rel| SkippedDir {
                 path: rel.to_string_lossy().into_owned(),
                 reason: TRACKED_BUT_IGNORED_REASON.to_string(),
+                matched_pattern: None,
             })
             .collect();
         if rows.is_empty() {
@@ -665,6 +767,11 @@ impl ContentReader for FilesystemReader {
         let root = self.repo_path.clone();
         let dir_excludes = self.dir_excludes.clone();
         let unskip = self.unskip.clone();
+        // nw-436: this reader's OWN blocklist, not `crate::index::SKIP_DIRS`
+        // unconditionally. `&'static [&'static str]` is `Copy`, so this moves a
+        // reference into the `'static` closure below with no lifetime issue —
+        // see `Self::skip_dirs`'s doc comment for why this must vary by caller.
+        let skip_dirs = self.skip_dirs;
         let recorded = std::sync::Arc::clone(&self.skipped_dirs);
         if let Ok(mut pruned) = recorded.lock() {
             pruned.clear();
@@ -692,11 +799,12 @@ impl ContentReader for FilesystemReader {
                             pruned.push(SkippedDir {
                                 path: rel.to_string_lossy().into_owned(),
                                 reason: reason.to_string(),
+                                matched_pattern: None,
                             });
                         }
                     };
                     if let Some(name) = e.file_name().to_str()
-                        && crate::index::SKIP_DIRS.contains(&name)
+                        && skip_dirs.contains(&name)
                         && !unskip.contains(name)
                     {
                         note(name);
@@ -725,8 +833,31 @@ impl ContentReader for FilesystemReader {
             if entry.file_type().is_some_and(|ft| ft.is_file())
                 && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
             {
-                if self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel)) {
-                    continue;
+                // nw-437: a FILE-shaped `[[repos]] exclude` glob is tested here,
+                // below `filter_entry` — the directory-level prune above cuts a
+                // subtree before enumeration ever reaches this loop, but a
+                // pattern like `other.rs` names no directory to prune, so the
+                // file is filtered per-entry instead. That used to just
+                // `continue`, silently: the file was gone from the graph while
+                // `skipped_files` stayed empty and `coverage_status` read
+                // "complete". Record it through the SAME channel the directory
+                // case uses, so both shapes reach `index::disclose_pruned_dir`.
+                if let Some(gs) = self.excludes.as_ref() {
+                    let matches = gs.matches(rel);
+                    if !matches.is_empty() {
+                        let matched_pattern = matches
+                            .first()
+                            .and_then(|&i| self.exclude_patterns.get(i))
+                            .cloned();
+                        if let Ok(mut pruned) = self.skipped_dirs.lock() {
+                            pruned.push(SkippedDir {
+                                path: rel.to_string_lossy().into_owned(),
+                                reason: CONFIGURED_FILE_EXCLUDE_REASON.to_string(),
+                                matched_pattern,
+                            });
+                        }
+                        continue;
+                    }
                 }
                 files.push(rel.to_path_buf());
             }
@@ -1739,6 +1870,109 @@ mod tests {
         assert!(
             !names.contains(&"assets/app.min.js".to_string()),
             "file-shaped glob must be excluded: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_level_exclude_glob_is_disclosed_not_only_a_directory_one() {
+        // nw-437. `filesystem_reader_excludes_file_shaped_globs` above already
+        // pins that a file-shaped `exclude` glob (`**/*.min.js`) keeps the file
+        // out of `list_files()` — that half worked. What did NOT work is
+        // disclosure: unlike a directory prune (recorded inside
+        // `filter_entry`, before enumeration), a per-file match was tested
+        // only in the main loop below the walker and just `continue`d, so
+        // `skipped_dirs()` never grew a row for it. A user who excluded ONE
+        // file by name got a graph that reported complete coverage over it —
+        // the exact shape nw-325/nw-387 exist to kill.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/keep.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/other.rs"), "").unwrap();
+
+        let reader = FilesystemReader::new(dir.path())
+            .excluding(&["src/other.rs".to_string()])
+            .unwrap();
+        let names: Vec<String> = reader
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !names.contains(&"src/other.rs".to_string()),
+            "the excluded file must still be absent from the graph: {names:?}"
+        );
+
+        let skipped = reader.skipped_dirs();
+        let row = skipped
+            .iter()
+            .find(|d| d.path == "src/other.rs")
+            .unwrap_or_else(|| {
+                panic!("excluded FILE must be disclosed, not just absent: {skipped:?}")
+            });
+        assert_eq!(row.reason, CONFIGURED_FILE_EXCLUDE_REASON);
+        assert_eq!(
+            row.matched_pattern.as_deref(),
+            Some("src/other.rs"),
+            "the disclosure should name the exact glob that matched: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_vault_skip_dirs_override_does_not_prune_a_code_only_name() {
+        // nw-436. `FilesystemReader::list_files` used to prune EVERY caller's
+        // walk by `crate::index::SKIP_DIRS` unconditionally — a list curated
+        // for source repos, which includes `.claude` and `.superpowers`. The
+        // vault indexer (`index_md.rs`) shares this reader but maintains its
+        // OWN, smaller `SKIP_DIRS` that does not name either directory,
+        // because a vault's `.claude/skills/*.md` are notes the user wrote,
+        // not tooling config. `with_skip_dirs` is what lets a caller say "use
+        // MY list, not the code one".
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude/skills/foo")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/skills/foo/SKILL.md"),
+            "# A note the user wrote\n",
+        )
+        .unwrap();
+
+        // Control: the CODE default still prunes `.claude` (unchanged
+        // behaviour for every existing code-indexing caller).
+        let code_reader = FilesystemReader::new(dir.path());
+        let code_names: Vec<String> = code_reader
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !code_names.iter().any(|n| n.contains(".claude")),
+            "the code default must still prune .claude: {code_names:?}"
+        );
+        // And that prune must still be disclosed under the DEFAULT list too.
+        let code_skipped = code_reader.skipped_dirs();
+        assert!(
+            code_skipped.iter().any(|d| d.path == ".claude"),
+            "a code-path .claude prune must still be disclosed: {code_skipped:?}"
+        );
+
+        // A vault-style override must NOT prune it.
+        const VAULT_SKIP_DIRS: &[&str] = &[".obsidian", ".trash", ".git"];
+        let vault_reader = FilesystemReader::new(dir.path()).with_skip_dirs(VAULT_SKIP_DIRS);
+        let vault_names: Vec<String> = vault_reader
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            vault_names.contains(&".claude/skills/foo/SKILL.md".to_string()),
+            "a vault-scoped skip-dirs override must not drop notes under .claude: {vault_names:?}"
+        );
+        assert!(
+            vault_reader.skipped_dirs().is_empty(),
+            "nothing was pruned under the vault list, so nothing should be disclosed: {:?}",
+            vault_reader.skipped_dirs()
         );
     }
 

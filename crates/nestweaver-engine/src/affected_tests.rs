@@ -97,6 +97,11 @@ pub struct AffectedTestsResult {
     pub notifications: Vec<Notification>,
     /// Repositories whose persisted edges were not produced by the exact
     /// resolver generation this binary understands.
+    ///
+    /// nw-371: distinct from `_meta.stale_repos` (federation lag) and from
+    /// `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools,
+    /// different populations under the same key name). See the glossary on
+    /// `ResolverStaleness` in `src/main.rs` for the full list.
     #[serde(default)]
     pub resolver_stale_repos: Vec<String>,
     /// Machine-readable CI directive derived from `status` (TIA-style

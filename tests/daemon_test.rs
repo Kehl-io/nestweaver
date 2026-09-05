@@ -823,7 +823,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut start = normal_daemon_cmd();
     start
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "start"])
         .assert()
         .success();
@@ -837,7 +836,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
         || {
             let mut stop = normal_daemon_cmd();
             let _ = stop
-                .arg("--no-embed")
                 .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
                 .output();
         },
@@ -849,7 +847,6 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut second = normal_daemon_cmd();
     second
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "start"])
         .assert()
         .success()
@@ -862,15 +859,13 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
 
     let mut status = normal_daemon_cmd();
     status
-        .arg("--no-embed")
         .args(["daemon", "--db", &db_path.display().to_string(), "status"])
         .assert()
         .success()
         .stdout(contains("running"));
 
     let mut stop = normal_daemon_cmd();
-    stop.arg("--no-embed")
-        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+    stop.args(["daemon", "--db", &db_path.display().to_string(), "stop"])
         .assert()
         .success();
 
@@ -934,7 +929,6 @@ credential_method = "gh"
 
     let mut start = normal_daemon_cmd();
     start
-        .arg("--no-embed")
         .args([
             "daemon",
             "--db",
@@ -977,8 +971,7 @@ credential_method = "gh"
     );
 
     let mut stop = normal_daemon_cmd();
-    stop.arg("--no-embed")
-        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+    stop.args(["daemon", "--db", &db_path.display().to_string(), "stop"])
         .assert()
         .success();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1006,7 +999,7 @@ fn macos_temp_start_reports_child_failure_promptly() {
     let started = std::time::Instant::now();
 
     let mut command = normal_daemon_cmd();
-    command.arg("--no-embed").args([
+    command.args([
         "daemon",
         "--db",
         &db_path.display().to_string(),
@@ -1756,6 +1749,125 @@ fn ui_different_port_ui_during_outage_stays_degraded_then_recovers() {
     assert!(
         ui_a.is_alive(),
         "ui_a must still be the original process (no restart)"
+    );
+}
+
+/// FIXTURE ADEQUACY for the two tests below. `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS`
+/// only shortens the WINDOW nw-088 leg (2)'s heuristic uses — it must not,
+/// on its own, make a temp-path daemon die for some unrelated reason (a
+/// crash, a port clash) that would make either test pass or fail for the
+/// wrong reason. A plain one-shot command (`daemon status`, which issues one
+/// RPC and exits — no `ui`, no long-running declaration) autostarting a
+/// daemon against a temp-shaped `--db` and then going idle must still see
+/// that daemon self-terminate within the shortened window: proof this
+/// harness can genuinely exhibit the mechanism under test, on the SAME env
+/// var and the SAME temp-path shape the `ui` test below reuses.
+#[test]
+fn one_shot_ephemeral_daemon_still_dies_within_the_shortened_idle_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    // `dir` is already under the OS temp root, so `db_path` is temp-shaped —
+    // the exact `is_temp_db_path` branch this whole leg is about.
+    let db_path = dir.path().join("oneshot-ephemeral").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    // A one-shot, daemon-routed command: connects (autostarting the daemon
+    // with today's OneShot ephemeral idle-timeout), issues one RPC, exits.
+    // Nothing after this holds the daemon open.
+    StdCommand::new(bin_path())
+        .args(["daemon", "--db", &db_path.display().to_string(), "status"])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "3")
+        .output()
+        .expect("failed to run nestweaver daemon status");
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            std::os::unix::net::UnixStream::connect(&socket).is_err()
+        }),
+        "fixture-adequacy check: a one-shot command's autostarted daemon over \
+         a temp-shaped --db must still self-terminate within the shortened \
+         ephemeral idle window — if it does not, the test below proves \
+         nothing about `ui`'s fix specifically"
+    );
+}
+
+/// nw-088 leg (2) FOLLOW-UP (this fix). Reproduced three times by the manual
+/// regression pass, confirmed with `ps aux`: `nestweaver ui --db <path under
+/// /tmp>` autostarts its daemon with the SAME shortened ephemeral
+/// idle-timeout a one-shot command against the same path correctly gets
+/// (previous test), and the daemon self-terminates out from under the live
+/// UI session ~55-100s later in production — every daemon-routed endpoint
+/// (`/api/v1/search`, `/api/v1/symbol/{uid}`, `/api/v1/brain/context`,
+/// `/api/v1/events`) then 503s until the operator restarts it by hand.
+///
+/// Measured with a REAL timed run against the daemon `ui` actually
+/// autostarts — `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS` only shortens the
+/// window from production's 60s to a few seconds so this does not need to
+/// sleep for a minute+; nothing about the autostart/idle-timeout mechanism
+/// itself is mocked or bypassed.
+#[test]
+fn ui_autostarted_daemon_survives_past_the_ephemeral_idle_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("ui-ephemeral").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    let port = free_port();
+    let ui_stderr = std::fs::File::create(dir.path().join("ui-stderr.log")).unwrap();
+    let ui = StdCommand::new(bin_path())
+        .args([
+            "ui",
+            "--no-open",
+            "--port",
+            &port.to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD")
+        .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "3")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(ui_stderr))
+        .spawn()
+        .expect("failed to spawn nestweaver ui");
+    let mut ui = UiChildGuard(ui);
+
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            matches!(ui_http_get(port, "/api/v1/health"), Some((200, _)))
+        }),
+        "UI never reached http=200 with the daemon up"
+    );
+
+    // Sit idle well past the shortened window (3s) — long enough that the
+    // fixture-adequacy test above proves a one-shot daemon would already be
+    // dead several times over.
+    std::thread::sleep(Duration::from_secs(10));
+
+    assert!(
+        matches!(ui_http_get(port, "/api/v1/health"), Some((200, _))),
+        "a live `ui` session must survive well past the ephemeral idle \
+         window — declaring itself long-running must keep its autostarted \
+         daemon's normal idle-timeout budget, not the shortened one"
+    );
+    assert!(ui.is_alive(), "the UI process itself must still be running");
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the backing daemon must still be accepting connections, not just \
+         the UI's own HTTP port"
     );
 }
 

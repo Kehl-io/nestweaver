@@ -231,44 +231,113 @@ fn common_path_prefix(paths: &[&str]) -> Option<String> {
 }
 
 /// Compute the sidecar file path for cluster data: `<db>.clusters.json`.
+///
+/// nw-401: this is the "last-writer-wins" canonical path — every
+/// `save_clusters` call overwrites it regardless of resolution, and every
+/// caller that does not care WHICH resolution answered (the `hubs`/`bridges`
+/// cluster-attachment paths, `blast_radius`, and `cluster <id>` with no
+/// `--resolution`) reads it. It is kept, unchanged, for exactly those
+/// callers. What changed is that it is no longer the ONLY record: see
+/// [`sidecar_path_for_resolution`].
 pub fn sidecar_path(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".clusters.json")
 }
 
-/// Persist clustering output to the sidecar file.
+/// The sidecar file path for cluster data at a SPECIFIC resolution:
+/// `<db>.clusters.<resolution>.json`.
+///
+/// nw-401. The single unkeyed sidecar meant `clusters --resolution 0.5`
+/// followed by an unrelated `clusters --resolution 5.0` silently reinterpreted
+/// every subsequent `cluster <id>` call: ~24 of 27 community IDs remap between
+/// resolutions on a real graph, so this was not an edge case. Keying by
+/// resolution lets multiple resolutions' clusterings coexist on disk so an
+/// explicit `cluster --resolution R` can find R's own data even after a later
+/// run at a different resolution overwrote the canonical file.
+///
+/// Formatted with `{:e}` (exponential notation) rather than `{}` or a fixed
+/// number of decimal places: Rust's float formatting is the shortest
+/// round-trippable representation in either mode, so two DIFFERENT
+/// resolutions never collide on the same filename the way fixed-precision
+/// truncation would (`0.0000001` and `0.0000005` both round to `0.000000` at
+/// 6 decimals; `1e-7` and `5e-7` do not collide as exponential strings).
+pub fn sidecar_path_for_resolution(db_path: &Path, resolution: f64) -> PathBuf {
+    crate::sidecar_path(db_path, &format!(".clusters.{resolution:e}.json"))
+}
+
+/// Atomically write `output` as JSON to `path`.
 ///
 /// Writes to a process-unique temp file and renames into place, so a
-/// concurrent `load_clusters` (e.g. `hub_nodes` racing a `clusters` call)
-/// never observes a partially-written file. Concurrent writers resolve to
-/// last-writer-wins — acceptable because the output is deterministic for a
-/// given graph state.
-pub fn save_clusters(db_path: &Path, output: &ClusteringOutput) -> Result<()> {
-    let path = sidecar_path(db_path);
+/// concurrent reader (e.g. `hub_nodes` racing a `clusters` call) never
+/// observes a partially-written file.
+fn write_clusters_atomic(path: &Path, output: &ClusteringOutput) -> Result<()> {
     let json =
         serde_json::to_string_pretty(output).context("failed to serialize clustering output")?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to move {} into place", path.display()));
     }
     Ok(())
 }
 
-/// Load clustering output from the sidecar file, if it exists.
+/// Persist clustering output to the sidecar file(s).
 ///
-/// Returns `Ok(None)` when the sidecar does not exist (i.e. clusters have
-/// never been computed for this database).
-pub fn load_clusters(db_path: &Path) -> Result<Option<ClusteringOutput>> {
-    let path = sidecar_path(db_path);
+/// nw-401: writes BOTH the canonical last-writer-wins path (unchanged
+/// behavior, for callers that want "whatever was computed most recently") AND
+/// a resolution-keyed copy (so a caller that later pins `--resolution` can
+/// still find THIS run's data, undisturbed by a later run at a different
+/// resolution). Concurrent writers at the SAME resolution still resolve to
+/// last-writer-wins on the keyed path too — acceptable, because the output is
+/// deterministic for a given graph state and resolution.
+pub fn save_clusters(db_path: &Path, output: &ClusteringOutput) -> Result<()> {
+    write_clusters_atomic(&sidecar_path(db_path), output)?;
+    write_clusters_atomic(
+        &sidecar_path_for_resolution(db_path, output.resolution),
+        output,
+    )?;
+    Ok(())
+}
+
+/// Load a clustering output from a specific sidecar file path.
+fn load_clusters_from(path: &Path) -> Result<Option<ClusteringOutput>> {
     if !path.exists() {
         return Ok(None);
     }
     let json =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let output: ClusteringOutput =
         serde_json::from_str(&json).context("failed to parse clusters sidecar")?;
     Ok(Some(output))
+}
+
+/// Load clustering output from the canonical (unkeyed) sidecar file, if it
+/// exists.
+///
+/// Returns `Ok(None)` when the sidecar does not exist (i.e. clusters have
+/// never been computed for this database). This is "whatever was computed
+/// most recently, at whichever resolution" — the same last-writer-wins
+/// semantics this function has always had. Callers that need a SPECIFIC
+/// resolution, immune to a later differently-resolved run, must use
+/// [`load_clusters_for_resolution`] instead.
+pub fn load_clusters(db_path: &Path) -> Result<Option<ClusteringOutput>> {
+    load_clusters_from(&sidecar_path(db_path))
+}
+
+/// Load clustering output computed at EXACTLY `resolution`, if it has ever
+/// been computed and saved for this database.
+///
+/// nw-401. Unlike [`load_clusters`], this cannot be poisoned by an unrelated
+/// `clusters --resolution` run at a different resolution: it reads the
+/// resolution-keyed sidecar, which a later run at a DIFFERENT resolution
+/// never touches (it writes its own key). Returns `Ok(None)` when nobody has
+/// computed clusters at this exact resolution for this database yet — the
+/// caller must decide whether to compute it now or refuse.
+pub fn load_clusters_for_resolution(
+    db_path: &Path,
+    resolution: f64,
+) -> Result<Option<ClusteringOutput>> {
+    load_clusters_from(&sidecar_path_for_resolution(db_path, resolution))
 }
 
 #[cfg(test)]
@@ -342,6 +411,84 @@ mod tests {
         let db = Path::new("/tmp/test.lbug");
         let expected = PathBuf::from("/tmp/test.lbug.clusters.json");
         assert_eq!(sidecar_path(db), expected);
+    }
+
+    /// nw-401. The defect: `clusters --resolution 0.5` then an unrelated
+    /// `clusters --resolution 5.0` silently reinterpreted every later
+    /// `cluster <id>` call, because both writes landed on the SAME unkeyed
+    /// sidecar. This pins the fix: the resolution-keyed load must return
+    /// EXACTLY what was saved at that resolution, unperturbed by a later save
+    /// at a different resolution, while the canonical unkeyed load keeps its
+    /// existing last-writer-wins behavior for callers that want it.
+    #[test]
+    fn a_later_resolution_cannot_poison_an_earlier_ones_keyed_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        let low = ClusteringOutput {
+            resolution: 0.5,
+            modularity: 0.42,
+            communities: vec![CommunityInfo {
+                id: 2,
+                name: "low-res".to_string(),
+                cohesion: 0.906,
+                member_count: 36,
+                members: vec![],
+                key_files: vec![],
+            }],
+        };
+        save_clusters(&db_path, &low).unwrap();
+
+        let high = ClusteringOutput {
+            resolution: 5.0,
+            modularity: 0.9,
+            communities: vec![CommunityInfo {
+                id: 2,
+                name: "high-res".to_string(),
+                cohesion: 0.266,
+                member_count: 3,
+                members: vec![],
+                key_files: vec![],
+            }],
+        };
+        save_clusters(&db_path, &high).unwrap();
+
+        // The keyed load for 0.5 must still see the FIRST run's data, even
+        // though the second `save_clusters` ran after it and shares the
+        // canonical unkeyed path.
+        let pinned = load_clusters_for_resolution(&db_path, 0.5)
+            .unwrap()
+            .expect("resolution 0.5 was saved and must still be found");
+        assert_eq!(pinned.communities[0].member_count, 36);
+        assert_eq!(pinned.communities[0].name, "low-res");
+
+        // The keyed load for 5.0 sees its own data too — this isn't a
+        // one-survivor accident.
+        let other = load_clusters_for_resolution(&db_path, 5.0)
+            .unwrap()
+            .expect("resolution 5.0 was saved and must be found");
+        assert_eq!(other.communities[0].member_count, 3);
+
+        // COUNTERWEIGHT: invert the claim. The UNKEYED canonical load is
+        // documented as last-writer-wins and must still behave that way — the
+        // fix must not have accidentally made EVERY load resolution-stable,
+        // which would silently change behavior for callers (hubs/bridges
+        // cluster-attachment, blast_radius) that rely on "whatever is most
+        // recent".
+        let canonical = load_clusters(&db_path).unwrap().unwrap();
+        assert_eq!(
+            canonical.communities[0].member_count, 3,
+            "the canonical sidecar must still reflect the LAST save, not the first"
+        );
+
+        // A resolution nobody ever computed must not be silently satisfied by
+        // partial-match filename luck.
+        assert!(
+            load_clusters_for_resolution(&db_path, 1.0)
+                .unwrap()
+                .is_none(),
+            "a resolution that was never saved must not be found"
+        );
     }
 
     #[test]

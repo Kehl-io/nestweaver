@@ -1960,6 +1960,24 @@ pub struct DaemonGcReport {
     /// in every root they occupy. Not an error: unidentifiable means
     /// undeletable, by design.
     pub unidentified: Vec<String>,
+    /// nw-088 leg (1). A LIVE daemon (proven by its pidfile flock, or its
+    /// database write lock) whose `--db` path no longer exists on disk — the
+    /// state a directly-spawned daemon reaches when its database files are
+    /// removed out from under it while the process stays alive.
+    ///
+    /// This sweep never signals a live process — that is `daemon stop`'s job,
+    /// not a directory-hygiene pass's — so an instance in this list is ALSO
+    /// in `spared` (and in `spared_pidfile_lock` and/or
+    /// `spared_database_write_lock`, whichever the kernel could still prove).
+    /// What this list adds is the fact those three could not state: sparing
+    /// it forever, with no path back, is not the same as sparing a daemon
+    /// that still serves a real database. The remedy is nameable —
+    /// `nestweaver daemon --db <path> stop` reclaims it, because `stop`
+    /// locates the process by socket/pidfile rather than by re-checking that
+    /// the database exists — and reporting it here is what lets an operator
+    /// find that remedy instead of reading "spared (pidfile lock held)"
+    /// forever with no indication anything is wrong.
+    pub spared_daemon_database_gone: Vec<(String, PathBuf)>,
     /// The socket-fallback root was skipped because it is not a real
     /// directory owned by this user — the squat shape
     /// [`secure_fallback_sock_dir`] refuses at daemon startup. A
@@ -2422,6 +2440,24 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
             if ownership.pidfile_lock_held {
                 report.spared_pidfile_lock.push(name.clone());
             }
+            // nw-088 leg (1). A live daemon is being spared exactly as
+            // designed — this sweep never signals a process — but if its
+            // database is gone, sparing it FOREVER with no indication
+            // anything is wrong is the defect: gc inspects launchd agents
+            // and directory ownership, never whether `--db` still exists.
+            // Name the gap and the remedy, in addition to (not instead of)
+            // the ownership facts already recorded above.
+            if !db_path.exists() {
+                tracing::info!(
+                    instance = name.as_str(),
+                    db = %db_path.display(),
+                    "sparing a live daemon whose database no longer exists — \
+                     `daemon stop` can still reclaim it"
+                );
+                report
+                    .spared_daemon_database_gone
+                    .push((name.clone(), db_path.clone()));
+            }
             report.spared.push(name);
             continue;
         }
@@ -2456,6 +2492,7 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
     report.spared_database_write_lock.sort();
     report.spared_database_unreadable.sort();
     report.spared_pidfile_lock.sort();
+    report.spared_daemon_database_gone.sort();
     report.unidentified.sort();
     Ok(report)
 }
@@ -4224,6 +4261,116 @@ mod tests {
         );
         assert!(report.spared_database_unreadable.is_empty());
         assert!(report.removed.is_empty());
+    }
+
+    /// nw-088 leg (1)'s exact repro: a daemon holding its pidfile flock (the
+    /// process is genuinely alive) whose `--db` path has been deleted out
+    /// from under it. `gc` is RIGHT to spare it — a directory-hygiene sweep
+    /// must never signal a live process — but before this fix it gave no
+    /// indication that anything unusual was true of this instance versus a
+    /// perfectly healthy one, so it was spared silently, forever, with no
+    /// path back. `spared_daemon_database_gone` is the fact that closes that
+    /// gap: the same instance, plus its now-nonexistent database path, named
+    /// explicitly so an operator can act (`daemon stop --db <path>`).
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_names_a_live_daemon_whose_database_is_gone() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("deaddead", db.to_str().unwrap());
+            let pidfile = pidfile_path("deaddead");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, b"").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            // The process (proven alive by the held flock above) stays up;
+            // only its database is removed out from under it.
+            std::fs::remove_file(&db).unwrap();
+
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+            report
+        });
+
+        assert_eq!(
+            report.spared,
+            vec!["deaddead".to_string()],
+            "gc must never signal a live process — sparing it is still correct"
+        );
+        assert_eq!(report.spared_pidfile_lock, vec!["deaddead".to_string()]);
+        assert!(
+            report.spared_database_write_lock.is_empty(),
+            "the path is gone, so the kernel has nothing to hold a lock on"
+        );
+        assert_eq!(
+            report.spared_daemon_database_gone,
+            vec![("deaddead".to_string(), db.clone())],
+            "the gap this item names: a live daemon whose --db no longer exists, \
+             with the concrete path an operator needs for `daemon stop --db <path>`"
+        );
+        assert!(report.removed.is_empty());
+    }
+
+    /// The counterweight: a live daemon whose database DOES still exist must
+    /// not be reported in `spared_daemon_database_gone` at all — otherwise the
+    /// test above could pass by reporting every spared instance as
+    /// database-gone regardless of the filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_does_not_flag_a_live_daemon_whose_database_still_exists() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("beefbeef", db.to_str().unwrap());
+            let pidfile = pidfile_path("beefbeef");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, b"").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+            report
+        });
+
+        assert_eq!(report.spared, vec!["beefbeef".to_string()]);
+        assert_eq!(report.spared_pidfile_lock, vec!["beefbeef".to_string()]);
+        assert!(
+            report.spared_daemon_database_gone.is_empty(),
+            "the database still exists, so this must stay empty"
+        );
     }
 
     /// The evidence layers are independent: the pidfile flock still spares an

@@ -232,6 +232,11 @@ pub struct BlastRadiusResult {
     pub notifications: Vec<Notification>,
     /// Repositories whose edge semantics cannot be trusted by this resolver.
     /// Kept separate from `coverage.stale_repos`, which means behind-git-HEAD.
+    ///
+    /// nw-371: also distinct from `_meta.stale_repos` (federation lag) and
+    /// from `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools,
+    /// different populations under the same key name). See the glossary on
+    /// `ResolverStaleness` in `src/main.rs` for the full list.
     #[serde(default)]
     pub resolver_stale_repos: Vec<String>,
     /// The gate verdict, derived from `status` + `risk_level`. Never emits

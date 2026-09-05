@@ -579,7 +579,14 @@ message BrainContextRequest {
   string root = 15;
   bool prf = 16;
   bool rerank = 17;
-  double weight_semantic = 18;
+  // nw-430 FIX 2. `optional`, matching `ProjectContextRequest.include_components`'s
+  // precedent (nw-316): a plain proto3 `double` cannot distinguish an
+  // explicit 0.0 (what `--no-embed` sends) from "never set", so a server-side
+  // `if weight_semantic > 0.0` guard silently dropped an explicit disable and
+  // fell back to the config default — the exact bug this field's `optional`
+  // now closes. Wire-compatible: the field number and base type are
+  // unchanged, `optional` only adds presence tracking.
+  optional double weight_semantic = 18;
   string since = 19;
   double recency_weight = 20;
   double recency_half_life_days = 21;
@@ -623,6 +630,13 @@ message ProjectContextRequest {
   repeated string tags = 13;
   // Drop note/section nodes tagged with any of these tags.
   repeated string exclude_tags = 14;
+  // nw-430 FIX 1. Disable semantic ranking for this call. A plain proto3
+  // `bool` is sufficient here (unlike `weight_semantic` on
+  // `BrainContextRequest`, which needs `optional` to distinguish an
+  // explicit 0.0 from unset): `no_embed` has only two meaningful states,
+  // "disable" (true) and "don't" (false/absent), so there is no third state
+  // presence-tracking would need to recover.
+  bool no_embed = 15;
 }
 message ProjectContextResponse { string result_json = 1; }
 

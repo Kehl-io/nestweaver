@@ -2941,6 +2941,72 @@ class Config:
         );
     }
 
+    // nw-434: a call with an explicit template-argument list between the
+    // callee name and the argument list -- `f<T>(args)` -- produces no CALLS
+    // reference at all. Confirmed real instance:
+    // `third_party/antlr4_runtime/src/tree/Trees.cpp`, `Trees::findAllNodes`
+    // calling `_findAllNodes<ParseTree *>(t, index, findTokens, nodes)` at
+    // line 185, reported dead code because that one call was invisible to the
+    // graph while the self-recursive call inside `_findAllNodes` (no template
+    // args, plain `identifier` callee) resolved fine.
+    #[test]
+    fn cpp_templated_free_function_call_is_a_reference() {
+        let parsed = parse_source(
+            Path::new("a.cpp"),
+            "void _findAllNodes(int t) {}\nvoid findAllNodes(int t) {\n    _findAllNodes<int>(t);\n}\n",
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.name == "_findAllNodes" && r.kind == ReferenceKind::Call),
+            "f<T>(...) must produce a Call reference: {:#?}",
+            parsed.references
+        );
+    }
+
+    /// Sibling form: a qualified call with explicit template arguments --
+    /// `ns::f<T>(...)` (and, by the same grammar node, `Base::f<T>(...)` for a
+    /// class-qualified static/inherited method call).
+    #[test]
+    fn cpp_templated_qualified_call_is_a_reference() {
+        let parsed = parse_source(
+            Path::new("a.cpp"),
+            "void setup() {\n    sensors::calibrate<int>(1);\n}\n",
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.name == "calibrate" && r.kind == ReferenceKind::Call),
+            "ns::f<T>(...) must produce a Call reference: {:#?}",
+            parsed.references
+        );
+    }
+
+    /// Sibling form: a member call with explicit template arguments --
+    /// `obj.f<T>(...)`. Verified separately (not re-checked here, since it is
+    /// the identical AST shape modulo the `operator` field) that `ptr->f<T>()`
+    /// parses through the same `field_expression` / `template_method` nodes.
+    #[test]
+    fn cpp_templated_member_call_is_a_reference() {
+        let parsed = parse_source(
+            Path::new("a.cpp"),
+            "void setup() {\n    Sensor s;\n    s.readTyped<int>();\n}\n",
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.name == "readTyped" && r.kind == ReferenceKind::Call),
+            "obj.f<T>(...) must produce a Call reference: {:#?}",
+            parsed.references
+        );
+    }
+
     // ── Rust tests ──────────────────────────────────────────────────────
 
     #[test]

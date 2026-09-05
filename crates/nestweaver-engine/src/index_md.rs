@@ -78,6 +78,20 @@ pub struct MarkdownRefreshResult {
 }
 
 /// Canonical full-refresh summary shared by direct CLI and daemon progress.
+///
+/// nw-196: this is the ONLY call site `format_markdown_refresh_summary` has in
+/// `src/main.rs` (the `brain refresh` full-refresh branch), which is what
+/// makes this the right — and sufficient — place to fix. `brain add` already
+/// printed each skipped file's path and reason itself (`"  {path} - {reason}"`,
+/// in `src/main.rs`'s vault-add arm); `brain refresh` called this function and
+/// got only the aggregate "Coverage DEGRADED: N note file(s) skipped." line,
+/// with no way to learn which N. Per the standing lesson here (nw-217: two
+/// implementations of one disclosure drift), the fix is not a second itemised
+/// printer for `refresh` — it is making the summary EVERY caller of this
+/// function already prints include the same detail `brain add` prints
+/// separately, so the one shared function becomes the one reporting path.
+/// Matches `brain add`'s per-line format exactly (`  {path} - {reason}`) so
+/// the two commands read as one contract, not two coincidentally similar ones.
 pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String {
     let mut summary = format!(
         "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
@@ -98,22 +112,79 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
             " Coverage DEGRADED: {} note file(s) skipped.",
             result.index.skipped.len()
         ));
+        for sf in &result.index.skipped {
+            summary.push_str(&format!("\n  {} - {}", sf.path, sf.reason));
+        }
     }
     summary
 }
 
-/// Directory names skipped when walking a vault. Includes `.obsidian` (config),
-/// `.trash` (Obsidian's recycle bin), and common synthetic dirs.
+/// Directory names skipped when walking a vault.
+///
+/// nw-436 review (FIX 1): this used to be a 9-entry list, and switching vault
+/// walks from `crate::index::SKIP_DIRS` (the code list, 32 entries) to THIS
+/// list — the nw-436 fix — admitted `.claude` (intended) and 24 OTHER
+/// directory names that were never evaluated (`.venv`, `venv`, `vendor`,
+/// `Pods`, `coverage`, `__pycache__`, `.tox`, `.mypy_cache`, `.ruff_cache`,
+/// `playwright-report`, `test-results`, `.expo`, `.wrangler`, `.astro`,
+/// `public`, `out`, `.output`, `storybook-static`, `.gradle`, `env`, `.pio`,
+/// `.superpowers`, ...). Measured: a vault with one `.md` planted under each
+/// of 16 such directories reported `Indexed 17 notes` — all of them. A vault
+/// living near a Python/Node project, or a home directory doubling as a vault
+/// root, would silently ingest thousands of vendored `README.md`s into a
+/// personal knowledge graph — a WORSE version of the defect nw-436 exists to
+/// fix: instead of silently dropping content, silently ingesting noise.
+///
+/// So this list is now `crate::index::SKIP_DIRS` VERBATIM, minus the two
+/// directories that hold user-authored content in a vault (`.claude`,
+/// `.superpowers` — both are agent skills/instructions the operator wrote,
+/// the nw-436 population), plus the two vault-only entries code repos never
+/// have (`.obsidian`, `.trash`). The principle: a vault should still skip
+/// build output, vendored dependencies and tool artefacts (that noise is not
+/// notes, in a vault or a repo) while admitting user-authored agent content.
+/// `.claude`/`.superpowers` and `.obsidian`/`.trash` are decided explicitly,
+/// not defaulted: the former look user-authored (skills/instructions the
+/// operator wrote); the latter are Obsidian's own app config and recycle
+/// bin — never notes, by construction — which is also why both are in
+/// `index::UNDISCLOSED_PRUNES` rather than degrading every vault's coverage
+/// forever (see that constant's doc comment).
+///
+/// DO NOT hand-curate this list again without checking it against
+/// `crate::index::SKIP_DIRS` — the whole point of nw-436's review is that a
+/// list built independently drifts silently, in either direction.
 const SKIP_DIRS: &[&str] = &[
     ".obsidian",
     ".trash",
     ".git",
     "node_modules",
     "target",
-    ".next",
-    ".nuxt",
+    "__pycache__",
+    "vendor",
     "dist",
     "build",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".astro",
+    ".wrangler",
+    "test-results",
+    "playwright-report",
+    ".expo",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "env",
+    ".env",
+    ".pio",
+    "Pods",
+    ".gradle",
+    "public",
+    "out",
+    ".output",
+    "storybook-static",
 ];
 
 /// Returns true if any component of `rel_path` matches one of the vault
@@ -280,8 +351,14 @@ pub fn index_markdown_directory_with_store_and_deletion_count(
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    // nw-436: this reader's prune list is the VAULT one, not the code default
+    // `FilesystemReader::with_limits` used to leave in place — see
+    // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
+    // (notes the user wrote) vanished from the graph the same way a code
+    // repo's `.claude/` tooling config is meant to.
     let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
+            .with_skip_dirs(SKIP_DIRS);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
@@ -329,8 +406,14 @@ pub fn index_markdown_directory_in_memory(
 ) -> Result<(MarkdownIndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("create in-memory GraphStore")?;
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    // nw-436: this reader's prune list is the VAULT one, not the code default
+    // `FilesystemReader::with_limits` used to leave in place — see
+    // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
+    // (notes the user wrote) vanished from the graph the same way a code
+    // repo's `.claude/` tooling config is meant to.
     let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
+            .with_skip_dirs(SKIP_DIRS);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
     let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result.index, store))
@@ -545,8 +628,14 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    // nw-436: this reader's prune list is the VAULT one, not the code default
+    // `FilesystemReader::with_limits` used to leave in place — see
+    // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
+    // (notes the user wrote) vanished from the graph the same way a code
+    // repo's `.claude/` tooling config is meant to.
     let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
+            .with_skip_dirs(SKIP_DIRS);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
@@ -1582,6 +1671,27 @@ where
     // silently excluded — matching the old WalkDir + symlink-rejection
     // behaviour.
     let all_files = reader.list_files()?;
+
+    // nw-196/nw-436/nw-437: DRAIN THE SAME PRUNE RECORDER `index.rs`'s code
+    // path reads. Before this, a directory or file this reader's walk pruned
+    // (a vault `SKIP_DIRS` name, or a `[[repos]] exclude` glob) was invisible
+    // to the vault indexer: `FilesystemReader::skipped_dirs()` existed and was
+    // populated, but nothing on this path ever called it, so a pruned
+    // directory vanished from a vault with no trace — `Indexed 0 notes`,
+    // exit 0, and no `Coverage DEGRADED` line, the exact shape nw-436 was
+    // filed from. `disclose_pruned_dir` is `index.rs`'s existing builder
+    // (made `pub(crate)` for this), shared rather than re-implemented so the
+    // two commands cannot disagree about the same vault. MUST STAY
+    // IMMEDIATELY AFTER `list_files`, for the same reason `index.rs`'s drain
+    // does: the recorder is cleared at the top of every `list_files` call.
+    for pruned in reader.skipped_dirs() {
+        if let Some(sf) =
+            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
+        {
+            skipped.push(sf);
+        }
+    }
+
     for rel_path in all_files {
         if !is_markdown(&rel_path) {
             continue;
@@ -4127,6 +4237,19 @@ sub b body
 
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "x").unwrap();
         assert_eq!(result.notes_count, 1, "only real.md should be indexed");
+        // nw-436 review, FIX 2: `.obsidian` is present in EVERY Obsidian vault.
+        // Now that the vault drain (nw-436) is wired, disclosing it would
+        // degrade `coverage_status` on literally every vault forever — a gate
+        // that always fires carries no information, exactly the failure
+        // `index::UNDISCLOSED_PRUNES`'s doc comment explains for `.git`. It is
+        // Obsidian's own app config, never notes, by construction, so it earns
+        // the same carve-out `.git` does rather than a vault-unaware remedy.
+        assert!(
+            result.skipped.is_empty(),
+            "`.obsidian` must be pruned SILENTLY, not reported as degraded \
+             coverage on every vault: {:?}",
+            result.skipped
+        );
     }
 
     #[test]
@@ -4139,6 +4262,122 @@ sub b body
 
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "x").unwrap();
         assert_eq!(result.notes_count, 1);
+    }
+
+    #[test]
+    fn dot_claude_notes_are_indexed_not_silently_dropped() {
+        // nw-436. `FilesystemReader::list_files()` used to prune EVERY caller
+        // by `crate::index::SKIP_DIRS` (the CODE blocklist, which includes
+        // `.claude`/`.superpowers`) regardless of who was calling it. A vault's
+        // `.claude/skills/*.md` are notes the user wrote, not tooling config —
+        // unlike a code repo, where skipping `.claude` is defensible — and
+        // `index_md.rs` already maintains its OWN, smaller `SKIP_DIRS` that
+        // does not name either directory, for exactly that reason. Before the
+        // fix this reported `notes_count: 0` with an EMPTY `skipped` list: the
+        // file was in neither the graph nor the disclosure.
+        let (_dir, root) = make_vault(&[(
+            ".claude/skills/nestweaver-debug/SKILL.md",
+            "# Debug errors using NestWeaver's code+notes graph\n",
+        )]);
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.notes_count, 1,
+            ".claude/**/*.md must be indexed in a vault, not silently dropped: skipped={:?}",
+            result.skipped
+        );
+        assert!(
+            result.skipped.is_empty(),
+            "it must be INDEXED, not merely disclosed as skipped: {:?}",
+            result.skipped
+        );
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].title,
+            "Debug errors using NestWeaver's code+notes graph"
+        );
+    }
+
+    #[test]
+    fn a_vault_skip_dir_prune_reaches_the_markdown_index_result_not_only_the_recorder() {
+        // nw-436/nw-196, the vault-side twin of nw-387. `FilesystemReader::
+        // skipped_dirs()` was already populated correctly for every caller,
+        // but `index_into_store_with_write_gate` (the vault indexer) never
+        // drained it into `MarkdownIndexResult::skipped` — so a directory the
+        // vault's OWN skip list prunes (`node_modules` is in both lists)
+        // vanished from the vault with `notes_count` simply lower and NOTHING
+        // in `result.skipped` to say why. Per nw-387's own methodology note,
+        // this asserts on `MarkdownIndexResult`, the surface nw-436 was filed
+        // against, not on the recorder directly.
+        let (_dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            ("node_modules/leaked/README.md", "# Should not count\n"),
+        ]);
+
+        let (result, _store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.notes_count, 1, "only real.md should be indexed");
+        let row = result
+            .skipped
+            .iter()
+            .find(|sf| sf.path == "node_modules")
+            .unwrap_or_else(|| panic!("pruned directory must be disclosed: {:?}", result.skipped));
+        // nw-436 review, FIX 2: `[[repos]] unskip` is a `RepoConfig` field with
+        // no vault equivalent, so a vault's remedy must not tell the operator
+        // to use it as if it worked — that was a fresh nw-334 instance (a
+        // remedy nobody can execute) introduced by sharing `disclose_pruned_dir`
+        // with the vault caller without adapting its generic-branch message.
+        assert!(
+            !row.reason.contains("re-admit it with `[[repos]] unskip`"),
+            "a vault has no [[repos]] unskip surface to re-admit anything with: {row:?}"
+        );
+        // The remedy must instead be something the operator can actually do
+        // (rename the directory), and it should orient them at the vault's
+        // real indexing config surface (`.brainignore`).
+        assert!(
+            row.reason.contains("Rename the directory") && row.reason.contains(".brainignore"),
+            "the vault remedy must be executable and name the real config surface: {row:?}"
+        );
+    }
+
+    #[test]
+    fn vault_indexing_still_skips_build_and_dependency_directories_it_admits_dot_claude_from() {
+        // nw-436 review, FIX 1 (the finding that blocked the first pass):
+        // switching vault walks from `crate::index::SKIP_DIRS` (32 entries) to
+        // `index_md.rs`'s OWN list (originally 9 entries) admitted `.claude`
+        // (intended) AND 24 other directory names nobody decided to admit —
+        // `.venv`, `vendor`, `coverage`, `playwright-report`, `Pods`, and more.
+        // A vault living near a Python/Node project would have silently
+        // ingested thousands of vendored README/CHANGELOG files into a
+        // personal knowledge graph — a WORSE version of the defect nw-436
+        // exists to fix. This pins the NEGATIVE case the two `.claude` tests
+        // above do not: these names must still be pruned (and disclosed) in a
+        // vault, even though `.claude` now is not.
+        let (_dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            (".venv/lib/README.md", "# Should not count\n"),
+            ("vendor/some_pkg/CHANGELOG.md", "# Should not count\n"),
+            ("coverage/lcov-report/README.md", "# Should not count\n"),
+            ("playwright-report/data/README.md", "# Should not count\n"),
+        ]);
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.notes_count, 1,
+            "only real.md should be indexed — build/dependency dirs must stay pruned: {:?}",
+            result.skipped
+        );
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Real");
+
+        for name in [".venv", "vendor", "coverage", "playwright-report"] {
+            assert!(
+                result.skipped.iter().any(|sf| sf.path == name),
+                "{name} must be disclosed as pruned, not merely absent: {:?}",
+                result.skipped
+            );
+        }
     }
 
     #[test]
@@ -4166,6 +4405,48 @@ sub b body
             Some(MAX_NOTE_SIZE_BYTES + 1)
         );
         assert_eq!(result.skipped[0].limit_bytes, Some(MAX_NOTE_SIZE_BYTES));
+    }
+
+    #[test]
+    fn refresh_summary_itemises_each_skipped_note_like_brain_add_does() {
+        // nw-196. `brain add`'s vault arm already prints each skipped file's
+        // path and reason (`"  {path} - {reason}"`, in `src/main.rs`);
+        // `brain refresh`'s ONLY route to stdout is this shared summary
+        // function (it is the sole call site in `src/main.rs`), and this
+        // function used to print nothing past the aggregate count. Fixing it
+        // HERE — rather than teaching `brain refresh` its own itemised
+        // printer — is what makes `brain add` and `brain refresh` share one
+        // reporting path instead of drifting into two, per the nw-217
+        // lesson this whole batch is an instance of.
+        let note = |title: &str, size: usize| {
+            let prefix = format!("# {title}\n\n");
+            format!("{prefix}{}", "x".repeat(size - prefix.len()))
+        };
+        let above = note("Above", MAX_NOTE_SIZE_BYTES as usize + 1);
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("big.md", above.as_str())]);
+        let db_path = root.join("scratch.lbug");
+
+        let result = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.skipped.len(), 1);
+
+        let summary = format_markdown_refresh_summary(&result);
+        assert!(
+            summary.contains("Coverage DEGRADED: 1 note file(s) skipped."),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("big.md") && summary.contains("exceeds"),
+            "the path and reason `brain add` already prints must appear in the \
+             SAME summary `brain refresh` prints, not stay refresh-only \
+             information the user has no way to see: {summary}"
+        );
     }
 
     #[test]
