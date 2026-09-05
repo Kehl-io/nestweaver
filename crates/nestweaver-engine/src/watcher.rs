@@ -253,6 +253,42 @@ impl BrainWatcher {
             .transpose()
     }
 
+    /// `acquire_mutation_lease`, but logs the "refused during shutdown"
+    /// special case once here instead of duplicating the log at every call
+    /// site. The `WatchMutationRefused` error itself is passed through
+    /// unwrapped (not folded into a different return shape and not given
+    /// `.context(...)`, which would still let `downcast_ref` find it through
+    /// anyhow's chain but there is no reason to rely on that) so callers
+    /// can `?`-propagate it up to `process_batch`'s caller, which is the
+    /// single place that turns it into a graceful `Ok(())` exit — exactly
+    /// the match the pre-nw-380 code had at its one call site.
+    ///
+    /// nw-380: this is called once PER FILE (and once around establishing the
+    /// publication marker, and once around finalizing it) rather than once
+    /// for an entire debounced batch, so a large or slow batch releases and
+    /// re-acquires the write gate between files instead of holding it
+    /// continuously. `WriteGate` is FIFO-fair (`write_gate.rs`), so each
+    /// release point is a real opportunity for a queued `trigram_reconcile`/
+    /// `embedding_reconcile` waiter to be served before this batch resumes,
+    /// rather than only after the whole batch — however large — completes.
+    fn try_acquire_batch_lease(
+        &self,
+        needed: bool,
+        label: &'static str,
+    ) -> Result<Option<Box<dyn WatchMutationLease>>, anyhow::Error> {
+        if !needed {
+            return Ok(None);
+        }
+        match self.acquire_mutation_lease(label) {
+            Ok(lease) => Ok(lease),
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                tracing::info!("BrainWatcher batch refused during shutdown; exiting");
+                Err(error)
+            }
+            Err(error) => Err(error.context("acquire brain watcher batch lease")),
+        }
+    }
+
     fn event_targets_manifest(&self, path: &Path) -> bool {
         self.manifests_path.is_some()
             && path.exists()
@@ -487,114 +523,175 @@ impl BrainWatcher {
                 }
             };
 
-            let mut unique_paths = batch;
-            unique_paths.sort();
-            unique_paths.dedup();
-            let graph_batch = unique_paths
-                .iter()
-                .any(|path| self.event_targets_graph(path));
-            let mutation_batch = graph_batch
-                || unique_paths
-                    .iter()
-                    .any(|path| self.event_targets_manifest(path));
-            let _mutation_lease = if mutation_batch {
-                match self.acquire_mutation_lease("watch_vault_batch") {
-                    Ok(lease) => lease,
-                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
-                        tracing::info!("BrainWatcher batch refused during shutdown; exiting");
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error.context("acquire brain watcher batch lease")),
+            match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
+                Ok(()) => {}
+                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                    return Ok(());
                 }
-            } else {
-                None
-            };
-            let publication = if graph_batch {
-                // Establish the fail-closed marker before handle_event can
-                // cascade-delete a note and then fail during read or parse.
-                Some(self.establish_graph_publication_with_io(
-                    &store,
-                    &crate::index::FileSystemIndexEpilogueIo,
-                )?)
-            } else {
-                None
-            };
-
-            // Pre-build the symbol index once per batch so cross-domain
-            // refresh doesn't re-query the DB for every file.
-            let symbol_index = crate::cross_domain::build_symbol_index(&store).ok();
-
-            // Pre-build the wikilink title lookup once per batch so
-            // reinsert_note doesn't re-query all notes for every file.
-            // Uses a bidirectional map: title→UIDs (forward) + UID→title
-            // (reverse) for O(1) removal on rename.
-            let mut title_forward: HashMap<String, Vec<String>> = HashMap::new();
-            let mut title_reverse: HashMap<String, String> = HashMap::new();
-            for n in store.list_notes(None).unwrap_or_default() {
-                let key = n.title.to_lowercase();
-                title_forward
-                    .entry(key.clone())
-                    .or_default()
-                    .push(n.uid.clone());
-                title_reverse.insert(n.uid.clone(), key);
-            }
-
-            let mut batch_failures = Vec::new();
-            for path in unique_paths {
-                match self.handle_event(
-                    &store,
-                    tantivy.as_deref(),
-                    &v_uid,
-                    path,
-                    symbol_index.as_ref(),
-                    &mut title_forward,
-                    &mut title_reverse,
-                ) {
-                    Ok(outcome) => log_outcome(&outcome),
-                    Err(e) => {
-                        batch_failures.push(format!("event handling failed: {e:#}"));
-                        tracing::warn!("event handling failed: {e:#}");
-                    }
-                }
-            }
-
-            // After a batch that touched the graph, recompute PPR over
-            // the unified scope so brain_context queries see fresh ranks.
-            // Per the architecture doc §6.3: full recompute is fine for
-            // <50K-node graphs (~milliseconds); true incremental
-            // forward-push residuals are a later optimisation.
-            if graph_batch {
-                let finalization = self.finalize_graph_publication_with_io(
-                    publication.expect("graph batch established publication lease"),
-                    &crate::index::FileSystemIndexEpilogueIo,
-                );
-                if finalization.is_ok() {
-                    tracing::debug!(
-                        generation = store.pagerank_generation(),
-                        "PPR durably published after watcher batch"
-                    );
-                    // Record the watcher commit timestamp so `brain status`
-                    // shows the actual last-indexed time, not max(modified_at).
-                    if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, &v_uid)
-                    {
-                        batch_failures.push(format!("record last_indexed_at: {e:#}"));
-                    }
-
-                    if let Some(ref cb) = on_change {
-                        cb();
-                    }
-                }
-                if let Err(error) = finalization {
-                    batch_failures.push(format!("mandatory graph publication: {error}"));
-                }
-            }
-            if !batch_failures.is_empty() {
-                anyhow::bail!(
-                    "brain watcher batch failed after committed graph work: {}",
-                    batch_failures.join("; ")
-                );
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Process one debounced batch of raw filesystem paths: dedupe, decide
+    /// whether it touches the graph, then reindex every path and (for a
+    /// graph-touching batch) recompute PPR and publish.
+    ///
+    /// Split out of `run_inner`'s loop body so it is callable directly with a
+    /// synthetic path list — real filesystem-event timing is inherently
+    /// flaky in tests (see the `#[ignore]`d `watcher_picks_up_a_new_file`
+    /// etc.), but the nw-380 fix (lease acquired per file rather than once
+    /// for the whole batch) needs a DETERMINISTIC way to count acquisitions,
+    /// which this makes possible via `with_mutation_lease_factory` alone.
+    #[allow(clippy::too_many_arguments)]
+    fn process_batch(
+        &self,
+        store: &GraphStore,
+        tantivy: Option<&TantivyIndex>,
+        v_uid: &str,
+        batch: Vec<PathBuf>,
+        on_change: &Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
+        let mut unique_paths = batch;
+        unique_paths.sort();
+        unique_paths.dedup();
+        let batch_started = Instant::now();
+        let batch_len = unique_paths.len();
+        let graph_batch = unique_paths
+            .iter()
+            .any(|path| self.event_targets_graph(path));
+        let mutation_batch = graph_batch
+            || unique_paths
+                .iter()
+                .any(|path| self.event_targets_manifest(path));
+
+        // nw-380: establishing the fail-closed publication marker is itself
+        // a store write, so it gets its own freshly acquired lease rather
+        // than inheriting one held since before this batch began — there is
+        // no reason to hold the gate across the symbol-index/title-map
+        // rebuild below, which touches no shared derived state the gate
+        // protects.
+        let publication = if graph_batch {
+            let _lease = self.try_acquire_batch_lease(true, "watch_vault_batch")?;
+            // Establish the fail-closed marker before handle_event can
+            // cascade-delete a note and then fail during read or parse. It
+            // stays established across the whole per-path loop below (crash
+            // safety demands that: a crash mid-loop must still find the
+            // corpus marked dirty), even though the WRITE GATE itself is
+            // released as soon as `_lease` drops here.
+            Some(self.establish_graph_publication_with_io(
+                store,
+                &crate::index::FileSystemIndexEpilogueIo,
+            )?)
+        } else {
+            None
+        };
+
+        // Pre-build the symbol index once per batch so cross-domain
+        // refresh doesn't re-query the DB for every file.
+        let symbol_index = crate::cross_domain::build_symbol_index(store).ok();
+
+        // Pre-build the wikilink title lookup once per batch so
+        // reinsert_note doesn't re-query all notes for every file.
+        // Uses a bidirectional map: title→UIDs (forward) + UID→title
+        // (reverse) for O(1) removal on rename.
+        let mut title_forward: HashMap<String, Vec<String>> = HashMap::new();
+        let mut title_reverse: HashMap<String, String> = HashMap::new();
+        for n in store.list_notes(None).unwrap_or_default() {
+            let key = n.title.to_lowercase();
+            title_forward
+                .entry(key.clone())
+                .or_default()
+                .push(n.uid.clone());
+            title_reverse.insert(n.uid.clone(), key);
+        }
+
+        let mut batch_failures = Vec::new();
+        for path in unique_paths {
+            // nw-380: the invariant this releases-and-reacquires per file to
+            // uphold is "a vault write must not be able to starve the write
+            // gate indefinitely" — NOT "a batch commits as one atomic unit".
+            // Each file's cascade-delete+reinsert is already self-contained
+            // (nw-006 established the same for the indexer's Vault write
+            // path), and a trigram/embedding reconciler that interleaves
+            // mid-batch just sees a partially-updated, still-internally-
+            // consistent graph and catches up further on its next cycle — it
+            // does not corrupt anything by running between files instead of
+            // only after the last one.
+            let _lease = self.try_acquire_batch_lease(mutation_batch, "watch_vault_batch")?;
+            match self.handle_event(
+                store,
+                tantivy,
+                v_uid,
+                path,
+                symbol_index.as_ref(),
+                &mut title_forward,
+                &mut title_reverse,
+            ) {
+                Ok(outcome) => log_outcome(&outcome),
+                Err(e) => {
+                    batch_failures.push(format!("event handling failed: {e:#}"));
+                    tracing::warn!("event handling failed: {e:#}");
+                }
+            }
+        }
+
+        // After a batch that touched the graph, recompute PPR over the
+        // unified scope so brain_context queries see fresh ranks. This stays
+        // a single per-BATCH operation, not per-file: PPR recompute cost
+        // scales with total graph size, not with how many files changed, so
+        // doing it once per file would multiply an already-nontrivial cost
+        // by the batch's file count instead of paying it once. (Per the
+        // architecture doc §6.3 this was "fine for <50K-node graphs
+        // (~milliseconds)"; nw-380's own production measurement — 192,818
+        // live vectors — is well past that, so treat this as a real,
+        // currently-unshrunk cost rather than the stale comment's
+        // "~milliseconds".)
+        if graph_batch {
+            let _lease = self.try_acquire_batch_lease(true, "watch_vault_batch")?;
+            let finalization = self.finalize_graph_publication_with_io(
+                publication.expect("graph batch established publication lease"),
+                &crate::index::FileSystemIndexEpilogueIo,
+            );
+            if finalization.is_ok() {
+                tracing::debug!(
+                    generation = store.pagerank_generation(),
+                    "PPR durably published after watcher batch"
+                );
+                // Record the watcher commit timestamp so `brain status`
+                // shows the actual last-indexed time, not max(modified_at).
+                if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, v_uid) {
+                    batch_failures.push(format!("record last_indexed_at: {e:#}"));
+                }
+
+                if let Some(cb) = on_change {
+                    cb();
+                }
+            }
+            if let Err(error) = finalization {
+                batch_failures.push(format!("mandatory graph publication: {error}"));
+            }
+        }
+        // nw-380: "instrument first" — nothing previously logged batch size
+        // or hold duration, so a recurrence could not distinguish "many
+        // files" from "one slow file" from "an expensive PPR recompute" as
+        // the cause. `elapsed_ms` covers the WHOLE batch (all per-file lease
+        // windows plus the final publish), not any single lease hold,
+        // precisely because per-file holds are no longer expected to
+        // dominate it after this fix.
+        tracing::info!(
+            files = batch_len,
+            elapsed_ms = batch_started.elapsed().as_millis() as u64,
+            mutation_batch,
+            "BrainWatcher batch complete"
+        );
+        if !batch_failures.is_empty() {
+            anyhow::bail!(
+                "brain watcher batch failed after committed graph work: {}",
+                batch_failures.join("; ")
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -914,6 +1011,20 @@ pub(crate) fn event_kind_can_mutate(kind: &EventKind) -> bool {
     }
 }
 
+/// Hard ceiling on how long ONE debounced batch may keep growing under a
+/// steady trickle of events, regardless of `quiet_period` resetting on every
+/// arrival (nw-380). Unlike `quiet_period` this deadline is fixed at the
+/// FIRST event's arrival and never extended — it exists only to guarantee a
+/// batch eventually gets handed off (and, downstream, that its write-gate
+/// lease windows and publication-marker-dirty window are eventually
+/// released) instead of growing for as long as the vault keeps being
+/// edited. Production measured a single batch's write-gate hold reach 453s
+/// this way before this cap existed. The value only needs to be FINITE, not
+/// small — it trades a slightly larger-than-minimal batch for not
+/// re-triggering a full per-batch PPR recompute (see `run_inner`) on every
+/// few-second tick during a long, continuously-active editing session.
+const WATCH_BATCH_MAX_AGE: Duration = Duration::from_secs(5);
+
 pub(crate) fn receive_debounced_paths(
     rx: &std::sync::mpsc::Receiver<RawWatchResult>,
     quiet_period: Duration,
@@ -927,16 +1038,18 @@ pub(crate) fn receive_debounced_paths(
             return WatchReceive::Disconnected;
         }
     };
+    let max_age_deadline = Instant::now() + WATCH_BATCH_MAX_AGE;
     let mut quiet_deadline = Instant::now() + quiet_period;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             return WatchReceive::Stop;
         }
         let now = Instant::now();
-        if now >= quiet_deadline {
+        if now >= quiet_deadline || now >= max_age_deadline {
             return WatchReceive::Batch(paths);
         }
         let wait = quiet_deadline
+            .min(max_age_deadline)
             .saturating_duration_since(now)
             .min(Duration::from_millis(250));
         match rx.recv_timeout(wait) {
@@ -1523,6 +1636,109 @@ mod tests {
         assert!(path_in_skip_dir(p));
         let p = Path::new("/x/vault/notes/regular.md");
         assert!(!path_in_skip_dir(p));
+    }
+
+    /// nw-380: before this fix, `run_inner` acquired ONE `watch_vault_batch`
+    /// lease and held it across establishing the publication marker, every
+    /// `handle_event` call in the batch, AND finalizing publication. This
+    /// drives `process_batch` directly (real fs-event timing is flaky in
+    /// tests — see the `#[ignore]`d cases above) with a counting lease
+    /// factory, so the acquisition COUNT is the deterministic signal: a
+    /// 3-file graph batch must acquire the lease 5 times (establish + one
+    /// per file + finalize), not once for the whole batch.
+    #[test]
+    fn nw_380_batch_lease_is_acquired_per_file_not_once_for_the_whole_batch() {
+        use std::sync::atomic::AtomicU32;
+
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\nAlpha body.\n"),
+            ("b.md", "# B\n\nBravo body.\n"),
+            ("c.md", "# C\n\nCharlie body.\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        let acquisitions = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&acquisitions);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |_label: &'static str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "test", "test").with_mutation_lease_factory(factory);
+
+        watcher
+            .process_batch(
+                &store,
+                None,
+                "vlt:test",
+                vec![root.join("a.md"), root.join("b.md"), root.join("c.md")],
+                &None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            5,
+            "expected establish(1) + one per file(3) + finalize(1) = 5 \
+             separate acquisitions, not one held across the whole batch"
+        );
+    }
+
+    /// nw-380: `receive_debounced_paths` reset `quiet_deadline` on every
+    /// arrival with no ceiling, so a steady trickle of saves could extend
+    /// one debounced batch indefinitely — the mechanism behind the 453s (and
+    /// production's 69-minute) write-gate hold. `quiet_period` here is
+    /// deliberately far larger than `WATCH_BATCH_MAX_AGE`: under the
+    /// pre-nw-380 design this call would not return until the sending
+    /// thread stops AND `quiet_period` elapses with nothing further
+    /// arriving — i.e. not before the sender's own ~7s run finishes, plus
+    /// the 10s quiet period on top. The age cap must force a hand-off long
+    /// before that.
+    #[test]
+    fn nw_380_receive_debounced_paths_caps_total_batch_age_under_sustained_events() {
+        let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
+        let stop_flag = AtomicBool::new(false);
+        let sender = thread::spawn(move || {
+            for i in 0..70u32 {
+                thread::sleep(Duration::from_millis(100));
+                if tx
+                    .send(Ok(vec![PathBuf::from(format!("/tmp/nw380-{i}.md"))]))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result = receive_debounced_paths(&rx, Duration::from_secs(10), &stop_flag);
+        let elapsed = started.elapsed();
+        // Drop the receiver now so the sender's remaining sends fail fast
+        // instead of running its full ~7s before the thread can be joined.
+        drop(rx);
+
+        let batch_len = match result {
+            WatchReceive::Batch(paths) => paths.len(),
+            WatchReceive::Timeout => panic!("expected a batch, got a bare timeout"),
+            WatchReceive::NotifyError(_) => panic!("expected a batch, got a notify error"),
+            WatchReceive::Disconnected => panic!("expected a batch, got disconnected"),
+            WatchReceive::Stop => panic!("expected a batch, got stop"),
+        };
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "WATCH_BATCH_MAX_AGE must force a hand-off around 5s regardless \
+             of the 10s quiet_period continuously resetting under sustained \
+             events: took {elapsed:?}"
+        );
+        assert!(
+            batch_len > 0,
+            "the capped-off batch must still carry whatever paths arrived \
+             before the age ceiling, not discard them"
+        );
+        let _ = sender.join();
     }
 
     #[test]

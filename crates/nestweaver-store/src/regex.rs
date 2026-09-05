@@ -1484,6 +1484,35 @@ impl GraphStore {
         max_millis: Option<u64>,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<RegexSearchResult, StoreError> {
+        self.regex_search_cancellable_with_candidate_cap(
+            pattern,
+            path_prefix,
+            kinds,
+            limit,
+            max_millis,
+            cancel,
+            CANDIDATE_CAP,
+        )
+    }
+
+    /// `regex_search_cancellable` with the candidate cap parameterized
+    /// instead of hardcoded to [`CANDIDATE_CAP`]. The public entry point above
+    /// always passes the real constant; this seam exists so a unit test can
+    /// force `hydration_stop = Some(CandidateCap)` on a small, fast in-memory
+    /// store (nw-427) rather than needing 200,000 real rows to hit the
+    /// production cap — `CandidateCap` and `Deadline` both flow through the
+    /// identical `hydration_stop` -> verification-loop path this item fixes,
+    /// so exercising one deterministically exercises the other.
+    fn regex_search_cancellable_with_candidate_cap(
+        &self,
+        pattern: &str,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        limit: Option<usize>,
+        max_millis: Option<u64>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        candidate_cap: usize,
+    ) -> Result<RegexSearchResult, StoreError> {
         if let Some(l) = limit
             && l > SEARCH_PRESENTATION_LIMIT_MAX
         {
@@ -1547,7 +1576,7 @@ impl GraphStore {
                         deadline_ms,
                         CandidateLimits {
                             cancel,
-                            max_candidates: CANDIDATE_CAP,
+                            max_candidates: candidate_cap,
                         },
                     )?;
                     let (mut hydrated, hydrated_stop) = self.load_candidates_by_uid(
@@ -1558,11 +1587,11 @@ impl GraphStore {
                         deadline_ms,
                         CandidateLimits {
                             cancel,
-                            max_candidates: CANDIDATE_CAP,
+                            max_candidates: candidate_cap,
                         },
                     )?;
                     hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
-                    let remaining = CANDIDATE_CAP.saturating_sub(candidates.len());
+                    let remaining = candidate_cap.saturating_sub(candidates.len());
                     if hydrated.len() > remaining {
                         hydrated.truncate(remaining);
                         hydration_stop = Some(RegexTruncationReason::CandidateCap);
@@ -1579,7 +1608,7 @@ impl GraphStore {
                         deadline_ms,
                         CandidateLimits {
                             cancel,
-                            max_candidates: CANDIDATE_CAP,
+                            max_candidates: candidate_cap,
                         },
                     )?;
                     hydration_stop = stop;
@@ -1591,10 +1620,11 @@ impl GraphStore {
         candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
         let hydration_ms = elapsed_millis(hydration_started);
 
-        // Scan the full candidate set, bounded by the wall-clock deadline (and a
-        // high safety ceiling) — NOT a low pre-truncation. `truncated` is set
-        // ONLY when the scan actually stops early, so `truncated:true` with an
-        // empty `results` now genuinely means "incomplete scan" rather than
+        // Scan the full candidate set collection managed to gather, bounded by
+        // a phase-local wall-clock budget (and a high safety ceiling) — NOT a
+        // low pre-truncation. `truncated` is set ONLY when the scan actually
+        // stops early or the corpus wasn't fully gathered, so `truncated:true`
+        // with an empty `results` now genuinely means "incomplete" rather than
         // "the match was ordered past a 5000 cap and never scanned" (nw-076).
         // A short CORPUS is not a stopped SCAN, and the two must not share a
         // channel. `hydration_stop` feeds `truncated`, and `truncated` breaks
@@ -1608,12 +1638,21 @@ impl GraphStore {
             hydration_stop = None;
         }
         let elapsed_deadline = elapsed_millis(start) >= deadline_ms;
-        let mut truncated = planning_deadline || hydration_stop.is_some() || elapsed_deadline;
-        let mut truncation_reason = if planning_deadline || elapsed_deadline {
-            Some(RegexTruncationReason::Deadline)
-        } else {
-            hydration_stop
-        };
+        // nw-427: collection possibly not having gathered the FULL corpus
+        // (`hydration_stop`/`elapsed_deadline`) is a fact about COMPLETENESS,
+        // not a reason to discard the candidates it already gathered —
+        // verifying an in-memory candidate is orders of magnitude cheaper than
+        // the graph lookups that produced it, and this crate's regex engine is
+        // finite-automata/linear-time (see `compile_pattern`), so scanning a
+        // `candidate_cap`-bounded, already-collected set cannot itself blow
+        // up. Only `planning_deadline` gates the loop's entry below, because
+        // it is the one case where `candidates` is guaranteed empty (`if
+        // planning_deadline { (Vec::new(), 0) }` above) — there is nothing to
+        // lose by skipping it. Whether collection was complete is folded back
+        // in AFTER the loop runs, not before.
+        let collection_incomplete = hydration_stop.is_some() || elapsed_deadline;
+        let mut truncated = planning_deadline;
+        let mut truncation_reason = planning_deadline.then_some(RegexTruncationReason::Deadline);
         let mut results = Vec::new();
         let mut scanned_candidates = 0usize;
         let verification_started = Instant::now();
@@ -1622,12 +1661,22 @@ impl GraphStore {
             if truncated {
                 break;
             }
-            if start.elapsed().as_millis() as u64 > deadline_ms {
+            // Verification gets its OWN phase-local ceiling, measured from
+            // `verification_started` rather than the search's overall `start`:
+            // collection is allowed to (and, per the measurements behind
+            // nw-427, routinely does) run right up to or slightly past
+            // `deadline_ms` before returning a complete-or-partial candidate
+            // list, and that overrun must not be inherited as an
+            // already-exhausted budget for the cheap phase that follows. This
+            // is a safety ceiling against a pathologically large already-
+            // collected set, not a doubling of the caller's stated budget in
+            // the common case.
+            if verification_started.elapsed().as_millis() as u64 > deadline_ms {
                 truncated = true;
                 truncation_reason = Some(RegexTruncationReason::Deadline);
                 break;
             }
-            if i >= CANDIDATE_CAP {
+            if i >= candidate_cap {
                 truncated = true;
                 truncation_reason = Some(RegexTruncationReason::CandidateCap);
                 break;
@@ -1693,6 +1742,26 @@ impl GraphStore {
             }
         }
         let verification_ms = elapsed_millis(verification_started);
+
+        // The verification loop ran over everything COLLECTION handed it
+        // without itself hitting a limit — but collection may not have
+        // gathered the full corpus (`collection_incomplete`, computed before
+        // the loop from `hydration_stop`/`elapsed_deadline`). Surface that now
+        // rather than before the loop ran: nothing collected was thrown away
+        // (that was the bug), but "no more matches exist" still is not
+        // established when the corpus itself was cut short.
+        if !truncated && collection_incomplete {
+            truncated = true;
+            // Preserve the original priority: an overall-elapsed deadline is
+            // the more actionable reason to surface (the caller can raise
+            // `--max-millis`), even when `hydration_stop` independently named
+            // a different cause such as `CandidateCap`.
+            truncation_reason = Some(if elapsed_deadline {
+                RegexTruncationReason::Deadline
+            } else {
+                hydration_stop.unwrap_or(RegexTruncationReason::Deadline)
+            });
+        }
 
         // The scan ran to completion over a corpus that was missing rows. The
         // results are real, but "no more matches exist" is not established —
@@ -1932,6 +2001,82 @@ mod tests {
         );
         assert_eq!(result.hydrated_candidates, 0);
         assert_eq!(result.scanned_candidates, 0);
+    }
+
+    /// nw-427: when collection stops early (`hydration_stop.is_some()`) it
+    /// must not discard the candidates it already gathered. Forces
+    /// `hydration_stop = Some(CandidateCap)` deterministically (no reliance
+    /// on wall-clock timing, which would make this test flaky) by giving
+    /// `regex_search_cancellable_with_candidate_cap` a cap smaller than the
+    /// number of matching symbols in one repo scope. Before the fix,
+    /// `truncated` was seeded from `hydration_stop.is_some()` BEFORE the
+    /// verification loop ran, so the loop broke on its very first iteration
+    /// and `scanned_candidates`/`results` stayed at zero even though
+    /// `candidates` held real, already-collected matches.
+    #[test]
+    fn hydration_candidate_cap_does_not_discard_already_collected_candidates() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..4 {
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym:cap:{i}"),
+                    name: "authenticateUser".to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:cap".to_string(),
+                    file_path: format!("src/auth_{i}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: "fn authenticateUser(req: Request) -> Result<Token>".to_string(),
+                    summary: None,
+                    content_hash: format!("c{i}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+
+        // Four matching symbols exist; cap collection at 2 so
+        // `collect_candidates_for_scopes` returns exactly 2 candidates with
+        // `Some(RegexTruncationReason::CandidateCap)` — a real, non-empty
+        // `candidates` Vec paired with a non-`None` `hydration_stop`, which is
+        // precisely the shape the discard bug required.
+        let result = store
+            .regex_search_cancellable_with_candidate_cap(
+                "authenticateUser",
+                None,
+                None,
+                None,
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+
+        assert!(result.truncated, "collection was capped, so this is honest");
+        assert_eq!(
+            result.truncation_reason,
+            Some(RegexTruncationReason::CandidateCap),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.scanned_candidates, 2,
+            "the 2 candidates collection DID gather must be verified, not discarded: {result:?}"
+        );
+        assert_eq!(
+            result.results.len(),
+            2,
+            "both collected candidates actually match the pattern: {result:?}"
+        );
+        assert!(
+            result.note.is_none(),
+            "results are non-empty, so no scan-budget hedge note applies: {result:?}"
+        );
     }
 
     #[test]
