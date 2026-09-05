@@ -554,17 +554,24 @@ enum CliDiagnostic {
     /// refused with a bare `anyhow::bail!`, which is invisible to
     /// `diagnostic_inventory` for the same reason `repair`'s `eprintln!` was.
     ///
-    /// Exit code is `EXIT_USAGE` (64), superseding `d565547f`'s one-round-old
-    /// call to keep it at 1. That decision reasoned this is a SEMANTIC
-    /// refusal rather than a usage error; nw-360's own closing note leaves
-    /// either exit code "defensible" and asks only that the whole codebase
-    /// AGREE on one, and the 2026-09-04 regression sweep settled that
-    /// question for `search --limit`, `blast-radius --limit`, and the empty-
-    /// query guards (nw-431/nw-432/nw-379) by standardising on 64 for every
-    /// "the value(s) you passed cannot be honoured" refusal this sweep
-    /// touches. Two individually-valid enum values whose COMBINATION is
-    /// unsupported is exactly that shape: nothing failed at runtime, the
-    /// invocation itself cannot be honoured, which is what 64 means.
+    /// Exit code stays 1, deliberately. `d565547f` decided one round ago, with
+    /// its rationale preserved in the item, that this is a SEMANTIC refusal
+    /// rather than a usage error; reversing that without new evidence would
+    /// leave two rounds of contradictory reasoning in the record. The defect
+    /// nw-360 names is the SHAPE of the refusal, and a named condition with a
+    /// followable remedy fixes exactly that.
+    ///
+    /// A 2026-09-04 pass considered moving this to 64 to match the rest of
+    /// that session's sweep (`search --limit`, `blast-radius --limit`, the
+    /// empty-query guards) and reverted the idea on review: 64 means "you
+    /// asked wrongly" (bad spelling/syntax) and 1 means "a legal request
+    /// this build cannot satisfy". `--format msgpack --scope vault` is two
+    /// CORRECTLY SPELLED values; reporting 64 would tell the caller to fix
+    /// the spelling of a word that is already right. That same pass DID
+    /// extend the condition below from `format == "msgpack"` to
+    /// `format != "graphml"`, so `cypher` and `mermaid` get this named
+    /// diagnostic too instead of a raw `export_graph RPC failed: ...` --
+    /// that was the real defect nw-360 named; the exit code was never it.
     #[error("`--format {format}` cannot represent `--scope {scope}`")]
     #[diagnostic(
         code(nestweaver::export_scope_unsupported),
@@ -7209,7 +7216,21 @@ enum BrainCommands {
     /// Check `resolved_target_uid` to tell a link that RESOLVED at a lower tier
     /// from one that points at nothing.
     BrokenLinks {
-        #[arg(long, default_value = "5", help = "Max suggested targets per link")]
+        // nw-217b's third hole (2026-09-04): this flag was never probed by
+        // the bounds sweep because the schema-key lookup compared the
+        // kebab-case CLI flag (`--max-suggestions`) against the snake_case
+        // schema key with exact string equality. Once that lookup was
+        // normalized, the sweep found this flag had NO bound at all --
+        // `--max-suggestions 0` and `--max-suggestions 51` both parsed and
+        // reached the engine, while the MCP `brain_broken_links` schema
+        // declares `minimum: 1, maximum: 50`. Copied from the schema, same
+        // idiom as `--limit` below (nw-400).
+        #[arg(
+            long,
+            default_value = "5",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=50),
+            help = "Max suggested targets per link (1-50; default 5; matches the MCP brain_broken_links schema)"
+        )]
         max_suggestions: usize,
         // nw-400: bounded HERE, not by the MCP JSON-Schema validator this
         // command routes through. Unbounded, `--limit 0` reached
@@ -7349,7 +7370,19 @@ enum BrainCommands {
     /// counts, broken links, orphans, average out-degree, top tags, and notes
     /// by year.
     DocStats {
-        #[arg(long, default_value = "10", help = "Max entries in top_tags")]
+        // nw-217b's third hole (2026-09-04): never probed for the same
+        // reason `broken-links --max-suggestions` wasn't -- the sweep's
+        // schema-key lookup only matched exact spelling, and this flag's
+        // kebab-case form is `--top-tags-limit`. Once fixed, the sweep found
+        // NO bound here at all while the MCP `brain_doc_stats` schema
+        // declares `minimum: 1, maximum: 1000` (`RESULT_LIMIT_MAX`). Copied
+        // from the schema.
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max entries in top_tags (1-1000; default 10; matches the MCP brain_doc_stats schema)"
+        )]
         top_tags_limit: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -16061,19 +16094,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // empty file reported as success). Checking `!= "graphml"`
             // instead of enumerating the other three means a fifth
             // code-only format added later inherits the refusal instead of
-            // silently reopening this gap.
-            //
-            // Exit code is `EXIT_USAGE`, not the generic `Err` path's
-            // `EXIT_ERROR` -- see the variant's doc comment for why this
-            // round settled the question the previous one left open.
+            // silently reopening this gap. Exit code stays 1 -- see the
+            // variant's doc comment; this is a semantic refusal of a
+            // correctly-spelled combination, not a usage error.
             if format != "graphml" && scope == "vault" {
-                let diagnostic = CliDiagnostic::ExportScopeUnsupported {
+                return Err(anyhow::Error::new(CliDiagnostic::ExportScopeUnsupported {
                     format: format.clone(),
                     scope: scope.clone(),
-                };
-                let report: miette::Report = diagnostic.into();
-                eprintln!("{report:?}");
-                return Ok((EXIT_USAGE, None));
+                }));
             }
 
             // Route through daemon when available.
@@ -28079,6 +28107,52 @@ mod cli_help_contract_tests {
         })
     }
 
+    /// nw-217b's THIRD hole, found on review of holes 1 and 2: the schema
+    /// lookup below used to compare the CLI's long-flag name against the
+    /// JSON schema's property key with EXACT string equality. clap defaults
+    /// to kebab-case (`--token-budget`); every schema property in this
+    /// registry is snake_case (`token_budget`). So `investigate`,
+    /// `investigate-hydrate`, `project-context`, and `brain context`'s
+    /// `--token-budget` -- each ALREADY correctly bounded 1..=16000 on the
+    /// CLI -- were NEVER PROBED: the lookup missed on every multi-word
+    /// flag, which is exactly the "looks covered, isn't" shape this item
+    /// exists to kill. Fixed by normalizing hyphens to underscores before
+    /// the lookup, which is unambiguous because it is a spelling
+    /// convention, not a judgment call.
+    ///
+    /// Normalization alone does not close every miss: `blast-radius --depth`
+    /// bounds the schema's `max_depth` (a genuinely different word, not a
+    /// spelling convention), and so do `hubs`/`bridges --top` (`top_n`) and
+    /// `read-symbols --neighbors` (`include_neighbors`). These three are
+    /// confirmed against the exact RPC-arg builders that already translate
+    /// each CLI flag to its wire name (`"max_depth": depth` at
+    /// `src/main.rs:15684`, `"top_n": top`, `"include_neighbors":
+    /// neighbors`) -- so declaring them here documents an EXISTING
+    /// translation, it does not invent one. Declared per (tool, flag) rather
+    /// than guessed, for the same reason `declared_cli_mcp_twin` is a
+    /// declaration: a wrong guess here would recreate the exact defect this
+    /// function exists to close.
+    fn lookup_schema_property<'a>(
+        properties: &'a serde_json::Map<String, serde_json::Value>,
+        tool: &str,
+        long: &str,
+    ) -> Option<&'a serde_json::Value> {
+        if let Some(value) = properties.get(long) {
+            return Some(value);
+        }
+        let normalized = long.replace('-', "_");
+        if let Some(value) = properties.get(&normalized) {
+            return Some(value);
+        }
+        let aliased = match (tool, long) {
+            ("blast_radius", "depth") => "max_depth",
+            ("hub_nodes", "top") | ("bridge_nodes", "top") => "top_n",
+            ("read_symbols", "neighbors") => "include_neighbors",
+            _ => return None,
+        };
+        properties.get(aliased)
+    }
+
     /// nw-217b: completeness for [`declared_cli_mcp_twin`]. Walks the same
     /// tree the bounds sweep walks and asserts every visited path has an
     /// arm -- an undeclared command (new or renamed) FAILS this test rather
@@ -28242,7 +28316,7 @@ mod cli_help_contract_tests {
                         continue;
                     }
                     let Some(long) = arg.get_long() else { continue };
-                    let Some(declared) = properties.get(long) else {
+                    let Some(declared) = lookup_schema_property(properties, tool, long) else {
                         continue;
                     };
                     for (key, offset) in [("minimum", -1i64), ("maximum", 1i64)] {
@@ -28284,7 +28358,7 @@ mod cli_help_contract_tests {
              the declaration table is not actually being reached"
         );
         assert!(
-            asserted_pairs.len() >= 8 && probes >= 10,
+            asserted_pairs.len() >= 15 && probes >= 25,
             "bounds sweep looks vacuous -- {} pair(s) produced a real probe and {probes} \
              probe(s) ran; the guard is not actually comparing anything",
             asserted_pairs.len()

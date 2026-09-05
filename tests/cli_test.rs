@@ -3317,6 +3317,47 @@ fn repo_map_token_budget_enforces_the_codebase_wide_range() {
         .stderr(contains("16001 is not in 1..=16000"));
 }
 
+/// nw-217b's third hole (2026-09-04): the bounds sweep's schema-key lookup
+/// compared the CLI's kebab-case long-flag name against the JSON schema's
+/// snake_case property key with exact string equality, so `--max-suggestions`
+/// never matched `max_suggestions` and this flag was never probed despite
+/// having no bound at all -- `--max-suggestions 0` and `--max-suggestions 51`
+/// both parsed while the MCP `brain_broken_links` schema declares
+/// `minimum: 1, maximum: 50`.
+#[test]
+fn broken_links_max_suggestions_enforces_the_brain_broken_links_schema_bound() {
+    nestweaver_cmd()
+        .args(["brain", "broken-links", "--max-suggestions", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=50"));
+
+    nestweaver_cmd()
+        .args(["brain", "broken-links", "--max-suggestions", "51"])
+        .assert()
+        .code(64)
+        .stderr(contains("51 is not in 1..=50"));
+}
+
+/// The same hole, the same day, a different command: `--top-tags-limit`
+/// never matched the MCP `brain_doc_stats` schema's `top_tags_limit`
+/// property for the same kebab/snake reason, and had no bound at all
+/// (schema declares `minimum: 1, maximum: 1000`).
+#[test]
+fn doc_stats_top_tags_limit_enforces_the_brain_doc_stats_schema_bound() {
+    nestweaver_cmd()
+        .args(["brain", "doc-stats", "--top-tags-limit", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["brain", "doc-stats", "--top-tags-limit", "1001"])
+        .assert()
+        .code(64)
+        .stderr(contains("1001 is not in 1..=1000"));
+}
+
 /// nw-379: an empty query used to mean "match everything" on `search` and
 /// `investigate` while `regex-search`/`count-patterns` already refused it BY
 /// NAME -- the project had already decided an empty query is invalid on two
@@ -5763,17 +5804,6 @@ fn ui_watch_refuses_a_wholly_inferred_write_and_can_be_corrected() {
 /// `--top` on the SAME command is a `usize`, so clap's own parse rejects a bad
 /// value and the binary already answers 64. The classification exists; these
 /// two arguments took a different route to it.
-///
-/// UPDATED by nw-360's 2026-09-04 settlement: `--format msgpack --scope
-/// vault` (individually legal values whose COMBINATION is unsupported) is
-/// ALSO exit 64 now, not the 1 this test originally pinned it at. The
-/// distinction this test exists to protect — a spelling error vs. a legal
-/// value the format cannot honour — still holds; it is now carried by the
-/// MESSAGE (`export_scope_unsupported`, naming both values and a remedy)
-/// rather than by a different exit code, because the parent regression sweep
-/// standardised "the value(s) you passed cannot be honoured" at 64 across
-/// this whole codebase (nw-431, nw-432, nw-379) and a bogus enum spelling is
-/// exactly that shape too.
 #[test]
 fn export_rejects_an_invalid_enum_as_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -5842,11 +5872,7 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
 
     // And `msgpack` must still reach its handler, which refuses `--scope vault`
     // as a SEMANTIC combination rather than an unknown value — a distinction a
-    // `PossibleValuesParser` must not flatten. It now shares exit 64 with the
-    // bogus-enum cases above (nw-360's 2026-09-04 settlement), so the
-    // distinction is carried by the MESSAGE instead of the exit code: a
-    // spelling error names "possible values"; this names the condition
-    // (`export_scope_unsupported`) and a remedy, never "invalid value".
+    // `PossibleValuesParser` must not flatten.
     let output = nestweaver_cmd()
         .args([
             "export",
@@ -5859,23 +5885,18 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
         ])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(
         output.status.code(),
         Some(0),
         "msgpack cannot represent the vault subgraph and must say so"
     );
-    assert_eq!(
+    assert_ne!(
         output.status.code(),
         Some(64),
-        "the invocation cannot be honoured -- usage error, per the 2026-09-04 \
-         codebase-wide settlement.\nstderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("export_scope_unsupported") && !stderr.contains("possible values"),
-        "`--scope vault` is a LEGAL value that this format cannot satisfy; the \
-         message must name the CONDITION and a remedy, not read like a \
-         misspelled enum.\nstderr:\n{stderr}"
+        "`--scope vault` is a LEGAL value that this format cannot satisfy; \
+         reporting it as a usage error would tell the caller to fix the \
+         spelling of a word that is spelled correctly.\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -7908,25 +7929,22 @@ fn instance_merge_says_nothing_when_no_bypass_was_granted() {
 }
 
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
-/// bogus `--format` or `--scope` now exits 64 at parse time.
+/// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
+/// preserved this case as a SEMANTIC refusal. That reasoning stands and the
+/// exit code is not changed here.
 ///
-/// What was wrong is the SHAPE. Two individually valid enums whose
-/// COMBINATION is unsupported reached the user as a raw RPC error naming
-/// neither value: `PossibleValuesParser` is per-argument and cannot see the
-/// other one, the daemon's own good sentence arrived as a `tonic::Status`
-/// wrapped in `.context("export_graph RPC failed")`, and `into_diagnostic`
-/// had no arm for it — so it fell to `CliDiagnostic::General` and printed the
-/// transport's words instead of the condition's. Measured 2026-09-04: this
-/// held for `msgpack` (a named diagnostic already, but at exit 1) while
-/// `cypher` and `mermaid` still fell through to the raw RPC error — the same
-/// refusal, two different shapes depending on which code-only format asked.
-///
-/// The exit code is now 64, not the 1 `d565547f` chose. That round reasoned
-/// this is a SEMANTIC refusal rather than a usage error and left either exit
-/// code "defensible"; the 2026-09-04 regression sweep settled the choice
-/// codebase-wide at 64 for "the value(s) you passed cannot be honoured"
-/// (nw-431, nw-432, nw-379), and this is that shape too — nothing failed at
-/// runtime, the invocation itself cannot be satisfied.
+/// What is wrong is the SHAPE. Two individually valid enums whose COMBINATION
+/// is unsupported reached the user as a raw RPC error naming neither value:
+/// `PossibleValuesParser` is per-argument and cannot see the other one, the
+/// daemon's own good sentence arrived as a `tonic::Status` wrapped in
+/// `.context("export_graph RPC failed")`, and `into_diagnostic` had no arm for
+/// it — so it fell to `CliDiagnostic::General` and printed the transport's
+/// words instead of the condition's. Measured 2026-09-04: this held for
+/// `msgpack` (a named diagnostic already, but at exit 1) while `cypher` and
+/// `mermaid` still fell through to the raw RPC error — the same refusal, two
+/// different shapes depending on which code-only format asked. All three now
+/// get the same named diagnostic, at the same exit code `msgpack` already
+/// used.
 #[test]
 fn an_unsupported_format_scope_pair_is_named_not_relayed() {
     let dir = tempfile::tempdir().unwrap();
@@ -7965,9 +7983,9 @@ fn an_unsupported_format_scope_pair_is_named_not_relayed() {
         );
         assert_eq!(
             output.status.code(),
-            Some(64),
-            "the invocation cannot be honoured -- usage error, per the 2026-09-04 \
-             codebase-wide settlement ({format}): {combined}"
+            Some(1),
+            "semantic refusal of a correctly-spelled combination, per d565547f \
+             ({format}): {combined}"
         );
     }
 }
