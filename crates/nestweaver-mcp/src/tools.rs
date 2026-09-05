@@ -133,242 +133,24 @@ fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, a
 }
 
 // ── nw-405/406/407: scope filters for brain_context / project_context ───────
-
-/// Which container owns a graph node, decided from the node's UID alone.
-///
-/// nw-405. `brain_context`'s and `project_context`'s `repos:` / `vaults:`
-/// filters used to answer this question with
-/// `n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)`,
-/// commented "Fallback: UID or location substring". That is a text search, not
-/// an ownership test, and it was wrong in FOUR separately measured directions
-/// on the live 44-repo + 1-vault graph:
-///
-///  * OVER-INCLUDE, vault: `repos:["nestweaver"]` returned 14 of 20 rows as
-///    `note:`/`sec:`/`head:` nodes under `Workspaces/NestWeaver/` — vault
-///    content, which belongs to no repo at all. On a consulting vault that is
-///    `repos:["clientA"]` returning clientB's notes because the PATH happens
-///    to contain the string.
-///  * OVER-INCLUDE, collision: `repos:["website"]` returned symbols from TWO
-///    different repos, because display names collide under `.contains()`.
-///  * UNDER-INCLUDE: `--repos website` returned ZERO symbols from the repo it
-///    named — a symbol's `location` is REPO-RELATIVE and therefore never
-///    contains its own repo name.
-///  * The documented UID form `repos:["repo:kory-brain:21ada82cccf0"]`
-///    answered `connected: 0`.
-///
-/// The UID is the authority because it is the only field on a `BrainNode` that
-/// NAMES an owner: `sym:`/`file:`/`svc:` embed the whole `repo:{inst}:{hash}`,
-/// and `note:`/`sec:`/`head:`/`tag:` embed the whole `vlt:{inst}:{hash}`.
-/// `location` names neither.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NodeOwner {
-    /// Owned by this repo UID.
-    Repo(String),
-    /// Owned by this vault UID. Vault content carries no `repo_uid` at all —
-    /// the same fact `RepoScope::NotRepoScoped` is written on.
-    Vault(String),
-    /// Nothing in the UID names an owner.
-    Unattributable,
-}
-
-/// The owner of `uid`.
-///
-/// The match is over [`nestweaver_schema::uid::UidKind`] rather than an `if`
-/// chain of `starts_with`, for nw-301's reason: an `if` chain cannot be
-/// exhaustive, so a twelfth UID domain would fall silently into whatever the
-/// trailing arm does instead of failing this build.
-fn node_owner(uid: &str) -> NodeOwner {
-    use nestweaver_schema::uid::UidKind;
-
-    /// `{prefix}{owner_uid}:{…}` — an owner UID is always exactly three
-    /// colon-separated components (`repo:{inst}:{hash}`, `vlt:{inst}:{hash}`),
-    /// so take three and discard the node-specific tail.
-    fn owner_head(rest: &str) -> Option<String> {
-        let parts: Vec<&str> = rest.splitn(4, ':').collect();
-        (parts.len() >= 3).then(|| format!("{}:{}:{}", parts[0], parts[1], parts[2]))
-    }
-
-    let Some(kind) = UidKind::of(uid) else {
-        return NodeOwner::Unattributable;
-    };
-    let rest = &uid[kind.prefix().len()..];
-    match kind {
-        // The container node itself.
-        UidKind::Repo => NodeOwner::Repo(uid.to_string()),
-        UidKind::Vault => NodeOwner::Vault(uid.to_string()),
-        // `{prefix}{repo_uid}:{…}`
-        UidKind::File | UidKind::Service | UidKind::Symbol => {
-            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Repo)
-        }
-        // `{prefix}{vault_uid}:{…}`
-        UidKind::Note | UidKind::Tag => {
-            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Vault)
-        }
-        // `sec:{note_uid}:{…}` / `head:{note_uid}:{…}`, and a note UID is
-        // itself `note:{vault_uid}:{…}`, so the inner `note:` comes off too.
-        UidKind::Section | UidKind::Heading => rest
-            .strip_prefix(UidKind::Note.prefix())
-            .and_then(owner_head)
-            .map_or(NodeOwner::Unattributable, NodeOwner::Vault),
-        // `proj:{instance}:{hash}` names an INSTANCE, not a repo, and a
-        // contract UID carries no repo component at all (see
-        // `tool_cross_repo_contracts`'s `FailClosed` reason). Neither can be
-        // attributed, so neither survives a scope filter.
-        UidKind::Project | UidKind::Contract => NodeOwner::Unattributable,
-    }
-}
-
-/// Resolve caller-supplied `repos:` entries to concrete repo UIDs.
-///
-/// nw-405's acceptance criterion is "each entry resolves to a concrete
-/// `repo_uid` (exact name / uid / url, erroring on unresolvable)". The
-/// resolution is [`nestweaver_engine::resolve_repo_selector`] — the SAME
-/// resolver `--repo` already uses everywhere else — so these two tools cannot
-/// grow a second, drifting notion of what a repo name means, and an ambiguous
-/// selector (`website` under two orgs) FAILS naming both candidates instead of
-/// quietly merging two tenants' code into one answer.
-///
-/// `visible` filters the candidate set first. Without it the resolver's own
-/// "not found" / "ambiguous, candidates are …" messages would enumerate repos
-/// a repo-scoped caller cannot see — an error string is not walked by
-/// `redact_response_for_visibility`, so this would have re-opened nw-403 on
-/// the error path. Filtered, a hidden repo is indistinguishable from one that
-/// does not exist.
-fn resolve_repo_filter(
-    store: &GraphStore,
-    selectors: &[String],
-    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
-) -> Result<HashSet<String>, anyhow::Error> {
-    let repos: Vec<nestweaver_schema::Repo> = store
-        .list_repos(None)
-        .context("listing repositories to resolve the `repos` filter")?
-        .into_iter()
-        .filter(|repo| repo_is_visible(&repo.uid, visible))
-        .collect();
-    selectors
-        .iter()
-        .map(|selector| {
-            nestweaver_engine::resolve_repo_selector(&repos, selector)
-                .map(|repo| repo.uid.clone())
-                // Flattened with `{error:#}` rather than `.context(…)`: an MCP
-                // client renders `Error::to_string()`, which shows only the
-                // OUTERMOST context — so a `.context()` here would hide the
-                // resolver's own "ambiguous; use an exact UID: …" candidate
-                // list, which is the only actionable part of the message.
-                .map_err(|error| anyhow!("`repos` filter entry {selector:?}: {error:#}"))
-        })
-        .collect()
-}
-
-/// Resolve caller-supplied `vaults:` entries to concrete vault UIDs.
-///
-/// The mirror of [`resolve_repo_filter`], written here rather than shared with
-/// it because there is no engine-side vault selector to reuse: `--repo` is a
-/// first-class CLI selector and `--vault` is not. The precedence deliberately
-/// matches `resolve_repo_selector`'s (exact UID, then case-insensitive exact
-/// name, then exact root path), and it is exact-only — no substring leg —
-/// because the substring leg is precisely what nw-405 is removing.
-fn resolve_vault_filter(
-    store: &GraphStore,
-    selectors: &[String],
-) -> Result<HashSet<String>, anyhow::Error> {
-    let vaults = store
-        .list_vaults(None)
-        .context("listing vaults to resolve the `vaults` filter")?;
-    selectors
-        .iter()
-        .map(|selector| {
-            let needle = selector.to_lowercase();
-            let matches: Vec<&nestweaver_schema::Vault> = vaults
-                .iter()
-                .filter(|vault| {
-                    vault.uid == *selector
-                        || vault.name.to_lowercase() == needle
-                        || vault.root_path == *selector
-                })
-                .collect();
-            match matches.as_slice() {
-                [vault] => Ok(vault.uid.clone()),
-                // An unresolvable entry ERRORS. The old predicate matched
-                // nothing and returned a confident empty result, which reads
-                // as "this vault has no relevant content" rather than "you
-                // named a vault that is not here".
-                [] => {
-                    let known: Vec<&str> = vaults.iter().map(|vault| vault.name.as_str()).collect();
-                    Err(anyhow!(
-                        "`vaults` filter entry {selector:?} matches no indexed vault; \
-                         known vaults: {}",
-                        if known.is_empty() {
-                            "(none indexed)".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    ))
-                }
-                ambiguous => Err(anyhow!(
-                    "`vaults` filter entry {selector:?} is ambiguous; use an exact UID: {}",
-                    ambiguous
-                        .iter()
-                        .map(|vault| format!("{} ({})", vault.name, vault.uid))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            }
-        })
-        .collect()
-}
-
-/// Keep only nodes owned by one of `repo_uids`.
-///
-/// **VAULT NODES ARE DROPPED.** This is nw-405's required recorded decision,
-/// and the schema text for `repos` says so in the same words. A Note, Section,
-/// Heading or Tag belongs to a VAULT and carries no `repo_uid`, so it is not
-/// "in repo X" under any reading — keeping it is exactly the measured
-/// over-include where `repos:["clientA"]` returns clientB's notes because
-/// their path contains the string. Vault content is scoped with `vaults:`,
-/// which is the parameter that can actually answer the question.
-///
-/// A node whose UID names no owner is dropped for the reason nw-403's
-/// redactor drops one: "I cannot tell what owns this" is not a reason to
-/// return it under a scope argument.
-fn retain_nodes_in_repos(
-    nodes: &mut Vec<nestweaver_engine::BrainNode>,
-    repo_uids: &HashSet<String>,
-) {
-    nodes.retain(
-        |node| matches!(node_owner(&node.uid), NodeOwner::Repo(uid) if repo_uids.contains(&uid)),
-    );
-}
-
-/// Keep only nodes owned by one of `vault_uids`.
-///
-/// The mirror of [`retain_nodes_in_repos`]: Symbol/File/Service nodes belong
-/// to a repo, so they cannot satisfy a vault scope and are dropped.
-fn retain_nodes_in_vaults(
-    nodes: &mut Vec<nestweaver_engine::BrainNode>,
-    vault_uids: &HashSet<String>,
-) {
-    nodes.retain(
-        |node| matches!(node_owner(&node.uid), NodeOwner::Vault(uid) if vault_uids.contains(&uid)),
-    );
-}
-
-/// Apply `path_prefix`, exempting nodes that have no path at all.
-///
-/// nw-406. The predicate was the bare
-/// `nodes.retain(|n| n.location.starts_with(prefix))`, and a Tag node carries
-/// `location: ""`: `"".starts_with("Workspaces/")` is false, so
-/// `--kinds Tag --path-prefix Workspaces/` measured 25 Tag nodes -> 0 on a
-/// vault whose 606 tags ALL live under `Workspaces/`. A confident zero with no
-/// disclosure.
-///
-/// A tag is not "outside" the prefix — it has no path concept for the prefix
-/// to test, which is the same unhandled-kind omission as the `tags`-vs-Symbol
-/// carve-out. An empty location is therefore EXEMPT rather than excluded: a
-/// filter that cannot decide a kind must not silently delete all of it.
-fn retain_nodes_under_path_prefix(nodes: &mut Vec<nestweaver_engine::BrainNode>, prefix: &str) {
-    nodes.retain(|node| node.location.is_empty() || node.location.starts_with(prefix));
-}
+//
+// nw-421: `NodeOwner`, `node_owner`, `resolve_repo_filter`,
+// `resolve_vault_filter`, `retain_nodes_in_repos`, `retain_nodes_in_vaults`
+// and `retain_nodes_under_path_prefix` used to be defined here verbatim, with
+// a byte-identical copy in `src/main.rs` because these were crate-private.
+// Both copies are now the ONE definition in `nestweaver_engine::node_scope`;
+// this is the sibling-gap fix nw-217 says is the only kind that holds — the
+// second implementation now CALLS the first instead of restating it.
+use nestweaver_engine::node_scope::{
+    resolve_repo_filter, resolve_vault_filter, retain_nodes_in_repos, retain_nodes_in_vaults,
+    retain_nodes_under_path_prefix,
+};
+// `NodeOwner`/`node_owner` are only exercised directly by this crate's own
+// parity tests below (production call sites here only ever call the
+// `retain_*` wrappers) — imported separately so a non-test build does not
+// warn about an import used only under `#[cfg(test)]`.
+#[cfg(test)]
+use nestweaver_engine::node_scope::{NodeOwner, node_owner};
 
 /// Resolve authoritative symbol ownership only when repository scoping is
 /// active. Restricted impact/test-selection responses fail closed if this
@@ -12626,9 +12408,16 @@ fn tool_schema_blast_radius() -> Value {
                     "description": "Maximum transitive traversal depth (1-15). Default 3. Higher values find more distant dependents.",
                     "default": 3
                 },
+                // nw-428: resolved the same way `--repo` is resolved
+                // everywhere else (exact repo_uid, exact display name, or
+                // exact local root path — see `resolve_repo_selector`), and
+                // an unresolvable value ERRORS rather than silently scoping
+                // to nothing. Many indexed repos have no display name (check
+                // `list_repos`'s `name` field); for those the repo_uid is the
+                // only value that will resolve.
                 "repo": {
                     "type": "string",
-                    "description": "Optional repo_uid to scope changed-file resolution to (recommended in multi-repo graphs)."
+                    "description": "Optional repo to scope changed-file resolution to (recommended in multi-repo graphs). Accepts the repo_uid, the exact display name `list_repos` prints, or the exact local root path. An unresolvable value is refused rather than silently returning zero affected symbols; if the repo has no display name (see `list_repos`), pass its repo_uid."
                 },
                 "include_data_edges": {
                     "type": "boolean",
@@ -12690,7 +12479,23 @@ fn tool_blast_radius(
         .map(|n| n as u32)
         .unwrap_or(3);
 
-    let target_repo = args.get("repo").and_then(|v| v.as_str());
+    // nw-428: `repo` used to be forwarded to `analyze_blast_radius` VERBATIM,
+    // and the engine only ever compares `target_repo` against `known_repo_uids`
+    // (raw repo UIDs). A `list-repos`-printed NAME therefore never matched —
+    // it silently fell into `repos_not_indexed` and the run answered a
+    // confident `affected_symbol_count: 0` / `gate_state: degraded-unknown`
+    // rather than refusing. `resolve_repo_filter` is the SAME resolver the
+    // `repos`/`vaults` filters above use (name, UID, or root path; visibility
+    // pre-filtered; ambiguous or unresolvable ERRORS naming the candidates) —
+    // reused rather than re-implemented, per nw-217/nw-421. An unresolvable
+    // `repo` is therefore a hard refusal (the tool call errors) instead of an
+    // empty, "complete" analysis.
+    let target_repo = match args.get("repo").and_then(|v| v.as_str()) {
+        Some(raw) => resolve_repo_filter(store, std::slice::from_ref(&raw.to_string()), visible)?
+            .into_iter()
+            .next(),
+        None => None,
+    };
 
     // Optional: also follow data-dependence edges (type refs & field access).
     // Default false — higher recall but noisier.
@@ -12710,7 +12515,7 @@ fn tool_blast_radius(
     );
 
     let options = BlastRadiusOptions {
-        target_repo: target_repo.map(str::to_string),
+        target_repo,
         max_depth,
         include_data_edges,
         // Restricted callers must be redacted against the complete result so
@@ -14900,7 +14705,7 @@ fn tool_schema_investigate() -> Value {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
-                "scope": { "type": "string", "description": "Optional scope. \"project:<slug>\" and \"repo:<name>\" genuinely restrict results; \"vault\" and \"all\" are PASS-THROUGHS that restrict nothing (default: \"all\"). Read `scope_filtered` in the response to know whether a filter was actually applied — `scope` only echoes what you asked for." },
+                "scope": { "type": "string", "description": "Optional scope. \"project:<slug>\" and \"repo:<name>\" genuinely restrict results; \"vault\" and \"all\" are PASS-THROUGHS that restrict nothing (default: \"all\"). Read `scope_filtered` in the response to know whether a filter was actually applied — `scope` only echoes what you asked for. NOTE on vault notes: a repo has no note-to-repo association in the schema, so \"repo:<name>\" EXCLUDES vault notes/sections/tags from the map entirely (symbols are restricted to the named repo). \"project:<slug>\" is different: it genuinely admits the project's own member notes (seeded from its vault_folder) alongside its member symbols." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
                 "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
             },
@@ -19077,6 +18882,161 @@ mod blast_radius_visibility_tests {
         assert!(
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
+        );
+    }
+
+    /// A two-repo store where one repo (`repo:kory-brain:10daef553576`) has a
+    /// display `name` (`bx-react-native-client`) and the other does not — the
+    /// measured nw-428 shape, where 29 of 44 real repos have `name: null`.
+    /// `root` is called by `dependent`, both in the named repo, so a `repo`
+    /// filter that resolves correctly finds a non-zero affected set; one that
+    /// silently fails to resolve (the pre-fix bug: raw string compared only
+    /// against known repo UIDS) reports zero with `repos_not_indexed`
+    /// naming the filter value.
+    fn named_repo_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let named = Repo {
+            uid: "repo:kory-brain:10daef553576".to_string(),
+            url: "https://example.test/bx-react-native-client".to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: Some("bx-react-native-client".to_string()),
+            root_path: None,
+        };
+        let unnamed = Repo {
+            uid: "repo:kory-brain:deadbeefcafe".to_string(),
+            url: "https://example.test/unnamed".to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store.insert_repo(&named).unwrap();
+        store.insert_repo(&unnamed).unwrap();
+        store
+            .insert_symbol(&symbol(
+                "root",
+                "Root",
+                &named.uid,
+                "src/theme/ThemeContext.tsx",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "dependent",
+                "Dependent",
+                &named.uid,
+                "src/consumer.tsx",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "dependent".to_string(),
+                target_uid: "root".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
+    /// nw-428. `--repo`/`repo` accepts the exact repo_uid, the exact display
+    /// `name` `list_repos` prints, and (per `resolve_repo_selector`'s
+    /// precedence) an exact URL/root-path match — the SAME resolver `impact
+    /// --repo` already uses, reused rather than re-implemented.
+    ///
+    /// COUNTERWEIGHT: reverting `tool_blast_radius`'s `repo` resolution to the
+    /// pre-fix `args.get("repo").and_then(|v| v.as_str()).map(str::to_string)`
+    /// (raw passthrough, no `resolve_repo_filter` call) makes this test FAIL —
+    /// the by-name run then reports `affected_symbol_count: 0` and
+    /// `repos_not_indexed: ["bx-react-native-client"]` while by-uid still
+    /// reports 1, so the first assertion (`by_uid == by_name`) trips. Verified
+    /// by hand before committing this test.
+    #[test]
+    fn tool_blast_radius_repo_filter_resolves_by_name_and_by_uid_identically() {
+        let store = named_repo_store();
+
+        let by_uid = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/theme/ThemeContext.tsx"], "repo": "repo:kory-brain:10daef553576" }),
+            None,
+            None,
+        )
+        .unwrap();
+        let by_name = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/theme/ThemeContext.tsx"], "repo": "bx-react-native-client" }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            by_uid["affected_symbol_count"], by_name["affected_symbol_count"],
+            "by-uid ({by_uid}) and by-name ({by_name}) must agree on affected_symbol_count"
+        );
+        assert!(
+            by_uid["affected_symbol_count"].as_u64().unwrap() > 0,
+            "the fixture's dependent edge must actually surface an affected symbol; got {by_uid}"
+        );
+        assert_eq!(by_uid["status"], "complete");
+        assert_eq!(by_name["status"], "complete");
+        assert_eq!(by_uid["gate_state"], by_name["gate_state"]);
+        assert_eq!(
+            by_name["coverage"]["repos_not_indexed"],
+            json!([]),
+            "resolving `repo` by its printed NAME must not report it as not-indexed; got {by_name}"
+        );
+    }
+
+    /// nw-428's companion half: a `repo` value that resolves to nothing must
+    /// REFUSE (the tool call errors) rather than silently answering a
+    /// confident `affected_symbol_count: 0` / `gate_state: degraded-unknown`
+    /// that reads as "nothing depends on this file, safe to change".
+    ///
+    /// COUNTERWEIGHT: the pre-fix passthrough behavior returns `Ok(_)` here
+    /// with `affected_symbol_count: 0`, so asserting `.is_err()` fails against
+    /// the un-fixed code — confirmed by hand before committing.
+    #[test]
+    fn tool_blast_radius_unresolvable_repo_filter_refuses_rather_than_answering_zero() {
+        let store = named_repo_store();
+        let result = tool_blast_radius(
+            &store,
+            json!({
+                "changed_files": ["src/theme/ThemeContext.tsx"],
+                "repo": "this-repo-does-not-exist",
+            }),
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "an unresolvable `repo` filter must refuse the analysis, not answer 0 affected; got {result:?}"
         );
     }
 
