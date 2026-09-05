@@ -26534,207 +26534,44 @@ fn run_brain(
 
 // ── `brain context` scope filters (nw-405 / nw-406 / nw-407) ────────────────
 //
-// The CLI twins of the private helpers in `crates/nestweaver-mcp/src/tools.rs`
-// (`NodeOwner`, `node_owner`, `resolve_repo_filter`, `resolve_vault_filter`,
-// `retain_nodes_in_repos`, `retain_nodes_in_vaults`,
-// `retain_nodes_under_path_prefix`), which carry the full argument for each
-// decision. They must stay equivalent to those: nw-405's fourth measured
-// symptom was the two surfaces DISAGREEING about one flag value — the CLI's
-// predicate was case-SENSITIVE where MCP's was not — and `brain context`
-// forwards these flags to the daemon except under `--no-tests` /
-// `--prefer-instance`, which force this direct path. So the same command
-// answered differently depending on whether a daemon happened to be running.
-//
-// They are DUPLICATED rather than shared only because the MCP copies are
-// crate-private. The durable fix is to lift one copy into `nestweaver-engine`
-// and have both surfaces call it; until then a change to either must be made
-// to both, which is exactly the hazard this item was filed about.
+// nw-421: `NodeOwner`, `node_owner`, `resolve_repo_filter`,
+// `resolve_vault_filter`, `retain_nodes_in_repos`, `retain_nodes_in_vaults`
+// and `retain_nodes_under_path_prefix` used to be defined here verbatim, with
+// a byte-identical copy in `crates/nestweaver-mcp/src/tools.rs` because the
+// MCP copies were crate-private. Both copies are now the ONE definition in
+// `nestweaver_engine::node_scope`; this CLI calls it exactly as the MCP tool
+// does; `visible` is always `None` here (the direct CLI path has no
+// authorization-scope concept), which is a no-op filter, not a divergence.
+use nestweaver_engine::node_scope::{
+    resolve_repo_filter as engine_resolve_repo_filter,
+    resolve_vault_filter as engine_resolve_vault_filter, retain_nodes_in_repos,
+    retain_nodes_in_vaults, retain_nodes_under_path_prefix,
+};
+// Only this file's own parity tests reference `NodeOwner`/`node_owner`
+// directly; production call sites here only ever call the `retain_*`
+// wrappers. Imported separately so a non-test build does not warn about an
+// import used only under `#[cfg(test)]` (mirrors the same split in
+// `crates/nestweaver-mcp/src/tools.rs`).
+#[cfg(test)]
+use nestweaver_engine::node_scope::{NodeOwner, node_owner};
 
-/// The container a node UID names as its owner.
-///
-/// The UID is the authority because it is the only field on a `BrainNode` that
-/// NAMES an owner: `sym:`/`file:`/`svc:` embed the whole `repo:{inst}:{hash}`,
-/// and `note:`/`sec:`/`head:`/`tag:` embed the whole `vlt:{inst}:{hash}`.
-/// `location` names neither — a symbol's location is REPO-RELATIVE and so
-/// never contains its own repo name, which is why `--repos website` used to
-/// return ZERO symbols from the repo it named.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NodeOwner {
-    Repo(String),
-    /// Vault content carries no `repo_uid` at all — the same fact
-    /// `RepoScope::NotRepoScoped` is written on.
-    Vault(String),
-    /// Nothing in the UID names an owner.
-    Unattributable,
-}
-
-/// The owner of `uid`.
-///
-/// Matched over [`nestweaver_schema::uid::UidKind`] rather than an `if` chain
-/// of `starts_with`, for nw-301's reason: an `if` chain cannot be exhaustive,
-/// so a twelfth UID domain would fall silently into whatever the trailing arm
-/// does instead of failing this build.
-fn node_owner(uid: &str) -> NodeOwner {
-    use nestweaver_schema::uid::UidKind;
-
-    /// `{prefix}{owner_uid}:{…}` — an owner UID is always exactly three
-    /// colon-separated components, so take three and discard the tail.
-    fn owner_head(rest: &str) -> Option<String> {
-        let parts: Vec<&str> = rest.splitn(4, ':').collect();
-        (parts.len() >= 3).then(|| format!("{}:{}:{}", parts[0], parts[1], parts[2]))
-    }
-
-    let Some(kind) = UidKind::of(uid) else {
-        return NodeOwner::Unattributable;
-    };
-    let rest = &uid[kind.prefix().len()..];
-    match kind {
-        UidKind::Repo => NodeOwner::Repo(uid.to_string()),
-        UidKind::Vault => NodeOwner::Vault(uid.to_string()),
-        UidKind::File | UidKind::Service | UidKind::Symbol => {
-            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Repo)
-        }
-        UidKind::Note | UidKind::Tag => {
-            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Vault)
-        }
-        // `sec:{note_uid}:{…}` / `head:{note_uid}:{…}`, and a note UID is
-        // itself `note:{vault_uid}:{…}`, so the inner `note:` comes off too.
-        UidKind::Section | UidKind::Heading => rest
-            .strip_prefix(UidKind::Note.prefix())
-            .and_then(owner_head)
-            .map_or(NodeOwner::Unattributable, NodeOwner::Vault),
-        // `proj:` names an INSTANCE and a contract UID carries no repo
-        // component, so neither can be attributed to a container.
-        UidKind::Project | UidKind::Contract => NodeOwner::Unattributable,
-    }
-}
-
-/// Resolve `--repos` entries to concrete repo UIDs.
-///
-/// The resolution is [`nestweaver_engine::resolve_repo_selector`] — the SAME
-/// resolver `--repo` already uses everywhere else — so this flag cannot grow a
-/// second, drifting notion of what a repo name means, and an ambiguous
-/// selector (`website` under two orgs) FAILS naming both candidates instead of
-/// quietly merging two tenants' code into one answer. An unresolvable entry
-/// ERRORS: the old predicate matched nothing and returned a confident empty
-/// result, which reads as "this repo has no relevant content" rather than "you
-/// named a repo that is not here".
+/// The CLI's direct path has no authorization-scope concept, so `visible` is
+/// always `None` — a no-op filter over `engine_resolve_repo_filter`, not a
+/// second implementation of it. The message is passed through unchanged
+/// rather than re-wrapped, so the CLI and MCP report the identical text for
+/// an unresolvable `--repos` entry.
 fn resolve_repo_filter(
     store: &GraphStore,
     selectors: &[String],
 ) -> Result<std::collections::HashSet<String>, anyhow::Error> {
-    let repos = store
-        .list_repos(None)
-        .context("listing repositories to resolve --repos")?;
-    selectors
-        .iter()
-        .map(|selector| {
-            nestweaver_engine::resolve_repo_selector(&repos, selector)
-                .map(|repo| repo.uid.clone())
-                // Flattened with `{error:#}` rather than `.context(…)` so the
-                // resolver's own "ambiguous; use an exact UID: …" candidate
-                // list — the only actionable part — survives to the terminal.
-                .map_err(|error| anyhow::anyhow!("--repos entry {selector:?}: {error:#}"))
-        })
-        .collect()
+    engine_resolve_repo_filter(store, selectors, None)
 }
 
-/// Resolve `--vaults` entries to concrete vault UIDs.
-///
-/// The mirror of [`resolve_repo_filter`], written out because there is no
-/// engine-side vault selector to reuse: `--repo` is a first-class selector and
-/// `--vault` is not. Precedence deliberately matches `resolve_repo_selector`'s
-/// (exact UID, then case-insensitive exact name, then exact root path) and is
-/// exact-only — the substring leg is precisely what nw-405 removes.
 fn resolve_vault_filter(
     store: &GraphStore,
     selectors: &[String],
 ) -> Result<std::collections::HashSet<String>, anyhow::Error> {
-    let vaults = store
-        .list_vaults(None)
-        .context("listing vaults to resolve --vaults")?;
-    selectors
-        .iter()
-        .map(|selector| {
-            let needle = selector.to_lowercase();
-            let matches: Vec<&nestweaver_schema::Vault> = vaults
-                .iter()
-                .filter(|vault| {
-                    vault.uid == *selector
-                        || vault.name.to_lowercase() == needle
-                        || vault.root_path == *selector
-                })
-                .collect();
-            match matches.as_slice() {
-                [vault] => Ok(vault.uid.clone()),
-                [] => {
-                    let known: Vec<&str> = vaults.iter().map(|vault| vault.name.as_str()).collect();
-                    Err(anyhow::anyhow!(
-                        "--vaults entry {selector:?} matches no indexed vault; known vaults: {}",
-                        if known.is_empty() {
-                            "(none indexed)".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    ))
-                }
-                ambiguous => Err(anyhow::anyhow!(
-                    "--vaults entry {selector:?} is ambiguous; use an exact UID: {}",
-                    ambiguous
-                        .iter()
-                        .map(|vault| format!("{} ({})", vault.name, vault.uid))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            }
-        })
-        .collect()
-}
-
-/// Keep only nodes owned by one of `repo_uids`.
-///
-/// **VAULT NODES ARE DROPPED.** This is nw-405's required recorded decision
-/// and it matches the MCP schema text for `repos`. A Note, Section, Heading or
-/// Tag belongs to a VAULT and carries no `repo_uid`, so it is not "in repo X"
-/// under any reading — keeping it is exactly the measured over-include where
-/// `--repos clientA` returned clientB's notes because their PATH contained the
-/// string. Vault content is scoped with `--vaults`.
-///
-/// An unattributable UID is dropped for nw-403's redactor's reason: "I cannot
-/// tell what owns this" is not a reason to return it under a scope argument.
-fn retain_nodes_in_repos(
-    nodes: &mut Vec<nestweaver_engine::BrainNode>,
-    repo_uids: &std::collections::HashSet<String>,
-) {
-    nodes.retain(
-        |node| matches!(node_owner(&node.uid), NodeOwner::Repo(uid) if repo_uids.contains(&uid)),
-    );
-}
-
-/// Keep only nodes owned by one of `vault_uids`.
-///
-/// The mirror of [`retain_nodes_in_repos`]: Symbol/File/Service nodes belong
-/// to a repo, so they cannot satisfy a vault scope and are dropped.
-fn retain_nodes_in_vaults(
-    nodes: &mut Vec<nestweaver_engine::BrainNode>,
-    vault_uids: &std::collections::HashSet<String>,
-) {
-    nodes.retain(
-        |node| matches!(node_owner(&node.uid), NodeOwner::Vault(uid) if vault_uids.contains(&uid)),
-    );
-}
-
-/// Apply `--path-prefix`, exempting nodes that have no path at all.
-///
-/// nw-406. The predicate was the bare
-/// `nodes.retain(|n| n.location.starts_with(prefix))`, and a Tag node carries
-/// `location: ""`: `"".starts_with("Workspaces/")` is false, so
-/// `--kinds Tag --path-prefix Workspaces/` measured 25 Tag nodes -> 0 on a
-/// vault whose 606 tags ALL live under `Workspaces/`. A confident zero with no
-/// disclosure. A tag is not "outside" the prefix — it has no path concept for
-/// the prefix to test, so an empty location is EXEMPT rather than excluded.
-fn retain_nodes_under_path_prefix(nodes: &mut Vec<nestweaver_engine::BrainNode>, prefix: &str) {
-    nodes.retain(|node| node.location.is_empty() || node.location.starts_with(prefix));
+    engine_resolve_vault_filter(store, selectors)
 }
 
 /// Keep only nodes that actually carry one of the requested tags.

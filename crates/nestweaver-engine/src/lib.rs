@@ -386,6 +386,7 @@ pub mod investigate;
 pub mod jobs;
 pub mod manifest;
 pub mod mcp_client;
+pub mod node_scope;
 pub mod parse_pool;
 pub mod parsed_cache;
 pub mod process;
