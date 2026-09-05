@@ -180,6 +180,42 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Order two RFC3339 timestamps by the INSTANT they name, not by their bytes.
+///
+/// [`now_rfc3339`] formats with `time`'s Rfc3339, whose subsecond field is
+/// VARIABLE WIDTH: trailing zeros are trimmed, and the field is omitted
+/// entirely on an exact second. Byte comparison therefore does NOT order these
+/// values. `Z` is 0x5A and sorts above every ASCII digit, so an earlier instant
+/// whose subsecond digits are a PREFIX of a later one's compares GREATER:
+///
+/// ```text
+///   "...T22:12:38.12345Z"  >  "...T22:12:38.123456Z"   // by bytes
+///   "...T22:12:38.12345Z"  <  "...T22:12:38.123456Z"   // by instant
+/// ```
+///
+/// The join in `compute_report` reads `selection.ts <= truth.ts` as "this
+/// selection was recorded before the outcome it explains". Under byte
+/// comparison that predicate goes FALSE for a selection recorded microseconds
+/// before its own truth, the truth then finds no eligible selection, and it
+/// drops out of the join entirely -- silently shrinking `n_joined` and the `n`
+/// carried by every metric, in the one module whose whole purpose is measured
+/// trust. Seen in CI as a rare `report_round_trip_hand_checkable` failure
+/// joining 11 of 12.
+///
+/// Falls back to byte order only when a value does not parse: that is the
+/// historical behaviour, and it is the best available ordering for a string
+/// that names no instant.
+fn ts_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let rfc = &time::format_description::well_known::Rfc3339;
+    match (
+        time::OffsetDateTime::parse(a, rfc),
+        time::OffsetDateTime::parse(b, rfc),
+    ) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
 fn recording_disabled() -> bool {
     std::env::var(NO_RECORD_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
 }
@@ -488,7 +524,8 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
             continue;
         }
         // Eligible selection with the GREATEST timestamp at or before the
-        // truth's own (RFC3339 compares lexicographically) — not simply the
+        // truth's own (compared as INSTANTS via `ts_cmp`, never as bytes --
+        // see its doc comment) — not simply the
         // last in append order, since parallel recorders can append out of
         // timestamp order. When no selection predates the truth,
         // only a timestamp-less selection may pair — never a future-dated one.
@@ -496,8 +533,10 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
             .iter()
             .enumerate()
             .filter(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
-            .filter(|(_, s)| !s.ts.is_empty() && s.ts <= truth.ts)
-            .max_by(|(_, a), (_, b)| a.ts.cmp(&b.ts))
+            .filter(|(_, s)| {
+                !s.ts.is_empty() && ts_cmp(&s.ts, &truth.ts) != std::cmp::Ordering::Greater
+            })
+            .max_by(|(_, a), (_, b)| ts_cmp(&a.ts, &b.ts))
             .or_else(|| {
                 selections.iter().enumerate().find(|(i, s)| {
                     !matched_sel.contains(i) && sel_matches(s, truth) && s.ts.is_empty()
@@ -946,6 +985,75 @@ mod tests {
         let measured = load_measured(&db).expect("measured present at n>=10");
         assert_eq!(measured.n_joined, 12);
         assert_eq!(measured.file_recall, 0.5);
+    }
+
+    /// A selection recorded BEFORE its own truth must still join, even when
+    /// the two timestamps collide on a subsecond PREFIX.
+    ///
+    /// `time`'s Rfc3339 subsecond field is variable width (trailing zeros
+    /// trimmed), so `.12345Z` and `.123456Z` are 6 and 7 bytes. Compared as
+    /// bytes the earlier instant sorts GREATER, because `Z` (0x5A) outranks
+    /// `6` (0x36) — the selection then fails the join's "recorded at or before
+    /// the truth" filter, finds no timestamp-less fallback, and its truth
+    /// drops out of the join.
+    ///
+    /// `report_round_trip_hand_checkable` above can only hit this by timing
+    /// luck: it calls the real clock, so it needs two adjacent instants to
+    /// land on a prefix pair. That made it a rare CI failure (11 joined of 12)
+    /// that passed on rerun and never reproduced locally. This test pins the
+    /// timestamps instead of racing for them, so the case is covered rather
+    /// than resampled.
+    ///
+    /// COUNTERWEIGHT: revert `ts_cmp` to `a.cmp(b)` and this fails 0 != 1,
+    /// while the hand-checkable test above keeps passing.
+    #[test]
+    fn a_subsecond_prefix_does_not_drop_a_selection_from_the_join() {
+        let (_dir, db) = scratch_db();
+
+        // Same second; the selection is genuinely EARLIER than the truth.
+        let sel_ts = "2026-09-05T22:12:38.12345Z";
+        let truth_ts = "2026-09-05T22:12:38.123456Z";
+        assert!(
+            sel_ts > truth_ts,
+            "fixture is pointless unless these misorder as BYTES"
+        );
+
+        let selection = SelectionRecord {
+            ts: sel_ts.to_string(),
+            repo_uid: "repo:1".to_string(),
+            sha: "deadbeef".to_string(),
+            changed_files: vec!["src/a.rs".to_string()],
+            selected_test_files: vec!["tests/a.test.ts".to_string()],
+            status: "ok".to_string(),
+            recommendation: "run-selected".to_string(),
+        };
+        let truth = TruthRecord {
+            ts: truth_ts.to_string(),
+            repo_uid: "repo:1".to_string(),
+            sha: "deadbeef".to_string(),
+            failed_test_files: vec!["tests/a.test.ts".to_string()],
+            total_test_files: Some(10),
+            flaky_test_files: Vec::new(),
+            reruns: Some(3),
+        };
+
+        std::fs::write(
+            crate::sidecar_path(&db, SELECTIONS_SUFFIX),
+            format!("{}\n", serde_json::to_string(&selection).unwrap()),
+        )
+        .expect("write selections");
+        std::fs::write(
+            crate::sidecar_path(&db, TRUTH_SUFFIX),
+            format!("{}\n", serde_json::to_string(&truth).unwrap()),
+        )
+        .expect("write truth");
+
+        let report = compute_report(&db, 0).expect("report");
+        assert_eq!(
+            report.n_joined, 1,
+            "a selection recorded before its truth must join regardless of \
+             subsecond width"
+        );
     }
 
     /// nw-066: a FLAKY failure must not count as a miss (it would deflate
