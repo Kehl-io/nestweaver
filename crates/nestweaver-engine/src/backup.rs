@@ -1080,15 +1080,17 @@ fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 ///
 /// `Owned` means this call acquired the namespace and per-database write
 /// leases itself and releases them when dropped. `Borrowed` means the
-/// calling process already held every namespace this restore needs — the CLI
-/// choke point (`with_exclusive_restore_access`) acquires exactly this
-/// authority before calling in — so re-acquiring here would self-conflict:
-/// the underlying primitives are scoped to the open file description /
-/// process-local claim registry, not to "some other call in this process
-/// already has it", and neither tolerates a same-process duplicate. Trusting
-/// an already-held claim is therefore correct, not merely convenient: the
-/// authority these leases represent is already in force for the duration of
-/// this call either way.
+/// calling process already held every namespace AND every per-database write
+/// lease this restore needs — the CLI choke point
+/// (`with_exclusive_restore_access`) acquires exactly this authority before
+/// calling in — so re-acquiring here would self-conflict: the underlying
+/// primitives are scoped to the open file description / process-local claim
+/// registry, not to "some other call in this process already has it", and
+/// neither tolerates a same-process duplicate. Trusting an already-VERIFIED
+/// claim is therefore correct, not merely convenient: the authority these
+/// leases represent is already in force for the duration of this call either
+/// way. A namespace claim ALONE is not enough to license this — see
+/// [`acquire_restore_authority`].
 #[must_use = "dropping this immediately reopens the window this authority closes"]
 enum RestoreAuthority {
     Owned {
@@ -1110,21 +1112,47 @@ enum RestoreAuthority {
 /// exclusion entirely (nw-375). Acquiring it here closes that gap for every
 /// caller, library or CLI, without changing what the CLI already does
 /// correctly.
+///
+/// Recognizing an already-held outer authority (`Borrowed`) must VERIFY that
+/// authority, not infer it from the namespace claim alone: a namespace lock
+/// proves only that database CREATION is closed for that directory pair, not
+/// that any INCUMBENT database's write lease was ever taken. An unrelated
+/// in-process caller holding just the namespace lease (via the public
+/// `acquire_db_namespace_lease`, for a reason that has nothing to do with
+/// restoring anything) would satisfy a namespace-only check while every
+/// incumbent `.lbug` underneath remained completely unexcluded — the same
+/// "trust ambient state instead of requiring a declaration" shape this sweep
+/// keeps finding elsewhere. So every enumerated target must ALSO be a write
+/// lease this exact process currently holds before `Borrowed` is trusted;
+/// otherwise this falls through to a genuine acquisition attempt, which
+/// refuses cleanly (rather than proceeding unprotected) against whichever
+/// target turns out not to be this process's own.
 fn acquire_restore_authority(data_dir: &Path) -> anyhow::Result<RestoreAuthority> {
     let restoring_dir = restoring_dir_for(data_dir);
     let namespace_dirs = [data_dir.to_path_buf(), restoring_dir];
 
-    // If this process already holds every namespace this restore needs, an
-    // outer caller (the CLI choke point, or an equivalent) has already
-    // established the authority for the exact same directories. Trust it
-    // instead of re-acquiring: `flock` does not know "this process already
-    // has an equivalent lock" and would simply retry against itself for the
-    // duration of the bounded retry window before failing closed.
     if namespace_dirs
         .iter()
         .all(|dir| nestweaver_store::current_process_claims_namespace_lease(dir))
     {
-        return Ok(RestoreAuthority::Borrowed);
+        // The namespace half of the outer authority is in force. Verify the
+        // other half before trusting it: every incumbent database this
+        // restore is about to destroy must ALSO be a write lease this
+        // process already holds. An empty target list (nothing exists to
+        // destroy yet) is vacuously satisfied, matching the CLI's own
+        // namespace-only protection for a fresh destination.
+        let targets = restore_lease_targets(data_dir)?;
+        if targets
+            .iter()
+            .all(|target| nestweaver_store::current_process_claims_write_lease(target))
+        {
+            return Ok(RestoreAuthority::Borrowed);
+        }
+        // Verification failed: an outer caller holds the namespace but not
+        // every incumbent's write lease. Do NOT proceed unprotected — fall
+        // through to a genuine acquisition attempt below, which will refuse
+        // cleanly (naming the exact conflict) rather than destroy data no
+        // lease of this process's actually covers.
     }
 
     let targets = restore_lease_targets(data_dir)?;
@@ -3715,5 +3743,88 @@ mod tests {
         drop(namespace);
         drop(restoring_namespace);
         assert!(nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok());
+    }
+
+    /// THE HIGH-SEVERITY GAP THE PREVIOUS TEST COULD NOT SEE: it exercised
+    /// `Borrowed` against a `data_dir` with NOTHING in it, so verifying the
+    /// per-database half of the authority was vacuously satisfied either way
+    /// and the gap was unobservable. Here `data_dir` holds a REAL incumbent
+    /// database, and the namespace lease is taken by a caller that has
+    /// nothing to do with restoring anything — it never took the incumbent's
+    /// write lease at all. `current_process_claims_namespace_lease` alone
+    /// must NOT be enough to license `Borrowed`: without verifying every
+    /// enumerated target is ALSO a write lease this process holds,
+    /// `backup_restore` would destroy the incumbent database with no
+    /// exclusion over it whatsoever — worse than refusing, because nothing
+    /// stops a genuine writer from racing the destructive rename underneath
+    /// it.
+    #[test]
+    fn backup_restore_does_not_trust_a_namespace_only_claim_over_a_real_incumbent() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source_db = tmp.path().join("source").join("test.lbug");
+        std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        drop(nestweaver_store::GraphStore::create(&source_db).unwrap());
+        let snapshot = tmp.path().join("test.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: source_db,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "namespace-only-claim".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        // A REAL incumbent database `backup_restore` is about to destroy.
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let target_db = data_dir.join("test.lbug");
+        drop(nestweaver_store::GraphStore::create(&target_db).unwrap());
+        std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+
+        // An UNRELATED in-process caller takes only the namespace lease —
+        // via the same public API the CLI choke point uses, but for a
+        // reason that has nothing to do with this restore, and critically
+        // WITHOUT ever taking the incumbent's write lease. This is exactly
+        // what `current_process_claims_namespace_lease` alone cannot tell
+        // apart from a caller that took the full, verified authority.
+        let namespace = nestweaver_store::acquire_db_namespace_lease(&data_dir).unwrap();
+        let restoring_namespace =
+            nestweaver_store::acquire_db_namespace_lease(&restoring_dir_for(&data_dir)).unwrap();
+        assert!(nestweaver_store::current_process_claims_namespace_lease(
+            &data_dir
+        ));
+        assert!(
+            !nestweaver_store::current_process_claims_write_lease(&target_db),
+            "the setup must not itself hold the incumbent's write lease — that is the point"
+        );
+
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+        })
+        .expect_err(
+            "a namespace-only claim must not license Borrowed over a real, unexcluded \
+             incumbent database",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("write lease") || message.contains("namespace"),
+            "the refusal must explain why, not fail silently: {message}"
+        );
+
+        drop(namespace);
+        drop(restoring_namespace);
+
+        // Exclusion, not just an error: the incumbent must be completely
+        // untouched.
+        assert!(
+            data_dir.join("INCUMBENT").exists(),
+            "a refused restore must not have touched the unexcluded incumbent at all"
+        );
+        assert!(
+            nestweaver_store::GraphStore::open_read_only(&target_db).is_ok(),
+            "the incumbent database must remain exactly as it was"
+        );
     }
 }
