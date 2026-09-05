@@ -5,6 +5,47 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The complete set of on-disk artifacts a database directory can hold,
+/// documented here because nothing else does (nw-368): not `brain
+/// reindex-search --help`, not `INSTALL.md`, not `docs/`. An operator who
+/// finds an unfamiliar file beside `<db>.lbug` should be able to find this
+/// list rather than guess whether it is safe to touch.
+///
+/// A fresh index with `--with-trigrams` lays down all twelve of:
+/// `.filemeta.json`, `.generation`, `.manifests.json`, `.pagerank.json`,
+/// `.parsed_cache.bin`, `.publications/`, `.resolution_deps.bin`,
+/// `.resolver_generation.json`, `.tantivy/`, `.wal`, `.write.lock`, and
+/// `.regex-v3/`. [`SIDECAR_SUFFIXES`] below is the subset a backup archives —
+/// it deliberately excludes three of these:
+///
+/// * `.wal` — copied separately by [`copy_db_files`] only if it still exists
+///   (it should not, after a clean `CHECKPOINT`); never itself a backup
+///   member name.
+/// * `.write.lock` — the exclusive-writer lease file
+///   ([`nestweaver_store::write_lease_path`]). Process-scoped and meaningless
+///   copied into an archive; a restored database gets a fresh one on next
+///   open.
+/// * `.publications/` — the staging area an in-progress publication cutover
+///   builds under, not restorable state; a live publication is backed up via
+///   its own generation, not this directory.
+///
+/// Two further undocumented-until-now artifacts are NOT sidecars of a healthy
+/// index at all, but residue a crashed schema migration can leave beside one
+/// (nw-368's other half):
+///
+/// * `<tantivy-dir>.reindexing` — the previous Tantivy index, renamed aside
+///   during a migration so it can be rolled back to. See
+///   [`nestweaver_store::reindex_lock_path`] for the lock that guards it and
+///   `recover_interrupted_reindex` (private to `nestweaver-store`) for the
+///   recovery this drives on the next open.
+/// * `<parent>/`[`nestweaver_store::TANTIVY_REINDEX_STAGING_PREFIX`]`*` — the
+///   replacement index a migration builds before installing it. Unlike the
+///   `.reindexing` backup, ordinary recovery does not reclaim this on its
+///   own: a migration killed before either rename leaves it behind with
+///   nothing to signal it needs cleanup. Call
+///   [`nestweaver_store::reclaim_orphaned_tantivy_staging`] to find and
+///   remove orphaned instances of this prefix.
+///
 /// Known sidecar suffixes to include in backups.
 const SIDECAR_SUFFIXES: &[&str] = &[
     ".tantivy",

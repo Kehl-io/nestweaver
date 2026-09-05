@@ -529,10 +529,38 @@ impl TantivyIndex {
         store: &GraphStore,
         old_writer: std::sync::MutexGuard<'_, tantivy::IndexWriter>,
     ) -> Result<usize, TantivyError> {
+        // Held for the ENTIRE staging lifetime, not just the rename window
+        // below. The staging directory this call creates is the thing
+        // [`reclaim_orphaned_tantivy_staging`] later has to tell "still being
+        // built" from "abandoned by a dead process" — it can only do that
+        // soundly by requiring the SAME lock to be free before it reclaims
+        // anything with this prefix (nw-368). Acquiring it here, before the
+        // tempdir even exists, closes that race by construction: any process
+        // that holds this lock is provably the only one that can be mid-build
+        // for this index, so a reclaimer that takes the lock is provably not
+        // racing one. Acquiring it late (as before) left the build-and-verify
+        // phase — the bulk of the work, and the bulk of the crash window —
+        // completely unguarded.
+        //
+        // Tantivy's own `INDEX_WRITER_LOCK` cannot cover this: it lives at
+        // `<index>/.tantivy-writer.lock`, so it travels with the directory the
+        // first rename moves aside and stops excluding anything.
+        let _recovery_guard = match try_acquire_reindex_lock(&self.path)? {
+            Some(guard) => guard,
+            None => {
+                return Err(TantivyError::Io(format!(
+                    "index recovery or migration is already in progress for {}; \
+                     retry shortly",
+                    self.path.display()
+                )));
+            }
+        };
+
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let staging_dir = tempfile::Builder::new()
-            .prefix(".nestweaver-tantivy-reindex-")
+            .prefix(TANTIVY_REINDEX_STAGING_PREFIX)
             .tempdir_in(parent)?;
+        maybe_crash_after_staging_dir_for_test();
         let staging_index = Index::create_in_dir(staging_dir.path(), build_schema())?;
         let staging_schema = inspect_schema(&staging_index.schema())?;
         if !staging_schema.current {
@@ -561,25 +589,8 @@ impl TantivyIndex {
 
         // Everything from here to the final `remove_dir_all(&backup)` mutates
         // whole directories, and between the two renames below the target is
-        // absent while the recovery copy exists. Hold the recovery lock across
-        // that whole window so a concurrent opener's
-        // `recover_interrupted_reindex` cannot restore the backup over this
-        // migration or retire it out from under the cleanup at the end.
-        //
-        // Tantivy's own `INDEX_WRITER_LOCK` cannot cover this: it lives at
-        // `<index>/.tantivy-writer.lock`, so it travels with the directory the
-        // first rename moves aside and stops excluding anything.
-        let _recovery_guard = match try_acquire_reindex_lock(&self.path)? {
-            Some(guard) => guard,
-            None => {
-                return Err(TantivyError::Io(format!(
-                    "index recovery or migration is already in progress for {}; \
-                     retry shortly",
-                    self.path.display()
-                )));
-            }
-        };
-
+        // absent while the recovery copy exists. The recovery lock acquired
+        // above already covers this window too.
         let backup = reindex_backup_path(&self.path);
         if backup.exists() {
             return Err(TantivyError::Io(format!(
@@ -1460,11 +1471,42 @@ fn directory_is_empty(path: &Path) -> Result<bool, TantivyError> {
     Ok(std::fs::read_dir(path)?.next().is_none())
 }
 
+/// Die immediately, right after the migration staging directory is created
+/// and before anything else touches it, so a test can reproduce a REAL
+/// process death that leaves it orphaned (nw-368) rather than only asserting
+/// against a hand-built one. `_exit` is async-signal-safe and runs no
+/// destructor — `tempfile::TempDir`'s own cleanup-on-drop, `.keep()`'d or
+/// not, never gets a chance to run, which is the entire point. Test builds
+/// only.
+#[cfg(test)]
+fn maybe_crash_after_staging_dir_for_test() {
+    if std::env::var_os("NW_TANTIVY_MIGRATION_TEST_CRASH_AFTER_STAGING_DIR").is_some() {
+        // SAFETY: see doc comment above.
+        unsafe { libc::_exit(9) };
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_crash_after_staging_dir_for_test() {}
+
 fn reindex_backup_path(path: &Path) -> PathBuf {
     let mut backup = path.as_os_str().to_os_string();
     backup.push(".reindexing");
     PathBuf::from(backup)
 }
+
+/// Prefix of the staging directory [`TantivyIndex::rebuild_current_schema_atomically`]
+/// builds a replacement index inside, beside the live index (same parent, so
+/// the final `rename` stays on one filesystem). Undocumented anywhere an
+/// operator would see it before nw-368; named here as the ONE place that
+/// creates it and the one that reclaims it
+/// ([`reclaim_orphaned_tantivy_staging`]), so the two can never drift apart.
+///
+/// A `tempfile::TempDir`'s own cleanup-on-drop cannot save a caller from this:
+/// `SIGKILL` runs no destructors, with or without `.keep()`, so ANY process
+/// death during the build — not only after the directory is `.keep()`'d —
+/// leaves this prefix on disk forever unless something else reclaims it.
+pub const TANTIVY_REINDEX_STAGING_PREFIX: &str = ".nestweaver-tantivy-reindex-";
 
 /// Where recovery locks live: ONE per-user root, never inside an index and
 /// never inside a publication slot.
@@ -1671,6 +1713,116 @@ fn recover_interrupted_reindex(path: &Path) -> Result<(), TantivyError> {
     std::fs::rename(&backup, path)?;
     crate::durable_sidecar::sync_parent_directory_durable(path)?;
     Ok(())
+}
+
+/// One staging directory [`reclaim_orphaned_tantivy_staging`] found but could
+/// not remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingReclaimIssue {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// What [`reclaim_orphaned_tantivy_staging`] found and did for one index.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StagingReclaimReport {
+    /// Orphaned staging directories removed by this call. Empty, and
+    /// distinct from an empty report overall, when nothing matched.
+    pub removed: Vec<PathBuf>,
+    /// Staging directories found but not removed; see each issue's error.
+    pub failures: Vec<StagingReclaimIssue>,
+    /// True when this call deferred without touching anything because a
+    /// migration or recovery already held `path`'s recovery lock — a
+    /// directory bearing the staging prefix could still be mid-build. Retry
+    /// later rather than treat this as "nothing to reclaim".
+    pub deferred: bool,
+}
+
+fn list_tantivy_staging_candidates(parent: &Path) -> Result<Vec<PathBuf>, TantivyError> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(TantivyError::Io(format!(
+                "list {} for orphaned migration staging directories: {error}",
+                parent.display()
+            )));
+        }
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            TantivyError::Io(format!(
+                "read a directory entry in {} while looking for orphaned migration staging: {error}",
+                parent.display()
+            ))
+        })?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(TANTIVY_REINDEX_STAGING_PREFIX)
+        {
+            continue;
+        }
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            candidates.push(entry.path());
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+/// Reclaim staging directories orphaned by a crashed schema migration for the
+/// Tantivy index at `path` (nw-368).
+///
+/// [`TantivyIndex::rebuild_current_schema_atomically`] stages its replacement
+/// index in a sibling directory named with [`TANTIVY_REINDEX_STAGING_PREFIX`],
+/// and now holds `path`'s recovery lock for the whole time such a directory
+/// can exist during a normal — or crashed — run. This function reclaims
+/// exactly what that invariant licenses: if it can take the SAME lock, no
+/// migration or recovery for `path` can be building or consuming one of these
+/// directories right now, so every directory with that prefix beside `path`
+/// at that moment was abandoned by a process that died before cleaning up
+/// after itself — `SIGKILL` runs no destructors, so `tempfile`'s own
+/// cleanup-on-drop never gets a chance to run, `.keep()` or not.
+///
+/// If the lock is already held, this defers entirely (`deferred: true`,
+/// nothing touched, nothing reported as reclaimed) rather than guess whether
+/// a visible directory is abandoned or mid-build; call again later.
+///
+/// Cheap when there is nothing to do: the lock is only attempted once a
+/// prefixed directory is actually found, so a healthy index with no crashed
+/// migration behind it pays only the one directory listing.
+pub fn reclaim_orphaned_tantivy_staging(path: &Path) -> Result<StagingReclaimReport, TantivyError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if list_tantivy_staging_candidates(parent)?.is_empty() {
+        return Ok(StagingReclaimReport::default());
+    }
+
+    let Some(_guard) = try_acquire_reindex_lock(path)? else {
+        return Ok(StagingReclaimReport {
+            deferred: true,
+            ..StagingReclaimReport::default()
+        });
+    };
+
+    // Re-list under the lock: a run that finished and cleaned up between the
+    // probe above and the acquisition must not be reported as still there.
+    let candidates = list_tantivy_staging_candidates(parent)?;
+    let mut report = StagingReclaimReport::default();
+    for candidate in candidates {
+        match std::fs::remove_dir_all(&candidate) {
+            Ok(()) => report.removed.push(candidate),
+            Err(error) => report.failures.push(StagingReclaimIssue {
+                path: candidate,
+                error: error.to_string(),
+            }),
+        }
+    }
+    if !report.removed.is_empty() {
+        let _ = crate::durable_sidecar::sync_parent_directory_durable(parent);
+    }
+    Ok(report)
 }
 
 fn extract_text(doc: &TantivyDocument, field: Field) -> String {
@@ -3117,5 +3269,179 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let result = TantivyIndex::open_reader_only(&missing);
         assert!(result.is_err(), "should fail on missing directory");
+    }
+
+    // -------------------------------------------------------------------
+    // nw-368: the migration staging directory must not leak forever.
+    // -------------------------------------------------------------------
+
+    fn staging_dirs_beside(index_path: &Path) -> Vec<PathBuf> {
+        let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TANTIVY_REINDEX_STAGING_PREFIX)
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// Re-invoked as a CHILD PROCESS by
+    /// [`reclaim_orphaned_tantivy_staging_removes_a_directory_left_by_a_real_crash`];
+    /// a no-op in a normal run. Runs a REAL legacy-schema migration and dies
+    /// with `_exit` right after the staging directory is created — no
+    /// unwinding, no destructors — so the parent can reclaim an orphan a real
+    /// death produced, not one it fabricated by hand.
+    #[test]
+    fn migration_crash_child() {
+        let (Ok(index_path), Ok(db_path)) = (
+            std::env::var("NW_MIGRATION_CRASH_INDEX_PATH"),
+            std::env::var("NW_MIGRATION_CRASH_DB_PATH"),
+        ) else {
+            return;
+        };
+        // SAFETY of the crash hook itself lives with `libc::_exit`; setting
+        // this env var only decides that THIS process, and not the test
+        // harness that spawned it, is the one that dies.
+        unsafe { std::env::set_var("NW_TANTIVY_MIGRATION_TEST_CRASH_AFTER_STAGING_DIR", "1") };
+        let store = GraphStore::open_or_create(Path::new(&db_path))
+            .expect("child must open the seeded graph store");
+        let legacy = TantivyIndex::open_or_create(Path::new(&index_path))
+            .expect("child must open the seeded legacy index");
+        // This must never return: the crash hook fires from inside it.
+        let _ = legacy.reindex_from_store(&store);
+        // Only reached if the hook did not fire — a distinct exit code so the
+        // parent can tell "hook missed" from "died as expected" (9).
+        std::process::exit(2);
+    }
+
+    /// THE nw-368 CLAIM, demonstrated against a REAL crash rather than only a
+    /// hand-built leftover directory: a schema migration killed partway
+    /// leaves a `.nestweaver-tantivy-reindex-*` staging directory beside the
+    /// live index, forever, unless something reclaims it. This mirrors the
+    /// filed reproduction exactly (SIGKILL a migration in progress, observe
+    /// the stray directory survive a subsequent open), then proves
+    /// `reclaim_orphaned_tantivy_staging` — and only that function, not the
+    /// ordinary open path — removes it.
+    #[test]
+    fn reclaim_orphaned_tantivy_staging_removes_a_directory_left_by_a_real_crash() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        write_legacy_schema_index(&index_path);
+        let db_path = root.path().join("graph.lbug");
+        drop(GraphStore::create(&db_path).unwrap());
+
+        let status = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "tantivy_index::tests::migration_crash_child",
+            ])
+            .env("NW_MIGRATION_CRASH_INDEX_PATH", &index_path)
+            .env("NW_MIGRATION_CRASH_DB_PATH", &db_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn the migration crash child");
+        assert_eq!(
+            status.code(),
+            Some(9),
+            "the child must have died at the injected crash point, not exited normally \
+             (2 would mean the crash hook never fired)"
+        );
+
+        // The leak, reproduced with a real death: exactly one orphaned
+        // staging directory survives it.
+        let leaked_before = staging_dirs_beside(&index_path);
+        assert_eq!(
+            leaked_before.len(),
+            1,
+            "a real crashed migration must leave exactly one orphaned staging directory"
+        );
+
+        // The live index itself was never touched: the crash landed before
+        // either rename, matching the filed report that the database was
+        // never corrupted.
+        assert!(
+            TantivyIndex::open_reader_only(&index_path).is_ok(),
+            "the pre-crash index must remain fully intact and openable"
+        );
+        assert_eq!(
+            staging_dirs_beside(&index_path).len(),
+            1,
+            "an ordinary read-only open must not have reclaimed the orphan itself"
+        );
+
+        // The fix under test.
+        let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.deferred, "{report:?}");
+        assert!(
+            staging_dirs_beside(&index_path).is_empty(),
+            "the orphaned staging directory must be gone after reclaim"
+        );
+
+        // And the live index is still exactly as it was — reclaim touches
+        // only the abandoned staging prefix, nothing else.
+        assert_eq!(
+            TantivyIndex::open_reader_only(&index_path)
+                .unwrap()
+                .search("payment", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reclaim_orphaned_tantivy_staging_is_a_cheap_no_op_when_nothing_is_orphaned() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        seed_recoverable_index(&index_path);
+
+        let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
+        assert_eq!(report, StagingReclaimReport::default());
+    }
+
+    /// A staging directory that IS still being built (recovery lock held) is
+    /// not the same shape as one abandoned by a dead process, and reclaim
+    /// must tell the two apart rather than guess. Simulated by holding the
+    /// lock directly, since driving a real concurrent build to this exact
+    /// window deterministically is not possible from a test.
+    #[test]
+    fn reclaim_orphaned_tantivy_staging_defers_while_the_recovery_lock_is_held() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let staging = index_path
+            .parent()
+            .unwrap()
+            .join(format!("{TANTIVY_REINDEX_STAGING_PREFIX}fake"));
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let held = try_acquire_reindex_lock(&index_path)
+            .unwrap()
+            .expect("must acquire the lock in this fresh root");
+
+        let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
+        assert!(report.deferred, "{report:?}");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(
+            staging.exists(),
+            "a deferred reclaim must not have touched the candidate directory"
+        );
+
+        drop(held);
+        let report = reclaim_orphaned_tantivy_staging(&index_path).unwrap();
+        assert!(!report.deferred, "{report:?}");
+        assert_eq!(report.removed, vec![staging.clone()]);
+        assert!(!staging.exists());
     }
 }
