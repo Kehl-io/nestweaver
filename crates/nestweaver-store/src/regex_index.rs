@@ -1035,6 +1035,27 @@ impl RegexIndex {
                 metadata.scope_uid
             )));
         }
+        // A crash-orphaned generation from a schema this binary no longer
+        // builds must not be silently adopted just because it is otherwise
+        // self-consistent: that would resurrect exactly the kind of stale
+        // artifact the tombstone work above exists to prevent, only via the
+        // adoption path instead of the deletion one. `refresh_regex_v3`
+        // already treats a schema/fingerprint mismatch as reason to rebuild
+        // (see its `compatible` check), so an old-schema orphan is not lost —
+        // it is left for a human or a future run to reconcile, not silently
+        // reused.
+        if metadata.schema_version != REGEX_INDEX_SCHEMA_VERSION
+            || metadata.tokenizer_fingerprint != REGEX_TOKENIZER_FINGERPRINT
+        {
+            return Err(StoreError::Query(format!(
+                "refusing to recover regex shard {}: schema {}/{:?} does not match this binary's {}/{:?}",
+                path.display(),
+                metadata.schema_version,
+                metadata.tokenizer_fingerprint,
+                REGEX_INDEX_SCHEMA_VERSION,
+                REGEX_TOKENIZER_FINGERPRINT
+            )));
+        }
         let generation_name = path
             .file_name()
             .ok_or_else(|| {
@@ -1600,5 +1621,63 @@ mod tests {
         assert_eq!(report.removed, 1);
         assert_eq!(report.adopted, 0);
         assert!(!scope_root.exists());
+    }
+
+    /// nw-374 review fix 3: a crash-orphaned generation built under a schema
+    /// or tokenizer this binary no longer produces must not be silently
+    /// adopted just because it is otherwise self-consistent (opens, count
+    /// matches, scope hash matches). Adopting it would resurrect a stale
+    /// artifact after an upgrade — the exact class of thing the tombstone
+    /// work exists to prevent, reached through recovery instead of deletion.
+    /// `replace_scope` itself refuses to BUILD a mismatched generation, so
+    /// this is hand-built to simulate one left behind by an older binary.
+    #[test]
+    fn missing_current_with_mismatched_schema_is_not_adopted() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let scope_uid = "repo:test";
+        let scope_root = index.scope_root(scope_uid);
+        let generations = scope_root.join("generations");
+        std::fs::create_dir_all(&generations).unwrap();
+
+        let mut stale_metadata = metadata(1, 0, "digest-stale");
+        stale_metadata.schema_version = REGEX_INDEX_SCHEMA_VERSION - 1;
+        let generation_path = generations.join("stale-generation");
+        std::fs::create_dir_all(&generation_path).unwrap();
+        let (schema, fields) = build_schema();
+        let tantivy_index = Index::create_in_dir(&generation_path, schema).unwrap();
+        let mut writer = tantivy_index.writer(15_000_000).unwrap();
+        let encoded_metadata = serde_json::to_string(&stale_metadata).unwrap();
+        writer
+            .add_document(doc!(
+                fields.uid => format!("meta:{scope_uid}"),
+                fields.kind => METADATA_KIND.to_string(),
+                fields.metadata => encoded_metadata,
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(tantivy_index);
+
+        // No CURRENT, no tombstone: the same shape a first-publication crash
+        // leaves, except this generation is from a schema the binary no
+        // longer builds.
+        let report = index.garbage_collect().unwrap();
+        assert_eq!(report.adopted, 0, "{report:?}");
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(
+            report.failures[0].error.contains("schema"),
+            "the refusal must explain why: {:?}",
+            report.failures[0]
+        );
+        assert!(
+            !scope_root.join("CURRENT").exists(),
+            "a mismatched-schema orphan must not be adopted"
+        );
+        assert!(
+            generation_path.exists(),
+            "a mismatched-schema orphan must not be guessed at and deleted either"
+        );
     }
 }
