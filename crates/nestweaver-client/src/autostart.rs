@@ -588,6 +588,31 @@ pub fn is_process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Override for how long an autostarted EPHEMERAL (temp-path) daemon idles
+/// before self-terminating, distinct from `daemon start --idle-timeout`'s own
+/// 3600s default.
+pub const EPHEMERAL_IDLE_TIMEOUT_ENV: &str = "NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS";
+
+/// nw-088 leg (2). `daemon start`'s `--idle-timeout` default (3600s) is sized
+/// for an interactive session against a REAL database. Autostart never
+/// overrode it, so a one-shot command against a scratch `--db` under `/tmp` —
+/// every test, every throwaway repro — left an hour-long resident daemon
+/// behind it: proven live in the 2026-09-04 QA pass, which watched a plain
+/// `index --repo <scratch> --db /tmp/.../s.lbug` do exactly that.
+const DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Resolve the ephemeral idle timeout, clamped to 1s or more. An unparseable
+/// or zero override falls back to the default rather than failing the
+/// command — this is a patience knob, not a correctness input, mirroring
+/// [`daemon_boot_timeout`]'s own fallback discipline.
+fn ephemeral_idle_timeout_secs() -> u64 {
+    std::env::var(EPHEMERAL_IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS)
+}
+
 fn daemon_start_command(
     exe: &Path,
     db_path: &Path,
@@ -595,6 +620,15 @@ fn daemon_start_command(
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
+    // nw-088 leg (2). One predicate governs "is this path ephemeral" across
+    // the whole daemon lifecycle — macOS launchd-vs-foreground-child routing
+    // and the gc sweep's reclaimability already use
+    // `nestweaver_daemon::lifecycle::is_temp_db_path`; using it here too is
+    // the same guard, not a second guess that can drift from the other two.
+    if nestweaver_daemon::lifecycle::is_temp_db_path(db_path) {
+        cmd.arg("--idle-timeout")
+            .arg(ephemeral_idle_timeout_secs().to_string());
+    }
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }
@@ -1247,6 +1281,10 @@ credential_method = "gh"
 
     #[test]
     fn daemon_start_command_forwards_db_and_config() {
+        // `tempfile::tempdir()` lives under the OS temp root by construction,
+        // so this exercises the SAME `is_temp_db_path(db)` branch nw-088 leg
+        // (2) added — the assertion below expects `--idle-timeout` for
+        // exactly that reason, not despite it.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         let spawn_lock = SpawnLock::acquire(&db).unwrap();
@@ -1268,6 +1306,8 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--idle-timeout",
+                &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
                 "--config",
                 "/tmp/nestweaver-instance.toml",
             ]
@@ -1282,6 +1322,29 @@ credential_method = "gh"
             .parse::<RawFd>()
             .unwrap();
         assert!(fd >= 3);
+    }
+
+    /// nw-088 leg (2)'s counterweight: a REAL (non-temp) database must keep
+    /// today's behaviour exactly — no `--idle-timeout` override at all, so
+    /// `daemon start`'s own 3600s default governs an interactive session.
+    /// Without this, the ephemeral-path branch above could satisfy its own
+    /// test by adding the flag unconditionally.
+    #[test]
+    fn daemon_start_command_does_not_override_idle_timeout_for_a_real_db() {
+        let db = Path::new("/home/kory/projects/brain/brain.lbug");
+        assert!(
+            !nestweaver_daemon::lifecycle::is_temp_db_path(db),
+            "precondition: this path must not be classified as ephemeral"
+        );
+        let command = daemon_start_command(Path::new("/opt/nestweaver"), db, None);
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from)
+        );
     }
 
     /// nw-114: a daemon that has already exited must be reported immediately,
