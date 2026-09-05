@@ -1503,6 +1503,11 @@ impl GraphStore {
     /// production cap — `CandidateCap` and `Deadline` both flow through the
     /// identical `hydration_stop` -> verification-loop path this item fixes,
     /// so exercising one deterministically exercises the other.
+    // One parameter more than the public entry point it mirrors, which is the
+    // whole point of the seam: the signature is deliberately identical so the
+    // test and production paths cannot drift. Bundling the arguments here would
+    // make them differ.
+    #[allow(clippy::too_many_arguments)]
     fn regex_search_cancellable_with_candidate_cap(
         &self,
         pattern: &str,

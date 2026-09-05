@@ -8324,7 +8324,7 @@ fn repair_says_nothing_about_tantivy_staging_when_there_is_none() {
 }
 
 /// Review follow-up (FIX 5). `--dry-run` used to filter only by name-prefix
-/// + `is_dir()`, while the real reclaim additionally requires
+/// and `is_dir()`, while the real reclaim additionally requires
 /// `looks_like_tantivy_staging` (empty, or containing `meta.json`) — so a
 /// directory that merely shares the staging prefix by coincidence (a
 /// person's own directory, not a crash artifact) would show as "would be

@@ -274,7 +274,7 @@ fn write_clusters_atomic(path: &Path, output: &ClusteringOutput) -> Result<()> {
         serde_json::to_string_pretty(output).context("failed to serialize clustering output")?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to move {} into place", path.display()));
     }

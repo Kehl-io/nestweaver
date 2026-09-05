@@ -1249,6 +1249,21 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_CRASH_REPORT_DIRS",
         role: EnvRole::Configures,
     },
+    // Tunes the shortened idle timeout autostart gives a daemon it judges
+    // ephemeral. Configures only: a message must not offer it as a remedy for a
+    // daemon that died -- the answer there is that the command should declare
+    // itself long-running, not that the user should retune a heuristic.
+    EnvVar {
+        name: "NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    // Asserts that a database under a temp root is real, suppressing the
+    // ephemeral-timeout heuristic. Grants, because it overrides a policy the
+    // binary would otherwise apply on its own.
+    EnvVar {
+        name: "NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT",
+        role: EnvRole::Grants,
+    },
     EnvVar {
         name: "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS",
         role: EnvRole::Configures,
@@ -2172,7 +2187,7 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
 
 /// The ranking-staleness disclosure, as fields on a `--json` payload.
 ///
-/// nw-308: [`warn_stale_resolver_rankings`] carries exactly these facts, but
+/// [`warn_stale_resolver_rankings`] carries exactly these facts, but
 /// sends them to STDERR only — deliberately, so `--json` could keep emitting a
 /// bare array. That contract is what makes the disclosure unreachable: an agent
 /// reading `--json` parses stdout, so the consumer most likely to ACT on a
@@ -2181,7 +2196,7 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
 /// might miss the warning" into "every repo in the graph returns pre-fix
 /// rankings and nothing on stdout says so".
 ///
-/// nw-371: THIS `stale_repos` (repo UIDs, e.g. `repo:kory-brain:<hash>`,
+/// THIS `stale_repos` (repo UIDs, e.g. `repo:kory-brain:<hash>`,
 /// generation-mismatch) is ONE of (at least) four populations that share the
 /// bare key name `stale_repos` across this API. [`ResolverStaleness::from_daemon_response`]
 /// is the exact seam where decoding one as another would happen, which is why
@@ -2201,6 +2216,7 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
 ///      `crates/nestweaver-engine/src/affected_tests.rs`, `blast_radius.rs`). Repo UIDs,
 ///      same MEANING as population 1 but under a different key, added later specifically
 ///      so it would not deepen this collision.
+///
 /// Nothing currently decodes one as another; keeping this list current is what keeps it
 /// that way the next time one of these four call sites is touched.
 struct ResolverStaleness {
@@ -2210,7 +2226,7 @@ struct ResolverStaleness {
     /// The repos that can be PROVEN stale, so the caller knows what to
     /// re-index. May be empty while `rankings_stale` is true — see
     /// [`ResolverStaleness::from_sidecar`]. Population 1 of 4 — see the
-    /// struct-level doc comment above (nw-371).
+    /// struct-level doc comment above.
     stale_repos: Vec<String>,
 }
 
@@ -2378,7 +2394,7 @@ impl RankingBounds {
 }
 
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
-/// the bare array that had nowhere to put it (nw-308).
+/// the bare array that had nowhere to put it.
 ///
 /// `daemon_meta` is the `_meta` of the daemon envelope this payload was decoded
 /// from, or `None` on the direct route. It is a parameter because the daemon
@@ -2503,7 +2519,7 @@ fn bridge_sampling_note(bounds: &RankingBounds) -> Option<String> {
 ///    [`print_json_payload`], so this was the one `--json` payload on either
 ///    route carrying no `_meta` provenance at all; and
 ///  * it had nowhere to put the staleness disclosure, which is the same reason
-///    `hubs --json` had none before nw-308 — a payload with no object to hang a
+///    `hubs --json` had none previously — a payload with no object to hang a
 ///    field on cannot disclose, so it does not.
 ///
 /// `token_count` stays derived from `map` here rather than read off the daemon
@@ -4544,7 +4560,7 @@ enum Commands {
     /// `--json`'s `stale_repos` is behind-HEAD git URLs — a different
     /// population from `hubs`/`bridges`/`repo-map`'s same-named field
     /// (generation-mismatch repo UIDs). This command's own generation-stale
-    /// set is the differently-named `resolver_stale_repos` (nw-371).
+    /// set is the differently-named `resolver_stale_repos`.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -4950,7 +4966,7 @@ enum Commands {
     ///
     /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs — the
     /// same population as `hubs`/`bridges`, and a different one from
-    /// `stale-check`'s same-named field (nw-371).
+    /// `stale-check`'s same-named field.
     RepoMap {
         // nw-397: had no `value_parser` at all -- `--token-budget 0`
         // returned `"map": "", "token_count": 0` at exit 0, indistinguishable
@@ -5222,7 +5238,7 @@ enum Commands {
         /// the one shape of this command with a semantic leg); without
         /// `--feature` this command is code-only PPR with no semantic leg on
         /// any route, and passing this flag is refused rather than silently
-        /// ignored (nw-430).
+        /// ignored.
         #[arg(long)]
         no_embed: bool,
     },
@@ -5453,13 +5469,13 @@ enum Commands {
     /// Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored,
     /// however connected: these kinds are not callable, and edges into them
     /// are typically the resolver crediting a receiver rather than the
-    /// method actually invoked (nw-308). A genuinely central config constant
+    /// method actually invoked. A genuinely central config constant
     /// or shared registry property will not appear here no matter how many
     /// places reference it.
     ///
     /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs
     /// (explaining `rankings_stale`) — a different population from
-    /// `stale-check`'s same-named field (nw-371; see `nestweaver stale-check --help`).
+    /// `stale-check`'s same-named field (see `nestweaver stale-check --help`).
     #[command(after_help = "Examples:\n  nestweaver hubs\n  nestweaver hubs --top 20 --json")]
     Hubs {
         #[arg(
@@ -5488,13 +5504,13 @@ enum Commands {
     /// Module/TypeAlias/Constant/Property/Variable symbols are NEVER scored,
     /// however connected: these kinds are not callable, and edges into them
     /// are typically the resolver crediting a receiver rather than the
-    /// method actually invoked (nw-308). A genuinely central config constant
+    /// method actually invoked. A genuinely central config constant
     /// or shared registry property will not appear here no matter how many
     /// places reference it.
     ///
     /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs
     /// (explaining `rankings_stale`) — a different population from
-    /// `stale-check`'s same-named field (nw-371; see `nestweaver stale-check --help`).
+    /// `stale-check`'s same-named field (see `nestweaver stale-check --help`).
     #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
     Bridges {
         // nw-251: bounded like `hubs --top`, which has carried
@@ -5789,7 +5805,7 @@ enum Commands {
         /// Disable semantic ranking for this call — the daemon's loaded
         /// embed model is the only place this command ever reaches semantic
         /// ranking; without a daemon it never has one regardless of this
-        /// flag (nw-430).
+        /// flag.
         #[arg(long)]
         no_embed: bool,
     },
@@ -5830,7 +5846,7 @@ enum Commands {
         /// Disable semantic ranking for this call — the daemon's loaded
         /// embed model is the only place this command ever reaches semantic
         /// ranking; without a daemon it never has one regardless of this
-        /// flag (nw-430).
+        /// flag.
         #[arg(long)]
         no_embed: bool,
     },
@@ -7029,7 +7045,7 @@ enum BrainCommands {
     /// `--json`'s `stale_repos` is behind-HEAD git URLs — a different
     /// population from `hubs`/`bridges`/`repo-map`'s same-named field
     /// (generation-mismatch repo UIDs). This command's own generation-stale
-    /// set is the differently-named `resolver_stale_repos` (nw-371).
+    /// set is the differently-named `resolver_stale_repos`.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
