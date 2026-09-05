@@ -480,9 +480,40 @@ pub fn stop_and_uninstall(instance_id: &str) -> Result<()> {
         .args(["bootout", &format!("gui/{uid}/{label}")])
         .output();
 
+    // nw-417. `bootout`'s subprocess exiting only means launchd ACCEPTED the
+    // teardown request, not that the job is gone: reproduced live, an
+    // immediate `launchctl print` on the SAME label right after `bootout`
+    // returns exit 0, `state = SIGTERMed` — the job is still tearing down. A
+    // poll confirmed it clears within about a second. `is_running` used to be
+    // a single, unretried `print`, so every caller of this function —
+    // including this one's own test — was asserting on kernel state the
+    // instant after releasing it, which is a race, not a flake. Waiting HERE,
+    // in the product, means every caller downstream (the plist removal right
+    // below, `daemon start`'s reinstall-over-an-incumbent path, `daemon
+    // stop`) observes a genuinely absent job instead of a launchd job mid-exit
+    // — fixing the teardown's correctness rather than adding a retry to each
+    // caller separately.
+    wait_for_launchd_absence(instance_id, std::time::Duration::from_secs(5));
+
     let _ = std::fs::remove_file(&plist_path);
 
     Ok(())
+}
+
+/// Bounded poll for `is_running(instance_id)` to report the job truly gone.
+///
+/// Never blocks past `timeout` — a job that genuinely will not go away (e.g.
+/// launchd itself is unhealthy) must not hang the caller forever; it is left
+/// for `is_running`'s ordinary callers to report accurately afterward, not
+/// escalated into an error here.
+fn wait_for_launchd_absence(instance_id: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !is_running(instance_id) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn is_running(instance_id: &str) -> bool {
