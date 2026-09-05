@@ -52,6 +52,26 @@ use serde::{Deserialize, Serialize};
 /// central trait/interface with no offsetting evidence that it is wrong to
 /// keep.
 ///
+/// `Extension` is RULED ON explicitly, not left implicit: it is a Rust `impl`
+/// block (`nestweaver-parser/src/parse.rs`: `"impl" => SymbolKind::Extension`),
+/// which superficially looks like the same shape of container-declaration
+/// phantom as `Module`/`write_gate`. It is kept CALLABLE (not denylisted)
+/// because this codebase already draws that exact line three separate times,
+/// independently of this fix: `nestweaver-resolver/src/resolve.rs`'s MRO map
+/// (`nw-330`: "an `impl Trait for Type` block IS the symbol... it used to be
+/// `SymbolKind::Class`"), `dead_code.rs`'s unreachable-class suppression
+/// (`SymbolKind::Class | SymbolKind::Extension`, "it used to BE
+/// `SymbolKind::Class`"), and `tools.rs`'s `flow` handler's class-to-methods
+/// expansion (same pairing, same reasoning). All three treat `Extension` as
+/// `Class` under a different name — a type-level container whose MEMBERS
+/// hold the calls, resolved the same way a class's methods are — not a
+/// namespace-level container like `Module`. Since `Class` is kept callable
+/// (and ground-truthed genuine: `GraphStore`), consistency requires `Extension`
+/// stay callable too; denylisting it would contradict three existing,
+/// independent architectural decisions for no offsetting evidence — the
+/// reviewer indexed an impl-block-heavy repo and found no `Extension`
+/// phantom in the top 20.
+///
 /// A useful SIDE EFFECT, not this function's job: nw-308(b)'s name-collision
 /// artifacts that happen to be `require`-bound local aliases (`const parse =
 /// require('url-parse')`, `knex`) are typically parsed as `Constant` or
@@ -693,5 +713,116 @@ mod tests {
             Some("not_phantom"),
             "the identical topology over a callable kind must rank first"
         );
+    }
+}
+
+/// nw-308 FIX 1(b), a separate module so it reads as its own enforcement
+/// mechanism rather than one more case in `tests`.
+///
+/// `is_callable_kind` matches on `&str` rather than on
+/// [`nestweaver_schema::nodes::SymbolKind`] because `Symbol.kind` is already
+/// stringified at the store layer before it ever reaches this crate — there
+/// is no enum to match on without a larger refactor this fix does not make.
+/// That is a real gap: a THIRTEENTH `SymbolKind` variant would silently
+/// classify as "callable" (the denylist's default) with no compile error and
+/// no failing test, unless something is checked against the real enum.
+///
+/// `expected_classification` closes it the same way nw-334's G1 closed the
+/// diagnostic-remedy class, and the same way `language_has_entry_point_model`
+/// closed it a second time: an EXHAUSTIVE match with no `_` arm over the real
+/// enum. Add a 13th `SymbolKind` variant and this match fails to COMPILE
+/// until a human decides which side of the line it falls on — the test
+/// below then asserts that decision agrees with what `is_callable_kind`
+/// actually does at runtime, so the two cannot drift apart silently either.
+#[cfg(test)]
+mod is_callable_kind_classification_tests {
+    use nestweaver_schema::nodes::SymbolKind;
+
+    use super::is_callable_kind;
+
+    /// The exhaustive match. No wildcard arm — see the module doc comment.
+    fn expected_classification(kind: SymbolKind) -> bool {
+        match kind {
+            // Callable: see `is_callable_kind`'s doc comment for
+            // Function/Method/Class/Enum, and its `Extension` note (ruled
+            // callable — treated as `Class` under a different name by
+            // resolve.rs's MRO map, dead_code.rs's suppression, and tools.rs's
+            // `flow` expansion, all independently of this fix). Interface/
+            // Trait: no evidence either way; kept callable rather than
+            // denylisted speculatively.
+            SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Extension
+            | SymbolKind::Interface
+            | SymbolKind::Trait => true,
+            // Denylisted: containers/bindings, not call targets. See
+            // `is_callable_kind`'s doc comment for the ground-truthed
+            // evidence per kind.
+            SymbolKind::Module
+            | SymbolKind::TypeAlias
+            | SymbolKind::Constant
+            | SymbolKind::Property
+            | SymbolKind::Variable => false,
+        }
+    }
+
+    /// Every `SymbolKind` variant, hand-listed because the enum has no
+    /// `ALL` constant (unlike `EntryPointKind::ALL`). This list is NOT
+    /// compile-enforced to stay complete — `expected_classification`'s
+    /// exhaustive match is the enforcement; a variant missing from THIS
+    /// list only fails to be exercised, whereas a variant missing from
+    /// `expected_classification`'s match fails to compile at all. Both
+    /// exist because either alone is incomplete: the match alone could
+    /// still drift from the runtime `&str` classification, and this list
+    /// alone would let an unlisted variant pass by never being asked about.
+    const ALL_KINDS: &[SymbolKind] = &[
+        SymbolKind::Function,
+        SymbolKind::Class,
+        SymbolKind::Method,
+        SymbolKind::Interface,
+        SymbolKind::Trait,
+        SymbolKind::Enum,
+        SymbolKind::Module,
+        SymbolKind::Extension,
+        SymbolKind::Constant,
+        SymbolKind::Property,
+        SymbolKind::TypeAlias,
+        SymbolKind::Variable,
+    ];
+
+    #[test]
+    fn every_symbol_kind_is_explicitly_classified() {
+        assert_eq!(
+            ALL_KINDS.len(),
+            12,
+            "a SymbolKind variant was added or removed — update ALL_KINDS \
+             (this list) AND expected_classification's exhaustive match \
+             (compile-enforced already; this assertion just makes the drift \
+             visible in the failure message)"
+        );
+        for &kind in ALL_KINDS {
+            assert_eq!(
+                is_callable_kind(kind.as_str()),
+                expected_classification(kind),
+                "is_callable_kind({:?}) disagrees with this test's explicit, \
+                 exhaustively-matched classification for {kind:?} — the \
+                 runtime denylist in `is_callable_kind` and the compile-time \
+                 match in `expected_classification` must agree",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT: this test module cannot be trivially satisfied by
+    /// `expected_classification` returning `true` for everything (which
+    /// would make `is_callable_kind` always agree with a match that never
+    /// disagrees with the default). Pin at least one denylisted kind's
+    /// expected value directly.
+    #[test]
+    fn a_denylisted_kind_is_expected_non_callable_not_vacuously_true() {
+        assert!(!expected_classification(SymbolKind::Module));
+        assert!(!is_callable_kind(SymbolKind::Module.as_str()));
     }
 }

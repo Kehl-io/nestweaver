@@ -9055,6 +9055,14 @@ fn nw439_reaped_child_pid() -> u32 {
 /// MCP/daemon twin, so it never passed through the wait+classify machinery
 /// `hubs` benefits from via the daemon route). Both are asserted against
 /// directly below.
+///
+/// COVERAGE NOTE: `nestweaver_cmd()` forces the `--no-daemon` direct path
+/// (see its `NESTWEAVER_NO_DAEMON`/`NESTWEAVER_ALLOW_NO_DAEMON` env vars), so
+/// this only exercises that route's WEDGED framing. The daemon route's
+/// `classify_index_publication_error` reads the SAME marker but escalates to
+/// WEDGED only past `is_wedged()`'s own criteria, and a fresh-enough marker
+/// there reports the milder TRANSIENT text instead — pre-existing behavior,
+/// untouched by this fix, and not exercised here.
 #[test]
 fn hubs_bridges_and_repo_map_refuse_identically_during_a_dirty_publication() {
     let dir = tempfile::tempdir().unwrap();
