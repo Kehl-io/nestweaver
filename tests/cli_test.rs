@@ -9027,3 +9027,187 @@ fn the_json_error_contract_holds_as_behaviour_not_only_as_documentation() {
         String::from_utf8_lossy(&bad.stderr)
     );
 }
+
+// ── nw-439: hubs/bridges/repo-map/count-patterns under a dirty publication ──
+
+/// A pid guaranteed not to name a live process: spawn a child and reap it.
+/// Same technique as the engine's and MCP's own copies of this helper — a
+/// third copy here rather than sharing one across crates, because this file
+/// is an integration test binary with no visibility into either crate's
+/// private test modules.
+fn nw439_reaped_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// Real measurement, not a mock: index a genuine two-symbol repo into a
+/// scratch DB, then leave the SAME file-based `.index-dirty` marker a real
+/// indexing writer leaves mid-publication, and prove `hubs`, `bridges` and
+/// `repo-map` now refuse IDENTICALLY (same exit code, same WEDGED framing,
+/// same marker/remedy disclosure) while `count-patterns` keeps answering with
+/// its stale-scope disclosure — the parity nw-439 was filed over.
+///
+/// Before this change: `bridges` alone answered with a full ranked payload at
+/// exit 0 (it never consulted the dirty-publication contract at all), and
+/// `repo-map` failed with a bare, remedyless `StoreError` string (it has no
+/// MCP/daemon twin, so it never passed through the wait+classify machinery
+/// `hubs` benefits from via the daemon route). Both are asserted against
+/// directly below.
+#[test]
+fn hubs_bridges_and_repo_map_refuse_identically_during_a_dirty_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() -> i32 { 42 }\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Sanity: all four commands answer cleanly before the marker exists.
+    for args in [
+        vec!["hubs", "--top", "2", "--json"],
+        vec!["bridges", "--top", "2", "--json"],
+        vec!["repo-map", "--json"],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--db"]);
+        nestweaver_cmd()
+            .args(&full)
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+
+    // Leave the marker: a dead writer pid and a free canonical lease, so
+    // `is_wedged()` reads `true` deterministically (no live process, no
+    // background indexer to race) — the same WEDGED shape the CLI's own
+    // `nestweaver-mcp` tests exercise.
+    let dead_pid = nw439_reaped_child_pid();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        sidecar_path(&db_path, ".index-dirty"),
+        nestweaver_store::index_publication::format_marker_payload(dead_pid, nanos, None),
+    )
+    .unwrap();
+
+    let hubs = nestweaver_cmd()
+        .args(["hubs", "--top", "2", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let bridges = nestweaver_cmd()
+        .args(["bridges", "--top", "2", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let repo_map = nestweaver_cmd()
+        .args(["repo-map", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let count_patterns = nestweaver_cmd()
+        .args([
+            "count-patterns",
+            "helper",
+            "--kinds",
+            "Symbol",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+
+    for (name, output) in [
+        ("hubs", &hubs),
+        ("bridges", &bridges),
+        ("repo-map", &repo_map),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name} must fail closed on a dirty publication like its siblings: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("WEDGED"),
+            "{name} must carry the same WEDGED framing hubs always had: {stderr}"
+        );
+        assert!(
+            stderr.contains(&dead_pid.to_string()),
+            "{name} must name the marker's writer pid: {stderr}"
+        );
+        assert!(
+            stderr.contains("nestweaver repair"),
+            "{name} must name an executable remedy (nw-334), not just refuse: {stderr}"
+        );
+        assert!(
+            stderr.contains("not a dirty git working tree"),
+            "{name} must correct the wrong conclusion a reader could draw: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{name} must not emit a payload alongside a hard failure: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // count-patterns is the model this item asks the other three to match
+    // POLICY with, not OUTPUT with: it degrades-with-disclosure rather than
+    // failing closed, because an approximate text-count answer remains
+    // meaningful mid-publication in a way a PageRank-derived ranking does not.
+    // Its own `stale_index`/`ready_scopes`/`dirty_scopes` bookkeeping tracks
+    // TRIGRAM SCOPE readiness, a different subsystem from the generic
+    // `.index-dirty` publication marker this fixture plants by hand (it only
+    // moves under a REAL concurrent indexing writer, which this test does not
+    // run) — so this asserts the parity claim nw-439 is actually about
+    // (count-patterns keeps answering while its siblings refuse), not the
+    // specific field values, which the ticket's own live-graph evidence
+    // already covers.
+    assert_eq!(
+        count_patterns.status.code(),
+        Some(0),
+        "count-patterns must keep answering rather than fail closed like its \
+         ranked siblings, even while a dirty publication marker is present: {:?}",
+        String::from_utf8_lossy(&count_patterns.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&count_patterns.stdout).unwrap();
+    assert!(
+        payload[0].get("stale_index").is_some(),
+        "count-patterns must still carry its staleness-disclosure field: {payload}"
+    );
+
+    // COUNTERWEIGHT: remove the marker and all four answer normally again —
+    // proving every assertion above keyed on the marker's presence, not on
+    // some other state the fixture happened to change along the way.
+    std::fs::remove_file(sidecar_path(&db_path, ".index-dirty")).unwrap();
+    for args in [
+        vec!["hubs", "--top", "2", "--json"],
+        vec!["bridges", "--top", "2", "--json"],
+        vec!["repo-map", "--json"],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--db"]);
+        nestweaver_cmd()
+            .args(&full)
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+}
