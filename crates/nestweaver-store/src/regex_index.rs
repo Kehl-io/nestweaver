@@ -21,6 +21,11 @@ pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 3;
 pub const REGEX_TOKENIZER_FINGERPRINT: &str =
     "nestweaver-unicode-scalar-lowercase-distinct-trigram-v1";
 const METADATA_KIND: &str = "__nestweaver_regex_metadata__";
+/// Durable tombstone written by [`RegexIndex::retire_scope`] before it removes
+/// `CURRENT`. Its presence is the ONLY thing that licenses
+/// [`RegexIndex::garbage_collect`] to delete a scope whose `CURRENT` is
+/// absent; see `retire_scope` for why absence alone cannot mean that (nw-374).
+const RETIRED_MARKER: &str = "RETIRED";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegexShardMetadata {
@@ -44,6 +49,9 @@ pub struct RegexScopeIssue {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RegexGarbageCollectionReport {
     pub removed: usize,
+    /// Generations durably adopted as `CURRENT` because a crash left them
+    /// complete but unselected (nw-374): see [`RegexIndex::garbage_collect`].
+    pub adopted: usize,
     pub failures: Vec<RegexScopeIssue>,
 }
 
@@ -121,6 +129,15 @@ impl CurrentPointer {
         }
         Ok(())
     }
+}
+
+/// Outcome of [`RegexIndex::recover_missing_current`].
+enum MissingCurrentRecovery {
+    /// The sole leftover generation was validated and durably selected.
+    Adopted,
+    /// No generation directory existed at all; nothing to lose by removing
+    /// the (already-empty-of-data) scope directory.
+    Empty,
 }
 
 #[derive(Clone, Copy)]
@@ -704,12 +721,41 @@ impl RegexIndex {
         Ok(Some(hashes))
     }
 
-    /// Retire a removed scope by durably unlinking only its selector. Existing
-    /// readers may finish against immutable generation files; cleanup is a
-    /// separate retention operation.
+    /// Retire a removed scope by durably marking it for reclamation, then
+    /// unlinking its selector. Existing readers may finish against immutable
+    /// generation files; cleanup is a separate retention operation performed
+    /// by [`Self::garbage_collect`].
+    ///
+    /// The [`RETIRED_MARKER`] tombstone is written *before* `CURRENT` is
+    /// removed, and that order is load-bearing (nw-374). An absent `CURRENT`
+    /// is not, by itself, proof that a scope was retired — `replace_scope`'s
+    /// own crash window (rename-then-select) produces that exact state for a
+    /// scope's first publication, and garbage collection must not confuse the
+    /// two. Writing the tombstone first means any crash after this call
+    /// begins can only ever resolve toward "fully retired" (tombstone
+    /// present, so GC reclaims the whole scope) and never toward
+    /// resurrecting a scope that was deliberately dropped from the graph. The
+    /// converse order would let a crash between removing `CURRENT` and
+    /// writing the tombstone leave a retired scope looking exactly like a
+    /// first-publication crash, which garbage collection would then "adopt"
+    /// back to life.
+    ///
+    /// A caller that receives an error from this function has an
+    /// incompletely retired scope on disk and MUST retry until it succeeds;
+    /// do not call this for a scope that should remain live.
     pub fn retire_scope(&self, scope_uid: &str) -> Result<bool, StoreError> {
         self.readers.clear();
         let scope_root = self.scope_root(scope_uid);
+        if !scope_root.exists() {
+            return Ok(false);
+        }
+        let tombstone = scope_root.join(RETIRED_MARKER);
+        crate::durable_sidecar::atomic_replace_file(&tombstone, |file| {
+            file.write_all(RETIRED_MARKER.as_bytes())
+        })
+        .map_err(|error| {
+            StoreError::Query(format!("retire regex scope {scope_uid}: mark {error}"))
+        })?;
         let current = scope_root.join("CURRENT");
         let selector_removed = crate::durable_sidecar::remove_file_durable_if_exists(&current)
             .map_err(|error| {
@@ -718,13 +764,22 @@ impl RegexIndex {
         Ok(selector_removed)
     }
 
-    /// Remove unselected generations and selector-less retired scopes.
+    /// Remove unselected generations and durably-tombstoned retired scopes.
     ///
     /// This is deliberately separate from publication: a reader that still
     /// holds an old generation may delay deletion on Windows. The selected
     /// generation is never removed, and a corrupt selector fails closed
     /// rather than guessing which generation is live. A later refresh retries
     /// cleanup, so transient descriptor pressure cannot lose the shard.
+    ///
+    /// A scope whose `CURRENT` is absent is deleted ONLY when it also carries
+    /// the [`RETIRED_MARKER`] tombstone (nw-374). Without the tombstone, an
+    /// absent `CURRENT` means `replace_scope` crashed between renaming a
+    /// generation into place and durably selecting it — a live scope's first
+    /// publication in progress, not garbage. That case is recovered by
+    /// adopting the sole leftover generation as `CURRENT` (see
+    /// [`Self::recover_missing_current`]) rather than discarding it, closing
+    /// the crash window by construction instead of by luck of timing.
     pub fn garbage_collect(&self) -> Result<RegexGarbageCollectionReport, StoreError> {
         self.readers.clear();
         let scopes = self.root.join("scopes");
@@ -764,18 +819,40 @@ impl RegexIndex {
                 }
             }
             let scope_root = entry.path();
+            if scope_root.join(RETIRED_MARKER).exists() {
+                match std::fs::remove_dir_all(&scope_root) {
+                    Ok(()) => report.removed += 1,
+                    Err(error) => report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!(
+                            "remove retired regex shard {}: {error}",
+                            scope_root.display()
+                        ),
+                    }),
+                }
+                continue;
+            }
             let current_path = scope_root.join("CURRENT");
             let bytes = match std::fs::read(&current_path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match std::fs::remove_dir_all(&scope_root) {
-                        Ok(()) => report.removed += 1,
+                    match self.recover_missing_current(&scope_root, &entry_hash) {
+                        Ok(MissingCurrentRecovery::Adopted) => report.adopted += 1,
+                        Ok(MissingCurrentRecovery::Empty) => {
+                            match std::fs::remove_dir_all(&scope_root) {
+                                Ok(()) => report.removed += 1,
+                                Err(error) => report.failures.push(RegexScopeIssue {
+                                    scope_hash: entry_hash.clone(),
+                                    error: format!(
+                                        "remove empty regex shard {}: {error}",
+                                        scope_root.display()
+                                    ),
+                                }),
+                            }
+                        }
                         Err(error) => report.failures.push(RegexScopeIssue {
-                            scope_hash: entry_hash,
-                            error: format!(
-                                "remove retired regex shard {}: {error}",
-                                scope_root.display()
-                            ),
+                            scope_hash: entry_hash.clone(),
+                            error: error.to_string(),
                         }),
                     }
                     continue;
@@ -875,6 +952,106 @@ impl RegexIndex {
             StoreError::Query(format!("sync regex garbage collection: {error}"))
         })?;
         Ok(report)
+    }
+
+    /// Recover a scope whose `CURRENT` is absent and which carries no
+    /// [`RETIRED_MARKER`] tombstone.
+    ///
+    /// `update_scope` requires an existing `CURRENT` to run at all, so this
+    /// state can only arise from `replace_scope`'s crash window on a scope's
+    /// FIRST publication: the new generation was renamed into place (and
+    /// durably synced) but the process died before `CURRENT` was written to
+    /// select it. Exactly one generation directory therefore exists. This
+    /// adopts it — verifying it opens, that its embedded metadata is
+    /// self-consistent, and that it belongs to this scope hash — and durably
+    /// writes `CURRENT` to select it, so garbage collection heals the crash
+    /// instead of discarding a complete shard.
+    ///
+    /// More than one leftover generation, or one that fails validation, is
+    /// not a shape this window produces; garbage collection fails closed
+    /// (reports a failure, deletes nothing) rather than guessing.
+    fn recover_missing_current(
+        &self,
+        scope_root: &Path,
+        entry_hash: &str,
+    ) -> Result<MissingCurrentRecovery, StoreError> {
+        let generations_dir = scope_root.join("generations");
+        let mut candidates: Vec<PathBuf> = match std::fs::read_dir(&generations_dir) {
+            Ok(entries) => {
+                let mut paths = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        StoreError::Query(format!(
+                            "read regex generation for recovery {}: {error}",
+                            generations_dir.display()
+                        ))
+                    })?;
+                    let is_dir = entry.file_type().map_err(|error| {
+                        StoreError::Query(format!("inspect regex generation for recovery: {error}"))
+                    })?;
+                    if is_dir.is_dir() {
+                        paths.push(entry.path());
+                    }
+                }
+                paths
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(StoreError::Query(format!(
+                    "list regex generations for recovery {}: {error}",
+                    generations_dir.display()
+                )));
+            }
+        };
+        if candidates.is_empty() {
+            return Ok(MissingCurrentRecovery::Empty);
+        }
+        if candidates.len() > 1 {
+            return Err(StoreError::Query(format!(
+                "refusing to recover regex shard {}: {} generations with no CURRENT and no retirement marker",
+                scope_root.display(),
+                candidates.len()
+            )));
+        }
+        let path = candidates.remove(0);
+        let index = Index::open_in_dir(&path).map_err(|error| {
+            StoreError::Query(format!(
+                "open leftover regex generation {} for recovery: {error}",
+                path.display()
+            ))
+        })?;
+        let fields = inspect_fields(&index.schema())?;
+        let (metadata, count) = read_metadata(&index, fields)?;
+        if count != metadata.candidate_count {
+            return Err(StoreError::Query(format!(
+                "refusing to recover regex shard {}: metadata/content mismatch",
+                path.display()
+            )));
+        }
+        if scope_hash(&metadata.scope_uid) != entry_hash {
+            return Err(StoreError::Query(format!(
+                "refusing to recover regex shard {} after scope-hash collision for {}",
+                path.display(),
+                metadata.scope_uid
+            )));
+        }
+        let generation_name = path
+            .file_name()
+            .ok_or_else(|| {
+                StoreError::Query(format!(
+                    "leftover regex generation {} has no file name",
+                    path.display()
+                ))
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let pointer = CurrentPointer::new(generation_name, metadata)?;
+        let pointer_path = scope_root.join("CURRENT");
+        let bytes = serde_json::to_vec_pretty(&pointer)
+            .map_err(|error| StoreError::Query(format!("serialize regex pointer: {error}")))?;
+        crate::durable_sidecar::atomic_replace_file(&pointer_path, |file| file.write_all(&bytes))
+            .map_err(|error| StoreError::Query(format!("adopt recovered regex pointer: {error}")))?;
+        Ok(MissingCurrentRecovery::Adopted)
     }
 
     /// Inspect every currently selected shard without trusting directory names
@@ -1303,5 +1480,125 @@ mod tests {
             with_test_fault(TestFault::Remove, || index.retire_scope("repo:test")).unwrap_err();
         assert!(error.to_string().contains("retire regex scope"));
         assert!(index.metadata("repo:test").unwrap().is_some());
+    }
+
+    /// nw-374: a crash between `replace_scope` renaming its generation into
+    /// place and durably writing `CURRENT` must not cost the shard. Simulated
+    /// via the `Persist` fault, which fails exactly the `CURRENT` write after
+    /// the generation directory has already been renamed and synced.
+    #[test]
+    fn first_publication_crash_before_current_is_adopted_not_destroyed() {
+        use crate::durable_sidecar::{TestFault, with_test_fault};
+
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        let meta = metadata(1, 1, "digest-one");
+
+        let error = with_test_fault(TestFault::Persist, || {
+            index.replace_scope(meta.clone(), std::slice::from_ref(&document))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("publish regex pointer"));
+
+        // This scope has never been selected: no prior shard exists to fall
+        // back to, and CURRENT was never written.
+        assert!(index.metadata("repo:test").unwrap().is_none());
+        assert!(!index.scope_root("repo:test").join("CURRENT").exists());
+        let generations = index.scope_root("repo:test").join("generations");
+        assert_eq!(
+            std::fs::read_dir(&generations).unwrap().count(),
+            1,
+            "the complete generation from the crashed publish must still be on disk"
+        );
+
+        let report = index.garbage_collect().unwrap();
+        assert_eq!(
+            report.adopted, 1,
+            "the leftover generation must be adopted, not deleted"
+        );
+        assert_eq!(report.removed, 0);
+        assert!(report.failures.is_empty());
+
+        // Adoption closes the window completely: the shard is selected and
+        // searchable without a rebuild, and it is the SAME generation.
+        assert_eq!(index.metadata("repo:test").unwrap(), Some(meta.clone()));
+        assert_eq!(
+            index
+                .candidate_uids(&meta, &[HashSet::from(["alp".to_string()])], 10)
+                .unwrap()
+                .unwrap(),
+            HashSet::from(["sym:one".to_string()])
+        );
+        assert_eq!(
+            std::fs::read_dir(&generations).unwrap().count(),
+            1,
+            "no rebuild occurred; the crashed generation was reused"
+        );
+    }
+
+    /// nw-374: an absent `CURRENT` with MORE THAN ONE leftover generation and
+    /// no retirement tombstone is not a shape either `replace_scope`'s crash
+    /// window or `retire_scope` produces. Garbage collection must fail closed
+    /// (report a failure, delete nothing) rather than guess which generation,
+    /// if any, is safe to select.
+    #[test]
+    fn missing_current_with_multiple_leftover_generations_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        index
+            .replace_scope(
+                metadata(1, 1, "digest-one"),
+                std::slice::from_ref(&document),
+            )
+            .unwrap();
+        index
+            .replace_scope(metadata(2, 1, "digest-two"), &[document])
+            .unwrap();
+        // Hand-craft the otherwise-unreachable state: two generations, no
+        // CURRENT, no tombstone. Neither real code path produces this; it
+        // stands in for on-disk corruption a real crash cannot cause.
+        std::fs::remove_file(index.scope_root("repo:test").join("CURRENT")).unwrap();
+
+        let generations = index.scope_root("repo:test").join("generations");
+        assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 2);
+        let report = index.garbage_collect().unwrap();
+        assert_eq!(report.adopted, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(&generations).unwrap().count(),
+            2,
+            "an ambiguous state must not be guessed at, in either direction"
+        );
+    }
+
+    /// nw-374: a scope directory with no generations at all and no `CURRENT`
+    /// (e.g. `replace_scope` crashed before ever renaming a generation into
+    /// place) holds nothing worth recovering and is safe to reclaim.
+    #[test]
+    fn missing_current_with_no_generations_is_reclaimed_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let scope_root = index.scope_root("repo:test");
+        std::fs::create_dir_all(scope_root.join("generations")).unwrap();
+
+        let report = index.garbage_collect().unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.adopted, 0);
+        assert!(!scope_root.exists());
     }
 }
