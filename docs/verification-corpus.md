@@ -34,7 +34,7 @@ Fixture-green is necessary, not sufficient.
 ## Usage
 
 ```sh
-scripts/build-verification-corpus.sh            # ~20 repos, 10 languages
+scripts/build-verification-corpus.sh            # ~20 repos, 9 languages
 scripts/build-verification-corpus.sh --small    # 5 repos, for iterating
 scripts/build-verification-corpus.sh --teardown # delete everything
 ```
@@ -46,10 +46,15 @@ Environment:
 
 ## Design decisions worth not re-litigating
 
-**Every repo is pinned to a commit SHA.** An unpinned corpus is not a corpus: a
-measurement taken against "whatever `main` was that day" cannot be compared to
-the next one. That is exactly how nw-291's re-measurement became
-uncomparable to its own filing.
+**Every repo is pinned to a ref, resolved and printed as a SHA at clone time.**
+An unpinned corpus is not a corpus: a measurement taken against "whatever
+`main` was that day" cannot be compared to the next one. That is exactly how
+nw-291's re-measurement became uncomparable to its own filing. Most entries
+are pinned to a release tag rather than a raw SHA — weaker pinning, since a
+tag can move — and one entry (`TypeScript-Node-Starter`, which publishes no
+tags) floats on `master` and is flagged as such in the script's output. The
+script resolves and prints the concrete SHA each ref checked out to, so a
+measurement can still record exactly what it ran against.
 
 **A repo that fails to clone or index is reported, never silently skipped.** A
 corpus that quietly indexed 12 of 20 repos would make every measurement taken
@@ -62,7 +67,7 @@ inherits a daemon pointing at a path that no longer exists (nw-377's wedge).
 **Repos are chosen for size, not just language spread.** The corpus has to
 exceed the internal caps under test or it cannot prove they disclose
 themselves: `DEFAULT_RETRIEVAL_BREADTH` 30, `HUB_COUNT` 30,
-`MAX_CLUSTER_SUMMARIES` 50, `bound_identifiers` `MAX_COUNT` 1000.
+`MAX_CLUSTER_SUMMARIES` 50, `bound_identifiers`'s `MAX_IDENTIFIER_COUNT` 1000.
 
 ## Definition of done
 

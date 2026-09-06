@@ -30,9 +30,8 @@ Security issues include but are not limited to:
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | Yes       |
+Only the latest published release is supported. Please upgrade before
+reporting an issue — it may already be fixed.
 
 ## Threat model & known residuals
 
@@ -55,6 +54,26 @@ known, accepted residual risks (not treated as vulnerabilities):
 - **`git rev-parse <ref>`** in the bare-clone reader passes a config/HEAD-derived
   ref without an end-of-options guard. Not attacker-reachable today (refs are
   `refs/heads/<branch>` / `HEAD` / `FETCH_HEAD`), noted for defense-in-depth.
-- **Unmaintained transitive dependencies.** `cargo audit` reports no exploitable
-  advisories; a few transitive crates (`paste`, `number_prefix`, `rustls-pemfile`)
-  are flagged unmaintained. Tracked, no known impact.
+- **Advisory-flagged transitive dependencies.** `cargo audit` reports no
+  *vulnerability* advisories and exits 0. It does report three warnings, all in
+  transitive dependencies, verified on 2026-09-05:
+  - `paste` 1.0.15 — unmaintained ([RUSTSEC-2024-0436]).
+  - `cxx` 1.0.138 — unsound: `let_cxx_string!` can expose an uninitialized
+    value under an exception-safety violation ([RUSTSEC-2026-0202]). Reached
+    only through the storage engine's C++ bridge; NestWeaver does not use that
+    macro directly.
+  - `lru` 0.16.4 — unsound: potential use-after-free if a user-supplied `Drop`
+    panics inside `LruCache::pop()` ([RUSTSEC-2026-0253]). Reached via
+    `tantivy` 0.26.1 only. `nestweaver-store`'s own direct `lru` dependency is
+    0.18.2, which is NOT affected — both versions are in the tree, so checking
+    the direct dependency alone would give a misleading all-clear.
+
+  Tracked, no known exploit path. Two crates previously named here
+  (`number_prefix`, `rustls-pemfile`) have since dropped out of the tree
+  entirely. Re-run `cargo audit` before each release — this list went stale
+  once already, and "no exploitable advisories" is not the same claim as
+  "no advisories".
+
+[RUSTSEC-2024-0436]: https://rustsec.org/advisories/RUSTSEC-2024-0436
+[RUSTSEC-2026-0202]: https://rustsec.org/advisories/RUSTSEC-2026-0202
+[RUSTSEC-2026-0253]: https://rustsec.org/advisories/RUSTSEC-2026-0253

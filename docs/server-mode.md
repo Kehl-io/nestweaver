@@ -150,9 +150,10 @@ interchangeable:
 
 `write_holder` names what currently holds the write lock and
 `write_holder_seconds` how long it has held it. Every writer in the daemon
-process stamps it: RPC names for gRPC writers (`embed`, `index_repo`, ...),
-`worker_commit` for the worker pool, `admin_remove_repo` for the web admin
-API. An empty `write_holder` while `write_queue_depth` is non-zero means a
+process stamps it: RPC names for gRPC writers (`embed`, `index_repo`,
+`remove_repo`, ...), `worker_commit` for the worker pool — the web admin
+API's repo removal goes through the same `remove_repo` RPC, not a separate
+name. An empty `write_holder` while `write_queue_depth` is non-zero means a
 daemon older than 4.2, not an unidentifiable writer.
 
 A CLI command blocked on the write lock prints a periodic stderr line naming
@@ -871,7 +872,10 @@ nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
 
 ```bash
 nestweaver backup inspect /backups/brain-2026-06-25T10-30-00.nwsnap.zst
-# => repos: 200, notes: 5000, size: 1.2 GB, created: 2026-06-25T10:30:00Z
+# => Repos: 200, Symbols: 480000, Uncompressed: 1.2 GB, Compressed: 210 MB,
+#    Created: 2026-06-25T10:30:00Z
+# (there is no separate notes count — symbol_count covers code; a vault's
+# Note/Section/Heading nodes are not broken out in the manifest)
 ```
 
 ### Automatic backups

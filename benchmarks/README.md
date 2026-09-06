@@ -16,7 +16,7 @@ NUM_RUNS=1 benchmarks/run.sh
 
 The suite is fully self-contained — nothing touches your global NestWeaver install:
 
-- **NestWeaver** is built from source into `/private/tmp/nestweaver-bench/local/` with Metal + embed features
+- **NestWeaver** is built from source into `/private/tmp/nestweaver-bench/local/` with the `embed` feature (`run.sh` additionally enables `metal` when it detects Apple Silicon)
 - **A dedicated daemon** starts per-repo with its own DB socket (your production daemon is untouched)
 - **Graphify** is installed into a Python virtual environment under the bench root
 - **Python deps** (matplotlib, tiktoken) go into a venv at `venvs/bench/`

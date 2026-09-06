@@ -32,8 +32,10 @@ optional package, so `nestweaver` FAILS with the supported-targets list at
 invocation time rather than leaving you with a wrapper that silently cannot
 run; use a release archive or a source build instead. The two Linux platform
 packages additionally declare `libc: ["glibc"]` (musl/Alpine is not
-currently supported) — this is safe to declare on a Linux-only package in a
-way it never was on the combined macOS+Linux wrapper (see nw-433 below).
+currently supported). Declaring `libc` is safe on a Linux-only package; it was
+not safe on the earlier combined macOS+Linux wrapper, where it made npm reject
+every macOS install with `EBADPLATFORM` because `libc` is not a concept on
+macOS. The field itself was never the problem — the package it sat on was.
 
 Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer and
 Debian 12. The platform package includes the GCC 13 runtime LadybugDB needs

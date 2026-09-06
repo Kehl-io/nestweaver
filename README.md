@@ -42,7 +42,7 @@
 <td width="50%" valign="top">
 
 **32 Languages**<br>
-Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more. Tracks CALLS, IMPORTS, USES, and ACCESSES edges. Resolves monorepo workspaces and tsconfig path aliases. As of 9.0.0 `.h` files are parsed with the **C++** grammar (they used to get C, which has no `class` keyword) and C++ `#include` resolves to real `IMPORTS` edges.
+Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 18 more. Tracks CALLS, IMPORTS, USES, and ACCESSES edges. Resolves monorepo workspaces and tsconfig path aliases. As of 9.0.0 `.h` files are parsed with the **C++** grammar (they used to get C, which has no `class` keyword) and C++ `#include` resolves to real `IMPORTS` edges.
 
 </td>
 <td width="50%" valign="top">
@@ -431,7 +431,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | **A review aid, not a deletion list**, and it **refuses to produce one at all on a resolver-generation-stale graph** — exit `2`, `refused: true` with `reason: "outdated_resolver"` and a runnable `remedies[].command` on `--json`, on every route including MCP. A missing edge can only fail to *reach* a live symbol, so an under-resolved graph moves live code onto a deletion list; re-index with `nestweaver index --repo <path> --force` and re-run. Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk had no usable seed set, so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
+| `dead-code` | **A review aid, not a deletion list**, and it **refuses to produce one at all on a resolver-generation-stale graph** — exit `2`, `refused: true` with `reason: "outdated_resolver"` and a runnable `remedies[].command` on `--json`, on every route including MCP. A missing edge can only fail to *reach* a live symbol, so an under-resolved graph moves live code onto a deletion list; re-index with `nestweaver index --repo <path> --force` and re-run. Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk proved nothing — no entry point (`entry_points == 0`), undecodable symbols in the store, or a language that contributed analysed symbols but zero entry points of its own (named in `languages_without_entry_points`) — so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
 | `rerank` | Lightweight result reranker (off-by-default heuristic) |
 | `info` | Show hardware and configuration information |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
@@ -551,24 +551,33 @@ nestweaver brain context "MyProject"
 <details>
 <summary>Semantic Search (Embedding Seed Layer)</summary>
 
-Query with natural language — no need to know exact symbol names. NestWeaver
-embeds symbols, notes, and headings using the configured local or external
-backend, then uses semantic similarity to find entry points for the graph walk.
-Backend and device selection are explicit: failures are reported and never
-switch to another backend or device.
+NestWeaver embeds symbols, notes, and headings using the configured local or
+external backend, then uses semantic similarity as one of the signals ranking
+the graph walk. Backend and device selection are explicit: failures are
+reported and never switch to another backend or device.
 
 ```sh
 # Embed all indexed content (one-time, incremental after)
 nestweaver embed --stats
 
-# Natural language queries just work
-nestweaver context "how does authentication work"
-nestweaver context "BLE bluetooth connection handling"
-nestweaver context "where does the upload pipeline start"
+# Ask a question in plain language
+nestweaver investigate "how does the daemon decide when to reindex a repository"
+nestweaver investigate "where does the upload pipeline start"
 ```
 
+**Use `investigate` for a question; use `context`/`brain context` for a name
+you already know.** This is the one distinction worth learning up front.
+`context` and `brain context` RESOLVE their argument to seed nodes — as a UID,
+note title, tag, or symbol name — and a multi-word question resolves to none of
+those, so they exit 1 with `No seeds resolved` even on a fully embedded graph
+with a daemon running. `investigate` is the natural-language entry point: when
+seed resolution finds nothing it falls back to BM25 over the corpus, so a
+question still returns an answer.
+
 Three retrieval signals are fused via Convex Combination: PPR (graph
-structure), BM25 (text match), and semantic (embedding similarity).
+structure), BM25 (text match), and semantic (embedding similarity). Semantic
+similarity re-ranks and blends candidates; it is not, on its own, a
+natural-language front door for the seed-resolving commands.
 
 **Device policy.**
 

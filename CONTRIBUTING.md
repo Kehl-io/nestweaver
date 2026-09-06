@@ -63,9 +63,15 @@ belongs in a comment rather than in a shared function.
 
 ## Architecture
 
-See [CLAUDE.md](CLAUDE.md) for the crate dependency diagram and conventions.
-The key rule: `schema` and `storage` have zero internal dependencies.
-Everything else depends on `schema`. Only `engine` depends on all crates.
+See [CLAUDE.md](CLAUDE.md) for the full crate dependency diagram and
+conventions — read the diagram there rather than a paraphrase here, which is
+what let this section fall out of sync with it. The short version: `schema`,
+`storage`, and `algorithms` have zero internal dependencies; `algorithms` is
+the WASM-compatible pure-compute layer, so `nestweaver-wasm` depends on it
+alone and, notably, does *not* depend on `schema`. No single crate depends on
+all the others — `engine` depends on `schema`/`parser`/`resolver`/`store`/
+`storage`/`algorithms` (plus `embed` behind a feature); the root `nestweaver`
+binary is the one that aggregates almost everything, transitively.
 
 ## Commit Convention
 
@@ -90,16 +96,19 @@ Format: `<type>(<scope>): <description>`
 
 The authoritative list is `rules.scope-enum` in
 [`.commitlintrc.yml`](.commitlintrc.yml) — read it there rather than from a copy
-here, which is how the list below fell out of date in the first place. At time of
-writing it holds: `schema`, `parser`, `resolver`, `store`, `storage`, `engine`,
-`mcp`, `cli`, `ci`, `deps`, `docs`, `release`.
+here, which is how the list below fell out of date once already. As of
+2026-08-30 it holds 24 scopes: the original `schema`, `parser`, `resolver`,
+`store`, `storage`, `engine`, `mcp`, `cli`, `ci`, `deps`, `docs`, `release`,
+plus `brain`, `client`, `context`, `daemon`, `federation`, `impact`,
+`investigate`, `parity`, `proto`, `queries`, `rankings`, `summaries` — added to
+match scopes that were already in use in commit history since `v8.0.0`.
 
-**The enum has drifted from practice.** History since `v8.0.0` contains commits
-scoped `daemon`, `client`, `federation`, `proto`, `brain`, `context`,
-`investigate`, `rankings`, `summaries` and `parity` — none of which are in the
-enum. Either the hook is not enforced on every path, or it was bypassed. Before
-adding a scope that is not in the enum, add it to `.commitlintrc.yml` in the same
-commit; do not rely on the gap staying open.
+**The enum drifted from practice once already, because commitlint runs only as
+a pre-commit hook, not in CI** — a scope outside the enum only ever fails
+locally, and only for someone with the hook installed. That gap is why the
+enum could describe a stale set of scopes for a while without anything
+red across it. Before adding a scope that is not in the enum, add it to
+`.commitlintrc.yml` in the same commit; do not rely on the gap staying open.
 
 ### Examples
 
@@ -179,7 +188,7 @@ cargo build --release
 # Index a test repo and query it
 nestweaver index --repo ./testdata/js
 nestweaver context greet              # task-focused subgraph via PPR
-nestweaver context src/main.js        # seed from all symbols in a file
+nestweaver context simple.js          # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet"
 
