@@ -297,10 +297,19 @@ Run the lightweight local policy checks with:
 
 ```sh
 bash scripts/verify-required-ci.sh --self-test
-bash scripts/verify-release-bundle.sh --self-test
-bash scripts/verify-release-package.sh --self-test
+bash scripts/verify-release-bundle.sh --self-test     # GNU coreutils only
+bash scripts/verify-release-package.sh --self-test    # GNU coreutils only
 bash -n scripts/observe-release-visibility.sh scripts/verify-release-canary-pr.sh
 ```
+
+**Two of those do not run on macOS.** `verify-release-bundle.sh` and
+`verify-release-package.sh` use `find -printf`, which is a GNU extension that
+BSD `find` does not implement, so on macOS they exit 1 with
+`find: -printf: unknown primary or operator` before testing anything. That is a
+portability gap in the scripts, not a failure you introduced — they run on
+ubuntu in `Required CI` and in the release workflow, which is the only place
+they are load-bearing. `verify-required-ci.sh --self-test` and the `bash -n`
+checks work everywhere.
 
 The release workflow also has positive and negative controls. They build and
 attest artifacts but never call Release Please, create a tag/release, or publish
