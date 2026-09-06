@@ -215,26 +215,46 @@ self_test() {
 
   echo "before=$before_total after=$after_total removed=$removed_total" >&2
 
-  # 1. Exactly the three confirmed nw-096 duplicate pairs in the shipped
-  #    9.1.0 section, and nothing more.
-  if [[ "$removed_total" -ne 3 ]]; then
-    echo "expected exactly 3 removed bullets against the real CHANGELOG.md, got $removed_total" >&2
+  # 1. The newest section ends up with NO duplicate titles left, and exactly
+  #    as many bullets were removed as there were duplicates to remove.
+  #
+  #    The expected count is DERIVED from the input here, by a different
+  #    method than the script itself uses (strip each bullet's commit link,
+  #    then count titles beyond the first occurrence). It used to be the
+  #    literal `3` -- the three nw-096 pairs that happened to sit in the
+  #    9.1.0 section when this test was written -- checked against the REAL
+  #    CHANGELOG.md. That coupled a self-test to data that changes on EVERY
+  #    release: cutting 9.2.0 made the newest section a different section
+  #    with one duplicate, and this assertion failed on a script that was
+  #    working correctly, blocking the release. A self-test must not depend
+  #    on which release happens to be newest.
+  local newest_section expected_removed leftover_dupes
+  newest_section=$(awk '/^## \[/{n++} n==1' "$changelog")
+  expected_removed=$(printf '%s\n' "$newest_section" \
+    | grep -E "$BULLET_RE" \
+    | sed -E 's/ \(\[[0-9a-f]{7,40}\].*$//' \
+    | sort | uniq -c | awk '$1>1 {total += $1 - 1} END {print total+0}')
+
+  if [[ "$removed_total" -ne "$expected_removed" ]]; then
+    echo "expected $expected_removed removed bullets (duplicate titles in the newest section of the real CHANGELOG.md), got $removed_total" >&2
     exit 1
   fi
-  if [[ "$((before_total - 3))" -ne "$after_total" ]]; then
-    echo "bullet count arithmetic does not add up: before=$before_total after=$after_total" >&2
+  if [[ "$((before_total - expected_removed))" -ne "$after_total" ]]; then
+    echo "bullet count arithmetic does not add up: before=$before_total after=$after_total removed=$expected_removed" >&2
     exit 1
   fi
-  for text in \
-    'disclosure, bounds and coverage sweep across 13 items' \
-    'security, coverage-disclosure and merge-gate sweep across 12 items' \
-    'let release-context read the draft it validates'; do
-    occurrences=$(printf '%s\n' "$output" | grep -Fc -- "$text")
-    if [[ "$occurrences" -ne 1 ]]; then
-      echo "expected exactly one surviving entry for: $text (found $occurrences)" >&2
-      exit 1
-    fi
-  done
+
+  # And the point of the whole exercise: nothing duplicated survives in the
+  # newest section of the OUTPUT.
+  leftover_dupes=$(printf '%s\n' "$output" | awk '/^## \[/{n++} n==1' \
+    | grep -E "$BULLET_RE" \
+    | sed -E 's/ \(\[[0-9a-f]{7,40}\].*$//' \
+    | sort | uniq -d)
+  if [[ -n "$leftover_dupes" ]]; then
+    echo "duplicate titles survived in the newest section:" >&2
+    printf '%s\n' "$leftover_dupes" >&2
+    exit 1
+  fi
 
   # 2. THE REGRESSION THIS SELF-TEST EXISTS TO CATCH: a bullet that
   #    legitimately ships in multiple already-released versions (v0.12.0,
@@ -275,7 +295,7 @@ self_test() {
   fi
   rm -f -- "$expected_rest" "$actual_rest"
 
-  echo "real-CHANGELOG.md self-test passed (removed exactly 3 confirmed nw-096 duplicates; $cross_version_occurrences legitimate cross-version duplicates preserved; history below the newest section untouched byte-for-byte)"
+  echo "real-CHANGELOG.md self-test passed (removed $expected_removed duplicate title(s) from the newest section; $cross_version_occurrences legitimate cross-version duplicates preserved; history below the newest section untouched byte-for-byte)"
 }
 
 self_test_continuation_block() {

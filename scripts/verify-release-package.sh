@@ -270,13 +270,32 @@ verify_package_artifact() {
       .sha256 == $sha256
     ' "$manifest" >/dev/null
 
-  tar -tzf "$package_path" | grep -qFx package.json 2>/dev/null || {
-    tar -tzf "$package_path" | grep -qx 'package/package\.json' || {
+  # List ONCE into a variable rather than piping `tar` into `grep -q` per
+  # check. `grep -q` exits on its first match and closes the pipe; GNU tar
+  # then takes SIGPIPE on whatever it had left to write, prints
+  # `tar: stdout: write error` and exits non-zero -- and under the
+  # `set -euo pipefail` at the top of this file that non-zero becomes the
+  # PIPELINE's status, so the `||` branch fires even though grep SUCCEEDED.
+  #
+  # This is worse than a flake: it fails precisely when the entry being
+  # looked for appears EARLY, because that is when tar has the most left
+  # unwritten. `package/bin/nestweaver` is the first entry npm packs, so the
+  # bin check was the one that broke, while the `package.json` check --
+  # matching the LAST line, by which point tar has already finished -- kept
+  # passing and made the failure look content-specific rather than
+  # structural. It blocked the 9.2.0 release on a tarball that was correct.
+  #
+  # BSD tar (macOS) does not reproduce it, so this only ever fires on the
+  # Linux runners that actually gate a release.
+  local listing
+  listing="$(tar -tzf "$package_path")"
+
+  grep -qFx 'package.json' <<< "$listing" ||
+    grep -qFx 'package/package.json' <<< "$listing" || {
       echo "npm tarball is missing package.json" >&2
       return 1
     }
-  }
-  tar -tzf "$package_path" | grep -qx 'package/bin/nestweaver' || {
+  grep -qFx 'package/bin/nestweaver' <<< "$listing" || {
     echo "npm tarball is missing bin/nestweaver" >&2
     return 1
   }
