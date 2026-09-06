@@ -325,7 +325,12 @@ jobs:
   cleanup-draft:
     name: Delete exact private draft
     needs: release-context
-    if: ${{ needs.release-context.outputs.mode == 'cleanup-draft' }}
+    # nw-426, same defect as `dry-run-baseline` below and for the same reason:
+    # `cleanup-draft` is a workflow_dispatch-only recovery operation, so
+    # `release-please` is ALWAYS skipped when it is requested, and without a
+    # status-check function of its own this job inherits that skip. The
+    # recovery path was structurally unreachable.
+    if: ${{ always() && needs.release-context.outputs.mode == 'cleanup-draft' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -713,7 +718,12 @@ jobs:
   publish-release-lockfile:
     name: Publish validated release lockfile without executing PR code
     needs: [release-pr, prepare-release-lockfile]
-    if: ${{ needs.prepare-release-lockfile.result == 'success' }}
+    # nw-426. `prepare-release-lockfile` above already carries `always() &&`
+    # for this reason; this consumer was missed. It explicitly tests
+    # `.result == 'success'`, so `always()` cannot loosen the gate -- it only
+    # stops an unrelated skipped ancestor from suppressing a job whose own
+    # dependency genuinely succeeded.
+    if: ${{ always() && needs.prepare-release-lockfile.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -1261,7 +1271,17 @@ jobs:
   dry-run-baseline:
     name: Capture dry-run visibility baseline
     needs: release-context
-    if: ${{ needs.release-context.outputs.mode == 'dry-run' }}
+    # nw-426. `always() &&` is LOAD-BEARING, not defensive. Without it this
+    # job could never run at all: `dry-run` is a workflow_dispatch-only
+    # operation, `release-please` is skipped on every dispatch
+    # (`if: github.event_name != 'workflow_dispatch'`), and a skipped ancestor
+    # propagates through the graph to any consumer that does not carry its own
+    # status-check function -- `release-context`'s own `always()` rescues
+    # itself, not its dependents. Proven by controlled comparison inside run
+    # 34005527906: `cleanup-canary` gates on the SAME
+    # `outputs.mode == 'dry-run'` WITH `always()` and ran; this job gated on it
+    # WITHOUT `always()` and skipped, in the same run, off the same outputs.
+    if: ${{ always() && needs.release-context.outputs.mode == 'dry-run' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
