@@ -419,7 +419,17 @@ pub fn generate_guide_with_tools(
         "| `GET /api/v1/version` | `{\"graph_generation\": N, \"pagerank_generation\": N}` |\n",
     );
     out.push_str("| `GET /api/v1/snapshot.msgpack` | MessagePack-encoded graph (`X-Graph-Generation` header) |\n");
-    out.push_str("| `GET /api/v1/events` | SSE stream: `graph:updated`, `pagerank:recomputed`, `full_refresh` |\n");
+    // `graph:updated` was listed here for a long time and is NOT emitted by
+    // anything. It was wired to `CodeWatcher::on_change` once; that wiring is
+    // gone, and the only `GraphEvent` construction
+    // (`nestweaver-web/src/rank_events.rs`) always sets
+    // `pagerank:recomputed`, with `full_refresh` emitted by
+    // `routes/events.rs` on lag. An agent told to wait for `graph:updated`
+    // to detect a re-index waits forever, which is worse than being told
+    // nothing -- and because this generator regenerates the agent guide,
+    // fixing the emitted markdown alone would have been undone on the next
+    // `nestweaver setup`.
+    out.push_str("| `GET /api/v1/events` | SSE stream: `pagerank:recomputed`, `full_refresh` |\n");
     out.push('\n');
 
     Ok(out)

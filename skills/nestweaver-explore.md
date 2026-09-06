@@ -8,7 +8,7 @@ description: Explore unfamiliar code using the NestWeaver knowledge graph. Prefe
 When the user asks to explore, understand, or navigate unfamiliar code:
 
 1. Identify the file or symbol they're looking at
-2. Call `brain_context` with that file path or symbol name as a seed — returns a type-aware subgraph of related code ranked by Personalized PageRank. This replaces grepping for usages.
+2. Seed by the RIGHT tool for what you have. A SYMBOL NAME goes to `brain_context`, which returns a type-aware subgraph ranked by Personalized PageRank and includes vault notes. A FILE PATH goes to `code_context` instead — `brain_context` resolves seeds as UIDs, note titles, tags and symbol names only, so a path fails to resolve there. `code_context` wants the path REPO-RELATIVE (`crates/foo/src/bar.rs`); a bare basename (`bar.rs`) does not resolve either. Both replace grepping for usages.
 3. For deeper exploration, use `investigate` to build a focused investigation bundle, then `investigate_expand` to widen the scope
 4. Use `project_context` if exploring within a specific project boundary (filters to that project's repos and notes)
 5. Use `flow_trace` to follow execution from a specific entry point forward

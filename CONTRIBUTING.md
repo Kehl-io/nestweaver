@@ -63,9 +63,15 @@ belongs in a comment rather than in a shared function.
 
 ## Architecture
 
-See [CLAUDE.md](CLAUDE.md) for the crate dependency diagram and conventions.
-The key rule: `schema` and `storage` have zero internal dependencies.
-Everything else depends on `schema`. Only `engine` depends on all crates.
+See [CLAUDE.md](CLAUDE.md) for the full crate dependency diagram and
+conventions — read the diagram there rather than a paraphrase here, which is
+what let this section fall out of sync with it. The short version: `schema`,
+`storage`, and `algorithms` have zero internal dependencies; `algorithms` is
+the WASM-compatible pure-compute layer, so `nestweaver-wasm` depends on it
+alone and, notably, does *not* depend on `schema`. No single crate depends on
+all the others — `engine` depends on `schema`/`parser`/`resolver`/`store`/
+`storage`/`algorithms` (plus `embed` behind a feature); the root `nestweaver`
+binary is the one that aggregates almost everything, transitively.
 
 ## Commit Convention
 
@@ -90,16 +96,19 @@ Format: `<type>(<scope>): <description>`
 
 The authoritative list is `rules.scope-enum` in
 [`.commitlintrc.yml`](.commitlintrc.yml) — read it there rather than from a copy
-here, which is how the list below fell out of date in the first place. At time of
-writing it holds: `schema`, `parser`, `resolver`, `store`, `storage`, `engine`,
-`mcp`, `cli`, `ci`, `deps`, `docs`, `release`.
+here, which is how the list below fell out of date once already. As of
+2026-08-30 it holds 24 scopes: the original `schema`, `parser`, `resolver`,
+`store`, `storage`, `engine`, `mcp`, `cli`, `ci`, `deps`, `docs`, `release`,
+plus `brain`, `client`, `context`, `daemon`, `federation`, `impact`,
+`investigate`, `parity`, `proto`, `queries`, `rankings`, `summaries` — added to
+match scopes that were already in use in commit history since `v8.0.0`.
 
-**The enum has drifted from practice.** History since `v8.0.0` contains commits
-scoped `daemon`, `client`, `federation`, `proto`, `brain`, `context`,
-`investigate`, `rankings`, `summaries` and `parity` — none of which are in the
-enum. Either the hook is not enforced on every path, or it was bypassed. Before
-adding a scope that is not in the enum, add it to `.commitlintrc.yml` in the same
-commit; do not rely on the gap staying open.
+**The enum drifted from practice once already, because commitlint runs only as
+a pre-commit hook, not in CI** — a scope outside the enum only ever fails
+locally, and only for someone with the hook installed. That gap is why the
+enum could describe a stale set of scopes for a while without anything
+red across it. Before adding a scope that is not in the enum, add it to
+`.commitlintrc.yml` in the same commit; do not rely on the gap staying open.
 
 ### Examples
 
@@ -179,7 +188,7 @@ cargo build --release
 # Index a test repo and query it
 nestweaver index --repo ./testdata/js
 nestweaver context greet              # task-focused subgraph via PPR
-nestweaver context src/main.js        # seed from all symbols in a file
+nestweaver context simple.js          # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet"
 
@@ -288,10 +297,19 @@ Run the lightweight local policy checks with:
 
 ```sh
 bash scripts/verify-required-ci.sh --self-test
-bash scripts/verify-release-bundle.sh --self-test
-bash scripts/verify-release-package.sh --self-test
+bash scripts/verify-release-bundle.sh --self-test     # GNU coreutils only
+bash scripts/verify-release-package.sh --self-test    # GNU coreutils only
 bash -n scripts/observe-release-visibility.sh scripts/verify-release-canary-pr.sh
 ```
+
+**Two of those do not run on macOS.** `verify-release-bundle.sh` and
+`verify-release-package.sh` use `find -printf`, which is a GNU extension that
+BSD `find` does not implement, so on macOS they exit 1 with
+`find: -printf: unknown primary or operator` before testing anything. That is a
+portability gap in the scripts, not a failure you introduced — they run on
+ubuntu in `Required CI` and in the release workflow, which is the only place
+they are load-bearing. `verify-required-ci.sh --self-test` and the `bash -n`
+checks work everywhere.
 
 The release workflow also has positive and negative controls. They build and
 attest artifacts but never call Release Please, create a tag/release, or publish

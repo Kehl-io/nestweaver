@@ -47,9 +47,9 @@ test-crate crate:
         cargo test -p {{crate}} --all-features
     fi
 
-# Lint with clippy (zero warnings)
+# Lint with clippy (zero warnings) -- same invocation CI runs
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -60,6 +60,12 @@ fmt:
     cargo fmt --all
 
 # Run all checks (what CI does)
+#
+# `lint` deliberately does NOT pass `--all-features`: per `no_all_features`
+# above, `nestweaver` and `nestweaver-embed` forward `metal`, which pulls
+# `objc2` and does not compile off macOS -- so an `--all-features` clippy run
+# is not portable, and CI does not use one either
+# (.github/workflows/ci.yml runs `cargo clippy --workspace --all-targets`).
 check: fmt-check lint test
 
 # Start web UI in development mode

@@ -45,8 +45,22 @@ was **0/15**, and it remains poor on C++.
 
 NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
 earlier release is ranked over stale edges** until it is re-indexed
-(`nestweaver index --repo <path> --force`). `stale_check` will not tell you —
-it compares indexed SHA against git HEAD only. `hub_nodes` and `bridge_nodes`
-are the **only** tools that disclose it, via `rankings_stale` / `stale_repos`;
-roughly a dozen other ranking-derived surfaces disclose nothing, so the absence
-of a staleness field is not evidence of freshness.
+(`nestweaver index --repo <path> --force` — plain `index` is incremental and
+does nothing on a repo already at HEAD).
+
+`stale_check` DOES tell you: as of 9.0.0 it consults the resolver-generation
+sidecar and reports `status: "outdated_resolver"` with `resolver_stale: true`,
+exiting 2. (It compared indexed SHA against git HEAD only through 8.x, which is
+what this section used to say.)
+
+`hub_nodes`, `bridge_nodes`, `repo_map`, `ranking rank` and hub-level
+`get_summary` disclose it via `rankings_stale` / `stale_repos`. `clusters`,
+`blast_radius`, `affected_tests`, `pr_impact` and PPR-backed context disclose
+nothing, so on those the absence of a staleness field is not evidence of
+freshness.
+
+**`stale_repos` does not mean the same thing everywhere.** On `stale_check`'s
+`--json` it is behind-HEAD git URLs, and the generation-stale set is the
+separately named `resolver_stale_repos`. On `hub_nodes` / `bridge_nodes` /
+`repo_map` the same field name carries generation-mismatch repo UIDs. Read the
+field the command actually documents rather than assuming the name transfers.
