@@ -210,7 +210,7 @@ nestweaver watch ./my-project            # watch a specific directory
 nestweaver context greet                 # task-focused subgraph via PPR
 nestweaver context greet --intent find-definition          # intent-tuned PPR
 nestweaver context greet --limit 20                        # cap connected nodes
-nestweaver context src/main.js           # seed from all symbols in a file
+nestweaver context simple.js             # seed from all symbols in a file (repo-relative path)
 nestweaver search "greet"
 nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
