@@ -1,5 +1,74 @@
 # Changelog
 
+## [9.2.0](https://github.com/Kehl-io/nestweaver/compare/v9.1.0...v9.2.0) (2026-09-06)
+
+
+### Bug Fixes
+
+* **cli,client:** surface two disclosures that were computed and dropped, and let a long-running command say so ([74ea5bc](https://github.com/Kehl-io/nestweaver/commit/74ea5bc398b2f38d0ddf54f63ceac79a246fd275))
+* **cli,daemon,federation:** forward --no-embed across the proto boundary; make it a per-command field ([7d4d001](https://github.com/Kehl-io/nestweaver/commit/7d4d0014d7c654e19c3db3b3cddd433ac7ed66ce))
+* **cli,engine,mcp:** give the direct route a semantic model, disclose what shaped an answer, and bound investigate's hydration ([06a70c2](https://github.com/Kehl-io/nestweaver/commit/06a70c25f157fd324c9f27e695951469363837ad))
+* **cli,mcp:** --no-embed genuinely disables semantic ranking or is refused; disambiguate four stale_repos populations in docs ([2c3c7b4](https://github.com/Kehl-io/nestweaver/commit/2c3c7b4085b99e19b25f1a9b2e95b683ddc9030f))
+* **cli:** close the nw-217b sweep's third hole (kebab/snake schema-key lookup) and revert nw-360's exit code ([2b89ead](https://github.com/Kehl-io/nestweaver/commit/2b89ead2a56789e900f35e55c129170b93e70cb9))
+* **client:** shorten the idle timeout autostart uses for ephemeral --db paths ([140d4f1](https://github.com/Kehl-io/nestweaver/commit/140d4f1bc80de3d4f0bdc6413cf7ef133e379116))
+* **client:** two-tier blast_radius no longer kills the federated response (nw-428 review) ([705559f](https://github.com/Kehl-io/nestweaver/commit/705559fec921f3e240717c57e17d5b6b40724e75))
+* **cli:** explicit daemon start/status validate the database; repair reclaims orphaned sidecars ([c4619fa](https://github.com/Kehl-io/nestweaver/commit/c4619fa6286ae6bfa1a7ecd0745a2df914006314))
+* **cli:** reclassify brain add/remove as real MCP twins in declared_cli_mcp_twin ([6c9b338](https://github.com/Kehl-io/nestweaver/commit/6c9b338200c4ffc1410666a5a0b9662008fa98fc))
+* **cli:** repair the nw-217b bounds sweep and close nw-431/nw-432/nw-397/nw-360/nw-379 ([17299b3](https://github.com/Kehl-io/nestweaver/commit/17299b3e56147a3dabbbd928f7dac5fb1acb75c4))
+* **cli:** wire repo-map/cluster/cross-repo-contracts/hubs/bridges to the engine and mcp fixes ([0d4131e](https://github.com/Kehl-io/nestweaver/commit/0d4131e242134c2199465bcc9c7dca50f27bb776))
+* **daemon,client:** observable launchd-stop timeout; explicit escape for the ephemeral idle-timeout heuristic ([0fa2b6f](https://github.com/Kehl-io/nestweaver/commit/0fa2b6ff0463f192ec65df258f07e3e9168202aa))
+* **daemon:** gc names a live daemon whose database no longer exists ([64dd910](https://github.com/Kehl-io/nestweaver/commit/64dd910ef805cb2e5adf01be5f2abaaae44e6116))
+* **daemon:** wait for launchd to actually release a job before proceeding ([d9349c7](https://github.com/Kehl-io/nestweaver/commit/d9349c7f1aabebda8b093ae6f1e3e2b560c907b1))
+* **engine,cli:** reorder RenderCap's scope filter ahead of its cap, disclose what it drops, and drop a per-candidate DB hit from the hot loop ([5ae23ef](https://github.com/Kehl-io/nestweaver/commit/5ae23ef32e3f25efcf76b72e5dd3aa483d40a21e))
+* **engine,mcp:** rule Extension callable with enforcement, disclose the hub/bridge kind exclusion ([cf60c35](https://github.com/Kehl-io/nestweaver/commit/cf60c356d368fae191b4ecea1e4ea4067e2ed121))
+* **engine:** cluster --resolution reads a resolution-keyed sidecar instead of whatever ran last ([26b3903](https://github.com/Kehl-io/nestweaver/commit/26b39034a3bb2e79b1856574d0d853018edd3eba))
+* **engine:** curate the vault skip-dirs list deliberately instead of admitting everything the 9-entry list happened not to name (nw-436 review) ([31ca15b](https://github.com/Kehl-io/nestweaver/commit/31ca15be14c6c5550603570eb627482eb072a76f))
+* **engine:** disclose file-level `[[repos]] exclude` prunes (nw-437) ([8fbe62b](https://github.com/Kehl-io/nestweaver/commit/8fbe62b663facf252be9ac4d24f8c1f47e4d2e67))
+* **engine:** give backup_restore its own exclusive restore authority ([e74675d](https://github.com/Kehl-io/nestweaver/commit/e74675d3ccfa343eb46d4424f94f30fa7c994d42))
+* **engine:** give the vault skip-dir disclosure its own honest remedy, and stop degrading every vault's coverage forever (nw-436 review) ([3fbfd6f](https://github.com/Kehl-io/nestweaver/commit/3fbfd6ffc666cf75eb03920cb9cc6fbf1dcc4836))
+* **engine:** hubs/bridges stop ranking non-callable symbol kinds and bridges fails closed during a dirty publication ([af39a49](https://github.com/Kehl-io/nestweaver/commit/af39a49f372cd0b1b028e189bc79982762f3ad1f))
+* **engine:** investigate repo: scope now excludes vault notes (nw-378) ([be4ebc6](https://github.com/Kehl-io/nestweaver/commit/be4ebc6210fc1eeebb54ae5706b7efc924b7ae48))
+* **engine:** order rts-eval timestamps by instant, not by bytes ([15e2f35](https://github.com/Kehl-io/nestweaver/commit/15e2f359247a38d0dd773b4e8aaf0688e9f24e98))
+* **engine:** repo-map discloses truncation and stops merging same-path files from different repos ([50cb6a7](https://github.com/Kehl-io/nestweaver/commit/50cb6a750de9cf1733ea05f87bd4caa0f83bd63d))
+* **engine:** review round 2 — visibility parity, remedy text, project: scope leak ([c94d27e](https://github.com/Kehl-io/nestweaver/commit/c94d27e8108672a08e64f2b4e434583733ff5579))
+* **engine:** stop vault indexing from inheriting the code repo skip-dirs list, and disclose every prune it makes (nw-436, nw-196) ([6e29dbd](https://github.com/Kehl-io/nestweaver/commit/6e29dbdc536e8ab903612f8f964c064ff0106ebe))
+* **engine:** verify per-database write leases before trusting Borrowed ([ceade73](https://github.com/Kehl-io/nestweaver/commit/ceade732e211381fdeaa5979732e3267541e7676))
+* **mcp:** blast_radius resolves --repo by name/uid, refuses unresolvable (nw-428) ([5f9e85c](https://github.com/Kehl-io/nestweaver/commit/5f9e85cd988d91b93e0ac846575673a32e04a6ec))
+* **mcp:** cross_repo_contracts attributes rows to a repo, and publication messages stop asserting TRANSIENT past the expected window ([1b0c42c](https://github.com/Kehl-io/nestweaver/commit/1b0c42c007e86a0d94c8800b58534cf3d9ae6fea))
+* **npm:** declare a minimum supported Node version (nw-433) ([057fac9](https://github.com/Kehl-io/nestweaver/commit/057fac9db54012a670894d5e07b6357b539b66ec))
+* **npm:** declare the engines floor the package actually needs, not the LTS policy floor ([542fdb0](https://github.com/Kehl-io/nestweaver/commit/542fdb02f757e89720f1cc6fb48b2c6eaa1f3964))
+* **npm:** make isMuslLinux fail open when the report is unreadable, not just undefined-glibc (nw-433) ([903c932](https://github.com/Kehl-io/nestweaver/commit/903c9328f79021f588914ed17aa96853b76d11f1))
+* **npm:** resolve the bin script through npm's install symlinks (nw-433) ([dae8b30](https://github.com/Kehl-io/nestweaver/commit/dae8b30a11f5016afee6471b15026cfb87752ee8))
+* **npm:** stop declaring a libc constraint that refuses every macOS install (nw-433) ([eac6410](https://github.com/Kehl-io/nestweaver/commit/eac6410a2166242cebfb41edf2502a320fea795b))
+* **parser,engine:** gate languages_without_entry_points on a capability check (nw-435) ([ffe3eb3](https://github.com/Kehl-io/nestweaver/commit/ffe3eb3100d5498b72c6fd695923f2e4e23a1ac4))
+* **parser,engine:** model script/module top-level as an entry point (nw-435) ([774b1c4](https://github.com/Kehl-io/nestweaver/commit/774b1c4e6c4ee81fdde6ae294e5a8f846bdb30fb))
+* **parser:** capture C++ calls with explicit template arguments (nw-434) ([d93548b](https://github.com/Kehl-io/nestweaver/commit/d93548b8595732049db5e02314de61b04b4d4206))
+* post-9.1.0 regression sweep — 26 items, incl. the npm install blocker ([06e4790](https://github.com/Kehl-io/nestweaver/commit/06e47906dab1ac7ed5105b129b248daf2ee697aa))
+* **release,npm:** dedupe merge-commit changelog entries and ship per-platform npm packages ([827034e](https://github.com/Kehl-io/nestweaver/commit/827034e8601c83007838cdd4f62ff6fde02f8847))
+* **release:** give the last three output-gated jobs a status function ([111d3e9](https://github.com/Kehl-io/nestweaver/commit/111d3e9aa1bbc528bc9efbaa8b41400e7447403b))
+* **release:** give the last three output-gated jobs a status function ([e2fa21f](https://github.com/Kehl-io/nestweaver/commit/e2fa21f8fe70b2353e7876f794bd26bb3ceea9e5))
+* **release:** scope changelog dedup to one section, drop the impossible gitHead check ([147bd6b](https://github.com/Kehl-io/nestweaver/commit/147bd6bafe85580acf4914e1d0647bc6ec23461b))
+* resolver enclosing-symbol kinds, per-platform npm packages, and retrieval correctness under scope ([3deca27](https://github.com/Kehl-io/nestweaver/commit/3deca272f9c4346afc8c83efee5e7c2f7f0704a0))
+* **resolver:** apply can_contain_code to find_enclosing_symbol's exact-match branch ([3bc825b](https://github.com/Kehl-io/nestweaver/commit/3bc825b8ee49b3b68e28a307bb1408e5af57a9bb))
+* stop the disclosure work leaking ticket ids into user-facing help ([9ee5345](https://github.com/Kehl-io/nestweaver/commit/9ee5345c4df91107846fce664a61ba85081b81b8))
+* **store,engine:** stop discarding collected regex candidates; bound the watcher's write-gate hold ([d36ec9a](https://github.com/Kehl-io/nestweaver/commit/d36ec9ad502d37db58d93d323691dbb7f93f0f36))
+* **store:** bound regex verification by the remaining deadline, not a fresh one ([ab7244d](https://github.com/Kehl-io/nestweaver/commit/ab7244d8aa827e25b078f870e98eedfdd110bae4))
+* **store:** clear the namespace-claim registry before the OS flock releases ([8fb453c](https://github.com/Kehl-io/nestweaver/commit/8fb453ccaaf34995d16dddae5d41247f240fc2bf))
+* **store:** reclaim orphaned Tantivy migration staging directories ([b9e6b05](https://github.com/Kehl-io/nestweaver/commit/b9e6b05105764ccadeaf86de392a2a6342cf3654))
+* **store:** recover a crash-orphaned regex generation instead of deleting it ([25057a7](https://github.com/Kehl-io/nestweaver/commit/25057a7665506c122167cb3df265fe3af9be8ab2))
+* **store:** refuse to adopt a crash-orphaned generation on schema mismatch ([dc518ba](https://github.com/Kehl-io/nestweaver/commit/dc518ba19312de09359d43d23815bb7640ea2797))
+* **store:** sanity-check a candidate before reclaiming it as staging residue ([9b7958a](https://github.com/Kehl-io/nestweaver/commit/9b7958afadbe283cb4da195cd0d98b60e91b8af4))
+
+
+### Reverts
+
+* **parser:** drop the synthetic script/module entry-point symbol (nw-435) ([32682c0](https://github.com/Kehl-io/nestweaver/commit/32682c0d210db73a0240d1788e0b9580e4885dca))
+
+
+### Miscellaneous Chores
+
+* release 9.2.0 ([54f0b02](https://github.com/Kehl-io/nestweaver/commit/54f0b02b20c78eb7f319bdaa0be89987e601f69e))
+
 ## [9.1.0](https://github.com/Kehl-io/nestweaver/compare/v9.0.5...v9.1.0) (2026-09-04)
 
 

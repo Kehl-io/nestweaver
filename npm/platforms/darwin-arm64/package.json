@@ -1,6 +1,6 @@
 {
   "name": "nestweaver-darwin-arm64",
-  "version": "9.1.0",
+  "version": "9.2.0",
   "description": "NestWeaver prebuilt binary for macOS arm64 (Apple Silicon). Not meant to be installed directly -- installed automatically as an optional dependency of the `nestweaver` package.",
   "os": [
     "darwin"
