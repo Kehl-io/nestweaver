@@ -313,12 +313,33 @@ pub fn finalize_committed_graph_mutation(
         match load_manifest_cache_for_db(store, db_path) {
             Ok(manifests) => Some(manifests),
             Err(error) => {
-                outcome.record_warning(
-                    "load-manifest-cache",
-                    format!(
-                        "could not carry the repository manifest cache across publication: {error:#}"
-                    ),
-                );
+                // nw-459. The manifest cache is REBUILDABLE derived data. An
+                // upgrade invalidates it by construction (the artifact records
+                // the producing version), and the next index regenerates it.
+                // Recording that as a publication WARNING flipped the
+                // disposition to `CommittedDegraded`, which the daemon and CLI
+                // both surface as a hard error — so the first index after every
+                // upgrade exited non-zero on a graph that had committed
+                // perfectly, telling the user to "repair the named stage(s)"
+                // for a stage that needed no repair.
+                //
+                // A genuine incompatibility (different algorithm, different
+                // schema, foreign identity, corrupt payload) is NOT rebuildable
+                // and still degrades the publication loudly.
+                let rendered = format!("{error:#}");
+                if nestweaver_store::artifact_envelope::is_rebuildable_artifact(&rendered) {
+                    tracing::debug!(
+                        error = %rendered,
+                        "dropping a rebuildable manifest cache; the next index regenerates it"
+                    );
+                } else {
+                    outcome.record_warning(
+                        "load-manifest-cache",
+                        format!(
+                            "could not carry the repository manifest cache across publication: {rendered}"
+                        ),
+                    );
+                }
                 None
             }
         }
