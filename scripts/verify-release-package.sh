@@ -18,6 +18,33 @@
 
 set -euo pipefail
 
+# nw-455: `sha256sum` is GNU coreutils. It resolves on this machine only via a
+# compat shim newer macOS ships at /sbin, which is neither guaranteed nor GNU.
+# `verify-release-bundle.sh` already uses the portable `shasum -a 256`, so the
+# two sibling verifiers disagreed with each other. One helper, both forms.
+nw_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  else
+    echo "neither sha256sum nor shasum is available; cannot verify checksums" >&2
+    return 1
+  fi
+}
+
+nw_sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c -- "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c -- "$@"
+  else
+    echo "neither sha256sum nor shasum is available; cannot verify checksums" >&2
+    return 1
+  fi
+}
+
+
 PLATFORM_KEYS=(darwin-arm64 darwin-x64 linux-arm64 linux-x64)
 
 platform_os() {
@@ -186,7 +213,7 @@ pack_package() {
   package_filename=$(jq -er '.[0].filename' <<< "$pack_json")
   package_path="$package_dir/$package_filename"
   test -f "$package_path"
-  package_sha256=$(sha256sum "$package_path" | awk '{print $1}')
+  package_sha256=$(nw_sha256 "$package_path" | awk '{print $1}')
   [[ "$package_sha256" =~ ^[0-9a-f]{64}$ ]]
   printf '%s  %s\n' "$package_sha256" "$package_filename" > "$package_path.sha256"
 
@@ -252,8 +279,8 @@ verify_package_artifact() {
   fi
   rm -f -- "$expected_files" "$actual_files"
 
-  (cd "$package_dir" && sha256sum -c -- "$package_filename.sha256") >&2
-  package_sha256=$(sha256sum "$package_path" | awk '{print $1}')
+  (cd "$package_dir" && nw_sha256_check "$package_filename.sha256") >&2
+  package_sha256=$(nw_sha256 "$package_path" | awk '{print $1}')
   package_integrity=$(node -e '
     const crypto = require("crypto");
     const fs = require("fs");
