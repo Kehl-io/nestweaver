@@ -2994,10 +2994,10 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
 /// Unwrapping to the local tier restores all three. An unrecognised or absent
 /// `tier` is returned unchanged, so single-tier behaviour is untouched.
 fn brain_impact_local_tier(payload: &serde_json::Value) -> &serde_json::Value {
-    if payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier") {
-        if let Some(local) = payload.get("local_impact") {
-            return local;
-        }
+    if payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier")
+        && let Some(local) = payload.get("local_impact")
+    {
+        return local;
     }
     payload
 }
