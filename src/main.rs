@@ -21252,7 +21252,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             // Keep lifecycle identity bound to the stable anchor. Following
             // publication CURRENT here would select a different runtime ID.
-            let (db_path, _, source) = resolve_base_db_with_config_source(db, lifecycle_config)?;
+            let (db_path, _, source) = resolve_base_db_with_config_source(db, lifecycle_config)
+                .map_err(|error| {
+                    if matches!(&action, DaemonAction::Restart { .. }) {
+                        error.context(
+                            "restart configuration is invalid; daemon has not been shut down",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
             if matches!(source, DbSource::CwdLocal | DbSource::RepoLocal)
                 || db_path.as_os_str().is_empty()
             {
