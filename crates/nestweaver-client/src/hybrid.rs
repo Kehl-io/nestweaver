@@ -1319,8 +1319,40 @@ pub async fn two_tier_query(
     .await)
 }
 
-/// The stable, narrow substring that identifies "the local `repo` filter
-/// could not be resolved" among every other possible local failure.
+/// LEGACY fallback signal: the substring that identifies "the local `repo`
+/// filter could not be resolved" when the daemon did not stamp a typed error
+/// code.
+///
+/// nw-443 replaced this as the PRIMARY contract with
+/// [`nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE`], carried in
+/// gRPC metadata. Matching on prose was pinned by nothing on either end -- a
+/// rename in `node_scope.rs` left the producing tests (which assert only
+/// `"ambiguous"` / `"not-a-repo"`) and the consuming tests (which
+/// hand-construct the string) green while federation silently reverted to
+/// killing a healthy upstream's entire two-tier answer.
+///
+/// It is KEPT for two reasons, and the second one is load-bearing far more
+/// often than it looks:
+///
+/// 1. Version skew: a client newer than the daemon it talks to receives no
+///    metadata code.
+/// 2. REQUEST COALESCING. `blast_radius` is in `CACHEABLE_TOOLS`, so
+///    concurrent identical calls collapse through
+///    `nestweaver_mcp::tools::coalesce_in_flight`. Only the LEADER runs
+///    `resolve_repo_filter` and holds the typed error; every follower is
+///    handed `anyhow!("{msg}")` rebuilt from a STRING the leader published,
+///    with `RepoFilterUnresolved` nowhere in its chain. The daemon therefore
+///    cannot stamp the code for a follower, and detection for those callers
+///    runs entirely on the prose below. Measured against a live daemon with
+///    12 concurrent identical calls: 1-2 responses carried the code, 10-11
+///    did not.
+///
+/// So "a rewording can no longer break this" is TRUE for a unique request and
+/// FALSE for a coalesced follower. Closing that properly means preserving an
+/// error code across the coalescing boundary in `tools.rs`, which is shared
+/// cache infrastructure well outside this item; until then the fallback is
+/// what keeps federation correct under concurrency, and `node_scope.rs`'s
+/// prefix assertion is what keeps the fallback honest.
 ///
 /// `nestweaver-daemon`'s `dispatch_err_to_status` wraps a tool's error as
 /// `Status::internal("tool {tool} failed: {e}")`, and
@@ -1332,6 +1364,32 @@ pub async fn two_tier_query(
 /// text is emitted ONLY by that one function today, so matching on it
 /// cannot mistake an unrelated failure for an unresolved `repo` filter.
 const UNRESOLVED_REPO_FILTER_SIGNAL: &str = "repo filter entry ";
+
+/// Whether `error` is the daemon reporting an unresolved local `repo` filter.
+///
+/// nw-443. TYPED FIRST: `dispatch_err_to_status` stamps
+/// [`nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE`] into the
+/// gRPC status metadata, and `tonic::Status` survives the client's
+/// `.with_context()` wrapping as a source in the anyhow chain, so it can be
+/// downcast rather than read. A rewording of the message can no longer break
+/// this.
+///
+/// PROSE SECOND, and only as a version-skew downgrade -- see
+/// [`UNRESOLVED_REPO_FILTER_SIGNAL`].
+fn is_unresolved_repo_filter(error: &anyhow::Error, rendered: &str) -> bool {
+    let coded = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .and_then(|status| {
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+        })
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|code| code == nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE);
+
+    coded || rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL)
+}
 
 /// Build a degraded, disclosure-shaped stand-in for a two-tier LOCAL result
 /// whose `repo` filter did not resolve against the local index.
@@ -1372,7 +1430,7 @@ fn degraded_local_impact_for_unresolved_repo_filter(
         return None;
     }
     let rendered = format!("{error:#}");
-    if !rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL) {
+    if !is_unresolved_repo_filter(error, &rendered) {
         return None;
     }
     let changed_files = params
@@ -1545,6 +1603,62 @@ mod tests {
         assert_eq!(
             degraded["max_depth"], 3,
             "an omitted max_depth must default to 3, matching tool_blast_radius's own default"
+        );
+    }
+
+    /// nw-443: THE TYPED CONTRACT. Detection must survive a complete
+    /// rewording of the message, because the previous contract -- a substring
+    /// match on `resolve_repo_filter`'s prose, pinned by nothing on either
+    /// end -- meant a rename in `node_scope.rs` silently reverted federation
+    /// to killing a healthy upstream's whole answer, with every test on both
+    /// sides still green.
+    #[test]
+    fn degraded_stand_in_recognizes_the_typed_error_code_without_the_prose() {
+        let mut status =
+            tonic::Status::internal("tool blast_radius failed: entirely different wording");
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE
+                .parse()
+                .unwrap(),
+        );
+        let error = anyhow::Error::new(status).context("blast_radius RPC failed");
+        assert!(
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &json!({}))
+                .is_some(),
+            "the typed error code must be recognized on its own, with no prose match"
+        );
+    }
+
+    /// COUNTERWEIGHT to the test above: a `Status` carrying a DIFFERENT code
+    /// must not be absorbed. Otherwise the typed check would degrade every
+    /// coded error into a stand-in -- a gate that always fires.
+    #[test]
+    fn degraded_stand_in_ignores_a_different_typed_error_code() {
+        let mut status = tonic::Status::internal("tool blast_radius failed: something else");
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            "some-other-code".parse().unwrap(),
+        );
+        let error = anyhow::Error::new(status).context("blast_radius RPC failed");
+        assert!(
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &json!({}))
+                .is_none()
+        );
+    }
+
+    /// nw-443 DOWNGRADE PATH: a new client against an older daemon gets no
+    /// metadata code at all, only the legacy prose. That must still be
+    /// recognized, or upgrading the client alone would reintroduce the very
+    /// regression this detection exists to prevent.
+    #[test]
+    fn degraded_stand_in_still_recognizes_the_legacy_prose_signal() {
+        let error = anyhow::anyhow!("repo filter entry \"x\": repo 'x' not found in graph")
+            .context("blast_radius RPC failed");
+        assert!(
+            degraded_local_impact_for_unresolved_repo_filter("blast_radius", &error, &json!({}))
+                .is_some(),
+            "an un-stamped daemon's message must still degrade gracefully"
         );
     }
 

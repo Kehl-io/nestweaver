@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6136
 expression: "parsed_symbols(\"simple.astro\", &source)"
 ---
 - name: simple
@@ -9,8 +8,8 @@ expression: "parsed_symbols(\"simple.astro\", &source)"
   end_line: 34
   signature: "<astro:component name=\"simple\">"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: EventListener
   visibility: Public
   type_info: ~
   parent_name: ~
@@ -21,8 +20,8 @@ expression: "parsed_symbols(\"simple.astro\", &source)"
   end_line: 10
   signature: "export function getStaticPaths() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: HttpHandler
   visibility: Public
   type_info: ~
   parent_name: ~

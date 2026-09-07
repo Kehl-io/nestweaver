@@ -15,6 +15,7 @@ use nestweaver_proto::*;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use tokio::sync::Notify;
 use tonic::codegen::http;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
@@ -46,7 +47,30 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
             }
         };
     }
-    Status::internal(format!("tool {tool_name} failed: {e}"))
+    let mut status = Status::internal(format!("tool {tool_name} failed: {e}"));
+
+    // nw-443. A typed engine error gets a MACHINE-READABLE code in the
+    // status metadata, so `nestweaver-client`'s two-tier degrade can match on
+    // a code instead of substring-matching this message's prose across three
+    // crates. The `internal` gRPC code and the message text are deliberately
+    // unchanged -- other consumers (upstream-health detection among them)
+    // read those, and this is meant to be purely additive.
+    //
+    // `chain()` rather than a bare downcast: the error may already carry
+    // `.context()` from the tool layer, and the type is what matters, not
+    // where it sits in the chain.
+    if e.chain()
+        .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>())
+        && let Ok(value) =
+            nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE.parse::<MetadataValue<_>>()
+    {
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            value,
+        );
+    }
+
+    status
 }
 
 /// Trip `cancel` when the request future is dropped (client cancel /
@@ -122,6 +146,55 @@ fn list_contracts_impl(
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod dispatch_err_to_status_tests {
+    use super::*;
+
+    /// nw-443: the daemon is the only place that can turn the engine's typed
+    /// `RepoFilterUnresolved` into something a federated client can read
+    /// across the gRPC boundary. Without this stamp the client's typed check
+    /// never fires in production and detection silently stays on prose --
+    /// the failure this item exists to end.
+    #[test]
+    fn an_unresolved_repo_filter_is_stamped_with_its_error_code() {
+        let error = anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "not-a-repo",
+            &anyhow::anyhow!("repo 'not-a-repo' not found in graph"),
+        ));
+        let status = dispatch_err_to_status("blast_radius", error);
+
+        let code = status
+            .metadata()
+            .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+            .expect("an unresolved repo filter must carry a machine-readable code")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            code,
+            nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE
+        );
+        assert!(
+            status.message().contains("repo filter entry"),
+            "the human message is unchanged; got {:?}",
+            status.message()
+        );
+    }
+
+    /// COUNTERWEIGHT: an ordinary failure must carry NO code, or the client's
+    /// typed check would absorb every local outage into a degraded stand-in.
+    #[test]
+    fn an_unrelated_failure_carries_no_error_code() {
+        let status = dispatch_err_to_status("blast_radius", anyhow::anyhow!("connection refused"));
+        assert!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .is_none()
+        );
+    }
 }
 
 #[cfg(test)]

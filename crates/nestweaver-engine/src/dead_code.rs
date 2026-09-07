@@ -433,18 +433,22 @@ fn detect_dead_code_inner(
     //
     // Gated on `language_has_entry_point_model`: "zero entry points" is only
     // evidence of a coverage GAP for a language that has a detection rule to
-    // come up empty. SQL, HCL, SystemVerilog, Vue, Svelte and Astro have no
-    // model at all (declarative, unimplemented, or routed around
-    // `detect_entry_point` entirely -- see that function's doc comment), so
-    // their entry-point count is ALWAYS zero and folding them in here would
-    // degrade `coverage_is_complete` permanently for any corpus containing
-    // even one such file, with no user action able to clear it. A probe
-    // confirmed this: `languages_without_entry_points = ["hcl", "sql",
-    // "systemverilog", "vue"]` on a corpus that also has real bash/python
-    // gaps, degrading coverage for a reason no fix can address. Excluding
-    // them here, rather than filtering the OUTPUT, keeps the field itself
-    // honest: a language only ever appears when its absence is a real,
-    // actionable gap.
+    // come up empty. SQL, HCL and SystemVerilog have no model at all
+    // (declarative or unimplemented), so their entry-point count is ALWAYS
+    // zero and folding them in here would degrade `coverage_is_complete`
+    // permanently for any corpus containing even one such file, with no user
+    // action able to clear it. Excluding them here, rather than filtering the
+    // OUTPUT, keeps the field itself honest: a language only ever appears
+    // when its absence is a real, actionable gap.
+    //
+    // nw-441 REMOVED Vue, Svelte and Astro from that list -- this comment used
+    // to name them here, and the probe it cited (`["hcl", "sql",
+    // "systemverilog", "vue"]`) is no longer reproducible. They now have
+    // `detect_component_framework`, so zero entry points from one of them IS
+    // an actionable gap. That cuts both ways and is why `vue.rs` had to learn
+    // to mint a component for `<script setup>` in the same change: with Vue
+    // enrolled, a file the parser could not see a component in would have
+    // degraded a corpus that previously read clean.
     let mut entry_point_uids: Vec<String> = Vec::new();
     let mut lang_totals: HashMap<String, usize> = HashMap::new();
     let mut lang_entries: HashMap<String, usize> = HashMap::new();

@@ -217,8 +217,16 @@ verify_package_artifact() {
     return 1
   fi
 
-  mapfile -t package_files < <(
-    find "$package_dir" -maxdepth 1 -type f -name '*.tgz' -printf '%f\n' | sort
+  # nw-440: `-printf` is a GNU find extension and `mapfile` is a bash 4
+  # builtin. macOS ships BSD find and bash 3.2, so both made this script --
+  # the release gate's own self-test -- unrunnable on the platform this
+  # project is primarily developed on. `-exec basename` and a read loop are
+  # equivalent here and run everywhere.
+  package_files=()
+  while IFS= read -r package_file; do
+    package_files+=("$package_file")
+  done < <(
+    find "$package_dir" -maxdepth 1 -type f -name '*.tgz' -exec basename {} \; | sort
   )
   if [[ ${#package_files[@]} -ne 1 ]]; then
     echo "release package artifact must contain exactly one npm tarball" >&2
@@ -236,7 +244,7 @@ verify_package_artifact() {
   printf '%s\n' \
     "$package_filename" "$package_filename.sha256" release-package.json \
     | sort > "$expected_files"
-  find "$package_dir" -maxdepth 1 -type f -printf '%f\n' | sort > "$actual_files"
+  find "$package_dir" -maxdepth 1 -type f -exec basename {} \; | sort > "$actual_files"
   if ! diff -u "$expected_files" "$actual_files" >&2; then
     rm -f -- "$expected_files" "$actual_files"
     echo "release package artifact inventory is not exact" >&2

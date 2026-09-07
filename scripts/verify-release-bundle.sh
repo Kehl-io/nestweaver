@@ -37,7 +37,9 @@ verify_bundle() {
   done
   sort -o "$expected_file" "$expected_file"
 
-  find "$bundle_dir" -maxdepth 1 -type f -printf '%f\n' | sort > "$actual_file"
+  # nw-440: `-printf` is GNU-only; BSD find (macOS) rejects it outright, which
+  # made this self-test unrunnable on the maintainer's own platform.
+  find "$bundle_dir" -maxdepth 1 -type f -exec basename {} \; | sort > "$actual_file"
   if ! diff -u "$expected_file" "$actual_file"; then
     echo "release bundle must contain exactly four archives and four checksums" >&2
     rm -f "$expected_file" "$actual_file"

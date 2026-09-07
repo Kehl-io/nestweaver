@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6605
 expression: "parsed_symbols(\"simple.svelte\", &source)"
 ---
 - name: simple
@@ -9,8 +8,8 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   end_line: 31
   signature: "<svelte:component name=\"simple\">"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: EventListener
   visibility: Public
   type_info: ~
   parent_name: ~

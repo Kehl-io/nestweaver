@@ -2939,6 +2939,132 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
     }
 }
 
+/// Derive `blast-radius`'s process exit code from its response payload.
+///
+/// nw-442: this used to read `resolver_stale_repos` from the TOP level of
+/// whatever the RPC returned. A two-tier payload
+/// (`nestweaver_federation::two_tier::two_tier_query`) only ever sets `tier`,
+/// `local_impact` and `org_wide_impact` up there — it never hoists
+/// `resolver_stale_repos` out of either tier — so the top-level read resolved
+/// to `Value::Null` and the branch answered `EXIT_SUCCESS` **regardless of the
+/// staleness sitting inside a tier**. `EXIT_NEEDS_REINDEX` was therefore dead
+/// code on every federated call, and v9.0.0's deliberate "break CI on a stale
+/// graph" signal was silently discarded on exactly the deployments that span
+/// the most repos.
+///
+/// Both tiers are now inspected explicitly, mirroring how `affected_tests`
+/// handles the identical situation (`AffectedTestsRpcPayload::TwoTier`) rather
+/// than inventing a third spelling for it.
+fn blast_radius_exit_code(payload: &serde_json::Value) -> i32 {
+    if blast_radius_tier_is_stale(payload) {
+        EXIT_NEEDS_REINDEX
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+/// True when `payload` — an envelope or a single tier — reports any
+/// resolver-stale repo.
+///
+/// An unrecognised `tier` string is treated as single-tier rather than
+/// ignored: reading the top level of an unknown envelope may find nothing, but
+/// answering "not stale" without looking is what nw-442 was.
+fn blast_radius_tier_is_stale(payload: &serde_json::Value) -> bool {
+    if payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier") {
+        let local_stale = payload
+            .get("local_impact")
+            .is_some_and(blast_radius_tier_is_stale);
+        // An unavailable upstream carries `status`/`note` and no `results`, so
+        // the local tier decides alone. That is the correct reading: we cannot
+        // claim an absent tier is clean, but we also have no repos to name.
+        let org_stale = payload
+            .get("org_wide_impact")
+            .and_then(|org| org.get("results"))
+            .is_some_and(blast_radius_tier_is_stale);
+        return local_stale || org_stale;
+    }
+    payload["resolver_stale_repos"]
+        .as_array()
+        .is_some_and(|repos| !repos.is_empty())
+}
+
+#[cfg(test)]
+mod blast_radius_exit_code_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// nw-442: a two-tier payload sets only `tier`, `local_impact` and
+    /// `org_wide_impact` at the top level, so a top-level read of
+    /// `resolver_stale_repos` can never see a stale repo. These pin the
+    /// two-tier cases the top-level read silently answered `0` for.
+    fn stale_tier(repo: &str) -> serde_json::Value {
+        json!({
+            "affected_symbol_count": 1,
+            "risk": "high",
+            "resolver_stale_repos": [repo],
+        })
+    }
+
+    fn clean_tier() -> serde_json::Value {
+        json!({ "affected_symbol_count": 1, "risk": "low", "resolver_stale_repos": [] })
+    }
+
+    #[test]
+    fn single_tier_stale_needs_reindex() {
+        assert_eq!(
+            blast_radius_exit_code(&stale_tier("repo:local")),
+            EXIT_NEEDS_REINDEX
+        );
+    }
+
+    #[test]
+    fn single_tier_clean_succeeds() {
+        assert_eq!(blast_radius_exit_code(&clean_tier()), EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn two_tier_local_stale_needs_reindex() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": stale_tier("repo:local"),
+            "org_wide_impact": { "source_server": "org", "results": clean_tier() },
+        });
+        assert_eq!(blast_radius_exit_code(&payload), EXIT_NEEDS_REINDEX);
+    }
+
+    #[test]
+    fn two_tier_org_stale_needs_reindex() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": clean_tier(),
+            "org_wide_impact": { "source_server": "org", "results": stale_tier("repo:org") },
+        });
+        assert_eq!(blast_radius_exit_code(&payload), EXIT_NEEDS_REINDEX);
+    }
+
+    #[test]
+    fn two_tier_clean_succeeds() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": clean_tier(),
+            "org_wide_impact": { "source_server": "org", "results": clean_tier() },
+        });
+        assert_eq!(blast_radius_exit_code(&payload), EXIT_SUCCESS);
+    }
+
+    /// An unavailable upstream carries `status`/`note` and no `results`. The
+    /// local tier still decides the exit code.
+    #[test]
+    fn two_tier_org_unavailable_reads_local_tier() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": stale_tier("repo:local"),
+            "org_wide_impact": { "source_server": "org", "status": "unavailable" },
+        });
+        assert_eq!(blast_radius_exit_code(&payload), EXIT_NEEDS_REINDEX);
+    }
+}
+
 /// Render a `flow-trace` tree as text from its JSON payload.
 ///
 /// `edge_type` is printed on every child. CROSS_REPO_LINK is an INFERRED
@@ -16611,14 +16737,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 render_blast_radius_text(&payload);
             }
-            let exit = if payload["resolver_stale_repos"]
-                .as_array()
-                .is_some_and(|repos| !repos.is_empty())
-            {
-                EXIT_NEEDS_REINDEX
-            } else {
-                EXIT_SUCCESS
-            };
+            let exit = blast_radius_exit_code(&payload);
             Ok((exit, None))
         }
 
