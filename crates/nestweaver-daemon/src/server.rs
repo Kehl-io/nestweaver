@@ -3893,20 +3893,24 @@ fn finalize_node_graph_deletion(
     // Vault deletion cannot alter code manifests. Read their trusted binding
     // before advancing the graph, including a present but empty cache.
     let manifest_path = nestweaver_engine::manifest_cache_path(&state.db_path);
-    let carried_manifests = if manifest_path.exists() {
-        match nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path) {
-            Ok(manifests) => Some(manifests),
-            Err(error) => {
-                push_reconciliation_failure(
-                    &mut failures,
-                    nestweaver_engine::DeletionReconciliationStage::ManifestCache,
-                    format!("load manifest cache before vault deletion publication: {error:#}"),
-                );
-                None
+    let carried_manifests = match manifest_path.try_exists() {
+        Ok(false) => None,
+        presence => {
+            let loaded = presence.map_err(anyhow::Error::from).and_then(|_| {
+                nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
+            });
+            match loaded {
+                Ok(manifests) => Some(manifests),
+                Err(error) => {
+                    push_reconciliation_failure(
+                        &mut failures,
+                        nestweaver_engine::DeletionReconciliationStage::ManifestCache,
+                        format!("load manifest cache before vault deletion publication: {error:#}"),
+                    );
+                    None
+                }
             }
         }
-    } else {
-        None
     };
     match state.store.reconcile_embedding_index_stages() {
         Err(error) => push_reconciliation_failure(
