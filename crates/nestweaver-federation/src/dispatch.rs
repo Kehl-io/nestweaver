@@ -268,6 +268,10 @@ fn brain_context_request(params: &Value) -> nestweaver_proto::BrainContextReques
         })
         .unwrap_or_default();
     nestweaver_proto::BrainContextRequest {
+        limit: params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
         seeds,
         token_budget: params
             .get("token_budget")
@@ -569,6 +573,16 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brain_context_count_cap_survives_typed_transport_with_token_budget() {
+        let req = brain_context_request(
+            &serde_json::json!({"seeds":["fixture"],"limit":2,"token_budget":1000}),
+        );
+        assert_eq!(req.limit, Some(2));
+        assert_eq!(req.token_budget, 1000);
+        assert_eq!(brain_context_request(&serde_json::json!({})).limit, None);
+    }
 
     #[test]
     fn typed_brain_search_json_preserves_counts_and_old_response_defaults() {

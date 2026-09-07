@@ -510,6 +510,42 @@ impl TruncationCause {
     }
 }
 
+/// Compose independent row and token caps without discarding either constraint.
+/// `budget_cut` is the prefix length allowed by the caller's renderer.
+pub fn compose_result_caps(
+    total: usize,
+    count_limit: Option<usize>,
+    budget_cut: Option<usize>,
+) -> (usize, Option<TruncationCause>) {
+    let count_cut = count_limit.unwrap_or(total).min(total);
+    let token_cut = budget_cut.unwrap_or(total).min(total);
+    let cut = count_cut.min(token_cut);
+    let cause = TruncationCause::resolve(
+        token_cut < total && token_cut <= count_cut,
+        count_cut < total,
+    );
+    (cut, cause)
+}
+
+#[cfg(test)]
+mod composed_cap_tests {
+    use super::*;
+    #[test]
+    fn independent_caps_preserve_both_bounds_and_name_the_binding_one() {
+        for (count, tokens, cut, cause) in [
+            (None, None, 10, None),
+            (Some(2), None, 2, Some(TruncationCause::Limit)),
+            (None, Some(3), 3, Some(TruncationCause::TokenBudget)),
+            (Some(2), Some(8), 2, Some(TruncationCause::Limit)),
+            (Some(8), Some(2), 2, Some(TruncationCause::TokenBudget)),
+            (Some(2), Some(2), 2, Some(TruncationCause::TokenBudget)),
+            (Some(20), Some(20), 10, None),
+        ] {
+            assert_eq!(compose_result_caps(10, count, tokens), (cut, cause));
+        }
+    }
+}
+
 /// How many symbols ONE bare-name seed input may contribute to the PPR
 /// personalization vector.
 ///

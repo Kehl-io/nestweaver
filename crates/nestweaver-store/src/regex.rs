@@ -81,6 +81,12 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex, StoreError> {
         .map_err(|e| StoreError::Query(format!("invalid regex: {e}")))
 }
 
+/// Validate a caller's pattern before transport selection, using precisely
+/// the same input and compiled-program limits as graph queries.
+pub fn validate_pattern(pattern: &str) -> Result<(), StoreError> {
+    compile_pattern(pattern).map(|_| ())
+}
+
 /// File line of a frontmatter block's FIRST content line.
 ///
 /// Line 1 is the opening `---` fence, so the YAML itself starts at 2. The

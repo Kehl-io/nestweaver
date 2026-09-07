@@ -42,11 +42,14 @@ pub fn validate_request(value: Value) -> Result<Request, InvalidRequest> {
     // a legal correlation ID, while a boolean/array/object ID must answer null.
     let id = match object.remove("id") {
         None => None,
-        Some(value @ (Value::Null | Value::String(_) | Value::Number(_))) => Some(value),
+        Some(value @ (Value::Null | Value::String(_))) => Some(value),
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+            Some(Value::Number(number))
+        }
         Some(_) => {
             return Err(InvalidRequest {
                 response_id: Value::Null,
-                message: "JSON-RPC request id must be a string, number, or null".to_string(),
+                message: "JSON-RPC request id must be a string, null, or an integer in -9223372036854775808..=18446744073709551615; floating-point, exponent and out-of-range numeric IDs are not accepted".to_string(),
             });
         }
     };
@@ -92,12 +95,107 @@ pub fn validate_request(value: Value) -> Result<Request, InvalidRequest> {
             });
         }
     };
+    // A tools/call is a request, never a notification. Reject before any
+    // transport can dispatch it: response suppression is not write prevention.
+    if method == "tools/call" && id.is_none() {
+        return Err(InvalidRequest {
+            response_id: Value::Null,
+            message: "tools/call requires a correlated request id".to_string(),
+        });
+    }
     Ok(Request {
         jsonrpc,
         id,
         method,
         params,
     })
+}
+
+/// Validate MCP method parameters after envelope validation. All transports
+/// use this same contract and report failures as INVALID_PARAMS, not tool errors.
+/// `params: null` remains equivalent to omission for argument-less methods.
+pub fn validate_method_params(req: &Request) -> Result<(), String> {
+    let allowed: &[&str] = match req.method.as_str() {
+        "initialize" => &["protocolVersion", "capabilities", "clientInfo", "_meta"],
+        "ping" | "notifications/initialized" | "initialized" => &["_meta"],
+        "tools/list" => &["cursor", "_meta"],
+        "tools/call" => &["name", "arguments", "_meta"],
+        "notifications/cancelled" => &["requestId", "reason", "_meta"],
+        _ => return Ok(()),
+    };
+    let object = match req.params.as_ref() {
+        None => None,
+        Some(Value::Object(object)) => Some(object),
+        Some(_) => return Err(format!("{} params must be an object", req.method)),
+    };
+    if let Some(object) = object {
+        for key in object.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!("{}: unknown parameter '{key}'", req.method));
+            }
+        }
+        if object.get("_meta").is_some_and(|value| !value.is_object()) {
+            return Err(format!("{}: '_meta' must be an object", req.method));
+        }
+    }
+    let get = |key: &str| object.and_then(|object| object.get(key));
+    let nonempty_string = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match req.method.as_str() {
+        "initialize" => {
+            if !get("protocolVersion").is_some_and(Value::is_string) {
+                return Err("initialize: 'protocolVersion' must be a string".into());
+            }
+            if !get("capabilities").is_some_and(Value::is_object) {
+                return Err("initialize: 'capabilities' must be an object".into());
+            }
+            let info = get("clientInfo").and_then(Value::as_object);
+            if !info
+                .and_then(|info| info.get("name"))
+                .is_some_and(Value::is_string)
+                || !info
+                    .and_then(|info| info.get("version"))
+                    .is_some_and(Value::is_string)
+            {
+                return Err("initialize: 'clientInfo' requires string name and version".into());
+            }
+        }
+        "tools/list" if get("cursor").is_some_and(|value| !value.is_string()) => {
+            return Err("tools/list: 'cursor' must be a string".into());
+        }
+        "tools/call" => {
+            if !nonempty_string(get("name")) {
+                return Err("tools/call: 'name' must be a nonempty string".into());
+            }
+            if get("arguments").is_some_and(|value| !value.is_object()) {
+                return Err("tools/call: 'arguments' must be an object".into());
+            }
+        }
+        "notifications/cancelled" => {
+            if req.id.is_some() {
+                return Err("notifications/cancelled must not carry a request id".into());
+            }
+            let valid = match get("requestId") {
+                Some(Value::String(_)) => true,
+                Some(Value::Number(number)) => number.is_i64() || number.is_u64(),
+                _ => false,
+            };
+            if !valid {
+                return Err(
+                    "notifications/cancelled: 'requestId' must be a string or lossless integer"
+                        .into(),
+                );
+            }
+            if get("reason").is_some_and(|value| !value.is_string()) {
+                return Err("notifications/cancelled: 'reason' must be a string".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for InvalidRequest {
@@ -253,7 +351,8 @@ mod request_validation_tests {
             json!("request-1"),
             json!(0),
             json!(-1),
-            json!(1.5),
+            json!(i64::MIN),
+            json!(u64::MAX),
             Value::Null,
         ] {
             let request = parse(json!({"jsonrpc": "2.0", "id": id, "method": "ping"})).unwrap();
@@ -267,5 +366,69 @@ mod request_validation_tests {
         }))
         .unwrap();
         assert_eq!(explicit_null_params.params, None);
+    }
+    #[test]
+    fn numeric_id_bounds_are_checked_before_rounding_can_escape() {
+        for token in [
+            "1234567890123456789012345678901234567890",
+            "18446744073709551616",
+            "-9223372036854775809",
+            "1.5",
+            "1e2",
+            "1.0",
+        ] {
+            let raw = format!(r#"{{"jsonrpc":"2.0","id":{token},"method":"ping"}}"#);
+            let error = validate_request(serde_json::from_str(&raw).unwrap()).unwrap_err();
+            assert_eq!(error.response_id, Value::Null, "{token}");
+        }
+    }
+
+    #[test]
+    fn tool_calls_require_ids_but_null_remains_a_correlated_request() {
+        assert!(
+            validate_request(
+                json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"set_extension"}})
+            )
+            .is_err()
+        );
+        assert!(validate_request(json!({"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"brain_status"}})).is_ok());
+        assert!(
+            validate_request(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_ok()
+        );
+    }
+
+    #[test]
+    fn method_params_reject_wrong_shapes_and_keep_client_metadata() {
+        for (method, params) in [
+            ("initialize", json!([])),
+            ("initialize", json!({})),
+            ("ping", json!([])),
+            ("ping", json!({"unexpected":true})),
+            ("tools/list", json!({"cursor":7})),
+            ("tools/call", json!({"name":"brain_status","arguments":[]})),
+        ] {
+            let req =
+                validate_request(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                    .unwrap();
+            assert!(validate_method_params(&req).is_err(), "{method}");
+        }
+        for (method, params) in [
+            (
+                "initialize",
+                json!({"protocolVersion":"2024-11-05","capabilities":{"experimental":{}},"clientInfo":{"name":"client","version":"1","title":"Client"},"_meta":{}}),
+            ),
+            ("ping", Value::Null),
+            ("ping", json!({"_meta":{}})),
+            ("tools/list", json!({"cursor":"next","_meta":{}})),
+            (
+                "tools/call",
+                json!({"name":"brain_status","arguments":{},"_meta":{"progressToken":1}}),
+            ),
+        ] {
+            let req =
+                validate_request(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                    .unwrap();
+            validate_method_params(&req).unwrap();
+        }
     }
 }

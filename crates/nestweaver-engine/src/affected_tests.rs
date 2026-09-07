@@ -158,6 +158,26 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     affected_tests_within(store, &changed_files, None)
 }
 
+/// Canonical empty selection after a caller proved a VCS diff empty and
+/// checked the exact resolver compatibility of that diff's repository.
+/// This does not admit empty user/MCP input; those entry points still validate.
+pub fn empty_derived_selection() -> AffectedTestsResult {
+    AffectedTestsResult {
+        changed_files: Vec::new(),
+        changed_symbols: Vec::new(),
+        tier_1: Vec::new(),
+        tier_2: Vec::new(),
+        tier_3: Vec::new(),
+        summary: "0 tier-1, 0 tier-2, 0 tier-3 tests affected".to_string(),
+        disclaimer: DISCLAIMER.to_string(),
+        status: AnalysisStatus::Complete,
+        notifications: Vec::new(),
+        resolver_stale_repos: Vec::new(),
+        recommendation: "selection-usable".to_string(),
+        measured: None,
+    }
+}
+
 /// Compute affected tests for a file list derived from a trusted VCS diff.
 ///
 /// Unlike [`affected_tests`], this deliberately permits an empty list because

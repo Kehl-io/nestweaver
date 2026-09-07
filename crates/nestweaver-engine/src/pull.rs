@@ -93,6 +93,60 @@ pub fn pull_repo(
     indexed_sha: &str,
     options: &PullOptions,
 ) -> Result<PullResult, PullError> {
+    pull_repo_with_credentials(workspace_root, repo_url, indexed_sha, options, None)
+}
+
+/// Validate the selected instance's authentication strategy before filesystem
+/// or network work. Credentials are supplied to Git's protocol, never its URL.
+pub fn validate_credential_method(method: &str) -> Result<(), anyhow::Error> {
+    if matches!(method, "gh" | "ssh" | "credential-helper" | "env") {
+        Ok(())
+    } else {
+        anyhow::bail!("unsupported git credential_method '{method}'")
+    }
+}
+
+fn pull_git_command(credential_method: Option<&str>) -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    match credential_method {
+        Some("gh") => {
+            command.args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.helper=!gh auth git-credential",
+            ]);
+        }
+        Some("ssh") => {
+            command.args(["-c", "credential.helper="]);
+        }
+        Some("env") => {
+            // An explicitly supplied askpass program is Git's native env
+            // protocol. Otherwise expose GH_TOKEN only through helper stdin/
+            // stdout; the token never appears in argv or the remote URL.
+            command.args(["-c", "credential.helper="]);
+            if std::env::var_os("GIT_ASKPASS").is_none() {
+                command.args(["-c", r#"credential.helper=!f() { test "$1" = get && test -n "$GH_TOKEN" && printf '%s\n' 'username=x-access-token' "password=$GH_TOKEN"; }; f"#]);
+            }
+        }
+        _ => {}
+    }
+    command
+}
+
+/// Instance-aware variant; the old public entry point retains ambient Git
+/// authentication when no instance was selected.
+pub fn pull_repo_with_credentials(
+    workspace_root: &Path,
+    repo_url: &str,
+    indexed_sha: &str,
+    options: &PullOptions,
+    credential_method: Option<&str>,
+) -> Result<PullResult, PullError> {
+    if let Some(method) = credential_method {
+        validate_credential_method(method).map_err(PullError::Other)?;
+    }
     ensure_workspace_hygiene(workspace_root)?;
     let repo_name = clone_dir_name_from_url(repo_url);
     if repo_name.is_empty() || repo_name == "." || repo_name.contains("..") {
@@ -112,7 +166,7 @@ pub fn pull_repo(
 
     if dest.exists() && dest.join(".git").exists() {
         // Fetch
-        let output = Command::new("git")
+        let output = pull_git_command(credential_method)
             .args(["fetch", "origin"])
             .current_dir(&dest)
             .output()?;
@@ -131,7 +185,7 @@ pub fn pull_repo(
         args.push(repo_url.to_string());
         args.push(dest.display().to_string());
 
-        let output = Command::new("git").args(&args).output()?;
+        let output = pull_git_command(credential_method).args(&args).output()?;
         if !output.status.success() {
             // A failed pull must clean up the workspace dir it created —
             // validate_repo_dest pre-creates `dest`, and a partial clone must
@@ -274,6 +328,72 @@ pub fn cleanup_repo(workspace_root: &Path, repo_url: &str) -> Result<(), anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_credentials_are_command_local_and_never_embed_a_token() {
+        for method in ["gh", "ssh", "credential-helper", "env"] {
+            validate_credential_method(method).unwrap();
+            let command = pull_git_command(Some(method));
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect();
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.contains("https://") || arg.contains("Authorization:"))
+            );
+            if method == "gh" {
+                assert!(
+                    args.iter()
+                        .any(|arg| arg == "credential.helper=!gh auth git-credential")
+                );
+                assert!(args.iter().any(|arg| arg == "credential.helper="));
+            }
+        }
+        assert!(validate_credential_method("typo").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_gh_helper_answers_git_credential_protocol_without_persisting_it() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth git-credential get' ] || exit 1\nprintf '%s\\n' username=fixture password=synthetic-test-token\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let mut child = pull_git_command(Some("gh"))
+            .args(["credential", "fill"])
+            .current_dir(dir.path())
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=example.invalid\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("password=synthetic-test-token"));
+        assert!(!dir.path().join(".git/config").exists());
+    }
 
     #[test]
     fn repo_name_from_https_url() {
