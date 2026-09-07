@@ -934,6 +934,49 @@ pub const DAEMON_BOOT_TIMEOUT_ENV: &str = "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS";
 /// daemon is actually alive and working.
 const DEFAULT_DAEMON_BOOT_TIMEOUT_SECS: u64 = 30;
 
+/// Extra patience per GiB of graph on disk.
+///
+/// nw-460. The 30s default above is calibrated for a small graph, but the
+/// product is sold on large ones, and boot cost is dominated by opening the
+/// database and its sidecars. Measured on the 1.3 GiB `kory-brain` graph
+/// (687 MiB database + 579 MiB embeddings): a cold `brain status` needed ~44s
+/// and failed at 30s, reporting that the daemon "did not become healthy" when
+/// it was simply still loading. That is a DEFAULTS problem, not a fault, and
+/// it cost real diagnostic time during a WAL recovery by making a SUCCESSFUL
+/// fix look like a continued failure.
+const DAEMON_BOOT_TIMEOUT_SECS_PER_GIB: u64 = 30;
+
+/// Total on-disk footprint of `db_path` and the sidecars beside it.
+///
+/// Sidecars share the database's file name as a prefix (`<db>.embeddings.bin`,
+/// `<db>.clusters.json`, …), which is what the daemon opens on boot, so their
+/// size is the thing that predicts boot cost. Anything unreadable counts as
+/// zero: this only ever buys patience, so a bad estimate must not shorten the
+/// ceiling.
+fn graph_footprint_bytes(db_path: &Path) -> u64 {
+    let Some(dir) = db_path.parent() else {
+        return 0;
+    };
+    let Some(stem) = db_path.file_name().and_then(|n| n.to_str()) else {
+        return 0;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name == stem || name.starts_with(&format!("{stem}.")))
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// Resolve the boot ceiling, clamped to 1..=600s. An unparseable or
 /// out-of-range value falls back to the default rather than failing the
 /// command — this is a patience knob, not a correctness input.
@@ -948,13 +991,38 @@ pub fn daemon_boot_timeout() -> Duration {
         )
 }
 
+/// The boot ceiling for a SPECIFIC database, scaled by what the daemon has to
+/// open before it can bind.
+///
+/// nw-460. An explicit `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` still wins
+/// outright — a human who names a number means it. Otherwise the default grows
+/// with the graph, so a multi-hundred-MB corpus boots without the caller having
+/// to discover an environment variable. Still clamped to the same 600s ceiling,
+/// and `wait_for_socket_watching` continues to watch process liveness, so a
+/// genuinely dead daemon is still reported promptly rather than waited out.
+pub fn daemon_boot_timeout_for(db_path: &Path) -> Duration {
+    if let Some(explicit) = std::env::var(DAEMON_BOOT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| (1..=600).contains(secs))
+    {
+        return Duration::from_secs(explicit);
+    }
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let gibibytes = graph_footprint_bytes(db_path) / GIB;
+    let scaled = DEFAULT_DAEMON_BOOT_TIMEOUT_SECS
+        .saturating_add(gibibytes.saturating_mul(DAEMON_BOOT_TIMEOUT_SECS_PER_GIB))
+        .min(600);
+    Duration::from_secs(scaled)
+}
+
 fn wait_for_daemon_ready(
     db_path: &Path,
     ignore_pid: Option<i32>,
     expected_config: &crate::RestartConfig,
     launcher: Option<&mut SpawnedLauncher>,
 ) -> Result<()> {
-    let timeout = daemon_boot_timeout();
+    let timeout = daemon_boot_timeout_for(db_path);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1016,6 +1084,12 @@ fn wait_for_socket_watching(
     ignore_pid: Option<i32>,
 ) -> Result<()> {
     let start = Instant::now();
+    // nw-460 deliberately does NOT scale here: this helper has no database
+    // context, and it is the liveness-watching leg -- it bails as soon as the
+    // daemon is known to have exited, so its ceiling is a backstop rather than
+    // the thing a large graph exhausts. The ceiling that a big corpus actually
+    // hit is in `wait_for_daemon_ready`, which does know the database and does
+    // scale.
     let timeout = daemon_boot_timeout();
     let mut delay = Duration::from_millis(50);
     let max_delay = Duration::from_millis(500);
@@ -1693,6 +1767,58 @@ credential_method = "gh"
 
         unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
         assert_eq!(daemon_boot_timeout(), default);
+    }
+
+    /// nw-460: a small graph keeps the 30s default, a large one earns more.
+    #[test]
+    fn the_boot_ceiling_scales_with_the_graph_on_disk() {
+        // SAFETY: single-threaded test scope, restored below.
+        unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"small").unwrap();
+        assert_eq!(
+            daemon_boot_timeout_for(&db),
+            Duration::from_secs(30),
+            "a tiny graph must not pay for patience it does not need"
+        );
+
+        // A sidecar is what actually dominates boot: 2 GiB of embeddings.
+        let sidecar = dir.path().join("brain.lbug.embeddings.bin");
+        let two_gib = vec![0_u8; 1024 * 1024];
+        let mut file = std::fs::File::create(&sidecar).unwrap();
+        use std::io::Write;
+        for _ in 0..2048 {
+            file.write_all(&two_gib).unwrap();
+        }
+        drop(file);
+        assert_eq!(
+            daemon_boot_timeout_for(&db),
+            Duration::from_secs(30 + 2 * 30),
+            "the sidecars beside the database are what the daemon opens on boot"
+        );
+    }
+
+    /// COUNTERWEIGHT: an explicit env override still wins outright. A human who
+    /// names a number means it, and scaling past it would ignore them.
+    #[test]
+    fn an_explicit_boot_timeout_still_overrides_the_scaled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"x").unwrap();
+        // SAFETY: single-threaded test scope, removed below.
+        unsafe { std::env::set_var(DAEMON_BOOT_TIMEOUT_ENV, "45") };
+        assert_eq!(daemon_boot_timeout_for(&db), Duration::from_secs(45));
+        unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
+    }
+
+    /// COUNTERWEIGHT: a missing database must not panic or explode the ceiling.
+    #[test]
+    fn an_absent_database_falls_back_to_the_plain_default() {
+        // SAFETY: single-threaded test scope.
+        unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
+        let missing = Path::new("/nonexistent/definitely/not/here.lbug");
+        assert_eq!(daemon_boot_timeout_for(missing), Duration::from_secs(30));
     }
 
     #[test]
