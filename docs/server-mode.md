@@ -193,6 +193,38 @@ The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixe
 
 The MCP endpoint is **`POST /mcp`** on the HTTP port.
 
+### MCP request IDs and cancellation
+
+All MCP transports accept string IDs, explicit `null`, and integer numeric IDs
+in `-9223372036854775808..=18446744073709551615`. Floating-point and exponent
+notation, and integers outside that range, are rejected before dispatch with
+`-32600` and a null response ID. Use a string for larger identifiers. Accepted
+IDs are echoed without numeric conversion. `tools/call` requires an ID;
+omitting it never starts a tool or a mutation.
+
+Core method parameters are validated separately from tool arguments.
+`initialize` requires `protocolVersion`, an object `capabilities`, and
+`clientInfo` with string `name` and `version`. `ping` and `tools/list` accept
+omitted or null parameters; when present, parameters must be an object.
+`tools/list.cursor` must be a string. Client `_meta` objects are accepted.
+Malformed method parameters return `-32602`.
+
+Send `notifications/cancelled` with `params.requestId` to cancel an in-flight
+request. Stdio continues reading cancellation and ping frames while tool work
+runs. Cancelled queued tools never start; active reads stop cooperatively and
+their responses are suppressed. A dispatch that does not check cancellation
+may take longer to finish. An admitted mutation retains its worker and write
+ownership until completion: cancellation does **not** roll back a commit or
+abort a blocking worker. Check the resulting state before retrying a write.
+
+HTTP cancellation requires the established `mcp-session-id` returned by
+`initialize`, using the same authenticated role as the target request. Equal
+IDs in other sessions or roles are unaffected. Stateless cancellation is a
+no-op. Cancelled HTTP requests return an empty `202`; a mutation may finish
+before that response is returned. Cancellation notifications themselves never
+produce a JSON-RPC response. Stdio bounds pending tool dispatches to 128 while
+continuing to accept ping and cancellation controls.
+
 NestWeaver's registry holds **42** tools. The number is derivable, not typed:
 `all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs` is the
 registry, and `tools::tool_doc_tests::all_tools_have_doc_categories` asserts the

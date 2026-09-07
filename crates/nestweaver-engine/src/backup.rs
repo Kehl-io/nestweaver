@@ -163,6 +163,27 @@ pub fn seal_publication_slot(
     db_path: &Path,
     slot_root: &Path,
 ) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+    seal_publication_slot_inner(db_path, slot_root, false)
+}
+
+/// Seal a live staged slot while retaining its exact database writer authority.
+/// The operational lock stays in place; it is never an archived artifact.
+pub fn seal_publication_slot_with_authority(
+    db_path: &Path,
+    slot_root: &Path,
+    authority: &nestweaver_store::DbWriteLease,
+) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+    if !authority.authorizes(db_path) {
+        anyhow::bail!("publication seal requires authority for the exact staged database");
+    }
+    seal_publication_slot_inner(db_path, slot_root, true)
+}
+
+fn seal_publication_slot_inner(
+    db_path: &Path,
+    slot_root: &Path,
+    live_writer: bool,
+) -> anyhow::Result<crate::publication::PublicationBundleV3> {
     let db_parent = db_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -189,8 +210,19 @@ pub fn seal_publication_slot(
         instance_id: "publication".to_string(),
         workspace_path: None,
     };
-    let bundle =
-        build_backup_publication_bundle(&config, slot_root, &identity, source_graph_generation)?;
+    let bundle = build_backup_publication_bundle_inner(
+        &config,
+        slot_root,
+        &identity,
+        source_graph_generation,
+        live_writer,
+    )?;
+    crate::publication::validate_slot_contents(
+        slot_root,
+        &bundle,
+        crate::publication::ArtifactBytes::Verified,
+    )
+    .map_err(|error| anyhow::anyhow!("validate staged publication: {error}"))?;
     let bytes = serde_json::to_vec_pretty(&bundle)?;
     let manifest_path = slot_root.join(crate::publication::PUBLICATION_MANIFEST_FILE);
     nestweaver_store::durable_sidecar::atomic_replace_file(&manifest_path, |file| {
@@ -213,6 +245,25 @@ pub struct StagedBackup {
     write_pause: Duration,
     publication_identity: nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
+    logical_instance_id: String,
+}
+
+/// Resolve portable backup identity from graph ownership, never a runtime path hash.
+pub fn backup_logical_instance_id(store: &nestweaver_store::GraphStore) -> anyhow::Result<String> {
+    if let Some(identity) = store.data_instance_id()? {
+        if identity.trim().is_empty() {
+            anyhow::bail!("database-owned logical instance identity is empty");
+        }
+        return Ok(identity);
+    }
+    let observed = store.observed_instance_ids()?;
+    match observed.as_slice() {
+        [] => Ok("default".to_string()),
+        [identity] => Ok(identity.clone()),
+        _ => anyhow::bail!(
+            "cannot infer backup logical instance identity from multiple graph instances"
+        ),
+    }
 }
 
 /// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
@@ -299,6 +350,7 @@ pub fn stage_backup_from_store(
         .map_err(|error| anyhow::anyhow!("read backup publication identity: {error}"))?
         .ok_or_else(|| anyhow::anyhow!("backup graph has no publication identity"))?;
     let source_graph_generation = store.graph_generation();
+    let logical_instance_id = backup_logical_instance_id(store)?;
 
     let write_pause = pause_start.elapsed();
     publication
@@ -312,6 +364,7 @@ pub fn stage_backup_from_store(
         write_pause,
         publication_identity,
         source_graph_generation,
+        logical_instance_id,
     })
 }
 
@@ -341,6 +394,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         write_pause,
         publication_identity,
         source_graph_generation,
+        logical_instance_id,
     } = staged;
     let bundle = build_backup_publication_bundle(
         config,
@@ -364,6 +418,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         &bundle,
         publication_manifest_blake3,
     )?;
+    manifest.instance_id = logical_instance_id;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
@@ -1307,6 +1362,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             &temp_dir.path().join(&graph.path),
         )
         .map_err(|error| anyhow::anyhow!("open restored graph identity: {error}"))?;
+        validate_restored_logical_identity(&manifest, &graph_store)?;
         let graph_identity = graph_store
             .publication_identity()
             .map_err(|error| anyhow::anyhow!("read restored graph identity: {error}"))?
@@ -1322,6 +1378,26 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                 graph_identity.publication_uuid
             );
         }
+    }
+
+    if manifest.version < 2 {
+        // Legacy archives have no typed graph inventory. Accept only an
+        // unambiguous database payload and prove its logical ownership too.
+        let graphs: Vec<_> = manifest
+            .checksums
+            .keys()
+            .filter(|path| path.ends_with(".lbug") || path.ends_with(".kuzu"))
+            .collect();
+        let [graph] = graphs.as_slice() else {
+            anyhow::bail!(
+                "legacy backup has no unambiguous graph payload for logical identity validation"
+            );
+        };
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(
+            &temp_dir.path().join(graph),
+        )
+        .map_err(|error| anyhow::anyhow!("open legacy restored graph identity: {error}"))?;
+        validate_restored_logical_identity(&manifest, &store)?;
     }
 
     // The backup saves clones under `clones/` (historical name), but the
@@ -1551,6 +1627,16 @@ fn build_backup_publication_bundle(
     identity: &nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
 ) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+    build_backup_publication_bundle_inner(config, staging, identity, source_graph_generation, false)
+}
+
+fn build_backup_publication_bundle_inner(
+    config: &BackupConfig,
+    staging: &Path,
+    identity: &nestweaver_store::PublicationIdentity,
+    source_graph_generation: u64,
+    live_writer: bool,
+) -> anyhow::Result<crate::publication::PublicationBundleV3> {
     identity
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid backup publication identity: {error}"))?;
@@ -1592,6 +1678,11 @@ fn build_backup_publication_bundle(
     let mut fatal: Vec<String> = Vec::new();
     for entry in entries {
         let path = normalized_relative_path(staging, entry.path())?;
+        if live_writer && path == format!("{db_filename}.write.lock") {
+            // Only the live-slot caller with exact authority enables this.
+            // Archive staging still classifies this name as an error.
+            continue;
+        }
         if path == crate::publication::PUBLICATION_MANIFEST_FILE || path == "manifest.json" {
             continue;
         }
@@ -1941,6 +2032,21 @@ fn build_backup_manifest(
     })
 }
 
+fn validate_restored_logical_identity(
+    manifest: &BackupManifest,
+    store: &nestweaver_store::GraphStore,
+) -> anyhow::Result<()> {
+    let logical = backup_logical_instance_id(store)?;
+    if manifest.instance_id != logical {
+        anyhow::bail!(
+            "backup logical instance identity mismatch: manifest '{}', graph '{}'; restore refused before cutover",
+            manifest.instance_id,
+            logical
+        );
+    }
+    Ok(())
+}
+
 /// Package a staging directory as tar + zstd.
 fn package_tar_zstd(staging: &Path, output: &Path) -> anyhow::Result<()> {
     if let Some(parent) = output.parent() {
@@ -2265,11 +2371,11 @@ mod tests {
 
         let result = backup_save(&config).unwrap();
         assert!(output.exists());
-        assert_eq!(result.manifest.instance_id, "test");
+        assert_eq!(result.manifest.instance_id, "default");
         assert_eq!(result.manifest.tier, "standard");
 
         let manifest = backup_inspect(&output).unwrap();
-        assert_eq!(manifest.instance_id, "test");
+        assert_eq!(manifest.instance_id, "default");
         assert_eq!(manifest.version, MANIFEST_VERSION);
         assert!(uuid::Uuid::parse_str(&manifest.brain_uuid).is_ok());
         assert!(uuid::Uuid::parse_str(&manifest.publication_uuid).is_ok());
@@ -2307,7 +2413,7 @@ mod tests {
 
         backup_save(&config).unwrap();
         let manifest = backup_inspect(&output).unwrap();
-        assert_eq!(manifest.instance_id, "nested");
+        assert_eq!(manifest.instance_id, "default");
         assert!(
             manifest.checksums.contains_key(
                 "test.lbug.regex-v3/scopes/scope-a/generations/generation-a/meta.json"
@@ -2532,8 +2638,8 @@ mod tests {
         // Store is still open here — the daemon keeps serving.
         assert!(store.count_symbols().is_ok());
         assert!(output.exists());
-        assert_eq!(result.manifest.instance_id, "test");
-        assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
+        assert_eq!(result.manifest.instance_id, "default");
+        assert_eq!(backup_inspect(&output).unwrap().instance_id, "default");
     }
 
     #[test]
@@ -3379,7 +3485,7 @@ mod tests {
         };
 
         let result = backup_restore(&restore_config).unwrap();
-        assert_eq!(result.manifest.instance_id, "test");
+        assert_eq!(result.manifest.instance_id, "default");
 
         let restored_db = restore_dir.join("test.lbug");
         let store = nestweaver_store::GraphStore::open_read_only(&restored_db).unwrap();
@@ -3469,7 +3575,7 @@ mod tests {
 
         let result = backup_save(&config).unwrap();
         assert!(output.exists());
-        assert_eq!(result.manifest.instance_id, "bare-test");
+        assert_eq!(result.manifest.instance_id, "default");
     }
 
     #[test]
@@ -3503,6 +3609,191 @@ mod tests {
         )
         .unwrap();
         assert_eq!(persisted, bundle);
+    }
+
+    #[test]
+    fn live_slot_lock_requires_exact_authority_and_is_never_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let db = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+        drop(nestweaver_store::GraphStore::create(&db).unwrap());
+        let authority = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+        let lock = nestweaver_store::write_lease_path(&db);
+        assert!(lock.exists());
+        assert!(
+            seal_publication_slot(&db, &slot)
+                .unwrap_err()
+                .to_string()
+                .contains("write.lock")
+        );
+        let bundle = seal_publication_slot_with_authority(&db, &slot, &authority).unwrap();
+        assert!(lock.exists(), "sealing must retain the writer anchor");
+        assert!(
+            !bundle
+                .artifacts
+                .iter()
+                .any(|a| a.path.ends_with("write.lock"))
+        );
+        crate::publication::validate_slot_contents(
+            &slot,
+            &bundle,
+            crate::publication::ArtifactBytes::Verified,
+        )
+        .unwrap();
+        std::fs::write(slot.join("foreign.write.lock"), "foreign").unwrap();
+        assert!(
+            crate::publication::validate_slot_contents(
+                &slot,
+                &bundle,
+                crate::publication::ArtifactBytes::Verified
+            )
+            .is_err()
+        );
+        std::fs::remove_file(slot.join("foreign.write.lock")).unwrap();
+        let other = dir.path().join("other.lbug");
+        drop(nestweaver_store::GraphStore::create(&other).unwrap());
+        let wrong = nestweaver_store::acquire_db_write_lease(&other).unwrap();
+        assert!(seal_publication_slot_with_authority(&db, &slot, &wrong).is_err());
+        drop(authority);
+        crate::publication::validate_slot_contents(
+            &slot,
+            &bundle,
+            crate::publication::ArtifactBytes::Live,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_slot_refuses_symlinked_writer_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let db = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+        drop(nestweaver_store::GraphStore::create(&db).unwrap());
+        let authority = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+        let bundle = seal_publication_slot_with_authority(&db, &slot, &authority).unwrap();
+        let lock = nestweaver_store::write_lease_path(&db);
+        // This scratch-only replacement simulates tampering after admission.
+        std::fs::remove_file(&lock).unwrap();
+        let outside = dir.path().join("outside.lock");
+        std::fs::write(&outside, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, &lock).unwrap();
+        assert!(seal_publication_slot_with_authority(&db, &slot, &authority).is_err());
+        assert!(
+            crate::publication::validate_slot_contents(
+                &slot,
+                &bundle,
+                crate::publication::ArtifactBytes::Verified
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_backup_identity_requires_unique_graph_ownership() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        assert_eq!(backup_logical_instance_id(&store).unwrap(), "default");
+        let vault = |instance: &str| nestweaver_schema::Vault {
+            uid: format!("vault:{instance}:v"),
+            name: "v".into(),
+            root_path: "/fixture".into(),
+            instance_id: instance.into(),
+        };
+        store.upsert_vault(&vault("legacy")).unwrap();
+        assert_eq!(backup_logical_instance_id(&store).unwrap(), "legacy");
+        assert_eq!(store.data_instance_id().unwrap(), None);
+        store.upsert_vault(&vault("foreign")).unwrap();
+        assert!(
+            backup_logical_instance_id(&store)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple")
+        );
+    }
+
+    #[test]
+    fn backup_instance_is_graph_owned_even_when_path_and_config_disagree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("arbitrary-name.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        store.ensure_data_instance_id("logical-owner").unwrap();
+        drop(store);
+        let config = BackupConfig {
+            db_path: db,
+            output_path: dir.path().join("snapshot.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "physical-path-hash".into(),
+            workspace_path: None,
+        };
+        let result = backup_save(&config).unwrap();
+        assert_eq!(result.manifest.instance_id, "logical-owner");
+        assert_eq!(
+            backup_inspect(&config.output_path).unwrap().instance_id,
+            "logical-owner"
+        );
+        let restored = dir.path().join("moved");
+        backup_restore(&RestoreConfig {
+            snapshot_path: config.output_path,
+            data_dir: restored.clone(),
+        })
+        .unwrap();
+        let reopened =
+            nestweaver_store::GraphStore::open_read_only(&restored.join("arbitrary-name.lbug"))
+                .unwrap();
+        assert_eq!(
+            backup_logical_instance_id(&reopened).unwrap(),
+            "logical-owner"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_forged_logical_identity_before_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("owned.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        store.ensure_data_instance_id("owned").unwrap();
+        drop(store);
+        let original = dir.path().join("original.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: db,
+            output_path: original.clone(),
+            include_clones: false,
+            instance_id: "wrong-config".into(),
+            workspace_path: None,
+        })
+        .unwrap();
+        let extracted = dir.path().join("extracted");
+        let decoder =
+            nestweaver_store::zstd::Decoder::new(std::fs::File::open(original).unwrap()).unwrap();
+        tar::Archive::new(decoder).unpack(&extracted).unwrap();
+        let path = extracted.join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest.instance_id = "forged".into();
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let forged = dir.path().join("forged.nwsnap.zst");
+        package_tar_zstd(&extracted, &forged).unwrap();
+        let target = dir.path().join("existing");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), "keep existing data").unwrap();
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: forged,
+            data_dir: target.clone(),
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("logical instance identity mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("sentinel")).unwrap(),
+            "keep existing data"
+        );
+        assert!(!target.join("owned.lbug").exists());
     }
 
     #[test]

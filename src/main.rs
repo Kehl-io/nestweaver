@@ -7452,11 +7452,11 @@ enum BrainCommands {
             help = "Approximate token budget for the connected list (1-16000; matches the MCP brain_context schema)"
         )]
         token_budget: Option<usize>,
-        /// Hard cap on connected results. Used when --token-budget is not
-        /// set; ignored when it is.
+        /// Hard cap on connected results, enforced together with --token-budget.
         #[arg(
             long,
-            help = "Maximum connected results (default: 30, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum connected results (1-1000; default: 30, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -14238,13 +14238,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = repo {
                     args["repo"] = serde_json::json!(r);
                 }
-                match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args)? {
+                match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args) {
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<tonic::Status>()
+                                .is_some_and(|status| status.code() == tonic::Code::NotFound)
+                        }) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
                     // A not-found/error response does not deserialize into a
                     // summary with a non-empty uid, so it falls through to the
                     // NOT_FOUND arm below rather than fabricating an empty
                     // service and printing a header for it.
-                    Some(value) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
-                    None => {
+                    Ok(Some(value)) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
+                    Ok(None) => {
                         let store = open_store(db.as_deref())?;
                         nestweaver_engine::query::service_summary(
                             &store,
@@ -14674,11 +14684,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             full,
             pinned,
             ephemeral,
-            instance: _,
+            instance,
             db,
         } => {
-            let db_default = default_db_path();
-            let db_path = db.as_deref().unwrap_or(&db_default);
+            // Validate selected intent before connecting or creating any checkout.
+            let selected_config = instance
+                .as_deref()
+                .map(|id| -> anyhow::Result<_> {
+                    let registry = nestweaver_engine::registry::Registry::load_or_create(
+                        &default_registry_path(),
+                    )?;
+                    let entry = registry
+                        .get(id)
+                        .ok_or_else(|| anyhow::anyhow!("instance '{id}' not found in registry"))?;
+                    let path = PathBuf::from(&entry.config_path);
+                    let config = nestweaver_engine::InstanceConfig::from_file(&path)?;
+                    if config.workspace.backend != "local" {
+                        anyhow::bail!(
+                            "pull requires a local workspace backend for instance '{id}'"
+                        );
+                    }
+                    nestweaver_engine::pull::validate_credential_method(
+                        &config.git.credential_method,
+                    )?;
+                    Ok((path, config))
+                })
+                .transpose()?;
+            let db_path = resolve_db_with_config(
+                db,
+                selected_config.as_ref().map(|(path, _)| path.as_path()),
+            )?;
 
             // An ephemeral pull must never reuse — and especially never
             // DELETE — a pre-existing persistent checkout. Give it a unique
@@ -14691,6 +14726,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .unwrap_or(0);
                 std::env::temp_dir()
                     .join(format!("nestweaver-pull-{}-{unique}", std::process::id()))
+            } else if let Some((path, config)) = &selected_config {
+                let workspace = PathBuf::from(&config.workspace.path);
+                if workspace.is_absolute() {
+                    workspace
+                } else {
+                    path.parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(workspace)
+                }
             } else {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -14709,7 +14753,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let rt = tokio::runtime::Runtime::new()?;
             let repos: Vec<nestweaver_schema::Repo> = {
                 let mut client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(db_path, None))
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
                     .context("failed to connect to daemon")?;
                 let req = tonic::Request::new(nestweaver_proto::JsonRequest {
                     args_json: serde_json::json!({}).to_string(),
@@ -14747,7 +14791,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .map(|r| r.indexed_sha.clone())
                 .unwrap_or_default();
 
-            match nestweaver_engine::pull_repo(
+            match nestweaver_engine::pull::pull_repo_with_credentials(
                 &workspace_root,
                 &repo,
                 &indexed_sha,
@@ -14756,6 +14800,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     sha_policy,
                     ephemeral,
                 },
+                selected_config
+                    .as_ref()
+                    .map(|(_, config)| config.git.credential_method.as_str()),
             ) {
                 Ok(result) => {
                     println!("Pulled to {}", result.path.display());
@@ -17524,20 +17571,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             if changed_files.is_empty() {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "changed_files": [],
-                            "changed_symbols": [],
-                            "tier_1": [],
-                            "tier_2": [],
-                            "tier_3": [],
-                            "summary": "0 tier-1, 0 tier-2, 0 tier-3 tests affected",
-                        }))?
-                    );
+                // Only a successfully derived VCS diff reaches this branch.
+                // Resolve its actual repository, not every unrelated repo in
+                // a multi-repo graph, before rendering the canonical empty set.
+                require_existing_db(&db_path)?;
+                let repos: Vec<nestweaver_schema::Repo> = if use_daemon {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let mut client =
+                        rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                    let response = rt.block_on(client.inner_mut().list_repos_json(
+                        tonic::Request::new(nestweaver_proto::JsonRequest {
+                            args_json: "{}".to_string(),
+                        }),
+                    ))?;
+                    serde_json::from_str(&response.into_inner().result_json)?
                 } else {
-                    println!("No changed files detected.");
+                    open_store(Some(&db_path))?.list_repos(None)?
+                };
+                let root = detect_repo_root()
+                    .canonicalize()
+                    .context("resolve git diff repository")?;
+                let target_repos: Vec<_> = repos
+                    .into_iter()
+                    .filter(|repo| {
+                        repo.local_root()
+                            .and_then(|path| Path::new(path).canonicalize().ok())
+                            .is_some_and(|path| path == root)
+                    })
+                    .collect();
+                if target_repos.is_empty() {
+                    let note = format!(
+                        "git diff repository {} is not indexed; run the full suite and index this repository",
+                        root.display()
+                    );
+                    if json {
+                        print_json_payload(&serde_json::json!({
+                            "refused": true, "needs_reindex": true, "reason": "repo_not_indexed",
+                            "recommendation": "run-full-suite", "note": note,
+                        }))?;
+                    }
+                    eprintln!("Error: {note}");
+                    return Ok((EXIT_NEEDS_REINDEX, None));
+                }
+                if let Some(refusal) =
+                    nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
+                        &db_path,
+                        &target_repos,
+                    )
+                {
+                    let payload = affected_tests_refusal_payload(&refusal);
+                    if json {
+                        print_json_payload(&payload)?;
+                    }
+                    eprintln!("Error: {}", affected_tests_refusal_note(&payload));
+                    return Ok((EXIT_NEEDS_REINDEX, None));
+                }
+                let result = nestweaver_engine::affected_tests::empty_derived_selection();
+                if json {
+                    print_json_payload(&serde_json::to_value(&result)?)?;
+                } else {
+                    render_affected_tests_result(&result, None);
                 }
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -18400,6 +18493,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            if let Err(error) = nestweaver_store::regex::validate_pattern(&pattern) {
+                let message = error.to_string();
+                if json {
+                    print_json_argument_error("pattern", &pattern, &message);
+                }
+                eprintln!("Error: invalid regex pattern '{pattern}': {message}");
+                return Ok((EXIT_USAGE, None));
+            }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -18572,6 +18673,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            for candidate in &patterns {
+                if let Err(error) = nestweaver_store::regex::validate_pattern(candidate) {
+                    let message = error.to_string();
+                    if json {
+                        print_json_argument_error("patterns", &patterns.join(", "), &message);
+                    }
+                    eprintln!("Error: invalid regex pattern '{candidate}': {message}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -19292,7 +19403,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // A missing input file must fail as a clean not-found (exit 2),
             // not a generic IO error.
-            if !input.exists() {
+            if input.as_os_str() != "-" && !input.exists() {
                 eprintln!("Error: impact report not found: {}", input.display());
                 return Ok((EXIT_NOT_FOUND, None));
             }
@@ -21133,16 +21244,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if matches!(action, DaemonAction::Gc) {
                 return run_daemon_gc();
             }
-            let db_path = db
-                .or_else(|| {
-                    std::env::var("NESTWEAVER_DB")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .map(PathBuf::from)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
-                })?;
+            let lifecycle_config = match &action {
+                DaemonAction::Start { config, .. }
+                | DaemonAction::Restart { config, .. }
+                | DaemonAction::Run { config, .. } => config.as_deref(),
+                _ => None,
+            };
+            // Keep lifecycle identity bound to the stable anchor. Following
+            // publication CURRENT here would select a different runtime ID.
+            let (db_path, _, source) = resolve_base_db_with_config_source(db, lifecycle_config)?;
+            if matches!(source, DbSource::CwdLocal | DbSource::RepoLocal)
+                || db_path.as_os_str().is_empty()
+            {
+                anyhow::bail!(
+                    "No database path provided. Use --db, --config with db, or set NESTWEAVER_DB."
+                );
+            }
             let selected_slot_legacy_id =
                 nestweaver_daemon::lifecycle::selected_slot_identity_instance_id(&db_path);
             if matches!(
@@ -22913,10 +23030,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // Parity contract: if --json reports a caveat, the human output
                 // must say so too.
                 let crash = &capabilities["crash_recurrence"];
-                println!("  Crash recurrence (nw-073):");
+                println!(
+                    "  Crash recurrence ({}):",
+                    crash["backlog_id"].as_str().unwrap_or("unavailable")
+                );
                 println!(
                     "    Signature: {}",
-                    crash["signature"].as_str().unwrap_or("unknown")
+                    crash["signature"]
+                        .as_array()
+                        .map(|parts| parts
+                            .iter()
+                            .filter_map(|part| part.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "))
+                        .or_else(|| crash["signature"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unavailable".to_string())
                 );
                 println!(
                     "    Status:    {}",
@@ -24190,7 +24318,7 @@ fn try_hybrid_json_rpc_checked(
                 // nothing to fall back FROM, so surface it as-is instead of
                 // recommending a daemon reset.
                 if let Some(message) = daemon_application_error(&e) {
-                    return Err(anyhow::anyhow!("{message}"));
+                    return Err(e.context(message));
                 }
                 ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
                     format!("hybrid query {rpc_name} failed ({e:#}); refusing direct fallback")
@@ -26220,8 +26348,9 @@ fn run_brain(
             // here is what made this command ignore a config its siblings honour.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let instance_specified = instance.is_some() || config.is_some();
-            let instance_id_owned =
-                resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
+            // An unscoped removal intentionally cleans all discovered rows at
+            // this path. It need not choose an identity for a new mutation.
+            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
             let instance_id = instance_id_owned.as_str();
 
             let canonical = abs_for_daemon(&path);
@@ -26237,7 +26366,7 @@ fn run_brain(
                     if let Some(inst) = inst_filter {
                         args["instance"] = serde_json::json!(inst);
                     }
-                    if let Some(value) = try_hybrid_json_rpc(
+                    if let Some(value) = try_hybrid_json_rpc_checked(
                         use_daemon,
                         &db_path,
                         config.as_deref(),
@@ -26333,13 +26462,17 @@ fn run_brain(
                     return Ok((EXIT_NOT_FOUND, None));
                 }
             } else {
-                uids_to_remove.push(v_uid_canon);
                 let all_vaults = fetch_vaults(None)?;
                 for v in &all_vaults {
                     if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
                         uids_to_remove.push(v.uid.clone());
                     }
                 }
+            }
+
+            if uids_to_remove.is_empty() {
+                println!("No vault found at {canon_str}; 0 row(s) cleaned.");
+                return Ok((EXIT_NOT_FOUND, None));
             }
 
             let mut vault_name = path
@@ -26366,8 +26499,10 @@ fn run_brain(
             for uid in &uids_to_remove {
                 match rt.block_on(client.remove_vault(uid)) {
                     Ok(resp) => {
-                        total_dropped += resp.notes_deleted as usize;
-                        rows_cleaned += 1;
+                        if resp.committed {
+                            total_dropped += resp.notes_deleted as usize;
+                            rows_cleaned += 1;
+                        }
                         // The daemon already rebuilt the search index as part
                         // of the removal, and already reports whether that
                         // succeeded. Its answer is the one to relay.
@@ -26750,6 +26885,7 @@ fn run_brain(
                 let context_params = serde_json::json!({
                         "seeds": seeds,
                         "token_budget": token_budget.unwrap_or(0),
+                        "limit": limit,
                         "repos": repos,
                         "vaults": vaults,
                         "kinds": kinds,
@@ -26779,13 +26915,34 @@ fn run_brain(
                     context_params["since"] = serde_json::json!(since);
                 }
 
-                if let Some(result_json) = try_hybrid_json_rpc_checked(
+                let context_response = match try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_path.as_deref(),
                     "brain_context",
                     context_params,
-                )? {
+                ) {
+                    Err(error)
+                        if error
+                            .chain()
+                            .any(|cause| cause.to_string().contains("No seeds resolved")) =>
+                    {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "error": "not found", "seeds_expanded": 0,
+                                    "connected": [], "unresolved_seeds": seeds,
+                                }))?
+                            );
+                        } else {
+                            eprintln!("{error}");
+                        }
+                        return Ok((EXIT_NOT_FOUND, None));
+                    }
+                    other => other?,
+                };
+                if let Some(result_json) = context_response {
                     let source = hybrid_source_label(&result_json);
                     // Read the daemon's disclosure BEFORE `from_value` narrows
                     // the payload to the fields `BrainContextResult` declares —
@@ -26800,7 +26957,9 @@ fn run_brain(
                         // renderer emits full nodes, so the detailed rate is the
                         // correct one here — unlike `project-context`, which
                         // renders concise and was charging this rate anyway.
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
+                        Some(budget) => {
+                            limit.min(token_budgeted_truncate(&result.connected, budget, false))
+                        }
                         None => limit.min(result.connected.len()),
                     };
                     if json {
@@ -27115,13 +27274,15 @@ fn run_brain(
                         );
                     }
 
-                    // token_budget takes precedence over the count-based limit.
+                    // Apply both the count and token caps; neither discards the other.
                     let cut = match token_budget {
                         // nw-316: `false` preserves TODAY's cost for this route. Its
                         // renderer emits full nodes, so the detailed rate is the
                         // correct one here — unlike `project-context`, which
                         // renders concise and was charging this rate anyway.
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
+                        Some(budget) => {
+                            limit.min(token_budgeted_truncate(&result.connected, budget, false))
+                        }
                         None => limit.min(result.connected.len()),
                     };
                     let node_count = result.seeds.len() + cut;
@@ -27144,6 +27305,7 @@ fn run_brain(
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
+                                    "error": "not found",
                                     "seeds_expanded": 0,
                                     "connected": [],
                                     "unresolved_seeds": seeds,
@@ -31246,6 +31408,7 @@ fn render_project_context_daemon_response(
 /// still read its own pre-cut total off `result.connected`.
 #[derive(Default)]
 struct UpstreamContextDisclosure {
+    truncated_by: Option<String>,
     /// Rows that matched upstream, BEFORE the cut it already applied.
     total: Option<usize>,
     /// Federation provenance (`_meta`) the hybrid layer attached: which
@@ -31259,6 +31422,10 @@ impl UpstreamContextDisclosure {
     /// into `BrainContextResult`.
     fn from_wire(value: &serde_json::Value) -> Self {
         Self {
+            truncated_by: value
+                .get("truncated_by")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             total: value
                 .get("total")
                 .and_then(serde_json::Value::as_u64)
@@ -31310,15 +31477,10 @@ fn brain_context_json_value(
     // and the honest total came over the wire.
     let total = upstream.total(result.connected.len(), returned);
     let truncated = returned < total;
-    // The two CLI caps are mutually exclusive at every call site: the `cut`
-    // above is `token_budgeted_truncate(..)` when `--token-budget` is set and
-    // `limit.min(len)` otherwise — "token_budget takes precedence over the
-    // count-based limit". `resolve` still decides which to blame so the CLI
-    // and `tool_brain_context` cannot drift on the precedence rule.
-    let truncated_by = nestweaver_engine::TruncationCause::resolve(
-        truncated && token_budget.is_some(),
-        truncated && token_budget.is_none(),
-    );
+    let budget_cut =
+        token_budget.map(|budget| token_budgeted_truncate(&result.connected, budget, false));
+    let (_, truncated_by) =
+        nestweaver_engine::compose_result_caps(result.connected.len(), Some(limit), budget_cut);
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
         "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
@@ -31327,7 +31489,7 @@ fn brain_context_json_value(
         "truncated": truncated,
         // Emitted even when null, matching the MCP twin: one shape parses
         // both routes.
-        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str).or(upstream.truncated_by.as_deref()),
         "semantic_applied": result.semantic_applied,
         "degraded_components": result.degraded_components,
     });
@@ -31404,6 +31566,47 @@ mod context_json_renderer_tests {
             seed_resolution_limit: None,
             admitted_before_cap: None,
         }
+    }
+
+    #[test]
+    fn context_disclosure_names_the_binding_cap_and_keeps_upstream_cause() {
+        let mut result = degraded_context();
+        result.connected = (0..10)
+            .map(|i| nestweaver_engine::BrainNode {
+                uid: format!("note:{i}"),
+                kind: "Note".into(),
+                title: "Fixture".into(),
+                location: "fixture.md".into(),
+                relevance: 1.0,
+                inline_body: None,
+                body_complete: true,
+            })
+            .collect();
+        let value = brain_context_json_value(
+            &result,
+            2,
+            Some(10_000),
+            &UpstreamContextDisclosure::default(),
+        );
+        assert_eq!(value["returned"], 2);
+        assert_eq!(value["total"], 10);
+        assert_eq!(value["truncated_by"], "limit");
+        let budget = render_cost_tokens(&result.connected[0], false);
+        let cut = token_budgeted_truncate(&result.connected, budget, false);
+        let value = brain_context_json_value(
+            &result,
+            cut,
+            Some(budget),
+            &UpstreamContextDisclosure::default(),
+        );
+        assert_eq!(value["truncated_by"], "token_budget");
+        result.connected.truncate(2);
+        let upstream = UpstreamContextDisclosure::from_wire(
+            &serde_json::json!({"total":10,"truncated_by":"limit"}),
+        );
+        let value = brain_context_json_value(&result, 2, Some(10_000), &upstream);
+        assert_eq!(value["total"], 10);
+        assert_eq!(value["truncated_by"], "limit");
     }
 
     #[test]
@@ -32592,7 +32795,7 @@ fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> 
                         "path": path.display().to_string(),
                         "error": message,
                     });
-                    eprintln!("{}", serde_json::to_string(&result)?);
+                    println!("{}", serde_json::to_string(&result)?);
                     Ok((EXIT_ERROR, None))
                 }
                 Err(error) => Err(error)
@@ -32768,13 +32971,15 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(config_path);
             let registry_path = default_registry_path();
-            let mut registry = nestweaver_engine::Registry::load_or_create(&registry_path)?;
+            let mut registry =
+                nestweaver_engine::registry::Registry::load_or_create(&registry_path)?;
             registry.register(&config.instance_id, &canonical)?;
             println!("Registered instance '{}'", config.instance_id);
             Ok(EXIT_SUCCESS)
         }
         InstanceCommands::List => {
-            let registry = nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+            let registry =
+                nestweaver_engine::registry::Registry::load_or_create(&default_registry_path())?;
             if registry.list().is_empty() {
                 println!("No instances registered.");
             } else {
@@ -32799,7 +33004,7 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
                 None
             };
             let mut registry =
-                nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+                nestweaver_engine::registry::Registry::load_or_create(&default_registry_path())?;
             let registry_removed = match registry.remove(&id) {
                 Ok(()) => true,
                 Err(e) => {
@@ -32853,7 +33058,8 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
             Ok(EXIT_SUCCESS)
         }
         InstanceCommands::Pull { id } => {
-            let registry = nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+            let registry =
+                nestweaver_engine::registry::Registry::load_or_create(&default_registry_path())?;
             let entry = registry
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("instance '{}' not registered", id))?;
@@ -33767,6 +33973,7 @@ fn dispatch_hybrid_mcp_request(
     lite: bool,
     write_tools: &std::collections::HashSet<&str>,
     request: &nestweaver_mcp::protocol::Request,
+    cancel: &nestweaver_mcp::session::CancelFlag,
 ) -> serde_json::Value {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
     match request.method.as_str() {
@@ -33826,7 +34033,10 @@ fn dispatch_hybrid_mcp_request(
                             arguments.clone(),
                         )
                     } else {
-                        rt.block_on(hybrid.query(name, &arguments))
+                        rt.block_on(nestweaver_mcp::session::await_cancellable(
+                            Some(cancel),
+                            hybrid.query(name, &arguments),
+                        ))
                     }
                 }));
                 match dispatched {
@@ -33855,10 +34065,19 @@ fn dispatch_hybrid_mcp_request(
     }
 }
 
+#[cfg(test)]
 fn process_hybrid_mcp_envelope(
     parsed: serde_json::Value,
     mut dispatch: impl FnMut(&nestweaver_mcp::protocol::Request) -> serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let mut dispatch = |request: &nestweaver_mcp::protocol::Request| {
+        match nestweaver_mcp::protocol::validate_method_params(request) {
+            Ok(()) => dispatch(request),
+            Err(message) => {
+                serde_json::json!({"jsonrpc":"2.0", "id":request.id, "error":{"code":-32602,"message":message}})
+            }
+        }
+    };
     let invalid = |error: nestweaver_mcp::protocol::InvalidRequest| {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -33939,8 +34158,6 @@ fn run_mcp_hybrid(
     track_interactions: bool,
     _db_path: &Path,
 ) -> anyhow::Result<()> {
-    use std::io::{BufRead, Write};
-
     nestweaver_mcp::tools::set_lite_mode(lite);
 
     // Start the background maintenance task (active upstream health recovery +
@@ -33959,11 +34176,6 @@ fn run_mcp_hybrid(
     let _ = track_interactions;
 
     tracing::info!("brain MCP server ready on stdio (hybrid routing mode)");
-
-    let stdin = std::io::stdin();
-    let mut stdout = TypedStdout;
-    let mut line = String::new();
-    let mut reader = stdin.lock();
 
     // Write tools that must bypass hybrid routing.
     //
@@ -33986,43 +34198,9 @@ fn run_mcp_hybrid(
         .copied()
         .collect();
 
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            tracing::info!("client closed stdin; shutting down (hybrid)");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": { "code": -32700, "message": format!("invalid JSON: {e}") }
-                });
-                serde_json::to_writer(&mut stdout, &resp)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-                continue;
-            }
-        };
-
-        let response = process_hybrid_mcp_envelope(parsed, |request| {
-            dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request)
-        });
-
-        if let Some(response) = response {
-            serde_json::to_writer(&mut stdout, &response)?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
-    }
+    nestweaver_mcp::session::run_stdio(|request, cancel| {
+        dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request, cancel)
+    })
 }
 
 /// Format a byte count as a human-readable string.
@@ -34831,7 +35009,7 @@ fn run_publication_rebuild(
                         &target_db,
                         "seal the staged publication",
                     )?;
-                    nestweaver_engine::backup::seal_publication_slot(&target_db, &slot)?;
+                    nestweaver_engine::backup::seal_publication_slot_with_authority(&target_db, &slot, &_authority)?;
                     state = nestweaver_engine::publication_operation::mark_ready(
                         &publication_root,
                         &operation_uuid,
@@ -35319,8 +35497,9 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
             // Resolve snapshot directory and backend from args/config/instance registry.
             let (snap_dir, backend_name, b_path) = if let Some(inst_id) = instance {
                 // Load from registry → instance config
-                let registry =
-                    nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+                let registry = nestweaver_engine::registry::Registry::load_or_create(
+                    &default_registry_path(),
+                )?;
                 let entry = registry
                     .get(&inst_id)
                     .ok_or_else(|| anyhow::anyhow!("instance '{}' not registered", inst_id))?;

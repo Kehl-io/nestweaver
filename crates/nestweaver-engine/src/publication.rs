@@ -1447,6 +1447,15 @@ pub(crate) fn validate_slot_contents(
         if name == PUBLICATION_MANIFEST_FILE {
             continue;
         }
+        // A live slot retains the kernel writer-lock anchor after its writer
+        // exits. It is operational state, not portable graph content. Symlinks
+        // were rejected above, and only the exact declared graph's sibling is
+        // allowed; archive inventory validation remains strict.
+        if bundle.artifacts.iter().any(|artifact| {
+            artifact.kind == ArtifactKind::Graph && name == format!("{}.write.lock", artifact.path)
+        }) {
+            continue;
+        }
         present.insert(name);
     }
     let undescribed: Vec<&String> = present

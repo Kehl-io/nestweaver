@@ -6,7 +6,7 @@
 //! JSON-RPC 2.0. `tracing` is configured by the caller to write to stderr
 //! (CRITICAL — anything on stdout must be a valid MCP frame).
 
-use std::io::{self, BufRead, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 pub mod federation;
 pub mod http;
 pub mod protocol;
+pub mod session;
 pub mod tools;
 
 use protocol::{ErrorResponse, PROTOCOL_VERSION, Response, error, error_code, success};
@@ -289,152 +290,23 @@ pub fn run_stdio_server(
         "brain MCP server ready on stdio"
     );
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut line = String::new();
-    let mut reader = stdin.lock();
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            // EOF from the client — clean shutdown.
-            if let Some(tracker) = &tracker {
-                // Best-effort terminal-success heuristic: if the agent's last
-                // tool call was NOT another search (i.e. it stopped looking),
-                // the context it had at that point was "good enough". Record a
-                // TerminalSuccess for the UIDs most recently surfaced this
-                // session so that positive outcome reinforces those nodes.
-                // This is purely heuristic and must never break shutdown.
-                maybe_record_terminal_success(tracker);
-                if let Err(e) = tracker.flush() {
-                    tracing::warn!("failed to flush interaction tracker: {e}");
-                }
-            }
-            // Flush any in-process response cache entries that haven't been
-            // written to disk yet (periodic flush threshold may not have been hit).
-            crate::tools::flush_response_cache();
-            tracing::info!("client closed stdin; shutting down");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse as serde_json::Value first to detect batch (array) vs
-        // single (object) requests per JSON-RPC 2.0 §6.
-        let parsed: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = error(
-                    Value::Null,
-                    error_code::PARSE_ERROR,
-                    format!("invalid JSON: {e}"),
-                );
-                if closed_stdout_ends_session(
-                    write_response(&mut stdout, &Frame::Error(resp)),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        if let Value::Array(arr) = parsed {
-            // Batch request.
-            if arr.is_empty() {
-                let resp = error(
-                    Value::Null,
-                    error_code::INVALID_REQUEST,
-                    "empty batch array",
-                );
-                if closed_stdout_ends_session(
-                    write_response(&mut stdout, &Frame::Error(resp)),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                continue;
-            }
-            let mut responses: Vec<Value> = Vec::new();
-            for item in arr {
-                let req = match protocol::validate_request(item) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        responses.push(serde_json::to_value(error(
-                            e.response_id,
-                            error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {}", e.message),
-                        ))?);
-                        continue;
-                    }
-                };
-                let is_notification = req.id.is_none();
-                let outcome = dispatch_method(&store, tantivy.as_ref(), &req, tracker.as_ref());
-                if is_notification {
-                    if let Frame::Error(e) = outcome {
-                        tracing::warn!(
-                            "batch notification {} produced error: {}",
-                            req.method,
-                            e.error.message
-                        );
-                    }
-                    continue;
-                }
-                let val = match outcome {
-                    Frame::Success(r) => serde_json::to_value(r)?,
-                    Frame::Error(e) => serde_json::to_value(e)?,
-                };
-                responses.push(val);
-            }
-            if !responses.is_empty() {
-                let serialized = serde_json::to_string(&responses)?;
-                if closed_stdout_ends_session(
-                    write_stdout_frame(&mut stdout, &serialized).map_err(Into::into),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-            }
-        } else {
-            // Single request.
-            let req = match protocol::validate_request(parsed) {
-                Ok(r) => r,
-                Err(e) => {
-                    let resp = error(
-                        e.response_id,
-                        error_code::INVALID_REQUEST,
-                        format!("invalid request: {}", e.message),
-                    );
-                    if closed_stdout_ends_session(
-                        write_response(&mut stdout, &Frame::Error(resp)),
-                        tracker.as_ref(),
-                    )? {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-            let is_notification = req.id.is_none();
-            let outcome = dispatch_method(&store, tantivy.as_ref(), &req, tracker.as_ref());
-            if is_notification {
-                if let Frame::Error(e) = outcome {
-                    tracing::warn!(
-                        "notification {} produced error: {}",
-                        req.method,
-                        e.error.message
-                    );
-                }
-                continue;
-            }
-            if closed_stdout_ends_session(write_response(&mut stdout, &outcome), tracker.as_ref())?
-            {
-                return Ok(());
-            }
+    let result = session::run_stdio(|req, cancel| {
+        frame_value(dispatch_method_cancellable(
+            &store,
+            tantivy.as_ref(),
+            req,
+            tracker.as_ref(),
+            Some(cancel),
+        ))
+    });
+    if let Some(tracker) = &tracker {
+        maybe_record_terminal_success(tracker);
+        if let Err(error) = tracker.flush() {
+            tracing::warn!("failed to flush interaction tracker: {error}");
         }
     }
+    tools::flush_response_cache();
+    result
 }
 
 /// Run the brain server in daemon proxy mode: instead of opening the DB
@@ -467,149 +339,36 @@ pub fn run_stdio_server_daemon(
         "brain MCP server ready on stdio (daemon proxy mode)"
     );
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut line = String::new();
-    let mut reader = stdin.lock();
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            if let Some(tracker) = &tracker {
-                maybe_record_terminal_success(tracker);
-                if let Err(e) = tracker.flush() {
-                    tracing::warn!("failed to flush interaction tracker: {e}");
-                }
-            }
-            tracing::info!("client closed stdin; shutting down (daemon proxy)");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let parsed: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = error(
-                    Value::Null,
-                    error_code::PARSE_ERROR,
-                    format!("invalid JSON: {e}"),
-                );
-                if closed_stdout_ends_session(
-                    write_response(&mut stdout, &Frame::Error(resp)),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        if let Value::Array(arr) = parsed {
-            if arr.is_empty() {
-                let resp = error(
-                    Value::Null,
-                    error_code::INVALID_REQUEST,
-                    "empty batch array",
-                );
-                if closed_stdout_ends_session(
-                    write_response(&mut stdout, &Frame::Error(resp)),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-                continue;
-            }
-            let mut responses: Vec<Value> = Vec::new();
-            for item in arr {
-                let req = match protocol::validate_request(item) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        responses.push(serde_json::to_value(error(
-                            e.response_id,
-                            error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {}", e.message),
-                        ))?);
-                        continue;
-                    }
-                };
-                let is_notification = req.id.is_none();
-                let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req, tracker.as_ref());
-                if is_notification {
-                    if let Frame::Error(e) = outcome {
-                        tracing::warn!(
-                            "batch notification {} produced error: {}",
-                            req.method,
-                            e.error.message
-                        );
-                    }
-                    continue;
-                }
-                let val = match outcome {
-                    Frame::Success(r) => serde_json::to_value(r)?,
-                    Frame::Error(e) => serde_json::to_value(e)?,
-                };
-                responses.push(val);
-            }
-            if !responses.is_empty() {
-                let serialized = serde_json::to_string(&responses)?;
-                if closed_stdout_ends_session(
-                    write_stdout_frame(&mut stdout, &serialized).map_err(Into::into),
-                    tracker.as_ref(),
-                )? {
-                    return Ok(());
-                }
-            }
-        } else {
-            let req = match protocol::validate_request(parsed) {
-                Ok(r) => r,
-                Err(e) => {
-                    let resp = error(
-                        e.response_id,
-                        error_code::INVALID_REQUEST,
-                        format!("invalid request: {}", e.message),
-                    );
-                    if closed_stdout_ends_session(
-                        write_response(&mut stdout, &Frame::Error(resp)),
-                        tracker.as_ref(),
-                    )? {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-            let is_notification = req.id.is_none();
-            let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req, tracker.as_ref());
-            if is_notification {
-                if let Frame::Error(e) = outcome {
-                    tracing::warn!(
-                        "notification {} produced error: {}",
-                        req.method,
-                        e.error.message
-                    );
-                }
-                continue;
-            }
-            if closed_stdout_ends_session(write_response(&mut stdout, &outcome), tracker.as_ref())?
-            {
-                return Ok(());
-            }
+    let result = session::run_stdio(|req, cancel| {
+        frame_value(dispatch_method_daemon_cancellable(
+            &mut grpc_client,
+            &rt,
+            req,
+            tracker.as_ref(),
+            Some(cancel),
+        ))
+    });
+    if let Some(tracker) = &tracker {
+        maybe_record_terminal_success(tracker);
+        if let Err(error) = tracker.flush() {
+            tracing::warn!("failed to flush interaction tracker: {error}");
         }
     }
+    result
 }
 
 #[cfg(feature = "daemon")]
-fn dispatch_method_daemon(
+fn dispatch_method_daemon_cancellable(
     client: &mut tools::DaemonGrpcClient,
     rt: &tokio::runtime::Runtime,
     req: &protocol::Request,
     tracker: Option<&nestweaver_engine::InteractionTracker>,
+    cancel: Option<&session::CancelFlag>,
 ) -> Frame {
     let id = req.id.clone().unwrap_or(Value::Null);
-
+    if let Err(message) = protocol::validate_method_params(req) {
+        return Frame::Error(error(id, error_code::INVALID_PARAMS, message));
+    }
     match req.method.as_str() {
         "initialize" => Frame::Success(success(
             id,
@@ -655,7 +414,7 @@ fn dispatch_method_daemon(
             // Isolate a panicking tool so one bad call can't unwind the stdio
             // read loop and kill the session (mirrors the HTTP path).
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tools::dispatch_via_daemon(client, rt, &name, arguments.clone())
+                tools::dispatch_via_daemon_cancellable(client, rt, &name, arguments.clone(), cancel)
             }));
             match dispatched {
                 Ok(Ok(result)) => {
@@ -679,6 +438,17 @@ fn dispatch_method_daemon(
             error_code::METHOD_NOT_FOUND,
             format!("method not implemented: {other}"),
         )),
+    }
+}
+
+fn frame_value(frame: Frame) -> Value {
+    match frame {
+        Frame::Success(response) => {
+            serde_json::to_value(response).expect("response contains only JSON values")
+        }
+        Frame::Error(response) => {
+            serde_json::to_value(response).expect("response contains only JSON values")
+        }
     }
 }
 
@@ -754,47 +524,27 @@ fn write_stdout_frame(out: &mut impl Write, serialized: &str) -> Result<(), Stdo
     out.flush().map_err(StdoutWriteError)
 }
 
-fn closed_stdout_ends_session(
-    result: Result<(), anyhow::Error>,
-    tracker: Option<&nestweaver_engine::InteractionTracker>,
-) -> Result<bool, anyhow::Error> {
-    match result {
-        Ok(()) => Ok(false),
-        Err(error)
-            if error
-                .downcast_ref::<StdoutWriteError>()
-                .is_some_and(|stdout| stdout.kind() == std::io::ErrorKind::BrokenPipe) =>
-        {
-            // The client is gone. Flush durable session state just like the
-            // stdin-EOF path, but do not infer terminal success from a closed
-            // response pipe.
-            if let Some(tracker) = tracker {
-                let _ = tracker.flush();
-            }
-            crate::tools::flush_response_cache();
-            Ok(true)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn write_response(out: &mut impl Write, frame: &Frame) -> Result<(), anyhow::Error> {
-    let serialized = match frame {
-        Frame::Success(r) => serde_json::to_string(r)?,
-        Frame::Error(e) => serde_json::to_string(e)?,
-    };
-    write_stdout_frame(out, &serialized)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn dispatch_method(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     req: &protocol::Request,
     tracker: Option<&nestweaver_engine::InteractionTracker>,
 ) -> Frame {
-    let id = req.id.clone().unwrap_or(Value::Null);
+    dispatch_method_cancellable(store, tantivy, req, tracker, None)
+}
 
+fn dispatch_method_cancellable(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    req: &protocol::Request,
+    tracker: Option<&nestweaver_engine::InteractionTracker>,
+    cancel: Option<&session::CancelFlag>,
+) -> Frame {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    if let Err(message) = protocol::validate_method_params(req) {
+        return Frame::Error(error(id, error_code::INVALID_PARAMS, message));
+    }
     match req.method.as_str() {
         "initialize" => Frame::Success(success(
             id,
@@ -850,7 +600,15 @@ fn dispatch_method(
             // loop and killing the whole session (mirrors the HTTP path, which
             // maps a dispatch panic to an isError result via spawn_blocking).
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tools::dispatch(store, tantivy, &name, arguments.clone(), None)
+                tools::dispatch_cancellable(
+                    store,
+                    tantivy,
+                    &name,
+                    arguments.clone(),
+                    None,
+                    cancel,
+                    None,
+                )
             }));
             match dispatched {
                 Ok(Ok(result)) => {
@@ -1062,7 +820,11 @@ mod tests {
     #[test]
     fn initialize_returns_capabilities_and_server_info() {
         let store = GraphStore::in_memory().unwrap();
-        let req = make_request("initialize", 1, json!({}));
+        let req = make_request(
+            "initialize",
+            1,
+            json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}),
+        );
         let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Success(resp) => {
@@ -1229,7 +991,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
-                "params": { "protocolVersion": "2024-11-05" }
+                "params": {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
             },
             {
                 "jsonrpc": "2.0",
@@ -1266,7 +1028,7 @@ mod tests {
         // implements this.
         let store = GraphStore::in_memory().unwrap();
         let mixed = serde_json::json!([
-            {"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}},
             {"jsonrpc": "2.0",          "method": "notifications/initialized"}
         ]);
         let arr = mixed.as_array().unwrap();

@@ -590,6 +590,8 @@ message BrainContextRequest {
   string since = 19;
   double recency_weight = 20;
   double recency_half_life_days = 21;
+  // Independent count cap; absence preserves configured/default tool behavior.
+  optional uint32 limit = 22;
 }
 message BrainContextResponse {
   string result_json = 1;

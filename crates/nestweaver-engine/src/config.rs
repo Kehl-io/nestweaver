@@ -658,7 +658,7 @@ pub struct LimitsConfig {
     /// parsed config, so merely passing `--config` for an unrelated reason
     /// silently changed `nestweaver search`'s default from 10 to 50. Keeping
     /// the option lets each caller apply its OWN documented default when
-    /// nothing was configured.
+    /// nothing was configured. Valid configured values are 1 through 1000.
     #[serde(default)]
     pub default_result_limit: Option<usize>,
 }
@@ -1151,6 +1151,12 @@ impl InstanceConfig {
             config.expected_brain_uuid = Some(parsed.to_string());
         }
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
+        if let Some(limit) = config.limits.default_result_limit
+            && !(1..=1000).contains(&limit)
+        {
+            anyhow::bail!("limits.default_result_limit must be between 1 and 1000, got {limit}");
+        }
+
         // Fail config loading on an unparseable reconcile interval. Silently
         // treating a typo as "disabled" would reintroduce exactly the failure
         // this loop exists to remove: trigrams quietly going stale with no
@@ -1768,6 +1774,35 @@ url = "https://github.com/example/repo"
             .expect_err("unsupported accelerator must be rejected");
 
         assert!(err.to_string().contains("accelerator"));
+    }
+
+    #[test]
+    fn configured_result_limits_match_all_consumers() {
+        for limit in [0, 1001, usize::MAX] {
+            let text = format!("{MINIMAL_TOML}\n[limits]\ndefault_result_limit = {limit}\n");
+            let error = InstanceConfig::from_toml_str(&text).unwrap_err();
+            assert!(
+                error.to_string().contains("default_result_limit"),
+                "{error}"
+            );
+        }
+        for limit in [1, 1000] {
+            let text = format!("{MINIMAL_TOML}\n[limits]\ndefault_result_limit = {limit}\n");
+            assert_eq!(
+                InstanceConfig::from_toml_str(&text)
+                    .unwrap()
+                    .limits
+                    .default_result_limit,
+                Some(limit)
+            );
+        }
+        assert_eq!(
+            InstanceConfig::from_toml_str(MINIMAL_TOML)
+                .unwrap()
+                .limits
+                .default_result_limit,
+            None
+        );
     }
 
     // Configured instance IDs are daemon write defaults, so empty values and

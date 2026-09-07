@@ -108,10 +108,24 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
         result.index.unresolved_link_targets,
     );
     if !result.index.skipped.is_empty() {
-        summary.push_str(&format!(
-            " Coverage DEGRADED: {} note file(s) skipped.",
-            result.index.skipped.len()
-        ));
+        let excluded = result
+            .index
+            .skipped
+            .iter()
+            .filter(|file| {
+                matches!(file.reason_code, SkipReasonCode::Ignored)
+                    && file.reason == "matched .brainignore pattern"
+            })
+            .count();
+        let degraded = result.index.skipped.len() - excluded;
+        if degraded > 0 {
+            summary.push_str(&format!(
+                " Coverage DEGRADED: {degraded} note file(s) skipped."
+            ));
+        }
+        if excluded > 0 {
+            summary.push_str(&format!(" Excluded by request: {excluded} note file(s)."));
+        }
         for sf in &result.index.skipped {
             summary.push_str(&format!("\n  {} - {}", sf.path, sf.reason));
         }
@@ -4447,6 +4461,41 @@ sub b body
              SAME summary `brain refresh` prints, not stay refresh-only \
              information the user has no way to see: {summary}"
         );
+    }
+
+    #[test]
+    fn explicit_exclusions_remain_visible_without_degrading_eligible_coverage() {
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("ignore.md", "# Ignore\n")]);
+        let db = root.join("scratch.lbug");
+        for from_file in [false, true] {
+            let ignore = if from_file {
+                std::fs::write(root.join(".brainignore"), "ignore.md\n").unwrap();
+                vec![]
+            } else {
+                vec!["ignore.md".to_string()]
+            };
+            let mut result = index_markdown_directory_with_ignore_and_deletion_count(
+                &root, &db, "default", "v", &ignore,
+            )
+            .unwrap();
+            assert_eq!(result.index.notes_count, 1);
+            let summary = format_markdown_refresh_summary(&result);
+            assert!(!summary.contains("Coverage DEGRADED"), "{summary}");
+            assert!(
+                summary.contains("Excluded by request: 1") && summary.contains("ignore.md"),
+                "{summary}"
+            );
+            result.index.skipped.push(SkippedFile::new(
+                "large.md",
+                SkipReasonCode::Oversized,
+                "too large",
+            ));
+            let mixed = format_markdown_refresh_summary(&result);
+            assert!(
+                mixed.contains("Coverage DEGRADED: 1") && mixed.contains("Excluded by request: 1"),
+                "{mixed}"
+            );
+        }
     }
 
     #[test]

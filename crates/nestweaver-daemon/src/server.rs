@@ -23,6 +23,23 @@ use crate::safeguards::{
     ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard_cancellable,
 };
 
+/// Reports a gRPC index only while its blocking worker owns the write lease.
+/// This is separate from the queue worker's liveness flags used during drain.
+struct RpcIndexActivity {
+    current: Arc<std::sync::Mutex<Option<String>>>,
+}
+impl RpcIndexActivity {
+    fn start(current: Arc<std::sync::Mutex<Option<String>>>, repo: String) -> Self {
+        *current.lock().unwrap_or_else(|e| e.into_inner()) = Some(repo);
+        Self { current }
+    }
+}
+impl Drop for RpcIndexActivity {
+    fn drop(&mut self) {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 // ── State ───────────────────────────────────────────────────────────
 
 /// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
@@ -1782,6 +1799,7 @@ pub struct DaemonState {
     pub read_only: bool,
     /// Whether the server-side worker pool is currently indexing a repo.
     pub indexing_active: Arc<AtomicBool>,
+    rpc_indexing_repo: Arc<std::sync::Mutex<Option<String>>>,
     /// The repo currently being indexed (empty string when idle).
     pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
     /// Number of pending + running jobs in the server-side job queue.
@@ -3872,6 +3890,24 @@ fn finalize_node_graph_deletion(
     operation: &str,
 ) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
     let mut failures = Vec::new();
+    // Vault deletion cannot alter code manifests. Read their trusted binding
+    // before advancing the graph, including a present but empty cache.
+    let manifest_path = nestweaver_engine::manifest_cache_path(&state.db_path);
+    let carried_manifests = if manifest_path.exists() {
+        match nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path) {
+            Ok(manifests) => Some(manifests),
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::ManifestCache,
+                    format!("load manifest cache before vault deletion publication: {error:#}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     match state.store.reconcile_embedding_index_stages() {
         Err(error) => push_reconciliation_failure(
             &mut failures,
@@ -3912,11 +3948,27 @@ fn finalize_node_graph_deletion(
         }
     };
     let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
-    if generation_advanced && let Err(error) = state.store.save_graph_generation(&generation_path) {
+    let generation_persisted = generation_advanced
+        && match state.store.save_graph_generation(&generation_path) {
+            Ok(()) => true,
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
+                    format!("{}: {error:#}", generation_path.display()),
+                );
+                false
+            }
+        };
+    if generation_persisted
+        && let Some(manifests) = carried_manifests
+        && let Err(error) =
+            nestweaver_engine::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)
+    {
         push_reconciliation_failure(
             &mut failures,
-            nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
-            format!("{}: {error:#}", generation_path.display()),
+            nestweaver_engine::DeletionReconciliationStage::ManifestCache,
+            format!("rebind manifest cache after vault deletion publication: {error:#}"),
         );
     }
     if let Err(error) =
@@ -5440,6 +5492,9 @@ fn brain_context_args_from_request(req: &BrainContextRequest) -> serde_json::Val
         "prf": req.prf,
         "rerank": req.rerank,
     });
+    if let Some(limit) = req.limit {
+        args["limit"] = serde_json::json!(limit);
+    }
     if req.token_budget > 0 {
         args["token_budget"] = serde_json::json!(req.token_budget);
     }
@@ -5600,8 +5655,27 @@ mod context_request_args_tests {
     }
 
     #[test]
+    fn brain_context_count_and_token_caps_both_reach_dispatch() {
+        let req = BrainContextRequest {
+            seeds: vec!["fixture".into()],
+            limit: Some(2),
+            token_budget: 1000,
+            ..Default::default()
+        };
+        let args = brain_context_args_from_request(&req);
+        assert_eq!(args["limit"], 2);
+        assert_eq!(args["token_budget"], 1000);
+        assert!(
+            brain_context_args_from_request(&BrainContextRequest::default())
+                .get("limit")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn brain_context_explicit_zero_weight_semantic_reaches_args_distinct_from_absent() {
         let mut req = BrainContextRequest {
+            limit: None,
             seeds: vec!["x".to_string()],
             token_budget: 0,
             response_format: String::new(),
@@ -6567,6 +6641,10 @@ impl NestWeaverDaemon for DaemonService {
                 _write_lease: write_lock.blocking_lock("index_repo"),
                 _connection_guard: guard,
             };
+            let _activity = RpcIndexActivity::start(
+                Arc::clone(&state.rpc_indexing_repo),
+                repo_path.display().to_string(),
+            );
             // Dropped when the index task ends → fires the watchdog's `done_rx`
             // so it releases its stream sender and the response can terminate.
             let _done = done_tx;
@@ -8049,9 +8127,19 @@ impl NestWeaverDaemon for DaemonService {
             .dispatch_tool_json("brain_status", args, &extensions)
             .await?;
 
-        let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+        let rpc_repo = self
+            .state
+            .rpc_indexing_repo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let indexing_active =
+            rpc_repo.is_some() || self.state.indexing_active.load(Ordering::Relaxed);
         let indexing_repo = if indexing_active && !restricted {
-            self.state.indexing_repo.read().await.clone()
+            match rpc_repo {
+                Some(repo) => repo,
+                None => self.state.indexing_repo.read().await.clone(),
+            }
         } else {
             String::new()
         };
@@ -8158,13 +8246,23 @@ impl NestWeaverDaemon for DaemonService {
         let mut json_resp = resp.into_inner();
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["server_mode"] = serde_json::json!(self.state.server_mode);
-            let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+            let rpc_repo = self
+                .state
+                .rpc_indexing_repo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let indexing_active =
+                rpc_repo.is_some() || self.state.indexing_active.load(Ordering::Relaxed);
             value["indexing_active"] = serde_json::json!(indexing_active);
             // Always present (null when idle): the shared builder emits the
             // key on every path, so the daemon must too, or key-set parity
             // with the direct path breaks.
             value["indexing_repo"] = if indexing_active && !restricted {
-                serde_json::json!(*self.state.indexing_repo.read().await)
+                serde_json::json!(match rpc_repo {
+                    Some(repo) => repo,
+                    None => self.state.indexing_repo.read().await.clone(),
+                })
             } else {
                 serde_json::Value::Null
             };
@@ -12512,6 +12610,7 @@ pub async fn run_server(
         embed_progress: Arc::new(EmbedProgress::default()),
         server_mode: is_server_mode,
         indexing_active: Arc::new(AtomicBool::new(false)),
+        rpc_indexing_repo: Arc::new(std::sync::Mutex::new(None)),
         indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
         indexing_queue_depth: Arc::new(AtomicU32::new(0)),
         indexing_in_flight: Arc::new(AtomicU32::new(0)),
@@ -14826,6 +14925,111 @@ credential_method = "gh"
                 "stale embedding survived for {uid}"
             );
         }
+    }
+
+    #[test]
+    fn remove_vault_preserves_present_empty_and_populated_manifest_caches() {
+        for populated in [false, true] {
+            let state = test_state_with_writer();
+            let mut manifests = std::collections::HashMap::new();
+            if populated {
+                manifests.insert(
+                    "repo:survivor".to_string(),
+                    nestweaver_engine::ManifestInfo {
+                        package_name: Some("survivor".into()),
+                        dependencies: vec![],
+                        entry_files: vec!["src/main.rs".into()],
+                    },
+                );
+            }
+            nestweaver_engine::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)
+                .unwrap();
+            seed_vault_note_heading_embeddings(
+                &state,
+                "vlt:manifest:docs",
+                "docs",
+                "/missing/docs",
+            );
+            let generation = state.store.graph_generation();
+            let result =
+                run_remove_vault_with_projection(&state, "vlt:manifest:docs", None).unwrap();
+            assert!(result.committed);
+            assert!(
+                result.reconciliation_failures.is_empty(),
+                "{:?}",
+                result.reconciliation_failures
+            );
+            assert_eq!(state.store.graph_generation(), generation + 1);
+            let carried =
+                nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&carried).unwrap(),
+                serde_json::to_value(&manifests).unwrap()
+            );
+            let publication =
+                nestweaver_engine::finalize_committed_graph_mutation(&state.store, true);
+            assert!(
+                publication.warnings.is_empty(),
+                "{:?}",
+                publication.warnings
+            );
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn node_deletion_does_not_relabel_stale_or_corrupt_manifests() {
+        for corrupt in [false, true] {
+            let state = test_state_with_writer();
+            let path = nestweaver_engine::manifest_cache_path(&state.db_path);
+            nestweaver_engine::save_manifest_cache_for_db(
+                &std::collections::HashMap::new(),
+                &state.store,
+                &state.db_path,
+            )
+            .unwrap();
+            if corrupt {
+                std::fs::write(&path, "invalid JSON").unwrap();
+            } else {
+                state.store.try_bump_graph_generation().unwrap();
+            }
+            let original = std::fs::read(&path).unwrap();
+            let failures = finalize_node_graph_deletion(&state, "manifest trust regression");
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f.stage
+                        == nestweaver_engine::DeletionReconciliationStage::ManifestCache),
+                "{failures:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn node_deletion_generation_persistence_failure_does_not_rebind_manifest() {
+        let state = test_state_with_writer();
+        let path = nestweaver_engine::manifest_cache_path(&state.db_path);
+        nestweaver_engine::save_manifest_cache_for_db(
+            &std::collections::HashMap::new(),
+            &state.store,
+            &state.db_path,
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        if generation_path.exists() {
+            std::fs::remove_file(&generation_path).unwrap();
+        }
+        std::fs::create_dir(&generation_path).unwrap();
+        let failures = finalize_node_graph_deletion(&state, "manifest persistence regression");
+        assert!(
+            failures.iter().any(|f| f.stage
+                == nestweaver_engine::DeletionReconciliationStage::GenerationPersistence),
+            "{failures:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[tokio::test]
@@ -19994,6 +20198,7 @@ credential_method = "gh"
             server_mode: false,
             read_only: false,
             indexing_active: Arc::new(AtomicBool::new(false)),
+            rpc_indexing_repo: Arc::new(std::sync::Mutex::new(None)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
             indexing_in_flight: Arc::new(AtomicU32::new(0)),
@@ -20086,6 +20291,7 @@ credential_method = "gh"
             server_mode: false,
             read_only: false,
             indexing_active: Arc::new(AtomicBool::new(false)),
+            rpc_indexing_repo: Arc::new(std::sync::Mutex::new(None)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
             indexing_in_flight: Arc::new(AtomicU32::new(0)),
@@ -20168,6 +20374,53 @@ credential_method = "gh"
             value.get("effective_config").is_none(),
             "effective config provenance must remain typed-only so Combined federation cannot backfill it"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_index_activity_is_reported_and_cleared_on_both_status_routes() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(Arc::clone(&state));
+        let activity =
+            RpcIndexActivity::start(Arc::clone(&state.rpc_indexing_repo), "/fixture/repo".into());
+        assert!(
+            !state.indexing_active.load(Ordering::Relaxed),
+            "queue worker stays idle"
+        );
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(typed.indexing_active);
+        assert_eq!(typed.indexing_repo, "/fixture/repo");
+        let json = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&json.result_json).unwrap();
+        assert_eq!(value["indexing_active"], true);
+        assert_eq!(value["indexing_repo"], "/fixture/repo");
+        drop(activity);
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!typed.indexing_active);
+        assert!(typed.indexing_repo.is_empty());
+        let json = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&json.result_json).unwrap();
+        assert_eq!(value["indexing_active"], false);
+        assert!(value["indexing_repo"].is_null());
     }
 
     /// A3. The incident: an embed had run 12h32m and `brain status` still said

@@ -230,6 +230,9 @@ pub struct McpHttpState {
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
     pub sessions: Arc<DashMap<String, McpSession>>,
+    /// Cancellation keys include both established session and authenticated
+    /// role; equal request IDs in different clients cannot cancel each other.
+    in_flight: Arc<DashMap<String, crate::session::CancelFlag>>,
     /// Live count of active MCP sessions, republished from `sessions.len()` on
     /// each insert and after each sweep. Shared with the daemon so the admin
     /// dashboard and the `MCP_SESSIONS` Prometheus gauge can read a connection
@@ -285,6 +288,21 @@ pub struct McpHttpState {
     /// single-node provenance. Present only under the `daemon` feature.
     #[cfg(feature = "daemon")]
     pub federation: Option<Arc<crate::federation::FederationState>>,
+}
+
+struct HttpInFlight {
+    entries: Arc<DashMap<String, crate::session::CancelFlag>>,
+    key: String,
+    flag: crate::session::CancelFlag,
+    cancel_on_drop: bool,
+}
+impl Drop for HttpInFlight {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.flag.store(true, Ordering::Release);
+        }
+        self.entries.remove(&self.key);
+    }
 }
 
 /// Build the per-repo permission source from the instance config's `[authz]`
@@ -351,6 +369,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
             mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
             read_only: false,
@@ -386,6 +405,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
             mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
             read_only: false,
@@ -802,6 +822,15 @@ async fn handle_mcp(
         }
     };
     let notification = req.id.is_none();
+    if let Err(message) = crate::protocol::validate_method_params(&req) {
+        return jsonrpc_http_error(
+            notification,
+            axum::http::StatusCode::OK,
+            req.id.clone().unwrap_or(Value::Null),
+            error_code::INVALID_PARAMS,
+            &message,
+        );
+    }
 
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -883,6 +912,33 @@ async fn handle_mcp(
             entry.last_active = Instant::now();
             entry.request_count += 1;
         }
+    }
+
+    // Cancellation requires an established session. A stateless HTTP request
+    // has no correlation namespace; never guess which client's equal ID it is.
+    let cancellation_prefix = session_id.as_ref().map(|sid| {
+        format!(
+            "{}:{sid}:",
+            if admin_bypass_rate_limit {
+                "admin"
+            } else if state.auth_token.is_some() {
+                "query"
+            } else {
+                "anonymous"
+            }
+        )
+    });
+    if req.method == "notifications/cancelled" {
+        if let (Some(prefix), Some(request_id)) = (
+            &cancellation_prefix,
+            req.params
+                .as_ref()
+                .and_then(|params| params.get("requestId")),
+        ) && let Some(flag) = state.in_flight.get(&format!("{prefix}{request_id}"))
+        {
+            flag.store(true, Ordering::Release);
+        }
+        return axum::http::StatusCode::ACCEPTED.into_response();
     }
 
     let response = match req.method.as_str() {
@@ -1015,6 +1071,33 @@ async fn handle_mcp(
                 );
             }
 
+            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mutation = MUTATING_TOOLS.contains(&name.as_str());
+            let _in_flight = if let Some(prefix) = &cancellation_prefix {
+                let key = format!("{prefix}{id}");
+                match state.in_flight.entry(key.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => {
+                        return jsonrpc_error(
+                            axum::http::StatusCode::OK,
+                            id.clone(),
+                            error_code::INVALID_REQUEST,
+                            "request id is already in flight in this session",
+                        );
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(cancel_flag.clone());
+                    }
+                }
+                Some(HttpInFlight {
+                    entries: state.in_flight.clone(),
+                    key,
+                    flag: cancel_flag.clone(),
+                    cancel_on_drop: !mutation,
+                })
+            } else {
+                None
+            };
+
             let store = state.store.clone();
             let tantivy = match &state.search_index_provider {
                 Some(provider) => provider.search_index(),
@@ -1113,9 +1196,8 @@ async fn handle_mcp(
             // dead_code, flow_trace, vector search) observe the flag and stop.
             let timeout = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
             let tool_name = name.clone();
-            let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let dispatch_cancel = std::sync::Arc::clone(&cancel_flag);
-            let result = tokio::time::timeout(
+            let work = tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
                     tools::set_current_db_path(db_path);
@@ -1137,8 +1219,21 @@ async fn handle_mcp(
                         Some(&visible),
                     )
                 }),
-            )
-            .await;
+            );
+            let result = tokio::select! {
+                result = work => result,
+                _ = async {
+                    if mutation { std::future::pending::<()>().await; }
+                    while !cancel_flag.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => return axum::http::StatusCode::ACCEPTED.into_response(),
+            };
+            // A mutation remains awaited while its retained worker owns the
+            // write. Cancellation suppresses the response, not the commit.
+            if cancel_flag.load(Ordering::Acquire) {
+                return axum::http::StatusCode::ACCEPTED.into_response();
+            }
 
             match result {
                 Ok(Ok(Ok(value))) => {
@@ -1154,14 +1249,27 @@ async fn handle_mcp(
                         (Some(fed), Some((fed_args, fed_visible))) => {
                             let expose_staleness =
                                 matches!(fed_visible, nestweaver_engine::authz::VisibleRepos::All);
-                            let (v, src) = crate::federation::federate_two_tier(
-                                fed,
-                                &name,
-                                &fed_args,
-                                value,
-                                &fed_visible,
+                            let federated = crate::session::await_cancellable(
+                                (!mutation).then_some(&cancel_flag),
+                                async {
+                                    Ok(crate::federation::federate_two_tier(
+                                        fed,
+                                        &name,
+                                        &fed_args,
+                                        value,
+                                        &fed_visible,
+                                    )
+                                    .await)
+                                },
                             )
                             .await;
+                            let (v, src) = match federated {
+                                Ok(value) => value,
+                                Err(_) => return axum::http::StatusCode::ACCEPTED.into_response(),
+                            };
+                            if cancel_flag.load(Ordering::Acquire) {
+                                return axum::http::StatusCode::ACCEPTED.into_response();
+                            }
                             let stale_repos = if expose_staleness {
                                 fed.stale_repos()
                             } else {
@@ -1560,6 +1668,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
+            "params": {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}},
         });
         let req = Request::builder()
             .method("POST")
@@ -1656,9 +1765,14 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["error"]["code"], error_code::INVALID_REQUEST);
+        assert_eq!(response["id"], Value::Null);
         assert!(
-            bytes.is_empty(),
-            "post-validation notification errors must have no JSON body"
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires a correlated request id")
         );
     }
 
@@ -1844,6 +1958,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
+            "params": {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}},
             });
             let req = Request::builder()
                 .method("POST")
@@ -2018,6 +2133,22 @@ mod tests {
                     .unwrap();
                 let json: Value = serde_json::from_slice(&bytes).unwrap();
 
+                if !arguments.is_object() {
+                    // The tools/call envelope requires an arguments object.
+                    // Reject this core shape before either authorization gate;
+                    // object-shaped tool schema failures remain in-band below.
+                    assert_eq!(json["error"]["code"], error_code::INVALID_PARAMS);
+                    assert_eq!(json["id"], tool);
+                    assert!(
+                        json["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("'arguments' must be an object")
+                    );
+                    assert!(json.get("result").is_none());
+                    continue;
+                }
+
                 assert!(
                     json.get("error").is_none(),
                     "{tool} before {gate} gate: {json}"
@@ -2160,5 +2291,226 @@ mod tests {
                 .unwrap()
                 .contains("re-initialize"),
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_regression_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn post(
+        app: Router,
+        raw: String,
+        token: Option<&str>,
+        session: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(raw)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn http_rejects_lossy_ids_method_shapes_and_notification_mutation_before_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(McpHttpState::new(
+            false,
+            Arc::new(GraphStore::in_memory().unwrap()),
+            None,
+            temp.path().join("test.lbug"),
+            None,
+            false,
+        ));
+        let app = router(state);
+        for (raw, code) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1234567890123456789012345678901234567890,"method":"ping"}"#,
+                -32600,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}"#,
+                -32602,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":7}}"#,
+                -32602,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"set_extension","arguments":{"uid":"test","key":"must-not-write","value":true}}}"#,
+                -32600,
+            ),
+        ] {
+            let (_, result) = post(app.clone(), raw.into(), None, None).await;
+            assert_eq!(result["error"]["code"], code, "{result}");
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path()).unwrap().count(),
+            0,
+            "notification mutated an extension sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_cancellation_is_scoped_to_session_and_authenticated_role() {
+        let state = Arc::new(McpHttpState::with_auth(
+            false,
+            Arc::new(GraphStore::in_memory().unwrap()),
+            None,
+            PathBuf::from("unused"),
+            None,
+            false,
+            "query".into(),
+            Some("admin".into()),
+        ));
+        let now = Instant::now();
+        for sid in ["first", "second"] {
+            state.sessions.insert(
+                sid.into(),
+                McpSession {
+                    id: sid.into(),
+                    created_at: now,
+                    last_active: now,
+                    request_count: 0,
+                    rate_window_start: now,
+                },
+            );
+        }
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admin = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .in_flight
+            .insert("query:first:1".into(), first.clone());
+        state
+            .in_flight
+            .insert("query:second:1".into(), second.clone());
+        state
+            .in_flight
+            .insert("admin:first:1".into(), admin.clone());
+        let cancel =
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+                .to_string();
+        let app = router(state);
+        let (status, _) = post(app.clone(), cancel.clone(), Some("query"), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            !first.load(Ordering::Acquire),
+            "stateless cancellation guessed an owner"
+        );
+        let (status, _) = post(app, cancel, Some("query"), Some("first")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+        assert!(!admin.load(Ordering::Acquire));
+    }
+    #[cfg(feature = "daemon")]
+    #[tokio::test]
+    async fn http_cancellation_interrupts_the_post_local_federation_stage() {
+        // A real loopback TCP peer accepts the upstream connection but never
+        // answers its handshake. Seeing accept proves local dispatch finished
+        // and the handler reached federation; no throughput/sleep guess does.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.await;
+        });
+        let config: nestweaver_engine::InstanceConfig = toml::from_str(&format!(
+            r#"
+instance_id="http-cancel-test"
+[snapshot_storage]
+backend="local"
+path="unused"
+[workspace]
+backend="local"
+path="unused"
+[inference]
+endpoint="http://127.0.0.1:1"
+embedding_model="unused"
+summary_model="unused"
+[git]
+credential_method="gh"
+[[upstream]]
+name="blocked"
+url="http://{address}"
+mode="primary"
+timeout="60s"
+"#
+        ))
+        .unwrap();
+        let mut state = McpHttpState::new(
+            false,
+            Arc::new(GraphStore::in_memory().unwrap()),
+            None,
+            PathBuf::from("unused"),
+            None,
+            false,
+        );
+        state.federation = crate::federation::FederationState::from_instance_config(&config);
+        let now = Instant::now();
+        state.sessions.insert(
+            "session".into(),
+            McpSession {
+                id: "session".into(),
+                created_at: now,
+                last_active: now,
+                request_count: 0,
+                rate_window_start: now,
+            },
+        );
+        let app = router(Arc::new(state));
+        let request_app = app.clone();
+        let request = tokio::spawn(async move {
+            post(request_app, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"blast_radius","arguments":{"changed_files":["missing.rs"]}}}).to_string(), None, Some("session")).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("handler never reached upstream stage")
+            .unwrap();
+        let (status, _) = post(
+            app,
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+                .to_string(),
+            None,
+            Some("session"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("cancel waited for blocked upstream")
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body, Value::Null);
+        let _ = release_tx.send(());
+        peer.await.unwrap();
     }
 }

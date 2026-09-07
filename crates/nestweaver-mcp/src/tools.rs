@@ -4967,6 +4967,10 @@ fn tool_schema_brain_context() -> Value {
                     "items": { "type": "string", "minLength": 1 },
                     "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, free-text terms, or UIDs (sym:/note:/head:/sec:/tag:)."
                 },
+                "limit": {
+                    "type": "integer", "minimum": 1, "maximum": 1000,
+                    "description": "Optional maximum connected result count, enforced together with token_budget. Defaults to the configured result limit when set."
+                },
                 "token_budget": {
                     "type": "integer",
                     "minimum": 1,
@@ -5575,7 +5579,29 @@ fn tool_brain_context(
 
     let concise = is_concise(&args);
 
-    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget, concise);
+    let count_limit = if args.get("limit").is_some() {
+        Some(read_limit(
+            &args,
+            "limit",
+            configured_result_limit(),
+            1,
+            RESULT_LIMIT_MAX,
+        )?)
+    } else {
+        current_instance_config().and_then(|cfg| cfg.limits.default_result_limit)
+    };
+    let (budget_cut, _) = budgeted_cut(&result.connected, token_budget, concise);
+    let (cut, truncated_by) = nestweaver_engine::compose_result_caps(
+        result.connected.len(),
+        count_limit,
+        Some(budget_cut),
+    );
+    let used_tokens: usize = result
+        .connected
+        .iter()
+        .take(cut)
+        .map(|node| render_cost(node, concise))
+        .sum();
 
     let connected_json: Vec<Value> = result
         .connected
@@ -5619,12 +5645,6 @@ fn tool_brain_context(
     let total = result.connected.len();
     let returned = connected_json.len();
     let truncated = returned < total;
-    // `token_budget` is this tool's only cap on `connected`, so only the
-    // budget branch of `resolve` is reachable here. Called anyway, exactly as
-    // `code_context` does: the precedence rule lives in ONE place even where
-    // one branch of it cannot fire, because a second copy is how the human and
-    // machine routes came to disagree in the first place.
-    let truncated_by = nestweaver_engine::TruncationCause::resolve(truncated, false);
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         // nw-393. The SEED cap, one layer upstream of the connected-list
@@ -5659,6 +5679,7 @@ fn tool_brain_context(
         "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "tokens_used": used_tokens,
         "token_budget": token_budget,
+        "limit": count_limit,
         "semantic_applied": result.semantic_applied,
         "degraded_components": &result.degraded_components,
     });
@@ -11505,7 +11526,7 @@ fn tool_brain_diff(
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within strict project membership, bounded by token budget. Each result reports in_project, source_project, and membership_basis; linked foreign content is excluded.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -11588,6 +11609,20 @@ fn tool_schema_project_context() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+/// Attribute child nodes by the UID grammar; paths and title matches are not membership.
+fn project_member_uid(uid: &str, members: &std::collections::HashSet<String>) -> bool {
+    if members.contains(uid) {
+        return true;
+    }
+    if let Some(note) = nestweaver_schema::uid::note_uid_of_heading(uid) {
+        return members.contains(note);
+    }
+    uid.strip_prefix("sec:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .and_then(|(without_hash, _)| without_hash.rsplit_once(':'))
+        .is_some_and(|(note, _)| members.contains(note))
 }
 
 fn tool_project_context(
@@ -11707,6 +11742,11 @@ fn tool_project_context(
         .list_project_symbol_uids(&project.uid)
         .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
     member_uids.extend(sym_uids);
+    let mut member_sources: std::collections::HashMap<String, String> = member_uids
+        .iter()
+        .map(|uid| (uid.clone(), project.uid.clone()))
+        .collect();
+    member_sources.insert(project.uid.clone(), project.uid.clone());
 
     // 3. If include_components, also collect note/symbol UIDs from each component project.
     let component_uids = if include_components {
@@ -11717,14 +11757,25 @@ fn tool_project_context(
         vec![]
     };
     for comp_uid in &component_uids {
+        member_sources.insert(comp_uid.clone(), comp_uid.clone());
         let comp_notes = store
             .list_project_note_uids(comp_uid)
             .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
+        for uid in &comp_notes {
+            member_sources
+                .entry(uid.clone())
+                .or_insert_with(|| comp_uid.clone());
+        }
         member_note_uids.extend(comp_notes.iter().cloned());
         member_uids.extend(comp_notes);
         let comp_syms = store
             .list_project_symbol_uids(comp_uid)
             .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
+        for uid in &comp_syms {
+            member_sources
+                .entry(uid.clone())
+                .or_insert_with(|| comp_uid.clone());
+        }
         member_uids.extend(comp_syms);
     }
 
@@ -11779,7 +11830,7 @@ fn tool_project_context(
     }
 
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
-    ppr_seeds.extend(component_uids);
+    ppr_seeds.extend(component_uids.iter().cloned());
     ppr_seeds.extend(member_note_uids.iter().cloned());
     ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
@@ -11846,6 +11897,19 @@ fn tool_project_context(
     //       Heading is redundant; notes-heavy projects spend ~25% of a
     //       2000-token budget on these duplicates without this trim.
     nestweaver_engine::dedup_heading_section_pairs(&mut result);
+
+    // Membership is a boundary, not merely a ranking preference. Filter
+    // before counting or spending the budget, including promoted seeds.
+    {
+        let mut admitted: std::collections::HashSet<String> = member_uids.iter().cloned().collect();
+        admitted.insert(project.uid.clone());
+        admitted.extend(component_uids.iter().cloned());
+        let retain = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+            nodes.retain(|node| project_member_uid(&node.uid, &admitted));
+        };
+        retain(&mut result.seeds);
+        retain(&mut result.connected);
+    }
 
     // 4c. Post-PPR scope boost: multiply relevance for nodes that belong
     //     to the project (member UIDs are the authoritative membership signal).
@@ -12038,7 +12102,7 @@ fn tool_project_context(
     // concise drops the machine id (uid) and the relevance score in favor of the semantic
     // fields an agent orients with (kind/title/location); detailed keeps the full record.
     let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
-        if concise {
+        let mut row = if concise {
             json!({
                 "kind": n.kind,
                 "title": n.title,
@@ -12052,7 +12116,34 @@ fn tool_project_context(
                 "location": n.location,
                 "relevance": n.relevance,
             })
-        }
+        };
+        let parent_note = nestweaver_schema::uid::note_uid_of_heading(&n.uid).or_else(|| {
+            n.uid
+                .strip_prefix("sec:")
+                .and_then(|rest| rest.rsplit_once(':'))
+                .and_then(|(rest, _)| rest.rsplit_once(':'))
+                .map(|(note, _)| note)
+        });
+        let source_project = member_sources
+            .get(&n.uid)
+            .or_else(|| parent_note.and_then(|note| member_sources.get(note)));
+        let basis = if n.uid == project.uid {
+            "project"
+        } else if component_uids.contains(&n.uid) {
+            "component"
+        } else if n.uid.starts_with("head:") {
+            "owned_heading"
+        } else if n.uid.starts_with("sec:") {
+            "owned_section"
+        } else if source_project == Some(&project.uid) {
+            "member"
+        } else {
+            "component_member"
+        };
+        row["in_project"] = json!(true);
+        row["source_project"] = json!(source_project);
+        row["membership_basis"] = json!(basis);
+        row
     };
 
     let mut connected_json: Vec<Value> =
@@ -14019,7 +14110,18 @@ pub fn dispatch_via_daemon(
     name: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    dispatch_via_daemon_inner(client, rt, name, args).map(provenance_seam::stamp)
+    dispatch_via_daemon_cancellable(client, rt, name, args, None)
+}
+
+#[cfg(feature = "daemon")]
+pub fn dispatch_via_daemon_cancellable(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    args: serde_json::Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<serde_json::Value, anyhow::Error> {
+    dispatch_via_daemon_inner(client, rt, name, args, cancel).map(provenance_seam::stamp)
 }
 
 /// The daemon-route tool table. Returns [`Unstamped`] so that no arm — the
@@ -14032,6 +14134,7 @@ fn dispatch_via_daemon_inner(
     rt: &tokio::runtime::Runtime,
     name: &str,
     args: serde_json::Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Unstamped, anyhow::Error> {
     use nestweaver_proto::JsonRequest;
 
@@ -14191,7 +14294,7 @@ fn dispatch_via_daemon_inner(
         |key: &str| -> bool { args.get(key).and_then(|v| v.as_bool()).unwrap_or(false) };
     let f64_field = |key: &str| -> f64 { args.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) };
 
-    let result_json: String = rt.block_on(async {
+    let request_future = async {
         match name {
             // ── Typed hot-path RPCs ──────────────────────────────────
             "brain_search" => {
@@ -14214,6 +14317,10 @@ fn dispatch_via_daemon_inner(
             "brain_context" => {
                 use nestweaver_proto::BrainContextRequest;
                 let req = tonic::Request::new(BrainContextRequest {
+                    limit: args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .and_then(|limit| u32::try_from(limit).ok()),
                     seeds: str_array("seeds"),
                     token_budget: i32_field("token_budget"),
                     response_format: str_field("response_format"),
@@ -14447,7 +14554,12 @@ fn dispatch_via_daemon_inner(
                 Ok(resp.into_inner().result_json)
             }
         }
-    })?;
+    };
+    let result_json: String = if crate::http::MUTATING_TOOLS.contains(&name) {
+        rt.block_on(request_future)?
+    } else {
+        rt.block_on(crate::session::await_cancellable(cancel, request_future))?
+    };
 
     serde_json::from_str(&result_json)
         .map(Unstamped::new)
@@ -15468,32 +15580,36 @@ mod project_context_bug12_tests {
     // land in `seeds`, disjoint from the rendered `connected` list — and must
     // be promoted into `connected`. This guards the wiring at the call site:
     // removing the promote step leaves notes in `seeds` only and fails here.
-    /// nw-305 / F-VAULT-6 — CHARACTERISATION, not a fix.
-    ///
-    /// `project_context` seeds a PPR walk from the project and its members,
-    /// multiplies member relevance by 5, sorts, and then fills the token budget
-    /// from whatever the walk reached. Every scope filter — `kinds`, `repos`,
-    /// `path_prefix`, `tags`, `exclude_tags`, `since` — is opt-in from `args`
-    /// and defaults to off, so NOTHING narrows the result back to the project.
-    /// This is a designed absence, not a scoring bug or a broken filter: the
-    /// boost is working (the members are ranked first), nothing removes the
-    /// rest.
-    ///
-    /// The test pins that behaviour deliberately rather than asserting "no
-    /// foreign notes", which would encode a design decision nobody has made —
-    /// and the two candidate fixes (disclose `in_project` / add a
-    /// `scope: "strict"` argument) want different assertions here.
-    ///
-    /// It also runs the measurement the ticket asks for. The ticket's framing
-    /// is "degrades when a project has FEW notes". The model that fits the code
-    /// is budget-driven: foreign nodes appear iff the budget buys more slots
-    /// than the project's own reachable mass fills, which makes the leak
-    /// UNIVERSAL rather than small-project-specific — every project hits it
-    /// once the budget outgrows it. Raising the budget on a fixed fixture
-    /// discriminates the two: under the budget model the foreign count rises,
-    /// under a similarity model it does not.
+    /// Project membership comes from exact graph ownership, including note children.
     #[test]
-    fn project_context_fills_budget_from_outside_the_project() {
+    fn project_membership_attributes_children_without_prefix_leakage() {
+        let note = "note:owner:v:scope.md";
+        let members = std::collections::HashSet::from([note.to_string(), "project:owner:p".into()]);
+        assert!(project_member_uid(note, &members));
+        assert!(project_member_uid(
+            &nestweaver_schema::uid::heading_uid(note, "intro", 2),
+            &members
+        ));
+        assert!(project_member_uid(
+            &nestweaver_schema::uid::section_uid(note, 3, "abcd"),
+            &members
+        ));
+        for foreign in ["note:owner:v:scope.md.backup", "note:foreign:v:scope.md"] {
+            assert!(!project_member_uid(foreign, &members));
+            assert!(!project_member_uid(
+                &nestweaver_schema::uid::heading_uid(foreign, "intro", 2),
+                &members
+            ));
+            assert!(!project_member_uid(
+                &nestweaver_schema::uid::section_uid(foreign, 3, "abcd"),
+                &members
+            ));
+        }
+        assert!(!project_member_uid("tag:shared", &members));
+    }
+
+    #[test]
+    fn project_context_never_fills_budget_from_outside_membership() {
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_vault(&Vault {
@@ -15548,7 +15664,7 @@ mod project_context_bug12_tests {
                 .unwrap();
         }
         for (i, member) in members.iter().enumerate() {
-            let section_uid = format!("sec:{member}");
+            let section_uid = nestweaver_schema::uid::section_uid(member, 1, &format!("th-{i}"));
             store
                 .insert_section(&Section {
                     uid: section_uid.clone(),
@@ -15587,6 +15703,21 @@ mod project_context_bug12_tests {
                 None,
             )
             .unwrap();
+            if budget == 16_000 {
+                assert!(
+                    !resp["connected"].as_array().unwrap().is_empty(),
+                    "members remain visible"
+                );
+            }
+            for node in resp["connected"].as_array().unwrap() {
+                assert_eq!(node["in_project"], true, "{node}");
+                assert_eq!(node["source_project"], resp["project_uid"], "{node}");
+                assert!(node["membership_basis"].as_str().is_some(), "{node}");
+            }
+            assert_eq!(
+                resp["budget_exceeded"],
+                resp["tokens_used"].as_u64().unwrap() > budget as u64
+            );
             resp["connected"]
                 .as_array()
                 .expect("connected array")
@@ -15596,39 +15727,13 @@ mod project_context_bug12_tests {
                 .count()
         };
 
-        // The measured sweep on this fixture, which is the ticket's open
-        // question answered: foreign notes per token_budget =
-        //   100 -> 0, 200 -> 0, 400 -> 6, 800 -> 10, 1600 -> 10, 3200 -> 10,
-        //   16000 -> 10
-        // Zero while the budget is smaller than the project's own mass, then
-        // monotonically rising, then flat once the walk runs out of reachable
-        // foreign notes. That is a budget-fill signature, not a similarity one:
-        // no PPR-weight change can fix it, and it is not specific to small
-        // projects — it is what every project does once `token_budget` exceeds
-        // its in-project reachable mass.
-        let tight = foreign_count(200);
-        let roomy = foreign_count(800);
-
-        assert_eq!(
-            tight, 0,
-            "characterisation: a budget smaller than the project's own mass \
-             leaks nothing — the members fill it first"
-        );
-        assert!(
-            roomy > tight,
-            "characterisation: with no scope filter on by default, the surplus \
-             budget is filled from whatever the PPR walk reached, including \
-             notes belonging to no project (nw-305). Measured {tight} foreign \
-             at budget 200 and {roomy} at 800. Flip this assertion once the \
-             owner picks between `in_project` disclosure and a `scope` argument."
-        );
-        assert!(
-            foreign_count(16_000) >= roomy,
-            "the leak is BUDGET-driven, not similarity-driven: the foreign \
-             count must not SHRINK as the budget grows. If this ever inverts, \
-             the ticket's 'small projects leak' framing is right after all and \
-             the fix belongs in ranking rather than in scoping."
-        );
+        for budget in [1, 200, 800, 16_000] {
+            assert_eq!(
+                foreign_count(budget),
+                0,
+                "strict membership at budget {budget}"
+            );
+        }
     }
 
     #[test]
@@ -15918,6 +16023,51 @@ mod project_context_bug12_tests {
             with_model["_meta"]["answer_shaping"]["track_interactions"], true,
             "the [ranking] track_interactions input must be disclosed: {with_model}"
         );
+    }
+
+    #[test]
+    fn brain_context_enforces_both_caps_and_reports_binding_cause() {
+        set_current_instance_config(None);
+        let store = GraphStore::in_memory().unwrap();
+        let mut seeds = Vec::new();
+        for i in 0..10 {
+            let name = format!("CapFixture{i}");
+            store
+                .insert_symbol(&mk_symbol(
+                    &format!("sym:repo:t:abc:cap{i}"),
+                    "repo:t:abc",
+                    "src/cap.rs",
+                    &name,
+                ))
+                .unwrap();
+            seeds.push(name);
+        }
+        let query = |limit, budget| {
+            tool_brain_context(&store, None,
+            json!({"seeds": seeds, "limit": limit, "token_budget": budget, "response_format": "detailed"}),
+            None, None, None).unwrap()
+        };
+        let count = query(2, 16000);
+        assert_eq!(count["returned"], 2, "{count}");
+        assert!(count["total"].as_u64().unwrap() > 2, "{count}");
+        assert_eq!(count["truncated_by"], "limit");
+        let tokens = query(10, 1);
+        assert_eq!(tokens["returned"], 0, "{tokens}");
+        assert_eq!(tokens["tokens_used"], 0);
+        assert_eq!(tokens["truncated_by"], "token_budget");
+        for invalid in [0, 1001] {
+            assert!(
+                tool_brain_context(
+                    &store,
+                    None,
+                    json!({"seeds": seeds, "limit":invalid}),
+                    None,
+                    None,
+                    None
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

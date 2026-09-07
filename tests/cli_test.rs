@@ -191,7 +191,7 @@ path = "/tmp/nestweaver/repo"
         .unwrap();
 
     assert!(!output.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["valid"], false);
     assert_eq!(result["path"], config_path.display().to_string());
     let error = result["error"].as_str().unwrap();
