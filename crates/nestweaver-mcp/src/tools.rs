@@ -15716,7 +15716,7 @@ mod project_context_bug12_tests {
             }
             assert_eq!(
                 resp["budget_exceeded"],
-                resp["tokens_used"].as_u64().unwrap() > budget as u64
+                resp["tokens_used"].as_u64().unwrap() > budget
             );
             resp["connected"]
                 .as_array()
