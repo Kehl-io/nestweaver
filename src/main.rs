@@ -2875,6 +2875,46 @@ fn render_investigate_text(payload: &serde_json::Value) {
 /// emitting JSON or text depending on whether a daemon happened to be running
 /// (nw-108).
 fn render_blast_radius_text(payload: &serde_json::Value) {
+    // nw-454. Every read below is a TOP-LEVEL key, and a two-tier payload has
+    // none of them up there -- it carries `tier`, `local_impact` and
+    // `org_wide_impact`. So a federated call printed "0 affected symbol(s),
+    // risk " with blank status and gate_state, then "No affected symbols
+    // reported.".
+    //
+    // That was survivable while the exit code was ALSO wrong (nw-442): both
+    // said "clean" and at least agreed. Now that the exit code is correct, a
+    // federated run can exit 2 while the text claims nothing was affected --
+    // a CI failure with no visible cause. Render each tier through this same
+    // function instead, so the two surfaces cannot disagree.
+    if payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier") {
+        if let Some(local) = payload.get("local_impact") {
+            println!("Local impact");
+            render_blast_radius_text(local);
+        }
+        let org = payload.get("org_wide_impact");
+        println!();
+        match org.and_then(|o| o.get("results")) {
+            Some(results) => {
+                let server = org
+                    .and_then(|o| o.get("source_server"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("upstream");
+                println!("Org-wide impact (via {server})");
+                render_blast_radius_text(results);
+            }
+            None => {
+                // An unavailable upstream carries `status`/`note` and no
+                // `results`. Say so rather than printing an empty section that
+                // reads as "upstream found nothing".
+                let note = org
+                    .and_then(|o| o.get("note"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("upstream did not answer");
+                println!("Org-wide impact: unavailable — {note}");
+            }
+        }
+        return;
+    }
     let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let n = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -2939,6 +2979,101 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
     }
 }
 
+/// The tier of a `brain_impact` payload that the CLI's rendering block reads.
+///
+/// nw-451, the same class as nw-442 on a different command. `brain_impact` is
+/// `ToolRouting::TwoTier`, so with a healthy upstream the daemon returns
+/// `{tier, local_impact, org_wide_impact}` and NOTHING the caller wants is at
+/// the top level. Three separate reads then went wrong at once:
+/// `value.get("status")` missed a local `not_found`/`ambiguous` and fell
+/// through to the "found" branch; `value.get("impact_nodes")` was `None`, so
+/// `--json` printed the whole envelope as if it were the node list; and the
+/// text branch, gated on the same `None`, was skipped entirely and the command
+/// returned `EXIT_SUCCESS` having printed NOTHING.
+///
+/// Unwrapping to the local tier restores all three. An unrecognised or absent
+/// `tier` is returned unchanged, so single-tier behaviour is untouched.
+fn brain_impact_local_tier(payload: &serde_json::Value) -> &serde_json::Value {
+    if payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier")
+        && let Some(local) = payload.get("local_impact")
+    {
+        return local;
+    }
+    payload
+}
+
+/// Whether `payload` is a two-tier envelope carrying an org-wide tier that the
+/// CLI does not yet render.
+///
+/// nw-451: reading only the local tier is correct but INCOMPLETE, and silently
+/// dropping an upstream answer is the kind of omission this codebase treats as
+/// a disclosure defect. The caller prints a note rather than pretending the
+/// local tier was the whole response.
+fn brain_impact_has_unrendered_org_tier(payload: &serde_json::Value) -> bool {
+    payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier")
+        && payload
+            .get("org_wide_impact")
+            .and_then(|org| org.get("results"))
+            .is_some()
+}
+
+#[cfg(test)]
+mod brain_impact_tier_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn two_tier(local: serde_json::Value) -> serde_json::Value {
+        json!({
+            "tier": "two_tier",
+            "local_impact": local,
+            "org_wide_impact": {"source_server": "org", "results": {"impact_nodes": []}},
+        })
+    }
+
+    #[test]
+    fn a_two_tier_envelope_resolves_to_its_local_tier() {
+        let local = json!({"status": "not_found", "impact_nodes": []});
+        let payload = two_tier(local.clone());
+        assert_eq!(brain_impact_local_tier(&payload), &local);
+    }
+
+    /// The defect in one assertion: pre-fix, `status` read `None` from the
+    /// envelope and a genuinely missing symbol rendered as "found".
+    #[test]
+    fn a_local_not_found_is_visible_through_the_envelope() {
+        let payload = two_tier(json!({"status": "not_found"}));
+        assert_eq!(
+            brain_impact_local_tier(&payload)
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("not_found")
+        );
+        assert_eq!(payload.get("status").and_then(|v| v.as_str()), None);
+    }
+
+    /// COUNTERWEIGHT: a single-tier payload must pass through untouched, or
+    /// every non-federated caller would start reading a tier that is not there.
+    #[test]
+    fn a_single_tier_payload_is_returned_unchanged() {
+        let single = json!({"status": "ok", "impact_nodes": [{"uid": "a"}]});
+        assert_eq!(brain_impact_local_tier(&single), &single);
+        assert!(!brain_impact_has_unrendered_org_tier(&single));
+    }
+
+    /// COUNTERWEIGHT: an unavailable upstream carries no `results`, so there is
+    /// nothing unrendered to disclose and the note must not fire.
+    #[test]
+    fn an_unavailable_upstream_is_not_reported_as_unrendered() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": {"status": "ok"},
+            "org_wide_impact": {"source_server": "org", "status": "unavailable"},
+        });
+        assert!(!brain_impact_has_unrendered_org_tier(&payload));
+        assert!(brain_impact_has_unrendered_org_tier(&two_tier(json!({}))));
+    }
+}
+
 /// Derive `blast-radius`'s process exit code from its response payload.
 ///
 /// nw-442: this used to read `resolver_stale_repos` from the TOP level of
@@ -2986,6 +3121,65 @@ fn blast_radius_tier_is_stale(payload: &serde_json::Value) -> bool {
     payload["resolver_stale_repos"]
         .as_array()
         .is_some_and(|repos| !repos.is_empty())
+}
+
+#[cfg(test)]
+mod blast_radius_text_tier_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// nw-454: the renderer reads top-level keys, which a two-tier payload does
+    /// not have. These pin that the two-tier shape is DETECTED — the printing
+    /// itself goes to stdout, so the observable contract under test is that the
+    /// function recognises the envelope and recurses rather than falling into
+    /// the single-tier reads and printing zeros.
+    #[test]
+    fn a_two_tier_payload_is_recognised_as_such() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": {"affected_symbol_count": 3, "risk": "high"},
+            "org_wide_impact": {"source_server": "org", "results": {"affected_symbol_count": 1}},
+        });
+        assert_eq!(
+            payload.get("tier").and_then(serde_json::Value::as_str),
+            Some("two_tier")
+        );
+        // The single-tier reads the renderer would otherwise use find nothing,
+        // which is exactly why the old output said 0 / blank.
+        assert_eq!(payload.get("affected_symbol_count"), None);
+        assert_eq!(payload.get("risk"), None);
+        // Rendering must not panic on either tier shape.
+        render_blast_radius_text(&payload);
+    }
+
+    /// COUNTERWEIGHT: an unavailable upstream has no `results`, and must render
+    /// as unavailable rather than as an empty (i.e. "found nothing") section.
+    #[test]
+    fn an_unavailable_upstream_renders_without_panicking() {
+        let payload = json!({
+            "tier": "two_tier",
+            "local_impact": {"affected_symbol_count": 0, "risk": "low"},
+            "org_wide_impact": {"source_server": "org", "status": "unavailable"},
+        });
+        assert!(
+            payload
+                .get("org_wide_impact")
+                .and_then(|o| o.get("results"))
+                .is_none()
+        );
+        render_blast_radius_text(&payload);
+    }
+
+    /// COUNTERWEIGHT: a single-tier payload must still take the original path.
+    #[test]
+    fn a_single_tier_payload_still_renders_directly() {
+        let payload = json!({"affected_symbol_count": 2, "risk": "low", "status": "complete"});
+        assert_ne!(
+            payload.get("tier").and_then(serde_json::Value::as_str),
+            Some("two_tier")
+        );
+        render_blast_radius_text(&payload);
+    }
 }
 
 #[cfg(test)]
@@ -19572,6 +19766,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "limit": limit,
                     }),
                 )? {
+                    // nw-451: unwrap a two-tier envelope BEFORE anything reads
+                    // this payload. `brain_impact` is TwoTier-routed, so with a
+                    // healthy upstream `status` and `impact_nodes` live inside
+                    // `local_impact` and every read below sees `None` at the top
+                    // level -- which silently turned a `not_found` into "found"
+                    // and made the text path print nothing and exit 0.
+                    let envelope = value;
+                    let value = brain_impact_local_tier(&envelope).clone();
+                    if brain_impact_has_unrendered_org_tier(&envelope) && !json && !out.quiet {
+                        // Disclose rather than drop: the local tier is not the
+                        // whole answer, and saying so is cheaper than pretending.
+                        eprintln!(
+                            "Note: an org-wide tier was returned and is not rendered here; \
+                             use --json to see it."
+                        );
+                    }
                     // Honor the daemon tool's status so daemon mode matches the direct path's
                     // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
                     match value.get("status").and_then(|v| v.as_str()) {

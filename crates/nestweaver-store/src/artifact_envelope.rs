@@ -24,6 +24,31 @@ pub fn is_stale_artifact_generation(message: &str) -> bool {
     message.contains(STALE_ARTIFACT_MARKER)
 }
 
+/// Marks a refusal that a caller can clear by REBUILDING the artifact.
+///
+/// nw-459. `producer_version` is compared by exact string equality, so a
+/// cache written by ANY earlier release compares unequal — even when
+/// `algorithm_fingerprint`, the field that exists to express algorithmic
+/// compatibility, matches exactly. That collapsed two different facts into
+/// one refusal: "a different ALGORITHM produced this" (must abort) and "the
+/// same algorithm in an older BUILD produced this" (drop it and move on).
+///
+/// Measured cost of the collapse on a live install: the first `brain refresh`
+/// after upgrading exited 1, because a producer-only mismatch degraded a
+/// publication whose graph had committed perfectly. Every user hit that on
+/// every upgrade.
+///
+/// This marker restores the distinction the module header already claims to
+/// draw, alongside [`STALE_ARTIFACT_MARKER`], so callers classify rather than
+/// string-match a version.
+pub const REBUILDABLE_ARTIFACT_MARKER: &str = "rebuildable artifact";
+
+/// Whether an error message is a refusal a re-index would clear.
+#[must_use]
+pub fn is_rebuildable_artifact(message: &str) -> bool {
+    message.contains(REBUILDABLE_ARTIFACT_MARKER) || is_stale_artifact_generation(message)
+}
+
 use serde_json::Value;
 
 use crate::{PublicationIdentity, StoreError};
@@ -113,6 +138,29 @@ impl ArtifactEnvelope {
             return Err(incompatible(format!(
                 "envelope version {} does not match supported version {}",
                 self.envelope_version, ARTIFACT_ENVELOPE_VERSION
+            )));
+        }
+        // nw-459: the producer is checked SEPARATELY and FIRST, because a
+        // producer-only difference is rebuildable rather than incompatible.
+        // Kind, schema and fingerprint must still match exactly — those
+        // describe WHAT the artifact is and HOW it was computed, and a
+        // mismatch there means the payload cannot be trusted at all.
+        if self.artifact_kind == expectation.artifact_kind
+            && self.artifact_schema_version == expectation.artifact_schema_version
+            && self.algorithm_fingerprint == expectation.algorithm_fingerprint
+            && self.producer_version != expectation.producer_version
+        {
+            return Err(StoreError::Query(format!(
+                "{REBUILDABLE_ARTIFACT_MARKER}: the {} artifact was produced by version {}, \
+                 but this build is {}. The algorithm ({}) and schema (v{}) are unchanged, so \
+                 this is derived data an upgrade invalidated, not a corrupt or foreign \
+                 artifact — re-index the repository \
+                 (`nestweaver index --repo <path> --force`) to regenerate it.",
+                self.artifact_kind,
+                self.producer_version,
+                expectation.producer_version,
+                self.algorithm_fingerprint,
+                self.artifact_schema_version
             )));
         }
         if self.artifact_kind != expectation.artifact_kind
@@ -263,6 +311,70 @@ mod tests {
             .validate_and_decode(expectation(&identity))
             .unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    /// nw-459: a producer-version bump alone must NOT read as "incompatible".
+    ///
+    /// `producer_version` was compared by exact string equality, so a cache
+    /// written by ANY earlier release was rejected — even though
+    /// `algorithm_fingerprint`, the field that exists to express algorithmic
+    /// compatibility, matched. Measured cost on a live install: the first
+    /// `brain refresh` after upgrading exited 1 on a vault that had committed
+    /// perfectly.
+    #[test]
+    fn a_producer_version_bump_alone_is_rebuildable_not_incompatible() {
+        let identity = identity();
+        let payload = HashMap::from([("a".to_string(), 1.0)]);
+        let envelope = ArtifactEnvelope::new(expectation(&identity), &payload).unwrap();
+
+        let mut upgraded = expectation(&identity);
+        upgraded.producer_version = "9.3.0";
+        let error = envelope
+            .validate_and_decode::<HashMap<String, f64>>(upgraded)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            is_rebuildable_artifact(&error),
+            "a producer-only difference must be classified rebuildable so callers can \
+             drop the cache and carry on; got {error:?}"
+        );
+        assert!(
+            error.contains("re-index") || error.contains("regenerate"),
+            "and it must name a remedy, like the generation check does; got {error:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT. Only the producer may differ. A fingerprint or schema
+    /// change is a REAL incompatibility and must stay a hard refusal, or this
+    /// fix would silently accept an artifact computed by a different algorithm.
+    #[test]
+    fn a_fingerprint_or_schema_change_is_still_hard_incompatible() {
+        let identity = identity();
+        let payload = HashMap::from([("a".to_string(), 1.0)]);
+        let envelope = ArtifactEnvelope::new(expectation(&identity), &payload).unwrap();
+
+        let mut fingerprint = expectation(&identity);
+        fingerprint.producer_version = "9.3.0";
+        fingerprint.algorithm_fingerprint = "pagerank-v3";
+        let error = envelope
+            .validate_and_decode::<HashMap<String, f64>>(fingerprint)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incompatible artifact"), "got {error:?}");
+        assert!(
+            !is_rebuildable_artifact(&error),
+            "a different ALGORITHM is not merely rebuildable; got {error:?}"
+        );
+
+        let mut schema = expectation(&identity);
+        schema.producer_version = "9.3.0";
+        schema.artifact_schema_version += 1;
+        let error = envelope
+            .validate_and_decode::<HashMap<String, f64>>(schema)
+            .unwrap_err()
+            .to_string();
+        assert!(!is_rebuildable_artifact(&error), "got {error:?}");
     }
 
     #[test]

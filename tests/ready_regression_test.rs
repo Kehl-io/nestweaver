@@ -289,11 +289,25 @@ fn healthy_empty_diff_ignores_an_unrelated_incompatible_repo() {
         .assert()
         .success();
     let repos = payload(&f.query(&["list-repos", "--json"], true));
+    // The indexer stores a CANONICAL root_path, so comparing it to the path
+    // string the test spelled is only correct where the two coincide. On macOS
+    // `TMPDIR` lives under `/var/folders/...` and `/var` is a symlink to
+    // `/private/var`, so the stored path is `/private/var/folders/...` and this
+    // find never matched -- the test failed at "unrelated repo must be indexed"
+    // on every macOS run while passing in CI, which is Linux-only. Canonicalise
+    // both sides so the comparison means what it says on either platform.
+    let unrelated_canonical =
+        std::fs::canonicalize(&unrelated).expect("unrelated dir must exist to canonicalise");
     let unrelated_uid = repos
         .as_array()
         .unwrap()
         .iter()
-        .find(|repo| repo["root_path"].as_str() == unrelated.to_str())
+        .find(|repo| {
+            repo["root_path"]
+                .as_str()
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .is_some_and(|path| path == unrelated_canonical)
+        })
         .expect("unrelated repo must be indexed")["uid"]
         .as_str()
         .unwrap();
