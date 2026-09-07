@@ -1331,11 +1331,28 @@ pub async fn two_tier_query(
 /// hand-construct the string) green while federation silently reverted to
 /// killing a healthy upstream's entire two-tier answer.
 ///
-/// It is KEPT, and only for version skew: a client newer than the daemon it
-/// talks to receives no metadata code, and dropping this would reintroduce
-/// the exact regression the detection exists to prevent. `node_scope.rs`'s
-/// own prefix assertion still pins the literal at its source for as long as
-/// this fallback lives.
+/// It is KEPT for two reasons, and the second one is load-bearing far more
+/// often than it looks:
+///
+/// 1. Version skew: a client newer than the daemon it talks to receives no
+///    metadata code.
+/// 2. REQUEST COALESCING. `blast_radius` is in `CACHEABLE_TOOLS`, so
+///    concurrent identical calls collapse through
+///    `nestweaver_mcp::tools::coalesce_in_flight`. Only the LEADER runs
+///    `resolve_repo_filter` and holds the typed error; every follower is
+///    handed `anyhow!("{msg}")` rebuilt from a STRING the leader published,
+///    with `RepoFilterUnresolved` nowhere in its chain. The daemon therefore
+///    cannot stamp the code for a follower, and detection for those callers
+///    runs entirely on the prose below. Measured against a live daemon with
+///    12 concurrent identical calls: 1-2 responses carried the code, 10-11
+///    did not.
+///
+/// So "a rewording can no longer break this" is TRUE for a unique request and
+/// FALSE for a coalesced follower. Closing that properly means preserving an
+/// error code across the coalescing boundary in `tools.rs`, which is shared
+/// cache infrastructure well outside this item; until then the fallback is
+/// what keeps federation correct under concurrency, and `node_scope.rs`'s
+/// prefix assertion is what keeps the fallback honest.
 ///
 /// `nestweaver-daemon`'s `dispatch_err_to_status` wraps a tool's error as
 /// `Status::internal("tool {tool} failed: {e}")`, and
