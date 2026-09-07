@@ -129,7 +129,11 @@ dedupe_changelog() {
   local before_bullets after_bullets removed half
 
   total_lines=$(wc -l < "$input")
-  first_line=$(grep -nE '^## \[' "$input" | head -1 | cut -d: -f1 || true)
+  # nw-456: `grep | head -1` under `pipefail` is the nw-450 shape -- head exits
+  # on the first match, grep takes SIGPIPE, and a SUCCESSFUL match is reported as
+  # a failed pipeline. `grep -m1` stops grep itself, so nothing is left writing
+  # into a closed pipe. Portable: -m is in GNU and BSD grep.
+  first_line=$(grep -m1 -nE '^## \[' "$input" | cut -d: -f1 || true)
 
   if [[ -z "$first_line" ]]; then
     # No version header at all -- nothing this script knows how to scope, so
@@ -281,8 +285,15 @@ self_test() {
   #    compare the wrong slices.
   local second_header second_line_source second_line_output
   second_header=$(grep -E '^## \[' "$changelog" | sed -n '2p')
-  second_line_source=$(grep -nFx -- "$second_header" "$changelog" | head -1 | cut -d: -f1)
-  second_line_output=$(printf '%s\n' "$output" | grep -nFx -- "$second_header" | head -1 | cut -d: -f1)
+  second_line_source=$(grep -m1 -nFx -- "$second_header" "$changelog" | cut -d: -f1)
+  # nw-456: a here-string, NOT a pipe. `grep -m1` is only safe when grep is the
+  # FIRST stage reading a file (lines 132/284). Here grep CONSUMES a ~350 KB
+  # producer, so making grep exit early leaves `printf` writing into a closed
+  # pipe -- printf takes SIGPIPE and `pipefail` reports 141. That is the same
+  # nw-450 shape, merely relocated from the consumer to the producer, and it
+  # was caught by this script's own self-test going 0 -> 141.
+  # `<<<` is a temp file rather than a pipe, so no stage can be SIGPIPEd.
+  second_line_output=$(grep -m1 -nFx -- "$second_header" <<< "$output" | cut -d: -f1)
   local expected_rest actual_rest
   expected_rest=$(mktemp)
   actual_rest=$(mktemp)
