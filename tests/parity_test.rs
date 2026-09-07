@@ -352,7 +352,7 @@ fn run_via_mcp(db_path: &Path, tool: &str, arguments: serde_json::Value) -> serd
     let frames = [
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": { "protocolVersion": "2024-11-05" }
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "parity-test", "version": "1" } }
         }),
         serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         serde_json::json!({
@@ -2014,7 +2014,7 @@ fn mcp_raw_frame(db_path: &Path, tool: &str, arguments: serde_json::Value) -> se
     let frames = [
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": { "protocolVersion": "2024-11-05" }
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "parity-test", "version": "1" } }
         }),
         serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         serde_json::json!({
@@ -2886,7 +2886,7 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
         "a consumer that cannot tell WHICH cap cut raises the wrong knob: {capped}"
     );
 
-    // ── CLI direct, cut by --token-budget; the budget takes precedence ──
+    // ── CLI direct, cut by --token-budget; both caps apply; the smaller budget binds ──
     let by_budget = run_direct(
         db,
         &[
@@ -2910,7 +2910,7 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
     assert_eq!(
         by_budget.get("truncated_by").and_then(|v| v.as_str()),
         Some("token_budget"),
-        "the budget is applied INSTEAD of --limit here, so naming --limit is the \
+        "the budget is tighter than --limit here, so naming --limit is the \
          wrong remedy: {by_budget}"
     );
 
@@ -2975,7 +2975,7 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
             "mainA",
             "--json",
             "--limit",
-            "5000",
+            "1000",
             "--token-budget",
             "16000",
         ],
@@ -3011,7 +3011,7 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
             "mainA",
             "--json",
             "--limit",
-            "5000",
+            "1000",
             "--token-budget",
             "16000",
         ],
