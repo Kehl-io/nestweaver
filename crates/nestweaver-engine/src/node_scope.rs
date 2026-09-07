@@ -88,6 +88,58 @@ pub fn node_owner(uid: &str) -> NodeOwner {
     }
 }
 
+/// The gRPC metadata key carrying a machine-readable NestWeaver error code.
+///
+/// nw-443. This lives here, next to the only error that sets it, rather than
+/// in the proto crate: the producing error type and the code that names it
+/// have to change together, and splitting them across crates is how the
+/// PREVIOUS contract (a bare message prefix) ended up pinned by nothing on
+/// either end.
+pub const NW_ERROR_CODE_METADATA_KEY: &str = "nw-error-code";
+
+/// The code stamped when a `repo` filter selector did not resolve.
+pub const REPO_FILTER_UNRESOLVED_CODE: &str = "repo-filter-unresolved";
+
+/// A `repo` filter selector that did not resolve against the graph — either
+/// not found, or ambiguous.
+///
+/// nw-443. `resolve_repo_filter` used to signal this with `anyhow!` and a
+/// message prefix, and `nestweaver-client`'s federation degrade recognized it
+/// by SUBSTRING-MATCHING that prefix across three crates. Nothing pinned the
+/// literal on either end: the producing tests asserted only `"ambiguous"` /
+/// `"not-a-repo"`, and the consuming tests hand-constructed the string as a
+/// fixture instead of calling this function. A rename here therefore left both
+/// sides green while silently reverting federation to the pre-fix behaviour,
+/// where one unresolvable local `--repo` killed an otherwise healthy upstream's
+/// entire two-tier answer.
+///
+/// The `Display` output is byte-identical to the old `anyhow!` wrapper on
+/// purpose: this is a change of TYPE, not of what a user reads. The prefix
+/// assertion below still pins that text, because a downgrade path (a new
+/// client against an older daemon that cannot stamp the metadata code) still
+/// falls back to it.
+#[derive(Debug, thiserror::Error)]
+#[error("repo filter entry {selector:?}: {rendered}")]
+pub struct RepoFilterUnresolved {
+    /// The selector as the caller spelled it.
+    pub selector: String,
+    /// The underlying resolver failure, pre-rendered with `{:#}` so the
+    /// "ambiguous; use an exact UID: …" candidate list survives — see the
+    /// note in `resolve_repo_filter` on why `.context()` is wrong here.
+    rendered: String,
+}
+
+impl RepoFilterUnresolved {
+    /// Public so the daemon's own status-mapping test can build one without
+    /// standing up a graph store just to provoke a resolver failure.
+    pub fn new(selector: &str, error: &anyhow::Error) -> Self {
+        Self {
+            selector: selector.to_string(),
+            rendered: format!("{error:#}"),
+        }
+    }
+}
+
 /// Resolve caller-supplied `repos:` / `--repos` entries to concrete repo
 /// UIDs.
 ///
@@ -127,7 +179,10 @@ pub fn resolve_repo_filter(
                 // OUTERMOST context — so a `.context()` here would hide the
                 // resolver's own "ambiguous; use an exact UID: …" candidate
                 // list, which is the only actionable part of the message.
-                .map_err(|error| anyhow!("repo filter entry {selector:?}: {error:#}"))
+                // nw-443: a TYPED error, not `anyhow!` with a magic prefix.
+                // `Display` is unchanged; what changed is that a consumer can
+                // now downcast instead of matching on prose.
+                .map_err(|error| anyhow::Error::new(RepoFilterUnresolved::new(selector, &error)))
         })
         .collect()
 }
@@ -335,16 +390,67 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        // This exact prefix, with the trailing space, is the literal
-        // `nestweaver-client/src/hybrid.rs`'s `UNRESOLVED_REPO_FILTER_SIGNAL`
-        // constant matches against across the daemon/gRPC boundary. If this
-        // assertion needs to change, `UNRESOLVED_REPO_FILTER_SIGNAL` (and its
-        // own test fixtures) must change with it in the same commit.
+        // nw-443 DEMOTED this from the contract to the FALLBACK. The prose
+        // is no longer how federation recognizes the condition -- the typed
+        // `RepoFilterUnresolved` and its error code are (see the test
+        // below). This prefix still matters only for a client newer than the
+        // daemon it talks to, which receives no metadata code; when that
+        // downgrade path is retired, `UNRESOLVED_REPO_FILTER_SIGNAL` and this
+        // assertion go together.
         assert!(
             error.starts_with("repo filter entry "),
             "resolve_repo_filter's not-found error must start with the literal \
              \"repo filter entry \" prefix nestweaver-client's federation fix \
              matches on; got {error:?}"
         );
+    }
+
+    /// nw-443: the contract that REPLACED the prefix above. A consumer must
+    /// be able to recognize this condition by TYPE, so that rewording the
+    /// message -- which nw-334 is open to do across this codebase -- cannot
+    /// silently revert federation to killing a healthy upstream's answer.
+    #[test]
+    fn resolve_repo_filter_not_found_error_is_typed_and_carries_the_selector() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: REPO_A.to_string(),
+                url: "https://example.test/repo-a".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let error = resolve_repo_filter(&store, &["this-repo-does-not-exist".to_string()], None)
+            .unwrap_err();
+
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RepoFilterUnresolved>())
+            .expect("an unresolved repo filter must be downcastable, not just readable");
+        assert_eq!(typed.selector, "this-repo-does-not-exist");
+    }
+
+    /// COUNTERWEIGHT: a selector that DOES resolve must not produce the error
+    /// at all, or the type above would be meaningless.
+    #[test]
+    fn a_resolvable_selector_produces_no_repo_filter_error() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: REPO_A.to_string(),
+                url: "https://example.test/repo-a".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: Some("repo-a".to_string()),
+                root_path: None,
+            })
+            .unwrap();
+
+        assert!(resolve_repo_filter(&store, &["repo-a".to_string()], None).is_ok());
     }
 }
