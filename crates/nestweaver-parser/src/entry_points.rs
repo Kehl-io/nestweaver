@@ -1258,7 +1258,13 @@ mod tests {
     #[test]
     fn a_function_named_after_the_file_is_not_the_component() {
         assert_eq!(
-            detect_entry_point("Counter", "src/lib/Counter.svelte", "function", None, "svelte"),
+            detect_entry_point(
+                "Counter",
+                "src/lib/Counter.svelte",
+                "function",
+                None,
+                "svelte"
+            ),
             None
         );
         assert_eq!(
