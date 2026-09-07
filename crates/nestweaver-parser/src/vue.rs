@@ -90,6 +90,12 @@ const CALL_EXCLUDE: &[&str] = &[
 /// - Function calls → [`ReferenceKind::Call`]
 pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
     let path_str = path.to_string_lossy().into_owned();
+    // nw-441: one spelling of the entry-point question for every symbol
+    // this file mints. These parsers used to hardcode
+    // `is_entry_point: false` at each construction site instead.
+    let entry_point_of = |name: &str, kind: &str, signature: Option<&str>| {
+        crate::entry_points::detect_entry_point(name, &path_str, kind, signature, "vue")
+    };
 
     let mut symbols: Vec<RawSymbol> = Vec::new();
     let mut references: Vec<RawReference> = Vec::new();
@@ -132,6 +138,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
 
             // defineComponent call
             if RE_DEFINE_COMPONENT.is_match(trimmed) {
+                let entry_point = entry_point_of(&component_name, "class", Some(trimmed));
                 symbols.push(RawSymbol {
                     name: component_name.clone(),
                     kind: SymbolKind::Class,
@@ -139,8 +146,8 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
-                    is_entry_point: false,
-                    entry_point_kind: None,
+                    is_entry_point: entry_point.is_some(),
+                    entry_point_kind: entry_point,
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
@@ -150,6 +157,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
 
             // export default (without defineComponent on same line)
             if RE_EXPORT_DEFAULT.is_match(trimmed) && !RE_DEFINE_COMPONENT.is_match(trimmed) {
+                let entry_point = entry_point_of(&component_name, "class", Some(trimmed));
                 symbols.push(RawSymbol {
                     name: component_name.clone(),
                     kind: SymbolKind::Class,
@@ -157,8 +165,8 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
-                    is_entry_point: false,
-                    entry_point_kind: None,
+                    is_entry_point: entry_point.is_some(),
+                    entry_point_kind: entry_point,
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
@@ -172,6 +180,11 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                 // `parse::export_declaration_kind`.
                 let kind = crate::parse::export_declaration_kind(&cap[1]);
                 let name = cap[2].to_string();
+                let entry_point = entry_point_of(
+                    &name,
+                    crate::entry_points::symbol_kind_label(kind),
+                    Some(trimmed),
+                );
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -179,8 +192,8 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
-                    is_entry_point: false,
-                    entry_point_kind: None,
+                    is_entry_point: entry_point.is_some(),
+                    entry_point_kind: entry_point,
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
@@ -193,6 +206,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                 && let Some(cap) = RE_FUNCTION.captures(trimmed)
             {
                 let name = cap[1].to_string();
+                let entry_point = entry_point_of(&name, "function", Some(trimmed));
                 symbols.push(RawSymbol {
                     name,
                     kind: SymbolKind::Function,
@@ -200,8 +214,8 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
-                    is_entry_point: false,
-                    entry_point_kind: None,
+                    is_entry_point: entry_point.is_some(),
+                    entry_point_kind: entry_point,
                     visibility: Visibility::Private,
                     type_info: None,
                     parent_name: None,

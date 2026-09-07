@@ -1249,20 +1249,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let content_hash = sha256_hex(node_text);
                 let signature = signature_line(node_text, lang_str);
 
-                let kind_label = match kind {
-                    SymbolKind::Function => "function",
-                    SymbolKind::Class => "class",
-                    SymbolKind::Method => "method",
-                    SymbolKind::Interface => "interface",
-                    SymbolKind::Trait => "trait",
-                    SymbolKind::Enum => "enum",
-                    SymbolKind::Module => "module",
-                    SymbolKind::Extension => "extension",
-                    SymbolKind::Constant => "constant",
-                    SymbolKind::Property => "property",
-                    SymbolKind::TypeAlias => "type_alias",
-                    SymbolKind::Variable => "variable",
-                };
+                let kind_label = crate::entry_points::symbol_kind_label(kind);
                 // A `definition.function` captured on a `call_expression` node is a
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
@@ -4106,6 +4093,86 @@ use crate::config::{Settings, load as load_config};
     }
 
     // ── Svelte tests ─────────────────────────────────────────────────────
+
+    // ── nw-441: component-framework entry points ─────────────────────────
+
+    /// nw-441: `vue.rs`, `svelte.rs` and `astro.rs` hardcoded
+    /// `is_entry_point: false` on EVERY symbol, so a Vue/Svelte/Astro
+    /// component could never seed a reachability walk and component-only code
+    /// was unreachable by construction. These assert the wiring end to end --
+    /// through the real parser, not just `detect_entry_point` in isolation.
+    fn component_symbol<'a>(parsed: &'a ParsedFile, name: &str) -> &'a RawSymbol {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name && s.kind == SymbolKind::Class)
+            .unwrap_or_else(|| panic!("no class symbol named {name}"))
+    }
+
+    #[test]
+    fn parse_vue_marks_the_component_as_an_entry_point() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+        let component = component_symbol(&parsed, "simple");
+        assert!(component.is_entry_point, "the Vue component roots the walk");
+        assert_eq!(
+            component.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    #[test]
+    fn parse_svelte_marks_the_component_as_an_entry_point() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+        let component = component_symbol(&parsed, "simple");
+        assert!(component.is_entry_point);
+        assert_eq!(
+            component.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    #[test]
+    fn parse_astro_marks_the_component_as_an_entry_point() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+        let component = component_symbol(&parsed, "simple");
+        assert!(component.is_entry_point);
+        assert_eq!(
+            component.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT. Without this the three tests above would also pass if
+    /// the parsers flipped `is_entry_point: true` on EVERYTHING -- which
+    /// would make `dead-code` report nothing dead in a component corpus, the
+    /// opposite failure and an equally useless one. A private helper in the
+    /// same file must stay non-entry.
+    #[test]
+    fn a_private_helper_in_a_component_file_stays_non_entry() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+        let handler = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "handleClick")
+            .expect("fixture defines handleClick");
+        assert!(
+            !handler.is_entry_point,
+            "a non-exported handler is not an entry point"
+        );
+
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatTitle")
+            .expect("fixture defines formatTitle");
+        assert!(!helper.is_entry_point);
+    }
 
     #[test]
     fn parse_svelte_extracts_component() {

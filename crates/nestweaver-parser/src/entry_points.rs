@@ -119,6 +119,30 @@ fn ends_with_test_stem(file_name: &str, ext: &str) -> bool {
         .is_some_and(|stem| stem.ends_with("_test"))
 }
 
+/// The lowercase label `detect_entry_point` expects for a `SymbolKind`.
+///
+/// nw-441: this used to live as an inline `match` inside `parse.rs`'s
+/// tree-sitter loop, which is why the three bespoke component parsers had no
+/// cheap way to call `detect_entry_point` and hardcoded `false` instead.
+/// One spelling, shared by every caller.
+pub fn symbol_kind_label(kind: nestweaver_schema::SymbolKind) -> &'static str {
+    use nestweaver_schema::SymbolKind;
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Module => "module",
+        SymbolKind::Extension => "extension",
+        SymbolKind::Constant => "constant",
+        SymbolKind::Property => "property",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Variable => "variable",
+    }
+}
+
 /// Whether `language` has an entry-point detection model AT ALL.
 ///
 /// "Zero entry points found" conflates two different facts, and a caller
@@ -132,15 +156,20 @@ fn ends_with_test_stem(file_name: &str, ext: &str) -> bool {
 /// - The language has NO model at all -- not a gap, a known limitation.
 ///   `detect_entry_point` below returns `"sql" | "hcl" => None`
 ///   unconditionally (SQL/HCL are declarative; there is no "entry" to
-///   detect), SystemVerilog has no arm and falls through the wildcard, and
-///   Vue/Svelte/Astro construct every symbol with `is_entry_point: false`
-///   hardcoded in their own parse functions -- `detect_entry_point` is never
-///   even CALLED for them. Folding this case into "coverage gap" would
-///   degrade `coverage_is_complete` PERMANENTLY for any corpus containing
-///   one `.sql`, `.tf`, `.sv`, `.vue`, `.svelte` or `.astro` file, with no
-///   user action able to clear it -- the same failure shape as a check that
-///   never fires: a gate that always fires carries the same amount of
-///   information as one that never does.
+///   detect), and SystemVerilog has no arm and falls through the wildcard.
+///   Folding this case into "coverage gap" would degrade
+///   `coverage_is_complete` PERMANENTLY for any corpus containing one
+///   `.sql`, `.tf` or `.sv` file, with no user action able to clear it --
+///   the same failure shape as a check that never fires: a gate that always
+///   fires carries the same amount of information as one that never does.
+///
+/// nw-441 MOVED Vue/Svelte/Astro OUT of that second group. They used to sit
+/// there for a reason that was never a decision: their bespoke parsers built
+/// every symbol with `is_entry_point: false` hardcoded and never called
+/// `detect_entry_point` at all, so a component could not root a reachability
+/// walk and component-only code was unreachable by construction. They now
+/// have `detect_component_framework`, so a zero from one of them is once
+/// again a REAL gap and must stay reportable.
 ///
 /// This match has NO wildcard arm ON PURPOSE. A hand-maintained "languages
 /// without a model" list rots the moment someone adds a 33rd language or
@@ -175,18 +204,13 @@ pub fn language_has_entry_point_model(language: Language) -> bool {
         | Language::PowerShell
         | Language::Julia
         | Language::Fortran
-        | Language::Pascal => true,
-        // No entry-point model. SQL/HCL: declarative, unconditional `None`
-        // below. SystemVerilog: no arm below, falls through `_ => None`.
-        // Vue/Svelte/Astro: `is_entry_point: false` is hardcoded where their
-        // symbols are constructed (vue.rs/svelte.rs/astro.rs) -- this
-        // function's caller never runs for them at all.
-        Language::Sql
-        | Language::Hcl
-        | Language::SystemVerilog
+        | Language::Pascal
         | Language::Vue
         | Language::Svelte
-        | Language::Astro => false,
+        | Language::Astro => true,
+        // No entry-point model. SQL/HCL: declarative, unconditional `None`
+        // below. SystemVerilog: no arm below, falls through `_ => None`.
+        Language::Sql | Language::Hcl | Language::SystemVerilog => false,
     }
 }
 
@@ -204,6 +228,11 @@ pub fn detect_entry_point(
 ) -> Option<EntryPointKind> {
     match language {
         "javascript" | "typescript" => detect_js_ts(name, file_path, kind, signature),
+        // nw-441. A component framework's script block IS JavaScript/
+        // TypeScript, so the JS/TS rules apply to everything in it; what the
+        // JS rules cannot know is that the FILE is itself an instantiable
+        // component. `detect_component_framework` adds only that.
+        "vue" | "svelte" | "astro" => detect_component_framework(name, file_path, kind, signature),
         "python" => detect_python(name, file_path, kind, signature),
         "java" => detect_java(name, file_path, kind, signature),
         "go" => detect_go(name, file_path, kind, signature),
@@ -231,6 +260,54 @@ pub fn detect_entry_point(
         "fortran" => detect_fortran(name, file_path, kind, signature),
         "pascal" => detect_pascal(name, file_path, kind, signature),
         _ => None,
+    }
+}
+
+/// Entry points for the three component frameworks with bespoke parsers
+/// (`vue.rs`, `svelte.rs`, `astro.rs`).
+///
+/// nw-441. These parsers hardcoded `is_entry_point: false` on every symbol
+/// and bypassed `detect_entry_point` entirely, so `dead-code` could never
+/// root its reachability walk in a component and component-only code was
+/// unreachable BY CONSTRUCTION -- the same shape nw-435 found for bash and
+/// python, and the same shape nw-351 closed for C++ by widening the seed set.
+///
+/// The rule is deliberately narrow: the COMPONENT ITSELF is the entry point,
+/// identified by a class-kind symbol whose name is the file stem, which is
+/// exactly how all three parsers mint it. A Vue/Svelte/Astro component's
+/// default export is instantiable in precisely the sense `detect_js_ts`
+/// already treats a React component as an entry point.
+///
+/// Everything else in the file falls through to `detect_js_ts`, because a
+/// `<script>` block or an Astro frontmatter fence genuinely IS JS/TS -- so
+/// `getStaticPaths`, a `/pages/` route and a `/components/` component all
+/// keep the meaning those rules already give them, rather than getting a
+/// second, divergent spelling here.
+///
+/// `EntryPointKind::EventListener` is the existing overload for UI
+/// components (see the React hook/component notes in `detect_js_ts`); this
+/// adds no new variant on purpose.
+fn detect_component_framework(
+    name: &str,
+    file_path: &str,
+    kind: &str,
+    signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if kind == "class" && name == component_file_stem(file_path) {
+        return Some(EntryPointKind::EventListener);
+    }
+    detect_js_ts(name, file_path, kind, signature)
+}
+
+/// The file stem of `file_path` -- `src/lib/Counter.svelte` -> `Counter`.
+///
+/// This mirrors the `path.file_stem()` the three parsers use to name the
+/// component symbol, so the two agree by construction.
+fn component_file_stem(file_path: &str) -> &str {
+    let file_name = file_path.rsplit(['/', '\\']).next().unwrap_or(file_path);
+    match file_name.rfind('.') {
+        Some(0) | None => file_name,
+        Some(dot) => &file_name[..dot],
     }
 }
 
@@ -1079,17 +1156,13 @@ mod tests {
         .filter(|&lang| !language_has_entry_point_model(lang))
         .collect();
 
+        // nw-441 moved Vue/Svelte/Astro out of this list by giving them
+        // `detect_component_framework`. SQL and HCL are declarative and
+        // SystemVerilog has no arm; all three stay, deliberately.
         assert_eq!(
             without_model,
-            vec![
-                Language::Sql,
-                Language::Hcl,
-                Language::Vue,
-                Language::Svelte,
-                Language::Astro,
-                Language::SystemVerilog,
-            ],
-            "exactly these six languages have no entry-point model: {without_model:?}"
+            vec![Language::Sql, Language::Hcl, Language::SystemVerilog],
+            "exactly these three languages have no entry-point model: {without_model:?}"
         );
     }
 
@@ -1100,6 +1173,103 @@ mod tests {
     fn bash_and_python_have_an_entry_point_model() {
         assert!(language_has_entry_point_model(Language::Bash));
         assert!(language_has_entry_point_model(Language::Python));
+    }
+
+    // ── nw-441: the component-framework entry-point surface ─────────────
+
+    /// nw-441: `vue.rs`, `svelte.rs` and `astro.rs` built EVERY symbol with
+    /// `is_entry_point: false` hardcoded and never called `detect_entry_point`
+    /// at all, so a component could never root a reachability walk and
+    /// component-only code was unreachable BY CONSTRUCTION. These pin the
+    /// component itself as an entry point on each of the three.
+    #[test]
+    fn vue_component_is_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "Counter",
+                "src/components/Counter.vue",
+                "class",
+                Some("export default {"),
+                "vue",
+            ),
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    #[test]
+    fn svelte_component_is_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "Counter",
+                "src/lib/Counter.svelte",
+                "class",
+                Some("<svelte:component name=\"Counter\">"),
+                "svelte",
+            ),
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    #[test]
+    fn astro_component_is_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "Layout",
+                "src/layouts/Layout.astro",
+                "class",
+                Some("<astro:component name=\"Layout\">"),
+                "astro",
+            ),
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT. If every symbol in a component file were promoted, the
+    /// three tests above would pass for the wrong reason and `dead-code` would
+    /// report nothing dead in a component-only corpus -- a gate that always
+    /// fires. A private helper inside the same file must stay non-entry.
+    #[test]
+    fn a_private_helper_in_a_component_is_not_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "formatLabel",
+                "src/components/Counter.vue",
+                "function",
+                None,
+                "vue"
+            ),
+            None
+        );
+        assert_eq!(
+            detect_entry_point("tick", "src/lib/Counter.svelte", "function", None, "svelte"),
+            None
+        );
+    }
+
+    /// COUNTERWEIGHT. The component rule keys on the symbol NAME matching the
+    /// file stem. A class with some other name is not the component.
+    #[test]
+    fn a_differently_named_class_in_a_component_file_is_not_the_component() {
+        assert_eq!(
+            detect_entry_point(
+                "HelperWidget",
+                "src/lib/Counter.svelte",
+                "class",
+                None,
+                "svelte"
+            ),
+            None
+        );
+    }
+
+    /// nw-441 requires the honesty gate to be re-enrolled: with a model in
+    /// place, "zero entry points" for these three is once again a REAL
+    /// coverage gap rather than a known limitation.
+    #[test]
+    fn component_frameworks_have_an_entry_point_model() {
+        assert!(language_has_entry_point_model(Language::Vue));
+        assert!(language_has_entry_point_model(Language::Svelte));
+        assert!(language_has_entry_point_model(Language::Astro));
     }
 
     // ── nw-351: the C++ entry-point surface ─────────────────────────────

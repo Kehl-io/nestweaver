@@ -18,7 +18,9 @@ pub mod vue;
 
 pub use canvas::{CanvasEdge, CanvasFile, CanvasNode, parse_canvas};
 pub use dataview::{DataviewQuery, parse_dataview_query};
-pub use entry_points::{detect_entry_point, is_test_file, language_has_entry_point_model};
+pub use entry_points::{
+    detect_entry_point, is_test_file, language_has_entry_point_model, symbol_kind_label,
+};
 pub use frameworks::detect_frameworks;
 pub use language::{detect_language, is_markdown};
 pub use markdown::{
