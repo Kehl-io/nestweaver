@@ -1182,12 +1182,16 @@ mod tests {
     /// at all, so a component could never root a reachability walk and
     /// component-only code was unreachable BY CONSTRUCTION. These pin the
     /// component itself as an entry point on each of the three.
+    /// The path deliberately avoids `/components/`: `detect_js_ts`'s React
+    /// rule (uppercase name + `/components/`) would otherwise satisfy this
+    /// assertion on its own, and the test would pass even with the component
+    /// rule removed entirely.
     #[test]
     fn vue_component_is_an_entry_point() {
         assert_eq!(
             detect_entry_point(
                 "Counter",
-                "src/components/Counter.vue",
+                "src/views/Counter.vue",
                 "class",
                 Some("export default {"),
                 "vue",
@@ -1242,6 +1246,23 @@ mod tests {
         );
         assert_eq!(
             detect_entry_point("tick", "src/lib/Counter.svelte", "function", None, "svelte"),
+            None
+        );
+    }
+
+    /// COUNTERWEIGHT to the other half of the guard. Every other counterweight
+    /// here uses a name that DIFFERS from the file stem, so dropping the
+    /// `kind == "class"` check survived the entire suite: a function that
+    /// happens to share the file's name is not the component, and promoting it
+    /// would seed the reachability walk from an ordinary helper.
+    #[test]
+    fn a_function_named_after_the_file_is_not_the_component() {
+        assert_eq!(
+            detect_entry_point("Counter", "src/lib/Counter.svelte", "function", None, "svelte"),
+            None
+        );
+        assert_eq!(
+            detect_entry_point("Counter", "src/views/Counter.vue", "function", None, "vue"),
             None
         );
     }
