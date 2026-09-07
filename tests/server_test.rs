@@ -897,6 +897,11 @@ async fn server_mcp_http_initialize() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "server-test", "version": "1" },
+            },
         }))
         .send()
         .await
@@ -1058,6 +1063,11 @@ async fn server_mcp_sessions_tracked() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "server-test", "version": "1" },
+            },
         }))
         .send()
         .await
@@ -1080,6 +1090,11 @@ async fn server_mcp_sessions_tracked() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "server-test", "version": "1" },
+            },
         }))
         .send()
         .await
