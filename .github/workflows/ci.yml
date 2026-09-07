@@ -1139,10 +1139,31 @@ jobs:
           )
           echo "npm accepted the platform for $(uname -sm) without --force"
           launcher_output="$(node "$install_dir/node_modules/nestweaver/bin/nestweaver" --version 2>&1 || true)"
+          # BOTH outcomes below are correct, and which one occurs is decided by
+          # something outside this PR: whether the version pinned in
+          # npm/package.json has been PUBLISHED yet.
+          #
+          # This assertion used to accept only the first. That held while the
+          # pinned version was always unreleased, but it inverts the moment a
+          # release publishes -- `nestweaver-darwin-arm64@<pinned>` then
+          # resolves, npm installs it, and the launcher runs for real. The job
+          # is skipped unless the `rust` filter trips, so after 9.2.0 shipped
+          # this sat latent on main and failed on the next PR to touch a
+          # filtered path, reporting a defect in the PR for a state the PR did
+          # not create -- a gate that is wrong about correct work, the same
+          # class as the three defects in the 9.2.0 release incident.
+          #
+          # What this job actually guards (nw-433) is the line above: a real
+          # `npm install` on macOS arm64 succeeding WITHOUT `--force`. That is
+          # what EBADPLATFORM broke and what no other job covers. The launcher
+          # check is downstream of it, so it must accept either honest result
+          # and reject only genuine breakage.
           if grep -q 'optional dependency' <<< "$launcher_output"; then
             echo "bin/nestweaver correctly reports the missing (not-yet-published) platform package"
+          elif grep -Eq '^nestweaver [0-9]+\.[0-9]+\.[0-9]+' <<< "$launcher_output"; then
+            echo "the pinned platform package is published; the installed launcher ran it: $launcher_output"
           else
-            echo "::error::expected the missing-optional-dependency message, got:" >&2
+            echo "::error::launcher neither reported a missing optional dependency nor ran, got:" >&2
             echo "$launcher_output" >&2
             exit 1
           fi
