@@ -265,6 +265,44 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
         }
     }
 
+    // nw-441 follow-up. The two sites above mint the component only when the
+    // script contains `defineComponent(` or `export default`. Vue 3's
+    // `<script setup>` -- the syntax the Vue docs recommend for new SFCs --
+    // has NEITHER: its default export is synthesised by the compiler, never
+    // written by hand. Such a file therefore produced no component symbol at
+    // all, so the entry-point model could not reach it and, now that Vue is
+    // enrolled in `language_has_entry_point_model`, a corpus containing one
+    // flipped from `coverage: complete` to `degraded`.
+    //
+    // `svelte.rs` and `astro.rs` never had this problem because they push the
+    // component unconditionally. This is that same unconditional mint, applied
+    // only when the scan found no component, so a classic SFC keeps exactly
+    // one component symbol with its original span and signature.
+    if !symbols
+        .iter()
+        .any(|s| s.kind == SymbolKind::Class && s.name == component_name)
+    {
+        let entry_point = entry_point_of(&component_name, "class", None);
+        symbols.push(RawSymbol {
+            name: component_name.clone(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            // The component IS the file, matching svelte.rs/astro.rs: a
+            // file-spanning span is the true containment, and because
+            // `find_enclosing_symbol` returns the INNERMOST match, a call
+            // inside a function still attributes to that function.
+            end_line: source.lines().count().max(1) as u32,
+            signature: format!("<script setup> {component_name}"),
+            content_hash: sha256_hex(&component_name),
+            is_entry_point: entry_point.is_some(),
+            entry_point_kind: entry_point,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+            scope_chain: None,
+        });
+    }
+
     ParsedFile {
         path: path_str,
         symbols,

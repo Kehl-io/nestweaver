@@ -4145,6 +4145,51 @@ use crate::config::{Settings, load as load_config};
         );
     }
 
+    /// nw-441 follow-up: `vue.rs` only minted the component's class symbol when
+    /// the script block contained `defineComponent(` or `export default`. Vue 3's
+    /// `<script setup>` -- the recommended syntax -- has NEITHER (the default
+    /// export is compiler-synthesised), so such a file produced no component
+    /// symbol at all and the entry-point fix could not reach it.
+    ///
+    /// That was not merely a missed improvement: with Vue now enrolled in
+    /// `language_has_entry_point_model`, a `<script setup>` file yielding zero
+    /// entry points flips a corpus from `coverage: complete` to `degraded`.
+    /// `svelte.rs` and `astro.rs` never had this problem because they mint the
+    /// component unconditionally.
+    #[test]
+    fn parse_vue_script_setup_still_yields_a_component_entry_point() {
+        let source = "<template>\n  <button @click=\"increment\">{{ count }}</button>\n</template>\n\n<script setup>\nimport { ref } from 'vue'\n\nconst count = ref(0)\n\nfunction increment() {\n  count.value += 1\n}\n</script>\n";
+        let parsed = parse_source(Path::new("Widget.vue"), source).unwrap();
+        let component = component_symbol(&parsed, "Widget");
+        assert!(
+            component.is_entry_point,
+            "a <script setup> component must still root a reachability walk"
+        );
+        assert_eq!(
+            component.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT: the fallback must not mint a SECOND component symbol for
+    /// a file that already declared one, or every classic Vue SFC would carry
+    /// a duplicate.
+    #[test]
+    fn parse_vue_export_default_yields_exactly_one_component_symbol() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+        let components: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "simple" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(
+            components.len(),
+            1,
+            "exactly one component symbol; got {components:?}"
+        );
+    }
+
     /// COUNTERWEIGHT. Without this the three tests above would also pass if
     /// the parsers flipped `is_entry_point: true` on EVERYTHING -- which
     /// would make `dead-code` report nothing dead in a component corpus, the
