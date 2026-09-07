@@ -878,6 +878,47 @@ pub fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_rep
 
 #[cfg(test)]
 mod tests {
+    /// nw-371: THREE different JSON keys are spelled `stale_repos` and mean
+    /// three different populations. This is not a defect — nothing decodes one
+    /// as another today — but the NAMING is a trap, and the next author to
+    /// "unify" them will be doing something that looks like cleanup.
+    ///
+    /// This test is that author's tripwire. If you are here because it failed,
+    /// read this before changing it:
+    ///
+    /// 1. `_meta.stale_repos` (HERE, federation) — upstream servers whose data
+    ///    is behind. Values are repo IDENTIFIERS as the upstream names them,
+    ///    e.g. `github.com/acme/api`.
+    /// 2. `stale_repos` on `hub_nodes` / `repo_map`
+    ///    (`nestweaver-mcp/src/tools.rs`) — repos whose edges were built by an
+    ///    older resolver. Values are repo UIDs, e.g. `repo:default:59d69492b3df`.
+    /// 3. `stale_repos` on `stale_check` (same file) — repos BEHIND HEAD in git.
+    ///    Values are git URLs, e.g. `file:///path/to/repo`.
+    ///
+    /// They are not interchangeable and must not be merged into one key: a
+    /// caller that unions them gets a list whose values are three different
+    /// kinds of string. nw-370 already faced this and deliberately added
+    /// `resolver_stale_repos` as a FOURTH, differently-named field rather than
+    /// overloading a third meaning onto this one — that precedent is the
+    /// intended direction.
+    #[test]
+    fn the_three_stale_repos_populations_stay_distinct() {
+        // Population (1) is what this crate owns. Pin its location and the
+        // shape of its values, so moving it out of `_meta` or switching it to
+        // UIDs fails here rather than silently in a consumer.
+        let mut value = json!({"results": []});
+        set_stale_repos(&mut value, &["github.com/acme/api".to_string()]);
+        assert_eq!(
+            value["_meta"]["stale_repos"][0], "github.com/acme/api",
+            "federation staleness lives under `_meta` and carries upstream repo identifiers"
+        );
+        assert!(
+            value.get("stale_repos").is_none(),
+            "it must NOT also appear at the top level, where it would collide with \
+             the generation-stale and behind-HEAD populations"
+        );
+    }
+
     use super::*;
     use nestweaver_schema::uid::{
         canonical_symbol_id, note_uid, repo_uid, symbol_uid, tag_uid, vault_uid,
