@@ -75,7 +75,18 @@ use std::path::Path;
 ///     invisible to every existing graph, which is the trap this module exists
 ///     for and which this codebase has now sprung twice (nw-103, and again in
 ///     round 3).
-pub const RESOLVER_GENERATION: u32 = 4;
+/// 5 — nw-441: `vue.rs`, `svelte.rs` and `astro.rs` hardcoded
+///     `is_entry_point: false` on every symbol and never called
+///     `detect_entry_point`. Both `is_entry_point` and `entry_point_kind` are
+///     PERSISTED per-symbol columns that `dead-code`, `process.rs` and
+///     `ranking.rs` read straight off disk rather than re-deriving, so a
+///     component in an already-indexed graph keeps `false` forever and cannot
+///     seed a reachability walk no matter which binary asks. Two graphs of
+///     identical source then disagree about what is dead, and without this
+///     bump the disagreement is silent — the same shape as generation 4's own
+///     "svelte/vue/astro named exports change `SymbolKind`" entry, which is
+///     the precedent this follows.
+pub const RESOLVER_GENERATION: u32 = 5;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
