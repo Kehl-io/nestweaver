@@ -835,7 +835,7 @@ pub fn investigate(
     let mut admitted_before_cap: Option<usize> = None;
     let mut semantic_applied = false;
     let mut semantic_unavailable = Some(
-        serde_json::json!({"reason":"seed_resolution_fallback", "remediation":"use a resolvable seed or verify semantic availability"}),
+        serde_json::json!({"component":"semantic", "stage":"seed_resolution", "reason":"seed_resolution_fallback", "remediation":"use a resolvable seed or verify semantic availability"}),
     );
     let mut degraded_components = vec!["semantic".to_string()];
     let mut connected: Vec<BrainNode> = match connected_result {

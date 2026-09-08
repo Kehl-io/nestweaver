@@ -2819,7 +2819,7 @@ pub fn dispatch(
 /// which return symbol-, file- or path-derived data, which IS repo-scoped.
 ///
 /// The real rule is: **every tool is repo-scoped until it is written down
-/// that it is not.** `repo_scope` records one of four dispositions for every
+/// that it is not.** `repo_scope` records one of three dispositions for every
 /// tool in the catalogue and `dispatch_uncached` enforces it before the arm
 /// runs; a tool with no recorded disposition fails closed. Nothing "ignores"
 /// visibility any more — a tool either filters, declares itself vault-only,
@@ -2835,6 +2835,21 @@ pub fn dispatch_cancellable(
 ) -> Result<Value, anyhow::Error> {
     // Enforce --tools allowlist and --lite mode.
     enforce_tool_allowed(name)?;
+
+    // Refuse before embedding/graph preflights, response caches, and shared
+    // flights. Otherwise a scoped caller could receive global preflight details,
+    // or a follower could lose the typed authorization error when coalescing.
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) && let RepoScope::FailClosed(reason) = repo_scope(name)
+    {
+        return Err(RepositoryScopeRefused {
+            tool: name.to_string(),
+            reason,
+        }
+        .into());
+    }
 
     validate_tool_arguments(name, &args)?;
     // Reranking consumes persisted embedding-derived similarity signals even
@@ -22907,21 +22922,13 @@ mod repo_visibility_coverage_tests {
             .collect()
     }
 
-    /// THE bug: `hub_nodes` and `bridge_nodes` handed a repo-scoped caller the
-    /// uid of every stale repo in the brain, through `stale_repos`.
-    ///
-    /// Both tools are `RedactedAfterDispatch`, and the redactor could not see
-    /// the field: `row_allowed` early-returned `true` for any array element
-    /// that was not an object, so a `Vec<String>` walked through untouched.
-    /// Same enumeration class that earned `brain_status` its `EnforcedInArm`
-    /// treatment — a bare list of repo identities is the payload the policy
-    /// withholds, whatever JSON shape it arrives in.
+    /// Aggregate refusal must also withhold the stale-repository inventory.
     #[test]
     fn a_scoped_caller_cannot_enumerate_hidden_repos_through_stale_repos() {
         let (_dir, _db_path, store) = hidden_repo_store_on_disk();
         let visible = only_alpha();
         for tool in ["hub_nodes", "bridge_nodes"] {
-            let value = dispatch_cancellable(
+            let error = dispatch_cancellable(
                 &store,
                 None,
                 tool,
@@ -22930,25 +22937,18 @@ mod repo_visibility_coverage_tests {
                 None,
                 Some(&visible),
             )
-            .unwrap_or_else(|error| panic!("{tool} must still answer a scoped caller: {error:#}"));
-            assert_eq!(
-                stale_repos_from(&value),
-                vec!["repo:alpha".to_string()],
-                "{tool} named a repo outside the caller's scope: {value}"
-            );
-            // The disclosure must not be silently deleted along with the row:
-            // a scoped caller whose OWN repo is stale still needs to be told.
-            assert_eq!(value["rankings_stale"], json!(true), "{tool}: {value}");
+            .expect_err("whole-graph rankings must refuse repository-scoped callers");
             assert!(
-                leaked(&value.to_string()).is_none(),
-                "{tool} leaked a hidden marker: {value}"
+                error.downcast_ref::<RepositoryScopeRefused>().is_some(),
+                "{tool}: {error:#}"
             );
+            assert!(leaked(&error.to_string()).is_none(), "{tool}: {error:#}");
         }
     }
 
     /// COUNTERWEIGHT, and the assertion that makes the one above non-vacuous:
     /// on THIS fixture the field is genuinely populated with both repos, so the
-    /// scoped result is a filter and not an empty array.
+    /// refusal above protects an actual global inventory.
     ///
     /// If a future refactor reverts the fixture to `GraphStore::in_memory()`,
     /// this test fails and the one above starts passing for the wrong reason —
@@ -24279,11 +24279,11 @@ mod hardening_aggregate_tests {
             "regex_search",
         ] {
             for format in ["concise", "detailed"] {
-                let error = dispatch_uncached(
+                let error = dispatch_cancellable(
                     &store,
                     None,
                     name,
-                    json!({"response_format":format}),
+                    json!({"response_format":format,"rerank":true,"include_bodies":true}),
                     None,
                     None,
                     Some(&visible),

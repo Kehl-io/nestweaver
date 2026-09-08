@@ -1063,14 +1063,18 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
     // Reconcile against graph liveness before retiring the durable dirty marker.
     // This retries a failed targeted tombstone flush and detects untombstoned
     // orphans that index-internal occupancy cannot identify.
-    if let Err(error) = store.reconcile_embedding_index() {
-        push_reconciliation_failure(
-            &mut failures,
-            DeletionReconciliationStage::EmbeddingIndex,
-            None,
-            format!("committed graph requires embedding reconciliation: {error:#}"),
-        );
-    }
+    let embeddings_reconciled = match store.reconcile_embedding_index() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::EmbeddingIndex,
+                None,
+                format!("committed graph requires embedding reconciliation: {error:#}"),
+            );
+            false
+        }
+    };
 
     store.invalidate_pagerank();
     let pagerank_safe = if let Some(db_path) = db_path {
@@ -1211,7 +1215,7 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         }
 
         if generation_durable
-            && failures.is_empty()
+            && embeddings_reconciled
             && pagerank_safe
             && pagerank_persisted
             && let Some(db_path) = db_path
@@ -12948,6 +12952,41 @@ function hello(name) { return "Hello " + name; }
         );
         let persisted = persisted_pagerank(&db_path);
         assert_note_ranks(&persisted, "raced");
+    }
+
+    #[test]
+    fn code_publication_retains_the_fence_when_embedding_tombstones_cannot_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.set_embedding_metadata("fixture", 2).unwrap();
+        assert!(store.add_embedding("sym:deleted", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db),
+            "post-delete code publication",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        fs::create_dir(crate::sidecar_path(&db, ".embeddings.journal")).unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db),
+            "post-delete code publication",
+            &FileSystemIndexEpilogueIo,
+            false,
+        )
+        .expect_err("committed graph cannot publish clean with undurable tombstones");
+        assert!(
+            error
+                .failures
+                .iter()
+                .any(|failure| failure.stage == DeletionReconciliationStage::EmbeddingIndex)
+        );
+        assert!(crate::sidecar_path(&db, ".index-dirty").exists());
+        assert!(store.is_index_publication_dirty());
+        assert!(!store.has_embedding("sym:deleted"));
     }
 
     #[test]

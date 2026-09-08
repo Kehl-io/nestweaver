@@ -22244,10 +22244,17 @@ external_model = "unavailable-test-model"
                 message.contains("repository-scoped caller"),
                 "{route} must explain the scope refusal: {error}"
             );
-            assert!(
-                message.contains("filesystem root") || message.contains("filesystem roots"),
-                "{route} must identify the untrusted root boundary: {error}"
-            );
+            if route == "GetContext" {
+                // The aggregate guard now refuses before source-body handling.
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                assert!(message.contains("global ranking"), "{error}");
+            } else {
+                assert!(
+                    message.contains("filesystem root") || message.contains("filesystem roots"),
+                    "{route} must identify the untrusted root boundary: {error}"
+                );
+            }
+            assert!(!message.contains(attacker_root));
         }
     }
 
