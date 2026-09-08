@@ -24520,6 +24520,33 @@ external_model = "unavailable-test-model"
     }
 }
 
+// A real daemon arms a process-lifetime database-lock guard and installs
+// process-wide runtime state. Booting one in a parallel unit-test process
+// contaminates later lifecycle probes even after the server task exits.
+#[cfg(test)]
+fn run_server_test_in_child(test_name: &str) -> bool {
+    const CHILD_TEST: &str = "NESTWEAVER_ISOLATED_SERVER_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let _env_guard = lifecycle::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .output()
+        .expect("start isolated server test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "isolated {test_name} failed: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
+
 #[cfg(test)]
 mod boot_reconciliation_tests {
     use super::*;
@@ -24783,6 +24810,11 @@ mod boot_reconciliation_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_write_daemon_boot_recovers_before_immediate_shutdown() {
+        if run_server_test_in_child(
+            "server::boot_reconciliation_tests::read_write_daemon_boot_recovers_before_immediate_shutdown",
+        ) {
+            return;
+        }
         // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
         // the daemon's whole lifetime under the same lock the sibling e2e
         // tests hold while swapping XDG vars.
@@ -25199,6 +25231,11 @@ mod watcher_e2e_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_e2e_pid_watch_force_and_shutdown() {
+        if run_server_test_in_child(
+            "server::watcher_e2e_tests::daemon_e2e_pid_watch_force_and_shutdown",
+        ) {
+            return;
+        }
         // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
         // the daemon's whole lifetime under the same lock the lifecycle unit
         // tests and the clean-shutdown e2e below hold while swapping XDG vars.
@@ -25420,6 +25457,11 @@ mod watcher_e2e_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_clean_shutdown_leaves_no_dirs_for_temp_db() {
+        if run_server_test_in_child(
+            "server::watcher_e2e_tests::daemon_clean_shutdown_leaves_no_dirs_for_temp_db",
+        ) {
+            return;
+        }
         let _env_guard = lifecycle::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
