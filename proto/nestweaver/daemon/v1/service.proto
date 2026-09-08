@@ -181,6 +181,7 @@ message TrigramRefreshDetail {
   uint64 postings_deleted = 7;
   bool migrated_legacy_index = 8;
   uint64 elapsed_ms = 9;
+  repeated string posting_deltas_unavailable = 10;
 }
 
 // ─── Write RPCs ─────────────────────────────────────────────────────
@@ -823,6 +824,7 @@ message BackupResponse {
   uint64 symbol_count = 6;
   uint64 db_size_bytes = 7;
   uint64 total_compressed = 8;
+  repeated string warnings = 9;
 }
 
 // ─── Service ─────────────────────────────────────────────────────────

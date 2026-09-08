@@ -187,8 +187,8 @@ fn claude_task_hook_entry() -> Value {
 /// `existing` is the current settings JSON (e.g. parsed
 /// `.claude/settings.local.json`); pass an empty object if there is none. The
 /// returned value is the settings document with the hook merged in
-/// idempotently — if a `Task` matcher already exists it is left untouched (no
-/// duplicates).
+/// idempotently — an exact command/event/matcher match is left untouched.
+/// Unrelated Task hooks are preserved and do not suppress installation.
 ///
 /// ## Why this returns a `Result`
 ///
@@ -222,29 +222,70 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Erro
         );
     };
     let mut settings = Value::Object(existing.clone());
+    validate_claude_hook_containers(&settings)?;
+    if !has_exact_claude_hook(&settings) {
+        let hooks = settings["hooks"].take();
+        let mut hooks = if hooks.is_null() { json!({}) } else { hooks };
+        if hooks.get("PreToolUse").is_none() {
+            hooks["PreToolUse"] = json!([]);
+        }
+        // Shape validation above ensures this is an array.
+        if let Some(entries) = hooks["PreToolUse"].as_array_mut() {
+            entries.push(claude_task_hook_entry());
+        }
+        settings["hooks"] = hooks;
+    }
 
-    if let Some(obj) = settings.as_object_mut() {
-        let hooks = obj
-            .entry("hooks")
-            .or_insert_with(|| json!({}))
-            .as_object_mut();
-        if let Some(hooks) = hooks {
-            let pre = hooks
-                .entry("PreToolUse")
-                .or_insert_with(|| json!([]))
-                .as_array_mut();
-            if let Some(arr) = pre {
-                let already = arr
-                    .iter()
-                    .any(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Task"));
-                if !already {
-                    arr.push(claude_task_hook_entry());
+    Ok(settings)
+}
+
+fn validate_claude_hook_containers(existing: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(existing.is_object(), "hook settings must be a JSON object");
+    if let Some(hooks) = existing.get("hooks") {
+        anyhow::ensure!(
+            hooks.is_object(),
+            "hooks must be a JSON object; fix the settings structure before installing"
+        );
+        if let Some(entries) = hooks.get("PreToolUse") {
+            anyhow::ensure!(
+                entries.is_array(),
+                "hooks.PreToolUse must be an array; fix the settings structure before installing"
+            );
+            if let Some(entries) = entries.as_array() {
+                for entry in entries {
+                    anyhow::ensure!(
+                        entry.is_object()
+                            && entry.get("matcher").is_none_or(Value::is_string)
+                            && entry
+                                .get("hooks")
+                                .and_then(Value::as_array)
+                                .is_some_and(|hooks| hooks.iter().all(Value::is_object)),
+                        "each PreToolUse entry requires an array of hook objects and, when present, a string matcher"
+                    );
                 }
             }
         }
     }
+    Ok(())
+}
 
-    Ok(settings)
+fn has_exact_claude_hook(existing: &Value) -> bool {
+    existing
+        .pointer("/hooks/PreToolUse")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["matcher"] == "Task"
+                    && entry
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|hooks| {
+                            hooks.iter().any(|hook| {
+                                hook["type"] == "command" && hook["command"] == HOOK_COMMAND
+                            })
+                        })
+            })
+        })
 }
 
 /// Compute a hook patch for the given runtime.
@@ -261,17 +302,10 @@ pub fn compute_hook_patch(runtime: Runtime, existing: &Value) -> Result<Value, a
 /// is what `--dry-run` should print so the output is the addition, not the
 /// whole merged document.
 ///
-/// When the `Task` matcher already exists the `PreToolUse` array is empty
+/// When the exact NestWeaver command/event/matcher already exists the `PreToolUse` array is empty
 /// (nothing to add).
 pub fn compute_claude_hook_delta(existing: &Value) -> Value {
-    let already_present = existing
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|p| p.as_array())
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Task"))
-        });
+    let already_present = has_exact_claude_hook(existing);
 
     let to_add = if already_present {
         json!([])
@@ -285,7 +319,10 @@ pub fn compute_claude_hook_delta(existing: &Value) -> Value {
 /// Compute the minimal dry-run delta for the given runtime.
 pub fn compute_hook_delta(runtime: Runtime, existing: &Value) -> Result<Value, anyhow::Error> {
     match runtime {
-        Runtime::Claude => Ok(compute_claude_hook_delta(existing)),
+        Runtime::Claude => {
+            validate_claude_hook_containers(existing)?;
+            Ok(compute_claude_hook_delta(existing))
+        }
     }
 }
 
@@ -338,7 +375,7 @@ pub fn read_runtime_settings(path: &Path) -> Result<crate::user_config::JsonConf
 
 /// Merge the runtime hook into `path`, preserving every key it does not own.
 ///
-/// NestWeaver owns exactly one entry — the `Task` matcher under
+/// NestWeaver owns its exact command entry under the `Task` matcher in
 /// `hooks.PreToolUse`. Everything else in the document is the user's, and this
 /// function either preserves all of it or writes nothing at all:
 ///
@@ -376,6 +413,11 @@ pub fn install_hook(runtime: Runtime, path: &Path) -> Result<HookInstall, anyhow
     let mut rendered = serde_json::to_string_pretty(&patched)?;
     rendered.push('\n');
     crate::user_config::replace_file_atomically(path, &rendered, INSTALL_COMMAND)?;
+    let observed = read_runtime_settings(path)?;
+    anyhow::ensure!(
+        hook_already_present(runtime, &observed.value)?,
+        "hook installation could not be verified; inspect the settings and retry"
+    );
     Ok(HookInstall::Installed)
 }
 
@@ -623,7 +665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.local.json");
         let original = "{\n  // mine\n  \"hooks\": { \"PreToolUse\": [ \
-                        { \"matcher\": \"Task\", \"hooks\": [] } ] }\n}\n";
+                        { \"matcher\": \"Task\", \"hooks\": [{ \"type\": \"command\", \"command\": \"nestweaver admin instructions --for-subagent\" }] } ] }\n}\n";
         std::fs::write(&path, original).unwrap();
 
         assert_eq!(
@@ -770,5 +812,82 @@ mod tests {
         assert!(!hook_already_present(Runtime::Claude, &empty).unwrap());
         let installed = compute_hook_patch(Runtime::Claude, &empty).unwrap();
         assert!(hook_already_present(Runtime::Claude, &installed).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod exact_hook_regressions {
+    use super::*;
+    #[test]
+    fn a_hook_with_an_omitted_matcher_is_preserved() {
+        // Claude treats an omitted matcher as match-all.
+        // https://code.claude.com/docs/en/hooks#matcher-patterns
+        let existing =
+            json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"audit-all"}]}]}});
+        let patched = compute_claude_hook_patch(&existing).unwrap();
+        assert_eq!(
+            patched["hooks"]["PreToolUse"][0],
+            existing["hooks"]["PreToolUse"][0]
+        );
+        assert!(has_exact_claude_hook(&patched));
+    }
+
+    #[test]
+    fn competing_task_hook_is_preserved_and_install_is_verified_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = json!({"permissions":{"allow":["Read"]},"hooks":{"PreToolUse":[
+            {"matcher":"Task","hooks":[{"type":"command","command":"other-tool"}]}]}});
+        std::fs::write(&path, original.to_string()).unwrap();
+        assert_eq!(
+            install_hook(Runtime::Claude, &path).unwrap(),
+            HookInstall::Installed
+        );
+        let first = std::fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(value["permissions"], original["permissions"]);
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0],
+            original["hooks"]["PreToolUse"][0]
+        );
+        assert!(has_exact_claude_hook(&value));
+        assert_eq!(
+            install_hook(Runtime::Claude, &path).unwrap(),
+            HookInstall::AlreadyPresent
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+    }
+    #[test]
+    fn incompatible_containers_refuse_without_writing_even_in_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for value in [
+            json!({"hooks":[]}),
+            json!({"hooks":null}),
+            json!({"hooks":{"PreToolUse":{}}}),
+            json!({"hooks":{"PreToolUse":[null]}}),
+            json!({"hooks":{"PreToolUse":[{"matcher":"Task","hooks":[null]}]}}),
+            json!({"hooks":{"PreToolUse":[{"hooks":["command"]}]}}),
+        ] {
+            let bytes = value.to_string();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(install_hook(Runtime::Claude, &path).is_err());
+            assert!(compute_hook_delta(Runtime::Claude, &value).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+    }
+    #[test]
+    fn only_the_exact_event_matcher_type_and_command_suppress_install() {
+        for value in [
+            json!({"hooks":{"PostToolUse":[claude_task_hook_entry()]}}),
+            json!({"hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":HOOK_COMMAND}]}]}}),
+            json!({"hooks":{"PreToolUse":[{"matcher":"Task","hooks":[{"type":"prompt","command":HOOK_COMMAND}]}]}}),
+            json!({"hooks":{"PreToolUse":[{"matcher":"Task","hooks":[{"type":"command","command":format!("{HOOK_COMMAND} --extra")}]}]}}),
+        ] {
+            assert!(!hook_already_present(Runtime::Claude, &value).unwrap());
+            assert!(has_exact_claude_hook(
+                &compute_hook_patch(Runtime::Claude, &value).unwrap()
+            ));
+        }
     }
 }

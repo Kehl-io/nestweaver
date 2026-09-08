@@ -3953,8 +3953,14 @@ impl GraphStore {
         repo_uid: &str,
         file_path: &str,
     ) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn()?;
-        Self::delete_symbols_in_file_on(&conn, repo_uid, file_path)
+        // A delete-only filesystem index does not insert any replacement
+        // symbols, so it cannot rely on bulk_index_write to queue this scope.
+        // Commit deletion and invalidation together, including standalone use.
+        let conn = self.begin_transaction()?;
+        let removed = Self::delete_symbols_in_file_on(&conn, repo_uid, file_path)?;
+        Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
+        self.commit_transaction(&conn)?;
+        Ok(removed)
     }
 
     /// Delete symbols in a file using an externally-provided connection (for

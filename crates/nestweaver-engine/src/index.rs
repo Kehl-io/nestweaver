@@ -15654,6 +15654,7 @@ function hello(name) { return "Hello " + name; }
             let store = GraphStore::open_or_create(&db_path).unwrap();
             let files = store.list_files_by_repo(&r_uid).unwrap();
             assert_eq!(files.len(), 2, "both files should be indexed");
+            store.rebuild_trigram_index().unwrap();
             assert!(
                 !store.symbols_in_file("helper.js").unwrap().is_empty(),
                 "helper.js should have symbols after first index"
@@ -15680,6 +15681,15 @@ function hello(name) { return "Hello " + name; }
             store.symbols_in_file("helper.js").unwrap().is_empty(),
             "removed helper.js symbols should be pruned"
         );
+        assert_eq!(
+            store.pending_regex_scope_count().unwrap(),
+            1,
+            "delete-only pruning must invalidate the previously acknowledged shard"
+        );
+        let delta = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(delta.nodes_deleted, 1);
+        assert_eq!(delta.postings_added, 0);
+        assert!(delta.postings_deleted > 0);
     }
 
     #[test]

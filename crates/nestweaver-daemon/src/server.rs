@@ -2187,6 +2187,7 @@ fn trigram_refresh_detail(stats: &nestweaver_store::TrigramRefreshStats) -> Trig
         nodes_deleted: stats.nodes_deleted as u64,
         postings_added: stats.postings_added as u64,
         postings_deleted: stats.postings_deleted as u64,
+        posting_deltas_unavailable: stats.posting_deltas_unavailable.clone(),
         migrated_legacy_index: stats.migrated_legacy_index,
         elapsed_ms: stats.elapsed_ms,
     }
@@ -5828,6 +5829,7 @@ impl NestWeaverDaemon for DaemonService {
         let m = &result.manifest;
         tracing::info!(output = %result.output_path.display(), "backup complete");
         Ok(Response::new(BackupResponse {
+            warnings: m.warnings.clone(),
             output_path: result.output_path.to_string_lossy().into_owned(),
             instance_id: m.instance_id.clone(),
             tier: m.tier.clone(),

@@ -273,11 +273,33 @@ pub struct TrigramRefreshStats {
     pub nodes_added: usize,
     pub nodes_changed: usize,
     pub nodes_deleted: usize,
+    /// Live (UID, trigram) set additions, excluding scopes listed below.
     pub postings_added: usize,
     pub postings_deleted: usize,
+    /// Scopes whose prior shard was unreadable; their posting deltas are
+    /// unknown and excluded from the totals, without preventing repair.
+    #[serde(default)]
+    pub posting_deltas_unavailable: Vec<String>,
     pub migrated_legacy_index: bool,
     #[serde(default)]
     pub elapsed_ms: u64,
+}
+
+fn record_posting_delta(
+    stats: &mut TrigramRefreshStats,
+    scope: &str,
+    delta: Result<(usize, usize), StoreError>,
+) {
+    match delta {
+        Ok((added, deleted)) => {
+            stats.postings_added += added;
+            stats.postings_deleted += deleted;
+        }
+        Err(error) => {
+            tracing::warn!(scope, %error, "posting delta unavailable; scope excluded from totals while repairing shard");
+            stats.posting_deltas_unavailable.push(scope.to_string());
+        }
+    }
 }
 
 /// A unit of indexed text plus its node metadata. Internal to this module.
@@ -421,7 +443,7 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
 
 impl GraphStore {
     /// Incrementally refresh trigram postings over all indexed text. Existing
-    /// callers keep the historical return value (postings written), while
+    /// callers receive live posting additions, while
     /// [`GraphStore::refresh_trigram_index`] exposes detailed work metrics.
     pub fn build_trigram_index(&self) -> Result<usize, StoreError> {
         Ok(self.refresh_trigram_index(false)?.postings_added)
@@ -532,9 +554,11 @@ impl GraphStore {
                     Some(state) if state.tombstone => state.desired_epoch,
                     _ => self.mark_regex_scope_dirty(&scope_uid, true)?,
                 };
+                let delta = index.posting_delta(&scope_uid, &[]);
                 if index.retire_scope(&scope_uid)? {
                     stats.scopes_refreshed += 1;
                 }
+                record_posting_delta(&mut stats, &scope_uid, delta);
                 self.acknowledge_regex_tombstone(&scope_uid, epoch)?;
                 continue;
             }
@@ -659,6 +683,7 @@ impl GraphStore {
                         && prior.brain_uuid == identity.brain_uuid
                         && prior.publication_uuid == identity.publication_uuid
                 });
+            let posting_delta = index.posting_delta(&scope_uid, &documents);
             if can_update {
                 index.update_scope(
                     prior.expect("checked above"),
@@ -672,7 +697,7 @@ impl GraphStore {
             self.acknowledge_regex_scope(&scope_uid, epoch, candidates.len(), &digest)?;
 
             stats.scopes_refreshed += 1;
-            stats.postings_added += trigram_sets.iter().map(HashSet::len).sum::<usize>();
+            record_posting_delta(&mut stats, &scope_uid, posting_delta);
         }
         stats.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         match index.garbage_collect() {
@@ -2352,6 +2377,79 @@ mod tests {
     }
 
     #[test]
+    fn deleting_one_file_queues_its_scope_and_reports_live_posting_deletions() {
+        let store = store_with_text();
+        let mut kept = store.lookup_symbol("sym:1").unwrap();
+        let repo = kept.repo_uid.clone();
+        let deleted_file = kept.file_path.clone();
+        kept.uid = "sym:kept".to_string();
+        kept.name = "marker_beta".to_string();
+        kept.file_path = "src/kept.rs".to_string();
+        kept.signature = "fn marker_beta()".to_string();
+        store.insert_symbol(&kept).unwrap();
+        store.rebuild_trigram_index().unwrap();
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 0);
+        let removed = store.delete_symbols_in_file(&repo, &deleted_file).unwrap();
+        assert_eq!(removed, vec!["sym:1".to_string()]);
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 1);
+        let delta = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(delta.nodes_deleted, 1);
+        assert_eq!(delta.postings_added, 0);
+        assert!(delta.postings_deleted > 0);
+        let old = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(old.results.iter().all(|hit| hit.uid != "sym:1"));
+        let kept = store
+            .regex_search("marker_beta", None, None, None, None)
+            .unwrap();
+        assert_eq!(kept.results.len(), 1);
+        assert!(!kept.scanned_fallback);
+    }
+
+    #[test]
+    fn refresh_reports_live_posting_deltas_across_rebuild_edit_and_retirement() {
+        let store = store_with_text();
+        let first = store.rebuild_trigram_index().unwrap();
+        assert!(first.postings_added > 0);
+        assert_eq!(first.postings_deleted, 0);
+        assert!(first.posting_deltas_unavailable.is_empty());
+        let rebuilt = store.rebuild_trigram_index().unwrap();
+        assert_eq!((rebuilt.postings_added, rebuilt.postings_deleted), (0, 0));
+        store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("MATCH (s:Symbol {uid: 'sym:1'}) SET s.signature = 'fn zzzUniqueReplacement()'")
+            .unwrap();
+        store.mark_regex_scope_dirty("repo:1", false).unwrap();
+        let edited = store.refresh_trigram_index(false).unwrap();
+        assert!(edited.postings_added > 0);
+        assert!(edited.postings_deleted > 0);
+        assert!(edited.posting_deltas_unavailable.is_empty());
+        let quiet = store.refresh_trigram_index(false).unwrap();
+        assert_eq!((quiet.postings_added, quiet.postings_deleted), (0, 0));
+        store
+            .conn()
+            .unwrap()
+            .query("MATCH (s:Symbol {uid: 'sym:1'}) DETACH DELETE s")
+            .unwrap();
+        store.mark_regex_scope_dirty("repo:1", true).unwrap();
+        let deleted = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(deleted.postings_added, 0);
+        assert!(deleted.postings_deleted > 0);
+        assert!(
+            store
+                .regex_search("zzzUniqueReplacement", None, None, None, None)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn on_disk_store_uses_identity_bound_regex_v3_shards() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
@@ -2431,6 +2529,12 @@ mod tests {
         assert_eq!(
             repaired.scopes_refreshed, 1,
             "refresh must rebuild only the scope with the corrupt selector"
+        );
+        assert_eq!(repaired.posting_deltas_unavailable.len(), 1);
+        assert_eq!(
+            (repaired.postings_added, repaired.postings_deleted),
+            (0, 0),
+            "unknown deltas must not be replaced with invented totals"
         );
         let result = store
             .regex_search("authenticateUser", None, None, None, None)
