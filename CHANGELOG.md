@@ -1,5 +1,32 @@
 # Changelog
 
+## [9.3.0](https://github.com/Kehl-io/nestweaver/compare/v9.2.0...v9.3.0) (2026-09-08)
+
+
+### Features
+
+* **mcp:** add unset_extension, reusing the gated RPC rather than a second path ([8aee280](https://github.com/Kehl-io/nestweaver/commit/8aee2803734699ff8aacbd101ba24f2ff92dc7d7))
+* **parser:** give Vue, Svelte and Astro components an entry-point model ([b673b91](https://github.com/Kehl-io/nestweaver/commit/b673b918a0d0747f9a0ed1d54937731694ea8182))
+
+
+### Bug Fixes
+
+* address verified CLI MCP and publication regressions ([5ea8a49](https://github.com/Kehl-io/nestweaver/commit/5ea8a4942e38e6548650d9f6e907b0e47ca18edc))
+* **ci:** stop the npm smoke gate failing once the pinned version is published ([5b07b1c](https://github.com/Kehl-io/nestweaver/commit/5b07b1c42d11f9c46464afbe240cdc19172d2849))
+* **cli,daemon:** route the two sidecar DELETES through the daemon write gate ([8b0f242](https://github.com/Kehl-io/nestweaver/commit/8b0f2423e36ac450f9a804221ec92fb1e60c12f1))
+* **client:** scale the daemon boot ceiling with the graph on disk ([afa125f](https://github.com/Kehl-io/nestweaver/commit/afa125f4583ebb4d134bcd060cf9de7d7796c315))
+* **cli:** make blast-radius's needs-reindex exit code fire on federated calls ([a12430e](https://github.com/Kehl-io/nestweaver/commit/a12430ebf0a7186dd84c26fb5b80b5a282a74764))
+* **cli:** render and read both tiers in impact and blast-radius ([0a3fa23](https://github.com/Kehl-io/nestweaver/commit/0a3fa236a9ff9e4a684d6e2f928dc82340511d4e))
+* **engine:** bump RESOLVER_GENERATION for the component entry-point change ([b08cedf](https://github.com/Kehl-io/nestweaver/commit/b08cedf1d06debf1ba1524accd6680e92aba4db0))
+* **federation:** recognise an unresolved repo filter by type, not by prose ([a7845fc](https://github.com/Kehl-io/nestweaver/commit/a7845fcbb114638aa7b54c43fed3d96796ff8ff1))
+* **parser:** mint a Vue component for `<script setup>` too ([708d3ba](https://github.com/Kehl-io/nestweaver/commit/708d3badf4d6a8d6f8b7ead05addacfb3c7b0f9e))
+* preserve restart preflight safety diagnostics ([bf0c474](https://github.com/Kehl-io/nestweaver/commit/bf0c474a6d5a346353951ab2caa9eedb3ba9256c))
+* **release:** make both release verifiers runnable on macOS ([3758cce](https://github.com/Kehl-io/nestweaver/commit/3758cce124a7a76f8c2c9c2ca20e0244bce374a8))
+* **release:** remove the SIGPIPE-shaped pipelines from the changelog deduper ([2af115f](https://github.com/Kehl-io/nestweaver/commit/2af115f2f8e235f75ee0080ea87354189b7413e6))
+* **release:** use a portable checksum helper in the package verifier ([a1cc088](https://github.com/Kehl-io/nestweaver/commit/a1cc088aecdc15ad5223dce80452f89563eb4861))
+* report manifest presence errors during deletion reconciliation ([88b2eb6](https://github.com/Kehl-io/nestweaver/commit/88b2eb6402808d49a0b79840881d8f7a21b96e33))
+* **store,engine:** stop a version upgrade failing the first index ([d19d567](https://github.com/Kehl-io/nestweaver/commit/d19d56772e3b9d31575f223aefd155fab6350385))
+
 ## [9.2.0](https://github.com/Kehl-io/nestweaver/compare/v9.1.0...v9.2.0) (2026-09-06)
 
 
