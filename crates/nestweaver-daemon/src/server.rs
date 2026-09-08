@@ -10268,6 +10268,8 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         | "RemoveVault"
         | "ServeUi"
         | "SetExtension"
+        | "UnsetExtension"
+        | "ForgetInteraction"
         | "Shutdown"
         | "StopUi"
         | "StopWatch"
@@ -19047,6 +19049,7 @@ credential_method = "gh"
                 "brain_remove_source",
                 "brain_memory_consolidate",
                 "set_extension",
+                "unset_extension",
                 "prune_stale",
                 "compact_embeddings",
             ]
@@ -24027,6 +24030,10 @@ external_model = "unavailable-test-model"
         "Embed",
         "CompactEmbeddings",
         "SetExtension",
+        // nw-462: the delete counterparts mutate the same sidecars, so they
+        // belong on exactly the same side of this partition as the write.
+        "UnsetExtension",
+        "ForgetInteraction",
         "Backup",
         "BrainMemoryConsolidate",
         "RefreshBrain",

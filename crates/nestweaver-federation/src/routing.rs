@@ -98,6 +98,7 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         | "brain_remove_source"
         | "prune_stale"
         | "set_extension"
+        | "unset_extension"
         | "compact_embeddings"
         | "query_extensions" => ToolRouting::LocalOnly,
 

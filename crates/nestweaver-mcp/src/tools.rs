@@ -476,7 +476,7 @@ fn repo_scope(tool: &str) -> RepoScope {
                  prune_stale additionally returns the pruned repos by identity",
             )
         }
-        "set_extension" | "query_extensions" => RepoScope::FailClosed(
+        "set_extension" | "unset_extension" | "query_extensions" => RepoScope::FailClosed(
             "the extension store is keyed by scope uid (a repo or vault uid), so both reading \
              and writing it enumerate or address repos outside the caller's scope",
         ),
@@ -762,6 +762,7 @@ fn all_tool_schemas_undecorated() -> Vec<Value> {
         tool_schema_clusters(),
         tool_schema_stale_check(),
         tool_schema_set_extension(),
+        tool_schema_unset_extension(),
         tool_schema_query_extensions(),
         tool_schema_brain_diff(),
         tool_schema_project_context(),
@@ -1243,7 +1244,7 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
-    fn registry_contains_exactly_the_42_advertised_unique_names() {
+    fn registry_contains_exactly_the_43_advertised_unique_names() {
         let expected: BTreeSet<&str> = [
             "affected_tests",
             "backlinks",
@@ -1287,6 +1288,7 @@ mod tool_schema_validation_tests {
             "regex_search",
             "set_extension",
             "stale_check",
+            "unset_extension",
         ]
         .into_iter()
         .collect();
@@ -1294,7 +1296,7 @@ mod tool_schema_validation_tests {
         let schemas = all_tool_schemas();
         assert_eq!(
             schemas.len(),
-            42,
+            43,
             "registry must contain exactly 42 schemas"
         );
         let names: BTreeSet<&str> = schemas
@@ -2668,6 +2670,7 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         ("regex_search", "Code search"),
         ("count_patterns", "Code search"),
         ("set_extension", "Extensions"),
+        ("unset_extension", "Extensions"),
         ("query_extensions", "Extensions"),
         ("brain_broken_links", "Vault health"),
         ("brain_orphan_documents", "Vault health"),
@@ -3197,6 +3200,7 @@ fn dispatch_tool_arm(
         "clusters" => tool_clusters(store, args),
         "stale_check" => tool_stale_check(store, visible),
         "set_extension" => tool_set_extension(args),
+        "unset_extension" => tool_unset_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args, visible),
         "project_context" => {
@@ -11208,6 +11212,81 @@ fn tool_schema_set_extension() -> Value {
     })
 }
 
+fn tool_schema_unset_extension() -> Value {
+    json!({
+        "name": "unset_extension",
+        "description": "Remove one custom property from one node, from the JSON sidecar alongside the database.\n\nGuidelines:\n- The counterpart of set_extension; removes exactly the one (uid, key) named\n- Removing an absent key is not an error — it reports removed:false\n- To see what is set, use query_extensions\n\nLimitations:\n- Removes a single key; it is not a bulk clear\n- Cannot be undone from here — the previous value is not retained",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "uid": {
+                    "type": "string",
+                    "description": "Node UID whose property should be removed."
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Property name to remove (e.g. \"team_owner\")."
+                }
+            },
+            "required": ["uid", "key"]
+        }
+    })
+}
+
+/// nw-281: the delete half of the extension surface, which an agent could
+/// previously write but never remove — the documented workaround was hand-
+/// editing the sidecar.
+///
+/// Routes through the SAME gated RPC nw-462 added for the CLI rather than
+/// building a second write path to the same file. That is the whole reason the
+/// two items were paired: an ungated MCP delete would have reintroduced exactly
+/// the defect nw-462 closed.
+fn tool_unset_extension(args: Value) -> Result<Value, anyhow::Error> {
+    let db_path = CURRENT_DB_PATH
+        .with(|c| c.borrow().clone())
+        .ok_or_else(|| anyhow!("database path not set on server"))?;
+
+    #[cfg(feature = "daemon")]
+    {
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        let req = nestweaver_proto::JsonRequest {
+            args_json: args.to_string(),
+        };
+        let resp = rt
+            .block_on(client.unset_extension(req))
+            .map_err(|e| anyhow!("unset_extension RPC failed: {e}"))?;
+        return serde_json::from_str(&resp.into_inner().result_json)
+            .map_err(|e| anyhow!("decode unset_extension response: {e}"));
+    }
+
+    // Non-daemon fallback: single-process, so a direct write is the only writer
+    // and needs no cross-process gate. Mirrors `tool_set_extension`.
+    #[cfg(not(feature = "daemon"))]
+    {
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'uid' must be a string"))?;
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'key' must be a string"))?;
+        let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)?;
+        Ok(json!({
+            "uid": uid,
+            "key": key,
+            "removed": removed,
+            "status": if removed { "removed" } else { "absent" },
+        }))
+    }
+}
+
 fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
     let db_path = CURRENT_DB_PATH
         .with(|c| c.borrow().clone())
@@ -14543,6 +14622,7 @@ fn dispatch_via_daemon_inner(
                     "investigate_expand" => client.investigate_expand(req).await,
                     "investigate_hydrate" => client.investigate_hydrate(req).await,
                     "set_extension" => client.set_extension(req).await,
+                    "unset_extension" => client.unset_extension(req).await,
                     "query_extensions" => client.query_extensions(req).await,
                     unknown => {
                         return Err(anyhow::anyhow!(
@@ -22164,6 +22244,14 @@ mod repo_visibility_coverage_tests {
             (
                 "set_extension",
                 json!({ "scope_uid": "repo:alpha", "key": "k", "value": "v" }),
+            ),
+            // nw-281: the delete shares `set_extension`'s FailClosed
+            // disposition for the same reason — the extension store is keyed by
+            // scope uid, so addressing it reaches outside a repo-scoped
+            // caller's boundary whether you are writing or removing.
+            (
+                "unset_extension",
+                json!({ "scope_uid": "repo:alpha", "key": "k" }),
             ),
             ("query_extensions", json!({ "scope_uid": "repo:alpha" })),
             ("brain_diff", json!({})),

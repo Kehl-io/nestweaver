@@ -890,7 +890,7 @@ mod tests {
                 ] {
                     assert!(names.contains(&expected), "missing tool: {expected}");
                 }
-                assert_eq!(tools.len(), 42, "expected 42 tools, got {}", tools.len());
+                assert_eq!(tools.len(), 43, "expected 43 tools, got {}", tools.len());
                 // Every tool has a description leading with usage guidance.
                 for tool in tools {
                     let desc = tool["description"].as_str().expect("description");
