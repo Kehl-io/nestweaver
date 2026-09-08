@@ -444,9 +444,19 @@ unknown/unlisted token sees nothing.
 "team-backend-token"  = ["github.com/acme/backend*"]
 ```
 
-Blast-radius responses (affected/changed symbols, `org_wide` impact, coverage,
-cluster/summary counts) are redacted to the caller's visible repos. Stdio MCP and
-the local CLI are single-user and always see all repos.
+Each tool declares whether it can enforce repository visibility or must refuse
+before computing a graph-wide answer. Enabling a rule does not make global
+aggregates safe through row filtering alone.
+
+With repository authorization enabled, `brain_status` (including both typed
+and JSON status RPCs) requires an administrator: host paths, runtime activity
+and embedding telemetry describe the whole instance. Raw-path implicit-project
+preview also requires an administrator, including `dry_run=true`; query and
+anonymous identities are refused before the path is examined. Admin preview
+remains read-only, and applying a plan still takes the writer gate.
+
+An absent or empty policy preserves the existing local status and preview
+behavior. Admin identities retain full operational status.
 
 #### `[[links]]` — Cross-repo relationships
 

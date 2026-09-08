@@ -1331,38 +1331,8 @@ pub async fn two_tier_query(
 /// hand-construct the string) green while federation silently reverted to
 /// killing a healthy upstream's entire two-tier answer.
 ///
-/// It is KEPT for two reasons, and the second one is load-bearing far more
-/// often than it looks:
-///
-/// 1. Version skew: a client newer than the daemon it talks to receives no
-///    metadata code.
-/// 2. REQUEST COALESCING. `blast_radius` is in `CACHEABLE_TOOLS`, so
-///    concurrent identical calls collapse through
-///    `nestweaver_mcp::tools::coalesce_in_flight`. Only the LEADER runs
-///    `resolve_repo_filter` and holds the typed error; every follower is
-///    handed `anyhow!("{msg}")` rebuilt from a STRING the leader published,
-///    with `RepoFilterUnresolved` nowhere in its chain. The daemon therefore
-///    cannot stamp the code for a follower, and detection for those callers
-///    runs entirely on the prose below. Measured against a live daemon with
-///    12 concurrent identical calls: 1-2 responses carried the code, 10-11
-///    did not.
-///
-/// So "a rewording can no longer break this" is TRUE for a unique request and
-/// FALSE for a coalesced follower. Closing that properly means preserving an
-/// error code across the coalescing boundary in `tools.rs`, which is shared
-/// cache infrastructure well outside this item; until then the fallback is
-/// what keeps federation correct under concurrency, and `node_scope.rs`'s
-/// prefix assertion is what keeps the fallback honest.
-///
-/// `nestweaver-daemon`'s `dispatch_err_to_status` wraps a tool's error as
-/// `Status::internal("tool {tool} failed: {e}")`, and
-/// `dispatch_json_rpc_authed` adds its own `"{tool_name} RPC failed"`
-/// context on top — both preserve the original message text verbatim, so
-/// `nestweaver_engine::node_scope::resolve_repo_filter`'s own wrapping
-/// (`"repo filter entry {selector:?}: {error:#}"`, in both its "not found"
-/// and "ambiguous" outcomes) survives across the gRPC boundary intact. This
-/// text is emitted ONLY by that one function today, so matching on it
-/// cannot mistake an unrelated failure for an unresolved `repo` filter.
+/// Kept only for older daemons that cannot stamp a typed metadata code.
+/// Current request coalescing preserves the typed error for every follower.
 const UNRESOLVED_REPO_FILTER_SIGNAL: &str = "repo filter entry ";
 
 /// Whether `error` is the daemon reporting an unresolved local `repo` filter.
@@ -1377,18 +1347,20 @@ const UNRESOLVED_REPO_FILTER_SIGNAL: &str = "repo filter entry ";
 /// PROSE SECOND, and only as a version-skew downgrade -- see
 /// [`UNRESOLVED_REPO_FILTER_SIGNAL`].
 fn is_unresolved_repo_filter(error: &anyhow::Error, rendered: &str) -> bool {
-    let coded = error
+    let code = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<tonic::Status>())
         .and_then(|status| {
             status
                 .metadata()
                 .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
-        })
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|code| code == nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE);
-
-    coded || rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL)
+        });
+    match code {
+        Some(value) => {
+            value.to_str().ok() == Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE)
+        }
+        None => rendered.contains(UNRESOLVED_REPO_FILTER_SIGNAL),
+    }
 }
 
 /// Build a degraded, disclosure-shaped stand-in for a two-tier LOCAL result
@@ -1492,6 +1464,29 @@ fn degraded_local_impact_for_unresolved_repo_filter(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_error_code_overrides_legacy_looking_text() {
+        let text = "repo filter entry old message";
+        for code in [None, Some("repo-filter-unresolved"), Some("another-code")] {
+            let mut status = tonic::Status::internal(text);
+            if let Some(code) = code {
+                status.metadata_mut().insert(
+                    nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                    code.parse().unwrap(),
+                );
+            }
+            let error = anyhow::Error::new(status).context("outer client context");
+            assert_eq!(
+                super::is_unresolved_repo_filter(&error, text),
+                code != Some("another-code")
+            );
+        }
+        assert!(!super::is_unresolved_repo_filter(
+            &anyhow::anyhow!("ordinary error"),
+            "ordinary error"
+        ));
+    }
+
     use super::*;
     use serde_json::json;
 

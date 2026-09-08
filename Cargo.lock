@@ -4317,6 +4317,7 @@ name = "nestweaver-proto"
 version = "9.3.0"
 dependencies = [
  "prost",
+ "serde_json",
  "tokio-stream",
  "tonic",
  "tonic-build",

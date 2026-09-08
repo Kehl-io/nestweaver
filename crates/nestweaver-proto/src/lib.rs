@@ -4,6 +4,18 @@ pub mod nestweaver_daemon_v1 {
 
 pub use nestweaver_daemon_v1::*;
 
+/// One lossless structured representation for every prune consumer.
+pub fn prune_stale_json(response: &PruneStaleResponse) -> serde_json::Value {
+    serde_json::json!({
+        "removed_repos": response.removed_repos,
+        "removed_vaults": response.removed_vaults,
+        "committed": response.committed,
+        "reconciliation_failures": response.reconciliation_failures.iter().map(|failure| serde_json::json!({
+            "stage": failure.stage, "repo_uid": failure.repo_uid, "message": failure.message,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod additive_status_contract_tests {
     use super::*;

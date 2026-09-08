@@ -2684,6 +2684,43 @@ async fn hybrid_blast_radius_two_tier_degrades_local_when_repo_only_resolves_ups
     // exact-root-path leg — real and resolvable at the SERVER (which indexed
     // it), absent from the LOCAL daemon's index (which only has `repo_b`).
     let repo_a_path = server_repo.display().to_string();
+    // Exercise the actual error mapper and wire metadata under concurrency.
+    // The MCP unit test separately forces eight followers with a barrier;
+    // this process test does not assume a particular server scheduling order.
+    let channel = tonic::transport::Channel::from_shared(_local_guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut calls = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let mut client = NestWeaverDaemonClient::new(channel.clone());
+        let args_json = json!({
+            "changed_files": ["server/main.js"],
+            "max_depth": 3,
+            "repo": repo_a_path,
+        })
+        .to_string();
+        calls.spawn(async move {
+            client
+                .blast_radius(JsonRequest { args_json })
+                .await
+                .unwrap_err()
+        });
+    }
+    while let Some(result) = calls.join_next().await {
+        let status = result.unwrap();
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE),
+            "every concurrent wire response must preserve the typed code: {status}"
+        );
+    }
+    // The hybrid query below exercises the production client decoder and
+    // proves the unresolved local scope still permits a healthy upstream tier.
     let resp = hybrid
         .query(
             "blast_radius",
