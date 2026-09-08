@@ -305,7 +305,7 @@ fn merge_honesty_fields(local: &Value, server: &Value, response: &mut Value) {
     // surrounding provenance/encounter-order convention.
     if let Some(detail) = tiers
         .iter()
-        .find_map(|value| value.get("semantic_unavailable"))
+        .find_map(|value| value.get("semantic_unavailable").filter(|v| !v.is_null()))
     {
         response["semantic_unavailable"] = detail.clone();
     }
@@ -417,6 +417,17 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     // merged (not copied) — see `merge_honesty_fields` for the rules — and are
     // a no-op for tools that never carried them.
     merge_honesty_fields(local, server, &mut response);
+    let warnings: Vec<_> = [("local", local), ("server", server)]
+        .into_iter()
+        .filter_map(|(tier, v)| {
+            v.get("engine_warning")
+                .filter(|w| !w.is_null())
+                .map(|w| serde_json::json!({"tier":tier,"warning":w}))
+        })
+        .collect();
+    if !warnings.is_empty() {
+        response["engine_warnings"] = serde_json::json!(warnings);
+    }
 
     response
 }
@@ -2543,4 +2554,73 @@ mod tests {
         assert!(merged.get("semantic_applied").is_none());
         assert!(merged.get("degraded_components").is_none());
     }
+}
+
+/// Apply the caller's cap after cross-tier ranking/deduplication, per public kind.
+pub fn cap_brain_search_results(value: &mut Value, limit: usize) {
+    let Some(rows) = value.get_mut("results").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let before = rows.len();
+    let mut counts = HashMap::<String, usize>::new();
+    rows.retain(|row| {
+        let kind = row.get("kind").and_then(Value::as_str).unwrap_or("unknown");
+        let kind = if kind.starts_with("Symbol/") {
+            "Symbol"
+        } else {
+            kind
+        };
+        let count = counts.entry(kind.to_string()).or_default();
+        *count += 1;
+        *count <= limit
+    });
+    let returned = rows.len();
+    value["returned_matches"] = serde_json::json!(returned);
+    value["limit_per_kind"] = serde_json::json!(limit);
+    if returned < before {
+        value["truncated"] = Value::Bool(true);
+    }
+}
+
+#[cfg(test)]
+mod hardening_cap_tests {
+    use super::*;
+    #[test]
+    fn caps_symbol_subtypes_together_and_keeps_counts_and_degradation() {
+        let tier = |prefix: &str| {
+            serde_json::json!({
+            "query":"x", "results":[
+                {"uid":format!("{prefix}a"),"kind":"Symbol/Function"},
+                {"uid":format!("{prefix}b"),"kind":"Symbol/Class"},
+                {"uid":format!("{prefix}c"),"kind":"note"}],
+            "total_matches":3,"returned_matches":3,"total_matches_relation":"eq","truncated":false,
+            "engine_warning":"lexical fallback"})
+        };
+        let mut value = merge_json_results(&tier("a"), &tier("b"));
+        cap_brain_search_results(&mut value, 1);
+        assert_eq!(value["results"].as_array().unwrap().len(), 2);
+        assert_eq!(value["returned_matches"], 2);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["engine_warnings"].as_array().unwrap().len(), 2);
+        assert!(value["total_matches"].as_u64().unwrap() >= 2);
+    }
+}
+
+/// A request override wins; otherwise respect the stricter resolved tier configuration.
+pub fn brain_search_limit(params: &Value, local: &Value, server: &Value) -> usize {
+    params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            [local, server]
+                .into_iter()
+                .filter_map(|v| {
+                    v.get("limit_per_kind")
+                        .and_then(Value::as_u64)
+                        .filter(|n| *n > 0)
+                })
+                .min()
+        })
+        .unwrap_or(20) as usize
 }

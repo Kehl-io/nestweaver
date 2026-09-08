@@ -275,6 +275,8 @@ pub struct InvestigateResult {
     /// because the caller had no way to know the ranking was BM25-only.
     #[serde(default)]
     pub semantic_applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_unavailable: Option<serde_json::Value>,
     /// Retrieval components that were requested but unavailable, matching
     /// `brain_context` / `brain_search`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -831,8 +833,16 @@ pub fn investigate(
     // number to `RenderCap` if the cap truncated anything. `None` on the
     // `bm25_fallback` path (no `RenderCap` there to undercount against).
     let mut admitted_before_cap: Option<usize> = None;
+    let mut semantic_applied = false;
+    let mut semantic_unavailable = Some(
+        serde_json::json!({"reason":"seed_resolution_fallback", "remediation":"use a resolvable seed or verify semantic availability"}),
+    );
+    let mut degraded_components = vec!["semantic".to_string()];
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => {
+            semantic_applied = ctx.semantic_applied;
+            semantic_unavailable = ctx.semantic_unavailable;
+            degraded_components = ctx.degraded_components;
             admitted_before_cap = ctx.admitted_before_cap;
             seed_uids = ctx.seeds.iter().map(|n| n.uid.clone()).collect();
             let mut nodes = ctx.seeds;
@@ -1002,7 +1012,6 @@ pub fn investigate(
         })?;
     }
 
-    let semantic_applied = embed_model.is_some();
     // nw-362(b). The keyed map, built HERE from the counters that were
     // already in scope. `retrieval_breadth` is a hard internal bound the
     // caller never stated and cannot raise, which is precisely why it must be
@@ -1045,11 +1054,8 @@ pub fn investigate(
         entries,
         more_available,
         semantic_applied,
-        degraded_components: if semantic_applied {
-            Vec::new()
-        } else {
-            vec!["semantic".to_string()]
-        },
+        semantic_unavailable,
+        degraded_components,
     })
 }
 

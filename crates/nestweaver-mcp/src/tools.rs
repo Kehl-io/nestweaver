@@ -208,6 +208,7 @@ fn restricted_symbol_owners(
 /// deliberately not indexed: it is not a locator, and a short one ("core",
 /// "web") would collide with ordinary strings and start deleting array
 /// elements that name nothing.
+#[cfg(test)]
 fn restricted_repo_identities(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
@@ -318,17 +319,6 @@ enum RepoScope {
     /// or dropping a node has to leave a marker behind rather than vanish
     /// (`flow_trace`, whose empty `children` is nw-390's defect).
     EnforcedInArm,
-    /// Filtered after dispatch by [`redact_response_for_visibility`], which
-    /// walks the response and removes every row whose owning repo is not
-    /// visible.
-    ///
-    /// Sound only because every row of these tools names the entity it
-    /// describes (`uid` / `repo_uid` / `target_uid` / ...). A
-    /// `response_format: "concise"` response drops exactly that field, which
-    /// is why a concise call from a repo-scoped caller is REFUSED rather than
-    /// served unfiltered — an unidentifiable row cannot be attributed to a
-    /// repo, and "cannot attribute" must mean "do not return".
-    RedactedAfterDispatch,
     /// Opt-out. The response is provably free of repo-, symbol-, file- and
     /// path-derived data — the vault surfaces, whose Note/Section/Heading/Tag
     /// nodes belong to a vault and carry no `repo_uid` at all.
@@ -352,11 +342,13 @@ enum RepoScope {
 /// redaction. Everything else — `sym:`, `proc:`, cluster ids, anything a
 /// future indexer invents — is treated as unattributable and DROPPED, because
 /// "I cannot tell which repo owns this" is not a reason to return it.
+#[cfg(test)]
 const VAULT_OWNED_UID_PREFIXES: &[&str] = &["note:", "sec:", "head:", "tag:", "vlt:"];
 
 /// The keys under which a response row names the entity it describes. A row
 /// carrying any of them is attributed through that uid; `repo_uid` (checked
 /// first, since it is the direct answer) short-circuits the lookup.
+#[cfg(test)]
 const IDENTIFYING_UID_KEYS: &[&str] = &[
     "uid",
     "target_uid",
@@ -402,8 +394,10 @@ fn repo_scope(tool: &str) -> RepoScope {
 
         // ── Redacted after dispatch ──────────────────────────────────────
         // Every row of these carries a uid, so one walk attributes them all.
-        "brain_context" | "code_context" | "project_context" | "regex_search" | "dead_code"
-        | "hub_nodes" | "bridge_nodes" => RepoScope::RedactedAfterDispatch,
+        "brain_context" | "code_context" | "project_context" | "dead_code" | "hub_nodes"
+        | "bridge_nodes" | "regex_search" => RepoScope::FailClosed(
+            "global ranking, traversal and aggregate counts cannot be computed safely by post-dispatch redaction",
+        ),
 
         // ── Opt-outs: genuinely not repo-scoped ──────────────────────────
         "note_get" | "backlinks" => RepoScope::NotRepoScoped(
@@ -489,25 +483,6 @@ fn repo_scope(tool: &str) -> RepoScope {
     }
 }
 
-/// True when this call asked for the identifier-free rendering.
-///
-/// `project_context` is the exception the generic [`is_concise`] cannot
-/// express: its `response_format` DEFAULTS to concise (anything but
-/// "detailed" is concise), so a scoped caller who sends no `response_format`
-/// at all would otherwise receive uid-free rows that nothing can attribute.
-/// The default is restated rather than shared because the two live far apart
-/// and the safe reading of an absent field differs between them.
-fn response_omits_identifiers(tool: &str, args: &Value) -> bool {
-    match tool {
-        "project_context" => args
-            .get("response_format")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.eq_ignore_ascii_case("detailed"))
-            .unwrap_or(true),
-        _ => is_concise(args),
-    }
-}
-
 /// Walks a tool response and removes every row whose owning repo is not
 /// visible to the caller.
 ///
@@ -515,6 +490,7 @@ fn response_omits_identifiers(tool: &str, args: &Value) -> bool {
 /// already builds, so there is exactly ONE symbol→repo authority in this file,
 /// and it decides through [`repo_is_visible`], so there is exactly one
 /// predicate. A row it cannot attribute is dropped, not kept.
+#[cfg(test)]
 struct VisibilityRedactor<'a> {
     owners: &'a HashMap<String, String>,
     /// nw-416: identity string -> owning repo, for the string arrays
@@ -525,6 +501,7 @@ struct VisibilityRedactor<'a> {
     removed: usize,
 }
 
+#[cfg(test)]
 impl VisibilityRedactor<'_> {
     /// A uid is allowed when its owning repo is visible. An unknown `sym:`
     /// uid (a row the ownership scan did not see, e.g. a tombstoned symbol)
@@ -611,6 +588,7 @@ impl VisibilityRedactor<'_> {
 /// over the whole graph before any row is dropped, so a scoped caller reading
 /// `returned` against `total` would otherwise conclude the tool truncated for
 /// budget reasons. `visibility.redacted_entries` names the real cause.
+#[cfg(test)]
 fn redact_response_for_visibility(
     store: &GraphStore,
     value: &mut Value,
@@ -2330,6 +2308,8 @@ mod tool_schema_validation_tests {
             semantic_applied: false,
             degraded_components: Vec::new(),
             semantic_unavailable: None,
+            engine_warning: None,
+            limit_per_kind: 20,
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -2429,6 +2409,8 @@ mod tool_schema_validation_tests {
             semantic_applied: false,
             degraded_components: Vec::new(),
             semantic_unavailable: None,
+            engine_warning: None,
+            limit_per_kind: 20,
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -3144,24 +3126,6 @@ fn dispatch_uncached(
                 "tool answered a repository-scoped caller under a not-repo-scoped exemption"
             );
             dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)
-        }
-        RepoScope::RedactedAfterDispatch => {
-            // A concise rendering omits the very uid the redactor attributes
-            // rows by, so it cannot be filtered — and an unfilterable
-            // response is refused, not served. The remedy is in the message
-            // because `project_context` defaults to concise and its callers
-            // never sent the field at all.
-            if response_omits_identifiers(name, &args) {
-                return Err(anyhow!(
-                    "{name}: response_format \"concise\" omits the per-row UIDs that repository \
-                     visibility filtering attributes rows by, so it cannot be scoped to this \
-                     caller's repositories. Re-request with response_format \"detailed\"."
-                ));
-            }
-            let mut value =
-                dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)?;
-            redact_response_for_visibility(store, &mut value, visible)?;
-            Ok(value)
         }
         RepoScope::FailClosed(reason) => Err(anyhow!(
             "{name} is not available to a repository-scoped caller: {reason}. Refusing rather \
@@ -5263,9 +5227,8 @@ fn tool_brain_context(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    // nw-405: the arm still returns rows through `RepoScope::RedactedAfterDispatch`;
-    // `visible` is taken here only so `resolve_repo_filter`'s ERROR text — which
-    // no redactor walks — cannot enumerate repos this caller may not see.
+    // Keep error construction scoped as defense in depth; dispatch refuses
+    // restricted callers before this aggregate arm runs.
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     require_verified_embedding_identity_for_rerank(store, &args)?;
@@ -5709,6 +5672,7 @@ fn tool_brain_context(
         "token_budget": token_budget,
         "limit": count_limit,
         "semantic_applied": result.semantic_applied,
+        "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": &result.degraded_components,
     });
 
@@ -6517,6 +6481,7 @@ fn tool_brain_search(
         // — the local in-process dispatch, strictly upstream of any federated
         // merge. `hybrid.rs` has no response cache and never writes merged
         // output back, so nothing downstream of the merge reads these values.
+        "limit_per_kind": limit,
         "semantic_applied": false,
         "degraded_components": [],
     });
@@ -7477,6 +7442,8 @@ mod brain_search_total_contract_tests {
             semantic_applied: false,
             degraded_components: Vec::new(),
             semantic_unavailable: None,
+            engine_warning: None,
+            limit_per_kind: 20,
         };
 
         // 2. Daemon-routed MCP: forwards the proto fields verbatim.
@@ -12276,6 +12243,7 @@ fn tool_project_context(
             "truncated": provisional_dropped > 0,
             "budget_exceeded": used_tokens > token_budget,
             "semantic_applied": result.semantic_applied,
+        "semantic_unavailable": result.semantic_unavailable,
             "degraded_components": &result.degraded_components,
         });
         if let Some(ref sj) = seeds_json {
@@ -12336,6 +12304,7 @@ fn tool_project_context(
         "seed_tokens_charged": seed_tokens,
         "budget_exceeded": final_payload_tokens > token_budget,
         "semantic_applied": result.semantic_applied,
+        "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": &result.degraded_components,
     });
 
@@ -14158,6 +14127,8 @@ fn daemon_brain_search_response_to_json(
     let mut value = json!({
         "query": response.query,
         "engine": response.engine,
+        "engine_warning": response.engine_warning,
+        "limit_per_kind": response.limit_per_kind,
         "total_matches": response.total_matches,
         "total_matches_relation": relation,
         "returned_matches": returned_matches,
@@ -14272,7 +14243,8 @@ fn dispatch_via_daemon_inner(
             let resp = rt
                 .block_on(client.list_repos_json(req))
                 .map_err(|s| anyhow::anyhow!("list_repos RPC failed: {}", s.message()))?;
-            serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
+            serde_json::from_str(&resp.into_inner().result_json)
+                .map_err(|e| anyhow!("repository inventory decode failed before removal; retry after repairing daemon response: {e}"))?
         };
         let matched_repo = match_repo_target(&repos, &target);
         if matched_repo.len() > 1 {
@@ -14306,12 +14278,11 @@ fn dispatch_via_daemon_inner(
             let req = tonic::Request::new(nestweaver_proto::JsonRequest {
                 args_json: "{}".to_string(),
             });
-            match rt.block_on(client.list_vaults_json(req)) {
-                Ok(resp) => {
-                    serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
-                }
-                Err(_) => Vec::new(),
-            }
+            let resp = rt.block_on(client.list_vaults_json(req)).map_err(|e| {
+                anyhow!("vault inventory RPC failed before removal; check daemon and retry: {e}")
+            })?;
+            serde_json::from_str(&resp.into_inner().result_json)
+                .map_err(|e| anyhow!("vault inventory decode failed before removal; repair daemon response and retry: {e}"))?
         };
         let canonical_target = std::fs::canonicalize(&target)
             .map(|p| p.display().to_string())
@@ -22544,7 +22515,7 @@ mod repo_visibility_coverage_tests {
                     !reason.is_empty(),
                     "{name} opts out of scoping without a justification"
                 ),
-                RepoScope::EnforcedInArm | RepoScope::RedactedAfterDispatch => {}
+                RepoScope::EnforcedInArm => {}
             }
         }
         // Counterweight: the fallback really is fail-closed, so a tool added
@@ -22717,8 +22688,7 @@ mod repo_visibility_coverage_tests {
         )
         .expect_err("a concise response cannot be repo-scoped");
         let text = format!("{error:#}");
-        assert!(text.contains("concise"), "{text}");
-        assert!(text.contains("detailed"), "{text}");
+        assert!(text.contains("repository-scoped caller"), "{text}");
         // Counterweight: the refusal is about SCOPING, not about concise mode.
         // An unscoped caller keeps the concise rendering it always had.
         assert!(
@@ -24277,6 +24247,42 @@ mod seed_cap_disclosure_tests {
                 Value::Null,
                 "{tool}: {payload}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod hardening_aggregate_tests {
+    use super::*;
+    #[test]
+    fn aggregate_tools_refuse_restricted_callers_before_reading_arguments() {
+        let store = GraphStore::in_memory().unwrap();
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(Default::default());
+        for name in [
+            "brain_context",
+            "code_context",
+            "project_context",
+            "dead_code",
+            "hub_nodes",
+            "bridge_nodes",
+            "regex_search",
+        ] {
+            for format in ["concise", "detailed"] {
+                let error = dispatch_uncached(
+                    &store,
+                    None,
+                    name,
+                    json!({"response_format":format}),
+                    None,
+                    None,
+                    Some(&visible),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("repository-scoped"),
+                    "{name}: {error}"
+                );
+            }
         }
     }
 }

@@ -350,6 +350,8 @@ message BrainSearchResponse {
   bool semantic_applied = 9;
   repeated string degraded_components = 10;
   optional SemanticUnavailable semantic_unavailable = 11;
+  optional string engine_warning = 12;
+  uint32 limit_per_kind = 13;
 }
 message SemanticUnavailable {
   string cause = 1;

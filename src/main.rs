@@ -2816,12 +2816,12 @@ fn render_investigate_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_bool())
         .is_some_and(|applied| !applied)
     {
-        println!(
-            "  note: semantic retrieval unavailable — ranking is lexical (BM25) only, \
-             so ordering differs from a daemon-served run."
-        );
+        println!("  note: semantic retrieval did not contribute to this result.");
     }
 
+    if let Some(detail) = payload.get("semantic_unavailable").filter(|v| !v.is_null()) {
+        println!("  Semantic diagnostic: {detail}");
+    }
     for d in &domains {
         println!("\n[{}]", text(d, "label"));
         let entry_point = text(d, "entry_point");
@@ -21295,12 +21295,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 files_count = result.files_count;
                 symbols_count = result.symbols_count;
-                edges_count = result.edges_count;
+                edges_count = Some(result.edges_count);
 
                 if !json {
                     println!(
                         "Indexed {} file(s), {} symbol(s), {} edge(s).",
-                        files_count, symbols_count, edges_count
+                        files_count, symbols_count, result.edges_count
                     );
                 }
 
@@ -21331,7 +21331,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 files_count = inc.files_added + inc.files_modified;
                 symbols_count = inc.symbols_added;
-                edges_count = 0; // not tracked separately in incremental
+                edges_count = inc.full_edges_count;
                 skipped_files = inc.skipped_files.clone();
 
                 if inc.fell_back_to_full {
@@ -21486,7 +21486,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "{} files, {} symbols, {} edges in {}",
                 files_count,
                 symbols_count,
-                edges_count,
+                edges_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unavailable".into()),
                 format_elapsed(t0.elapsed())
             );
 
@@ -25184,76 +25186,53 @@ fn run_brain(
         }
 
         BrainCommands::List { json, db, config } => {
-            // nw-280: resolved through the same helper as its two documented
-            // siblings, so a pinned `--config` selects the database its
-            // `db` field names instead of silently falling back to
-            // `./nestweaver.lbug`.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let db_path = db_path.as_path();
-
-            if use_daemon
-                && let Some(value) = try_hybrid_json_rpc(
-                    true,
-                    db_path,
-                    config.as_deref(),
-                    "list_vaults",
-                    serde_json::json!({}),
-                )?
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-                return Ok((EXIT_SUCCESS, None));
-            }
-
-            let store = open_store(Some(db_path))?;
-            let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
-
-            // Compute (note_count, last_indexed) per vault. Prefer the
-            // extension-store timestamp (actual indexer run) with fallback
-            // to max(note.modified_at).
-            let per_vault: Vec<(String, usize, Option<String>)> = vaults
-                .iter()
-                .map(|v| {
-                    let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
-                    let last = get_last_indexed_at(db_path, &v.uid)
-                        .or_else(|| notes.iter().filter_map(|n| n.modified_at.clone()).max());
-                    (v.uid.clone(), notes.len(), last)
-                })
-                .collect();
-
+            let value = if let Some(value) = try_hybrid_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "list_vaults",
+                serde_json::json!({"include_counts": true}),
+            )? {
+                value
+            } else {
+                let store = open_store(Some(&db_path))?;
+                nestweaver_engine::index_md::vault_inventory(&store, &db_path)?
+            };
+            let rows = value
+                .as_array()
+                .context("invalid vault inventory response")?;
             if json {
-                #[derive(serde::Serialize)]
-                struct VaultRow {
-                    uid: String,
-                    name: String,
-                    root_path: String,
-                    notes: usize,
-                    last_indexed: Option<String>,
-                }
-                let rows: Vec<VaultRow> = vaults
-                    .iter()
-                    .zip(per_vault.iter())
-                    .map(|(v, (_, notes, last))| VaultRow {
-                        uid: v.uid.clone(),
-                        name: v.name.clone(),
-                        root_path: v.root_path.clone(),
-                        notes: *notes,
-                        last_indexed: last.clone(),
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else if vaults.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if rows.is_empty() {
                 println!("No vaults indexed. Try: nestweaver brain add <path>");
             } else {
-                for (v, (_, notes, last)) in vaults.iter().zip(per_vault.iter()) {
-                    println!("{}", v.name);
-                    println!("  UID:   {}", v.uid);
-                    println!("  Path:  {}", v.root_path);
-                    println!("  Notes: {notes}");
-                    println!("  Last indexed: {}", last.as_deref().unwrap_or("(unknown)"));
-                    println!();
+                for row in rows {
+                    println!(
+                        "{}\n  UID:   {}\n  Path:  {}\n  Notes: {}\n  Last indexed: {}",
+                        row["name"].as_str().unwrap_or("(unknown)"),
+                        row["uid"].as_str().unwrap_or("(unknown)"),
+                        row["root_path"].as_str().unwrap_or("(unknown)"),
+                        row["notes"]
+                            .as_u64()
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
+                        row["last_indexed"].as_str().unwrap_or("(unknown)")
+                    );
+                    if let Some(error) = row["inventory_error"].as_str() {
+                        println!("  Warning: {error}");
+                    }
                 }
             }
-            Ok((EXIT_SUCCESS, None))
+            let unavailable = rows.iter().any(|r| r["notes"].is_null());
+            Ok((
+                if unavailable {
+                    EXIT_ERROR
+                } else {
+                    EXIT_SUCCESS
+                },
+                None,
+            ))
         }
 
         BrainCommands::Status { json, db, config } => {
@@ -25485,11 +25464,11 @@ fn run_brain(
                                                 client
                                                     .repo_states(req)
                                                     .await
-                                                    .map(|r| r.into_inner().repos.len())
-                                                    .unwrap_or(0)
+                                                    .map(|r| format!("{} repos", r.into_inner().repos.len()))
+                                                    .unwrap_or_else(|_| "repository inventory unavailable; check upstream authorization and retry".to_string())
                                             });
                                             println!(
-                                                "  Server: {name} (v{version}, {mode} mode, healthy, {repo_count} repos)"
+                                                "  Server: {name} (v{version}, {mode} mode, healthy, {repo_count})"
                                             );
                                         }
                                         _ => {
@@ -28696,6 +28675,18 @@ fn print_brain_context_text(
     token_budget: Option<usize>,
     upstream: &UpstreamContextDisclosure,
 ) {
+    if let Some(detail) = &result.semantic_unavailable {
+        println!(
+            "Warning: semantic retrieval unavailable ({}). {}",
+            detail["reason"].as_str().unwrap_or("unknown"),
+            detail["remediation"]
+                .as_str()
+                .unwrap_or("verify embedding readiness")
+        );
+        if let Some(pipeline) = detail.get("pipeline").filter(|v| !v.is_null()) {
+            println!("  Pipeline: {pipeline}");
+        }
+    }
     // Feature F7: show PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
@@ -28881,6 +28872,8 @@ fn render_brain_search_response(
         let mut payload = serde_json::json!({
             "query": resp.query,
             "engine": resp.engine,
+            "engine_warning": resp.engine_warning,
+            "limit_per_kind": resp.limit_per_kind,
             "results": results,
             "total_matches": resp.total_matches,
             "total_matches_relation": total_matches_relation,
@@ -28899,6 +28892,9 @@ fn render_brain_search_response(
         return Ok(());
     }
 
+    if let Some(warning) = &resp.engine_warning {
+        println!("Warning: {warning}");
+    }
     if let Some(detail) = &resp.semantic_unavailable {
         println!(
             "Warning: semantic search unavailable ({}): {}\n  Remediation: {}",
@@ -31476,6 +31472,8 @@ mod brain_search_renderer_tests {
             semantic_applied: false,
             degraded_components: Vec::new(),
             semantic_unavailable: None,
+            engine_warning: None,
+            limit_per_kind: 20,
         };
 
         let metadata = brain_search_display_metadata(&response);
@@ -31556,6 +31554,26 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
     let truncated =
         explicit_truncated || total_matches_relation != "eq" || returned_matches < total_matches;
 
+    if let Some(warning) = result
+        .get("engine_warning")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("Warning: {warning}");
+    }
+    if let Some(warnings) = result
+        .get("engine_warnings")
+        .and_then(serde_json::Value::as_array)
+    {
+        for warning in warnings {
+            println!(
+                "Warning ({}): {}",
+                warning["tier"].as_str().unwrap_or("upstream"),
+                warning["warning"]
+                    .as_str()
+                    .unwrap_or("lexical backend unavailable")
+            );
+        }
+    }
     if results.is_empty() {
         println!("No results for '{}'.", query);
         return Ok(());
@@ -31636,6 +31654,9 @@ fn render_project_context_daemon_response(
             Err(e) => eprintln!("warning: failed to serialize daemon response: {e}"),
         }
         return;
+    }
+    if let Some(detail) = value.get("semantic_unavailable").filter(|v| !v.is_null()) {
+        println!("Warning: semantic retrieval unavailable: {detail}");
     }
     let project = value.get("project").and_then(|v| v.as_str()).unwrap_or("");
     let project_uid = value
@@ -31774,6 +31795,7 @@ fn brain_context_json_value(
         // both routes.
         "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str).or(upstream.truncated_by.as_deref()),
         "semantic_applied": result.semantic_applied,
+        "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": result.degraded_components,
     });
 
@@ -31837,6 +31859,7 @@ mod context_json_renderer_tests {
             unresolved_seeds: vec!["missing".to_string()],
             expansion_terms: Vec::new(),
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec!["semantic".to_string()],
             // nw-393 added the seed-cap disclosure to `BrainContextResult`.
@@ -32461,6 +32484,13 @@ where
                                     api_model,
                                     u32::try_from(emb_dim)?,
                                 );
+                                if !force
+                                    && let Some(diagnostic) =
+                                        store.embedding_pipeline_mismatch(&pipeline)?
+                                {
+                                    eprintln!("embedding pipeline mismatch: {diagnostic}");
+                                    return Ok(EXIT_ERROR);
+                                }
                                 if store.add_embedding_with_pipeline(&h.uid, emb, &pipeline, force)
                                 {
                                     success_count += 1;
@@ -32531,6 +32561,13 @@ where
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
                                     let pipeline = embed_model
                                         .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline)?
+                                    {
+                                        eprintln!("embedding pipeline mismatch: {diagnostic}");
+                                        return Ok(EXIT_ERROR);
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &sym.uid,
                                         emb.clone(),
@@ -32593,6 +32630,13 @@ where
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
                                     let pipeline = embed_model
                                         .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline)?
+                                    {
+                                        eprintln!("embedding pipeline mismatch: {diagnostic}");
+                                        return Ok(EXIT_ERROR);
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &note.uid,
                                         emb.clone(),
@@ -32668,6 +32712,13 @@ where
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
                                     let pipeline = embed_model
                                         .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline)?
+                                    {
+                                        eprintln!("embedding pipeline mismatch: {diagnostic}");
+                                        return Ok(EXIT_ERROR);
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &h.uid,
                                         emb.clone(),

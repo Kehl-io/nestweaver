@@ -1224,16 +1224,7 @@ fn index_markdown_since_with_reader(
         }
     }
     let project_note_refs = string_edge_refs(&project_note_edges);
-    // nw-204, vault half: collect the Note and Heading UIDs the refresh is
-    // about to remove, BEFORE it removes them. Applied after the commit with a
-    // liveness filter, because an edited note is deleted and re-inserted under
-    // the same uid.
-    let embedding_candidates: Vec<String> = delete_note_uids
-        .iter()
-        .filter_map(|uid| store.note_embedding_candidate_uids(uid).ok())
-        .flatten()
-        .collect();
-
+    // Publication completion reconciles vectors against the committed graph.
     let graph_publication =
         crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
     store
@@ -1267,24 +1258,7 @@ fn index_markdown_since_with_reader(
 
     let publication = graph_publication.finish(true)?;
 
-    // Best-effort and AFTER the commit, like the symbol epilogue: a
-    // tombstoning failure must not fail a refresh that already succeeded.
-    // Without this a CLI `brain refresh` that dropped 200 notes left every
-    // note and heading vector live and scored, with only a WRITABLE daemon's
-    // periodic reconciler as backstop — so a CLI-only run, or one against a
-    // read-only daemon, leaked indefinitely.
-    if !embedding_candidates.is_empty() {
-        match store.tombstone_deleted_vault_embeddings(&embedding_candidates) {
-            Ok(0) => {}
-            Ok(removed) => {
-                tracing::debug!("vault refresh: tombstoned {removed} dead vault vector(s)")
-            }
-            Err(error) => tracing::warn!(
-                "vault refresh: could not tombstone dead vault vectors: {error}; \
-                 the periodic reconciler will reclaim them"
-            ),
-        }
-    }
+    // Publication completion reconciles vectors against the committed live graph.
 
     Ok(MarkdownSinceResult {
         vault_name: vault_name.to_string(),
@@ -6193,5 +6167,81 @@ mod link_resolution_tests {
     fn escaping_the_vault_root_is_refused() {
         assert_eq!(normalize_relative("a", "../../x"), None);
         assert_eq!(normalize_relative("", ".."), None);
+    }
+}
+
+/// One shared CLI/daemon inventory: failed counts remain unavailable.
+pub fn vault_inventory(store: &GraphStore, db_path: &Path) -> anyhow::Result<serde_json::Value> {
+    vault_inventory_with_notes(store, db_path, |uid| store.list_notes(Some(uid)))
+}
+
+fn vault_inventory_with_notes(
+    store: &GraphStore,
+    db_path: &Path,
+    list_notes: impl Fn(&str) -> Result<Vec<nestweaver_schema::Note>, nestweaver_store::StoreError>,
+) -> anyhow::Result<serde_json::Value> {
+    let vaults = store.list_vaults(None)?;
+    let rows: Vec<_> = vaults
+        .into_iter()
+        .map(|v| {
+            let (notes, last, error) = match list_notes(&v.uid) {
+                Ok(notes) => (
+                    Some(notes.len()),
+                    crate::get_last_indexed_at(db_path, &v.uid)
+                        .or_else(|| notes.iter().filter_map(|n| n.modified_at.clone()).max()),
+                    None,
+                ),
+                Err(_) => (
+                    None,
+                    crate::get_last_indexed_at(db_path, &v.uid),
+                    Some("note inventory unavailable; repair the store and retry"),
+                ),
+            };
+            serde_json::json!({"uid":v.uid,"name":v.name,"root_path":v.root_path,
+            "notes":notes,"last_indexed":last,"inventory_error":error})
+        })
+        .collect();
+    Ok(serde_json::json!(rows))
+}
+
+#[cfg(test)]
+mod hardening_inventory_tests {
+    use super::*;
+    #[test]
+    fn partial_inventory_keeps_failed_counts_null_and_real_empty_counts_zero() {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["vlt:empty", "vlt:unreadable"] {
+            store
+                .insert_vault(&Vault {
+                    uid: uid.into(),
+                    name: uid.into(),
+                    root_path: uid.into(),
+                    instance_id: "fixture".into(),
+                })
+                .unwrap();
+        }
+        let value = vault_inventory_with_notes(&store, Path::new("unused.lbug"), |uid| {
+            if uid == "vlt:unreadable" {
+                Err(nestweaver_store::StoreError::Query(
+                    "injected inventory read failure".into(),
+                ))
+            } else {
+                store.list_notes(Some(uid))
+            }
+        })
+        .unwrap();
+        let rows = value.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let empty = rows.iter().find(|v| v["uid"] == "vlt:empty").unwrap();
+        assert_eq!(empty["notes"], 0);
+        assert!(empty["inventory_error"].is_null());
+        let failed = rows.iter().find(|v| v["uid"] == "vlt:unreadable").unwrap();
+        assert!(failed["notes"].is_null());
+        assert!(
+            failed["inventory_error"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
     }
 }

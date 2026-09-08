@@ -1043,6 +1043,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec![],
             ..Default::default()
@@ -1074,6 +1075,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec![],
             ..Default::default()
@@ -1114,6 +1116,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec![],
             ..Default::default()
@@ -1147,6 +1150,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec![],
             ..Default::default()
@@ -1561,6 +1565,9 @@ pub struct BrainContextResult {
     /// vector search successfully.
     #[serde(default)]
     pub semantic_applied: bool,
+    /// Stable safe diagnostics for an optional semantic leg that could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_unavailable: Option<serde_json::Value>,
     /// How many entries in `seeds` were injected by the semantic leg rather
     /// than resolved from the query text.
     ///
@@ -2169,6 +2176,12 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         store.require_verified_embedding_identity()?;
     }
     let mut semantic_applied = false;
+    let mut semantic_detail = None;
+    let mut semantic_reason = if embed_model.is_none() {
+        "model_unavailable"
+    } else {
+        "vectors_unavailable"
+    };
     let mut semantic_seed_count: usize = 0;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
@@ -2186,13 +2199,44 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         // inference error. Preserve cancellation as an incomplete query rather
         // than degrading that error into a cacheable semantic miss.
         ensure_brain_context_not_cancelled(cancel)?;
+        semantic_reason = "query_inference_failed";
         if let Ok(query_emb) = query_embedding {
-            match crate::vector_search::vector_knn_all_cancellable(
-                store,
-                &query_emb,
-                config.semantic_limit,
-                cancel,
-            ) {
+            semantic_reason = "vector_search_failed";
+            if store
+                .embedding_index_dimension()
+                .is_some_and(|d| d != query_emb.len())
+            {
+                semantic_reason = "dimension_mismatch";
+            }
+
+            let pipeline = model.pipeline_for_dimension(query_emb.len());
+            let mismatch = match pipeline {
+                Ok(pipeline) if pipeline.provider != "opaque-runtime" => {
+                    store.embedding_pipeline_mismatch(&pipeline)?
+                }
+                Ok(_) => None,
+                Err(_) => {
+                    semantic_reason = "pipeline_unavailable";
+                    None
+                }
+            };
+            let search = if let Some(diagnostic) = mismatch {
+                semantic_reason = "pipeline_mismatch";
+                semantic_detail = Some(diagnostic);
+                Err(anyhow::anyhow!("pipeline mismatch"))
+            } else if semantic_reason == "pipeline_unavailable" {
+                Err(anyhow::anyhow!("query pipeline unavailable"))
+            } else if semantic_reason == "dimension_mismatch" {
+                Err(anyhow::anyhow!("query dimension mismatch"))
+            } else {
+                crate::vector_search::vector_knn_all_cancellable(
+                    store,
+                    &query_emb,
+                    config.semantic_limit,
+                    cancel,
+                )
+            };
+            match search {
                 Ok(hits) => {
                     semantic_applied = true;
                     if config.always_blend_semantic {
@@ -2222,7 +2266,14 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
                 {
                     return Err(e);
                 }
-                Err(_) => {}
+                Err(error) => {
+                    if matches!(
+                        error.downcast_ref::<nestweaver_store::StoreError>(),
+                        Some(nestweaver_store::StoreError::EmbeddingArtifactCorrupt)
+                    ) {
+                        semantic_reason = "vector_artifact_corrupt";
+                    }
+                }
             }
         }
     }
@@ -2354,6 +2405,17 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         unresolved_seeds: unresolved,
         expansion_terms,
         semantic_applied,
+        semantic_unavailable: (semantic_requested && !semantic_applied).then(|| serde_json::json!({
+            "component": "semantic", "reason": semantic_reason, "pipeline": semantic_detail,
+            "stage": match semantic_reason {
+                "model_unavailable" => "model_load",
+                "query_inference_failed" => "query_inference",
+                "pipeline_mismatch" | "dimension_mismatch" | "pipeline_unavailable" => "pipeline_validation",
+                "vector_artifact_corrupt" | "vectors_unavailable" => "vector_artifact",
+                _ => "vector_search",
+            },
+            "remediation": "verify the configured embedding model and vector artifacts, then retry or rebuild embeddings"
+        })),
         semantic_seed_count,
         degraded_components: if semantic_requested && !semantic_applied {
             vec!["semantic".to_string()]
@@ -2476,6 +2538,9 @@ pub fn weighted_score_fuse(
         }
     }
 
+    // Stable accumulation order also prevents floating-point normalization drift.
+    all_uids.sort_unstable();
+
     let ppr_raw: Vec<f64> = all_uids
         .iter()
         .map(|u| ppr_scores.get(u).copied().unwrap_or(0.0))
@@ -2502,7 +2567,7 @@ pub fn weighted_score_fuse(
         })
         .collect();
 
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     results
 }
 
@@ -4300,6 +4365,7 @@ mod dedup_heading_section_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_unavailable: None,
             semantic_seed_count: 0,
             degraded_components: vec![],
             ..Default::default()
@@ -4698,6 +4764,12 @@ mod semantic_leg_tests {
         let model = CountingEmbed { calls: 0.into() };
 
         let result = run_context(&store, Some(&model), 0.35);
+        let detail = result
+            .semantic_unavailable
+            .as_ref()
+            .expect("typed degradation");
+        assert_eq!(detail["reason"], "vectors_unavailable");
+        assert_eq!(detail["stage"], "vector_artifact");
 
         assert_eq!(
             model.call_count(),
@@ -4819,6 +4891,12 @@ mod semantic_leg_tests {
         let store = GraphStore::open(&db).unwrap();
         let model = CountingEmbed { calls: 0.into() };
         let result = run_context(&store, Some(&model), 0.35);
+        let detail = result
+            .semantic_unavailable
+            .as_ref()
+            .expect("typed degradation");
+        assert_eq!(detail["reason"], "vector_artifact_corrupt");
+        assert_eq!(detail["stage"], "vector_artifact");
 
         assert!(
             !result.semantic_applied,
@@ -4841,6 +4919,12 @@ mod semantic_leg_tests {
         assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
 
         let result = run_context(&store, None, 0.35);
+        let detail = result
+            .semantic_unavailable
+            .as_ref()
+            .expect("typed degradation");
+        assert_eq!(detail["reason"], "model_unavailable");
+        assert_eq!(detail["stage"], "model_load");
 
         assert!(!result.semantic_applied);
         assert_eq!(result.degraded_components, ["semantic"]);
@@ -4856,6 +4940,12 @@ mod semantic_leg_tests {
         assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
 
         let result = run_context(&store, Some(&FailingEmbed), 0.35);
+        let detail = result
+            .semantic_unavailable
+            .as_ref()
+            .expect("typed degradation");
+        assert_eq!(detail["reason"], "query_inference_failed");
+        assert_eq!(detail["stage"], "query_inference");
 
         assert!(!result.semantic_applied);
         assert_eq!(result.degraded_components, ["semantic"]);
@@ -5137,5 +5227,37 @@ mod service_summary_tests {
             "an unresolvable repo selector must fail loudly, not answer about \
              whichever repo the store returned first"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardening_order_tests {
+    use super::*;
+    #[test]
+    fn equal_scores_have_stable_uid_order_across_hash_seeds() {
+        let scores: Vec<_> = (0..100)
+            .rev()
+            .map(|i| (format!("sym:{i:03}"), 1.0))
+            .collect();
+        let expected: Vec<_> = (0..100).map(|i| format!("sym:{i:03}")).collect();
+        for _ in 0..100 {
+            let got = weighted_score_fuse(&scores, &[], &[], 1.0, 0.0, 0.0);
+            assert_eq!(
+                got.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn unequal_scores_are_not_rounded_to_ties() {
+        let got = weighted_score_fuse(
+            &[("a".into(), 1.0), ("z".into(), 1.0001)],
+            &[],
+            &[],
+            1.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(got[0].0, "z");
     }
 }

@@ -2263,6 +2263,11 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
             .map(|rows| rows.len() as u64)
     );
     assert_eq!(merged_small["truncated"], true);
+    assert_eq!(
+        merged_small["returned_matches"], 1,
+        "the final symbol cap applies across both tiers"
+    );
+    assert_eq!(merged_small["limit_per_kind"], 1);
     assert!(merged_small["total_matches"].as_u64().is_some());
 
     // With both sources complete, RRF dedup has the complete union and may
