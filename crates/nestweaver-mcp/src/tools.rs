@@ -11261,8 +11261,8 @@ fn tool_unset_extension(args: Value) -> Result<Value, anyhow::Error> {
         let resp = rt
             .block_on(client.unset_extension(req))
             .map_err(|e| anyhow!("unset_extension RPC failed: {e}"))?;
-        return serde_json::from_str(&resp.into_inner().result_json)
-            .map_err(|e| anyhow!("decode unset_extension response: {e}"));
+        serde_json::from_str(&resp.into_inner().result_json)
+            .map_err(|e| anyhow!("decode unset_extension response: {e}"))
     }
 
     // Non-daemon fallback: single-process, so a direct write is the only writer
