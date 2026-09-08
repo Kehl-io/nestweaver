@@ -313,6 +313,7 @@ pub struct EmbeddingIndex {
     /// and unknown always allows the write: the dimension guard still applies.
     recorded_model_id: Option<String>,
     recorded_pipeline_fingerprint: Option<String>,
+    recorded_pipeline: Option<nestweaver_schema::EmbeddingPipelineV2>,
     similarity: nestweaver_schema::EmbeddingSimilarity,
     artifact_envelope: Option<EmbeddingArtifactEnvelopeV2>,
     pending_deltas: Vec<EmbeddingDelta>,
@@ -391,6 +392,7 @@ impl EmbeddingIndex {
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            recorded_pipeline: None,
             similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
@@ -409,7 +411,36 @@ impl EmbeddingIndex {
     }
 
     pub fn set_recorded_pipeline_fingerprint(&mut self, fingerprint: Option<String>) {
+        if fingerprint.is_none() {
+            self.recorded_pipeline = None;
+        }
         self.recorded_pipeline_fingerprint = fingerprint;
+    }
+
+    pub(crate) fn set_recorded_pipeline(
+        &mut self,
+        pipeline: Option<nestweaver_schema::EmbeddingPipelineV2>,
+    ) {
+        self.recorded_pipeline = pipeline;
+    }
+
+    pub(crate) fn pipeline_mismatch(
+        &self,
+        incoming: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let fingerprint = incoming.fingerprint()?;
+        if self
+            .recorded_pipeline_fingerprint
+            .as_deref()
+            .is_some_and(|r| r != fingerprint)
+        {
+            return nestweaver_schema::EmbeddingPipelineV2::mismatch_diagnostic(
+                self.recorded_pipeline.as_ref(),
+                incoming,
+            )
+            .map(Some);
+        }
+        Ok(None)
     }
 
     pub(crate) fn recorded_pipeline_fingerprint(&self) -> Option<&str> {
@@ -471,6 +502,7 @@ impl EmbeddingIndex {
             // it without `--force`; no mixed vectors can result.
             if self.is_empty() {
                 self.recorded_pipeline_fingerprint = Some(incoming.clone());
+                self.recorded_pipeline = Some(pipeline.clone());
                 self.recorded_model_id = Some(pipeline.model_id.clone());
                 self.similarity = pipeline.similarity.clone();
             } else if !force {
@@ -478,6 +510,7 @@ impl EmbeddingIndex {
                     uid,
                     recorded,
                     incoming,
+                    diagnostic = ?self.pipeline_mismatch(pipeline),
                     "rejecting embedding pipeline mismatch"
                 );
                 return false;
@@ -509,6 +542,7 @@ impl EmbeddingIndex {
         let accepted = self.add_with_model(uid, embedding, Some(&pipeline.model_id), force);
         if accepted {
             self.recorded_pipeline_fingerprint = Some(incoming);
+            self.recorded_pipeline = Some(pipeline.clone());
             self.recorded_model_id = Some(pipeline.model_id.clone());
             self.similarity = pipeline.similarity.clone();
         }
@@ -641,6 +675,7 @@ impl EmbeddingIndex {
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            recorded_pipeline: None,
             similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
@@ -748,6 +783,7 @@ impl EmbeddingIndex {
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            recorded_pipeline: None,
             similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
@@ -966,6 +1002,7 @@ impl EmbeddingIndex {
             force_cleared: false,
             recorded_model_id: Some(envelope.pipeline.model_id.clone()),
             recorded_pipeline_fingerprint: Some(fingerprint),
+            recorded_pipeline: Some(envelope.pipeline.clone()),
             similarity: envelope.pipeline.similarity.clone(),
             artifact_envelope: Some(envelope),
             pending_deltas: Vec::new(),
@@ -1202,6 +1239,7 @@ impl EmbeddingIndex {
         self.deleted_base_uids = loaded.deleted_base_uids;
         self.recorded_model_id = loaded.recorded_model_id;
         self.recorded_pipeline_fingerprint = loaded.recorded_pipeline_fingerprint;
+        self.recorded_pipeline = loaded.recorded_pipeline;
         self.similarity = loaded.similarity;
         self.artifact_envelope = loaded.artifact_envelope;
         self.force_cleared = false;

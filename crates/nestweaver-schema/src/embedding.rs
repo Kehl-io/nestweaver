@@ -165,3 +165,85 @@ mod tests {
         );
     }
 }
+
+/// A field-level comparison safe for operator and machine diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingPipelineDifference {
+    pub field: String,
+    pub recorded: serde_json::Value,
+    pub incoming: serde_json::Value,
+}
+
+impl EmbeddingPipelineV2 {
+    /// Free-form identifiers are hashed: even a model ID or revision can contain
+    /// an operator's local path or credentials. Closed enums and numbers are safe.
+    pub fn differences(&self, incoming: &Self) -> Result<Vec<EmbeddingPipelineDifference>, String> {
+        let old = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        let new = serde_json::to_value(incoming).map_err(|e| e.to_string())?;
+        let safe = |key: &str, value: &serde_json::Value| -> serde_json::Value {
+            match key {
+                "provider"
+                | "model_id"
+                | "model_revision"
+                | "weights_sha256"
+                | "tokenizer_sha256"
+                | "tokenizer_config_sha256"
+                | "modules_sha256"
+                    if !value.is_null() =>
+                {
+                    serde_json::json!({"sha256": hex::encode(Sha256::digest(value.to_string().as_bytes()))})
+                }
+                _ => value.clone(),
+            }
+        };
+        let mut differences = Vec::new();
+        if let Some(fields) = old.as_object() {
+            for (field, recorded) in fields {
+                let incoming = &new[field];
+                if recorded != incoming {
+                    differences.push(EmbeddingPipelineDifference {
+                        field: field.clone(),
+                        recorded: safe(field, recorded),
+                        incoming: safe(field, incoming),
+                    });
+                }
+            }
+        }
+        Ok(differences)
+    }
+
+    pub fn mismatch_diagnostic(
+        recorded: Option<&Self>,
+        incoming: &Self,
+    ) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "reason": if recorded.is_some() { "pipeline_mismatch" } else { "legacy_or_missing_pipeline" },
+            "recorded_fingerprint": recorded.map(Self::fingerprint).transpose()?,
+            "incoming_fingerprint": incoming.fingerprint()?,
+            "differences": recorded.map(|r| r.differences(incoming)).transpose()?,
+            "remediation": "use the recorded pipeline or intentionally rebuild all embeddings"
+        }))
+    }
+}
+
+#[cfg(test)]
+mod hardening_diff_tests {
+    use super::*;
+    #[test]
+    fn differences_are_complete_and_free_form_values_are_safe() {
+        let old = EmbeddingPipelineV2::external("provider", "/private/token=secret", 2);
+        let mut new = old.clone();
+        new.produced_dimension = 4;
+        new.normalize = Some(true);
+        new.model_id = "/another/private/path".into();
+        let diff = old.differences(&new).unwrap();
+        assert_eq!(diff.len(), 3);
+        let encoded = serde_json::to_string(&diff).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("secret"));
+        assert!(encoded.contains("produced_dimension"));
+        assert!(old.differences(&old).unwrap().is_empty());
+        let legacy = EmbeddingPipelineV2::mismatch_diagnostic(None, &new).unwrap();
+        assert_eq!(legacy["reason"], "legacy_or_missing_pipeline");
+    }
+}

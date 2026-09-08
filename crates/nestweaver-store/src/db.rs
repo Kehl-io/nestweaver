@@ -1621,6 +1621,17 @@ impl GraphStore {
     }
 
     /// Clear the git-activity recency cache (restores neutral ranking).
+    /// Invalidate exactly one removed repository without disturbing other rankings.
+    pub fn clear_repo_git_activity(&self, repo_uid: &str) {
+        let mut cache = self
+            .git_activity_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(scores) = cache.as_mut() {
+            scores.remove(repo_uid);
+        }
+    }
+
     pub fn clear_git_activity_cache(&self) {
         *self
             .git_activity_cache
@@ -2371,6 +2382,7 @@ impl GraphStore {
                 .unwrap_or_else(|error| error.into_inner()) = None;
             index.set_recorded_model_id(recorded);
             index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
+            index.set_recorded_pipeline(pipeline.clone());
             if let Some(pipeline) = pipeline {
                 index.set_similarity(pipeline.similarity);
             }
@@ -2530,6 +2542,22 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         index.add_with_pipeline(uid, embedding, pipeline, force)
+    }
+
+    /// Compare a proposed pipeline with the cached recorded producer without per-vector database reads.
+    pub fn embedding_pipeline_mismatch(
+        &self,
+        incoming: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        self.require_verified_embedding_identity()?;
+        let index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if index.is_empty() {
+            return Ok(None);
+        }
+        index.pipeline_mismatch(incoming).map_err(StoreError::Query)
     }
 
     /// Re-arm the embedding index's once-per-run force-clear guard. Call at
@@ -6269,5 +6297,26 @@ mod live_writer_wal_tests {
             Some("2051a9da"),
             "and it must still SERVE, not merely open"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardening_activity_tests {
+    use super::*;
+    #[test]
+    fn removed_repo_scores_stay_neutral_while_other_repo_survives() {
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_cache(HashMap::from([
+            ("removed".into(), HashMap::from([("same.rs".into(), 0.9)])),
+            ("retained".into(), HashMap::from([("same.rs".into(), 0.2)])),
+        ]));
+        store.clear_repo_git_activity("removed");
+        assert_eq!(store.git_activity_score("removed", "same.rs"), None);
+        assert_eq!(store.git_activity_score("retained", "same.rs"), Some(0.2));
+        store.load_git_activity_cache(HashMap::from([
+            ("removed".into(), HashMap::from([("same.rs".into(), 0.1)])),
+            ("retained".into(), HashMap::from([("same.rs".into(), 0.2)])),
+        ]));
+        assert_eq!(store.git_activity_score("removed", "same.rs"), Some(0.1));
     }
 }

@@ -553,3 +553,218 @@ fn prune_cli_preserves_commit_state_for_noop_and_real_deletion() {
     assert!(repeat.status.success());
     assert!(String::from_utf8_lossy(&repeat.stdout).contains("Committed: false"));
 }
+
+#[test]
+fn discovered_mcp_configuration_rejects_invalid_files_before_handshake() {
+    let f = Fixture::new();
+    f.index();
+    let valid = std::fs::read_to_string(&f.config).unwrap();
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"regression\",\"version\":\"1\"}}}\n";
+    for contents in [
+        None,
+        Some(valid.as_str()),
+        Some("[broken"),
+        Some("unknown_typo = true\n"),
+    ] {
+        match contents {
+            Some(text) => std::fs::write(&f.config, text).unwrap(),
+            None => std::fs::remove_file(&f.config).unwrap(),
+        }
+        let output = f
+            .cmd()
+            .args(["mcp", "--db"])
+            .arg(&f.db)
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .write_stdin(init)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if matches!(contents, Some("[broken" | "unknown_typo = true\n")) {
+            assert!(!output.status.success());
+            assert!(
+                !stdout.contains("serverInfo"),
+                "invalid configuration initialized: {stdout}"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("instance.toml"));
+        } else {
+            assert!(
+                stdout.contains("serverInfo"),
+                "valid/absent config failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn first_index_retains_full_edge_count_and_incremental_does_not_invent_zero() {
+    let f = Fixture::new();
+    let run = |force: bool| {
+        let mut cmd = f.cmd();
+        cmd.args(["index", "--repo"])
+            .arg(&f.repo)
+            .arg("--db")
+            .arg(&f.db)
+            .arg("--json")
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
+        if force {
+            cmd.arg("--force");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        payload(&out)
+    };
+    let first = run(false);
+    let force = run(true);
+    assert!(first["edges_found"].as_u64().unwrap() > 0);
+    assert_eq!(first["edges_found"], force["edges_found"]);
+    // This fixture has only top-level functions: its build population is
+    // exactly persisted REFERENCES, with no MEMBER_OF or cross-repo edges.
+    let store = nestweaver_store::GraphStore::open_read_only(&f.db).unwrap();
+    assert_eq!(
+        first["edges_found"].as_u64().unwrap(),
+        store
+            .load_typed_edges()
+            .unwrap()
+            .iter()
+            .filter(|e| e.0.starts_with("sym:") && e.1.starts_with("sym:"))
+            .count() as u64
+    );
+    drop(store);
+    assert!(run(false)["edges_found"].is_null());
+}
+
+#[test]
+fn brain_list_preserves_selected_output_mode_across_routes() {
+    let f = Fixture::new();
+    f.index();
+    for direct in [true, false] {
+        let human = f.query(&["brain", "list"], direct);
+        assert!(
+            human.status.success(),
+            "{}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        assert!(String::from_utf8_lossy(&human.stdout).contains("No vaults indexed"));
+        let json = f.query(&["brain", "list", "--json"], direct);
+        assert!(json.status.success());
+        assert_eq!(payload(&json), json!([]));
+        f.stop();
+    }
+    let vault = f.dir.path().join("notes");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::write(vault.join("Note.md"), "# Note\nA populated inventory.\n").unwrap();
+    let added = f.query(&["brain", "add", vault.to_str().unwrap()], true);
+    assert!(added.status.success());
+    let direct = f.query(&["brain", "list", "--json"], true);
+    let daemon = f.query(&["brain", "list", "--json"], false);
+    assert!(direct.status.success() && daemon.status.success());
+    assert_eq!(payload(&direct), payload(&daemon));
+    assert_eq!(payload(&daemon)[0]["notes"], 1);
+    assert_eq!(payload(&daemon)[0]["instance_id"], "default");
+    let human = f.query(&["brain", "list"], false);
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("Notes: 1"));
+}
+
+#[test]
+fn immutable_context_ranking_is_identical_across_ten_processes() {
+    let f = Fixture::new();
+    for i in 0..8 {
+        std::fs::write(
+            f.repo.join(format!("tied{i}.py")),
+            "def tied():\n    return 1\n",
+        )
+        .unwrap();
+    }
+    f.index();
+    let mut baseline = None;
+    let mut eval_baseline = None;
+    let judgments = f.dir.path().join("judgments.jsonl");
+    let search = f.query(&["brain", "search", "tied", "--json"], true);
+    assert!(search.status.success());
+    let hits = payload(&search);
+    let uid = hits["results"][0]["uid"].as_str().unwrap();
+    std::fs::write(
+        &judgments,
+        json!({"query":"tied", "relevance":{uid:3}}).to_string(),
+    )
+    .unwrap();
+
+    for _ in 0..10 {
+        let out = f.query(
+            &[
+                "brain",
+                "context",
+                "tied",
+                "--weight-semantic",
+                "0",
+                "--json",
+            ],
+            true,
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value = payload(&out);
+        let ranking =
+            json!({"seeds_expanded":value["seeds_expanded"], "connected":value["connected"]});
+        let run = f.query(
+            &[
+                "eval",
+                "run",
+                "--queries",
+                judgments.to_str().unwrap(),
+                "--json",
+            ],
+            true,
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let report = payload(&run);
+        assert!(
+            report["mean_mrr"].as_f64().unwrap() > 0.0,
+            "the judged UID must be retrieved: {report}"
+        );
+        if let Some(expected) = &eval_baseline {
+            assert_eq!(&report, expected);
+        } else {
+            eval_baseline = Some(report.clone());
+        }
+        let compare = f.query(
+            &[
+                "eval",
+                "compare",
+                "--queries",
+                judgments.to_str().unwrap(),
+                "--prf",
+                "--json",
+            ],
+            true,
+        );
+        assert!(
+            compare.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compare.stderr)
+        );
+        assert_eq!(payload(&compare)["baseline"], report);
+
+        assert!(ranking["seeds_expanded"].as_u64().unwrap() > 0);
+        if let Some(expected) = &baseline {
+            assert_eq!(&ranking, expected);
+        } else {
+            baseline = Some(ranking);
+        }
+    }
+}

@@ -8231,6 +8231,7 @@ impl GraphStore {
         }
         if result.is_ok() {
             embedding_index.set_recorded_pipeline_fingerprint(Some(fingerprint));
+            embedding_index.set_recorded_pipeline(Some(pipeline.clone()));
             embedding_index.set_recorded_model_id(Some(pipeline.model_id.clone()));
             embedding_index.set_similarity(pipeline.similarity.clone());
             self.clear_embedding_identity_error();

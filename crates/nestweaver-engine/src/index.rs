@@ -194,6 +194,7 @@ pub enum DeletionReconciliationStage {
     IndexPublicationMarkerRetirement,
     FileMetadata,
     ResolutionDependencies,
+    GitActivity,
     ManifestCache,
     EmbeddingIndex,
     LegacyRetirement,
@@ -214,6 +215,7 @@ impl std::fmt::Display for DeletionReconciliationStage {
             Self::IndexPublicationMarkerRetirement => "index-publication-marker-retirement",
             Self::FileMetadata => "filemeta",
             Self::ResolutionDependencies => "resolution-deps",
+            Self::GitActivity => "git-activity",
             Self::ManifestCache => "manifest-cache",
             Self::EmbeddingIndex => "embedding-index",
             Self::LegacyRetirement => "legacy-retirement",
@@ -419,22 +421,42 @@ fn remove_repo_sidecar_slices_with_io(
     // and re-adding a repo at the same path resurrects recency scores mined
     // from a graph state that no longer exists.
     //
-    // A SAFE stage, not a required one: a stale slice biases ranking toward
-    // whatever those paths used to be, which is a quality issue rather than a
-    // correctness one — unlike resolution_deps, where a durable slice for a
-    // deleted UID can change what a later incremental resolution RESOLVES TO.
+    // Both the durable slice and the live cache must stop influencing ranking.
+    // A persistence/read failure is a committed-but-degraded removal.
     let gitactivity_path = crate::sidecar_path(db_path, ".gitactivity.json");
     if gitactivity_path.exists() {
-        let mut sidecar = crate::git_activity::load_git_activity_sidecar(&gitactivity_path);
+        let loaded = (|| -> anyhow::Result<crate::git_activity::GitActivitySidecar> {
+            let bytes = std::fs::read(&gitactivity_path)?;
+            let sidecar: crate::git_activity::GitActivitySidecar = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                sidecar.version == crate::git_activity::GITACTIVITY_VERSION,
+                "unsupported git-activity version"
+            );
+            Ok(sidecar)
+        })();
+        let mut sidecar = match loaded {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                push_reconciliation_failure(
+                    failures,
+                    DeletionReconciliationStage::GitActivity,
+                    Some(repo_uid),
+                    format!(
+                        "read removed git-activity slice: {error:#}; regenerate activity state before re-adding the repository"
+                    ),
+                );
+                return;
+            }
+        };
         if sidecar.repos.remove(repo_uid).is_some()
             && let Err(error) =
                 crate::git_activity::save_git_activity_sidecar(&sidecar, &gitactivity_path)
         {
-            tracing::debug!(
-                path = %gitactivity_path.display(),
-                repo = %repo_uid,
-                error = %error,
-                "git-activity slice for the deleted repo could not be removed"
+            push_reconciliation_failure(
+                failures,
+                DeletionReconciliationStage::GitActivity,
+                Some(repo_uid),
+                format!("persist removed git-activity slice: {error:#}"),
             );
         }
     }
@@ -572,6 +594,7 @@ fn finalize_code_graph_deletion_with_io(
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
     for uid in repo_uids {
+        store.clear_repo_git_activity(uid);
         remove_repo_sidecar_slices_with_io(db_path, uid, io, &mut failures);
     }
 
@@ -1037,6 +1060,22 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         }
     }
 
+    // Reconcile against graph liveness before retiring the durable dirty marker.
+    // This retries a failed targeted tombstone flush and detects untombstoned
+    // orphans that index-internal occupancy cannot identify.
+    let embeddings_reconciled = match store.reconcile_embedding_index() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::EmbeddingIndex,
+                None,
+                format!("committed graph requires embedding reconciliation: {error:#}"),
+            );
+            false
+        }
+    };
+
     store.invalidate_pagerank();
     let pagerank_safe = if let Some(db_path) = db_path {
         invalidate_pagerank_sidecar_with_io(
@@ -1176,6 +1215,7 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         }
 
         if generation_durable
+            && embeddings_reconciled
             && pagerank_safe
             && pagerank_persisted
             && let Some(db_path) = db_path
@@ -5471,11 +5511,9 @@ pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
 /// filters on the tombstone set, so a missing tombstone means the dead vector
 /// is SCORED and can consume a top-k slot a live result would have held.
 ///
-/// Deliberately BEST-EFFORT. The graph mutation is already committed and
-/// durable at this point; failing the whole index over sidecar hygiene would
-/// turn a recoverable degradation into a hard failure. The periodic reconcile
-/// on the daemon is the designed backstop, and `brain_status` reports the
-/// resulting occupancy gap, so a failure here is visible rather than silent.
+/// This targeted fast path is retried by publication completion's full live-set
+/// reconciliation. A persistent failure keeps the durable dirty marker and is
+/// reported as a committed/degraded publication instead of clean success.
 pub(crate) fn tombstone_deleted_symbol_embeddings_after_commit(
     store: &nestweaver_store::GraphStore,
     repo_uid: &str,
@@ -5497,8 +5535,7 @@ pub(crate) fn tombstone_deleted_symbol_embeddings_after_commit(
         Err(error) => tracing::warn!(
             %error,
             operation,
-            "embedding tombstoning failed; dead vectors stay searchable until the \
-             periodic reconcile repairs it (see `brain status` occupancy)"
+            "targeted embedding tombstoning failed; publication completion will retry and retain the recovery fence if persistence still fails"
         ),
     }
 }
@@ -5527,6 +5564,8 @@ pub struct IncrementalResult {
     /// every save.
     pub deleted_symbol_files: Vec<String>,
     pub fell_back_to_full: bool,
+    /// Resolved relationships from a completed fallback full build.
+    pub full_edges_count: Option<usize>,
 }
 
 enum IncrementalFileOutcome {
@@ -7343,6 +7382,7 @@ fn full_index_fallback(
         files_skipped: result.skipped_files.len(),
         skipped_files: result.skipped_files,
         symbols_added: result.symbols_count,
+        full_edges_count: Some(result.edges_count),
         files_deleted: result.files_deleted,
         symbols_removed: result.symbols_deleted,
         ..Default::default()
@@ -12912,6 +12952,41 @@ function hello(name) { return "Hello " + name; }
         );
         let persisted = persisted_pagerank(&db_path);
         assert_note_ranks(&persisted, "raced");
+    }
+
+    #[test]
+    fn code_publication_retains_the_fence_when_embedding_tombstones_cannot_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.set_embedding_metadata("fixture", 2).unwrap();
+        assert!(store.add_embedding("sym:deleted", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db),
+            "post-delete code publication",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        fs::create_dir(crate::sidecar_path(&db, ".embeddings.journal")).unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db),
+            "post-delete code publication",
+            &FileSystemIndexEpilogueIo,
+            false,
+        )
+        .expect_err("committed graph cannot publish clean with undurable tombstones");
+        assert!(
+            error
+                .failures
+                .iter()
+                .any(|failure| failure.stage == DeletionReconciliationStage::EmbeddingIndex)
+        );
+        assert!(crate::sidecar_path(&db, ".index-dirty").exists());
+        assert!(store.is_index_publication_dirty());
+        assert!(!store.has_embedding("sym:deleted"));
     }
 
     #[test]

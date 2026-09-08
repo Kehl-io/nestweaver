@@ -279,6 +279,43 @@ pub fn stage_backup_from_store(
     store: &nestweaver_store::GraphStore,
     config: &BackupConfig,
 ) -> anyhow::Result<StagedBackup> {
+    stage_backup_with_statistics(store, config, &StoreBackupStatistics)
+}
+
+trait BackupStatistics {
+    fn count(&self, store: &nestweaver_store::GraphStore) -> anyhow::Result<usize>;
+    fn per_repo(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> anyhow::Result<HashMap<String, usize>>;
+    fn repos(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> anyhow::Result<Vec<nestweaver_schema::Repo>>;
+}
+struct StoreBackupStatistics;
+impl BackupStatistics for StoreBackupStatistics {
+    fn count(&self, store: &nestweaver_store::GraphStore) -> anyhow::Result<usize> {
+        Ok(store.count_symbols()?)
+    }
+    fn per_repo(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> anyhow::Result<HashMap<String, usize>> {
+        Ok(store.count_symbols_by_repo()?)
+    }
+    fn repos(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> anyhow::Result<Vec<nestweaver_schema::Repo>> {
+        Ok(store.list_repos(None)?)
+    }
+}
+fn stage_backup_with_statistics(
+    store: &nestweaver_store::GraphStore,
+    config: &BackupConfig,
+    statistics: &dyn BackupStatistics,
+) -> anyhow::Result<StagedBackup> {
     let store_db_path = store
         .db_path()
         .ok_or_else(|| anyhow::anyhow!("cannot back up an in-memory graph store"))?;
@@ -333,11 +370,15 @@ pub fn stage_backup_from_store(
     )?;
 
     // Gather graph statistics for the manifest while the store is open.
-    let symbol_count = store.count_symbols().unwrap_or(0);
-    let per_repo = store.count_symbols_by_repo().unwrap_or_default();
-    let repos: Vec<BackupRepoInfo> = store
-        .list_repos(None)
-        .unwrap_or_default()
+    let symbol_count = statistics
+        .count(store)
+        .context("read backup symbol count")?;
+    let per_repo = statistics
+        .per_repo(store)
+        .context("read backup per-repository counts")?;
+    let repos: Vec<BackupRepoInfo> = statistics
+        .repos(store)
+        .context("read backup repository inventory")?
         .into_iter()
         .map(|r| BackupRepoInfo {
             symbols: per_repo.get(&r.uid).copied().unwrap_or(0),
@@ -4117,5 +4158,53 @@ mod tests {
             nestweaver_store::GraphStore::open_read_only(&target_db).is_ok(),
             "the incumbent database must remain exactly as it was"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardening_statistics_tests {
+    use super::*;
+    struct Fault(usize);
+    impl BackupStatistics for Fault {
+        fn count(&self, store: &nestweaver_store::GraphStore) -> anyhow::Result<usize> {
+            anyhow::ensure!(self.0 != 0, "injected count failure");
+            StoreBackupStatistics.count(store)
+        }
+        fn per_repo(
+            &self,
+            store: &nestweaver_store::GraphStore,
+        ) -> anyhow::Result<HashMap<String, usize>> {
+            anyhow::ensure!(self.0 != 1, "injected per-repo failure");
+            StoreBackupStatistics.per_repo(store)
+        }
+        fn repos(
+            &self,
+            store: &nestweaver_store::GraphStore,
+        ) -> anyhow::Result<Vec<nestweaver_schema::Repo>> {
+            anyhow::ensure!(self.0 != 2, "injected inventory failure");
+            StoreBackupStatistics.repos(store)
+        }
+    }
+    #[test]
+    fn no_archive_can_publish_when_any_statistics_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stats.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let config = BackupConfig {
+            db_path: db,
+            output_path: dir.path().join("backup.zst"),
+            include_clones: false,
+            instance_id: "default".into(),
+            workspace_path: None,
+        };
+        for stage in 0..3 {
+            let result = stage_backup_with_statistics(&store, &config, &Fault(stage));
+            assert!(result.is_err(), "stage {stage} must refuse");
+            assert!(!config.output_path.exists());
+        }
+        let staged = stage_backup_from_store(&store, &config).unwrap();
+        let result = package_staged(&config, staged).unwrap();
+        assert_eq!(result.manifest.symbol_count, 0);
+        assert!(config.output_path.exists());
     }
 }

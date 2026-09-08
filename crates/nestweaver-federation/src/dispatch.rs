@@ -190,6 +190,8 @@ fn brain_search_response_to_json(
     let mut value = serde_json::json!({
         "query": response.query,
         "engine": response.engine,
+        "engine_warning": response.engine_warning,
+        "limit_per_kind": response.limit_per_kind,
         "total_matches": response.total_matches,
         "total_matches_relation": relation,
         "returned_matches": returned_matches,
@@ -590,6 +592,8 @@ mod tests {
     #[test]
     fn typed_brain_search_json_preserves_counts_and_old_response_defaults() {
         let response = nestweaver_proto::BrainSearchResponse {
+            engine_warning: None,
+            limit_per_kind: 0,
             query: "needle".to_string(),
             engine: "bm25".to_string(),
             total_matches: 1,

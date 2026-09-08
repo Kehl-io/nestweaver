@@ -477,6 +477,16 @@ impl HybridClient {
                 // responses keep their `connected` schema; it falls back to the
                 // flat envelope for non-structured tools internally.
                 let mut merged = merge_structured_results(&local_result, &server_result);
+                if tool_name == "brain_search" {
+                    nestweaver_federation::results::cap_brain_search_results(
+                        &mut merged,
+                        nestweaver_federation::results::brain_search_limit(
+                            params,
+                            &local_result,
+                            &server_result,
+                        ),
+                    );
+                }
                 inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }
@@ -565,6 +575,12 @@ impl HybridClient {
         match server_result {
             Ok(Ok(server)) => {
                 let mut merged = merge_structured_results(&local, &server);
+                if tool_name == "brain_search" {
+                    nestweaver_federation::results::cap_brain_search_results(
+                        &mut merged,
+                        nestweaver_federation::results::brain_search_limit(params, &local, &server),
+                    );
+                }
                 inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }

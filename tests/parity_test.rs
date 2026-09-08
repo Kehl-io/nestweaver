@@ -1086,9 +1086,9 @@ fn strip_semantic_note(bytes: &[u8]) -> String {
     redact_bundle_ids(bytes)
         .lines()
         .filter(|line| {
-            !line
-                .trim_start()
-                .starts_with("note: semantic retrieval unavailable")
+            let line = line.trim_start();
+            !line.starts_with("note: semantic retrieval ")
+                && !line.starts_with("Semantic diagnostic:")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1146,7 +1146,8 @@ fn parity_investigate_human_direct_vs_daemon() {
     // always disclose that the ranking was lexical.
     let direct_text = String::from_utf8_lossy(&direct.stdout);
     assert!(
-        direct_text.contains("note: semantic retrieval unavailable"),
+        direct_text.contains("note: semantic retrieval did not contribute")
+            && direct_text.contains("Semantic diagnostic:"),
         "the direct path has no embedding model and must say so; got: {direct_text}"
     );
 }

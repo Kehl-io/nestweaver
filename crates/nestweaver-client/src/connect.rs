@@ -281,8 +281,8 @@ pub async fn connect_upstream(
     let repo_count = client
         .repo_states(req)
         .await
-        .map(|r| r.into_inner().repos.len())
-        .unwrap_or(0);
+        .context("upstream is reachable but repository inventory is unavailable; connection was not saved; check authorization and retry")?
+        .into_inner().repos.len();
 
     let config = UpstreamConfig {
         name: Some(name.unwrap_or("upstream").to_string()),

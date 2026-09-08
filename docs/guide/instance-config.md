@@ -446,7 +446,11 @@ unknown/unlisted token sees nothing.
 
 Each tool declares whether it can enforce repository visibility or must refuse
 before computing a graph-wide answer. Enabling a rule does not make global
-aggregates safe through row filtering alone.
+aggregates safe through row filtering alone. Repository-scoped callers are
+refused for `brain_context`, `code_context`, `project_context`, `dead_code`,
+`hub_nodes`, `bridge_nodes` and `regex_search` before traversal: their global
+rankings, topology or totals cannot be made safe by removing hidden rows.
+Unrestricted/admin callers retain these tools.
 
 With repository authorization enabled, `brain_status` (including both typed
 and JSON status RPCs) requires an administrator: host paths, runtime activity

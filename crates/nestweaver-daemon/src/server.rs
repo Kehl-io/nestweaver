@@ -44,7 +44,8 @@ impl Drop for RpcIndexActivity {
 
 /// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
 /// a cancelled query surfaces as `deadline_exceeded` rather than an opaque
-/// `internal`. Non-cancel errors keep the `internal` mapping. This is
+/// `internal`. Repository-scope refusals are `permission_denied`; other errors
+/// keep the `internal` mapping. This is
 /// defense-in-depth: on timeout the safeguard's `select!` already returns
 /// `deadline_exceeded` and drops this future, but a query that finishes with a
 /// cancel error just before that race is mapped consistently here too.
@@ -54,6 +55,11 @@ impl Drop for RpcIndexActivity {
 /// reports `Timeout`. On a client disconnect the request future is dropped
 /// before any `Status` is returned, so that path never surfaces here.
 fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
+    if e.chain()
+        .any(|cause| cause.is::<nestweaver_mcp::tools::RepositoryScopeRefused>())
+    {
+        return Status::permission_denied(format!("tool {tool_name} refused: {e}"));
+    }
     if let Some(reason) = e
         .downcast_ref::<nestweaver_store::StoreError>()
         .and_then(|s| s.cancel_reason())
@@ -7901,6 +7907,14 @@ impl NestWeaverDaemon for DaemonService {
             });
 
         Ok(Response::new(BrainSearchResponse {
+            engine_warning: value
+                .get("engine_warning")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            limit_per_kind: value
+                .get("limit_per_kind")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(20) as u32,
             query: query_echo,
             engine,
             total_matches,
@@ -7945,12 +7959,7 @@ impl NestWeaverDaemon for DaemonService {
         // `dispatch_tool_json`); `code_context`, one method away on the same
         // surface, was scoped the whole time.
         //
-        // `brain_context` is one of the tools nw-403's own measurement named
-        // as leaking (hidden-repo symbols, file paths and note prose). It is
-        // `RepoScope::RedactedAfterDispatch`, so a scoped caller now gets only
-        // the rows it owns, and a `response_format: "concise"` request — which
-        // omits the very uids attribution needs — is refused rather than
-        // served unfiltered.
+        // Global context aggregates fail closed for repository-scoped callers.
         let (_, extensions, req) = r.into_parts();
         let args = brain_context_args_from_request(&req);
 
@@ -7985,11 +7994,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<ProjectContextRequest>,
     ) -> Result<Response<ProjectContextResponse>, Status> {
-        // nw-415, argued at `dispatch_tool_json`. `project_context` is
-        // `RepoScope::RedactedAfterDispatch` AND its `response_format`
-        // DEFAULTS to concise, so a repo-scoped caller that sends no format at
-        // all is refused rather than handed uid-free rows that nothing
-        // downstream can attribute to a repo.
+        // Project aggregates use the same fail-closed authorization as MCP.
         let (_, extensions, req) = r.into_parts();
         let args = project_context_args_from_request(&req);
 
@@ -8207,9 +8212,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<HubNodesRequest>,
     ) -> Result<Response<HubNodesResponse>, Status> {
-        // nw-415, argued at `dispatch_tool_json`. `hub_nodes` is the third
-        // tool nw-403's measurement named (8 hidden-repo tokens); it is
-        // `RepoScope::RedactedAfterDispatch`.
+        // Global rankings require unrestricted repository access.
         let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({});
         if req.top_n > 0 {
@@ -8911,6 +8914,15 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
+            if args
+                .get("include_counts")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return nestweaver_engine::index_md::vault_inventory(&state.store, &state.db_path)
+                    .and_then(|value| Ok(serde_json::to_string(&value)?))
+                    .map_err(|e| Status::internal(format!("vault inventory failed: {e:#}")));
+            }
             let instance = args.get("instance").and_then(|v| v.as_str());
             let vaults = state
                 .store
@@ -9698,6 +9710,16 @@ impl NestWeaverDaemon for DaemonService {
                                     let pipeline = model
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
+                                                |e| Status::failed_precondition(e.to_string()),
+                                            )?
+                                    {
+                                        return Err(Status::failed_precondition(format!(
+                                            "embedding pipeline mismatch: {diagnostic}"
+                                        )));
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &sym.uid, emb, &pipeline, force,
                                     ) {
@@ -9748,6 +9770,16 @@ impl NestWeaverDaemon for DaemonService {
                                     let pipeline = model
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
+                                                |e| Status::failed_precondition(e.to_string()),
+                                            )?
+                                    {
+                                        return Err(Status::failed_precondition(format!(
+                                            "embedding pipeline mismatch: {diagnostic}"
+                                        )));
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &note.uid, emb, &pipeline, force,
                                     ) {
@@ -9798,6 +9830,16 @@ impl NestWeaverDaemon for DaemonService {
                                     let pipeline = model
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
+                                    if !force
+                                        && let Some(diagnostic) =
+                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
+                                                |e| Status::failed_precondition(e.to_string()),
+                                            )?
+                                    {
+                                        return Err(Status::failed_precondition(format!(
+                                            "embedding pipeline mismatch: {diagnostic}"
+                                        )));
+                                    }
                                     if store.add_embedding_with_pipeline(
                                         &heading.uid,
                                         emb,
@@ -20291,6 +20333,66 @@ credential_method = "gh"
         );
     }
 
+    #[tokio::test]
+    async fn removing_and_readding_a_repo_in_one_daemon_drops_only_its_activity() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let path = nestweaver_engine::sidecar_path(&state.db_path, ".gitactivity.json");
+        for (uid, score) in [("repo:removed", 0.9), ("repo:retained", 0.3)] {
+            state.store.insert_repo(&test_repo(uid, uid, None)).unwrap();
+            nestweaver_engine::git_activity::save_git_activity_for_repo(
+                uid,
+                &std::collections::HashMap::from([("src/main.rs".to_string(), score)]),
+                &path,
+            )
+            .unwrap();
+        }
+        refresh_git_activity(&state.store, &path);
+        assert_eq!(
+            state
+                .store
+                .git_activity_score("repo:removed", "src/main.rs"),
+            Some(0.9)
+        );
+        let mut request = Request::new(RemoveRepoRequest {
+            repo_uid: "repo:removed".into(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let result = service.remove_repo(request).await.unwrap().into_inner();
+        assert!(result.committed);
+        assert!(result.reconciliation_failures.is_empty(), "{result:?}");
+        state
+            .store
+            .insert_repo(&test_repo("repo:removed", "repo:removed", None))
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .git_activity_score("repo:removed", "src/main.rs"),
+            None
+        );
+        assert_eq!(
+            state
+                .store
+                .git_activity_score("repo:retained", "src/main.rs"),
+            Some(0.3)
+        );
+        // A subsequent reload cannot resurrect the deleted slice either.
+        refresh_git_activity(&state.store, &path);
+        assert_eq!(
+            state
+                .store
+                .git_activity_score("repo:removed", "src/main.rs"),
+            None
+        );
+        assert_eq!(
+            state
+                .store
+                .git_activity_score("repo:retained", "src/main.rs"),
+            Some(0.3)
+        );
+    }
+
     /// The other half: a refresh whose sidecar has gone away must leave ranking
     /// NEUTRAL, not serving scores mined from a graph state that no longer
     /// exists. This is why the helper clears before it loads.
@@ -21969,10 +22071,7 @@ external_model = "unavailable-test-model"
     ///   * `brain_status` (typed and JSON) — `EnforcedInArm`. It enumerates
     ///     each repo's URL and indexed git SHA, which is repo IDENTITY and the
     ///     most direct enumeration in the catalogue.
-    ///   * `brain_context` / `hub_nodes` — `RedactedAfterDispatch`. No token
-    ///     naming the hidden repo may survive anywhere in the payload.
-    ///   * `project_context` — `RedactedAfterDispatch` whose `response_format`
-    ///     DEFAULTS to concise, so an unattributable rendering is REFUSED.
+    ///   * `brain_context` / `hub_nodes` / `project_context` — `FailClosed`.
     ///   * `note_get` — `NotRepoScoped`, and it must still answer.
     #[tokio::test]
     async fn every_typed_grpc_rpc_that_bypassed_dispatch_now_scopes_to_the_request_identity() {
@@ -22024,65 +22123,43 @@ external_model = "unavailable-test-model"
             tonic::Code::PermissionDenied
         );
 
-        // `brain_context`: `RedactedAfterDispatch`.
-        let context = service
-            .get_context(nw415_request(nw415_context_request(), scoped()))
-            .await
-            .expect("a repo-scoped brain_context is redacted, not refused")
-            .into_inner();
-        if context.result_json.contains(NW415_HIDDEN_SYMBOL)
-            || context.result_json.contains("nw415needle_hidden")
-        {
-            leaks.push(format!(
-                "brain_context leaked a hidden-repo symbol: {}",
-                context.result_json
-            ));
-        }
-
-        // `hub_nodes`: `RedactedAfterDispatch`.
-        //
-        // The assertion is over the hidden SYMBOL, not the hidden repo uid, on
-        // purpose: `hub_nodes` also returns `stale_repos`, a bare string array
-        // of repo uids that the redactor cannot see (it early-returns `true`
-        // for any array element that is not an object). That is [[nw-416]],
-        // whose fix lives in the MCP crate's redactor; asserting it here would
-        // pin a defect this change cannot reach.
-        let hubs = service
-            .hub_nodes(nw415_request(nw415_hub_request(), scoped()))
-            .await
-            .expect("a repo-scoped hub_nodes is redacted, not refused")
-            .into_inner();
-        if hubs.result_json.contains(NW415_HIDDEN_SYMBOL)
-            || hubs.result_json.contains("nw415needle_hidden")
-        {
-            leaks.push(format!(
-                "hub_nodes leaked a hidden-repo symbol: {}",
-                hubs.result_json
-            ));
-        }
-
-        // `project_context`: `RedactedAfterDispatch` whose `response_format`
-        // DEFAULTS to concise, so the rows carry no uid to attribute and the
-        // call is REFUSED rather than served unfiltered.
-        match service
-            .get_project_context(nw415_request(
-                ProjectContextRequest {
-                    project: "anything".to_string(),
-                    ..Default::default()
-                },
-                scoped(),
-            ))
-            .await
-        {
-            Ok(response) => leaks.push(format!(
-                "project_context served an unattributable concise rendering: {}",
-                response.into_inner().result_json
-            )),
-            Err(error) if !error.message().contains("response_format") => leaks.push(format!(
-                "project_context failed for the wrong reason (the refusal must name its remedy): {}",
-                error.message()
-            )),
-            Err(_) => {}
+        // Whole-graph aggregates refuse restricted identities on every format.
+        for format in ["concise", "detailed"] {
+            let mut context = nw415_context_request();
+            context.response_format = format.into();
+            assert_eq!(
+                service
+                    .get_context(nw415_request(context, scoped()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            let mut hubs = nw415_hub_request();
+            hubs.response_format = format.into();
+            assert_eq!(
+                service
+                    .hub_nodes(nw415_request(hubs, scoped()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                service
+                    .get_project_context(nw415_request(
+                        ProjectContextRequest {
+                            project: "anything".into(),
+                            response_format: format.into(),
+                            ..Default::default()
+                        },
+                        scoped()
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
         }
 
         // `note_get`: the WRITTEN `NotRepoScoped` exemption must still answer.
@@ -22167,10 +22244,17 @@ external_model = "unavailable-test-model"
                 message.contains("repository-scoped caller"),
                 "{route} must explain the scope refusal: {error}"
             );
-            assert!(
-                message.contains("filesystem root") || message.contains("filesystem roots"),
-                "{route} must identify the untrusted root boundary: {error}"
-            );
+            if route == "GetContext" {
+                // The aggregate guard now refuses before source-body handling.
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                assert!(message.contains("global ranking"), "{error}");
+            } else {
+                assert!(
+                    message.contains("filesystem root") || message.contains("filesystem roots"),
+                    "{route} must identify the untrusted root boundary: {error}"
+                );
+            }
+            assert!(!message.contains(attacker_root));
         }
     }
 
@@ -24436,6 +24520,33 @@ external_model = "unavailable-test-model"
     }
 }
 
+// A real daemon arms a process-lifetime database-lock guard and installs
+// process-wide runtime state. Booting one in a parallel unit-test process
+// contaminates later lifecycle probes even after the server task exits.
+#[cfg(test)]
+fn run_server_test_in_child(test_name: &str) -> bool {
+    const CHILD_TEST: &str = "NESTWEAVER_ISOLATED_SERVER_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let _env_guard = lifecycle::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .output()
+        .expect("start isolated server test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "isolated {test_name} failed: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
+
 #[cfg(test)]
 mod boot_reconciliation_tests {
     use super::*;
@@ -24699,6 +24810,11 @@ mod boot_reconciliation_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_write_daemon_boot_recovers_before_immediate_shutdown() {
+        if run_server_test_in_child(
+            "server::boot_reconciliation_tests::read_write_daemon_boot_recovers_before_immediate_shutdown",
+        ) {
+            return;
+        }
         // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
         // the daemon's whole lifetime under the same lock the sibling e2e
         // tests hold while swapping XDG vars.
@@ -25115,6 +25231,11 @@ mod watcher_e2e_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_e2e_pid_watch_force_and_shutdown() {
+        if run_server_test_in_child(
+            "server::watcher_e2e_tests::daemon_e2e_pid_watch_force_and_shutdown",
+        ) {
+            return;
+        }
         // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
         // the daemon's whole lifetime under the same lock the lifecycle unit
         // tests and the clean-shutdown e2e below hold while swapping XDG vars.
@@ -25336,6 +25457,11 @@ mod watcher_e2e_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_clean_shutdown_leaves_no_dirs_for_temp_db() {
+        if run_server_test_in_child(
+            "server::watcher_e2e_tests::daemon_clean_shutdown_leaves_no_dirs_for_temp_db",
+        ) {
+            return;
+        }
         let _env_guard = lifecycle::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());

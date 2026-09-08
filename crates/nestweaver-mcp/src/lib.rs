@@ -250,19 +250,25 @@ pub fn run_stdio_server(
         // did not, so the strictness landed hardest exactly where it was
         // invisible.
         match sibling.as_deref() {
-            Some(path) if path.exists() => match nestweaver_engine::InstanceConfig::from_file(path)
+            Some(path)
+                if match std::fs::symlink_metadata(path) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        anyhow::bail!("cannot inspect discovered config {}: {e}", path.display())
+                    }
+                } =>
             {
-                Ok(config) => (Some(config), Some(path.display().to_string())),
-                Err(error) => {
-                    tracing::warn!(
-                        config = %path.display(),
-                        "instance config found beside the database but could NOT be parsed, so \
-                         NO configured setting is in effect (ranking, limits, response, cache \
-                         and projects all fall back to defaults): {error:#}"
-                    );
-                    (None, None)
+                match nestweaver_engine::InstanceConfig::from_file(path) {
+                    Ok(config) => (Some(config), Some(path.display().to_string())),
+                    Err(error) => {
+                        anyhow::bail!(
+                            "invalid discovered instance config {}: {error:#}",
+                            path.display()
+                        );
+                    }
                 }
-            },
+            }
             _ => (None, None),
         }
     };

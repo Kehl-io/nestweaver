@@ -345,6 +345,13 @@ pub fn finalize_committed_graph_mutation(
         }
     });
 
+    if let Err(error) = store.reconcile_embedding_index() {
+        outcome.record_warning(
+            "embedding-index",
+            format!("graph committed; embedding reconciliation must be retried: {error:#}"),
+        );
+    }
+
     // Clear live scores before exposing the new generation. The durable copy
     // is removed as well, so a process restart cannot reload pre-mutation
     // ranking even if a later publication step is degraded.
@@ -1608,5 +1615,49 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         .unwrap();
         let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.entry_files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hardening_embedding_recovery_tests {
+    use super::*;
+    #[test]
+    fn failed_embedding_reconciliation_keeps_durable_recovery_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        store.set_embedding_metadata("fixture", 2).unwrap();
+        // A vector whose graph node was deleted: occupancy alone calls it live.
+        assert!(store.add_embedding("sym:deleted", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(store.embedding_index_occupancy().tombstoned, 0);
+        let journal = crate::sidecar_path(&db, ".embeddings.journal");
+        std::fs::create_dir(&journal).unwrap();
+        let guard = begin_graph_mutation_publication(&store, "post-delete regression").unwrap();
+        let outcome = guard.finish(true).unwrap();
+        assert!(outcome.is_degraded());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.stage == "embedding-index")
+        );
+        assert!(crate::sidecar_path(&db, ".index-dirty").exists());
+        drop(store);
+        // The durable fence survives reopening before repair; ranked queries
+        // cannot treat the old artifact as a clean publication.
+        if let Ok(unrepaired) = nestweaver_store::GraphStore::open_read_only(&db) {
+            assert!(unrepaired.is_index_publication_dirty());
+        }
+        std::fs::remove_dir(&journal).unwrap();
+        let authority = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+        let store = nestweaver_store::GraphStore::open_with_authority(&db, &authority).unwrap();
+        crate::index::force_recover_index_publication(&store, &authority).unwrap();
+        assert!(!store.has_embedding("sym:deleted"));
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        drop(store);
+        drop(authority);
+        let reopened = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+        assert!(!reopened.has_embedding("sym:deleted"));
     }
 }
