@@ -6,6 +6,7 @@ license.workspace = true
 description = "Generated protobuf types for NestWeaver daemon gRPC service"
 
 [dependencies]
+serde_json = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }

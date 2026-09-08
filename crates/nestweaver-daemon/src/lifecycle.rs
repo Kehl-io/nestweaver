@@ -1936,9 +1936,9 @@ pub struct DaemonGcReport {
     /// Instances whose database still exists.
     pub kept: Vec<String>,
     /// Instances spared because something still owns them: the
-    /// database write lock, an unreadable database lock state, or the pidfile
-    /// flock. The union of the three lists below, deduplicated — a healthy
-    /// daemon appears in two of them, because two independent facts are true of
+    /// database write lock, an unreadable database lock state, pidfile flock,
+    /// or spawn handshake. The union of those lists, deduplicated — a healthy
+    /// daemon can appear in two of them, because two independent facts are true of
     /// it at once. Sparing applies to EVERY root the instance occupies: a
     /// live daemon's runtime files are never reclaimed.
     pub spared: Vec<String>,
@@ -1956,6 +1956,8 @@ pub struct DaemonGcReport {
     /// case, and forgeable by unlinking the pidfile — which is why it is
     /// reported alongside the database answer rather than instead of it.
     pub spared_pidfile_lock: Vec<String>,
+    /// Instances with a busy spawn handshake.
+    pub spared_spawnlock: Vec<String>,
     /// Instances left alone because their database could not be identified —
     /// in every root they occupy. Not an error: unidentifiable means
     /// undeletable, by design.
@@ -2354,23 +2356,73 @@ fn collect_fallback_candidates(
 /// and left alone *before* the test runs, so there is no candidate whose
 /// deletion rests on an unprobed database.
 ///
-/// One residual race, stated rather than hidden. The ownership probe and the
-/// deletion are not atomic, so a daemon BOOTING a temp or missing database
-/// between the two can lose directories mid-boot: a runtime-dir deletion
-/// landing between its pidfile claim and its socket bind unlinks the locked
-/// pidfile inode out from under it or fails the bind. The worst case is one
-/// retryable autostart failure — pidfile claim and socket bind recreate
-/// their directories, the database write lock is unaffected, and the client
-/// spawns again — and the same race existed for the state-only sweep before
-/// this change widened it to the runtime root. The pidfile flock narrows the
-/// window: the child claims it before opening the database or binding the
-/// socket, and a claimed flock spares the instance outright, so the
-/// uncovered span is only the client's pre-claim spawn phase (the sweep does
-/// not consult the client-side spawnlock — taking it here would serialize
-/// `daemon gc` against every in-flight spawn on the machine, a worse trade
-/// for a cleanup pass).
+/// GC takes each candidate's spawnlock nonblockingly, then rechecks writer
+/// ownership while retaining admission through deletion. The runtime directory
+/// is retired by rename LAST, before its contents are removed. New clients can
+/// then create a fresh runtime directory; waiters on the retired lock retry
+/// after checking its inode against the current pathname. No global lock or
+/// wait on a busy spawn is needed. Direct non-cooperating filesystem mutation
+/// by the data owner is outside this admission protocol.
 pub fn gc_orphaned_daemon_dirs() -> std::io::Result<DaemonGcReport> {
     gc_orphaned_daemon_dirs_in(&daemon_gc_roots())
+}
+
+#[cfg(unix)]
+fn gc_spawn_admission(runtime: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    std::fs::create_dir_all(runtime)?;
+    if !std::fs::symlink_metadata(runtime)?.is_dir() {
+        return Err(std::io::Error::other("runtime is not a directory"));
+    }
+    let path = runtime.join("daemon.spawnlock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let held = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    if !held.is_file()
+        || !current.is_file()
+        || held.dev() != current.dev()
+        || held.ino() != current.ino()
+    {
+        return Err(std::io::Error::other(
+            "spawnlock pathname changed during admission",
+        ));
+    }
+    Ok(Some(file))
+}
+
+/// Detach the admitted runtime namespace atomically. A newly admitted client
+/// must never create files inside a directory that GC is recursively deleting.
+#[cfg(unix)]
+fn retire_gc_runtime(runtime: &Path) -> std::io::Result<()> {
+    let parent = runtime
+        .parent()
+        .ok_or_else(|| std::io::Error::other("runtime has no parent"))?;
+    let retired = tempfile::Builder::new()
+        .prefix(".gc-retired-")
+        .tempdir_in(parent)?;
+    std::fs::rename(runtime, retired.path().join("instance"))?;
+    let retired_path = retired.path().to_path_buf();
+    retired.close().map_err(|error| {
+        std::io::Error::other(format!(
+            "retired runtime remains at {}: {error}",
+            retired_path.display()
+        ))
+    })
 }
 
 /// [`gc_orphaned_daemon_dirs`] against explicit roots — the seam that keeps
@@ -2413,6 +2465,21 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
             continue;
         };
 
+        let runtime = roots.pidfile_root().join(&name);
+        #[cfg(unix)]
+        let _spawn_admission = match gc_spawn_admission(&runtime) {
+            Ok(Some(file)) => file,
+            Ok(None) => {
+                report.spared_spawnlock.push(name.clone());
+                report.spared.push(name);
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(instance = name, %error, "cannot establish GC spawn admission; keeping instance");
+                report.kept.push(name);
+                continue;
+            }
+        };
         let pidfile = roots.pidfile_root().join(&name).join("daemon.pid");
         let ownership = state_dir_ownership(&pidfile, &db_path);
         if ownership.is_owned() {
@@ -2467,9 +2534,20 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
             continue;
         }
 
+        let mut locations = locations;
+        locations.sort_by_key(|(_, path)| path == &runtime);
+        let runtime_was_candidate = locations.iter().any(|(_, path)| path == &runtime);
         for (root_kind, path) in locations {
             let size = directory_size_bytes(&path);
-            match std::fs::remove_dir_all(&path) {
+            #[cfg(unix)]
+            let deletion = if path == runtime {
+                retire_gc_runtime(&path)
+            } else {
+                std::fs::remove_dir_all(&path)
+            };
+            #[cfg(not(unix))]
+            let deletion = std::fs::remove_dir_all(&path);
+            match deletion {
                 Ok(()) => {
                     report.reclaimed_bytes += size;
                     report.removed.push((root_kind, name.clone()));
@@ -2480,8 +2558,16 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
                 // the dedup after the loop keeps a multi-root failure from
                 // reporting the same instance twice.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => report.kept.push(name.clone()),
+                Err(error) => {
+                    tracing::warn!(instance = name, path = %path.display(), %error, "GC could not finish directory cleanup");
+                    report.kept.push(name.clone());
+                }
             }
+        }
+        // Admission may have created an otherwise absent runtime directory.
+        #[cfg(unix)]
+        if !runtime_was_candidate && retire_gc_runtime(&runtime).is_err() {
+            report.kept.push(name.clone());
         }
     }
 
@@ -2492,6 +2578,7 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
     report.spared_database_write_lock.sort();
     report.spared_database_unreadable.sort();
     report.spared_pidfile_lock.sort();
+    report.spared_spawnlock.sort();
     report.spared_daemon_database_gone.sort();
     report.unidentified.sort();
     Ok(report)
@@ -3857,6 +3944,60 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_spares_spawn_handshakes_and_collects_unrelated_orphans() {
+        use std::os::fd::AsRawFd;
+        let scratch = tempfile::tempdir().unwrap();
+        let roots = DaemonGcRoots {
+            state: scratch.path().join("state"),
+            runtime: Some(scratch.path().join("runtime")),
+            socket_fallback: scratch.path().join("fallback"),
+        };
+        for name in ["aaaaaaaa", "bbbbbbbb"] {
+            let state = roots.state.join(name);
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(
+                state.join("daemon.log"),
+                format!(
+                    "[daemon] starting for /tmp/missing-gc-{name}.lbug (instance label-{name})\n"
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(roots.pidfile_root().join(name)).unwrap();
+        }
+        let runtime = roots.pidfile_root().join("aaaaaaaa");
+        let held = gc_spawn_admission(&runtime).unwrap().unwrap();
+        let report = gc_orphaned_daemon_dirs_in(&roots).unwrap();
+        assert_eq!(report.spared_spawnlock, vec!["aaaaaaaa"]);
+        assert!(runtime.join("daemon.spawnlock").exists());
+        assert!(roots.state.join("aaaaaaaa").exists());
+        assert!(!roots.state.join("bbbbbbbb").exists());
+        assert!(!roots.pidfile_root().join("bbbbbbbb").exists());
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(held);
+        let report = gc_orphaned_daemon_dirs_in(&roots).unwrap();
+        assert!(report.removed.iter().any(|(_, name)| name == "aaaaaaaa"));
+        assert!(!runtime.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_retirement_does_not_remove_a_new_runtime_namespace() {
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = scratch.path().join("aaaaaaaa");
+        let held = gc_spawn_admission(&runtime).unwrap().unwrap();
+        retire_gc_runtime(&runtime).unwrap();
+        let successor = gc_spawn_admission(&runtime).unwrap().unwrap();
+        std::fs::write(runtime.join("successor"), "alive").unwrap();
+        drop(held);
+        assert!(runtime.join("successor").exists());
+        drop(successor);
     }
 
     /// Write a state directory as a real daemon boot would leave it.

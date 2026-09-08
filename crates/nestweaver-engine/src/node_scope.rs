@@ -118,7 +118,7 @@ pub const REPO_FILTER_UNRESOLVED_CODE: &str = "repo-filter-unresolved";
 /// assertion below still pins that text, because a downgrade path (a new
 /// client against an older daemon that cannot stamp the metadata code) still
 /// falls back to it.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("repo filter entry {selector:?}: {rendered}")]
 pub struct RepoFilterUnresolved {
     /// The selector as the caller spelled it.

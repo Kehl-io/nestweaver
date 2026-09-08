@@ -500,3 +500,56 @@ fn selected_pull_rejects_unknown_instance_and_uses_registered_workspace() {
             .contains(f.dir.path().join("selected-workspace").to_str().unwrap())
     );
 }
+
+#[test]
+fn invalid_dead_code_confidence_fails_before_any_route_or_database_work() {
+    let fixture = Fixture::new();
+    for direct in [false, true] {
+        for value in ["", "bogus", "NaN", "LOW"] {
+            let output = fixture.query(
+                &["dead-code", &format!("--min-confidence={value}"), "--json"],
+                direct,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(64),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !fixture.db.exists(),
+                "invalid input must not start a database"
+            );
+        }
+    }
+}
+
+#[test]
+fn prune_cli_preserves_commit_state_for_noop_and_real_deletion() {
+    let fixture = Fixture::new();
+    fixture.index();
+    let clean = fixture.query(&["prune-stale", "--json"], false);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let clean = payload(&clean);
+    assert_eq!(clean["committed"], false);
+    assert_eq!(clean["removed_repos"], json!([]));
+    assert_eq!(clean["reconciliation_failures"], json!([]));
+    std::fs::remove_dir_all(&fixture.repo).unwrap();
+    let removed = fixture.query(&["prune-stale", "--json"], false);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed = payload(&removed);
+    assert_eq!(removed["committed"], true);
+    assert_eq!(removed["removed_repos"].as_array().unwrap().len(), 1);
+    assert_eq!(removed["reconciliation_failures"], json!([]));
+    let repeat = fixture.query(&["prune-stale"], false);
+    assert!(repeat.status.success());
+    assert!(String::from_utf8_lossy(&repeat.stdout).contains("Committed: false"));
+}

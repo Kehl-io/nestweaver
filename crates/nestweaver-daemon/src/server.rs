@@ -4788,7 +4788,7 @@ where
         None => Ok(PruneStaleResponse {
             removed_repos: removed_repos.names,
             removed_vaults,
-            committed: true,
+            committed: changed,
             reconciliation_failures: to_proto_reconciliation_failures(&failures),
         }),
     };
@@ -8110,17 +8110,19 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainStatusRequest>,
     ) -> Result<Response<BrainStatusResponse>, Status> {
-        // nw-415, argued at `dispatch_tool_json`. `brain_status` is the most
-        // direct enumeration in the catalogue — nw-403 gave it its own
-        // `RepoScope::EnforcedInArm` treatment because `repos[]` carries each
-        // repo's URL and indexed git SHA, i.e. repo IDENTITY rather than repo
-        // content. Handing it `All` meant the enforcing arm was never reached
-        // and `repo_count` counted tenants the caller cannot see.
-        // `indexing_repo` is the worker job's configured repo identifier, not
-        // an authoritative graph repo UID. It therefore cannot be filtered
-        // through the repo-scope policy used for `repos[]`; suppress it for
-        // every restricted identity instead of risking a cross-tenant name
-        // leak from this process-level status field.
+        if self.state.permission_source.is_enabled()
+            && !matches!(
+                r.extensions().get::<nestweaver_engine::authz::Identity>(),
+                Some(nestweaver_engine::authz::Identity::Admin)
+            )
+        {
+            return Err(Status::permission_denied(
+                "BrainStatus requires an administrator while repository authorization is enabled",
+            ));
+        }
+        // The fail-closed guard above owns the current policy. Keep the
+        // earlier indexing-target suppression as defense in depth: a worker
+        // identifier is not an authoritative graph UID suitable for scoping.
         let restricted = matches!(
             self.state.visible_repos_for(r.extensions())?,
             nestweaver_engine::authz::VisibleRepos::Only(_)
@@ -8230,6 +8232,16 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
+        if self.state.permission_source.is_enabled()
+            && !matches!(
+                r.extensions().get::<nestweaver_engine::authz::Identity>(),
+                Some(nestweaver_engine::authz::Identity::Admin)
+            )
+        {
+            return Err(Status::permission_denied(
+                "BrainStatusJson requires an administrator while repository authorization is enabled",
+            ));
+        }
         // nw-415, argued at `dispatch_tool_json`. Same tool, same
         // enumeration, SECOND DOOR: the JSON twin bypassed the gate
         // independently of the typed `brain_status` RPC, so fixing only that
@@ -9181,6 +9193,16 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
+        if self.state.permission_source.is_enabled()
+            && !matches!(
+                r.extensions().get::<nestweaver_engine::authz::Identity>(),
+                Some(nestweaver_engine::authz::Identity::Admin)
+            )
+        {
+            return Err(Status::permission_denied(
+                "DetectImplicitProjectsJson requires an administrator while repository authorization is enabled",
+            ));
+        }
         let is_admin = matches!(
             r.extensions().get::<crate::auth::IsAdmin>(),
             Some(crate::auth::IsAdmin(true))
@@ -10224,16 +10246,14 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         // dispatch, or refuses unsafe traversal before it starts. The typed
         // `RepoStates`/`ListContracts` handlers apply the same visibility
         // contract directly.
-        "AffectedTests" | "BlastRadius" | "BrainDiff" | "BrainStatus" | "BrainStatusJson"
-        | "BridgeNodes" | "CodeContext" | "DeadCode" | "DetectChanges" | "FlowTrace"
-        | "GetContext" | "GetProjectContext" | "HubNodes" | "Impact" | "ListContracts"
-        | "PrImpactJson" | "ReadSymbols" | "RegexSearch" | "RepoStates" | "Search"
-        | "StaleCheck" => RpcRepoScope::Scoped,
+        "AffectedTests" | "BlastRadius" | "BrainDiff" | "BridgeNodes" | "CodeContext"
+        | "DeadCode" | "DetectChanges" | "FlowTrace" | "GetContext" | "GetProjectContext"
+        | "HubNodes" | "Impact" | "ListContracts" | "PrImpactJson" | "ReadSymbols"
+        | "RegexSearch" | "RepoStates" | "Search" | "StaleCheck" => RpcRepoScope::Scoped,
 
         // Vault/document-only tool routes plus process capabilities which do
-        // not enumerate repository-owned graph objects. The mutating form of
-        // DetectImplicitProjectsJson retains its payload-aware admin check in
-        // the handler; its dry-run result remains available here.
+        // not enumerate repository-owned graph objects. Raw-path project
+        // preview is classified fail-closed below.
         "BrainBrokenLinks"
         | "BrainDocStats"
         | "BrainMemoryLint"
@@ -10241,7 +10261,6 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         | "BrainOrphanDocuments"
         | "BrainTagGraph"
         | "BrainTopicClusters"
-        | "DetectImplicitProjectsJson"
         | "EmbeddingDimension"
         | "GetBacklinks"
         | "GetNote"
@@ -10280,11 +10299,30 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         // authorization-induced computation. Admin remains the explicit
         // escape hatch; every non-admin identity is rejected before handler
         // dispatch while per-repo authorization is enabled.
-        "BrainGuide" | "Clusters" | "ContractDrift" | "CountPatterns" | "CrossRepoContracts"
-        | "ExportGraph" | "FlowTraceContinue" | "GetSummary" | "ImpactAnalysis" | "Investigate"
-        | "InvestigateExpand" | "InvestigateHydrate" | "ListReposJson" | "ListServicesJson"
-        | "PlanEmbed" | "QueryExtensions" | "RepoMapJson" | "SearchSymbols"
-        | "ServiceSummaryJson" | "SuggestLinksJson" | "SymbolLookup" => RpcRepoScope::FailClosed,
+        "BrainStatus"
+        | "BrainStatusJson"
+        | "DetectImplicitProjectsJson"
+        | "BrainGuide"
+        | "Clusters"
+        | "ContractDrift"
+        | "CountPatterns"
+        | "CrossRepoContracts"
+        | "ExportGraph"
+        | "FlowTraceContinue"
+        | "GetSummary"
+        | "ImpactAnalysis"
+        | "Investigate"
+        | "InvestigateExpand"
+        | "InvestigateHydrate"
+        | "ListReposJson"
+        | "ListServicesJson"
+        | "PlanEmbed"
+        | "QueryExtensions"
+        | "RepoMapJson"
+        | "SearchSymbols"
+        | "ServiceSummaryJson"
+        | "SuggestLinksJson"
+        | "SymbolLookup" => RpcRepoScope::FailClosed,
 
         _ => return None,
     })
@@ -15350,6 +15388,23 @@ credential_method = "gh"
     }
 
     #[test]
+    fn prune_stale_noop_is_not_a_commit_and_does_not_reconcile() {
+        let state = test_state_with_writer();
+        let generation = state.store.graph_generation();
+        let result = run_prune_stale_with(
+            &state,
+            |_, _| panic!("no repo to delete"),
+            |_, _| panic!("no vault to delete"),
+            |_, _, _| panic!("no mutation to reconcile"),
+        )
+        .unwrap();
+        assert!(!result.committed);
+        assert!(result.removed_repos.is_empty() && result.removed_vaults.is_empty());
+        assert!(result.reconciliation_failures.is_empty());
+        assert_eq!(generation, state.store.graph_generation());
+    }
+
+    #[test]
     fn prune_stale_vault_prunes_note_and_heading_embeddings() {
         let state = test_state_with_writer();
         let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
@@ -15404,6 +15459,20 @@ credential_method = "gh"
 
         // nw-091 / Bug 2: committed prune → success-with-warnings (`error` binds the Ok response).
         assert!(error.committed);
+        let wire = nestweaver_proto::prune_stale_json(&error);
+        assert_eq!(wire["committed"], true);
+        assert!(
+            wire["reconciliation_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("injected Tantivy"))
+        );
+        assert_eq!(wire["removed_vaults"].as_array().unwrap().len(), 1);
+
         assert!(
             error
                 .reconciliation_failures
@@ -21790,6 +21859,92 @@ external_model = "unavailable-test-model"
         }
     }
 
+    #[tokio::test]
+    async fn implicit_preview_and_status_refuse_before_parsing_for_non_admins() {
+        use nestweaver_engine::authz::Identity;
+        let service = nw415_service();
+        let vault = tempfile::tempdir().unwrap();
+        let canary = vault.path().join("Projects/private-canary");
+        std::fs::create_dir_all(&canary).unwrap();
+        std::fs::write(canary.join("private-canary.md"), "# Private\n").unwrap();
+        for identity in [Identity::Anonymous, Identity::Token(NW415_TOKEN.into())] {
+            for path in [
+                vault.path().to_string_lossy().to_string(),
+                vault.path().join("absent").to_string_lossy().to_string(),
+            ] {
+                let request = nw415_request(
+                    JsonRequest {
+                        args_json: serde_json::json!({"vault":path,"dry_run":true}).to_string(),
+                    },
+                    identity.clone(),
+                );
+                let error = service
+                    .detect_implicit_projects_json(request)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                assert!(!error.message().contains(&path));
+                assert!(!error.message().contains("private-canary"));
+            }
+            let bad = nw415_request(
+                JsonRequest {
+                    args_json: "not json".into(),
+                },
+                identity.clone(),
+            );
+            assert_eq!(
+                service.brain_status_json(bad).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+            let bad = nw415_request(
+                JsonRequest {
+                    args_json: "not json".into(),
+                },
+                identity.clone(),
+            );
+            assert_eq!(
+                service
+                    .detect_implicit_projects_json(bad)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            let mut extensions = http::Extensions::new();
+            extensions.insert(identity);
+            for method in [
+                "BrainStatus",
+                "BrainStatusJson",
+                "DetectImplicitProjectsJson",
+            ] {
+                assert_eq!(
+                    authz_rejection(true, method, &extensions).unwrap().code(),
+                    tonic::Code::PermissionDenied
+                );
+                assert!(authz_rejection(false, method, &extensions).is_none());
+            }
+        }
+        let mut admin = nw415_request(
+            JsonRequest {
+                args_json: serde_json::json!({"vault":vault.path(),"dry_run":true}).to_string(),
+            },
+            Identity::Admin,
+        );
+        admin.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let preview = service
+            .detect_implicit_projects_json(admin)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(preview.result_json.contains("private-canary"));
+        assert!(
+            service
+                .brain_status(nw415_request(BrainStatusRequest {}, Identity::Admin))
+                .await
+                .is_ok()
+        );
+    }
+
     fn nw415_hub_request() -> HubNodesRequest {
         HubNodesRequest {
             top_n: 10,
@@ -21834,26 +21989,8 @@ external_model = "unavailable-test-model"
         // lets one of them be missed.
         let mut leaks: Vec<String> = Vec::new();
 
-        // `brain_status`, typed: `EnforcedInArm`, because `repos[]` carries
-        // each repo's URL and indexed git SHA — repo IDENTITY, the most direct
-        // enumeration in the catalogue.
-        let status = service
-            .brain_status(nw415_request(BrainStatusRequest {}, scoped()))
-            .await
-            .expect("a repo-scoped brain_status is scoped, not refused")
-            .into_inner();
-        if status.repo_count != 1 {
-            leaks.push(format!(
-                "typed brain_status counted {} repos; the caller may see 1",
-                status.repo_count
-            ));
-        }
-        if !status.indexing_repo.is_empty() {
-            leaks.push(format!(
-                "typed brain_status leaked an unauthoritative indexing repo identifier: {}",
-                status.indexing_repo
-            ));
-        }
+        // Both status variants refuse whole-instance telemetry for this
+        // scoped identity; the independent repo inventory remains filtered.
         let repos = service
             .repo_states(nw415_request(RepoStatesRequest {}, scoped()))
             .await
@@ -21865,42 +22002,27 @@ external_model = "unavailable-test-model"
                 repos.repos
             ));
         }
-
-        // `brain_status`, JSON: the second door onto the same enumeration.
-        let status_json = service
-            .brain_status_json(nw415_request(
-                JsonRequest {
-                    args_json: "{}".to_string(),
-                },
-                scoped(),
-            ))
-            .await
-            .expect("a repo-scoped brain_status_json is scoped, not refused")
-            .into_inner();
-        if status_json.result_json.contains(NW415_HIDDEN_URL) {
-            leaks.push(format!(
-                "brain_status_json leaked the hidden repo's URL: {}",
-                status_json.result_json
-            ));
-        }
-        if !status_json.result_json.contains(NW415_VISIBLE_URL) {
-            leaks.push(format!(
-                "brain_status_json dropped the repo the caller DOES own: {}",
-                status_json.result_json
-            ));
-        }
-        let status_value: serde_json::Value =
-            serde_json::from_str(&status_json.result_json).unwrap();
-        if status_value["visibility"]["scoped"] != serde_json::json!(true) {
-            leaks.push(format!(
-                "brain_status_json did not disclose that it was scoped: {status_value}"
-            ));
-        }
-        if !status_value["indexing_repo"].is_null() {
-            leaks.push(format!(
-                "brain_status_json leaked an unauthoritative indexing repo identifier: {status_value}"
-            ));
-        }
+        assert_eq!(
+            service
+                .brain_status(nw415_request(BrainStatusRequest {}, scoped()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .brain_status_json(nw415_request(
+                    JsonRequest {
+                        args_json: "{}".into()
+                    },
+                    scoped()
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
 
         // `brain_context`: `RedactedAfterDispatch`.
         let context = service

@@ -6,6 +6,7 @@ license.workspace = true
 description = "gRPC daemon for NestWeaver — serves read RPCs over a Unix domain socket"
 
 [dependencies]
+tempfile = { workspace = true }
 subtle = { workspace = true }
 nestweaver-proto = { workspace = true }
 nestweaver-engine = { workspace = true }
@@ -49,7 +50,6 @@ tokio-rustls-acme = { version = "0.9.1", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"

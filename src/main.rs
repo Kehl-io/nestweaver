@@ -4915,6 +4915,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Emit JSON, including commit and reconciliation state")]
+        json: bool,
     },
     /// Reconcile an index publication abandoned by a crashed indexer.
     ///
@@ -6457,6 +6459,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "low",
+            value_parser = ["low", "medium", "high"],
             help = "Minimum confidence to report (low, medium, high)"
         )]
         min_confidence: String,
@@ -13628,6 +13631,12 @@ fn run_daemon_gc() -> Result<(i32, Option<String>), anyhow::Error> {
             }
         }
     }
+    if !report.spared_spawnlock.is_empty() {
+        println!(
+            "  spared (spawn handshake active): {}",
+            report.spared_spawnlock.len()
+        );
+    }
     if !report.spared_pidfile_lock.is_empty() {
         println!(
             "  spared (pidfile lock held): {}",
@@ -14339,7 +14348,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::PruneStale { db } => {
+        Commands::PruneStale { db, json } => {
             let db_path = db.unwrap_or_else(default_db_path);
             require_existing_db(&db_path)?;
             let rt = tokio::runtime::Runtime::new()?;
@@ -14349,17 +14358,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             match rt.block_on(client.prune_stale()) {
                 Ok(resp) => {
-                    let total = resp.removed_repos.len() + resp.removed_vaults.len();
-                    if total == 0 {
-                        println!("No stale sources found.");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&nestweaver_proto::prune_stale_json(
+                                &resp
+                            ))?
+                        );
                     } else {
-                        for name in &resp.removed_repos {
-                            println!("  Removed repo: {name}");
+                        let total = resp.removed_repos.len() + resp.removed_vaults.len();
+                        if total == 0 {
+                            println!("No stale sources found.");
+                        } else {
+                            for name in &resp.removed_repos {
+                                println!("  Removed repo: {name}");
+                            }
+                            for name in &resp.removed_vaults {
+                                println!("  Removed vault: {name}");
+                            }
+                            println!("Pruned {total} stale source(s).");
                         }
-                        for name in &resp.removed_vaults {
-                            println!("  Removed vault: {name}");
+                        println!("Committed: {}", resp.committed);
+                        for failure in &resp.reconciliation_failures {
+                            eprintln!(
+                                "Warning: reconciliation {} [{}]: {}",
+                                failure.stage, failure.repo_uid, failure.message
+                            );
                         }
-                        println!("Pruned {total} stale source(s).");
+                    }
+                    if !resp.reconciliation_failures.is_empty() {
+                        return Ok((EXIT_ERROR, None));
                     }
                 }
                 Err(e) => {
@@ -17208,14 +17236,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let min_conf =
-                DeadCodeConfidence::from_str_loose(&min_confidence).unwrap_or_else(|| {
-                    eprintln!(
-                        "Warning: unknown confidence level '{}', defaulting to 'low'",
-                        min_confidence
-                    );
-                    DeadCodeConfidence::Low
-                });
+            let min_conf = DeadCodeConfidence::from_str_loose(&min_confidence)
+                .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence: {min_confidence}"))?;
             let store = open_store(db.as_deref())?;
 
             let db_path = db.clone().unwrap_or_else(default_db_path);

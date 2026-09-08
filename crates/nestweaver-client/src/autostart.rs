@@ -145,29 +145,57 @@ impl SpawnLock {
     }
 
     fn acquire_at(instance_id: String, spawn_lock_path: &Path) -> Result<Self> {
-        if let Some(parent) = spawn_lock_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create spawn lock directory {}", parent.display())
-            })?;
+        Self::acquire_at_with_opened(instance_id, spawn_lock_path, || {})
+    }
+
+    fn acquire_at_with_opened(
+        instance_id: String,
+        spawn_lock_path: &Path,
+        mut opened: impl FnMut(),
+    ) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        loop {
+            if let Some(parent) = spawn_lock_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = match fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(spawn_lock_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("open spawn lock"),
+            };
+            opened();
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("lock daemon spawn");
+            }
+            let held = file.metadata()?;
+            anyhow::ensure!(held.is_file(), "spawn lock must be a regular file");
+            // GC retires the runtime directory while holding this flock. A
+            // waiter may own the retired inode when woken: never hand that
+            // descriptor to a child. Recreate/reacquire the current pathname.
+            match fs::symlink_metadata(spawn_lock_path) {
+                Ok(current)
+                    if current.is_file()
+                        && current.dev() == held.dev()
+                        && current.ino() == held.ino() =>
+                {
+                    return Ok(Self {
+                        file,
+                        instance_id,
+                        unlock_on_drop: AtomicBool::new(true),
+                    });
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("verify daemon spawn lock"),
+            }
         }
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(spawn_lock_path)
-            .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!(
-                "flock on spawn lock failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(Self {
-            file,
-            instance_id,
-            unlock_on_drop: AtomicBool::new(true),
-        })
     }
 
     /// Close a fork-inherited descriptor without issuing `LOCK_UN`.
@@ -1345,6 +1373,41 @@ credential_method = "gh"
         rx.recv_timeout(Duration::from_secs(2))
             .expect("contender should proceed after transaction releases spawn lock");
         contender.join().unwrap();
+    }
+
+    #[test]
+    fn spawn_waiter_retries_retired_runtime_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let path = runtime.join("daemon.spawnlock");
+        let first = SpawnLock::acquire_at("instance".into(), &path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (proceed, wait) = std::sync::mpsc::channel();
+        let target = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut initial = true;
+            SpawnLock::acquire_at_with_opened("instance".into(), &target, || {
+                if initial {
+                    initial = false;
+                    tx.send(()).unwrap();
+                    wait.recv().unwrap();
+                }
+            })
+            .unwrap()
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        fs::rename(&runtime, dir.path().join("retired")).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        fs::write(&path, "").unwrap();
+        proceed.send(()).unwrap();
+        drop(first);
+        let acquired = waiter.join().unwrap();
+        assert_eq!(
+            acquired.file.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
     }
 
     #[test]

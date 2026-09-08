@@ -387,12 +387,13 @@ fn repo_scope(tool: &str) -> RepoScope {
         "brain_search" | "brain_impact" | "brain_diff" | "affected_tests" | "detect_changes" => {
             RepoScope::EnforcedInArm
         }
-        // nw-403: `brain_status` enumerated every repo's URL and indexed git
-        // SHA — repo IDENTITY, the most direct enumeration of a hidden tenant
-        // in the catalogue. Its rows are keyed by url/name, not by node uid,
-        // so the generic redactor cannot see them.
-        "brain_status" => RepoScope::EnforcedInArm,
-        // Keyed by repo, same reason as `brain_status`.
+        // Instance status includes host and whole-corpus telemetry that cannot
+        // be made tenant-safe by filtering the repository rows.
+        "brain_status" => RepoScope::FailClosed(
+            "host paths, runtime state and embedding telemetry describe the whole instance; \
+             a safe repository-scoped status response is not available",
+        ),
+        // Stale inventory can be filtered before its totals are computed.
         "stale_check" => RepoScope::EnforcedInArm,
         // Filtering has to happen DURING the walk. Redacting a call tree
         // afterwards would delete a subtree and leave `children: []`, which is
@@ -3525,10 +3526,32 @@ fn ensure_dispatch_not_cancelled(
 /// identical calls burned 30 embeds and piled into the tool timeout.
 /// Coalesce them: the first caller (leader) computes, followers wait on the
 /// shared slot and receive a clone of the leader's result. `anyhow::Error`
-/// is not `Clone`, so the slot carries the error's message and followers
-/// re-wrap it.
+/// is not `Clone`, so preserve its rendered context and the stable repository
+/// filter error used by federation. Followers must retain that source type so
+/// the daemon can stamp the same metadata code as it does for the leader.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+struct SharedFlightError {
+    message: String,
+    #[source]
+    repo_filter: Option<nestweaver_engine::node_scope::RepoFilterUnresolved>,
+}
+
+impl SharedFlightError {
+    fn capture(error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{error:#}"),
+            repo_filter: error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+                    .cloned()
+            }),
+        }
+    }
+}
+
 struct InFlightSlot {
-    result: std::sync::Mutex<Option<Result<Value, String>>>,
+    result: std::sync::Mutex<Option<Result<Value, SharedFlightError>>>,
     ready: std::sync::Condvar,
 }
 
@@ -3553,7 +3576,7 @@ struct FlightLeader {
 impl FlightLeader {
     /// Store the outcome for waiting followers; `drop` then unregisters the
     /// flight and notifies them.
-    fn finish(self, result: Result<Value, String>) {
+    fn finish(self, result: Result<Value, SharedFlightError>) {
         *self.slot.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
     }
 }
@@ -3573,9 +3596,10 @@ impl Drop for FlightLeader {
         }
         let mut result = self.slot.result.lock().unwrap_or_else(|e| e.into_inner());
         if result.is_none() {
-            *result = Some(Err(
-                "in-flight leader dropped before producing a result".to_string()
-            ));
+            *result = Some(Err(SharedFlightError {
+                message: "in-flight leader dropped before producing a result".to_string(),
+                repo_filter: None,
+            }));
         }
         drop(result);
         self.slot.ready.notify_all();
@@ -3623,7 +3647,7 @@ fn coalesce_in_flight(
             if let Some(res) = &*result {
                 return match res {
                     Ok(value) => Ok(value.clone()),
-                    Err(msg) => Err(anyhow!("{msg}")),
+                    Err(error) => Err(anyhow::Error::new(error.clone())),
                 };
             }
             if cancel.is_some() {
@@ -3643,7 +3667,7 @@ fn coalesce_in_flight(
         result
             .as_ref()
             .map(|v| v.clone())
-            .map_err(|e| format!("{e:#}")),
+            .map_err(SharedFlightError::capture),
     );
     result
 }
@@ -9010,10 +9034,7 @@ fn tool_prune_stale(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
             .map_err(|e| anyhow!("prune_stale RPC failed: {e}"))?;
         let inner = resp.into_inner();
-        Ok(json!({
-            "removed_repos": inner.removed_repos,
-            "removed_vaults": inner.removed_vaults
-        }))
+        Ok(nestweaver_proto::prune_stale_json(&inner))
     }
     #[cfg(not(feature = "daemon"))]
     {
@@ -14340,10 +14361,7 @@ fn dispatch_via_daemon_inner(
             .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
             .map_err(|e| anyhow::anyhow!("prune_stale RPC failed: {}", e.message()))?;
         let inner = resp.into_inner();
-        return Ok(Unstamped::new(json!({
-            "removed_repos": inner.removed_repos,
-            "removed_vaults": inner.removed_vaults
-        })));
+        return Ok(Unstamped::new(nestweaver_proto::prune_stale_json(&inner)));
     }
 
     // Helper to parse string arrays from JSON args.
@@ -14751,11 +14769,6 @@ fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
     md > 0 && md >= code
 }
 
-/// Instance id `brain_add_source` stamps vaults under when routing through the
-/// daemon, mirroring the CLI's nw-019 precedence (`resolve_instance_id`):
-/// config's `instance_id` > `"default"`. An empty id would defer to the daemon,
-/// whose config-less fallback is the db-path hash — a different identity than
-/// the CLI's `"default"`, duplicating any vault added via both paths.
 #[cfg(feature = "daemon")]
 /// The instance this MCP process should ask the daemon to write under.
 ///
@@ -18731,6 +18744,175 @@ mod cache_dispatch_tests {
         );
     }
 
+    #[test]
+    fn single_flight_preserves_typed_errors_for_every_follower() {
+        use std::sync::{Arc, Barrier};
+        let key: InFlightKey = ("/tmp/typed-flight.lbug".into(), 41, 42, 43);
+        let release = Arc::new(Barrier::new(2));
+        let leader_key = key.clone();
+        let leader_release = release.clone();
+        let leader = std::thread::spawn(move || {
+            coalesce_in_flight(leader_key, None, || {
+                leader_release.wait();
+                Err(
+                    anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                        "missing",
+                        &anyhow!("wording may change"),
+                    ))
+                    .context("outer tool context"),
+                )
+            })
+        });
+        let baseline = wait_for_flight_count(&key, |n| n >= 1);
+        let followers: Vec<_> = (0..8)
+            .map(|_| {
+                let key = key.clone();
+                std::thread::spawn(move || {
+                    coalesce_in_flight(key, None, || panic!("unexpected leader"))
+                })
+            })
+            .collect();
+        wait_for_flight_count(&key, |n| n >= baseline + 8);
+        release.wait();
+        for result in std::iter::once(leader).chain(followers) {
+            let error = result.join().unwrap().unwrap_err();
+            let typed = error
+                .chain()
+                .find_map(|cause| {
+                    cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+                })
+                .expect("typed code must survive");
+            assert_eq!(typed.selector, "missing");
+            assert!(error.to_string().contains("outer tool context"));
+        }
+        assert_eq!(
+            coalesce_in_flight(key, None, || Ok(json!("retry"))).unwrap(),
+            json!("retry")
+        );
+    }
+
+    #[test]
+    fn single_flight_cancelled_follower_does_not_cancel_leader_or_strand_retry() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+        let key: InFlightKey = ("/tmp/cancel-flight.lbug".into(), 51, 52, 53);
+        let release = Arc::new(Barrier::new(2));
+        let leader_key = key.clone();
+        let gate = release.clone();
+        let leader = std::thread::spawn(move || {
+            coalesce_in_flight(leader_key, None, || {
+                gate.wait();
+                Ok(json!("complete"))
+            })
+        });
+        let baseline = wait_for_flight_count(&key, |n| n >= 1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let follower_key = key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            tx.send(coalesce_in_flight(follower_key, Some(&flag), || {
+                panic!("follower computed")
+            }))
+            .unwrap();
+        });
+        wait_for_flight_count(&key, |n| n > baseline);
+        cancelled.store(true, Ordering::Release);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        release.wait();
+        follower.join().unwrap();
+        assert_eq!(leader.join().unwrap().unwrap(), json!("complete"));
+        assert!(coalesce_in_flight(key, None, || Ok(json!(true))).is_ok());
+    }
+
+    #[test]
+    fn single_flight_leader_cancellation_and_ordinary_failure_release_followers() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+        for cancelled in [false, true] {
+            let key: InFlightKey = (
+                "/tmp/leader-error-flight.lbug".into(),
+                71,
+                72,
+                u64::from(cancelled),
+            );
+            let flag = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(Barrier::new(2));
+            let gate = release.clone();
+            let leader_flag = flag.clone();
+            let leader_key = key.clone();
+            let leader = std::thread::spawn(move || {
+                coalesce_in_flight(leader_key, Some(&leader_flag), || {
+                    gate.wait();
+                    ensure_dispatch_not_cancelled(Some(&leader_flag))?;
+                    Err(anyhow!("ordinary failure"))
+                })
+            });
+            let baseline = wait_for_flight_count(&key, |n| n >= 1);
+            let follower_key = key.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let follower = std::thread::spawn(move || {
+                tx.send(coalesce_in_flight(follower_key, None, || {
+                    panic!("follower computed")
+                }))
+                .unwrap();
+            });
+            wait_for_flight_count(&key, |n| n > baseline);
+            flag.store(cancelled, Ordering::Release);
+            release.wait();
+            let leader_error = leader.join().unwrap().unwrap_err();
+            let follower_error = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            follower.join().unwrap();
+            assert_eq!(format!("{leader_error:#}"), format!("{follower_error:#}"));
+            assert!(coalesce_in_flight(key, None, || Ok(json!("retry"))).is_ok());
+        }
+    }
+
+    #[test]
+    fn single_flight_panicking_leader_wakes_followers() {
+        use std::sync::{Arc, Barrier};
+        let key: InFlightKey = ("/tmp/panic-flight.lbug".into(), 61, 62, 63);
+        let release = Arc::new(Barrier::new(2));
+        let gate = release.clone();
+        let leader_key = key.clone();
+        let leader = std::thread::spawn(move || {
+            coalesce_in_flight(leader_key, None, || {
+                gate.wait();
+                panic!("injected leader failure")
+            })
+        });
+        let baseline = wait_for_flight_count(&key, |n| n >= 1);
+        let follower_key = key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            tx.send(coalesce_in_flight(follower_key, None, || {
+                panic!("follower computed")
+            }))
+            .unwrap();
+        });
+        wait_for_flight_count(&key, |n| n > baseline);
+        release.wait();
+        assert!(leader.join().is_err());
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("leader dropped"));
+        follower.join().unwrap();
+        assert!(coalesce_in_flight(key, None, || Ok(json!(true))).is_ok());
+    }
+
     /// A failed leader cleans up: followers get the error, and a later call
     /// with the same key recomputes instead of poisoning the flight map.
     #[test]
@@ -22432,9 +22614,9 @@ mod repo_visibility_coverage_tests {
         }
     }
 
-    /// COUNTERWEIGHT: scoping must not be over-applied. A caller authorized
-    /// for BOTH repos is not restricted at all in effect, and an unconfigured
-    /// deployment (`None`) must be byte-identical to the pre-nw-403 behaviour.
+    /// COUNTERWEIGHT: both authorized repository inventories remain visible.
+    /// Host-wide status requires admin authority even when every repo is
+    /// visible; an unconfigured deployment retains its full status payload.
     #[test]
     fn a_caller_authorized_for_every_repo_still_sees_every_repo() {
         let store = hidden_repo_store();
@@ -22443,7 +22625,7 @@ mod repo_visibility_coverage_tests {
                 .into_iter()
                 .collect(),
         );
-        let scoped = call(&store, "brain_status", &json!({}), Some(&all));
+        let scoped = call(&store, "stale_check", &json!({}), Some(&all));
         assert!(
             scoped.contains("hidden-secret"),
             "a caller authorized for repo:hidden must still see it: {scoped}"
@@ -22460,29 +22642,30 @@ mod repo_visibility_coverage_tests {
     /// (URL + indexed git SHA) rather than repo content, and because its
     /// summaries have to stay consistent with the list they summarise.
     #[test]
-    fn brain_status_scopes_the_repo_list_without_erasing_the_visible_repo() {
+    fn brain_status_refuses_scoped_metadata_before_dispatch() {
         let store = hidden_repo_store();
-        let visible = only_alpha();
-        let value = dispatch_cancellable(
-            &store,
-            None,
-            "brain_status",
-            json!({}),
-            None,
-            None,
-            Some(&visible),
-        )
-        .expect("brain_status must still answer a scoped caller");
-        assert_eq!(value["repo_count"], json!(1), "{value}");
-        let repos = value["repos"].as_array().expect("repos array");
-        assert_eq!(repos.len(), 1, "{value}");
-        assert_eq!(
-            repos[0]["url"],
-            json!("https://example.test/alpha"),
-            "{value}"
-        );
-        assert_eq!(value["visibility"]["scoped"], json!(true), "{value}");
-        assert_eq!(value["visibility"]["repos_hidden"], json!(1), "{value}");
+        for visible in [
+            only_alpha(),
+            VisibleRepos::Only(
+                ["repo:alpha".to_string(), "repo:hidden".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            nestweaver_engine::authz::VisibleRepos::Only(Default::default()),
+        ] {
+            let error = dispatch_cancellable(
+                &store,
+                None,
+                "brain_status",
+                json!({}),
+                None,
+                None,
+                Some(&visible),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("host paths"));
+        }
+        assert!(dispatch(&store, None, "brain_status", json!({}), None).is_ok());
     }
 
     /// `stale_check` is scoped at its INPUT so its pre-summarised lists cannot
