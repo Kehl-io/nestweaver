@@ -1451,6 +1451,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_ISOLATED_SERVER_TEST",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_LBUG_MAX_DB_SIZE",
         role: EnvRole::Configures,
     },
