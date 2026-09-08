@@ -81,6 +81,12 @@ mutating_tools![
     // caller supplied. Nothing the caller did not name is touched, and the
     // same call twice leaves the same value.
     ("set_extension", false, true),
+    // nw-281/nw-462. DESTRUCTIVE: it removes a property the caller may not be
+    // able to reconstruct, which `set_extension` (a pure overwrite of a named
+    // key) is not. IDEMPOTENT: removing an already-absent key reports
+    // `removed: false` and leaves the sidecar unchanged, so a second call lands
+    // on the same state.
+    ("unset_extension", true, true),
     // "Cannot undo — removed sources must be re-indexed." Idempotent for the
     // same documented reason as `brain_remove_source`: a second run finds
     // nothing further to prune.
@@ -1412,6 +1418,7 @@ mod tests {
                 "brain_remove_source",
                 "brain_memory_consolidate",
                 "set_extension",
+                "unset_extension",
                 "prune_stale",
                 "compact_embeddings",
             ]
@@ -1459,6 +1466,10 @@ mod tests {
                 "uid": "sym:not-dispatched",
                 "key": "reviewed",
                 "value": true,
+            }),
+            "unset_extension" => json!({
+                "uid": "sym:not-dispatched",
+                "key": "reviewed",
             }),
             "prune_stale" => json!({}),
             "compact_embeddings" => json!({ "dry_run": true }),

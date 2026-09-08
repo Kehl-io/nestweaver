@@ -920,6 +920,13 @@ service NestWeaverDaemon {
   rpc InvestigateExpand(JsonRequest) returns (JsonResponse);
   rpc InvestigateHydrate(JsonRequest) returns (JsonResponse);
   rpc SetExtension(JsonRequest) returns (JsonResponse);
+  // nw-462: the DELETE counterparts of the two authored sidecars. They exist
+  // for the same reason SetExtension does -- the sidecar read-modify-write must
+  // run under the daemon write gate, serialized against a backup's sidecar
+  // staging and visible to the shutdown drain. Before these, both CLI delete
+  // verbs called the engine directly and raced any concurrent write.
+  rpc UnsetExtension(JsonRequest) returns (JsonResponse);
+  rpc ForgetInteraction(JsonRequest) returns (JsonResponse);
   rpc QueryExtensions(JsonRequest) returns (JsonResponse);
 
   // Read RPCs — JSON pass-through (CLI read commands routed via daemon)

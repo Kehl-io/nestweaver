@@ -96,6 +96,9 @@ pub async fn dispatch_json_rpc_authed(
         "investigate_expand" => client.investigate_expand(request).await,
         "investigate_hydrate" => client.investigate_hydrate(request).await,
         "set_extension" => client.set_extension(request).await,
+        // nw-281: reuses the gated RPC nw-462 added for the CLI rather than
+        // building a second write path for the same sidecar.
+        "unset_extension" => client.unset_extension(request).await,
         "query_extensions" => client.query_extensions(request).await,
         "brain_status" | "brain_status_json" => client.brain_status_json(request).await,
         "export_graph" => client.export_graph(request).await,
