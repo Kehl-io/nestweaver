@@ -657,6 +657,20 @@ fn brain_list_preserves_selected_output_mode_across_routes() {
         assert_eq!(payload(&json), json!([]));
         f.stop();
     }
+    let vault = f.dir.path().join("notes");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::write(vault.join("Note.md"), "# Note\nA populated inventory.\n").unwrap();
+    let added = f.query(&["brain", "add", vault.to_str().unwrap()], true);
+    assert!(added.status.success());
+    let direct = f.query(&["brain", "list", "--json"], true);
+    let daemon = f.query(&["brain", "list", "--json"], false);
+    assert!(direct.status.success() && daemon.status.success());
+    assert_eq!(payload(&direct), payload(&daemon));
+    assert_eq!(payload(&daemon)[0]["notes"], 1);
+    assert_eq!(payload(&daemon)[0]["instance_id"], "default");
+    let human = f.query(&["brain", "list"], false);
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("Notes: 1"));
 }
 
 #[test]
@@ -719,6 +733,10 @@ fn immutable_context_ranking_is_identical_across_ten_processes() {
             String::from_utf8_lossy(&run.stderr)
         );
         let report = payload(&run);
+        assert!(
+            report["mean_mrr"].as_f64().unwrap() > 0.0,
+            "the judged UID must be retrieved: {report}"
+        );
         if let Some(expected) = &eval_baseline {
             assert_eq!(&report, expected);
         } else {

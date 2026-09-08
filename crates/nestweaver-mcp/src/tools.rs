@@ -3076,6 +3076,16 @@ pub fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error
 /// Placing it below the response cache is safe because the cache key is
 /// already visibility-salted (`visibility_cache_salt`), so a redacted response
 /// can never be served to a different scope.
+/// Authorization refusal kept typed so transports do not report a server fault.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{tool} is not available to a repository-scoped caller: {reason}. Refusing rather than returning data from outside the caller's visible repositories (nw-403)."
+)]
+pub struct RepositoryScopeRefused {
+    tool: String,
+    reason: &'static str,
+}
+
 fn dispatch_uncached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -3127,10 +3137,11 @@ fn dispatch_uncached(
             );
             dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)
         }
-        RepoScope::FailClosed(reason) => Err(anyhow!(
-            "{name} is not available to a repository-scoped caller: {reason}. Refusing rather \
-             than returning data from outside the caller's visible repositories (nw-403)."
-        )),
+        RepoScope::FailClosed(reason) => Err(RepositoryScopeRefused {
+            tool: name.to_string(),
+            reason,
+        }
+        .into()),
     }
 }
 

@@ -25201,9 +25201,10 @@ fn run_brain(
             };
             let rows = value
                 .as_array()
+                .or_else(|| value.get("results").and_then(serde_json::Value::as_array))
                 .context("invalid vault inventory response")?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                println!("{}", serde_json::to_string_pretty(rows)?);
             } else if rows.is_empty() {
                 println!("No vaults indexed. Try: nestweaver brain add <path>");
             } else {

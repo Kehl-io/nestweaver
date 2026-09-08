@@ -6198,7 +6198,7 @@ fn vault_inventory_with_notes(
                 ),
             };
             serde_json::json!({"uid":v.uid,"name":v.name,"root_path":v.root_path,
-            "notes":notes,"last_indexed":last,"inventory_error":error})
+            "instance_id":v.instance_id,"notes":notes,"last_indexed":last,"inventory_error":error})
         })
         .collect();
     Ok(serde_json::json!(rows))
@@ -6234,6 +6234,7 @@ mod hardening_inventory_tests {
         assert_eq!(rows.len(), 2);
         let empty = rows.iter().find(|v| v["uid"] == "vlt:empty").unwrap();
         assert_eq!(empty["notes"], 0);
+        assert_eq!(empty["instance_id"], "fixture");
         assert!(empty["inventory_error"].is_null());
         let failed = rows.iter().find(|v| v["uid"] == "vlt:unreadable").unwrap();
         assert!(failed["notes"].is_null());
