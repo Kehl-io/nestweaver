@@ -14013,7 +14013,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // empty store, and this one would otherwise report a confident
             // "no such property" about a database that does not exist.
             require_existing_db(&db_path)?;
-            if nestweaver_engine::remove_extension_key_durable(&db_path, &uid, &key)? {
+            // nw-462: route the DELETE through the daemon, exactly as its
+            // matching WRITE (`set_extension`) does. This used to call
+            // `remove_extension_key_durable` directly, so the sidecar
+            // read-modify-write ran with no write gate -- unserialized against
+            // a backup's sidecar staging, invisible to the shutdown drain, and
+            // able to lose an update against a concurrent `set_extension`
+            // arriving over MCP. `atomic_replace_file` kept the file intact,
+            // so the failure mode was a lost update rather than corruption.
+            let rt = tokio::runtime::Runtime::new()?;
+            let removed = match rt.block_on(nestweaver_client::DaemonClient::connect(
+                &db_path,
+                config.as_deref(),
+            )) {
+                Ok(mut client) => rt.block_on(client.unset_extension(&uid, &key))?,
+                Err(error) => {
+                    // No silent direct-write fallback: falling back here would
+                    // reinstate exactly the ungated path this fix removes, and
+                    // would do it precisely when the daemon is unavailable --
+                    // the moment a concurrent writer is most likely to be
+                    // something this process cannot see.
+                    return Err(error).context(
+                        "extensions unset must run under the daemon write gate; \
+                         start the daemon and retry",
+                    );
+                }
+            };
+            if removed {
                 println!("Removed extension property '{key}' from {uid}");
                 Ok((EXIT_SUCCESS, None))
             } else {
@@ -16789,7 +16815,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // pinned config cannot delete out of a different instance's graph.
             InteractionCommands::Forget { uid, db, config } => {
                 let db_path = resolve_db_with_config(db, config.as_deref())?;
-                if nestweaver_engine::remove_node_score(&db_path, &uid)? {
+                // nw-462: same gate, same reasoning as `extensions unset`. Both
+                // delete verbs shipped in one commit calling the engine
+                // directly; both now route through the daemon.
+                let rt = tokio::runtime::Runtime::new()?;
+                let removed = match rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                )) {
+                    Ok(mut client) => rt.block_on(client.forget_interaction(&uid))?,
+                    Err(error) => {
+                        return Err(error).context(
+                            "interactions forget must run under the daemon write gate; \
+                             start the daemon and retry",
+                        );
+                    }
+                };
+                if removed {
                     println!("Forgot interaction memory for {uid}");
                     Ok((EXIT_SUCCESS, None))
                 } else {

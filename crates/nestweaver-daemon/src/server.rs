@@ -8694,6 +8694,103 @@ impl NestWeaverDaemon for DaemonService {
         .map(Response::new)
     }
 
+    /// nw-462: the gated delete counterpart of `set_extension`.
+    ///
+    /// The CLI's `extensions unset` used to call
+    /// `nestweaver_engine::remove_extension_key_durable` DIRECTLY, so the
+    /// sidecar read-modify-write ran with no write gate at all -- unserialized
+    /// against a backup's sidecar staging, invisible to the shutdown drain, and
+    /// able to lose an update against a concurrent `set_extension` arriving
+    /// over MCP. The write held the gate and the delete did not.
+    async fn unset_extension(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            r.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied(
+                "tool 'unset_extension' is mutating and requires the admin token",
+            ));
+        }
+        let req = r.into_inner();
+        let db_path = self.state.db_path.clone();
+
+        self.run_unary_mutation("unset_extension", move || {
+            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "tool unset_extension failed: invalid JSON in args_json: {e}"
+                ))
+            })?;
+            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool unset_extension failed: 'uid' must be a string")
+            })?;
+            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool unset_extension failed: 'key' must be a string")
+            })?;
+
+            let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)
+                .map_err(|e| Status::internal(format!("tool unset_extension failed: {e:#}")))?;
+
+            let result_json = serde_json::json!({
+                "uid": uid,
+                "key": key,
+                // `removed: false` is a legitimate outcome, not an error: the
+                // property was already absent. The CLI distinguishes the two.
+                "removed": removed,
+                "status": if removed { "removed" } else { "absent" },
+            })
+            .to_string();
+            Ok::<_, Status>(JsonResponse { result_json })
+        })
+        .await
+        .map(Response::new)
+    }
+
+    /// nw-462: the gated delete counterpart for interaction memory.
+    ///
+    /// Same defect as `unset_extension` above -- the CLI's `interactions forget`
+    /// called `nestweaver_engine::remove_node_score` directly. Both delete verbs
+    /// landed in the same commit with the same omission.
+    async fn forget_interaction(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            r.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied(
+                "tool 'forget_interaction' is mutating and requires the admin token",
+            ));
+        }
+        let req = r.into_inner();
+        let db_path = self.state.db_path.clone();
+
+        self.run_unary_mutation("forget_interaction", move || {
+            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "tool forget_interaction failed: invalid JSON in args_json: {e}"
+                ))
+            })?;
+            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool forget_interaction failed: 'uid' must be a string")
+            })?;
+
+            let removed = nestweaver_engine::remove_node_score(&db_path, uid)
+                .map_err(|e| Status::internal(format!("tool forget_interaction failed: {e:#}")))?;
+
+            let result_json = serde_json::json!({
+                "uid": uid,
+                "removed": removed,
+                "status": if removed { "forgotten" } else { "absent" },
+            })
+            .to_string();
+            Ok::<_, Status>(JsonResponse { result_json })
+        })
+        .await
+        .map(Response::new)
+    }
+
     async fn query_extensions(
         &self,
         r: Request<JsonRequest>,
@@ -22473,6 +22570,110 @@ external_model = "unavailable-test-model"
         })
         .await
         .expect("cancelled extension worker must finish after gate release");
+    }
+
+    /// nw-462: the DELETE must hold the gate exactly as the WRITE does.
+    ///
+    /// Probed identically to `set_extension_holds_write_gate` above, because
+    /// the defect was precisely that the two were not identical: the CLI's
+    /// `extensions unset` called the engine directly, so the sidecar
+    /// read-modify-write ran ungated. An implementation that skips the gate
+    /// returns immediately — that is the RED this guards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unset_extension_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_gate.mutex().lock_owned().await;
+
+        let args = serde_json::json!({ "uid": "sym:x", "key": "owner" }).to_string();
+        let mut req = Request::new(JsonRequest { args_json: args });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.unset_extension(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "unset_extension must block on the write gate while it is held \
+             (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled extension-delete worker must finish after gate release");
+    }
+
+    /// nw-462: same contract for the second authored sidecar. Both delete verbs
+    /// shipped in one commit with the same omission, so both are pinned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_interaction_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_gate.mutex().lock_owned().await;
+
+        let args = serde_json::json!({ "uid": "sym:x" }).to_string();
+        let mut req = Request::new(JsonRequest { args_json: args });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.forget_interaction(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "forget_interaction must block on the write gate while it is held; \
+             it returned without waiting"
+        );
+
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.active_writes.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled interaction-forget worker must finish after gate release");
+    }
+
+    /// COUNTERWEIGHT for both: these are MUTATING RPCs, so a non-admin caller
+    /// must be refused before any gate or filesystem work happens. Without
+    /// this, widening the surface would also widen who can write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_delete_rpcs_refuse_a_non_admin_caller() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        for admin in [Some(crate::auth::IsAdmin(false)), None] {
+            let mut unset = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "uid": "sym:x", "key": "k" }).to_string(),
+            });
+            if let Some(flag) = admin {
+                unset.extensions_mut().insert(flag);
+            }
+            let err = service.unset_extension(unset).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+
+            let mut forget = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "uid": "sym:x" }).to_string(),
+            });
+            if let Some(flag) = admin {
+                forget.extensions_mut().insert(flag);
+            }
+            let err = service.forget_interaction(forget).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+        }
     }
 
     /// nw-244: PR #308 wired `brain_memory_consolidate` to the write gate ONLY
