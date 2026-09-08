@@ -1745,14 +1745,32 @@ credential_method = "gh"
         );
     }
 
+    /// Serialises every test that mutates [`DAEMON_BOOT_TIMEOUT_ENV`].
+    ///
+    /// The comment those tests used to carry -- "SAFETY: single-threaded test"
+    /// -- was NOT true: `cargo test` runs a binary's tests on parallel threads.
+    /// It held only because one test was the sole toucher of this variable.
+    /// nw-460 added two more and they raced immediately: the override test set
+    /// `45` while the absent-database test asserted the `30` default, and the
+    /// loser saw the other's value. Environment variables are process-global,
+    /// so the fix is a lock rather than a comment.
+    ///
+    /// Poisoning is absorbed: a panic in one of these tests must fail THAT
+    /// test, not cascade into unrelated failures in the others.
+    static BOOT_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The ceiling is env-overridable so CI and constrained machines can extend
     /// it without a rebuild. Out-of-range and unparseable values fall back to
     /// the default — this is a patience knob, not a correctness input.
     #[test]
     fn boot_timeout_honours_the_env_override_and_rejects_nonsense() {
+        let _guard = BOOT_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let default = Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS);
 
-        // SAFETY: single-threaded test; the override is read only here.
+        // SAFETY: `BOOT_TIMEOUT_ENV_LOCK` is held for this whole test, so no
+        // other test in this binary reads or writes the variable meanwhile.
         unsafe { std::env::set_var(DAEMON_BOOT_TIMEOUT_ENV, "45") };
         assert_eq!(daemon_boot_timeout(), Duration::from_secs(45));
 
@@ -1772,7 +1790,10 @@ credential_method = "gh"
     /// nw-460: a small graph keeps the 30s default, a large one earns more.
     #[test]
     fn the_boot_ceiling_scales_with_the_graph_on_disk() {
-        // SAFETY: single-threaded test scope, restored below.
+        let _guard = BOOT_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the lock above serialises every toucher of this variable.
         unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
@@ -1803,10 +1824,13 @@ credential_method = "gh"
     /// names a number means it, and scaling past it would ignore them.
     #[test]
     fn an_explicit_boot_timeout_still_overrides_the_scaled_default() {
+        let _guard = BOOT_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"x").unwrap();
-        // SAFETY: single-threaded test scope, removed below.
+        // SAFETY: the lock above serialises every toucher of this variable.
         unsafe { std::env::set_var(DAEMON_BOOT_TIMEOUT_ENV, "45") };
         assert_eq!(daemon_boot_timeout_for(&db), Duration::from_secs(45));
         unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
@@ -1815,7 +1839,10 @@ credential_method = "gh"
     /// COUNTERWEIGHT: a missing database must not panic or explode the ceiling.
     #[test]
     fn an_absent_database_falls_back_to_the_plain_default() {
-        // SAFETY: single-threaded test scope.
+        let _guard = BOOT_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the lock above serialises every toucher of this variable.
         unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
         let missing = Path::new("/nonexistent/definitely/not/here.lbug");
         assert_eq!(daemon_boot_timeout_for(missing), Duration::from_secs(30));
