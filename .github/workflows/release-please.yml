@@ -639,7 +639,7 @@ jobs:
       # never affect whether a release proceeds; it exists purely to make
       # this failure self-evident instead of requiring another manual
       # rediscovery.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       # nw-465: the verdict lives in scripts/classify-release-pr-outputs.sh so
