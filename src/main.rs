@@ -3013,12 +3013,94 @@ fn brain_impact_local_tier(payload: &serde_json::Value) -> &serde_json::Value {
 /// dropping an upstream answer is the kind of omission this codebase treats as
 /// a disclosure defect. The caller prints a note rather than pretending the
 /// local tier was the whole response.
-fn brain_impact_has_unrendered_org_tier(payload: &serde_json::Value) -> bool {
-    payload.get("tier").and_then(serde_json::Value::as_str) == Some("two_tier")
-        && payload
-            .get("org_wide_impact")
-            .and_then(|org| org.get("results"))
-            .is_some()
+/// Render ONE `brain_impact` tier's node list as text.
+///
+/// nw-451. `blast-radius` got a two-tier text renderer in nw-454 by recursing
+/// into each tier through its own renderer; `impact` should follow that shape
+/// rather than invent a third. Extracted from the daemon arm so the local and
+/// org-wide tiers cannot drift into rendering differently -- the same reason
+/// `render_blast_radius_text` is one function.
+///
+/// Returns how many nodes were rendered, which the caller reports in `stats`.
+fn render_impact_tier_text(
+    tier: &serde_json::Value,
+    subject: &str,
+    verbose: bool,
+    quiet: bool,
+) -> Result<usize, anyhow::Error> {
+    #[derive(serde::Deserialize)]
+    struct DaemonImpactNode {
+        uid: String,
+        name: String,
+        file_path: String,
+        start_line: u32,
+        edge_type: String,
+        confidence: f32,
+        depth: u32,
+    }
+
+    let Some(arr) = tier.get("impact_nodes") else {
+        return Ok(0);
+    };
+    // nw-271: `unwrap_or_default()` on a DECODE turns "I could not read the
+    // daemon's answer" into "the answer was empty", and the branch below then
+    // prints a confident "no impact".
+    let node_count = arr.as_array().map(Vec::len).unwrap_or(0);
+    let nodes: Vec<DaemonImpactNode> = serde_json::from_value(arr.clone())
+        .with_context(|| format!("decode {node_count} impact node(s) from the daemon"))?;
+    let count = nodes.len();
+
+    if nodes.is_empty() {
+        if !quiet {
+            println!("No impact found for '{subject}'.");
+        }
+        return Ok(0);
+    }
+
+    // nw-110: say "50 of 495" when the set was capped, never a bare "50 nodes"
+    // -- the latter reads as the complete answer.
+    let total = tier.get("total").and_then(|v| v.as_u64());
+    if !quiet {
+        match total {
+            Some(t) if t > count as u64 => {
+                println!("Impact of '{subject}' ({count} of {t} nodes):")
+            }
+            _ => println!("Impact of '{subject}' ({count} nodes):"),
+        }
+    }
+    for n in &nodes {
+        if verbose {
+            println!(
+                "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
+                n.depth, n.name, n.edge_type, n.confidence, n.file_path, n.start_line, n.uid,
+            );
+        } else {
+            println!(
+                "  [depth {}] {} via {} ({:.2}) — {}:{}",
+                n.depth, n.name, n.edge_type, n.confidence, n.file_path, n.start_line,
+            );
+        }
+    }
+    Ok(count)
+}
+
+/// The `org_wide_impact` object of a two-tier envelope, if this is one.
+///
+/// nw-451. This was `brain_impact_has_unrendered_org_tier`, a predicate whose
+/// only job was to decide whether to print "an org-wide tier was returned and is
+/// not rendered here". Now that the tier IS rendered, a function named for it
+/// being unrendered would be a lie, and a bare predicate is the wrong shape --
+/// the renderer needs the object, not a yes/no.
+///
+/// Returns the object even when it carries no `results` (an unavailable
+/// upstream): distinguishing "no org tier" from "an org tier that could not
+/// answer" is exactly the distinction the caller must render differently, and
+/// collapsing them here would push that decision somewhere it cannot be tested.
+fn brain_impact_org_tier(payload: &serde_json::Value) -> Option<&serde_json::Value> {
+    if payload.get("tier").and_then(serde_json::Value::as_str) != Some("two_tier") {
+        return None;
+    }
+    payload.get("org_wide_impact")
 }
 
 #[cfg(test)]
@@ -3061,20 +3143,30 @@ mod brain_impact_tier_tests {
     fn a_single_tier_payload_is_returned_unchanged() {
         let single = json!({"status": "ok", "impact_nodes": [{"uid": "a"}]});
         assert_eq!(brain_impact_local_tier(&single), &single);
-        assert!(!brain_impact_has_unrendered_org_tier(&single));
+        assert!(brain_impact_org_tier(&single).is_none());
     }
 
-    /// COUNTERWEIGHT: an unavailable upstream carries no `results`, so there is
-    /// nothing unrendered to disclose and the note must not fire.
+    /// COUNTERWEIGHT: an unavailable upstream still HAS an org tier -- it just
+    /// carries no `results`. The renderer must be able to tell that from "no org
+    /// tier at all", because the two print differently ("unavailable — <note>"
+    /// versus nothing); collapsing them would make an upstream that failed look
+    /// like an upstream that was never consulted.
     #[test]
-    fn an_unavailable_upstream_is_not_reported_as_unrendered() {
+    fn an_unavailable_upstream_is_an_org_tier_without_results() {
         let payload = json!({
             "tier": "two_tier",
             "local_impact": {"status": "ok"},
             "org_wide_impact": {"source_server": "org", "status": "unavailable"},
         });
-        assert!(!brain_impact_has_unrendered_org_tier(&payload));
-        assert!(brain_impact_has_unrendered_org_tier(&two_tier(json!({}))));
+        let org = brain_impact_org_tier(&payload).expect("an org tier is present");
+        assert!(
+            org.get("results").is_none(),
+            "an unavailable upstream must carry no results"
+        );
+        // ... while a healthy one does, so the two are distinguishable.
+        let healthy = two_tier(json!({}));
+        let org = brain_impact_org_tier(&healthy).expect("an org tier is present");
+        assert!(org.get("results").is_some());
     }
 }
 
@@ -5922,6 +6014,13 @@ enum Commands {
             help = "Number of top hubs to show (1-1000; matches the MCP hub_nodes schema)"
         )]
         top: usize,
+        #[arg(
+            long = "repo",
+            value_name = "REPO",
+            help = "Restrict to this repo (name or UID; repeat for several). Applied before --top, \
+                    so results are the requested scope's top-N. An unknown repo name is an error."
+        )]
+        repos: Vec<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -5962,6 +6061,13 @@ enum Commands {
             help = "Number of top bridges to show (1-1000; matches the MCP bridge_nodes schema)"
         )]
         top: usize,
+        #[arg(
+            long = "repo",
+            value_name = "REPO",
+            help = "Restrict to this repo (name or UID; repeat for several). Applied before --top, \
+                    so results are the requested scope's top-N. An unknown repo name is an error."
+        )]
+        repos: Vec<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -13065,8 +13171,16 @@ fn hooks_dir_outside_repo(hooks_dir: &std::path::Path, repo_root: &std::path::Pa
 // instead of silently falling back to tool defaults.
 
 /// `bridge_nodes` reads `limit`/`top_n` — never `top`.
-fn bridge_nodes_rpc_args(top: usize) -> serde_json::Value {
-    serde_json::json!({ "top_n": top })
+///
+/// nw-468: `repos` travels with the request so `--repo` is not silently a no-op
+/// on the daemon route, which is the default one. Omitted when empty: an empty
+/// array is a MEANINGFUL filter (select nothing), not an absent one.
+fn bridge_nodes_rpc_args(top: usize, repos: &[String]) -> serde_json::Value {
+    let mut args = serde_json::json!({ "top_n": top });
+    if !repos.is_empty() {
+        args["repos"] = serde_json::json!(repos);
+    }
+    args
 }
 
 /// `affected_tests` reads `changed_files` (an array) — never a raw string
@@ -15880,6 +15994,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Hubs {
             top,
+            repos,
             json,
             db,
             config,
@@ -15887,13 +16002,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
 
+            // nw-468: the daemon route is the DEFAULT route, so the scope has to
+            // travel with the request. Passing it only on the direct path below
+            // would make `--repo` silently a no-op for almost every caller --
+            // the nw-154 defect (`impact --repo` ignored on one route) repeated
+            // on a new flag. Omitted entirely when empty so the daemon's own
+            // "no filter" default is what answers, rather than an empty array
+            // that the engine would read as "select nothing".
+            let mut hub_args = serde_json::json!({ "top_n": top });
+            if !repos.is_empty() {
+                hub_args["repos"] = serde_json::json!(repos);
+            }
+
             // ── hybrid guard (routes through local + upstream) ────
             if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "hub_nodes",
-                serde_json::json!({ "top_n": top }),
+                hub_args,
             )? {
                 // Deserialize into the direct path's type so
                 // both output modes match direct output byte-for-byte
@@ -15986,8 +16113,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `total` and a `truncated`. `find_hub_nodes` discards
             // `candidate_total`, which is why `hubs --json` used to carry
             // nothing but a list.
-            let found = nestweaver_engine::hubs::find_hub_nodes_bounded(&store, top)
-                .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
+            // nw-468: same resolver the MCP route uses, so an unknown repo name
+            // errors identically on both. `None` for `visible`: the CLI's direct
+            // path has no authorization boundary.
+            let hub_scope = if repos.is_empty() {
+                None
+            } else {
+                Some(nestweaver_engine::node_scope::resolve_repo_filter(
+                    &store, &repos, None,
+                )?)
+            };
+            let found = nestweaver_engine::hubs::find_hub_nodes_bounded_in_repos(
+                &store,
+                top,
+                hub_scope.as_ref(),
+            )
+            .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_hubs(&found);
             let mut hubs = found.hubs;
 
@@ -16043,6 +16184,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Bridges {
             top,
+            repos,
             json,
             db,
             config: config_opt,
@@ -16051,7 +16193,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let args = bridge_nodes_rpc_args(top);
+                let args = bridge_nodes_rpc_args(top, &repos);
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -16151,8 +16293,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `sampled`/`sources_sampled` say that every `betweenness_score`
             // below is a SAMPLE-based estimate rendered at full f64 precision.
             // `find_bridge_nodes` discards all three.
-            let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(&store, top)
-                .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
+            // nw-468: shared resolver, so an unknown repo name errors the same
+            // way it does through MCP. `None` for `visible`: no authz boundary
+            // on the CLI's direct path.
+            let bridge_scope = if repos.is_empty() {
+                None
+            } else {
+                Some(nestweaver_engine::node_scope::resolve_repo_filter(
+                    &store, &repos, None,
+                )?)
+            };
+            let found = nestweaver_engine::bridges::find_bridge_nodes_bounded_in_repos(
+                &store,
+                top,
+                bridge_scope.as_ref(),
+            )
+            .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_bridges(&found);
             let mut bridges = found.bridges;
             warn_stale_resolver_rankings(&store, &db_path);
@@ -19867,14 +20023,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // and made the text path print nothing and exit 0.
                     let envelope = value;
                     let value = brain_impact_local_tier(&envelope).clone();
-                    if brain_impact_has_unrendered_org_tier(&envelope) && !json && !out.quiet {
-                        // Disclose rather than drop: the local tier is not the
-                        // whole answer, and saying so is cheaper than pretending.
-                        eprintln!(
-                            "Note: an org-wide tier was returned and is not rendered here; \
-                             use --json to see it."
-                        );
-                    }
                     // Honor the daemon tool's status so daemon mode matches the direct path's
                     // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
                     match value.get("status").and_then(|v| v.as_str()) {
@@ -19996,73 +20144,47 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 note,
                             ))?
                         );
-                    } else if let Some(arr) = value.get("impact_nodes") {
-                        #[derive(serde::Deserialize)]
-                        struct DaemonImpactNode {
-                            uid: String,
-                            name: String,
-                            file_path: String,
-                            start_line: u32,
-                            edge_type: String,
-                            confidence: f32,
-                            depth: u32,
-                        }
-                        // nw-271: `unwrap_or_default()` on a DECODE turns "I
-                        // could not read the daemon's answer" into "the answer
-                        // was empty", and the branch below then prints a
-                        // confident "no impact". Same defect nw-249 fixed
-                        // three call sites up — its comment is at the top of
-                        // this file.
-                        let node_count = arr.as_array().map(Vec::len).unwrap_or(0);
-                        let nodes: Vec<DaemonImpactNode> = serde_json::from_value(arr.clone())
-                            .with_context(|| {
-                                format!("decode {node_count} impact node(s) from the daemon")
-                            })?;
-                        let count = nodes.len();
-                        if nodes.is_empty() {
-                            if !out.quiet {
-                                println!("No impact found for '{name_or_uid}'.");
-                            }
-                        } else {
-                            // nw-110: say "50 of 495" when the daemon capped the
-                            // set, never a bare "50 nodes" — the latter reads as
-                            // the complete answer.
-                            let total = value.get("total").and_then(|v| v.as_u64());
-                            if !out.quiet {
-                                match total {
-                                    Some(t) if t > count as u64 => {
-                                        println!(
-                                            "Impact of '{name_or_uid}' ({count} of {t} nodes):"
-                                        )
-                                    }
-                                    _ => println!("Impact of '{name_or_uid}' ({count} nodes):"),
+                    } else {
+                        // nw-451: render BOTH tiers, mirroring
+                        // `render_blast_radius_text` (nw-454). Previously only
+                        // the local tier was rendered and the org-wide tier was
+                        // merely disclosed, so a federated user could not see an
+                        // upstream answer without `--json`.
+                        let count =
+                            render_impact_tier_text(&value, &name_or_uid, out.verbose, out.quiet)?;
+
+                        if let Some(org) = brain_impact_org_tier(&envelope)
+                            && !out.quiet
+                        {
+                            println!();
+                            match org.get("results") {
+                                Some(results) => {
+                                    let server = org
+                                        .get("source_server")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("upstream");
+                                    println!("Org-wide impact (via {server})");
+                                    render_impact_tier_text(
+                                        results,
+                                        &name_or_uid,
+                                        out.verbose,
+                                        out.quiet,
+                                    )?;
                                 }
-                            }
-                            for n in &nodes {
-                                if out.verbose {
-                                    println!(
-                                        "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
-                                        n.depth,
-                                        n.name,
-                                        n.edge_type,
-                                        n.confidence,
-                                        n.file_path,
-                                        n.start_line,
-                                        n.uid,
-                                    );
-                                } else {
-                                    println!(
-                                        "  [depth {}] {} via {} ({:.2}) — {}:{}",
-                                        n.depth,
-                                        n.name,
-                                        n.edge_type,
-                                        n.confidence,
-                                        n.file_path,
-                                        n.start_line,
-                                    );
+                                None => {
+                                    // An unavailable upstream carries
+                                    // `status`/`note` and no `results`. Say so
+                                    // rather than printing an empty section that
+                                    // reads as "upstream found nothing".
+                                    let note = org
+                                        .get("note")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("upstream did not answer");
+                                    println!("Org-wide impact: unavailable — {note}");
                                 }
                             }
                         }
+
                         let stats = format!(
                             "{} affected symbols in {} (via daemon)",
                             count,
@@ -37842,7 +37964,7 @@ credential_method = "gh"
     /// `top_n` for bridge_nodes, `changed_files` (array) for affected_tests.
     #[test]
     fn rpc_args_use_tool_expected_names() {
-        let bridges = bridge_nodes_rpc_args(3);
+        let bridges = bridge_nodes_rpc_args(3, &[]);
         assert_eq!(bridges, serde_json::json!({ "top_n": 3 }));
         assert!(bridges.get("top").is_none());
 
