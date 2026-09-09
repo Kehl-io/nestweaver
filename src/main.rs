@@ -5788,7 +5788,11 @@ enum Commands {
         )]
         db: Option<PathBuf>,
 
-        #[arg(long, default_value = "3000", help = "Port to listen on")]
+        #[arg(
+            long,
+            default_value = "3000",
+            help = "Port to listen on (0 selects the default port 3000)"
+        )]
         port: u16,
 
         #[arg(long, help = "Path to instance config (TOML)")]
@@ -10248,6 +10252,17 @@ fn ui_port_serving(port: u16) -> bool {
     .is_ok()
 }
 
+/// Successful responses must name a usable endpoint, including requests for
+/// the daemon's port-zero/default sentinel. Never supervise the requested zero.
+fn served_ui_port(response: &nestweaver_proto::ServeUiResponse) -> anyhow::Result<u16> {
+    let port = u16::try_from(response.port).context("daemon returned an out-of-range UI port")?;
+    anyhow::ensure!(
+        response.ok && port != 0,
+        "daemon did not return a usable UI endpoint"
+    );
+    Ok(port)
+}
+
 /// Issue `serve_ui` with a bounded wait (see [`UI_SERVE_RPC_TIMEOUT`]).
 /// `open_browser` is always false — a supervision retry must never pop
 /// windows. `watch`/`watch_repo_path` mirror the startup request.
@@ -10258,14 +10273,18 @@ fn ui_serve_request(
     watch: bool,
     watch_repo_path: &str,
 ) -> anyhow::Result<nestweaver_proto::ServeUiResponse> {
-    rt.block_on(async {
+    let response = rt.block_on(async {
         tokio::time::timeout(
             UI_SERVE_RPC_TIMEOUT,
             client.serve_ui(port, false, watch, watch_repo_path, "default"),
         )
         .await
         .context("serve_ui RPC timed out")?
-    })
+    })?;
+    if response.ok {
+        served_ui_port(&response)?;
+    }
+    Ok(response)
 }
 
 /// Supervise the daemon-served web UI until Ctrl-C.
@@ -10297,7 +10316,7 @@ fn supervise_ui_daemon(
     watch_repo_path: &str,
     ctrlc_rx: &std::sync::mpsc::Receiver<()>,
     client: &mut nestweaver_client::DaemonClient,
-) -> bool {
+) -> anyhow::Result<bool> {
     let mut daemon_up = true;
     let mut degraded: Option<DegradedUiServer> = None;
     // Two consecutive probe failures before an outage is declared: a busy
@@ -10308,6 +10327,7 @@ fn supervise_ui_daemon(
     // Same two-strike rule for the port probe (the daemon's server task can
     // take a moment to bind after a fresh serve_ui).
     let mut port_failures = 0u32;
+    let mut repair_attempts = 0u8;
     // The "daemon serves a different UI port" state is logged once per
     // distinct port, not on every poll.
     let mut mismatch_logged_for: Option<u16> = None;
@@ -10329,10 +10349,16 @@ fn supervise_ui_daemon(
                     // never by binding the degraded server over a live daemon.
                     if ui_port_serving(port) {
                         port_failures = 0;
+                        repair_attempts = 0;
                     } else {
                         port_failures += 1;
                         if port_failures >= 2 {
                             port_failures = 0;
+                            anyhow::ensure!(
+                                repair_attempts < 3,
+                                "UI endpoint http://127.0.0.1:{port} stayed unavailable after three repair attempts; inspect daemon status and retry UI startup"
+                            );
+                            repair_attempts += 1;
                             tracing::error!(
                                 port,
                                 "daemon is healthy but the UI port is not serving — re-issuing serve_ui"
@@ -10342,6 +10368,11 @@ fn supervise_ui_daemon(
                             );
                             match ui_serve_request(rt, client, port, watch, watch_repo_path) {
                                 Ok(resp) if resp.ok => {
+                                    let actual = served_ui_port(&resp)?;
+                                    anyhow::ensure!(
+                                        actual == port,
+                                        "daemon now serves UI on port {actual}, but this session supervises {port}; reopen the reported endpoint"
+                                    );
                                     tracing::info!(port, "serve_ui re-issued: {}", resp.message)
                                 }
                                 Ok(resp) => tracing::error!(
@@ -10418,11 +10449,7 @@ fn supervise_ui_daemon(
                     {
                         // Mirror the startup path: trust the ACTUAL port the
                         // daemon reports, not the one we asked for.
-                        let actual_port = if resp.port != 0 {
-                            resp.port as u16
-                        } else {
-                            port
-                        };
+                        let actual_port = served_ui_port(&resp)?;
                         if actual_port == port {
                             // The daemon already serves OUR port (the outage
                             // was a false positive, or another ui bound it
@@ -10472,7 +10499,7 @@ fn supervise_ui_daemon(
                             );
                         }
                         match ui_serve_request(rt, &mut candidate, port, watch, watch_repo_path) {
-                            Ok(resp) if resp.ok => {
+                            Ok(resp) if resp.ok && served_ui_port(&resp)? == port => {
                                 tracing::info!(
                                     port,
                                     "daemon restored — full UI service resumed on :{port}"
@@ -10504,7 +10531,7 @@ fn supervise_ui_daemon(
                             }
                         }
                     }
-                    Ok(resp) if resp.ok => {
+                    Ok(resp) if resp.ok && served_ui_port(&resp)? == port => {
                         // A fresh-start claim while our degraded server still
                         // holds the port — the daemon could not have bound
                         // it. Hand over and let the port probe in the up
@@ -10551,7 +10578,7 @@ fn supervise_ui_daemon(
     if let Some(active) = degraded.take() {
         let _ = active.shutdown(rt);
     }
-    daemon_up
+    Ok(daemon_up)
 }
 
 /// Which PID, if any, `daemon stop` is allowed to signal.
@@ -18543,16 +18570,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // The daemon already serves the UI — point the user at
                         // the ACTUAL running port (resp.port), not the one they
                         // requested, instead of printing a dead URL.
-                        let actual_port = if resp.port != 0 {
-                            resp.port
-                        } else {
-                            port as u32
-                        };
+                        let actual_port = served_ui_port(&resp)?;
                         println!("NestWeaver UI: http://127.0.0.1:{actual_port}");
                         println!("{}", resp.message);
                         return Ok((EXIT_SUCCESS, None));
                     }
-                    Ok(_resp) => {
+                    Ok(resp) => {
+                        let port = served_ui_port(&resp)?;
                         daemon_ok = true;
                         println!("NestWeaver UI: http://127.0.0.1:{port}");
                         if watch {
@@ -18574,7 +18598,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             &watch_repo_path,
                             &rx,
                             &mut client,
-                        );
+                        )?;
                         // Tell the daemon to stop serving so
                         // the listen port is released when the CLI exits.
                         // Meaningless while the daemon is down — the degraded
@@ -18601,6 +18625,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             if !daemon_ok {
+                let port = if port == 0 { 3000 } else { port };
                 // Fallback: run the UI server directly (no daemon).
                 let tantivy_path = tantivy_sidecar_path_for(&db_path);
                 let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -21136,6 +21161,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let terminal = terminal.ok_or_else(|| {
                     anyhow::anyhow!("index completed without a terminal progress payload")
                 })?;
+                if let Some(stats) = &terminal.trigram_refresh
+                    && !stats.posting_deltas_unavailable.is_empty()
+                {
+                    out.status(&format!(
+                        "Posting totals exclude unreadable prior shards: {}",
+                        stats.posting_deltas_unavailable.join(", ")
+                    ));
+                }
                 if json {
                     let skipped: Vec<_> = terminal
                         .skipped_files
@@ -21159,6 +21192,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "nodes_deleted": stats.nodes_deleted,
                             "postings_added": stats.postings_added,
                             "postings_deleted": stats.postings_deleted,
+                            "posting_deltas_unavailable": stats.posting_deltas_unavailable,
                             "migrated_legacy_index": stats.migrated_legacy_index,
                             "elapsed_ms": stats.elapsed_ms,
                         })
@@ -21463,6 +21497,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     stats.elapsed_ms,
                     if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
                 ));
+                if !stats.posting_deltas_unavailable.is_empty() {
+                    out.status(&format!(
+                        "Posting totals exclude unreadable prior shards: {}",
+                        stats.posting_deltas_unavailable.join(", ")
+                    ));
+                }
                 trigram_refresh_stats = Some(stats);
             }
 
@@ -33689,6 +33729,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                     .map_err(|e| anyhow::anyhow!("Backup RPC failed: {e}"))?
                     .into_inner();
 
+                for warning in &resp.warnings {
+                    eprintln!("Warning: {warning}");
+                }
                 eprintln!("Backup saved to {}", resp.output_path);
                 eprintln!("  Instance:     {}", resp.instance_id);
                 eprintln!("  Tier:         {}", resp.tier);
@@ -33703,6 +33746,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             eprintln!("Creating backup...");
             let result = nestweaver_engine::backup_save(&config)?;
             let m = &result.manifest;
+            for warning in &m.warnings {
+                eprintln!("Warning: {warning}");
+            }
 
             eprintln!("Backup saved to {}", result.output_path.display());
             eprintln!("  Instance:     {}", m.instance_id);
@@ -33723,6 +33769,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
         }
         BackupCommands::Inspect { path } => {
             let manifest = nestweaver_engine::backup_inspect(&path)?;
+            for warning in &manifest.warnings {
+                println!("Warning: {warning}");
+            }
             println!("NestWeaver Snapshot -- {}", path.display());
             println!("  Instance:     {}", manifest.instance_id);
             println!("  Created:      {}", manifest.created_at);
@@ -33805,6 +33854,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 nestweaver_engine::backup_restore(&config)
             })?;
             let m = &result.manifest;
+            for warning in &m.warnings {
+                eprintln!("Warning: {warning}");
+            }
 
             eprintln!("Backup restored to {}", data_dir.display());
             eprintln!("  Instance:     {}", m.instance_id);
@@ -43637,3 +43689,40 @@ mod cli_honesty_sweep_tests {
         assert_eq!(unskip, vec!["public".to_string()]);
     }
 }
+
+#[cfg(test)]
+mod returned_ui_port_tests {
+    use super::*;
+    #[test]
+    fn successful_ui_response_requires_a_real_port() {
+        for port in [1, 3000, 49152, 65535] {
+            let response = nestweaver_proto::ServeUiResponse {
+                ok: true,
+                port,
+                ..Default::default()
+            };
+            assert_eq!(served_ui_port(&response).unwrap(), port as u16);
+        }
+        for port in [0, 65536, u32::MAX] {
+            assert!(
+                served_ui_port(&nestweaver_proto::ServeUiResponse {
+                    ok: true,
+                    port,
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            served_ui_port(&nestweaver_proto::ServeUiResponse {
+                ok: false,
+                port: 3000,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ui_supervision_tests;

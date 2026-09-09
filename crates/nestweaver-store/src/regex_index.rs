@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, STORED, STRING, Schema, Value};
-use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
+use tantivy::{DocAddress, DocSet, Index, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc};
 
 use crate::error::StoreError;
 
@@ -721,6 +721,86 @@ impl RegexIndex {
         Ok(Some(hashes))
     }
 
+    /// Logical live (UID, trigram) set difference, independent of segment
+    /// tombstones and reader-cache state. Stream postings instead of retaining
+    /// a second corpus-sized set of pairs. Missing first-publication shards
+    /// have an empty baseline; unreadable shards report unavailable telemetry.
+    pub(crate) fn posting_delta(
+        &self,
+        scope_uid: &str,
+        desired: &[RegexShardDocument<'_>],
+    ) -> Result<(usize, usize), StoreError> {
+        let desired_count: usize = desired.iter().map(|doc| doc.trigrams.len()).sum();
+        let desired: std::collections::HashMap<_, _> =
+            desired.iter().map(|doc| (doc.uid, doc.trigrams)).collect();
+        let Some((index, fields, _)) = self.open_current(scope_uid)? else {
+            let root = self.scope_root(scope_uid);
+            if root
+                .try_exists()
+                .map_err(|e| StoreError::Query(format!("inspect prior regex shard: {e}")))?
+                && !root.join(RETIRED_MARKER).is_file()
+            {
+                return Err(StoreError::Query(
+                    "prior regex shard has no selected generation".to_string(),
+                ));
+            }
+            return Ok((desired_count, 0));
+        };
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| StoreError::Query(format!("read regex posting delta: {e}")))?;
+        let searcher = reader.searcher();
+        let mut previous = 0usize;
+        let mut shared = 0usize;
+        for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+            let mut uids = std::collections::HashMap::new();
+            let inverted = segment
+                .inverted_index(fields.trigram)
+                .map_err(|e| StoreError::Query(format!("read regex inverted index: {e}")))?;
+            let mut terms = inverted
+                .terms()
+                .stream()
+                .map_err(|e| StoreError::Query(format!("stream regex terms: {e}")))?;
+            while let Some((term, info)) = terms.next() {
+                let term = std::str::from_utf8(term)
+                    .map_err(|e| StoreError::Query(format!("decode regex trigram: {e}")))?;
+                let mut postings = inverted
+                    .read_postings_from_terminfo(info, IndexRecordOption::Basic)
+                    .map_err(|e| StoreError::Query(format!("read regex postings: {e}")))?;
+                while postings.doc() != TERMINATED {
+                    let id = postings.doc();
+                    if !segment.is_deleted(id) {
+                        let uid = match uids.entry(id) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let document: TantivyDocument = searcher
+                                    .doc(DocAddress::new(ordinal as u32, id))
+                                    .map_err(|e| {
+                                        StoreError::Query(format!("decode regex posting UID: {e}"))
+                                    })?;
+                                entry.insert(extract_text(&document, fields.uid))
+                            }
+                        };
+                        previous += 1;
+                        if desired
+                            .get(uid.as_str())
+                            .is_some_and(|set| set.contains(term))
+                        {
+                            shared += 1;
+                        }
+                    }
+                    postings.advance();
+                }
+            }
+        }
+        let added = desired_count.checked_sub(shared).ok_or_else(|| {
+            StoreError::Query("duplicate live regex posting identity".to_string())
+        })?;
+        Ok((added, previous - shared))
+    }
+
     /// Retire a removed scope by durably marking it for reclamation, then
     /// unlinking its selector. Existing readers may finish against immutable
     /// generation files; cleanup is a separate retention operation performed
@@ -1182,6 +1262,83 @@ mod tests {
             candidate_count: count,
             candidate_digest: digest.to_string(),
         }
+    }
+
+    #[test]
+    fn posting_deltas_ignore_dead_documents_and_reader_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let old = HashSet::from(["abc".into(), "bcd".into()]);
+        let new = HashSet::from(["bcd".into(), "cde".into(), "def".into()]);
+        let first = RegexShardDocument {
+            uid: "one",
+            kind: "Symbol",
+            text_hash: "old",
+            trigrams: &old,
+        };
+        assert_eq!(
+            index
+                .posting_delta("repo:test", std::slice::from_ref(&first))
+                .unwrap(),
+            (2, 0)
+        );
+        let initial = metadata(1, 1, "one");
+        index
+            .replace_scope(initial.clone(), std::slice::from_ref(&first))
+            .unwrap();
+        // Warm the shared reader pool before in-place segment updates.
+        index
+            .candidate_uids(&initial, std::slice::from_ref(&old), 10)
+            .unwrap();
+        assert_eq!(index.posting_delta("repo:test", &[first]).unwrap(), (0, 0));
+        let edited = RegexShardDocument {
+            uid: "one",
+            kind: "Symbol",
+            text_hash: "new",
+            trigrams: &new,
+        };
+        assert_eq!(
+            index
+                .posting_delta("repo:test", std::slice::from_ref(&edited))
+                .unwrap(),
+            (2, 1)
+        );
+        let updated = metadata(2, 1, "two");
+        index
+            .update_scope(
+                &initial,
+                updated.clone(),
+                std::slice::from_ref(&edited),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            index
+                .posting_delta("repo:test", std::slice::from_ref(&edited))
+                .unwrap(),
+            (0, 0)
+        );
+        index
+            .replace_scope(metadata(3, 1, "two"), &[edited])
+            .unwrap();
+        let renamed = RegexShardDocument {
+            uid: "renamed",
+            kind: "Symbol",
+            text_hash: "new",
+            trigrams: &new,
+        };
+        assert_eq!(
+            index
+                .posting_delta("repo:test", std::slice::from_ref(&renamed))
+                .unwrap(),
+            (3, 3)
+        );
+        index
+            .replace_scope(metadata(4, 1, "three"), &[renamed])
+            .unwrap();
+        assert_eq!(index.posting_delta("repo:test", &[]).unwrap(), (0, 3));
+        index.retire_scope("repo:test").unwrap();
+        assert_eq!(index.posting_delta("repo:test", &[]).unwrap(), (0, 0));
     }
 
     #[test]

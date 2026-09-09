@@ -43,3 +43,31 @@ just as explicit `--force` does: resolved relationships, inferred cross-repo
 calls, and emitted `MEMBER_OF` edges. This is a build count, not all structural
 relationships in the database. A true incremental run reports `null` because
 it does not measure that population.
+
+Backup packaging validates git-activity payloads before assigning a schema.
+Repository-keyed v2 scores are preserved. Recognized legacy flat scores have
+no reliable repository ownership, so the staged copy is excluded and the
+archive manifest records a warning. Save (including daemon RPC), inspect, and
+restore display that warning. The live source file is unchanged. After restore,
+reindex each repository with `--with-git-activity` to rebuild these scores.
+Malformed, unreadable, and unknown-version payloads fail backup creation.
+
+Trigram refresh reports per-scope live `(UID, trigram)` additions and deletions.
+An unchanged full rebuild reports zero deltas, and deleted segment documents
+do not inflate counts. Standalone file-symbol deletion commits its regex
+invalidation with the deletion, so a delete-only index queues cleanup even
+when it has no replacement symbols to insert. Measuring a changed scope streams its prior postings
+once; it does not retain a second corpus-sized posting set. If the prior shard
+cannot be read, refresh still repairs it, but excludes that scope from posting
+totals and names it in `posting_deltas_unavailable` (JSON and gRPC).
+
+`ui --port 0` selects the default port, currently 3000. Successful daemon
+responses must contain a nonzero, in-range port; the CLI uses that returned
+endpoint for its URL and supervision. A healthy daemon with a persistently
+unavailable UI gets at most three repair requests before the CLI exits with an
+actionable error. Daemon-outage recovery continues to serve the degraded page.
+
+`admin install-hook` checks the exact NestWeaver command under the `Task`
+matcher in `PreToolUse`. Competing hooks, including match-all groups with no
+matcher, are preserved. Unsupported settings containers fail without writes;
+a successful write is reread and verified before reporting installation.

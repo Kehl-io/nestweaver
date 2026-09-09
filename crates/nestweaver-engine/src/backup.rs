@@ -92,6 +92,9 @@ pub struct BackupConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
+    /// Rebuildable data deliberately omitted from this archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub version: u32,
     pub tier: String,
     pub nestweaver_version: String,
@@ -437,6 +440,20 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         source_graph_generation,
         logical_instance_id,
     } = staged;
+    let activity_path = staging.path().join(
+        config
+            .db_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("database filename is missing"))?,
+    );
+    let activity_path = crate::sidecar_path(&activity_path, ".gitactivity.json");
+    let mut warnings = Vec::new();
+    if activity_path.try_exists()? && legacy_git_activity_payload(&std::fs::read(&activity_path)?)?
+    {
+        std::fs::remove_file(&activity_path)
+            .context("exclude legacy activity from backup staging")?;
+        warnings.push("Legacy unversioned git-activity scores were excluded from this backup because repository ownership cannot be recovered safely. Graph data is preserved; reindex repositories with --with-git-activity after restore to rebuild activity ranking.".to_string());
+    }
     let bundle = build_backup_publication_bundle(
         config,
         staging.path(),
@@ -460,6 +477,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         publication_manifest_blake3,
     )?;
     manifest.instance_id = logical_instance_id;
+    manifest.warnings = warnings;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
@@ -1602,7 +1620,18 @@ fn copy_db_files(
     // Copy known sidecars (skip missing ones silently).
     for suffix in SIDECAR_SUFFIXES {
         let sidecar = crate::sidecar_path(db_path, suffix);
-        if !sidecar.exists() {
+        let present = if *suffix == ".gitactivity.json" {
+            // A broken symlink or inaccessible payload is not an absent cache.
+            // Preserve the error instead of silently dropping activity scores.
+            match std::fs::symlink_metadata(&sidecar) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error).context("inspect git-activity sidecar for backup"),
+            }
+        } else {
+            sidecar.exists()
+        };
+        if !present {
             continue;
         }
         let dest_name = {
@@ -1813,6 +1842,27 @@ fn backup_artifact_contract_for_path(
     .with_context(|| absolute.display().to_string())
 }
 
+/// Flat v1 scores cannot be assigned to repositories without guessing.
+/// Corrupt and unknown-version data remain hard errors, not legacy exclusions.
+fn legacy_git_activity_payload(payload: &[u8]) -> anyhow::Result<bool> {
+    if let Ok(current) = serde_json::from_slice::<crate::git_activity::GitActivitySidecar>(payload)
+    {
+        anyhow::ensure!(
+            current.version == crate::git_activity::GITACTIVITY_VERSION,
+            "unsupported git-activity sidecar version {}; expected {}",
+            current.version,
+            crate::git_activity::GITACTIVITY_VERSION
+        );
+        return Ok(false);
+    }
+    if serde_json::from_slice::<HashMap<String, f64>>(payload).is_ok() {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "invalid git-activity payload; expected a versioned repository map or legacy flat scores"
+    )
+}
+
 fn backup_artifact_contract_for_path_inner(
     path: &str,
     db_filename: &str,
@@ -1821,6 +1871,18 @@ fn backup_artifact_contract_for_path_inner(
     source_graph_generation: u64,
 ) -> anyhow::Result<(crate::publication::ArtifactKind, u32, String)> {
     match path.strip_prefix(db_filename) {
+        Some(".gitactivity.json") => {
+            anyhow::ensure!(
+                !legacy_git_activity_payload(&std::fs::read(absolute)?)?,
+                "legacy git-activity payload requires explicit exclusion during backup packaging"
+            );
+            return Ok((
+                crate::publication::ArtifactKind::GitActivity,
+                crate::git_activity::GITACTIVITY_VERSION,
+                "nestweaver-git-activity-v2".to_string(),
+            ));
+        }
+
         Some(".pagerank.json") => {
             let payload = std::fs::read(absolute)?;
             let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
@@ -1944,9 +2006,9 @@ fn backup_artifact_contract(
             // v2: repo-keyed. Bumped with the format, or a restore would
             // reintroduce a v1 flat payload under a v2 contract claim — the
             // artifact vouching for a shape it does not have.
-            Some(".gitactivity.json") => {
-                (ArtifactKind::GitActivity, 2, "nestweaver-git-activity-v2")
-            }
+            Some(".gitactivity.json") => anyhow::bail!(
+                "git-activity contract requires payload inspection; use backup_artifact_contract_for_path"
+            ),
             Some(".cochange.json") => (ArtifactKind::Cochange, 1, "nestweaver-cochange-v1"),
             Some(".interactions.json") => {
                 (ArtifactKind::Interactions, 1, "nestweaver-interactions-v1")
@@ -2050,6 +2112,7 @@ fn build_backup_manifest(
     };
 
     Ok(BackupManifest {
+        warnings: Vec::new(),
         version: MANIFEST_VERSION,
         tier: tier.to_string(),
         nestweaver_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2391,6 +2454,120 @@ mod tests {
             type_info: None,
             framework_hint: None,
             canonical_id: None,
+        }
+    }
+
+    #[test]
+    fn git_activity_backup_round_trip_preserves_v2_and_excludes_legacy_honestly() {
+        for (payload, legacy) in [
+            (r#"{"src/main.rs":0.9}"#, true),
+            (
+                r#"{"version":2,"repos":{"repo:test":{"src/main.rs":0.9}}}"#,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("brain.lbug");
+            drop(nestweaver_store::GraphStore::open(&db).unwrap());
+            let activity = crate::sidecar_path(&db, ".gitactivity.json");
+            std::fs::write(&activity, payload).unwrap();
+            let output = dir.path().join("backup.nwsnap.zst");
+            let saved = backup_save(&BackupConfig {
+                db_path: db,
+                output_path: output.clone(),
+                include_clones: false,
+                instance_id: "test".into(),
+                workspace_path: None,
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&activity).unwrap(),
+                payload,
+                "live source is untouched"
+            );
+            assert_eq!(saved.manifest.warnings.len(), usize::from(legacy));
+            let inspected = backup_inspect(&output).unwrap();
+            assert_eq!(inspected.warnings, saved.manifest.warnings);
+            let data_dir = dir.path().join("restored");
+            let restored = backup_restore(&RestoreConfig {
+                snapshot_path: output,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap();
+            assert_eq!(restored.manifest.warnings, saved.manifest.warnings);
+            let restored_db = data_dir.join("brain.lbug");
+            let restored_activity = crate::sidecar_path(&restored_db, ".gitactivity.json");
+            assert_eq!(restored_activity.exists(), !legacy);
+            if !legacy {
+                assert_eq!(
+                    std::fs::read_to_string(&restored_activity).unwrap(),
+                    payload
+                );
+            }
+            let store = nestweaver_store::GraphStore::open(&restored_db).unwrap();
+            // Query startup explicitly loads ranking sidecars after opening the graph.
+            store.load_git_activity_sidecar(&restored_activity).unwrap();
+            assert_eq!(
+                store.git_activity_score("repo:test", "src/main.rs"),
+                if legacy { None } else { Some(0.9) }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_git_activity_is_not_silently_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        drop(nestweaver_store::GraphStore::open(&db).unwrap());
+        let activity = crate::sidecar_path(&db, ".gitactivity.json");
+        std::os::unix::fs::symlink(dir.path().join("missing-scores"), &activity).unwrap();
+        let output = dir.path().join("backup.nwsnap.zst");
+        assert!(
+            backup_save(&BackupConfig {
+                db_path: db,
+                output_path: output.clone(),
+                include_clones: false,
+                instance_id: "test".into(),
+                workspace_path: None
+            })
+            .is_err()
+        );
+        assert!(!output.exists());
+        assert!(
+            std::fs::symlink_metadata(activity)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn invalid_git_activity_never_publishes_an_archive() {
+        for payload in [
+            "broken",
+            r#"{"version":3,"repos":{}}"#,
+            r#"{"version":2,"repos":[]}"#,
+            "null",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("brain.lbug");
+            drop(nestweaver_store::GraphStore::open(&db).unwrap());
+            let activity = crate::sidecar_path(&db, ".gitactivity.json");
+            std::fs::write(&activity, payload).unwrap();
+            let output = dir.path().join("backup.nwsnap.zst");
+            assert!(
+                backup_save(&BackupConfig {
+                    db_path: db,
+                    output_path: output.clone(),
+                    include_clones: false,
+                    instance_id: "test".into(),
+                    workspace_path: None
+                })
+                .is_err()
+            );
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_to_string(activity).unwrap(), payload);
         }
     }
 
@@ -3151,6 +3328,7 @@ mod tests {
             );
         }
         let manifest = BackupManifest {
+            warnings: Vec::new(),
             version: 2,
             tier: "standard".to_string(),
             nestweaver_version: "test".to_string(),
@@ -3840,6 +4018,7 @@ mod tests {
     #[test]
     fn test_schema_compatibility_rejects_newer() {
         let manifest = BackupManifest {
+            warnings: Vec::new(),
             version: MANIFEST_VERSION + 1,
             tier: "standard".to_string(),
             nestweaver_version: "99.0.0".to_string(),
