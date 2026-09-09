@@ -649,6 +649,12 @@ message ProjectContextResponse { string result_json = 1; }
 message HubNodesRequest {
   int32 top_n = 1;
   string response_format = 2;
+  // nw-468. Additive. hub_nodes is one of the few TYPED requests; bridge_nodes
+  // and blast_radius are JsonRequest pass-throughs, so their `repos` survives
+  // the hop for free. Without this field a `repos` filter sent to a daemon is
+  // silently dropped in transit and the caller gets an unscoped ranking that
+  // looks correct -- the nw-154 class of defect.
+  repeated string repos = 3;
 }
 message HubNodesResponse { string result_json = 1; }
 

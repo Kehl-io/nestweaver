@@ -14619,6 +14619,17 @@ fn dispatch_via_daemon_inner(
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0) as i32,
                     response_format: str_field("response_format"),
+                    // nw-468: the typed hop drops anything without a field.
+                    repos: args
+                        .get("repos")
+                        .and_then(|v| v.as_array())
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 });
                 let resp = client.hub_nodes(req).await.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
