@@ -5,7 +5,7 @@
 //! many parts of the codebase depend on.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use nestweaver_store::GraphStore;
@@ -156,6 +156,41 @@ impl HubNodes {
 /// a 180-candidate graph — the same shape as F-DC-11 one level up, and found
 /// by asking where else that property had to hold rather than by a report.
 pub fn find_hub_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<HubNodes> {
+    find_hub_nodes_bounded_in_repos(store, top_n, None)
+}
+
+/// [`find_hub_nodes_bounded`] restricted to a set of repo UIDs.
+///
+/// nw-468. `hub_nodes`/`bridge_nodes` were the only scope-less analysis
+/// surfaces: `blast_radius` and `cross_repo_contracts` both take `repos`, so a
+/// caller who wanted the hubs of ONE repository had to over-fetch and filter
+/// client-side. That is not equivalent, and quietly so — `top_n` is applied
+/// during selection, so post-filtering a global top-N yields whatever survives
+/// rather than that repo's top-N, and for a small repository it can yield
+/// nothing at all while the repository plainly has hubs.
+///
+/// SCOPE SEMANTICS, stated because the alternative is defensible and this is
+/// not recoverable from the signature: the filter restricts which symbols are
+/// CANDIDATES, and degree is still computed over the FULL edge set. A symbol in
+/// the requested repo that is a hub precisely because other repositories call
+/// it keeps that degree. Restricting the edge set instead would answer a
+/// different question ("hubs of this repo in isolation") and would rank a
+/// widely-consumed API lower the more widely it is consumed, which is backwards
+/// for every use this filter has.
+///
+/// `candidate_total` is likewise scoped, so `truncated()` continues to describe
+/// the population the caller actually asked about.
+///
+/// Resolution of names to UIDs — and the error for a name that is not in the
+/// graph — belongs to `node_scope::resolve_repo_filter`, so this shares
+/// `blast_radius`'s behaviour instead of inventing a second one. Passing an
+/// EMPTY set is meaningful and is honoured literally: it selects nothing. Only
+/// `None` means "no filter".
+pub fn find_hub_nodes_bounded_in_repos(
+    store: &GraphStore,
+    top_n: usize,
+    repos: Option<&HashSet<String>>,
+) -> Result<HubNodes> {
     let (symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
@@ -216,7 +251,14 @@ pub fn find_hub_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<HubNod
     // O(n log k) with k allocations rather than O(n log n) with n.
     // Counted BEFORE the `top_n == 0` short-circuit and before the heap, so
     // the population is reported even when nothing survives selection.
-    let candidate_total = (0..n).filter(|&i| in_degree[i] + out_degree[i] > 0).count();
+    // nw-468: a symbol is in scope when no filter was given, or when its owning
+    // repo is in the requested set.
+    let in_scope =
+        |i: usize| -> bool { repos.is_none_or(|allowed| allowed.contains(&symbols[i].repo_uid)) };
+
+    let candidate_total = (0..n)
+        .filter(|&i| in_scope(i) && in_degree[i] + out_degree[i] > 0)
+        .count();
 
     if top_n == 0 {
         return Ok(HubNodes {
@@ -255,6 +297,12 @@ pub fn find_hub_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<HubNod
     // top, so admitting a candidate is one comparison.
     let mut best: BinaryHeap<Reverse<HubKey>> = BinaryHeap::with_capacity(top_n);
     for (index, sym) in symbols.iter().enumerate() {
+        // nw-468: filter BEFORE heap admission, so the survivors are this
+        // scope's top-N rather than whatever of the global top-N happens to
+        // belong to it.
+        if !in_scope(index) {
+            continue;
+        }
         let base = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
         let pagerank = if ga_active {
             base * nestweaver_store::git_activity_multiplier(
@@ -394,6 +442,177 @@ mod tests {
         assert!(!hubs.is_empty());
         assert_eq!(hubs[0].uid, "hub", "hub should rank first");
         assert_eq!(hubs[0].out_degree, 4);
+    }
+
+    fn make_symbol_in_repo(uid: &str, name: &str, repo_uid: &str) -> Symbol {
+        Symbol {
+            repo_uid: repo_uid.to_string(),
+            ..make_symbol(uid, name, "src/lib.rs")
+        }
+    }
+
+    /// nw-468. The whole point of the filter is that it applies BEFORE `top_n`.
+    /// A client-side filter of a global top-N is NOT equivalent: here the three
+    /// most-connected symbols all live in `repo-big`, so a caller asking for the
+    /// top 2 of `repo-small` gets NOTHING by post-filtering, while `repo-small`
+    /// plainly has hubs. That silent empty answer is the defect.
+    #[test]
+    fn repo_filter_selects_within_scope_not_from_the_global_top_n() {
+        let store = GraphStore::in_memory().unwrap();
+        // repo-big: a dense cluster that dominates any global ranking.
+        for i in 0..5 {
+            store
+                .insert_symbol(&make_symbol_in_repo(
+                    &format!("big{i}"),
+                    &format!("big_fn_{i}"),
+                    "repo-big",
+                ))
+                .unwrap();
+        }
+        for i in 0..5 {
+            for j in 0..5 {
+                if i != j {
+                    store
+                        .insert_edge(&make_edge(&format!("big{i}"), &format!("big{j}")))
+                        .unwrap();
+                }
+            }
+        }
+        // repo-small: genuinely connected, but far less so.
+        for i in 0..3 {
+            store
+                .insert_symbol(&make_symbol_in_repo(
+                    &format!("small{i}"),
+                    &format!("small_fn_{i}"),
+                    "repo-small",
+                ))
+                .unwrap();
+        }
+        store.insert_edge(&make_edge("small0", "small1")).unwrap();
+        store.insert_edge(&make_edge("small1", "small0")).unwrap();
+        store.insert_edge(&make_edge("small1", "small2")).unwrap();
+
+        // The premise: unscoped, the top 2 are all repo-big, so post-filtering
+        // a global top-2 for repo-small would return an empty list.
+        let global = find_hub_nodes_bounded(&store, 2).unwrap();
+        assert!(
+            global.hubs.iter().all(|h| h.uid.starts_with("big")),
+            "premise broken -- the global top 2 must be repo-big: {:?}",
+            global.hubs.iter().map(|h| &h.uid).collect::<Vec<_>>()
+        );
+
+        let scope: HashSet<String> = ["repo-small".to_string()].into_iter().collect();
+        let scoped = find_hub_nodes_bounded_in_repos(&store, 2, Some(&scope)).unwrap();
+
+        assert_eq!(
+            scoped.hubs.len(),
+            2,
+            "repo-small has hubs and must return them"
+        );
+        assert!(
+            scoped.hubs.iter().all(|h| h.uid.starts_with("small")),
+            "a scoped query must return only in-scope symbols: {:?}",
+            scoped.hubs.iter().map(|h| &h.uid).collect::<Vec<_>>()
+        );
+        // `small1` has degree 3 (two out, one in) and must lead its own scope.
+        assert_eq!(scoped.hubs[0].uid, "small1");
+        // `candidate_total` is scoped too, so `truncated()` describes the
+        // population the caller actually asked about -- 3 candidates, 2 returned.
+        assert_eq!(scoped.candidate_total, 3);
+        assert!(scoped.truncated());
+    }
+
+    /// COUNTERWEIGHT: `None` must behave exactly as before, or every existing
+    /// caller silently changes meaning.
+    #[test]
+    fn no_repo_filter_is_identical_to_the_unscoped_call() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..4 {
+            store
+                .insert_symbol(&make_symbol_in_repo(
+                    &format!("s{i}"),
+                    &format!("fn_{i}"),
+                    if i % 2 == 0 { "repo-a" } else { "repo-b" },
+                ))
+                .unwrap();
+        }
+        store.insert_edge(&make_edge("s0", "s1")).unwrap();
+        store.insert_edge(&make_edge("s1", "s2")).unwrap();
+        store.insert_edge(&make_edge("s2", "s3")).unwrap();
+
+        let baseline = find_hub_nodes_bounded(&store, 10).unwrap();
+        let explicit_none = find_hub_nodes_bounded_in_repos(&store, 10, None).unwrap();
+        assert_eq!(baseline.candidate_total, explicit_none.candidate_total);
+        assert_eq!(
+            baseline.hubs.iter().map(|h| &h.uid).collect::<Vec<_>>(),
+            explicit_none
+                .hubs
+                .iter()
+                .map(|h| &h.uid)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An EMPTY set is a meaningful filter (select nothing), not an absent one.
+    /// Conflating the two would make a resolver that legitimately resolved to no
+    /// repos return the whole graph -- the failure direction that matters.
+    #[test]
+    fn an_empty_repo_scope_selects_nothing() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("a", "fn_a", "repo-a"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("b", "fn_b", "repo-a"))
+            .unwrap();
+        store.insert_edge(&make_edge("a", "b")).unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let scoped = find_hub_nodes_bounded_in_repos(&store, 10, Some(&empty)).unwrap();
+        assert!(scoped.hubs.is_empty());
+        assert_eq!(scoped.candidate_total, 0);
+    }
+
+    /// Ranking still uses the FULL graph: a symbol that is central because
+    /// OTHER repos depend on it keeps that standing when scoped to its own repo.
+    /// Recomputing degree on the induced subgraph would rank a widely-consumed
+    /// API lower the more widely it is consumed.
+    #[test]
+    fn cross_repo_degree_is_retained_under_a_scope() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("api", "shared_api", "repo-lib"))
+            .unwrap();
+        // One intra-repo neighbour, so a subgraph-only degree would be 1.
+        store
+            .insert_symbol(&make_symbol_in_repo("local", "local_fn", "repo-lib"))
+            .unwrap();
+        store.insert_edge(&make_edge("local", "api")).unwrap();
+        // Three consumers in another repo.
+        for i in 0..3 {
+            store
+                .insert_symbol(&make_symbol_in_repo(
+                    &format!("c{i}"),
+                    &format!("consumer_{i}"),
+                    "repo-app",
+                ))
+                .unwrap();
+            store
+                .insert_edge(&make_edge(&format!("c{i}"), "api"))
+                .unwrap();
+        }
+
+        let scope: HashSet<String> = ["repo-lib".to_string()].into_iter().collect();
+        let scoped = find_hub_nodes_bounded_in_repos(&store, 5, Some(&scope)).unwrap();
+        let api = scoped
+            .hubs
+            .iter()
+            .find(|h| h.uid == "api")
+            .expect("the scoped repo's own symbol must be returned");
+        assert_eq!(
+            api.in_degree, 4,
+            "degree must count cross-repo callers, not just the induced subgraph"
+        );
     }
 
     #[test]
