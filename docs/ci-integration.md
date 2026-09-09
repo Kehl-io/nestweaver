@@ -274,6 +274,22 @@ SARIF viewers, downstream tooling) reading the file directly:
   degraded/incomplete run is visible, never silently reported as "clean".
 - **`run.properties["nestweaver/gateState"]`** — `ok` / `degraded-unknown` /
   `risk-flagged`. A degraded run is `degraded-unknown`, never `risk-flagged`.
+
+  **Changed in 9.4.0 (nw-467) — gate on this, not on `status`.** `gateState` and
+  `status` are two axes. A run that stopped at its configured traversal depth is
+  `status: partial` and now gates `ok`: it is *bounded*, not degraded. Previously
+  any non-`complete` status forced `degraded-unknown`, and because the default
+  depth of 3 truncates on essentially every non-trivial change, `ok` was
+  effectively unreachable — measured on a real graph, depth 3, 5, 8 and 15 (the
+  schema maximum) all truncate. That made the field carry no information, so
+  consumers learned to ignore it and then missed it when it fired for a real
+  reason. `degraded-unknown` is now reserved for stale, errored, refused or
+  cancelled runs.
+
+  **If your gate script tests `status == "complete"`, it never passed under
+  default settings and should move to `gateState != "degraded-unknown"`.** The
+  bound itself is not hidden: `nestweaver/coverage.traversalTruncated` and the
+  `depth-truncated` entry in `nestweaver/blindSpots` report it exactly as before.
 - **`nestweaver/coverage`** (repos in scope / not indexed / stale / truncated)
   and **`nestweaver/blindSpots`** — the inherent static gaps (`dynamic-dispatch`,
   `reflection`, `config-wiring`, `codegen`) plus run-specific ones

@@ -416,7 +416,10 @@ pub fn detect_changes_impact(
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
         let risk = RiskLevel::Low;
-        let gate_state = crate::blast_radius::derive_gate_state(status, risk);
+        // nw-467: `false` — this analysis has no configured traversal budget to
+        // stop at, so any non-Complete status here is a genuine degrade (drift,
+        // an undecodable row, or resolver staleness), never a bound.
+        let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
         return Ok(ChangeImpact {
             affected_symbols,
             affected_processes: Vec::new(),
@@ -532,7 +535,10 @@ pub fn detect_changes_impact(
     };
 
     let blast_radius = affected_symbols.len() + affected_processes.len();
-    let gate_state = crate::blast_radius::derive_gate_state(status, risk);
+    // nw-467: `false` — this analysis has no configured traversal budget to
+    // stop at, so any non-Complete status here is a genuine degrade (drift,
+    // an undecodable row, or resolver staleness), never a bound.
+    let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
 
     Ok(ChangeImpact {
         affected_symbols,

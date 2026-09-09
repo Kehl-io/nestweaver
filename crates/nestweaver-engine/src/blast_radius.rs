@@ -282,13 +282,40 @@ pub struct CoChangedFile {
     pub note: String,
 }
 
-/// Derive the gate verdict from the run status and computed risk.
+/// Derive the gate verdict from the run status, computed risk, and whether the
+/// only reason the run is not `Complete` is that it stopped at a configured
+/// traversal budget.
 ///
-/// NON-NEGOTIABLE rule: a run that did not complete is never `RiskFlagged`
-/// (we cannot trust an incomplete traversal to have found the risk), it is
+/// NON-NEGOTIABLE rule, unchanged: a run that is DEGRADED is never `RiskFlagged`
+/// (we cannot trust a degraded traversal to have found the risk), it is
 /// `DegradedUnknown`.
-pub(crate) fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
-    if status != AnalysisStatus::Complete {
+///
+/// nw-467: `bounded_only` splits an axis that used to carry two unrelated
+/// meanings. "The traversal stopped at its configured budget" is expected,
+/// benign, and — measured on a real graph — the STEADY STATE: at the default
+/// depth of 3 every non-trivial changed file truncates, and so does every depth
+/// up to the schema maximum of 15 (265 / 434 / 759 / 1738 affected symbols, all
+/// still truncated). Reporting that as `DegradedUnknown` meant `GateState::Ok`
+/// was unreachable in practice, so consumers learned to ignore the field — and
+/// then missed it when it fired for a real reason (nw-466's wrong repo scope).
+/// An alert a developer takes no action on is noise however TRUE it is.
+///
+/// The bound is still fully disclosed, via `coverage.traversal_truncated` and
+/// the `depth-truncated` / `pruned-below-threshold` blind spots. That is what
+/// keeps nw-105 honoured: its defect was that a truncated run was
+/// INDISTINGUISHABLE from an exhaustive one, not that the gate said `ok`. A
+/// truncated run still reports `status: partial`; only the GATE stops treating
+/// a budget as a fault.
+pub(crate) fn derive_gate_state(
+    status: AnalysisStatus,
+    risk_level: RiskLevel,
+    bounded_only: bool,
+) -> GateState {
+    // `bounded_only` can only ever excuse `Partial`. Clamping here rather than
+    // trusting the caller means a future call site cannot launder a genuine
+    // Degraded/Failed run through this argument: the severity ordering wins.
+    let bounded = bounded_only && status <= AnalysisStatus::Partial;
+    if status != AnalysisStatus::Complete && !bounded {
         GateState::DegradedUnknown
     } else if matches!(risk_level, RiskLevel::High) {
         GateState::RiskFlagged
@@ -493,14 +520,73 @@ pub fn analyze_blast_radius(
         // path may have drifted. Non-source files legitimately have no symbols.
         if syms.is_empty() {
             if nestweaver_parser::detect_language(file).is_some() {
-                notifications.push(Notification {
-                    level: NotificationLevel::Warning,
-                    message: format!(
-                        "changed source file {file_str} has no indexed symbols (new file, stale \
-                         index, or path drift) — its impact was not assessed"
-                    ),
-                    descriptor: "changed-file-no-symbols".to_string(),
-                });
+                // nw-466. Before blaming drift, check whether the file simply
+                // lives in a DIFFERENT repo than the one requested. A repo name
+                // that exists in the graph but does not own the changed file
+                // resolves fine and then finds nothing, which is reported here
+                // — and "new file, stale index, or path drift" sends the reader
+                // to re-index a repo that was never the problem.
+                //
+                // The graph already holds the answer, so guessing is
+                // unnecessary: repeat the lookup unscoped and name the owner.
+                // This runs ONLY on the already-degenerate zero-symbol path, so
+                // it costs nothing on a healthy run.
+                //
+                // Deliberately a WARNING, not an error: the nw-033 gate posture
+                // is fail-open + loud, and a repo-scoped caller legitimately
+                // analysing a file it cannot see must still get a result.
+                let owners: Vec<String> = match target_repo {
+                    Some(_) => store
+                        .symbols_in_file(&file_str)
+                        .map(|elsewhere| {
+                            let mut uids: Vec<String> = elsewhere
+                                .into_iter()
+                                .map(|sym| sym.repo_uid)
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
+                            uids.sort();
+                            uids
+                        })
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+
+                let display = |uid: &str| -> String {
+                    repo_display
+                        .get(uid)
+                        .cloned()
+                        .unwrap_or_else(|| uid.to_string())
+                };
+
+                if owners.is_empty() {
+                    notifications.push(Notification {
+                        level: NotificationLevel::Warning,
+                        message: format!(
+                            "changed source file {file_str} has no indexed symbols (new file, \
+                             stale index, or path drift) — its impact was not assessed"
+                        ),
+                        descriptor: "changed-file-no-symbols".to_string(),
+                    });
+                } else {
+                    let requested = target_repo.map(display).unwrap_or_default();
+                    let owner_list = owners
+                        .iter()
+                        .map(|uid| display(uid))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    notifications.push(Notification {
+                        level: NotificationLevel::Warning,
+                        message: format!(
+                            "changed source file {file_str} has no indexed symbols in the \
+                             requested repo {requested}, but its symbols are indexed in \
+                             {owner_list} — this analysis is scoped to a repo that does not own \
+                             the file, so its impact was NOT measured. Re-run scoped to the \
+                             owning repo, or drop the repo filter."
+                        ),
+                        descriptor: "changed-file-wrong-repo-scope".to_string(),
+                    });
+                }
                 status = status.max(AnalysisStatus::Partial);
             }
             continue;
@@ -879,6 +965,14 @@ pub fn analyze_blast_radius(
     // more importantly `status` itself is consumed by the summary line, the MCP
     // envelope and pr-impact. Downgrading only from Complete so a run already
     // Degraded or Failed is never upgraded.
+    //
+    // nw-467: capture WHY the status is about to become non-Complete. This
+    // condition already requires `status == Complete`, so when it fires nothing
+    // else has degraded the run and the truncation is the sole cause — that is
+    // exactly the "bounded, not degraded" case the gate must not punish. Read
+    // before the mutation, because after it the two causes are indistinguishable.
+    let bounded_only =
+        status == AnalysisStatus::Complete && (truncated_by_threshold || truncated_by_depth);
     if (truncated_by_threshold || truncated_by_depth) && status == AnalysisStatus::Complete {
         status = AnalysisStatus::Partial;
     }
@@ -895,7 +989,7 @@ pub fn analyze_blast_radius(
     // Gate verdict — a degraded/failed run is never RiskFlagged (see
     // `derive_gate_state`); it is reported as unknown so consumers don't read a
     // broken analysis as safe.
-    let gate_state = derive_gate_state(status, risk_level);
+    let gate_state = derive_gate_state(status, risk_level, bounded_only);
 
     // Build the org-wide (cross-repo) impact summary, if any. Sourced from this
     // daemon's unified multi-repo graph. A connected upstream server can augment
@@ -2127,6 +2221,143 @@ mod tests {
         assert_eq!(result.gate_state, GateState::DegradedUnknown);
     }
 
+    /// nw-466. A repo name that EXISTS in the graph but does not own the changed
+    /// file resolves fine and finds nothing. Reported as "new file, stale index,
+    /// or path drift" it sends the reader to re-index a repo that was never the
+    /// problem, while the analysis silently measured nothing.
+    #[test]
+    fn wrong_repo_scope_is_distinguished_from_path_drift() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        for (uid, url) in [
+            ("repo:owner", "https://example.com/owner"),
+            ("repo:other", "https://example.com/other"),
+        ] {
+            store
+                .insert_repo(&Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "abc123".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "inst-1".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .expect("insert repo");
+        }
+        // The file is indexed -- but in `repo:owner`, not `repo:other`.
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:owned".to_string(),
+                name: "owned_fn".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:owner".to_string(),
+                file_path: "src/owned.rs".to_string(),
+                start_line: 1,
+                end_line: 4,
+                signature: "fn owned_fn()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert symbol");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/owned.rs")],
+            &opts(Some("repo:other"), 3, false),
+            None,
+            None,
+        )
+        .expect("analysis");
+
+        let note = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-wrong-repo-scope")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a wrong-repo-scope notification, got: {:?}",
+                    result.notifications
+                )
+            });
+        assert_eq!(note.level, NotificationLevel::Warning);
+        // It must name the OWNER, which is the one fact that makes it actionable.
+        assert!(
+            note.message.contains("https://example.com/owner"),
+            "the notification must name the owning repo; got: {}",
+            note.message
+        );
+        // The generic drift message must NOT also fire -- two contradictory
+        // explanations for one file is what this change exists to end.
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"),
+            "the drift notification must not fire for a wrong-scope file: {:?}",
+            result.notifications
+        );
+        // Fail-open (nw-033): still a result, still degraded, never an error.
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.affected_symbol_count, 0);
+    }
+
+    /// COUNTERWEIGHT for the test above: with the file genuinely absent from the
+    /// whole graph, the same code path must keep reporting DRIFT. Without this,
+    /// a change that emitted the wrong-scope wording unconditionally would pass.
+    #[test]
+    fn genuinely_unindexed_file_still_reports_drift_not_wrong_scope() {
+        use nestweaver_schema::Repo;
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:only".to_string(),
+                url: "https://example.com/only".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .expect("insert repo");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/nowhere.rs")],
+            &opts(Some("repo:only"), 3, false),
+            None,
+            None,
+        )
+        .expect("analysis");
+
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"),
+            "a file in no repo at all is drift, not a scoping mistake: {:?}",
+            result.notifications
+        );
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-wrong-repo-scope"),
+            "must not claim a wrong scope when no repo owns the file: {:?}",
+            result.notifications
+        );
+    }
+
     #[test]
     fn zero_symbols_non_source_file_stays_complete() {
         use nestweaver_schema::Repo;
@@ -2371,20 +2602,25 @@ mod tests {
         );
 
         // nw-105: the same run must not simultaneously claim it completed.
-        // Before the fix, coverage.traversal_truncated and the DepthTruncated
-        // blind spot were both set while status stayed Complete, so
-        // derive_gate_state returned Ok — a merge gate read "safe" for an
-        // analysis that never finished.
+        // Before that fix, coverage.traversal_truncated and the DepthTruncated
+        // blind spot were both set while status stayed Complete, so the run was
+        // INDISTINGUISHABLE from an exhaustive one. That property is what nw-105
+        // bought and it is asserted above and here — it is NOT relaxed by nw-467.
         assert_ne!(
             result.status,
             AnalysisStatus::Complete,
             "a truncated traversal must not report status Complete — it did not complete"
         );
-        assert_eq!(
+        // nw-467: the GATE, however, no longer treats a configured budget as a
+        // fault. This run is bounded, not degraded — nothing went wrong — so it
+        // gates on its risk like any clean run. `degraded-unknown` is reserved
+        // for stale/errored/refused/cancelled runs, which is what makes it worth
+        // reading at all; see `derive_gate_state`.
+        assert_ne!(
             result.gate_state,
             GateState::DegradedUnknown,
-            "a truncated traversal must gate as degraded-unknown, never ok; \
-             got status {:?} / gate {:?}",
+            "a truncation-only run is bounded, not degraded, and must not gate as \
+             degraded-unknown; got status {:?} / gate {:?}",
             result.status,
             result.gate_state
         );
@@ -2522,28 +2758,64 @@ mod tests {
 
     #[test]
     fn degraded_run_never_risk_flagged() {
-        // The NON-NEGOTIABLE rule: a run that did not complete is never
-        // RiskFlagged, regardless of the computed risk — it is DegradedUnknown.
+        // The NON-NEGOTIABLE rule: a DEGRADED run is never RiskFlagged,
+        // regardless of the computed risk — it is DegradedUnknown.
         assert_eq!(
-            derive_gate_state(AnalysisStatus::Degraded, RiskLevel::High),
+            derive_gate_state(AnalysisStatus::Degraded, RiskLevel::High, false),
             GateState::DegradedUnknown
         );
         assert_eq!(
-            derive_gate_state(AnalysisStatus::Failed, RiskLevel::High),
+            derive_gate_state(AnalysisStatus::Failed, RiskLevel::High, false),
             GateState::DegradedUnknown
         );
         assert_eq!(
-            derive_gate_state(AnalysisStatus::Partial, RiskLevel::High),
+            derive_gate_state(AnalysisStatus::Partial, RiskLevel::High, false),
             GateState::DegradedUnknown
         );
         // Complete runs still map risk faithfully.
         assert_eq!(
-            derive_gate_state(AnalysisStatus::Complete, RiskLevel::High),
+            derive_gate_state(AnalysisStatus::Complete, RiskLevel::High, false),
             GateState::RiskFlagged
         );
         assert_eq!(
-            derive_gate_state(AnalysisStatus::Complete, RiskLevel::Low),
+            derive_gate_state(AnalysisStatus::Complete, RiskLevel::Low, false),
             GateState::Ok
+        );
+    }
+
+    #[test]
+    fn bounded_run_gates_on_risk_not_as_degraded() {
+        // nw-467. A run whose ONLY departure from Complete is that it stopped at
+        // its configured traversal budget is bounded, not degraded: it gates on
+        // risk exactly like a clean run, so `Ok` is reachable under the default
+        // depth instead of being a state the tool can never return.
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Partial, RiskLevel::Low, true),
+            GateState::Ok
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Partial, RiskLevel::High, true),
+            GateState::RiskFlagged
+        );
+
+        // The flag is not a blanket override, and that is enforced here rather
+        // than assumed of the caller: `bounded_only` can only excuse `Partial`.
+        // A future call site cannot launder a genuine Degraded/Failed run
+        // through this argument.
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Degraded, RiskLevel::Low, true),
+            GateState::DegradedUnknown,
+            "a Degraded run must stay degraded-unknown even if flagged bounded"
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Failed, RiskLevel::High, true),
+            GateState::DegradedUnknown,
+            "a Failed run must stay degraded-unknown even if flagged bounded"
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Partial, RiskLevel::Low, false),
+            GateState::DegradedUnknown,
+            "the same status without the bounded flag must still be degraded-unknown"
         );
     }
 
