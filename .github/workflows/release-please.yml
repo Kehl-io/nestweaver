@@ -384,6 +384,12 @@ jobs:
       number: ${{ steps.release_pr.outputs.number }}
       branch: ${{ steps.release_pr.outputs.branch }}
       head_sha: ${{ steps.release_pr.outputs.head_sha }}
+      # nw-465: an explicit statement of what this job BELIEVED it found, so a
+      # consumer can tell "there is legitimately no release PR" from "a located
+      # PR's identity was lost in the output mapping". Both arrive as an empty
+      # `number`, and treating the pair as one signal turned every successful
+      # publication red.
+      located: ${{ steps.release_pr.outputs.located }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
@@ -592,10 +598,17 @@ jobs:
           fi
 
           echo "located release PR: ${NUM:-<none>} (${BRANCH:-<none>} @ ${HEAD_SHA:-<none>})"
+          # nw-465. Derived from $NUM at the moment this job still knows the
+          # answer. Every path that reaches here with an empty $NUM has already
+          # established that no open release PR exists: a created-but-missing PR
+          # exits 1 above, and a located one that fails trusted base/head/author
+          # validation exits 1 too. So "empty here" means "none", never "lost".
+          if [ -n "$NUM" ]; then LOCATED=true; else LOCATED=false; fi
           {
             echo "number=$NUM"
             echo "branch=$BRANCH"
             echo "head_sha=$HEAD_SHA"
+            echo "located=$LOCATED"
           } >> "$GITHUB_OUTPUT"
 
   release-pr-output-diagnostic:
@@ -626,32 +639,33 @@ jobs:
       # never affect whether a release proceeds; it exists purely to make
       # this failure self-evident instead of requiring another manual
       # rediscovery.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # nw-465: the verdict lives in scripts/classify-release-pr-outputs.sh so
+      # its four cases are testable (tests/release_pr_diagnostic_test.rs) rather
+      # than only observable on a real release.
       - name: Report what a downstream job actually resolves
         env:
           RESULT: ${{ needs.release-pr.result }}
+          LOCATED: ${{ needs.release-pr.outputs.located }}
           NUMBER: ${{ needs.release-pr.outputs.number }}
           BRANCH: ${{ needs.release-pr.outputs.branch }}
           HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
         run: |
           set -euo pipefail
-          echo "release-pr.result=[$RESULT]"
-          echo "release-pr.outputs.number=[$NUMBER]"
-          echo "release-pr.outputs.branch=[$BRANCH]"
-          echo "release-pr.outputs.head_sha=[$HEAD_SHA]"
           {
-            echo "### release-pr output propagation (nw-426)"
+            echo "### release-pr output propagation (nw-426, nw-465)"
             echo ""
             echo "| field | value |"
             echo "| --- | --- |"
             echo "| \`result\` | \`$RESULT\` |"
+            echo "| \`outputs.located\` | \`$LOCATED\` |"
             echo "| \`outputs.number\` | \`$NUMBER\` |"
             echo "| \`outputs.branch\` | \`$BRANCH\` |"
             echo "| \`outputs.head_sha\` | \`$HEAD_SHA\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$RESULT" = "success" ] && [ -z "$NUMBER" ]; then
-            echo "::error::release-pr succeeded but its 'number' output reads empty here -- this is nw-426's job-output propagation failure reproducing. prepare-release-lockfile will skip and a manual Cargo.lock sync will be needed again." >&2
-            exit 1
-          fi
+          bash scripts/classify-release-pr-outputs.sh
 
   prepare-release-lockfile:
     name: Prepare release lockfile without write authority
