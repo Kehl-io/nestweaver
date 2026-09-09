@@ -166,9 +166,5 @@ fn missing_located_output_is_itself_treated_as_output_loss() {
         !out.status.success(),
         "a missing `located` output must fail rather than silently pass"
     );
-    assert!(
-        stderr(&out).contains("located"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    assert!(stderr(&out).contains("located"), "stderr: {}", stderr(&out));
 }
