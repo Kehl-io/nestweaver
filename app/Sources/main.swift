@@ -286,6 +286,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// nw-448. Handle the standard informational flags BEFORE any AppKit object is
+// created, so a probe cannot start or attach to a UI server as a side effect.
+//
+// `/Applications/<App>.app/Contents/MacOS/<Name>` is the conventional path a
+// script or installer probes, and the natural probe is `--version`. Previously
+// every argv fell through to "go start the UI": the probe printed the UI banner
+// and then BLOCKED indefinitely. A hang is a worse failure mode than a non-zero
+// exit because nothing surfaces a cause -- in CI it reads as a stalled step, and
+// locally it leaves a server the caller never asked for.
+//
+// Only these exact flags are intercepted. Anything unrecognised keeps today's
+// behaviour, which also leaves LaunchServices' own `-psn_...` argument alone.
+func bundleShortVersion() -> String? {
+    Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+}
+
+let informationalArgs = Set(CommandLine.arguments.dropFirst())
+
+if !informationalArgs.isDisjoint(with: ["--version", "-V"]) {
+    guard let version = bundleShortVersion() else {
+        FileHandle.standardError.write(
+            Data("NestWeaver: bundle is missing CFBundleShortVersionString\n".utf8))
+        exit(1)
+    }
+    print("NestWeaver \(version)")
+    exit(0)
+}
+
+if !informationalArgs.isDisjoint(with: ["--help", "-h"]) {
+    let version = bundleShortVersion() ?? "unknown"
+    print("""
+    NestWeaver \(version) -- macOS menu-bar app.
+
+    This is the GUI wrapper. Launched with no arguments it starts the NestWeaver
+    daemon and UI server and installs a menu-bar item.
+
+      --version, -V    print the bundle version and exit
+      --help, -h       print this message and exit
+
+    For the command-line interface use the CLI inside this bundle:
+      \(Bundle.main.bundlePath)/Contents/MacOS/nestweaver-cli --help
+    """)
+    exit(0)
+}
+
 let delegate = AppDelegate()
 NSApplication.shared.delegate = delegate
 NSApplication.shared.setActivationPolicy(.accessory)

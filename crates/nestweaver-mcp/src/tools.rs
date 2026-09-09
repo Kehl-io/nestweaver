@@ -3198,8 +3198,8 @@ fn dispatch_tool_arm(
             tool_project_context(store, tantivy, args, embed_model, cancel, visible)
         }
         "dead_code" => tool_dead_code(store, args, cancel, visible),
-        "hub_nodes" => tool_hub_nodes(store, args),
-        "bridge_nodes" => tool_bridge_nodes(store, args),
+        "hub_nodes" => tool_hub_nodes(store, args, visible),
+        "bridge_nodes" => tool_bridge_nodes(store, args, visible),
         "blast_radius" => tool_blast_radius(store, args, cancel, visible),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
@@ -10326,7 +10326,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -12530,6 +12530,11 @@ fn tool_schema_hub_nodes() -> Value {
                     "default": "detailed",
                     "description": "\"concise\" returns name + total degree only; \"detailed\" (default) adds UIDs, file paths, PageRank scores, and cluster IDs."
                 },
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these repos (names or UIDs), matching blast_radius/cross_repo_contracts. Applied BEFORE top_n, so results are the requested scope's top-N rather than whatever of the global top-N happens to fall in it — filtering client-side is not equivalent and can return nothing for a small repo. Ranking still uses the FULL graph, so a symbol that is central because other repos depend on it keeps that standing. An unknown repo name is an error, never a silent empty result."
+                },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
@@ -12538,7 +12543,11 @@ fn tool_schema_hub_nodes() -> Value {
     })
 }
 
-fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_hub_nodes(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     let top_n = args
         .get("limit")
         .or_else(|| args.get("top_n"))
@@ -12547,14 +12556,33 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         .unwrap_or(10);
     let concise = is_concise(&args);
 
+    // nw-468: resolve `repos` through the SHARED resolver, so a name that is not
+    // in the graph errors exactly as it does on blast_radius rather than
+    // returning a confident empty ranking. `visible` is threaded through so a
+    // repo-restricted caller's own filter is resolved against only the repos it
+    // may see -- without it the resolver's "not found"/"ambiguous, candidates
+    // are ..." messages would enumerate hidden repos, which is the nw-416 leak
+    // in a new channel.
+    let repo_scope = match args.get("repos").and_then(|v| v.as_array()) {
+        Some(entries) => {
+            let selectors: Vec<String> = entries
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            Some(resolve_repo_filter(store, &selectors, visible)?)
+        }
+        None => None,
+    };
+
     // nw-398. The engine already COMPUTES the population this ranking was cut
     // from; the discarding wrapper threw it away and `count` reported
     // `len(list)` — the anti-pattern the `Bounded` seam comment names by hand.
     // The CLI now publishes `total`/`truncated`, and `no_cli_command_discloses_
     // more_than_its_mcp_twin` forbids the CLI knowing more than this route, so
     // these two must move together.
-    let found = nestweaver_engine::hubs::find_hub_nodes_bounded(store, top_n)
-        .context("find_hub_nodes_bounded")?;
+    let found =
+        nestweaver_engine::hubs::find_hub_nodes_bounded_in_repos(store, top_n, repo_scope.as_ref())
+            .context("find_hub_nodes_bounded")?;
     let (hub_total, hub_truncated) = (found.candidate_total, found.truncated());
     let mut hubs = found.hubs;
 
@@ -12645,13 +12673,22 @@ fn tool_schema_bridge_nodes() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns name + betweenness score only; \"detailed\" (default) adds UIDs, file paths, and connected community IDs."
+                },
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these repos (names or UIDs), matching blast_radius/cross_repo_contracts. Applied BEFORE top_n, so results are the requested scope's top-N rather than whatever of the global top-N happens to fall in it. Betweenness is still computed over the FULL graph, because a bridge's score is a property of the paths around it; scoping the graph itself would erase the cross-repo connector this tool exists to find. An unknown repo name is an error, never a silent empty result."
                 }
             }
         }
     })
 }
 
-fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_bridge_nodes(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     let top_n = args
         .get("limit")
         .or_else(|| args.get("top_n"))
@@ -12660,14 +12697,36 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .unwrap_or(10);
     let concise = is_concise(&args);
 
+    // nw-468: resolve `repos` through the SHARED resolver, so a name that is not
+    // in the graph errors exactly as it does on blast_radius rather than
+    // returning a confident empty ranking. `visible` is threaded through so a
+    // repo-restricted caller's own filter is resolved against only the repos it
+    // may see -- without it the resolver's "not found"/"ambiguous, candidates
+    // are ..." messages would enumerate hidden repos, which is the nw-416 leak
+    // in a new channel.
+    let repo_scope = match args.get("repos").and_then(|v| v.as_array()) {
+        Some(entries) => {
+            let selectors: Vec<String> = entries
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            Some(resolve_repo_filter(store, &selectors, visible)?)
+        }
+        None => None,
+    };
+
     // nw-398. The engine already COMPUTES the population this ranking was cut
     // from; the discarding wrapper threw it away and `count` reported
     // `len(list)` — the anti-pattern the `Bounded` seam comment names by hand.
     // The CLI now publishes `total`/`truncated`, and `no_cli_command_discloses_
     // more_than_its_mcp_twin` forbids the CLI knowing more than this route, so
     // these two must move together.
-    let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(store, top_n)
-        .context("find_bridge_nodes_bounded")?;
+    let found = nestweaver_engine::bridges::find_bridge_nodes_bounded_in_repos(
+        store,
+        top_n,
+        repo_scope.as_ref(),
+    )
+    .context("find_bridge_nodes_bounded")?;
     let (bridge_total, bridge_truncated) = (found.candidate_total, found.truncated());
     // `betweenness_score` is a SAMPLE over at most SAMPLE_LIMIT sources, rendered
     // to 14 significant digits with nothing in the payload saying so. The digits
@@ -12721,7 +12780,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14560,6 +14619,17 @@ fn dispatch_via_daemon_inner(
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0) as i32,
                     response_format: str_field("response_format"),
+                    // nw-468: the typed hop drops anything without a field.
+                    repos: args
+                        .get("repos")
+                        .and_then(|v| v.as_array())
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 });
                 let resp = client.hub_nodes(req).await.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
@@ -19114,21 +19184,54 @@ mod arg_alias_tests {
     #[test]
     fn hub_nodes_accepts_limit_and_top_n_alias() {
         let store = GraphStore::in_memory().unwrap();
-        let via_limit = tool_hub_nodes(&store, json!({ "limit": 5 })).unwrap();
+        let via_limit = tool_hub_nodes(&store, json!({ "limit": 5 }), None).unwrap();
         assert_eq!(via_limit["top_n"], json!(5));
-        let via_alias = tool_hub_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        let via_alias = tool_hub_nodes(&store, json!({ "top_n": 7 }), None).unwrap();
         assert_eq!(via_alias["top_n"], json!(7));
-        let default = tool_hub_nodes(&store, json!({})).unwrap();
+        let default = tool_hub_nodes(&store, json!({}), None).unwrap();
         assert_eq!(default["top_n"], json!(10));
     }
 
     #[test]
     fn bridge_nodes_accepts_limit_and_top_n_alias() {
         let store = GraphStore::in_memory().unwrap();
-        let via_limit = tool_bridge_nodes(&store, json!({ "limit": 5 })).unwrap();
+        let via_limit = tool_bridge_nodes(&store, json!({ "limit": 5 }), None).unwrap();
         assert_eq!(via_limit["top_n"], json!(5));
-        let via_alias = tool_bridge_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        let via_alias = tool_bridge_nodes(&store, json!({ "top_n": 7 }), None).unwrap();
         assert_eq!(via_alias["top_n"], json!(7));
+    }
+
+    /// nw-468. An unknown repo name must ERROR on both new surfaces, exactly as
+    /// it does on `blast_radius` -- the alternative is a confident empty ranking
+    /// that reads as "this repo has no hubs" when it means "you named a repo
+    /// that is not here". Both tools move together; shipping one is the parity
+    /// drift nw-215 tracks.
+    #[test]
+    fn hub_and_bridge_nodes_reject_an_unknown_repo_name() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let hub_err = tool_hub_nodes(&store, json!({ "repos": ["no-such-repo"] }), None)
+            .expect_err("an unknown repo name must not resolve");
+        assert!(
+            hub_err.to_string().contains("no-such-repo"),
+            "the error must name the unresolved selector: {hub_err}"
+        );
+
+        let bridge_err = tool_bridge_nodes(&store, json!({ "repos": ["no-such-repo"] }), None)
+            .expect_err("an unknown repo name must not resolve");
+        assert!(
+            bridge_err.to_string().contains("no-such-repo"),
+            "the error must name the unresolved selector: {bridge_err}"
+        );
+    }
+
+    /// COUNTERWEIGHT: omitting `repos` must stay a no-op, or every existing
+    /// caller of these two tools silently changes behaviour.
+    #[test]
+    fn hub_and_bridge_nodes_without_repos_are_unfiltered() {
+        let store = GraphStore::in_memory().unwrap();
+        assert!(tool_hub_nodes(&store, json!({ "top_n": 3 }), None).is_ok());
+        assert!(tool_bridge_nodes(&store, json!({ "top_n": 3 }), None).is_ok());
     }
 
     #[test]

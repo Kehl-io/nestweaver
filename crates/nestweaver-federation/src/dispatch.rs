@@ -549,6 +549,18 @@ async fn dispatch_typed_hub_nodes(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        // nw-468: carry the repo filter over the typed hop, or it is dropped
+        // and the caller silently receives an unscoped ranking.
+        repos: params
+            .get("repos")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     let mut request = tonic::Request::new(req);
     inject_bearer_token(&mut request, auth_token);

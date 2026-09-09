@@ -953,8 +953,13 @@ pub fn generate_claude_md_with_rules(
     // so the guide has to say so explicitly rather than assume it is read.
     out.push_str("\n### Read the trust fields before trusting a result\n\n");
     out.push_str(
-        "- `status` / `gate_state` — a run that did not complete is `partial` / \
-         `degraded-unknown`, never `ok`. Do not report it as a clean result.\n",
+        "- `status` / `gate_state` — these are two different axes (nw-467). A run \
+         that stopped at its configured traversal budget is `partial` but still \
+         gates `ok`: it is BOUNDED, not broken, and at the default depth that is \
+         the normal state. A run that is stale, errored, refused or cancelled is \
+         `degraded-unknown` — that one is not a clean result and must not be \
+         reported as one. Gate on `gate_state`; read `status` alongside \
+         `coverage.traversal_truncated` to know how much was explored.\n",
     );
     out.push_str(
         "- `truncated` (with `truncated_by_depth` / `truncated_by_threshold`) — an \

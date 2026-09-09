@@ -538,7 +538,7 @@ pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
     render_rules_markdown,
 };
-pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
+pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes, find_hub_nodes_bounded_in_repos};
 pub use index::{
     CachedFileMeta, DeletedEmbeddingStateReconciliation, DeletedGraphStateReconciliation,
     DeletionReconciliationError, DeletionReconciliationFailure, DeletionReconciliationStage,

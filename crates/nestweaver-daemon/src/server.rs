@@ -5730,6 +5730,32 @@ mod context_request_args_tests {
     }
 }
 
+/// Translate a typed `HubNodesRequest` into the JSON args `hub_nodes` takes.
+///
+/// Extracted from the handler so the translation is TESTABLE. nw-468 shipped a
+/// `repos` filter that worked on the direct and MCP paths and was silently
+/// dropped over this hop, because `hub_nodes` is one of the few TYPED requests
+/// and the proto had no field for it. Every layer's own tests passed; the
+/// caller got an unscoped ranking that looked correct. A field that exists on
+/// one side of a typed hop and not the other cannot be caught by testing either
+/// side alone, so the translation itself is pinned here.
+fn hub_nodes_args(req: &HubNodesRequest) -> serde_json::Value {
+    let mut args = serde_json::json!({});
+    if req.top_n > 0 {
+        args["top_n"] = serde_json::json!(req.top_n);
+    }
+    if !req.response_format.is_empty() {
+        args["response_format"] = serde_json::json!(req.response_format);
+    }
+    // Only set when non-empty. An empty array is a MEANINGFUL filter downstream
+    // (select nothing), so a client that sent no filter must not arrive as one
+    // that selected nothing.
+    if !req.repos.is_empty() {
+        args["repos"] = serde_json::json!(req.repos);
+    }
+    args
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -8216,13 +8242,7 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<HubNodesResponse>, Status> {
         // Global rankings require unrestricted repository access.
         let (_, extensions, req) = r.into_parts();
-        let mut args = serde_json::json!({});
-        if req.top_n > 0 {
-            args["top_n"] = serde_json::json!(req.top_n);
-        }
-        if !req.response_format.is_empty() {
-            args["response_format"] = serde_json::json!(req.response_format);
-        }
+        let args = hub_nodes_args(&req);
 
         let value = self
             .dispatch_tool_json("hub_nodes", args, &extensions)
@@ -22049,10 +22069,57 @@ external_model = "unavailable-test-model"
         );
     }
 
+    /// nw-468 REGRESSION. `hub_nodes` is one of the few TYPED daemon requests;
+    /// `bridge_nodes` and `blast_radius` are JsonRequest pass-throughs, so their
+    /// `repos` filter survives the hop for free. When `repos` shipped WITHOUT a
+    /// proto field, the engine, the MCP handler and the CLI were all correct and
+    /// individually tested, and the filter was still silently discarded in
+    /// transit: `hubs --repo other-repo` returned a full unscoped ranking, and
+    /// `--repo does-not-exist` returned results instead of erroring. Every layer
+    /// passed its own tests. Found only by running the CLI against a real
+    /// two-repo graph.
+    #[test]
+    fn hub_nodes_args_carry_the_repo_filter_over_the_typed_hop() {
+        let args = hub_nodes_args(&HubNodesRequest {
+            top_n: 5,
+            response_format: "concise".to_string(),
+            repos: vec!["repo-a".to_string(), "repo-b".to_string()],
+        });
+        assert_eq!(args["top_n"], serde_json::json!(5));
+        assert_eq!(args["response_format"], serde_json::json!("concise"));
+        assert_eq!(
+            args["repos"],
+            serde_json::json!(["repo-a", "repo-b"]),
+            "a repo filter must survive the typed hop, or the caller silently \
+             receives an unscoped ranking: {args}"
+        );
+    }
+
+    /// COUNTERWEIGHT: no filter must arrive as NO KEY, not as an empty array.
+    /// Downstream an empty `repos` is a meaningful filter meaning "select
+    /// nothing", so conflating the two would make every unfiltered daemon call
+    /// return zero hubs.
+    #[test]
+    fn hub_nodes_args_omit_repos_entirely_when_none_were_sent() {
+        let args = hub_nodes_args(&HubNodesRequest {
+            top_n: 10,
+            response_format: String::new(),
+            repos: Vec::new(),
+        });
+        assert!(
+            args.get("repos").is_none(),
+            "an absent filter must not arrive as an empty one: {args}"
+        );
+        // response_format is likewise omitted rather than sent as "".
+        assert!(args.get("response_format").is_none());
+        assert_eq!(args["top_n"], serde_json::json!(10));
+    }
+
     fn nw415_hub_request() -> HubNodesRequest {
         HubNodesRequest {
             top_n: 10,
             response_format: "detailed".to_string(),
+            repos: Vec::new(),
         }
     }
 

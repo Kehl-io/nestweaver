@@ -139,6 +139,28 @@ impl BridgeNodes {
 /// reproducible rather than self-cancelling across calls — which is precisely
 /// why the estimate has to be labelled as one rather than left to average out.
 pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<BridgeNodes> {
+    find_bridge_nodes_bounded_in_repos(store, top_n, None)
+}
+
+/// [`find_bridge_nodes_bounded`] restricted to a set of repo UIDs.
+///
+/// nw-468, and the same scope semantics as `hubs::find_hub_nodes_bounded_in_repos`:
+/// the filter selects which symbols may be RETURNED, while betweenness is still
+/// computed over the whole graph. For bridges that distinction is not merely
+/// preferable, it is the only coherent reading — betweenness measures how many
+/// shortest paths run THROUGH a node, so a node's score is a property of the
+/// paths around it. Recomputing it on a single repo's induced subgraph would
+/// silently answer "bridges within this repo", which is a different question,
+/// and would erase exactly the cross-repo connector this tool exists to find.
+///
+/// `candidate_total` is scoped so `truncated()` keeps describing the population
+/// the caller asked about. An EMPTY set selects nothing; only `None` disables
+/// the filter.
+pub fn find_bridge_nodes_bounded_in_repos(
+    store: &GraphStore,
+    top_n: usize,
+    repos: Option<&std::collections::HashSet<String>>,
+) -> Result<BridgeNodes> {
     // nw-439. `hubs` fails closed during a dirty index publication because
     // `pagerank_scores()` (the ranking.rs module contract, in
     // nestweaver-store) refuses to serve ranks that might predate the
@@ -173,7 +195,14 @@ pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<Bri
     // Counted from the adjacency rather than the ranked list, and BEFORE the
     // truncate below, so the population is reported even when `top_n` is 0 and
     // nothing survives selection.
-    let candidate_total = graph.adj.iter().filter(|nbrs| !nbrs.is_empty()).count();
+    // nw-468: in scope when no filter was given, or the owning repo was asked for.
+    let in_scope = |i: usize| -> bool {
+        repos.is_none_or(|allowed| allowed.contains(&graph.symbols[i].repo_uid))
+    };
+
+    let candidate_total = (0..n)
+        .filter(|&i| in_scope(i) && !graph.adj[i].is_empty())
+        .count();
 
     // Compute betweenness centrality via Brandes' algorithm with sampling.
     let Betweenness {
@@ -205,7 +234,7 @@ pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<Bri
         .symbols
         .iter()
         .enumerate()
-        .filter(|(i, _)| !graph.adj[*i].is_empty())
+        .filter(|(i, _)| !graph.adj[*i].is_empty() && in_scope(*i))
         .map(|(i, sym)| BridgeNode {
             uid: sym.uid.clone(),
             name: sym.name.clone(),
