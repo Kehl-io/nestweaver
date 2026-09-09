@@ -775,15 +775,17 @@ jobs:
             "expected exactly Cargo.lock and lockfile-state.json, got: $(echo "$files" | tr '\n' ' ')"
           check artifact-size "Cargo.lock exceeds the 10 MiB ceiling" \
             test "$(stat -c '%s' lockfile-artifact/Cargo.lock)" -le 10485760
-          check state-shape \
-            "lockfile-state.json does not describe head $RELEASE_PR_HEAD_SHA with a well-formed original_blob/sha256/changed" \
-            jq -e \
-              --arg head "$RELEASE_PR_HEAD_SHA" \
-              '.head_sha == $head and
-               (.original_blob | test("^[0-9a-f]{40}$")) and
-               (.sha256 | test("^[0-9a-f]{64}$")) and
-               (.changed | type == "boolean")' \
-              lockfile-artifact/lockfile-state.json
+          # jq is invoked DIRECTLY rather than through `check`: routing it through
+          # a wrapper hides it from shellcheck, which then reads the jq program
+          # as a shell string and reports SC2016 on jq's own `--arg` variables.
+          jq -e \
+            --arg head "$RELEASE_PR_HEAD_SHA" \
+            '.head_sha == $head and
+             (.original_blob | test("^[0-9a-f]{40}$")) and
+             (.sha256 | test("^[0-9a-f]{64}$")) and
+             (.changed | type == "boolean")' \
+            lockfile-artifact/lockfile-state.json >/dev/null || fail state-shape \
+            "lockfile-state.json does not describe head $RELEASE_PR_HEAD_SHA with a well-formed original_blob/sha256/changed"
           expected_sha256="$(jq -er '.sha256' lockfile-artifact/lockfile-state.json)"
           actual_sha256="$(sha256sum lockfile-artifact/Cargo.lock | awk '{print $1}')"
           [ "$actual_sha256" = "$expected_sha256" ] || fail artifact-digest \
@@ -792,17 +794,16 @@ jobs:
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER")"
           # The exact-head and trusted-author lease. UNCHANGED in substance --
           # nw-463 labels it, it does not loosen it.
-          check pr-identity \
-            "PR #$RELEASE_PR_NUMBER failed the trusted lease: expected an open github-actions[bot] PR from $RELEASE_PR_BRANCH @ $RELEASE_PR_HEAD_SHA into main on $GITHUB_REPOSITORY (not a fork)" \
-            jq -e \
-              --arg branch "$RELEASE_PR_BRANCH" \
-              --arg head "$RELEASE_PR_HEAD_SHA" \
-              --arg repo "$GITHUB_REPOSITORY" '
-                .state == "open" and .base.ref == "main" and
-                .head.ref == $branch and .head.sha == $head and
-                .head.repo.full_name == $repo and .head.repo.fork == false and
-                .user.login == "github-actions[bot]"
-              ' <<< "$pr"
+          jq -e \
+            --arg branch "$RELEASE_PR_BRANCH" \
+            --arg head "$RELEASE_PR_HEAD_SHA" \
+            --arg repo "$GITHUB_REPOSITORY" '
+              .state == "open" and .base.ref == "main" and
+              .head.ref == $branch and .head.sha == $head and
+              .head.repo.full_name == $repo and .head.repo.fork == false and
+              .user.login == "github-actions[bot]"
+            ' <<< "$pr" >/dev/null || fail pr-identity \
+            "PR #$RELEASE_PR_NUMBER failed the trusted lease: expected an open github-actions[bot] PR from $RELEASE_PR_BRANCH @ $RELEASE_PR_HEAD_SHA into main on $GITHUB_REPOSITORY (not a fork)"
 
           current_lock="$(gh api \
             "repos/$GITHUB_REPOSITORY/contents/Cargo.lock?ref=$RELEASE_PR_BRANCH")"
