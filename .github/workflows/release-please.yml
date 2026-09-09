@@ -756,41 +756,68 @@ jobs:
           RELEASE_PR_NUMBER: ${{ needs.release-pr.outputs.number }}
         run: |
           set -euo pipefail
+
+          # nw-463. Every assertion below used to be a bare `[ ... ]` or a
+          # `jq -e`, so under `set -e` a failure exited with NO message: the
+          # 9.3.0 release (workflow 34184171024, job 101929792791) failed here
+          # having already written a correct lockfile commit, and the log did
+          # not say which assertion tripped. Recovery took a human reading the
+          # API by hand. Each check now names its stage. None of these messages
+          # interpolate a token -- only SHAs, paths and sizes.
+          fail() { echo "::error::publish-lockfile [$1]: $2" >&2; exit 1; }
+          check() { # check <stage> <message> <cmd...>
+            local stage="$1" message="$2"; shift 2
+            "$@" || fail "$stage" "$message"
+          }
+
           files="$(find lockfile-artifact -maxdepth 1 -type f -printf '%f\n' | sort)"
-          [ "$files" = $'Cargo.lock\nlockfile-state.json' ]
-          test "$(stat -c '%s' lockfile-artifact/Cargo.lock)" -le 10485760
-          jq -e \
-            --arg head "$RELEASE_PR_HEAD_SHA" \
-            '.head_sha == $head and
-             (.original_blob | test("^[0-9a-f]{40}$")) and
-             (.sha256 | test("^[0-9a-f]{64}$")) and
-             (.changed | type == "boolean")' \
-            lockfile-artifact/lockfile-state.json >/dev/null
+          [ "$files" = $'Cargo.lock\nlockfile-state.json' ] || fail artifact-contents \
+            "expected exactly Cargo.lock and lockfile-state.json, got: $(echo "$files" | tr '\n' ' ')"
+          check artifact-size "Cargo.lock exceeds the 10 MiB ceiling" \
+            test "$(stat -c '%s' lockfile-artifact/Cargo.lock)" -le 10485760
+          check state-shape \
+            "lockfile-state.json does not describe head $RELEASE_PR_HEAD_SHA with a well-formed original_blob/sha256/changed" \
+            jq -e \
+              --arg head "$RELEASE_PR_HEAD_SHA" \
+              '.head_sha == $head and
+               (.original_blob | test("^[0-9a-f]{40}$")) and
+               (.sha256 | test("^[0-9a-f]{64}$")) and
+               (.changed | type == "boolean")' \
+              lockfile-artifact/lockfile-state.json
           expected_sha256="$(jq -er '.sha256' lockfile-artifact/lockfile-state.json)"
-          [ "$(sha256sum lockfile-artifact/Cargo.lock | awk '{print $1}')" = "$expected_sha256" ]
+          actual_sha256="$(sha256sum lockfile-artifact/Cargo.lock | awk '{print $1}')"
+          [ "$actual_sha256" = "$expected_sha256" ] || fail artifact-digest \
+            "Cargo.lock digest $actual_sha256 does not match the state file's $expected_sha256"
 
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER")"
-          jq -e \
-            --arg branch "$RELEASE_PR_BRANCH" \
-            --arg head "$RELEASE_PR_HEAD_SHA" \
-            --arg repo "$GITHUB_REPOSITORY" '
-              .state == "open" and .base.ref == "main" and
-              .head.ref == $branch and .head.sha == $head and
-              .head.repo.full_name == $repo and .head.repo.fork == false and
-              .user.login == "github-actions[bot]"
-            ' <<< "$pr" >/dev/null
+          # The exact-head and trusted-author lease. UNCHANGED in substance --
+          # nw-463 labels it, it does not loosen it.
+          check pr-identity \
+            "PR #$RELEASE_PR_NUMBER failed the trusted lease: expected an open github-actions[bot] PR from $RELEASE_PR_BRANCH @ $RELEASE_PR_HEAD_SHA into main on $GITHUB_REPOSITORY (not a fork)" \
+            jq -e \
+              --arg branch "$RELEASE_PR_BRANCH" \
+              --arg head "$RELEASE_PR_HEAD_SHA" \
+              --arg repo "$GITHUB_REPOSITORY" '
+                .state == "open" and .base.ref == "main" and
+                .head.ref == $branch and .head.sha == $head and
+                .head.repo.full_name == $repo and .head.repo.fork == false and
+                .user.login == "github-actions[bot]"
+              ' <<< "$pr"
 
           current_lock="$(gh api \
             "repos/$GITHUB_REPOSITORY/contents/Cargo.lock?ref=$RELEASE_PR_BRANCH")"
           original_blob="$(jq -er '.original_blob' lockfile-artifact/lockfile-state.json)"
-          [ "$(jq -er '.sha' <<< "$current_lock")" = "$original_blob" ]
+          current_blob="$(jq -er '.sha' <<< "$current_lock")"
+          [ "$current_blob" = "$original_blob" ] || fail lockfile-blob-lease \
+            "Cargo.lock on $RELEASE_PR_BRANCH is now blob $current_blob but the artifact was prepared against $original_blob — the branch's lockfile changed under the lease"
           changed="$(jq -er '.changed' lockfile-artifact/lockfile-state.json)"
           expected_head="$RELEASE_PR_HEAD_SHA"
           if [ "$changed" = true ]; then
             branch_head="$(gh api \
               "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_PR_BRANCH" \
               --jq '.object.sha')"
-            [ "$branch_head" = "$RELEASE_PR_HEAD_SHA" ]
+            [ "$branch_head" = "$RELEASE_PR_HEAD_SHA" ] || fail branch-head-lease \
+              "branch $RELEASE_PR_BRANCH is at $branch_head, not the leased $RELEASE_PR_HEAD_SHA — refusing to publish onto a moved branch"
             base_tree="$(gh api \
               "repos/$GITHUB_REPOSITORY/git/commits/$RELEASE_PR_HEAD_SHA" \
               --jq '.tree.sha')"
@@ -814,11 +841,42 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_PR_BRANCH" \
                 --input - >/dev/null
           fi
-          actual_head="$(gh api \
-            "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq '.head.sha')"
-          [ "$actual_head" = "$expected_head" ]
-          if [ "$(jq -r '.draft' <<< "$pr")" = true ]; then
-            gh pr ready "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          # nw-463. This comparison reads the PULLS API immediately after
+          # PATCHing the git ref, and those are not the same store: the ref
+          # update is committed while `pulls/N.head.sha` can still serve the
+          # pre-update value for a short window. A single read therefore failed
+          # a publication that had ALREADY SUCCEEDED -- 9.3.0 left a correct
+          # `synchronize Cargo.lock` commit on the branch and still went red,
+          # and the three preceding main-push workflows failed the same way.
+          #
+          # Bounded re-read, NOT a weakened check. The lease still has to land
+          # on exactly `$expected_head`. Lag is the only tolerated reading, and
+          # only as the pre-publication head we ourselves just built on: any
+          # THIRD value means the branch genuinely moved under us, which fails
+          # immediately rather than being retried into acceptance.
+          prior_head="$RELEASE_PR_HEAD_SHA"
+          actual_head=""
+          for attempt in $(seq 1 10); do
+            actual_head="$(gh api \
+              "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq '.head.sha')"
+            [ "$actual_head" = "$expected_head" ] && break
+            if [ "$actual_head" != "$prior_head" ]; then
+              fail head-diverged \
+                "PR #$RELEASE_PR_NUMBER head is $actual_head — neither the published $expected_head nor the pre-publication $prior_head. The branch changed under the lease; refusing to proceed."
+            fi
+            echo "PR head still reads $actual_head; expected $expected_head (attempt $attempt/10) — read-after-write lag, re-reading in 3s"
+            sleep 3
+          done
+          [ "$actual_head" = "$expected_head" ] || fail head-not-converged \
+            "PR #$RELEASE_PR_NUMBER head never advanced to $expected_head after 10 reads over ~30s (last read: $actual_head)"
+
+          # nw-463: a publication that leaves the PR in draft needs a human to
+          # click Ready, which is the manual step the item exists to remove.
+          # Re-read `draft` rather than reusing the pre-publication `$pr`: the
+          # value may have changed with the head we just pushed.
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq '.draft')" = true ]; then
+            check pr-ready "could not mark PR #$RELEASE_PR_NUMBER ready for review" \
+              gh pr ready "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY"
           fi
 
   build:
