@@ -1,5 +1,19 @@
 # Changelog
 
+## [10.0.0](https://github.com/Kehl-io/nestweaver/compare/v9.3.0...v10.0.0) (2026-09-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* a consumer gating on `status == "complete"` never passed under default settings and should move to `gate_state != "degraded-unknown"`. The MCP tool descriptions, the shipped agent guide and docs/ci-integration.md are updated to say so. SARIF is unaffected: `executionSuccessful` only keys off `Failed`.
+
+### Bug Fixes
+
+* bug-fix round — three customer reports plus four backlog items ([#383](https://github.com/Kehl-io/nestweaver/issues/383)) ([ce594ce](https://github.com/Kehl-io/nestweaver/commit/ce594ce7191372ea7ae592ba4210f5927fa1b36b))
+* harden daemon GC and cross-transport contracts ([#379](https://github.com/Kehl-io/nestweaver/issues/379)) ([c242b43](https://github.com/Kehl-io/nestweaver/commit/c242b43a1b12b0b4412e7f3c9d4016b6b9d96429))
+* harden scoped retrieval and mutation diagnostics ([#381](https://github.com/Kehl-io/nestweaver/issues/381)) ([1596139](https://github.com/Kehl-io/nestweaver/commit/15961390f6c4623b9d6aae7ea1cbc79dbbdb6983))
+* verify hooks, backup activity, UI ports and trigram deltas ([#382](https://github.com/Kehl-io/nestweaver/issues/382)) ([de8bf69](https://github.com/Kehl-io/nestweaver/commit/de8bf69623a0ddb3f6b5b18c860bf243e3f1dc84))
+
 ## [9.3.0](https://github.com/Kehl-io/nestweaver/compare/v9.2.0...v9.3.0) (2026-09-08)
 
 
