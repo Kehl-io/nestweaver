@@ -744,7 +744,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-lockfile-${{ needs.release-pr.outputs.number }}
           path: lockfile-artifact
@@ -1416,7 +1416,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - name: Recover exact packages from the bound source run
         if: ${{ needs.release-context.outputs.mode == 'resume' || needs.release-context.outputs.mode == 'recover-npm' }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
@@ -1424,7 +1424,7 @@ jobs:
           github-token: ${{ github.token }}
       - name: Download built release archives
         if: ${{ needs.release-context.outputs.mode == 'publish' }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-bundle-*
           path: ${{ runner.temp }}/release-bundle
@@ -1615,7 +1615,7 @@ jobs:
             sleep 15
           done
       - name: Download all four artifacts from the bound source run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-bundle-*
           path: release-bundle
@@ -1807,7 +1807,7 @@ jobs:
       - name: Download staged targets
         id: download
         continue-on-error: true
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-bundle-*
           path: release-bundle
@@ -1962,7 +1962,7 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - name: Download the exact attested npm packages
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
