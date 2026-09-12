@@ -8341,7 +8341,7 @@ enum AdminCommands {
     Instructions {
         #[arg(
             long,
-            help = "Print the subagent guidance to stdout (single clean output, hook-friendly)"
+            help = "Print subagent guidance. Markdown on a TTY; dual-format hook JSON when stdin is a PreToolUse event (Cursor blocks Task on markdown stdout)"
         )]
         for_subagent: bool,
         #[arg(
@@ -15937,13 +15937,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     return Ok((EXIT_SUCCESS, None));
                 }
                 // No flag (or only --for-subagent): print the relevant store.
-                // --for-subagent prints a single clean stdout payload for hooks.
+                // Claude Code treated markdown stdout as extra context. Cursor
+                // loads the same Claude Task hook and blocks the tool when
+                // stdout is not JSON. A TTY stays markdown; a piped PreToolUse
+                // event becomes dual-format hook JSON.
                 let text = if for_subagent {
                     admin::read_subagent_instructions()?
                 } else {
                     admin::read_main_instructions()?
                 };
-                print!("{text}");
+                let payload = if for_subagent && !std::io::stdin().is_terminal() {
+                    let mut stdin = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin)?;
+                    admin::format_subagent_hook_stdout(&text, &stdin)
+                } else {
+                    text
+                };
+                print!("{payload}");
                 Ok((EXIT_SUCCESS, None))
             }
             AdminCommands::InstallHook { runtime, dry_run } => {
