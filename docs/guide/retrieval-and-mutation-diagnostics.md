@@ -71,3 +71,7 @@ actionable error. Daemon-outage recovery continues to serve the degraded page.
 matcher in `PreToolUse`. Competing hooks, including match-all groups with no
 matcher, are preserved. Unsupported settings containers fail without writes;
 a successful write is reread and verified before reporting installation.
+`admin instructions --for-subagent` prints markdown on a TTY. When stdin is a
+PreToolUse JSON event (Claude Code or Cursor), it prints dual-format hook JSON
+(`permission: allow` plus `hookSpecificOutput.additionalContext`) so Cursor does
+not block Task for invalid JSON.

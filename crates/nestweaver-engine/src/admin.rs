@@ -10,10 +10,17 @@
 //!
 //! ## Runtime specificity
 //!
-//! The hook JSON schemas produced here are **Claude-Code-specific** (the
-//! `hooks` / `PreToolUse` / `matcher` shape in `settings.local.json`). Other
-//! runtimes are stubbed out behind [`Runtime`] so support can be added later
-//! without changing call sites.
+//! The hook JSON *settings* produced here are **Claude-Code-specific** (the
+//! `hooks` / `PreToolUse` / `matcher` shape in `settings.local.json`). Cursor
+//! loads that same file as a third-party hook source. Other runtimes are
+//! stubbed out behind [`Runtime`] so support can be added later without changing
+//! call sites.
+//!
+//! `--for-subagent` used to print markdown. Claude Code treated that as extra
+//! context. Cursor's PreToolUse runner requires JSON and **blocks Task** when
+//! stdout is markdown (`invalid JSON` / "blocked for safety").
+//! [`format_subagent_hook_stdout`] emits dual-format hook JSON when stdin is a
+//! PreToolUse event, and leaves markdown for a human TTY.
 
 use std::path::{Path, PathBuf};
 
@@ -162,6 +169,73 @@ pub fn reset_instructions() -> Result<(), anyhow::Error> {
 
 /// The command a runtime hook invokes to fetch subagent guidance.
 pub const HOOK_COMMAND: &str = "nestweaver admin instructions --for-subagent";
+
+/// Format `--for-subagent` stdout for the runtime that invoked the hook.
+///
+/// Empty stdin, non-JSON stdin, or JSON that is not a PreToolUse/Task/Agent
+/// event is returned unchanged (markdown). That is the human/TTY path.
+///
+/// A hook event becomes dual-format JSON: Cursor's flat `permission: allow`
+/// (and `updated_input.prompt` when the Task prompt is present) plus Claude
+/// Code's `hookSpecificOutput.additionalContext`. Cursor maps the nested
+/// `permissionDecision` to `permission`; either field is enough to stop it
+/// treating markdown as a failed hook.
+pub fn format_subagent_hook_stdout(instructions: &str, stdin: &str) -> String {
+    let trimmed = stdin.trim();
+    if trimmed.is_empty() {
+        return instructions.to_string();
+    }
+    let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+        return instructions.to_string();
+    };
+    if !is_subagent_hook_event(&event) {
+        return instructions.to_string();
+    }
+
+    let mut body = json!({
+        "permission": "allow",
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "additionalContext": instructions,
+        }
+    });
+
+    if let Some(updated) = prepend_guidance_to_task_prompt(&event, instructions) {
+        body["updated_input"] = updated.clone();
+        body["hookSpecificOutput"]["updatedInput"] = updated;
+    }
+
+    serde_json::to_string(&body).unwrap_or_else(|_| instructions.to_string())
+}
+
+fn is_subagent_hook_event(event: &Value) -> bool {
+    if !event.is_object() {
+        return false;
+    }
+    let tool_name = event.get("tool_name").and_then(Value::as_str);
+    if matches!(tool_name, Some("Task") | Some("Agent")) {
+        return true;
+    }
+    let event_name = event
+        .get("hook_event_name")
+        .or_else(|| event.get("hookEventName"))
+        .and_then(Value::as_str);
+    matches!(event_name, Some("PreToolUse") | Some("preToolUse")) && tool_name.is_some()
+}
+
+fn prepend_guidance_to_task_prompt(event: &Value, instructions: &str) -> Option<Value> {
+    let mut input = event.get("tool_input")?.clone();
+    let prompt = input.as_object()?.get("prompt")?.as_str()?.to_string();
+    if prompt.contains(instructions.trim()) {
+        return None;
+    }
+    input.as_object_mut()?.insert(
+        "prompt".to_string(),
+        json!(format!("{instructions}\n\n{prompt}")),
+    );
+    Some(input)
+}
 
 /// Build the PreToolUse hook entry (Claude-Code shape) for the `Task` matcher.
 ///
@@ -431,6 +505,66 @@ mod tests {
         let text = read_subagent_instructions().unwrap();
         assert!(!text.trim().is_empty());
         assert!(text.contains("Subagent"));
+    }
+
+    #[test]
+    fn subagent_hook_stdout_stays_markdown_without_a_hook_event() {
+        let guidance = "# Subagent guidance (NestWeaver)\nUse CLI.\n";
+        assert_eq!(format_subagent_hook_stdout(guidance, ""), guidance);
+        assert_eq!(format_subagent_hook_stdout(guidance, "   "), guidance);
+        assert_eq!(
+            format_subagent_hook_stdout(guidance, "not json"),
+            guidance,
+            "non-JSON stdin is the human path, not a parse failure"
+        );
+        assert_eq!(
+            format_subagent_hook_stdout(guidance, r#"{"foo":1}"#),
+            guidance,
+            "random JSON must not be treated as a hook event"
+        );
+    }
+
+    #[test]
+    fn cursor_task_hook_event_emits_allow_json_not_markdown() {
+        let guidance = "# Subagent guidance (NestWeaver)\nUse CLI.\n";
+        let stdin = json!({
+            "tool_name": "Task",
+            "tool_input": {
+                "description": "Explore cards",
+                "prompt": "Find the scoring path.",
+                "subagent_type": "explore"
+            },
+            "cursor_version": "1.7.2",
+            "hook_event_name": "preToolUse"
+        });
+        let out = format_subagent_hook_stdout(guidance, &stdin.to_string());
+        let parsed: Value = serde_json::from_str(&out).expect("Cursor requires JSON stdout");
+        assert_eq!(parsed["permission"], "allow");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], guidance);
+        let prompt = parsed["updated_input"]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.starts_with(guidance),
+            "Cursor PreToolUse has no additionalContext; prepend the prompt"
+        );
+        assert!(prompt.contains("Find the scoring path."));
+        assert_eq!(parsed["updated_input"]["subagent_type"], "explore");
+    }
+
+    #[test]
+    fn already_injected_prompt_is_not_grown() {
+        let guidance = "# Subagent guidance (NestWeaver)\nUse CLI.\n";
+        let stdin = json!({
+            "tool_name": "Task",
+            "tool_input": { "prompt": format!("{guidance}\n\nDo the thing.") }
+        });
+        let out = format_subagent_hook_stdout(guidance, &stdin.to_string());
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed.get("updated_input").is_none(),
+            "rewriting an already-injected prompt would grow it every retry"
+        );
+        assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], guidance);
     }
 
     #[test]
