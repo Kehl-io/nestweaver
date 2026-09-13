@@ -6248,6 +6248,10 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(observe(&mut client).is_none());
+    let idle = rt.block_on(client.brain_status()).unwrap();
+    assert_eq!(idle.write_queue_depth, 0);
+    assert!(idle.write_holder.is_empty());
+    assert!(!sidecar_path(&db, ".index-dirty").exists());
     let mut third = spawn(false);
     let _ = wait_registration(&mut client, 0);
     stop_daemon(&db);

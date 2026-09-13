@@ -24216,6 +24216,57 @@ external_model = "unavailable-test-model"
         assert!(watcher_status(&state).is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_stop_drains_inflight_batch_before_reporting_completion() {
+        let state = test_state_with_writer();
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        let factory = daemon_mutation_lease_factory(state.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _lease = factory("watch_code_batch").unwrap();
+            let _ = entered_tx.send(());
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            clear_watcher_registration(&worker_state, id);
+        });
+        state
+            .watcher_tasks
+            .lock()
+            .unwrap()
+            .push(WatcherTask { id, handle: worker });
+        entered_rx.await.unwrap();
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(StopWatchRequest { watcher_id: id });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut stopping = tokio::spawn(async move { service.stop_watch(request).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stopping)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.write_gate.holder_snapshot().unwrap().0,
+            "watch_code_batch"
+        );
+        release_tx.send(()).unwrap();
+        assert!(stopping.await.unwrap().unwrap().into_inner().ok);
+        assert!(watcher_status(&state).is_none());
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.write_gate.waiting(), 0);
+        assert!(state.write_gate.holder_snapshot().is_none());
+    }
+
     /// Spawn a process, wait for it, and return its pid — a pid that is
     /// provably not live by the time this returns, without guessing at a
     /// number. Reaping matters: a zombie is still `kill(pid, 0)`-visible, so an
