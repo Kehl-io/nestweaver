@@ -55,5 +55,13 @@ paired comparison, not a substitute for its matched reference.
 
 Correctness gates are the quoted-endpoint test with 256 plain sample rows then
 44 comma/quote-bearing endpoints, and a disk-backed four-stage failure matrix
-(note, symbol, component, parent COPY). Each failure reopens the complete prior
+(note/symbol COPY and component/parent transactional CREATE). Each failure reopens the complete prior
 project topology and verifies all four relationship types.
+
+Project-to-Project topology uses one prepared transactional CREATE per edge. The
+0.19.1 native engine left component adjacency storage unreadable after a later
+parent COPY failure in the disk-backed fault matrix (including a component self
+edge). The matrix retains that late failure and exact reopened graph checks;
+only the small topology path avoids COPY. High-volume note/symbol memberships
+still use COPY. Missing topology endpoints return an error rather than silently
+matching zero rows. The paired benchmark measures this complete production path.

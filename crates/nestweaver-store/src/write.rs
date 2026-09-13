@@ -5413,6 +5413,46 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Use transactional CREATE for the small Project-to-Project topology.
+    /// LadybugDB 0.19.1 can leave an unreadable component adjacency chunk when
+    /// a later parent COPY aborts after a component COPY (including self edges).
+    /// Keep bulk COPY for the high-volume Note/Symbol memberships, but avoid
+    /// that unsafe native COPY rollback combination for topology relationships.
+    fn insert_project_topology_edges_on(
+        conn: &lbug::Connection<'_>,
+        relationship: &'static str,
+        edges: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let mut statement = conn
+            .prepare(&format!(
+                "MATCH (source:Project {{uid: $source}}), (target:Project {{uid: $target}}) \
+                 CREATE (source)-[:{relationship} {{confidence: 1.0}}]->(target) RETURN source.uid"
+            ))
+            .map_err(|error| StoreError::Query(format!("prepare {relationship}: {error}")))?;
+        for (source, target) in edges {
+            let mut rows = conn
+                .execute(
+                    &mut statement,
+                    vec![
+                        ("source", lbug::Value::String(source.clone())),
+                        ("target", lbug::Value::String(target.clone())),
+                    ],
+                )
+                .map_err(|error| StoreError::Query(format!("insert {relationship}: {error}")))?;
+            // MATCH without an endpoint succeeds with zero rows. Reject that
+            // explicitly so incomplete topology can never be committed.
+            if rows.next().is_none() {
+                return Err(StoreError::Query(format!(
+                    "insert {relationship}: missing endpoint for {source} -> {target}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically replace all explicitly configured Project nodes and their
     /// membership relationships. Planning is deliberately performed by the
     /// engine before this call, so a lookup or remote-source failure cannot
@@ -6014,8 +6054,12 @@ impl GraphStore {
             // never relies on LadybugDB to resurrect detached relationships.
             Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_NOTE", &note_additions, 1.0)?;
             Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &symbol_additions, 1.0)?;
-            Self::copy_project_edges_on(&conn, "PROJECT_HAS_COMPONENT", &component_additions, 1.0)?;
-            Self::copy_project_edges_on(&conn, "PROJECT_HAS_PARENT", &parent_additions, 1.0)?;
+            Self::insert_project_topology_edges_on(
+                &conn,
+                "PROJECT_HAS_COMPONENT",
+                &component_additions,
+            )?;
+            Self::insert_project_topology_edges_on(&conn, "PROJECT_HAS_PARENT", &parent_additions)?;
             for project in projects
                 .iter()
                 .filter(|project| existing_project_uids.contains(&project.uid))
@@ -6071,6 +6115,7 @@ impl GraphStore {
             });
         };
         let primary = Self::rollback_project_transaction(&conn, error, "Project materialization");
+        drop(conn);
         if !recover_on_failure {
             return Err(ReplaceMaterializedProjectsError::ambiguous(primary));
         }
@@ -11598,7 +11643,7 @@ mod tests {
                 &[],
                 true,
             );
-            let error = result.expect_err("the selected COPY must fail");
+            let error = result.expect_err("the selected relationship insertion must fail");
             assert_eq!(
                 error.disposition,
                 ProjectMutationDisposition::ConfirmedRolledBack,
