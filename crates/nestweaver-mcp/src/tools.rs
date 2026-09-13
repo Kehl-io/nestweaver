@@ -3489,6 +3489,12 @@ fn semantic_cache_salt(name: &str, embed_model: Option<&dyn EmbedQueryFn>) -> u6
     hasher.finish()
 }
 
+fn response_is_transient(name: &str, value: &Value) -> bool {
+    semantic_response_is_degraded(name, value)
+        || (name == "detect_changes"
+            && value.get("deadline_exceeded").and_then(Value::as_bool) == Some(true))
+}
+
 fn semantic_response_is_degraded(name: &str, value: &Value) -> bool {
     matches!(name, "brain_context" | "project_context" | "brain_search")
         && value
@@ -3705,7 +3711,7 @@ fn maybe_cached(
         // Defense in depth for persisted entries produced by an older binary:
         // degraded semantic responses are transient readiness/inference states,
         // never durable answers. Ignore them even if their legacy key matches.
-        if !semantic_response_is_degraded(name, &value) {
+        if !response_is_transient(name, &value) {
             CACHE_HITS.with(|c| c.set(c.get() + 1));
             return Ok(value);
         }
@@ -3729,7 +3735,7 @@ fn maybe_cached(
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
         return Ok(result);
     }
-    if semantic_response_is_degraded(name, &result) {
+    if response_is_transient(name, &result) {
         return Ok(result);
     }
     match serde_json::to_vec(&result) {
@@ -24473,5 +24479,21 @@ mod hardening_aggregate_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_cache_tests {
+    use super::*;
+    #[test]
+    fn deadline_limited_impact_is_never_a_durable_cache_answer() {
+        assert!(response_is_transient(
+            "detect_changes",
+            &json!({"deadline_exceeded":true,"status":"partial"})
+        ));
+        assert!(!response_is_transient(
+            "detect_changes",
+            &json!({"deadline_exceeded":false,"status":"complete"})
+        ));
     }
 }
