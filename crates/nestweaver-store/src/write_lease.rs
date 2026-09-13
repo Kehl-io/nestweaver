@@ -298,7 +298,13 @@ pub enum WriteLeaseError {
 /// live external canonical owner. Acquisition may briefly retry an inherited
 /// `flock` left in the fork-before-exec window of another thread.
 pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
-    acquire_db_write_lease_inner(db_path, None)
+    acquire_db_write_lease_inner(db_path, None, true)
+}
+
+/// Acquire authority only for an existing database, without manufacturing a
+/// zero-byte database during a diagnostic or runtime cleanup operation.
+pub fn acquire_existing_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
+    acquire_db_write_lease_inner(db_path, None, false)
 }
 
 /// Acquire one database authority while an exclusive namespace authority is
@@ -314,7 +320,7 @@ pub fn acquire_db_write_lease_under_namespace(
             "namespace authority does not cover this database",
         )));
     }
-    acquire_db_write_lease_inner(db_path, Some(namespace))
+    acquire_db_write_lease_inner(db_path, Some(namespace), true)
 }
 
 /// Exclusively close the database-creation namespace for a destructive
@@ -443,8 +449,12 @@ fn stable_parent_refuses_new_entries(stable_parent: &Path) -> bool {
 fn acquire_db_write_lease_inner(
     db_path: &Path,
     namespace: Option<&DbNamespaceLease>,
+    allow_creation: bool,
 ) -> Result<DbWriteLease, WriteLeaseError> {
     let db_path = canonical_db_path(db_path);
+    if !allow_creation {
+        std::fs::metadata(&db_path).map_err(WriteLeaseError::Unavailable)?;
+    }
     // This must precede every database open. See PROCESS_DB_LEASES: even a
     // descriptor that never called F_SETLK would release the incumbent
     // process's record lock when the failed acquisition closed it.
@@ -522,23 +532,34 @@ fn acquire_db_write_lease_inner(
     // Atomic create-new preserves provenance for staged publication creation;
     // falling back only on AlreadyExists prevents an arbitrary empty file from
     // masquerading as one this authority created.
-    let (db_file, created_db_file) = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&db_path)
-    {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = std::fs::OpenOptions::new()
+    let (db_file, created_db_file) = if !allow_creation {
+        (
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .truncate(false)
                 .open(&db_path)
-                .map_err(WriteLeaseError::Unavailable)?;
-            (file, false)
+                .map_err(WriteLeaseError::Unavailable)?,
+            false,
+        )
+    } else {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&db_path)
+        {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&db_path)
+                    .map_err(WriteLeaseError::Unavailable)?;
+                (file, false)
+            }
+            Err(error) => return Err(WriteLeaseError::Unavailable(error)),
         }
-        Err(error) => return Err(WriteLeaseError::Unavailable(error)),
     };
     // Every failure from here on must unwind the database inode this call
     // created. Publishing an empty `.lbug` would make the caller's next
@@ -998,6 +1019,26 @@ mod tests {
             acquire_db_write_lease(&data.join("new.lbug")),
             Err(WriteLeaseError::Held)
         ));
+    }
+
+    #[test]
+    fn existing_only_authority_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("missing.lbug");
+        assert!(
+            matches!(acquire_existing_db_write_lease(&db), Err(WriteLeaseError::Unavailable(error))
+            if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(!db.exists());
+        std::fs::write(&db, b"existing").unwrap();
+        let lease = acquire_existing_db_write_lease(&db).unwrap();
+        assert!(lease.authorizes(&db));
+        assert!(!lease.authorizes_fresh_creation(&db));
+        assert!(matches!(
+            acquire_existing_db_write_lease(&db),
+            Err(WriteLeaseError::Held)
+        ));
+        assert_eq!(std::fs::read(&db).unwrap(), b"existing");
     }
 
     #[test]

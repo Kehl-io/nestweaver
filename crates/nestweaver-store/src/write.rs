@@ -5396,6 +5396,7 @@ impl GraphStore {
         if edges.is_empty() {
             return Ok(());
         }
+        let copy_started = std::time::Instant::now();
         let tmp_dir =
             tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join(format!("{relationship}.csv"));
@@ -5405,6 +5406,10 @@ impl GraphStore {
             "COPY {relationship} FROM '{csv_str}' {COPY_CSV_OPTS}"
         ))
         .map_err(|e| StoreError::Query(format!("COPY {relationship}: {e}")))?;
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "copy", relationship, rows = edges.len(),
+            elapsed_ms = copy_started.elapsed().as_secs_f64() * 1000.0,
+            "project materialization phase");
         Ok(())
     }
 
@@ -5881,6 +5886,7 @@ impl GraphStore {
         stale_uids: &[String],
         recover_on_failure: bool,
     ) -> Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError> {
+        let planning_started = std::time::Instant::now();
         let existing_note_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_NOTE")?;
         let existing_symbol_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_SYMBOL")?;
         let existing_component_edges = self.list_project_edge_pairs("PROJECT_HAS_COMPONENT")?;
@@ -5992,6 +5998,9 @@ impl GraphStore {
             });
         }
 
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "planning", elapsed_ms = planning_started.elapsed().as_secs_f64() * 1000.0,
+            "project materialization phase");
         let conn = self.begin_transaction()?;
         let mutation = (|| {
             for project in projects
@@ -6046,12 +6055,16 @@ impl GraphStore {
             }
             Ok(())
         })();
+        let commit_started = std::time::Instant::now();
         let publication = match mutation {
             Ok(()) => self.commit_transaction(&conn).map_err(|error| {
                 StoreError::Query(format!("Project materialization commit: {error}"))
             }),
             Err(error) => Err(error),
         };
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "commit", elapsed_ms = commit_started.elapsed().as_secs_f64() * 1000.0,
+            success = publication.is_ok(), "project materialization phase");
         let Err(error) = publication else {
             return Ok(ReplaceMaterializedProjectsOutcome {
                 disposition: ProjectMutationDisposition::Changed,

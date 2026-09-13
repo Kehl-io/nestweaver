@@ -2,15 +2,17 @@
 
 Namespace restore and publication mutation retain their existing lockfiles for
 compatibility and additionally hold an independent registry anchor keyed by the
-canonical data directory or publication root. The registry lives at the fixed
-`/tmp/nestweaver-authority-<effective UID>` path, with a private 0700 directory
-and 0600 files. It is deliberately independent of `TMPDIR`, replaceable data
+canonical data directory or publication root. The registry lives under the effective UID's account-database home at
+`.local/state/nestweaver/authority`, with a private 0700 directory
+and 0600 files. It is deliberately independent of `HOME`, `XDG_STATE_HOME`, `TMPDIR`, replaceable data
 roots, and publication `LOCK` files. Entries must not be pruned while any
 NestWeaver processes may be running. An empty entry costs one inode; entries
 contain no paths, credentials, PID authority, or graph data.
 
-This is a cooperating-process protocol. It assumes the private registry remains
-intact. Arbitrary same-UID mutation of registry entries, changing their access
+This is a cooperating-process protocol. It assumes the private registry and its ancestors remain
+intact. Account-home resolution uses `getpwuid_r`, avoiding temporary-directory
+cleaners and inconsistent launch environments. An absent account home fails
+closed instead of falling back to a second registry. Arbitrary same-UID mutation of registry entries, changing their access
 permissions, or direct writes to database bytes is outside the guarantee: an
 owner can always bypass their own advisory locks. Registry symlinks, foreign
 ownership, and permissive modes are refused. Descriptor/path identity is checked

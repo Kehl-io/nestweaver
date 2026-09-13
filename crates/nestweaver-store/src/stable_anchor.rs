@@ -2,7 +2,7 @@
 //!
 //! Registry entries are never pruned while processes may be running. This is
 //! cooperating-process exclusion, not protection from arbitrary same-UID writes:
-//! the owner must not modify the registry (including via tmp cleaners). See
+//! the owner must not modify the registry (including its ancestors). See
 //! docs/architecture/filesystem-authority.md for the explicit trust boundary.
 
 use std::fs::File;
@@ -27,14 +27,62 @@ pub fn descriptor_matches_path(file: &File, path: &Path) -> bool {
     !named.file_type().is_symlink() && opened.dev() == named.dev() && opened.ino() == named.ino()
 }
 
+/// Resolve the effective user's persistent state home from the account
+/// database, not launch-environment overrides that could split authorities.
+fn registry_root(uid: libc::uid_t) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = vec![0_u8; 16 * 1024];
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                entry.as_mut_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && bytes.len() < 1024 * 1024 {
+            bytes.resize(bytes.len() * 2, 0);
+            continue;
+        }
+        if code != 0 {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        if result.is_null() {
+            return Err(std::io::Error::other(
+                "effective UID has no account home for authority registry",
+            ));
+        }
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_dir.is_null() {
+            return Err(std::io::Error::other("effective UID has no account home"));
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        let home = Path::new(std::ffi::OsStr::from_bytes(home));
+        if !home.is_absolute() {
+            return Err(std::io::Error::other(
+                "effective UID account home is not absolute",
+            ));
+        }
+        return Ok(home.join(".local/state/nestweaver/authority"));
+    }
+}
+
 impl StableAnchor {
     pub fn acquire(domain: &str, canonical_path: &Path, exclusive: bool) -> std::io::Result<Self> {
         use std::os::unix::ffi::OsStrExt;
-        // Fixed /tmp, never TMPDIR: different clients must choose the same
-        // registry even when their launch environments differ.
+        // A persistent account-bound path, never /tmp or environment overrides:
+        // clients and ordinary temporary-file cleaners cannot split authorities.
         let uid = unsafe { libc::geteuid() };
-        let root = PathBuf::from(format!("/tmp/nestweaver-authority-{uid}"));
-        match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        let root = registry_root(uid)?;
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+        {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),

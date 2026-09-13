@@ -35368,6 +35368,10 @@ fn run_publication_rebuild(
                         state.revision,
                         PublicationPhase::Graph,
                     )?;
+                    #[cfg(debug_assertions)]
+                    if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY").is_some() {
+                        std::process::exit(87);
+                    }
                 }
                 PublicationPhase::Graph => {
                     verify_staged_publication_identity(&target_db, &state.plan)?;
