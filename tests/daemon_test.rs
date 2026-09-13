@@ -6208,13 +6208,28 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         "lifecycleAtomicSave",
         Some("lifecycle-renamed.js"),
     );
-    let status = rt.block_on(client.brain_status()).unwrap();
-    assert!(
-        status.write_holder.is_empty(),
-        "metadata event left a write holder: {}",
-        status.write_holder
-    );
-    assert!(status.watcher.unwrap().age_seconds >= 3);
+    // Symbol visibility precedes publication cleanup. Wait for the actual
+    // idle state instead of treating a fixed debounce sleep as a drain fence.
+    let idle_deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let status = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), client.brain_status()).await
+            })
+            .unwrap()
+            .unwrap();
+        if status.write_holder.is_empty() && status.write_queue_depth == 0 {
+            assert!(status.watcher.unwrap().age_seconds >= 3);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < idle_deadline,
+            "metadata event did not drain: holder={}, queued={}",
+            status.write_holder,
+            status.write_queue_depth,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     std::fs::remove_file(&renamed).unwrap();
     wait_symbol(&mut client, "lifecycleAtomicSave", None);
     let mut second = spawn(true);
