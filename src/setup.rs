@@ -104,7 +104,7 @@ fn probe_configured_tool(name: &str, base: &Path) {
 fn configured_mcp_entry(name: &str, base: &Path) -> anyhow::Result<serde_json::Value> {
     if name == "codex" {
         let text = std::fs::read_to_string(base.join(".codex/config.toml"))?;
-        let root: toml::Value = toml::from_str(&text)?;
+        let root: serde_json::Value = toml_edit::de::from_str(&text)?;
         return serde_json::to_value(
             root.get("mcp_servers")
                 .and_then(|v| v.get("nestweaver"))

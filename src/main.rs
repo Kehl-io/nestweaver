@@ -20298,7 +20298,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
-                    return Ok((EXIT_SUCCESS, None));
                 }
             }
 
