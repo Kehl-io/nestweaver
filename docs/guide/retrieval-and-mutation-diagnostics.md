@@ -71,3 +71,18 @@ actionable error. Daemon-outage recovery continues to serve the degraded page.
 matcher in `PreToolUse`. Competing hooks, including match-all groups with no
 matcher, are preserved. Unsupported settings containers fail without writes;
 a successful write is reread and verified before reporting installation.
+`admin instructions --for-subagent` prints markdown on a TTY. When stdin is a
+PreToolUse JSON event for Task or Agent (Claude Code or Cursor), it prints
+dual-format hook JSON with context and a guidance-prefixed prompt, preserving
+the other tool input fields. Both response formats retain `allow`; Claude's
+explicit deny/ask rules still apply. Other recognizable hook payloads, including
+Task/Agent events without a phase, receive `{}` with no decision or mutation.
+Empty, non-JSON, or unrelated JSON stdin retains the Markdown output.
+
+Claude's current PreToolUse contract does not inject plain-text stdout as
+context. Cursor can import the Claude settings when third-party hooks are
+enabled, and accepts either the flat or nested JSON response format. See the
+[Claude hook reference](https://code.claude.com/docs/en/hooks#pretooluse-decision-control)
+and [Cursor compatibility reference](https://cursor.com/docs/reference/third-party-hooks).
+`admin install-hook` installs only Claude settings; it does not register Codex hooks or
+implement a shared SubagentStart adapter across hosts.
