@@ -1001,7 +1001,7 @@ mod tests {
             std::fs::create_dir(&sibling).unwrap();
             let _independent = acquire_db_namespace_lease(&sibling).unwrap();
             drop(lease);
-            acquire_db_write_lease(&data.join("new.lbug")).unwrap();
+            drop(acquire_db_write_lease(&data.join("new.lbug")).unwrap());
         }
     }
 
