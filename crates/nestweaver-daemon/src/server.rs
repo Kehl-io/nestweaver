@@ -21313,7 +21313,7 @@ credential_method = "gh"
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
         let config = dir.path().join("instance.toml");
-        std::fs::write(&config, "instance_id = 'test'").unwrap();
+        write_provenance_test_config(&config, dir.path());
         let noncanonical = nested.join("..").join("instance.toml");
 
         let mut state = test_state_with_writer();

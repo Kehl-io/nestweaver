@@ -37,5 +37,6 @@
     "direct_stdout_sha256": "4ec47f76257d991e3664f2fcf427b766f702b409f52ede9c0da120cdaa126047",
     "daemon_stdout_sha256": "4ec47f76257d991e3664f2fcf427b766f702b409f52ede9c0da120cdaa126047",
     "retained_response": "impact-ambiguous.json"
-  }
+  },
+  "source_commit": "2edadc77d7c5983fd6b34a0a0076e6c0bfbd3228"
 }

@@ -81,3 +81,23 @@ Workspace compilation, formatting, workflow lint and committed ruleset checks
 passed. Independent review and the local regression gate are signed off. The PR
 checks must be green for the actual final head before merge; earlier green runs
 are not substituted for that gate.
+
+
+## CI fixture correction
+
+CI run [34766259109](https://github.com/Kehl-io/nestweaver/actions/runs/34766259109)
+failed the macOS status-path test because its fixture wrote only `instance_id`,
+not a valid instance configuration. Fresh eligibility reload correctly rejected
+that file. The same failure was reproduced locally on Linux. The fixture now
+uses the existing complete-config helper and retains its canonical-path assertion;
+production behavior is unchanged.
+
+That macOS run passed its engine (1,520), MCP (339) and store (566) tests; its
+daemon suite had 395 passes and this one failure. These are partial results from
+a failed CI job. The manual binary/source provenance explicitly identifies
+`2edadc77`; subsequent changes here only repair the test fixture and document
+validation. A new CI run must validate the corrected PR head.
+
+The corrected fixture was rebuilt with the workspace feature set; all 384 local
+daemon tests passed, including the canonical-path test and watcher lifecycle
+regressions. Formatting and diff checks passed.
