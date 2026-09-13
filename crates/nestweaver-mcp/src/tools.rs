@@ -10525,8 +10525,16 @@ fn tool_detect_changes_scoped(
     // importance the way blast_radius does. Sorting by (file_path, name) buys
     // determinism and nothing more — which is why the schema says the cut is
     // positional rather than implying the first N matter most.
+    let sorting_started = std::time::Instant::now();
     let mut ranked_symbols: Vec<_> = impact.affected_symbols.iter().collect();
     ranked_symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+    tracing::debug!(
+        tool = "detect_changes",
+        phase = "symbol_sorting",
+        elapsed_us = sorting_started.elapsed().as_micros() as u64,
+        symbols = ranked_symbols.len(),
+        "response symbol sorting completed"
+    );
 
     let affected_symbols: Vec<Value> = ranked_symbols
         .iter()
