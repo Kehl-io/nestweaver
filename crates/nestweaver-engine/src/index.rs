@@ -68,6 +68,7 @@ pub struct IndexResult {
     /// Symbols removed by replacement/deletion transactions during this run.
     pub symbols_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
+    pub exclusion_inventory: crate::content_reader::ExclusionInventory,
     /// Contract nodes written by the contract phase. `0` on a repo with no
     /// specs and no route handlers — and also `0` when derivation failed, which
     /// is exactly why `contracts_status` exists alongside it.
@@ -2159,6 +2160,15 @@ pub(crate) fn disclose_pruned_dir(
     pruned: crate::content_reader::SkippedDir,
     caller: SkipDirCaller,
 ) -> Option<SkippedFile> {
+    if matches!(caller, SkipDirCaller::Repo)
+        && matches!(
+            pruned.reason.as_str(),
+            crate::content_reader::CONFIGURED_EXCLUDE_REASON
+                | crate::content_reader::CONFIGURED_FILE_EXCLUDE_REASON
+        )
+    {
+        return None; // Reported independently by ExclusionInventory.
+    }
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
     }
@@ -4515,6 +4525,7 @@ where
             files_deleted,
             symbols_deleted,
             skipped_files,
+            exclusion_inventory: reader.exclusion_inventory(),
             contracts_derived,
             contracts_status,
         };
@@ -5549,6 +5560,7 @@ pub struct IncrementalResult {
     pub files_renamed: usize,
     pub files_skipped: usize,
     pub skipped_files: Vec<SkippedFile>,
+    pub exclusion_inventory: crate::content_reader::ExclusionInventory,
     pub symbols_added: usize,
     pub symbols_removed: usize,
     /// UIDs of every Symbol deleted during the run — the RAW delete set, which
@@ -5615,6 +5627,7 @@ fn drain_pruned_dirs_into_incremental(
     reader: &dyn crate::content_reader::ContentReader,
     result: &mut IncrementalResult,
 ) {
+    result.exclusion_inventory = reader.exclusion_inventory();
     for pruned in reader.skipped_dirs() {
         if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             record_incremental_file_outcome(result, IncrementalFileOutcome::PolicySkipped(skipped));
@@ -7381,6 +7394,7 @@ fn full_index_fallback(
         files_added: result.files_count,
         files_skipped: result.skipped_files.len(),
         skipped_files: result.skipped_files,
+        exclusion_inventory: result.exclusion_inventory,
         symbols_added: result.symbols_count,
         full_edges_count: Some(result.edges_count),
         files_deleted: result.files_deleted,
@@ -7797,27 +7811,9 @@ mod tests {
             .excludes(&["plugins/**".to_string()]);
         let result = index_directory_with_store_opts(&store, &src, &db_path, &opts, None).unwrap();
 
-        let excluded = result
-            .skipped_files
-            .iter()
-            .find(|skipped| skipped.path == "plugins")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the excluded directory must still be disclosed: {:?}",
-                    result.skipped_files
-                )
-            });
-        assert!(
-            excluded.reason.contains("exclude"),
-            "the remedy must name the mechanism that actually pruned it: {:?}",
-            excluded.reason
-        );
-        assert!(
-            !excluded.reason.contains("unskip"),
-            "`unskip` does not govern `exclude`; offering it is a remedy that \
-             does nothing: {:?}",
-            excluded.reason
-        );
+        assert_eq!(result.exclusion_inventory.observed_paths, ["plugins"]);
+        assert_eq!(result.exclusion_inventory.tracked_files, None);
+        assert!(!result.skipped_files.iter().any(|row| row.path == "plugins"));
 
         let default_prune = result
             .skipped_files
@@ -11393,6 +11389,98 @@ function hello(name) { return "Hello " + name; }
             "neither route may be declared-not-implemented; got {:?}",
             report.declared_not_implemented
         );
+    }
+
+    #[test]
+    fn exclusions_survive_full_incremental_steady_state_and_force_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("plugins")).unwrap();
+        fs::write(root.join("main.rs"), "pub fn visible() {}\n").unwrap();
+        fs::write(root.join("plugins/vendor.rs"), "pub fn hidden() {}\n").unwrap();
+        let git = commit_all_in(&root, "initial");
+        let db = dir.path().join("index.lbug");
+        let excludes = vec!["plugins/**".to_string()];
+        let sha = git(&["rev-parse", "HEAD"]);
+        let opts =
+            IndexOptions::new("test", "https://example.test/excludes", &sha).excludes(&excludes);
+        let initial = index_directory_with_opts(&root, &db, &opts).unwrap();
+        assert_eq!(initial.files_count, 1);
+        assert_eq!(initial.exclusion_inventory.tracked_files, Some(1));
+        assert!(initial.skipped_files.is_empty());
+        for iteration in 0..3 {
+            match iteration {
+                0 => {
+                    fs::write(root.join("plugins/added.rs"), "pub fn added_hidden() {}\n").unwrap();
+                }
+                1 => {
+                    fs::write(
+                        root.join("plugins/vendor.rs"),
+                        "pub fn changed_hidden() {}\n",
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    fs::remove_file(root.join("plugins/added.rs")).unwrap();
+                }
+            }
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", "excluded mutation"]);
+            let incremental = incremental_index_with_excludes(
+                &root,
+                &db,
+                "test",
+                "https://example.test/excludes",
+                None,
+                crate::index_limits::IndexLimits::default(),
+                &excludes,
+            )
+            .unwrap();
+            assert!(!incremental.fell_back_to_full);
+            assert_eq!(incremental.files_added + incremental.files_modified, 0);
+            assert!(incremental.skipped_files.is_empty());
+            assert_eq!(
+                incremental.exclusion_inventory.tracked_files,
+                Some(if iteration < 2 { 2 } else { 1 })
+            );
+        }
+        let steady = incremental_index_with_excludes(
+            &root,
+            &db,
+            "test",
+            "https://example.test/excludes",
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &excludes,
+        )
+        .unwrap();
+        assert_eq!(steady.exclusion_inventory.tracked_files, Some(1));
+        let head = git(&["rev-parse", "HEAD"]);
+        let forced = index_directory_with_opts(
+            &root,
+            &db,
+            &IndexOptions::new("test", "https://example.test/excludes", &head)
+                .excludes(&excludes)
+                .force(true),
+        )
+        .unwrap();
+        assert_eq!(forced.files_count, 1);
+        assert_eq!(forced.exclusion_inventory.tracked_files, Some(1));
+        assert!(forced.skipped_files.is_empty());
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert!(
+            store
+                .symbols_in_file("plugins/vendor.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .symbols_in_file("plugins/added.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.symbols_in_file("main.rs").unwrap().is_empty());
     }
 
     #[test]

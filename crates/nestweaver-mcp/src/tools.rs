@@ -630,7 +630,7 @@ fn redact_response_for_visibility(
 
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
-const LITE_TOOLS: &[&str] = &[
+pub const LITE_TOOLS: &[&str] = &[
     "brain_context",
     "brain_search",
     "brain_impact",
@@ -8226,7 +8226,19 @@ pub fn brain_status_json(
     let warnings = brain_status_warnings_for(store, store.db_path(), publication_status.as_ref());
     let repos_json: Vec<Value> = repos
         .iter()
-        .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
+        .map(|r| {
+            use nestweaver_engine::content_reader::{ContentReader, FilesystemReader};
+            let config = current_instance_config();
+            let root = r.local_root().map(Path::new);
+            let excludes = config
+                .as_ref()
+                .map(|cfg| cfg.exclude_globs_for(&r.url, root))
+                .unwrap_or(&[]);
+            let inventory = root
+                .and_then(|root| FilesystemReader::new(root).excluding(excludes).ok())
+                .map(|reader| reader.exclusion_inventory());
+            json!({ "url": r.url, "sha": r.indexed_sha, "exclusion_inventory": inventory })
+        })
         .collect();
 
     // Every instance id present in this database, sorted for a stable
@@ -8385,6 +8397,9 @@ pub fn brain_status_json(
         // values, and the CLI's direct fallback re-nulls the two tantivy
         // fields (a process without the daemon's index open cannot claim
         // `false`/`0` honestly) and marks the document degraded.
+        "runtime_telemetry": "unavailable",
+        "watcher": Value::Null,
+        "supervision": "unknown/unverifiable",
         "embedding_status": Value::Null,
         "search_status": Value::Null,
         "indexing_active": Value::Null,
@@ -8797,6 +8812,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "coverage_status": if result.skipped_files.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped_files.len(),
                 "skipped_files": result.skipped_files,
+                "exclusion_inventory": result.exclusion_inventory,
             }));
         }
 
@@ -9581,13 +9597,13 @@ fn tool_brain_impact(
         match store.lookup_symbol(symbol) {
             Ok(sym) if uid_is_visible(&sym.uid) => sym.uid,
             Ok(_) | Err(nestweaver_store::StoreError::NotFound) => {
-                return Ok(json!({
+                return Ok(nestweaver_schema::responses::impact(json!({
                     "status": "not_found",
                     "symbol": symbol,
                     "impact_nodes": [],
                     "total": 0,
                     "returned": 0,
-                }));
+                })));
             }
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
@@ -9598,13 +9614,13 @@ fn tool_brain_impact(
         matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
         match matches.len() {
             0 => {
-                return Ok(json!({
+                return Ok(nestweaver_schema::responses::impact(json!({
                     "status": "not_found",
                     "symbol": symbol,
                     "impact_nodes": [],
                     "total": 0,
                     "returned": 0,
-                }));
+                })));
             }
             1 => matches.into_iter().next().unwrap().uid,
             _ => {
@@ -9619,11 +9635,11 @@ fn tool_brain_impact(
                         })
                     })
                     .collect();
-                return Ok(json!({
+                return Ok(nestweaver_schema::responses::impact(json!({
                     "status": "ambiguous",
                     "symbol": symbol,
                     "candidates": candidates,
-                }));
+                })));
             }
         }
     };
@@ -9674,8 +9690,9 @@ fn tool_brain_impact(
         })
         .collect();
 
-    Ok(json!({
+    Ok(nestweaver_schema::responses::impact(json!({
         "status": "ok",
+        "symbol": symbol,
         "target": uid,
         "impact_nodes": rows,
         "total": total,
@@ -9696,7 +9713,7 @@ fn tool_brain_impact(
         // order, so blaming exactly one would discard two live remedies.
         "truncated_by_limit": rows.len() < total,
         "note": note,
-    }))
+    })))
 }
 
 // ── 9. brain_guide ──────────────────────────────────────────────────────────
@@ -10562,8 +10579,14 @@ fn tool_detect_changes_scoped(
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
         "process_analysis_unavailable": false,
+        "work_budget_exceeded": impact.work_budget_exceeded,
+        "deadline_exceeded": impact.deadline_exceeded,
+        "affected_symbol_count_relation": if impact.deadline_exceeded { "gte" } else { "eq" },
+        "traversal_steps": impact.traversal_steps,
+        "phase_millis": impact.phase_millis,
+        "affected_process_count_relation": if impact.work_budget_exceeded || impact.deadline_exceeded { "gte" } else { "eq" },
         "limit": limit,
-        "truncated": symbols_omitted > 0 || processes_omitted > 0,
+        "truncated": symbols_omitted > 0 || processes_omitted > 0 || impact.work_budget_exceeded || impact.deadline_exceeded,
         "symbols_omitted": symbols_omitted,
         "processes_omitted": processes_omitted,
     }))
@@ -11877,13 +11900,21 @@ fn tool_project_context(
     member_uids.retain(|u| seen.insert(u.clone()));
 
     if member_uids.is_empty() {
-        return Ok(json!({
+        let mut response = json!({
             "project": project.name,
             "project_uid": project.uid,
             "seeds_expanded": 0,
             "connected": [],
             "tokens_used": 0,
             "token_budget": token_budget,
+            "more_available": 0,
+            "truncated": false,
+            "truncated_by": Value::Null,
+            "seed_tokens_charged": 0,
+            "budget_exceeded": false,
+            "semantic_applied": false,
+            "semantic_unavailable": Value::Null,
+            "degraded_components": [],
             "note": "No notes or symbols are associated with this project yet.",
             // Disclosed here too: an empty answer is still AN answer, and two
             // routes disagreeing about whether a project has members is
@@ -11892,7 +11923,20 @@ fn tool_project_context(
                 "answered_by": answering_config_disclosure(),
                 "answer_shaping": answer_shaping_disclosure(store, embed_model),
             },
-        }));
+        });
+        if args
+            .get("include_seeds")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            response["seeds"] = json!([]);
+        }
+        for _ in 0..3 {
+            let tokens = serde_json::to_vec(&response)?.len().div_ceil(4);
+            response["tokens_used"] = json!(tokens);
+            response["budget_exceeded"] = json!(tokens > token_budget);
+        }
+        return Ok(response);
     }
 
     // 4. Seed PPR from the project node, its components, and — critically —
@@ -12318,6 +12362,7 @@ fn tool_project_context(
         "token_budget": token_budget,
         "more_available": connected_dropped,
         "truncated": connected_dropped > 0,
+        "truncated_by": if connected_dropped > 0 { Some("token_budget") } else { None },
         // The ACTUAL serialized size, not the pre-serialization estimate.
         //
         // The estimate charges `seed_tokens` against the budget even when
@@ -14926,6 +14971,7 @@ fn dispatch_add_source_via_daemon(
                 "path": path,
                 "type": "vault",
                 "message": last_msg,
+                "exclusion_inventory": terminal.as_ref().and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
                 "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
                 "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
                 "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
@@ -14971,6 +15017,7 @@ fn dispatch_add_source_via_daemon(
                 "path": path,
                 "type": "repo",
                 "message": last_msg,
+                "exclusion_inventory": terminal.as_ref().and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
                 "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
                 "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
                 "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
@@ -16065,6 +16112,34 @@ mod project_context_bug12_tests {
         set_current_instance_config(Some(std::sync::Arc::new(cfg2)));
         let populated = ask();
         set_current_instance_config(None);
+        for key in [
+            "project",
+            "project_uid",
+            "seeds_expanded",
+            "connected",
+            "tokens_used",
+            "token_budget",
+            "more_available",
+            "truncated",
+            "truncated_by",
+            "seed_tokens_charged",
+            "budget_exceeded",
+            "semantic_applied",
+            "semantic_unavailable",
+            "degraded_components",
+            "_meta",
+        ] {
+            assert!(named.get(key).is_some(), "empty project omitted {key}");
+            assert!(
+                populated.get(key).is_some(),
+                "populated project omitted {key}"
+            );
+            assert_eq!(
+                std::mem::discriminant(&named[key]),
+                std::mem::discriminant(&populated[key]),
+                "type mismatch for {key}"
+            );
+        }
         assert!(
             populated["connected"]
                 .as_array()

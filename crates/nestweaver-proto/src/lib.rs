@@ -4,6 +4,13 @@ pub mod nestweaver_daemon_v1 {
 
 pub use nestweaver_daemon_v1::*;
 
+/// Exclusion counts describe Git-tracked inventory, never an estimate of
+/// unvisited descendants. Null means the Git inventory was unavailable.
+pub fn exclusion_inventory_json(value: &ExclusionInventory) -> serde_json::Value {
+    serde_json::json!({"patterns": value.patterns, "tracked_files": value.tracked_files,
+        "observed_paths": value.observed_paths})
+}
+
 /// One lossless structured representation for every prune consumer.
 pub fn prune_stale_json(response: &PruneStaleResponse) -> serde_json::Value {
     serde_json::json!({

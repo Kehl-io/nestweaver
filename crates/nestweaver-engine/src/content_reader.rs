@@ -48,6 +48,17 @@ pub struct BinarySource {
 /// read re-spawns a fresh batch process.
 const CAT_FILE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Configured exclusions are an inventory boundary, not parse failures.
+/// `tracked_files` counts git-index paths matched by the same compiled matcher;
+/// null means git inventory was unavailable. Untracked descendants of pruned
+/// directories are deliberately not enumerated merely to produce a count.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExclusionInventory {
+    pub patterns: Vec<String>,
+    pub tracked_files: Option<usize>,
+    pub observed_paths: Vec<String>,
+}
+
 /// Abstracts how the indexer reads file contents and discovers files.
 /// `FilesystemReader` preserves local behavior; `GitBareReader` (added in Task 6)
 /// reads from blobless bare clones via a pooled, persistent `git cat-file --batch`
@@ -157,6 +168,13 @@ pub trait ContentReader: Send + Sync {
     /// which is what every local `index`/`--fail-on-skip` run uses, and what
     /// nw-387 measured — is covered. Closing the bare-clone half needs a
     /// recorder in `list_files` there and is deliberately not smuggled in here.
+    fn exclusion_inventory(&self) -> ExclusionInventory {
+        ExclusionInventory {
+            tracked_files: Some(0),
+            ..Default::default()
+        }
+    }
+
     fn skipped_dirs(&self) -> Vec<SkippedDir> {
         Vec::new()
     }
@@ -502,6 +520,16 @@ impl FilesystemReader {
         self.excludes = Some(builder.build().context("build exclude globset")?);
         self.dir_excludes = Some(dir_builder.build().context("build exclude globset")?);
         Ok(self)
+    }
+
+    /// The compiled repository policy for watcher events, including deleted
+    /// paths that cannot be rediscovered by a filesystem walk.
+    pub fn accepts_path(&self, rel: &Path) -> bool {
+        !path_in_configured_skip_dir(rel, self.skip_dirs, &self.unskip)
+            && !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel))
+            && !rel.ancestors().skip(1).any(|dir| {
+                !dir.as_os_str().is_empty() && dir_is_excluded(self.dir_excludes.as_ref(), dir)
+            })
     }
 
     /// Repo-relative paths in git's index, or `None` when this root is not a
@@ -916,6 +944,43 @@ impl ContentReader for FilesystemReader {
     /// here would compile, satisfy the existing test, and remain unreachable
     /// from the only place that needed it — which is precisely how nw-325
     /// shipped half-done.
+    fn exclusion_inventory(&self) -> ExclusionInventory {
+        let tracked_files = if self.excludes.is_none() {
+            Some(0)
+        } else {
+            self.git_tracked_files().map(|files| {
+                files
+                    .iter()
+                    .filter(|rel| {
+                        self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel))
+                            || rel.ancestors().skip(1).any(|dir| {
+                                !dir.as_os_str().is_empty()
+                                    && dir_is_excluded(self.dir_excludes.as_ref(), dir)
+                            })
+                    })
+                    .count()
+            })
+        };
+        let mut observed_paths: Vec<_> = self
+            .skipped_dirs()
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.reason.as_str(),
+                    CONFIGURED_EXCLUDE_REASON | CONFIGURED_FILE_EXCLUDE_REASON
+                )
+            })
+            .map(|row| row.path)
+            .collect();
+        observed_paths.sort();
+        observed_paths.dedup();
+        ExclusionInventory {
+            patterns: self.exclude_patterns.clone(),
+            tracked_files,
+            observed_paths,
+        }
+    }
+
     fn skipped_dirs(&self) -> Vec<SkippedDir> {
         self.skipped_dirs
             .lock()

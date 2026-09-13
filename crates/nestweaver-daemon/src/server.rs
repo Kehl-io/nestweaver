@@ -2910,7 +2910,8 @@ impl DaemonService {
             .unwrap_or_default();
         let mut watcher =
             nestweaver_engine::CodeWatcher::new(&self.state.db_path, &repo_path, &instance_id)
-                .with_limits(limits);
+                .with_limits(limits)
+                .with_instance_config(self.state.instance_cfg.clone());
         let shutdown_handle = watcher.shutdown_handle();
 
         // Refuse shutdown before mutating the registry. This admission guard
@@ -6826,6 +6827,11 @@ impl NestWeaverDaemon for DaemonService {
                 Some(&cancel_for_index),
             ) {
                 Ok(result) => {
+                    let exclusion_inventory = Some(nestweaver_proto::ExclusionInventory {
+                        patterns: result.exclusion_inventory.patterns.clone(),
+                        tracked_files: result.exclusion_inventory.tracked_files.map(|n| n as u64),
+                        observed_paths: result.exclusion_inventory.observed_paths.clone(),
+                    });
                     let skipped_count = result.skipped_files.len();
                     let skipped_files = index_skip_details(&result.skipped_files);
                     let coverage_status = if skipped_count == 0 {
@@ -6846,6 +6852,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files: skipped_files.clone(),
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: exclusion_inventory.clone(),
                     }));
 
                     // PageRank is deferred to first query (lazy evaluation
@@ -6882,6 +6889,7 @@ impl NestWeaverDaemon for DaemonService {
                             skipped_files: skipped_files.clone(),
                             coverage_status,
                             trigram_refresh: None,
+                            exclusion_inventory: exclusion_inventory.clone(),
                         }));
                         return;
                     }
@@ -7124,6 +7132,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files: skipped_files.clone(),
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
 
                     let mutation = indexed_search_mutation(
@@ -7164,6 +7173,7 @@ impl NestWeaverDaemon for DaemonService {
                             skipped_files,
                             coverage_status,
                             trigram_refresh: None,
+                            exclusion_inventory: None,
                         }));
                         return;
                     }
@@ -7181,6 +7191,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files,
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
                 }
                 Err(e) => {

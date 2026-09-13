@@ -85,7 +85,58 @@ fn configure_tool(
         "hermes" => setup_hermes(db_path, base)?,
         _ => {}
     }
+    if name != "aider" {
+        match configured_mcp_entry(name, base) {
+            Ok(entry) => crate::setup_probe::report(&entry, base),
+            Err(error) => eprintln!(
+                "Server probe: not run ({error:#}). Host activation remains unverified; restart the host and inspect its tool list."
+            ),
+        }
+    }
     Ok(())
+}
+
+/// Read back what setup actually left on disk, including preserved custom
+/// commands, profiles, database bindings, and environment variables.
+fn configured_mcp_entry(name: &str, base: &Path) -> anyhow::Result<serde_json::Value> {
+    if name == "codex" {
+        let text = std::fs::read_to_string(base.join(".codex/config.toml"))?;
+        let root: toml::Value = toml::from_str(&text)?;
+        return serde_json::to_value(
+            root.get("mcp_servers")
+                .and_then(|v| v.get("nestweaver"))
+                .ok_or_else(|| anyhow::anyhow!("NestWeaver registration missing"))?,
+        )
+        .map_err(Into::into);
+    }
+    let relative = match name {
+        "claude-code" => ".mcp.json",
+        "cursor" => ".cursor/mcp.json",
+        "jetbrains" => ".junie/mcp/mcp.json",
+        "vscode" => ".vscode/mcp.json",
+        "gemini" => ".gemini/settings.json",
+        "copilot" => ".github/copilot-mcp.json",
+        "kiro" => ".kiro/settings.json",
+        "continue" => ".continue/config.json",
+        "cline" => ".cline/settings.json",
+        "opencode" => ".opencode/config.json",
+        "trae" => ".trae/config.json",
+        "devin" => "devin.json",
+        "hermes" => ".hermes/config.json",
+        "windsurf" => ".codeium/windsurf/mcp_config.json",
+        _ => anyhow::bail!("tool does not have a generated MCP registration"),
+    };
+    let root = if name == "windsurf" {
+        dirs::home_dir().context("home directory unavailable")?
+    } else {
+        base.to_path_buf()
+    };
+    let config = user_config::read_json_config(&root.join(relative), SETUP_COMMAND)?;
+    config
+        .value
+        .pointer("/mcpServers/nestweaver")
+        .cloned()
+        .context("NestWeaver registration missing")
 }
 
 pub fn run_setup(
@@ -1149,34 +1200,16 @@ fn generate_skill_content() -> String {
 }
 
 fn generate_cursor_rule_content() -> String {
-    "---\ndescription: Use NestWeaver for structural codebase understanding\nglobs:\nalwaysApply: true\n---\n\n\
-## Retrieval doctrine (token efficiency)\n\n\
-**Prefer the graph over raw files.** A single `brain_context` call returns ~1,000 tokens of ranked, structural \
-context vs ~10,000+ tokens from file-by-file exploration (validated 10x reduction, 2x fewer tool calls). Use NestWeaver tools INSTEAD OF grep/find/cat \
-whenever you need to understand code structure, find related symbols, or check impact.\n\n\
-- DO: `brain_context` seeded with a symbol → get ranked neighbors in one call\n\
-- DO: `brain_search` to find symbols/notes by name → faster than grep, searches code AND notes\n\
-- DO: `brain_impact` before modifying code → see blast radius without reading callers\n\
-- DO NOT: grep/rg across the whole repo to find usages — `brain_context` already has them\n\
-- DO NOT: read files to understand architecture — `brain_guide` or `hub_nodes` gives the structural picture\n\
-- DO NOT: open files just to check what a function does — `read_symbols` returns just the symbol body\n\n\
-## Key tools\n\n\
-- `brain_context` — PPR-ranked structural context from symbol/note seeds\n\
-- `brain_search` — full-text search across code AND notes in one call\n\
-- `brain_impact` — blast radius before modifying code\n\
-- `project_context` — project-scoped notes and symbols\n\
-- `detect_changes` — assess risk after changes\n\
-- `investigate` → `investigate_hydrate` → `read_symbols` — progressive disclosure\n\
-- `dead_code` — find unreachable symbols\n\
-- `hub_nodes` / `bridge_nodes` — find central and critical code\n\
-- `get_summary` — token-efficient overview at file or cluster level\n\n\
-## Quick Tool Reference\n\n\
-- Explore a topic: `brain_context` (seed with name, filter by repo)\n\
-- Find a symbol: `brain_search`\n\
-- Check impact: `brain_impact` or `blast_radius`\n\
-- Read source: `read_symbols` (not whole files)\n\
-- Don't grep indexed repos — use `brain_search`\n\
-- Don't read entire files — use `read_symbols`\n\n".to_string()
+    let mut text = String::from(
+        "---\ndescription: Use NestWeaver for structural codebase understanding\nglobs:\nalwaysApply: true\n---\n\n# NestWeaver capability profile v1: lite\n\nConfirm the host exposes these tools before following this guide. Configuration and a server handshake do not prove host activation; restart the host session if the tools are missing.\n\n",
+    );
+    for (name, description, _, _) in nestweaver_mcp::tools::tool_doc_entries() {
+        if nestweaver_mcp::tools::LITE_TOOLS.contains(&name.as_str()) {
+            text.push_str(&format!("- `{name}` — {description}\n"));
+        }
+    }
+    text.push_str("\nUse brain_context for structural exploration, brain_impact before changing a symbol, and detect_changes for the changed-file review. This lite registration does not expose every NestWeaver tool. For additional capabilities use the documented CLI command with the same --config and --db bindings, or explicitly enable the full MCP profile. If a capability cannot be verified, report that review step as unverified; do not equate a text search with graph impact analysis.\n");
+    text
 }
 
 fn generate_copilot_instructions() -> String {

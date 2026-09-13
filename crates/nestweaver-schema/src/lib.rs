@@ -7,6 +7,7 @@ pub mod limits;
 pub mod nodes;
 pub mod provenance;
 pub mod repo_url;
+pub mod responses;
 pub mod uid;
 pub mod version;
 

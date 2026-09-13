@@ -82,6 +82,7 @@ macro_rules! println {
 }
 
 mod setup;
+mod setup_probe;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -2163,8 +2164,10 @@ fn print_json_payload(payload: &serde_json::Value) -> anyhow::Result<()> {
 /// Every other surface here already returns an envelope (`blast_radius`,
 /// `dead-code`, `broken-links`, `contracts drift`); `impact` was the outlier.
 /// `status` is the discriminator a consumer branches on (nw-111).
+#[allow(clippy::too_many_arguments)]
 fn impact_json_ok(
     symbol: &str,
+    target: Option<&str>,
     nodes: serde_json::Value,
     truncated_by_threshold: bool,
     truncated_by_depth: bool,
@@ -2178,6 +2181,7 @@ fn impact_json_ok(
     let mut payload = serde_json::json!({
         "status": "ok",
         "symbol": symbol,
+        "target": target,
         "nodes": nodes,
         "truncated": truncated_by_threshold || truncated_by_depth || capped,
         "truncated_by_threshold": truncated_by_threshold,
@@ -2218,7 +2222,7 @@ fn impact_json_ok(
             obj.insert("note".to_string(), serde_json::json!(note));
         }
     }
-    payload
+    nestweaver_schema::responses::impact(payload)
 }
 
 /// Length of a JSON node collection, for envelopes that must report what they
@@ -2690,12 +2694,12 @@ fn impact_json_ambiguous(
     repo_filter: Option<&str>,
     candidates: serde_json::Value,
 ) -> serde_json::Value {
-    serde_json::json!({
+    nestweaver_schema::responses::impact(serde_json::json!({
         "status": "ambiguous",
         "symbol": symbol,
         "candidates": candidates,
         "note": impact_ambiguity_remedy(repo_filter),
-    })
+    }))
 }
 
 /// The one sentence both the JSON and the text renderings of an ambiguous
@@ -2715,12 +2719,12 @@ fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
-    serde_json::json!({
+    nestweaver_schema::responses::impact(serde_json::json!({
         "status": "not_found",
         "symbol": symbol,
         "error": "not found",
         "name": symbol,
-    })
+    }))
 }
 
 /// Render a `dead-code` result as text from its JSON payload.
@@ -18568,8 +18572,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // start.
             let write_lease = require_exclusive_store_access(&db_path, "watch")?;
 
-            let watcher =
-                CodeWatcher::new(&db_path, &repo_path, &instance_id).with_limits(index_limits);
+            let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id)
+                .with_limits(index_limits)
+                .with_instance_config(
+                    config
+                        .as_deref()
+                        .map(nestweaver_engine::InstanceConfig::from_file)
+                        .transpose()?
+                        .map(std::sync::Arc::new),
+                );
             let stop = watcher.shutdown_handle();
 
             let lock_path = {
@@ -20156,6 +20167,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // and made the text path print nothing and exit 0.
                     let envelope = value;
                     let value = brain_impact_local_tier(&envelope).clone();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&envelope)?);
+                        let code = match value.get("status").and_then(serde_json::Value::as_str) {
+                            Some("not_found") => EXIT_NOT_FOUND,
+                            Some("ambiguous") => EXIT_AMBIGUOUS,
+                            _ => EXIT_SUCCESS,
+                        };
+                        return Ok((code, None));
+                    }
+
                     // Honor the daemon tool's status so daemon mode matches the direct path's
                     // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
                     match value.get("status").and_then(|v| v.as_str()) {
@@ -20222,62 +20243,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         _ => {}
                     }
-                    if json {
-                        // nw-086: complete walks emit the bare node array (the direct
-                        // path's shape), NOT the daemon's {_meta, impact_nodes, ...}
-                        // envelope. When the daemon reports traversal pruning, mirror
-                        // the direct path's honest object form instead — a bare array
-                        // would hide that the impact set is a floor.
-                        let truncated_by_threshold = value
-                            .get("truncated_by_threshold")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let truncated_by_depth = value
-                            .get("truncated_by_depth")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        // nw-110: the daemon caps rows with `.take(limit)` and
-                        // reports both `total` and `returned`, but result-set
-                        // capping sets NEITHER truncated_by_* flag — those
-                        // describe traversal pruning. Reading only those flags
-                        // let a 50-of-495 answer print as a bare array of 50:
-                        // a floor presented as the whole set.
-                        let total = value.get("total").and_then(|v| v.as_u64());
-                        let returned = value.get("returned").and_then(|v| v.as_u64());
-                        let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
-                        let payload = value
-                            .get("impact_nodes")
-                            .cloned()
-                            .unwrap_or_else(|| value.clone());
-                        // One envelope for every outcome — a complete walk, a
-                        // pruned traversal and a capped result set all carry the
-                        // same keys, so a consumer parses one shape (nw-111).
-                        let note = if capped {
-                            Some(format!(
-                                "showing {} of {} impacted node(s) — reported impact is a \
-                                 floor; raise --limit or pass --min-score 0 for the full set",
-                                returned.unwrap_or(0),
-                                total.unwrap_or(0)
-                            ))
-                        } else {
-                            value
-                                .get("note")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        };
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&impact_json_ok(
-                                &name_or_uid,
-                                payload,
-                                truncated_by_threshold,
-                                truncated_by_depth,
-                                total,
-                                returned,
-                                note,
-                            ))?
-                        );
-                    } else {
+                    {
                         // nw-451: render BOTH tiers, mirroring
                         // `render_blast_radius_text` (nw-454). Previously only
                         // the local tier was rendered and the org-wide tier was
@@ -20408,6 +20374,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ok(
                                 &name_or_uid,
+                                Some(&uid),
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
@@ -21416,6 +21383,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let terminal = terminal.ok_or_else(|| {
                     anyhow::anyhow!("index completed without a terminal progress payload")
                 })?;
+                if !json
+                    && let Some(excluded) = &terminal.exclusion_inventory
+                    && !excluded.patterns.is_empty()
+                {
+                    out.status(&format!("Configured excludes: {} Git-tracked file(s); {} observed excluded path(s).",
+                        excluded.tracked_files.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+                        excluded.observed_paths.len()));
+                }
                 if let Some(stats) = &terminal.trigram_refresh
                     && !stats.posting_deltas_unavailable.is_empty()
                 {
@@ -21466,6 +21441,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "symbols_found": terminal.symbols_found,
                             "skipped_count": terminal.skipped_count,
                             "skipped_files": skipped,
+                            "exclusion_inventory": terminal.exclusion_inventory.as_ref().map(nestweaver_proto::exclusion_inventory_json),
                             "trigram_refresh": trigram_refresh,
                             "message": terminal.message,
                         }))?
@@ -21545,6 +21521,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
+            let exclusion_inventory;
 
             // Per-repo `exclude` globs and `unskip` names from `--config`. The
             // daemon route resolves these from its own loaded config; this is
@@ -21598,6 +21575,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 skipped_files = result.skipped_files;
+                exclusion_inventory = result.exclusion_inventory;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
                 // nw-418: the `_and_unskip` entry point, not the
@@ -21626,6 +21604,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 symbols_count = inc.symbols_added;
                 edges_count = inc.full_edges_count;
                 skipped_files = inc.skipped_files.clone();
+                exclusion_inventory = inc.exclusion_inventory.clone();
 
                 if inc.fell_back_to_full {
                     out.status(
@@ -21647,6 +21626,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            if !json && !exclusion_inventory.patterns.is_empty() {
+                out.status(&format!(
+                    "Configured excludes: {} Git-tracked file(s); {} observed excluded path(s).",
+                    exclusion_inventory
+                        .tracked_files
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    exclusion_inventory.observed_paths.len()
+                ));
+            }
             if !json && !skipped_files.is_empty() {
                 out.status(&format!(
                     "Done — DEGRADED — skipped {} eligible file(s):",
@@ -21776,6 +21765,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "edges_found": edges_count,
                         "skipped_count": skipped_files.len(),
                         "skipped_files": skipped_files,
+                        "exclusion_inventory": exclusion_inventory,
                         "trigram_refresh": trigram_refresh_stats,
                     }))?
                 );
@@ -27502,6 +27492,12 @@ fn run_brain(
                         "recency_half_life_days": recency_half_life_days,
                 });
                 let mut context_params = context_params;
+                if !no_embed && weight_semantic.is_none() {
+                    context_params
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("weight_semantic");
+                }
                 if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
                     context_params["since"] = serde_json::json!(since);
                 }
@@ -32171,9 +32167,10 @@ fn brain_context_json_value(
     // Federation provenance, passed through rather than regenerated — the CLI
     // is not the layer that knows which upstreams answered. Absent on the
     // direct route, which has exactly one source and never wrote a `_meta`.
-    if let Some(meta) = upstream.meta.as_ref() {
-        resp["_meta"] = meta.clone();
-    }
+    resp["_meta"] = upstream
+        .meta
+        .clone()
+        .unwrap_or_else(|| nestweaver_schema::provenance::provenance("direct", &["direct"], &[]));
     resp
 }
 
@@ -38577,9 +38574,27 @@ credential_method = "ssh"
     fn impact_envelope_key_set_is_identical_across_truncation_paths() {
         let nodes = serde_json::json!([{"name": "a"}, {"name": "b"}, {"name": "c"}]);
 
-        let by_depth = impact_json_ok("s", nodes.clone(), false, true, Some(9), Some(3), None);
+        let by_depth = impact_json_ok(
+            "s",
+            Some("sym:s"),
+            nodes.clone(),
+            false,
+            true,
+            Some(9),
+            Some(3),
+            None,
+        );
         // The threshold path is the one that used to omit the counts.
-        let by_threshold = impact_json_ok("s", nodes.clone(), true, false, None, None, None);
+        let by_threshold = impact_json_ok(
+            "s",
+            Some("sym:s"),
+            nodes.clone(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
 
         let keys = |v: &serde_json::Value| {
             let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();

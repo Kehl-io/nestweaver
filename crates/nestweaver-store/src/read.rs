@@ -2501,14 +2501,13 @@ impl GraphStore {
     /// Each tuple is `(source_uid, target_uid, edge_type, confidence, evidence)`.
     /// Used by graph-export functions that need the relationship type.
     pub fn load_typed_edges(&self) -> Result<Vec<TypedEdge>, StoreError> {
-        let conn = self.conn()?;
-
         let edge_types: Vec<&str> = nestweaver_schema::ALL_SYMBOL_EDGE_TYPES
             .iter()
             .map(|et| et.rel_table_name())
             .collect();
         let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
+            let conn = self.conn()?;
             let q = format!(
                 "MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence"
             );

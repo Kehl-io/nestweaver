@@ -86,3 +86,53 @@ enabled, and accepts either the flat or nested JSON response format. See the
 and [Cursor compatibility reference](https://cursor.com/docs/reference/third-party-hooks).
 `admin install-hook` installs only Claude settings; it does not register Codex hooks or
 implement a shared SubagentStart adapter across hosts.
+
+### Scoped review and exclusion contracts
+
+`detect_changes` keeps the display limit separate from its computation budget.
+It now limits reverse/forward traversal to 2,000,000 node/edge inspections and
+uses a shared 60-second deadline for database reads and traversal. A stopped
+analysis returns `status: partial`, `gate_state: degraded_unknown`, notifications,
+`work_budget_exceeded` and/or `deadline_exceeded`. Counts marked `gte` are lower
+bounds, including an empty result after a database deadline; they do not mean
+no impact. Raising `limit` does not raise these budgets. Split the request or run
+the full test suite. This is bounded partial analysis, not a continuation token.
+Database timeouts are cooperative in LadybugDB; they cannot preempt an OS-level
+storage stall. The client RPC deadline remains the final transport safeguard.
+
+`phase_millis` separates planning, graph loading, traversal, and sorting. For
+reference, the first 56 Rust files from `git diff --name-only v7.0.0 5149d22c --
+'*.rs'` completed on the pre-change local graph in 46.076 seconds at `limit=1000`,
+returning 361,171 bytes. This is an equivalent historical-delta fixture, not a
+claim to have recovered the original timed-out request or a portable benchmark.
+The regression suite also exercises a deterministic smaller work budget over a
+56-file graph and verifies that partial analysis cannot yield a clean gate.
+
+Code index results and each `brain_status.repos` entry disclose
+`exclusion_inventory` separately from skipped/failed source files. Its
+`tracked_files` is the exact number of Git-index paths matched by configured
+repository excludes; null means Git inventory was unavailable. It does not
+estimate untracked descendants of pruned directories. `patterns` states the
+configured boundary; index reports also include `observed_paths` encountered by
+the walk. Status does not walk pruned subtrees to populate that list. Explicit
+excludes do not trigger parse-failure or size-policy warnings. Default skip
+directories and genuine parse failures retain their existing coverage warnings.
+Full, incremental, unchanged, forced and watcher updates apply the same
+compiled repository policy, including deletion of obsolete watcher rows.
+
+Impact JSON preserves both `local_impact` and `org_wide_impact` when federated.
+Within an impact result, `nodes` and `impact_nodes` are additive aliases of the
+same list; `symbol` is the caller's query, `target` is a resolved UID or null,
+and `note` is always present. Runtime status has
+`runtime_telemetry: unavailable` when a transport has no daemon-runtime values;
+null runtime fields do not establish health. Deliberately disabling semantic
+retrieval is distinct from a missing semantic capability.
+
+After `setup` writes or reconciles a registration, it reads back the stored
+command, arguments and environment and performs a bounded MCP `initialize` /
+`tools/list` probe. It never invokes a tool or claims that the host session has
+activated the server. Missing databases skip the probe to avoid creating a
+new database. A failed probe is reported independently of the configuration
+write; restart the host and inspect its available tools. The ten-second total
+probe budget includes both requests, and individual responses cannot exceed
+256 KiB. Cursor's generated guide lists only the registered lite capabilities.

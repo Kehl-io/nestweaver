@@ -170,6 +170,13 @@ message IndexProgress {
   repeated IndexSkipDetail skipped_files = 7;
   CoverageStatus coverage_status = 8;
   TrigramRefreshDetail trigram_refresh = 9;
+  ExclusionInventory exclusion_inventory = 10;
+}
+
+message ExclusionInventory {
+  repeated string patterns = 1;
+  optional uint64 tracked_files = 2;
+  repeated string observed_paths = 3;
 }
 
 enum CoverageStatus {

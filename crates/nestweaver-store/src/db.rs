@@ -8,6 +8,19 @@ use crate::error::StoreError;
 use crate::ranking::QueryIntent;
 use crate::write_lease::{DbWriteLease, WriteLeaseError, acquire_db_write_lease};
 
+thread_local! {
+    /// Applies only inside a synchronous read operation. Never propagated to
+    /// unrelated requests or pooled threads after the scope returns/unwinds.
+    static READ_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+struct ReadDeadlineRestore(Option<std::time::Instant>);
+impl Drop for ReadDeadlineRestore {
+    fn drop(&mut self) {
+        READ_DEADLINE.set(self.0);
+    }
+}
+
 /// Dead fraction at which the embedding base is worth rewriting. 20% matches
 /// the threshold shape used by segment-merge reclaim in Lucene and by Milvus's
 /// automatic compaction.
@@ -3132,8 +3145,33 @@ impl GraphStore {
     }
 
     /// Return a new connection to the underlying database.
+    /// Bound a synchronous read operation's database queries by one shared
+    /// deadline. Nested calls may shorten, but cannot extend, an outer budget.
+    /// Callers must not perform writes inside this scope: an interrupted write
+    /// has different transaction/recovery requirements from a partial read.
+    pub fn with_read_deadline<T>(
+        &self,
+        deadline: std::time::Instant,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let previous = READ_DEADLINE.get();
+        let _restore = ReadDeadlineRestore(previous);
+        READ_DEADLINE.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
+        operation()
+    }
+
     pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
-        Ok(lbug::Connection::new(&self.db)?)
+        let conn = lbug::Connection::new(&self.db)?;
+        if let Some(deadline) = READ_DEADLINE.get() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
+            }
+            // Zero disables Ladybug's timer, so round a sub-millisecond budget
+            // up to one millisecond instead of accidentally removing it.
+            conn.set_query_timeout((remaining.as_millis() as u64).max(1));
+        }
+        Ok(conn)
     }
 
     fn publication_meta_value_on(
@@ -4166,6 +4204,41 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_read_deadlines_refuse_expired_restore_and_cannot_be_extended() {
+        let store = GraphStore::in_memory().unwrap();
+        let expired = std::time::Instant::now();
+        store.with_read_deadline(expired, || {
+            assert!(matches!(
+                store.count_symbols(),
+                Err(StoreError::Cancelled(_))
+            ));
+            store.with_read_deadline(expired + std::time::Duration::from_secs(30), || {
+                assert!(matches!(
+                    store.count_symbols(),
+                    Err(StoreError::Cancelled(_))
+                ));
+            });
+            assert!(matches!(
+                store.count_symbols(),
+                Err(StoreError::Cancelled(_))
+            ));
+        });
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        store.with_read_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || {
+                store.with_read_deadline(std::time::Instant::now(), || {
+                    assert!(matches!(
+                        store.count_symbols(),
+                        Err(StoreError::Cancelled(_))
+                    ));
+                });
+                assert_eq!(store.count_symbols().unwrap(), 0);
+            },
+        );
+    }
 
     #[test]
     fn constructors_fix_the_store_access_capability() {
