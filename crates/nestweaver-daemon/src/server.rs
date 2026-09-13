@@ -6899,6 +6899,7 @@ impl NestWeaverDaemon for DaemonService {
                     if with_git_activity {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Mining git activity...".to_string(),
+                            ..Default::default()
                         }));
                         let scores =
                             nestweaver_engine::git_activity::compute_git_activity(&repo_path);
@@ -6942,6 +6943,7 @@ impl NestWeaverDaemon for DaemonService {
                         // Co-change mining (piggybacks on --with-git-activity).
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Mining co-changes...".to_string(),
+                            ..Default::default()
                         }));
                         match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
                             Ok(edges) => {
@@ -6968,6 +6970,7 @@ impl NestWeaverDaemon for DaemonService {
                     if with_trigrams {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Refreshing trigram index...".to_string(),
+                            ..Default::default()
                         }));
                         let refresh = if rebuild_trigrams {
                             state.store.rebuild_trigram_index()
@@ -7026,6 +7029,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files,
                         coverage_status,
                         trigram_refresh,
+                        exclusion_inventory,
                     }));
                 }
                 Err(e) => {
