@@ -5165,3 +5165,267 @@ mod tests {
         }
     }
 }
+
+/// Supervision observed from the live process, never from installed unit files.
+/// Linux cgroup membership is read between two process-generation snapshots so
+/// a reused PID cannot supply another process's supervision evidence.
+pub fn process_supervision(pid: i32) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = format!("/proc/{pid}/stat");
+        let generation = |text: &str| {
+            text.rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                .map(str::to_owned)
+        };
+        let before = std::fs::read_to_string(&stat)
+            .ok()
+            .and_then(|s| generation(&s));
+        let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup"));
+        let after = std::fs::read_to_string(&stat)
+            .ok()
+            .and_then(|s| generation(&s));
+        if before.is_none() || before != after {
+            return "unknown/unverifiable";
+        }
+        return groups
+            .map(|groups| supervision_from_cgroups(&groups))
+            .unwrap_or("unknown/unverifiable");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        "unknown/unverifiable"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supervision_from_cgroups(groups: &str) -> &'static str {
+    let mut observed = false;
+    for line in groups.lines() {
+        let Some(path) = line.splitn(3, ':').nth(2) else {
+            return "unknown/unverifiable";
+        };
+        if !path.starts_with('/') {
+            return "unknown/unverifiable";
+        }
+        observed = true;
+        let units: Vec<_> = path.split('/').collect();
+        let service = units
+            .iter()
+            .rev()
+            .find(|unit| unit.ends_with(".service") && !unit.starts_with("user@"));
+        if service.is_some() {
+            return if units.contains(&"user.slice")
+                && units
+                    .iter()
+                    .any(|unit| unit.starts_with("user@") && unit.ends_with(".service"))
+            {
+                "systemd-user"
+            } else {
+                "unknown/unverifiable"
+            };
+        }
+    }
+    if observed {
+        "ad-hoc"
+    } else {
+        "unknown/unverifiable"
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod supervision_tests {
+    use super::*;
+    #[test]
+    fn supervision_requires_live_process_cgroup_evidence() {
+        assert_eq!(
+            supervision_from_cgroups(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/nestweaver.service"
+            ),
+            "systemd-user"
+        );
+        assert_eq!(
+            supervision_from_cgroups("0::/user.slice/user-1000.slice/session-2.scope"),
+            "ad-hoc"
+        );
+        assert_eq!(
+            supervision_from_cgroups("0::/system.slice/nestweaver.service"),
+            "unknown/unverifiable"
+        );
+        assert_eq!(
+            supervision_from_cgroups("unreadable"),
+            "unknown/unverifiable"
+        );
+        assert_eq!(process_supervision(i32::MAX), "unknown/unverifiable");
+    }
+}
+
+/// Read-only exact-entry inspection. Missing database identity remains an
+/// explicit refusal; directory age and absent files never prove writer absence.
+pub fn inspect_runtime_entry(path: &Path) -> std::io::Result<serde_json::Value> {
+    inspect_runtime_entry_in(path, &daemon_gc_roots())
+}
+
+fn exact_runtime_entry(path: &Path, roots: &DaemonGcRoots) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other(
+            "runtime entry must be an owned real directory",
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_instance_dir_name(name))
+        .ok_or_else(|| {
+            std::io::Error::other("select one exact 8-hex runtime entry, never a root or glob")
+        })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("runtime entry has no parent"))?
+        .canonicalize()?;
+    let root = roots.pidfile_root().canonicalize()?;
+    if parent != root {
+        return Err(std::io::Error::other(
+            "entry is not directly inside the selected runtime root",
+        ));
+    }
+    Ok(parent.join(name))
+}
+
+fn inspect_runtime_entry_in(
+    path: &Path,
+    roots: &DaemonGcRoots,
+) -> std::io::Result<serde_json::Value> {
+    let path = exact_runtime_entry(path, roots)?;
+    let mut contents = Vec::new();
+    for entry in std::fs::read_dir(&path)? {
+        let entry = entry?;
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        contents.push(
+            serde_json::json!({"name": entry.file_name().to_string_lossy(),
+            "bytes": meta.len(), "directory": meta.is_dir(), "symlink": meta.is_symlink()}),
+        );
+    }
+    contents.sort_by_key(|entry| entry["name"].as_str().unwrap_or_default().to_owned());
+    let age = std::fs::metadata(&path)?
+        .modified()
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .map(|age| age.as_secs());
+    let name = path.file_name().unwrap_or_default();
+    let database = db_path_from_log_dir(&roots.state.join(name));
+    Ok(
+        serde_json::json!({"path": path, "contents": contents, "age_seconds": age,
+        "database": database, "ownership_proof": "not established by inspection",
+        "prune_requires": "explicit --database matching this instance, exclusive spawn admission and database lease; only an empty entry or empty spawnlock is eligible"}),
+    )
+}
+
+/// Prune only an explicitly selected, identity-bound empty runtime entry.
+/// A lost log can be replaced by the exact database selection, never by age.
+pub fn prune_runtime_entry(path: &Path, database: &Path) -> std::io::Result<()> {
+    prune_runtime_entry_in(path, database, &daemon_gc_roots())
+}
+
+fn prune_runtime_entry_in(
+    path: &Path,
+    database: &Path,
+    roots: &DaemonGcRoots,
+) -> std::io::Result<()> {
+    let path = exact_runtime_entry(path, roots)?;
+    let identity = crate::instance_id_from_db_path(database);
+    if path.file_name().and_then(|name| name.to_str()) != Some(identity.as_str()) {
+        return Err(std::io::Error::other(
+            "database identity does not match the exact runtime entry; legacy identity remains unverifiable",
+        ));
+    }
+    // Validate before acquisition, since admission creates an absent spawnlock.
+    let validate_contents = || -> std::io::Result<()> {
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if entry.file_name() != "daemon.spawnlock" || !metadata.is_file() || metadata.len() != 0
+            {
+                return Err(std::io::Error::other(
+                    "entry has a PID, socket, nonempty lock or other ambiguous content; inspect it without deleting",
+                ));
+            }
+        }
+        Ok(())
+    };
+    validate_contents()?;
+    let _admission = gc_spawn_admission(&path)?
+        .ok_or_else(|| std::io::Error::other("spawn admission is held; runtime entry spared"))?;
+    validate_contents()?;
+    if !db_write_lock(database).is_provably_free() {
+        return Err(std::io::Error::other(
+            "database writer is live or unverifiable; runtime entry spared",
+        ));
+    }
+    let _writer = acquire_db_write_lease(database).map_err(|error| {
+        std::io::Error::other(format!("database/instance lease unavailable: {error}"))
+    })?;
+    retire_gc_runtime(&path)
+}
+
+#[cfg(test)]
+mod runtime_inspection_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, DaemonGcRoots, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        std::fs::create_dir(&root).unwrap();
+        let database = temp.path().join("fixture.lbug");
+        let entry = root.join(crate::instance_id_from_db_path(&database));
+        std::fs::create_dir(&entry).unwrap();
+        let roots = DaemonGcRoots {
+            state: root,
+            runtime: None,
+            socket_fallback: temp.path().join("fallback"),
+        };
+        (temp, roots, database, entry)
+    }
+    #[test]
+    fn inspection_is_read_only_and_empty_prune_requires_database_identity() {
+        let (_temp, roots, database, entry) = fixture();
+        let report = inspect_runtime_entry_in(&entry, &roots).unwrap();
+        assert_eq!(report["contents"], serde_json::json!([]));
+        assert!(std::fs::read_dir(&entry).unwrap().next().is_none());
+        assert!(prune_runtime_entry_in(&entry, &database.with_extension("wrong"), &roots).is_err());
+        prune_runtime_entry_in(&entry, &database, &roots).unwrap();
+        assert!(!entry.exists());
+        assert!(inspect_runtime_entry_in(&roots.state, &roots).is_err());
+    }
+    #[test]
+    fn stale_empty_spawnlock_is_removable_but_held_lock_is_spared() {
+        use std::os::fd::AsRawFd;
+        let (_temp, roots, database, entry) = fixture();
+        let lock = std::fs::File::create(entry.join("daemon.spawnlock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(prune_runtime_entry_in(&entry, &database, &roots).is_err());
+        drop(lock);
+        prune_runtime_entry_in(&entry, &database, &roots).unwrap();
+    }
+    #[test]
+    fn pid_socket_and_unknown_contents_are_never_pruned() {
+        for name in ["daemon.pid", "daemon.sock", "unknown"] {
+            let (_temp, roots, database, entry) = fixture();
+            std::fs::write(entry.join(name), std::process::id().to_string()).unwrap();
+            assert!(prune_runtime_entry_in(&entry, &database, &roots).is_err());
+            assert!(entry.join(name).exists());
+        }
+    }
+    #[test]
+    fn database_authority_spares_an_empty_runtime() {
+        let (_temp, roots, database, entry) = fixture();
+        let _writer = acquire_db_write_lease(&database).unwrap();
+        assert!(prune_runtime_entry_in(&entry, &database, &roots).is_err());
+        assert!(entry.exists());
+    }
+}

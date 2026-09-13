@@ -4635,6 +4635,25 @@ fn format_daemon_status_response(
                 "Config: {}",
                 format_effective_config(status.effective_config.as_ref())
             )];
+            lines.push(format!(
+                "Supervision: {}",
+                if status.supervision.is_empty() {
+                    "unknown/unverifiable"
+                } else {
+                    &status.supervision
+                }
+            ));
+            if let Some(watcher) = &status.watcher {
+                lines.push(format!(
+                    "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
+                    watcher.kind,
+                    watcher.target,
+                    watcher.id,
+                    watcher.controller_pid,
+                    watcher.started_unix_seconds,
+                    watcher.age_seconds
+                ));
+            }
             lines.push("Embedding:".to_string());
             if let Some(embedding) = status.embedding_status.as_ref() {
                 lines.push(format_embedding_status(embedding));
@@ -7215,7 +7234,19 @@ enum DaemonAction {
     /// write lock or pidfile lock with no way for a client to reach it. That
     /// third state is repairable and names the owning PID when the kernel
     /// reports one.
-    Status,
+    Status {
+        /// Emit read-only lifecycle evidence as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one exact runtime entry. Unidentified ownership always refuses pruning.
+    InspectRuntime { path: PathBuf },
+    /// Prune one inspected empty runtime entry after proving its database is unowned.
+    PruneRuntime {
+        path: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+    },
     /// Remove orphaned daemon runtime state.
     ///
     /// On macOS, sweeps orphaned launch agents left by ephemeral/test daemons —
@@ -10391,6 +10422,50 @@ fn ui_serve_request(
         served_ui_port(&response)?;
     }
     Ok(response)
+}
+
+/// Observe the specific registration without reconnecting/autostarting. A
+/// displaced controller never issues an unconditional stop against its successor.
+fn wait_for_daemon_watcher(
+    rt: &tokio::runtime::Runtime,
+    client: &mut nestweaver_client::DaemonClient,
+    watcher_id: u64,
+    rx: &std::sync::mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        watcher_id != 0,
+        "daemon did not provide watcher session identity; upgrade the daemon before controlling this watcher"
+    );
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let health = rt
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            client.health_check(),
+                        )
+                        .await
+                    })
+                    .context(
+                        "watcher status timed out; controller is no longer observing its watcher",
+                    )??;
+                anyhow::ensure!(
+                    health.watcher.as_ref().is_some_and(|w| w.id == watcher_id),
+                    "watcher session {watcher_id} was displaced or stopped; this controller has terminated"
+                );
+            }
+        }
+    }
+}
+
+/// Cleanup precedes propagation, including every supervisor error path.
+fn finish_ui_supervision(result: anyhow::Result<bool>, stop: impl FnOnce()) -> anyhow::Result<()> {
+    if !matches!(result, Ok(false)) {
+        stop();
+    }
+    result.map(|_| ())
 }
 
 /// Supervise the daemon-served web UI until Ctrl-C.
@@ -18238,7 +18313,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .block_on(async {
                     client
                         .inner_mut()
-                        .stop_watch(nestweaver_proto::StopWatchRequest {})
+                        .stop_watch(nestweaver_proto::StopWatchRequest::default())
                         .await
                 })
                 .map_err(daemon_status_error)?
@@ -18385,12 +18460,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
                         });
-                        let _ = rx.recv();
+                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
                         let _ = rt.block_on(async {
                             client
                                 .inner_mut()
-                                .stop_watch(nestweaver_proto::StopWatchRequest {})
+                                .stop_watch(nestweaver_proto::StopWatchRequest {
+                                    watcher_id: resp.watcher_id,
+                                })
                                 .await
                         });
                         eprintln!("Watcher stopped.");
@@ -18756,7 +18833,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // The listener lives in the daemon process; supervise
                         // it so a daemon outage degrades the UI instead of
                         // leaving a healthy-looking shell with a dead port.
-                        let daemon_up_at_exit = supervise_ui_daemon(
+                        let supervision = supervise_ui_daemon(
                             &rt,
                             &db_path,
                             port,
@@ -18764,12 +18841,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             &watch_repo_path,
                             &rx,
                             &mut client,
-                        )?;
-                        // Tell the daemon to stop serving so
-                        // the listen port is released when the CLI exits.
-                        // Meaningless while the daemon is down — the degraded
-                        // server was already shut down by supervise_ui_daemon.
-                        if daemon_up_at_exit {
+                        );
+                        finish_ui_supervision(supervision, || {
+                            // Tell the daemon to stop serving so
+                            // the listen port is released when the CLI exits.
+                            // Meaningless while the daemon is down — the degraded
+                            // server was already shut down by supervise_ui_daemon.
                             match rt.block_on(client.stop_ui()) {
                                 Ok(resp) if resp.ok => eprintln!("UI server stopped."),
                                 Ok(resp) => eprintln!("note: {}", resp.message),
@@ -18777,7 +18854,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     eprintln!("warning: failed to stop UI server cleanly: {e:#}")
                                 }
                             }
-                        }
+                        })?;
                     }
                     Err(error) => {
                         ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
@@ -23121,7 +23198,53 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
 
-                DaemonAction::Status => {
+                DaemonAction::PruneRuntime { path, database } => {
+                    nestweaver_daemon::lifecycle::prune_runtime_entry(&path, &database)?;
+                    println!("Removed exact runtime entry {}", path.display());
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::InspectRuntime { path } => {
+                    let report = nestweaver_daemon::lifecycle::inspect_runtime_entry(&path)?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::Status { json } => {
+                    if json {
+                        let reachable = daemon_socket_reported_pid(&socket);
+                        let owner = if reachable.is_none() {
+                            unreachable_daemon_owner(&db_path, &pidfile)
+                        } else {
+                            None
+                        };
+                        let (state, evidence, pid) = match (reachable, owner) {
+                            (Some(pid), _) => ("running", "kernel_socket_peer", Some(pid)),
+                            (_, Some(UnreachableOwner::DatabaseWriteLock { pid })) => {
+                                ("running_but_unreachable", "database_write_lock", Some(pid))
+                            }
+                            (_, Some(UnreachableOwner::DatabaseWriteLockAnonymous)) => {
+                                ("running_but_unreachable", "database_write_lock", None)
+                            }
+                            (_, Some(UnreachableOwner::PidfileLock)) => (
+                                "running_but_unreachable",
+                                "pidfile_lock_without_pid_identity",
+                                None,
+                            ),
+                            (_, Some(UnreachableOwner::DatabaseLockUnreadable)) => {
+                                ("unknown", "database_lock_unreadable", None)
+                            }
+                            _ => ("not_running", "no_observed_owner", None),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "state": state, "evidence": evidence, "pid": pid,
+                                "db_path": db_path, "instance_id": instance_id, "socket": socket,
+                                "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
+                                "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
+                            }))?
+                        );
+                        return Ok((EXIT_SUCCESS, None));
+                    }
                     if daemon_socket_reported_pid(&socket).is_none()
                         && !pidfile_flock_held(&pidfile)
                         && let Some(old_id) = selected_slot_legacy_id.as_deref()
@@ -23142,7 +23265,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     // Check launchd first on macOS
                     #[cfg(target_os = "macos")]
-                    if nestweaver_daemon::launchd::is_running(&instance_id) {
+                    if nestweaver_daemon::launchd::is_running(&instance_id)
+                        && daemon_socket_reported_pid(&socket).is_some()
+                    {
                         println!("Daemon is running (launchd agent)");
                         println!(
                             "  Label:  {}",
@@ -23161,8 +23286,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
                         // A live PID is not proof — it may be recycled.
-                        if daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
+                        if daemon_identity_verified(pid, &db_path, &pidfile, &socket)
+                            && daemon_socket_reported_pid(&socket) == Some(pid)
+                        {
                             println!("Daemon is running (PID {pid})");
+                            println!(
+                                "  Supervision: {}",
+                                nestweaver_daemon::lifecycle::process_supervision(pid)
+                            );
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
                             println!("  Log:    {log_hint}");
@@ -23195,6 +23326,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
                         println!("Daemon is running (PID {pid}, serving socket)");
+                        println!(
+                            "  Supervision: {}",
+                            nestweaver_daemon::lifecycle::process_supervision(pid)
+                        );
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {log_hint}");
@@ -26321,27 +26456,11 @@ fn run_brain(
                     let _ = tx.send(());
                 });
 
-                // Periodic health check so we notice daemon death.
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                        Ok(()) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let health = rt.block_on(async {
-                                client
-                                    .inner_mut()
-                                    .health_check(nestweaver_proto::HealthCheckRequest {})
-                                    .await
-                            });
-                            if health.is_err() {
-                                eprintln!("Daemon is no longer running.");
-                                return Ok((EXIT_ERROR, None));
-                            }
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
+                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
-                let stop_req = nestweaver_proto::StopWatchRequest {};
+                let stop_req = nestweaver_proto::StopWatchRequest {
+                    watcher_id: resp.watcher_id,
+                };
                 if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
                 {
                     // The watcher thread lives inside the daemon, so when the

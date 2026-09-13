@@ -24,6 +24,7 @@ impl<R, T: Clone + Send + 'static> tonic::server::UnaryService<R> for Reply<T> {
 struct Peer {
     port: u16,
     requests: Arc<AtomicUsize>,
+    stops: Arc<AtomicUsize>,
 }
 impl tonic::server::NamedService for Peer {
     const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
@@ -66,6 +67,17 @@ impl Service<http::Request<Body>> for Peer {
                         }
                     )
                 }
+                "StopUi" => {
+                    peer.stops.fetch_add(1, Ordering::SeqCst);
+                    respond!(
+                        StopUiResponse,
+                        StopUiRequest,
+                        StopUiResponse {
+                            ok: true,
+                            ..Default::default()
+                        }
+                    )
+                }
                 _ => tonic::Status::unimplemented("unexpected RPC").into_http(),
             })
         })
@@ -82,6 +94,15 @@ impl Drop for SocketCleanup {
 }
 #[test]
 fn healthy_peer_cannot_trap_supervisor_in_identical_repairs() {
+    supervisor_error_cleans_up(false);
+}
+
+#[test]
+fn mismatched_repair_endpoint_cleans_up() {
+    supervisor_error_cleans_up(true);
+}
+
+fn supervisor_error_cleans_up(mismatch: bool) {
     // Read-only consumers also coordinate with tests that change XDG: the
     // supervisor resolves its socket again on every health probe.
     let _environment = crate::XDG_RUNTIME_ENV_LOCK
@@ -110,9 +131,15 @@ fn healthy_peer_cannot_trap_supervisor_in_identical_repairs() {
     };
     let port = reservation.local_addr().unwrap().port();
     let requests = Arc::new(AtomicUsize::new(0));
+    let stops = Arc::new(AtomicUsize::new(0));
     let peer = Peer {
-        port,
+        port: if mismatch {
+            if port == 65535 { 1 } else { port + 1 }
+        } else {
+            port
+        },
         requests: requests.clone(),
+        stops: stops.clone(),
     };
     let server = rt.spawn(async move {
         tonic::transport::Server::builder()
@@ -132,14 +159,25 @@ fn healthy_peer_cannot_trap_supervisor_in_identical_repairs() {
         let _ = tx.send(());
     });
     let result = supervise_ui_daemon(&rt, &db, port, false, "", &rx, &mut client);
+    let result = finish_ui_supervision(result, || {
+        assert!(rt.block_on(client.stop_ui()).unwrap().ok);
+    });
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
     deadline.abort();
     server.abort();
     let error = result.expect_err("a deadline exit would conceal an infinite repair loop");
     assert!(
-        error.to_string().contains("three repair attempts"),
+        error.to_string().contains(if mismatch {
+            "this session supervises"
+        } else {
+            "three repair attempts"
+        }),
         "{error:#}"
     );
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        if mismatch { 1 } else { 3 }
+    );
 }
 
 #[test]

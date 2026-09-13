@@ -1553,7 +1553,7 @@ impl DaemonClient {
     pub async fn stop_watch(&mut self) -> Result<nestweaver_proto::StopWatchResponse> {
         let resp = self
             .inner
-            .stop_watch(nestweaver_proto::StopWatchRequest {})
+            .stop_watch(nestweaver_proto::StopWatchRequest::default())
             .await
             .context("stop_watch RPC failed")?;
         Ok(resp.into_inner())

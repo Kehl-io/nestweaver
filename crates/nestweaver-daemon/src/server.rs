@@ -1147,6 +1147,41 @@ pub struct WatcherRegistration {
     /// connection, or an in-process call — and is deliberately NOT treated as
     /// orphaned. Absence of evidence of death is not evidence of death.
     owner_pid: Option<i32>,
+    kind: String,
+    target: String,
+    started: std::time::Instant,
+    started_unix_seconds: u64,
+}
+
+fn watcher_status(state: &DaemonState) -> Option<nestweaver_proto::WatcherStatus> {
+    let guard = state.watcher_stop.lock().ok()?;
+    let watcher = guard.as_ref()?;
+    Some(nestweaver_proto::WatcherStatus {
+        id: watcher.id,
+        kind: watcher.kind.clone(),
+        target: watcher.target.clone(),
+        controller_pid: watcher.owner_pid,
+        started_unix_seconds: watcher.started_unix_seconds,
+        age_seconds: watcher.started.elapsed().as_secs(),
+    })
+}
+
+fn watcher_status_json(state: &DaemonState) -> serde_json::Value {
+    match watcher_status(state) {
+        Some(w) => serde_json::json!({"id": w.id, "kind": w.kind, "target": w.target,
+            "controller_pid": w.controller_pid, "started_unix_seconds": w.started_unix_seconds,
+            "age_seconds": w.age_seconds}),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn describe_watcher(state: &DaemonState, id: u64, kind: &str, target: &Path) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && let Some(w) = guard.as_mut().filter(|w| w.id == id)
+    {
+        w.kind = kind.to_owned();
+        w.target = target.display().to_string();
+    }
 }
 
 /// A retained watcher worker. The id ties the otherwise-unstructured join
@@ -2721,11 +2756,18 @@ fn register_watcher(
         }
         existing.handle.stop();
     }
-    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
+    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed) + 1;
     *guard = Some(WatcherRegistration {
         id,
         handle,
         owner_pid,
+        kind: "unknown".to_string(),
+        target: String::new(),
+        started: std::time::Instant::now(),
+        started_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     });
     Ok(id)
 }
@@ -2876,6 +2918,7 @@ impl DaemonService {
         // exact-worker lease from the factory below.
         let admission_guard = ConnectionGuard::write(&self.state)?;
         let watcher_id = register_watcher(&self.state, shutdown_handle, force, owner_pid)?;
+        describe_watcher(&self.state, watcher_id, "code", &repo_path);
 
         watcher =
             watcher.with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()));
@@ -5777,6 +5820,8 @@ impl NestWeaverDaemon for DaemonService {
             // PID against the socket-reported PID before signaling it.
             pid: std::process::id(),
             embedding_identity_repair: true,
+            watcher: watcher_status(&self.state),
+            supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
         }))
     }
 
@@ -5892,6 +5937,7 @@ impl NestWeaverDaemon for DaemonService {
             return Ok(Response::new(WatchVaultResponse {
                 ok: false,
                 message: format!("vault path is not a directory: {}", vault_path.display()),
+                ..Default::default()
             }));
         }
 
@@ -5960,10 +6006,12 @@ impl NestWeaverDaemon for DaemonService {
                     message: "A watcher is already running. Stop it with \
                               `nestweaver watch-stop`, or retry with --force to adopt it."
                         .to_string(),
+                    ..Default::default()
                 }));
             }
             Err(e) => return Err(e),
         };
+        describe_watcher(&self.state, watcher_id, "vault", &vault_path);
         let state = self.state.clone();
         let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
         watcher = watcher.with_mutation_lease_factory(mutation_factory);
@@ -6015,6 +6063,7 @@ impl NestWeaverDaemon for DaemonService {
                 "Watcher started for {} (vault: {})",
                 req.vault_path, vault_name
             ),
+            watcher_id,
         }))
     }
 
@@ -6039,6 +6088,7 @@ impl NestWeaverDaemon for DaemonService {
             return Ok(Response::new(WatchCodeResponse {
                 ok: false,
                 message: format!("repo path is not a directory: {}", repo_path.display()),
+                ..Default::default()
             }));
         }
 
@@ -6058,22 +6108,25 @@ impl NestWeaverDaemon for DaemonService {
         // ServeUI and WatchCode use this same constructor, so registration,
         // per-batch ownership, task retention, and shutdown behavior cannot
         // drift between the two entry points.
-        match self.start_registered_code_watcher(repo_path, instance_id, force, owner_pid) {
-            Ok(_) => {}
-            Err(e) if e.code() == tonic::Code::AlreadyExists => {
-                return Ok(Response::new(WatchCodeResponse {
-                    ok: false,
-                    message: "A watcher is already running. Stop it with \
+        let watcher_id =
+            match self.start_registered_code_watcher(repo_path, instance_id, force, owner_pid) {
+                Ok(id) => id,
+                Err(e) if e.code() == tonic::Code::AlreadyExists => {
+                    return Ok(Response::new(WatchCodeResponse {
+                        ok: false,
+                        message: "A watcher is already running. Stop it with \
                               `nestweaver watch-stop`, or retry with --force to adopt it."
-                        .to_string(),
-                }));
-            }
-            Err(e) => return Err(e),
-        }
+                            .to_string(),
+                        ..Default::default()
+                    }));
+                }
+                Err(e) => return Err(e),
+            };
 
         Ok(Response::new(WatchCodeResponse {
             ok: true,
             message: format!("Code watcher started for {}", req.repo_path,),
+            watcher_id,
         }))
     }
 
@@ -6095,7 +6148,13 @@ impl NestWeaverDaemon for DaemonService {
             .map(|registration| registration.id);
 
         if let Some(watcher_id) = watcher_id {
-            stop_watcher_registration(&self.state, watcher_id);
+            let requested_id = _request.get_ref().watcher_id;
+            if requested_id != 0 && requested_id != watcher_id {
+                return Ok(Response::new(StopWatchResponse { ok: false }));
+            }
+            if !stop_watcher_registration(&self.state, watcher_id) {
+                return Ok(Response::new(StopWatchResponse { ok: false }));
+            }
             if let Some(task) = take_watcher_task(&self.state, watcher_id) {
                 let _ = task.await;
             }
@@ -6832,7 +6891,6 @@ impl NestWeaverDaemon for DaemonService {
                     if with_git_activity {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Mining git activity...".to_string(),
-                            ..Default::default()
                         }));
                         let scores =
                             nestweaver_engine::git_activity::compute_git_activity(&repo_path);
@@ -6876,7 +6934,6 @@ impl NestWeaverDaemon for DaemonService {
                         // Co-change mining (piggybacks on --with-git-activity).
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Mining co-changes...".to_string(),
-                            ..Default::default()
                         }));
                         match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
                             Ok(edges) => {
@@ -6903,7 +6960,6 @@ impl NestWeaverDaemon for DaemonService {
                     if with_trigrams {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Refreshing trigram index...".to_string(),
-                            ..Default::default()
                         }));
                         let refresh = if rebuild_trigrams {
                             state.store.rebuild_trigram_index()
@@ -8233,6 +8289,8 @@ impl NestWeaverDaemon for DaemonService {
             write_holder,
             write_holder_seconds,
             search_status: Some(search_status_proto(&search_status)),
+            watcher: watcher_status(&self.state),
+            supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
         }))
     }
 
@@ -8286,6 +8344,12 @@ impl NestWeaverDaemon for DaemonService {
         let served = self.state.requests_served.fetch_add(1, Ordering::Relaxed) + 1;
         let mut json_resp = resp.into_inner();
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
+            value["runtime_telemetry"] = serde_json::json!("available");
+            value["watcher"] = watcher_status_json(&self.state);
+            value["watcher_pid"] =
+                serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
+            value["supervision"] =
+                serde_json::json!(lifecycle::process_supervision(std::process::id() as i32));
             value["server_mode"] = serde_json::json!(self.state.server_mode);
             let rpc_repo = self
                 .state
@@ -12806,7 +12870,12 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
-        next_watcher_id: std::sync::atomic::AtomicU64::new(0),
+        next_watcher_id: std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        ),
         instance_cfg,
         effective_config,
         permission_source,
@@ -24106,6 +24175,47 @@ external_model = "unavailable-test-model"
         assert!(state.watcher_stop.lock().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn displaced_controller_cannot_stop_replacement_and_status_names_session() {
+        let state = test_state_with_writer();
+        let first = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let second = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(stopped.clone()),
+            true,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        describe_watcher(&state, second, "vault", Path::new("/fixture/vault"));
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(StopWatchRequest { watcher_id: first });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(!service.stop_watch(request).await.unwrap().into_inner().ok);
+        assert!(!stopped.load(Ordering::Relaxed));
+        let health = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let watcher = health.watcher.unwrap();
+        assert_eq!(watcher.id, second);
+        assert_eq!(watcher.kind, "vault");
+        assert_eq!(watcher.target, "/fixture/vault");
+        assert_eq!(watcher.controller_pid, Some(std::process::id() as i32));
+        assert!(watcher.started_unix_seconds > 0);
+        let mut request = Request::new(StopWatchRequest { watcher_id: second });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_watch(request).await.unwrap().into_inner().ok);
+        assert!(watcher_status(&state).is_none());
+    }
+
     /// Spawn a process, wait for it, and return its pid — a pid that is
     /// provably not live by the time this returns, without guessing at a
     /// number. Reaping matters: a zombie is still `kill(pid, 0)`-visible, so an
@@ -25467,7 +25577,7 @@ mod watcher_e2e_tests {
         // And `StopWatch` empties the slot, which is what the new
         // `nestweaver watch-stop` subcommand issues.
         let stopped = client
-            .stop_watch(nestweaver_proto::StopWatchRequest {})
+            .stop_watch(nestweaver_proto::StopWatchRequest::default())
             .await
             .expect("stop_watch")
             .into_inner();

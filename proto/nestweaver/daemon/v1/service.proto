@@ -20,6 +20,8 @@ message HealthCheckResponse {
   // Explicit mutation capability negotiation. An older daemon decodes as
   // false, so clients can refuse repair before sending a destructive Embed.
   bool embedding_identity_repair = 8;
+  WatcherStatus watcher = 9;
+  string supervision = 10;
 }
 
 message ShutdownRequest {}
@@ -112,6 +114,7 @@ message WatchVaultRequest {
 message WatchVaultResponse {
   bool ok = 1;
   string message = 2;
+  uint64 watcher_id = 3;
 }
 
 message WatchCodeRequest {
@@ -127,9 +130,21 @@ message WatchCodeRequest {
 message WatchCodeResponse {
   bool ok = 1;
   string message = 2;
+  uint64 watcher_id = 3;
 }
 
-message StopWatchRequest {}
+// Zero retains the explicit administrator stop-all operation. Controllers send
+// their registration id so a displaced client cannot stop its replacement.
+message StopWatchRequest { uint64 watcher_id = 1; }
+
+message WatcherStatus {
+  uint64 id = 1;
+  string kind = 2;
+  string target = 3;
+  optional int32 controller_pid = 4;
+  uint64 started_unix_seconds = 5;
+  uint64 age_seconds = 6;
+}
 
 message StopWatchResponse {
   bool ok = 1;
@@ -516,6 +531,8 @@ message BrainStatusResponse {
   // a reader-only fallback may still serve the PRE-mutation corpus while a
   // durable reconciliation debt waits for the configured writer to recover.
   SearchStatus search_status = 18;
+  WatcherStatus watcher = 19;
+  string supervision = 20;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
