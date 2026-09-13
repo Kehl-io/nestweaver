@@ -8341,7 +8341,7 @@ enum AdminCommands {
     Instructions {
         #[arg(
             long,
-            help = "Print subagent guidance. Markdown on a TTY; dual-format hook JSON when stdin is a PreToolUse event (Cursor blocks Task on markdown stdout)"
+            help = "Print subagent guidance. Markdown on a TTY; dual-format hook JSON for PreToolUse Task/Agent events; empty JSON for other hook payloads"
         )]
         for_subagent: bool,
         #[arg(
@@ -15937,10 +15937,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     return Ok((EXIT_SUCCESS, None));
                 }
                 // No flag (or only --for-subagent): print the relevant store.
-                // Claude Code treated markdown stdout as extra context. Cursor
-                // loads the same Claude Task hook and blocks the tool when
-                // stdout is not JSON. A TTY stays markdown; a piped PreToolUse
-                // event becomes dual-format hook JSON.
+                // PreToolUse needs structured output for Claude context and
+                // Cursor compatibility. A TTY stays markdown; a piped Task/Agent
+                // PreToolUse event becomes dual-format JSON. Other recognizable
+                // hook payloads receive an empty JSON no-op.
                 let text = if for_subagent {
                     admin::read_subagent_instructions()?
                 } else {
