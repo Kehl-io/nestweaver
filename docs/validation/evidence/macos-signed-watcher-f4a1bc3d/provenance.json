@@ -1,0 +1,9 @@
+{
+  "source_sha": "f4a1bc3ddb0b7cdd71b9becff8aadc25a8b7f9e1",
+  "run_id": 34738345322,
+  "job_id": 103673671632,
+  "url": "https://github.com/Kehl-io/nestweaver/actions/runs/34738345322/job/103673671632",
+  "conclusion": "success",
+  "signing": "ad-hoc; not Developer ID distribution signing",
+  "evidence": "Selected build/signing and successful test-result lines from the completed job log."
+}

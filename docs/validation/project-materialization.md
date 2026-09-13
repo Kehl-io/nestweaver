@@ -65,3 +65,28 @@ edge). The matrix retains that late failure and exact reopened graph checks;
 only the small topology path avoids COPY. High-volume note/symbol memberships
 still use COPY. Missing topology endpoints return an error rather than silently
 matching zero rows. The paired benchmark measures this complete production path.
+
+## Recorded result — 2026-09-13
+
+The [isolated performance job](https://github.com/Kehl-io/nestweaver/actions/runs/34736783556/job/103669515714)
+passed on `a771754e7cccc8be96013194813ff3a2c865ef79`. Its measured materialization
+implementation is unchanged by the later logging and response-contract fixes.
+This successful job is distinct from the same run's failed, subsequently fixed
+contract tests.
+
+| Execution order | Legacy apply | COPY apply | Speedup | COPY write lease |
+| --- | ---: | ---: | ---: | ---: |
+| Legacy first | 96.404957 s | 0.283967 s | 339.494092x | 0.385804 s |
+| COPY first | 103.246523 s | 0.299186 s | 345.091158x | 0.448662 s |
+
+Both orders satisfy the 10x speedup and 120-second lease gates. The companion
+candidate runs measured planning at 55.734 / 51.381 ms, symbol COPY at 175.911 /
+173.432 ms, commit at 25.579 / 26.293 ms, and total time at 437.756 / 425.386 ms.
+Whole-invocation paired peak RSS was 291,312 / 296,080 KiB; that is not isolated
+per-algorithm memory. All six benchmark invocations exited successfully.
+
+[Raw evidence and checksums](evidence/backlog-performance-a771754e/SHA256SUMS.json)
+preserve both paired orders, detailed companion logs and the quiet runner record.
+See the [runner and removal decision](remove-repo.md#recorded-result--2026-09-13)
+for hardware and repeat criteria. These results validate the matched synthetic
+algorithm comparison, not the historical production graph or its 21-minute claim.

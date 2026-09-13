@@ -1,0 +1,90 @@
+{
+  "binary_sha256": "865253b05f151ff110a915e5b1bda96f924f47c77d2dd76b7749f93af97bf0c5",
+  "load_before": [
+    15.82275390625,
+    19.78564453125,
+    22.11474609375
+  ],
+  "runs": [
+    {
+      "name": "detect-1000-0",
+      "limit": 1000,
+      "exit": 0,
+      "seconds": 34.99719209398609,
+      "bytes": 355462,
+      "controls": [
+        {
+          "exit": 0,
+          "seconds": 0.8045830019982532,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 0.8144926519598812,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 0.5831112950108945,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        }
+      ],
+      "metadata": {
+        "_meta": {
+          "scope": "local",
+          "sources": [
+            "local"
+          ],
+          "stale_repos": []
+        },
+        "affected_process_count": 5955,
+        "affected_process_count_relation": "eq",
+        "affected_symbol_count": 6304,
+        "affected_symbol_count_relation": "eq",
+        "blast_radius": 12259,
+        "deadline_exceeded": false,
+        "gate_state": "risk-flagged",
+        "limit": 1000,
+        "notifications": [],
+        "phase_millis": {
+          "graph_load": 3600,
+          "planning": 25063,
+          "sorting": 16,
+          "traversal": 5973
+        },
+        "process_analysis_unavailable": false,
+        "processes_omitted": 4955,
+        "resolver_stale_repos": [],
+        "risk": "high",
+        "status": "complete",
+        "symbols_omitted": 5304,
+        "traversal_steps": 1950009,
+        "truncated": true,
+        "work_budget_exceeded": false
+      },
+      "returned_symbols": 1000,
+      "returned_processes": 1000
+    }
+  ],
+  "daemon_start": {
+    "exit": 0,
+    "seconds": 4.952334485016763,
+    "bytes": 0
+  },
+  "daemon_stop": {
+    "exit": 0,
+    "seconds": 0.42586214700713754,
+    "bytes": 0
+  },
+  "load_after": [
+    13.4267578125,
+    18.71923828125,
+    21.658203125
+  ]
+}

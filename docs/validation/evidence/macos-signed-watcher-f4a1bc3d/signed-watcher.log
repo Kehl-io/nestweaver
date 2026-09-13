@@ -1,0 +1,9 @@
+2026-09-13T05:21:10.3342600Z test result: ok. 1515 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 67.01s
+2026-09-13T05:21:21.6269540Z test result: ok. 564 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.51s
+2026-09-13T05:22:00.4862730Z test result: ok. 564 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 38.79s
+2026-09-13T05:22:01.5663600Z codesign --force --sign - target/release/nestweaver
+2026-09-13T05:22:01.5663960Z codesign --verify --strict --verbose=2 target/release/nestweaver
+2026-09-13T05:22:01.5664330Z codesign --display --verbose=2 target/release/nestweaver
+2026-09-13T05:22:25.0409550Z Signature=adhoc
+2026-09-13T05:23:29.1118160Z test displaced_watch_controller_exits_without_stopping_replacement ... ok
+2026-09-13T05:23:29.2994450Z test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 63.58s

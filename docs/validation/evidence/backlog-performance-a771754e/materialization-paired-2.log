@@ -1,0 +1,32 @@
+
+running 1 test
+test write::tests::project_materialization_paired_139509_benchmark ... PROJECT_MATERIALIZATION_RUN {"algorithm":"copy","apply_including_commit_ms":299.186231,"planning_ms":17.171982,"total_ms":466.143663,"write_lease_ms":448.661764}
+PROJECT_MATERIALIZATION_RUN {"algorithm":"legacy","apply_including_commit_ms":103246.522795,"planning_ms":17.171982,"total_ms":103463.34916200001,"write_lease_ms":103445.946533}
+PROJECT_MATERIALIZATION_PAIRED {"fixture":"synthetic-project-materialization-v1","historical_dataset":false,"legacy_source":"ad0619fb0e50e65253b52ea74d99f2969f65fbf2","runs":[{"algorithm":"copy","apply_including_commit_ms":299.186231,"planning_ms":17.171982,"total_ms":466.143663,"write_lease_ms":448.661764},{"algorithm":"legacy","apply_including_commit_ms":103246.522795,"planning_ms":17.171982,"total_ms":103463.34916200001,"write_lease_ms":103445.946533}],"same_machine":true,"speedup":345.09115760410776,"symbol_edges":139509}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 104.45s
+
+	Command being timed: "target/release/deps/nestweaver_store-b4d2b6a342d3b7d1 write::tests::project_materialization_paired_139509_benchmark --ignored --exact --nocapture --test-threads=1"
+	User time (seconds): 59.63
+	System time (seconds): 13.04
+	Percent of CPU this job got: 69%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:44.46
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 296080
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 50860
+	Voluntary context switches: 1127142
+	Involuntary context switches: 200
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 1228152
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

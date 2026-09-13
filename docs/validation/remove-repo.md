@@ -26,3 +26,35 @@ The decision criteria were selected before inspecting candidate results:
 The benchmark's exit status enforces only its smallest-degree sanity bound.
 The measurement item also needs the repeat calculation and explicit decision
 recorded on its parent backlog item before acceptance.
+
+## Recorded result — 2026-09-13
+
+[Performance job](https://github.com/Kehl-io/nestweaver/actions/runs/34736783556/job/103669515714)
+passed on `a771754e7cccc8be96013194813ff3a2c865ef79`. The run's other CI jobs
+contained subsequently fixed contract failures; only this successful job supplies
+performance acceptance. The measured store/engine/benchmark sources are unchanged
+in the later logging and response-contract fixes.
+
+| Hub degree | Run 1 (seconds) | Run 2 (seconds) | Repeat difference |
+| --- | ---: | ---: | ---: |
+| 1,000 | 0.083719248 | 0.084052186 | 0.396895% |
+| 8,700 | 0.737974507 | 0.737861485 | 0.015316% |
+| 86,800 | 10.912034457 | 10.886338553 | 0.235760% |
+
+Adjacent ratios are 8.814873 / 14.786465 for run 1 and 8.778611 / 14.753905 for
+run 2. Corresponding exponents are 1.006064 / 1.171035 and 1.004158 / 1.170077.
+Whole-ladder peak RSS was 284,568 / 284,504 KiB.
+
+All repeats pass and both high-degree ratios remain below 20. Decision: no
+additional scaling mitigation is justified by this fixture; retain current
+transaction behavior. Owner: NestWeaver maintainer, Kory Kehl. Reconsider with a
+representative production reproduction or a controlled ladder exceeding the
+recorded threshold. This does not establish an absolute latency objective or
+refute the historical incident.
+
+The runner had four logical CPUs on AMD EPYC 9V74, approximately 16.77 GB memory,
+ext4, Rust 1.98.1 and locked lbug 0.19.1. Three consecutive five-second CPU samples
+were 1.402%, 0.150% and 0.200% busy before measurement; process snapshots show no
+competing compiler or benchmark. Retained load averages include earlier builds.
+[Raw evidence and checksums](evidence/backlog-performance-a771754e/SHA256SUMS.json)
+include both removal logs, hardware/load snapshots and the exact lockfile.

@@ -1,0 +1,28 @@
+[32m INFO[0m [2mnestweaver_store::materialization_timing[0m[2m:[0m project materialization phase [3mphase[0m[2m=[0m"planning" [3melapsed_ms[0m[2m=[0m51.381142
+[32m INFO[0m [2mnestweaver_store::materialization_timing[0m[2m:[0m project materialization phase [3mphase[0m[2m=[0m"copy" [3mrelationship[0m[2m=[0m"PROJECT_INCLUDES_NOTE" [3mrows[0m[2m=[0m91 [3melapsed_ms[0m[2m=[0m1.3833140000000002
+[32m INFO[0m [2mnestweaver_store::materialization_timing[0m[2m:[0m project materialization phase [3mphase[0m[2m=[0m"copy" [3mrelationship[0m[2m=[0m"PROJECT_INCLUDES_SYMBOL" [3mrows[0m[2m=[0m139509 [3melapsed_ms[0m[2m=[0m173.432487
+[32m INFO[0m [2mnestweaver_store::materialization_timing[0m[2m:[0m project materialization phase [3mphase[0m[2m=[0m"commit" [3melapsed_ms[0m[2m=[0m26.293284 [3msuccess[0m[2m=[0mtrue
+{"apply_ms":288.736446,"component_edges":5,"fixture":"synthetic-project-materialization-v1","fixture_planning_ms":10.995695999999999,"historical_same_machine_comparison":false,"note_edges":91,"outcome":"Changed","projects":11,"symbol_edges":139509,"symbols":12683,"total_ms":425.385916,"write_lease_ms":414.03810899999996,"write_phase_target_ms":120000}
+	Command being timed: "env RUST_LOG=info target/release/examples/project_materialization_benchmark"
+	User time (seconds): 0.53
+	System time (seconds): 0.19
+	Percent of CPU this job got: 95%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.76
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 252440
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 45715
+	Voluntary context switches: 1116
+	Involuntary context switches: 1
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 30488
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

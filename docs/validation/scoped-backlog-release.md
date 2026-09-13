@@ -38,3 +38,16 @@ matrix provides evidence for the eventual PR's source and both architectures.
 
 Official references: [GitHub workflow triggers](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
 and [ruleset API](https://docs.github.com/en/rest/repos/rules).
+
+## Candidate acceptance (2026-09-13)
+
+The [normal dry-run](https://github.com/Kehl-io/nestweaver/actions/runs/34738154634)
+passed all four native targets, extracted archive checks, exact artifact inventory,
+bundle validation and enforcement/cleanup on `f4a1bc3d`. The
+[failed-target](https://github.com/Kehl-io/nestweaver/actions/runs/34736784741) and
+[omitted-target](https://github.com/Kehl-io/nestweaver/actions/runs/34736785749)
+exercises passed their proof and cleanup jobs on `a771754e`. The injected-failure
+run is intentionally failed overall. All three canaries (#386–#388) are closed
+unmerged with their exact branches independently confirmed absent. External tag,
+release and npm visibility stayed unchanged. Raw exact-run proofs and cleanup
+readbacks are retained under [evidence](evidence/).

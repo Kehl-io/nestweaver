@@ -704,8 +704,8 @@ jobs:
         # The `daemon_` filter is the exact complement of the main job's skip.
         run: cargo test --locked --workspace --no-fail-fast -- daemon_
       - name: MCP daemon-feature tests
-        # `cargo test --workspace` builds nestweaver-mcp without its optional
-        # `daemon` feature, so these tests never run in the main job.
+        # Check the standalone daemon-feature configuration separately from
+        # workspace feature unification (which also enables embedding support).
         run: cargo test --locked -p nestweaver-mcp --features daemon --no-fail-fast
 
   coverage:

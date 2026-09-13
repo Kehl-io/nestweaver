@@ -1,0 +1,5 @@
+2026-09-13T05:18:44.038891Z DEBUG nestweaver_daemon::server: response serialization completed tool=brain_status elapsed_us=218 bytes=1241
+2026-09-13T05:18:46.855133Z DEBUG nestweaver_daemon::server: response serialization completed tool=brain_status elapsed_us=218 bytes=1241
+2026-09-13T05:18:49.442201Z DEBUG nestweaver_daemon::server: response serialization completed tool=brain_status elapsed_us=296 bytes=1241
+2026-09-13T05:19:16.095603Z DEBUG nestweaver_mcp::tools: response symbol sorting completed tool="detect_changes" phase="symbol_sorting" elapsed_us=13615 symbols=6304
+2026-09-13T05:19:16.162212Z DEBUG nestweaver_daemon::server: response serialization completed tool=detect_changes elapsed_us=41440 bytes=279019
