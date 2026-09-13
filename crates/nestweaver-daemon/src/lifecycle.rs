@@ -5339,9 +5339,11 @@ fn prune_runtime_entry_in(
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = exact_runtime_entry(path, roots)?;
     let identity = crate::instance_id_from_db_path(database);
-    if path.file_name().and_then(|name| name.to_str()) != Some(identity.as_str()) {
+    let legacy_identity = legacy_instance_id_from_db_path(database);
+    let selected_name = path.file_name().and_then(|name| name.to_str());
+    if selected_name != Some(identity.as_str()) && selected_name != Some(legacy_identity.as_str()) {
         return Err(std::io::Error::other(
-            "database identity does not match the exact runtime entry; legacy identity remains unverifiable",
+            "database identity does not match a known current or legacy hash for the exact runtime entry",
         ));
     }
     // A runtime-only operation must not create a missing database. The
@@ -5380,7 +5382,7 @@ fn prune_runtime_entry_in(
         ));
     }
     let _writer = nestweaver_store::acquire_existing_db_write_lease(database).map_err(|error| {
-        std::io::Error::other(format!("database/instance lease unavailable: {error}"))
+        std::io::Error::other(format!("database/instance lease unavailable: {error:?}"))
     })?;
     let _admission = gc_spawn_admission(&path)?
         .ok_or_else(|| std::io::Error::other("spawn admission is held; runtime entry spared"))?;
