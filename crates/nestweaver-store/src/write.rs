@@ -8687,7 +8687,7 @@ mod copy_from_tests {
     // top passes on the unpinned build and proves nothing.
 
     /// Rows lbug's CSV dialect detector samples before deciding the dialect.
-    const DIALECT_SAMPLE_ROWS: usize = 256;
+    pub(super) const DIALECT_SAMPLE_ROWS: usize = 256;
 
     /// A field value that needs quoting: it carries both an embedded delimiter
     /// (exercises `DELIM`/`QUOTE`) and an embedded quote (exercises `ESCAPE`,
@@ -8697,7 +8697,7 @@ mod copy_from_tests {
     /// Assert a generated CSV really can reproduce the auto-detect bug: no row
     /// inside the detector's sample window may need quoting, and the first row
     /// after it must.
-    fn assert_fixture_shape(csv_path: &Path) {
+    pub(super) fn assert_fixture_shape(csv_path: &Path) {
         let text = std::fs::read_to_string(csv_path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert!(
@@ -8735,7 +8735,7 @@ mod copy_from_tests {
             .collect()
     }
 
-    fn plain_symbol(i: usize) -> Symbol {
+    pub(super) fn plain_symbol(i: usize) -> Symbol {
         Symbol {
             uid: format!("sym:plain:{i:04}"),
             name: format!("plain_{i:04}"),
@@ -9029,6 +9029,7 @@ mod copy_from_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::copy_from_tests::{DIALECT_SAMPLE_ROWS, assert_fixture_shape, plain_symbol};
     use super::*;
 
     fn seed_classified_vault(store: &GraphStore, vault_uid: &str) {
