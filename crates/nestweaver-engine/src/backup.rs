@@ -1845,8 +1845,11 @@ fn backup_artifact_contract_for_path(
 /// Flat v1 scores cannot be assigned to repositories without guessing.
 /// Corrupt and unknown-version data remain hard errors, not legacy exclusions.
 fn legacy_git_activity_payload(payload: &[u8]) -> anyhow::Result<bool> {
-    if let Ok(current) = serde_json::from_slice::<crate::git_activity::GitActivitySidecar>(payload)
-    {
+    let shape: serde_json::Value =
+        serde_json::from_slice(payload).context("invalid git-activity JSON")?;
+    if shape.get("version").is_some() {
+        let current: crate::git_activity::GitActivitySidecar =
+            serde_json::from_value(shape).context("invalid versioned git-activity payload")?;
         anyhow::ensure!(
             current.version == crate::git_activity::GITACTIVITY_VERSION,
             "unsupported git-activity sidecar version {}; expected {}",
@@ -2546,6 +2549,10 @@ mod tests {
     fn invalid_git_activity_never_publishes_an_archive() {
         for payload in [
             "broken",
+            r#"{"version":2}"#,
+            r#"{"version":3}"#,
+            r#"{"version":2,"repos":{"repo:test":"#,
+            r#"{"version":null}"#,
             r#"{"version":3,"repos":{}}"#,
             r#"{"version":2,"repos":[]}"#,
             "null",

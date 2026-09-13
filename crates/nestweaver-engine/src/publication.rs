@@ -787,6 +787,8 @@ impl Drop for ProcessPublicationRootClaim {
 /// Held by rebuild, rollback, discard and prune. Released on drop.
 #[derive(Debug)]
 pub struct PublicationRootLock {
+    anchor: nestweaver_store::stable_anchor::StableAnchor,
+    root_file: std::fs::File,
     _file: std::fs::File,
     root: PathBuf,
     path: PathBuf,
@@ -820,6 +822,17 @@ impl PublicationRootLock {
         let process_claim = ProcessPublicationRootClaim::acquire(&path).ok_or_else(|| {
             publication_lock_contention(&path, std::io::ErrorKind::WouldBlock.into())
         })?;
+        let anchor = nestweaver_store::stable_anchor::StableAnchor::acquire(
+            "publication-root",
+            &canonical_root,
+            true,
+        )
+        .map_err(|error| publication_lock_contention(&path, error))?;
+        // Lock the directory inode as well: its new name after a rename must
+        // not manufacture another owner for the displaced publication tree.
+        let root_file = std::fs::File::open(&canonical_root)?;
+        lock_publication_file(&root_file)
+            .map_err(|error| publication_lock_contention(&path, error))?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -829,6 +842,8 @@ impl PublicationRootLock {
             .with_context(|| format!("open publication lock {}", path.display()))?;
         lock_publication_file(&file).map_err(|error| publication_lock_contention(&path, error))?;
         Ok(Self {
+            anchor,
+            root_file,
             _file: file,
             root: canonical_root,
             path,
@@ -844,7 +859,10 @@ impl PublicationRootLock {
     /// Whether this guard covers exactly this publication root after resolving
     /// relative paths and symlink aliases.
     pub fn authorizes(&self, publication_root: &Path) -> bool {
-        std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
+        self.anchor.is_current()
+            && nestweaver_store::stable_anchor::descriptor_matches_path(&self.root_file, &self.root)
+            && nestweaver_store::stable_anchor::descriptor_matches_path(&self._file, &self.path)
+            && std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
     }
 
     pub(crate) fn ensure_authorizes(&self, publication_root: &Path) -> anyhow::Result<&Path> {
@@ -2218,6 +2236,50 @@ mod tests {
     /// This proves the replacement is a real, root-anchored, cross-process
     /// lock: a SECOND acquisition of the same root is refused, including from
     /// another process.
+    #[test]
+    fn publication_root_and_lock_replacement_do_not_admit_another_owner() {
+        for replace_root in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("publications");
+            let held = PublicationRootLock::acquire(&root).unwrap();
+            let displaced = dir.path().join("displaced");
+            if replace_root {
+                std::fs::rename(&root, &displaced).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                assert!(PublicationRootLock::acquire(&displaced).is_err());
+            } else {
+                std::fs::rename(root.join("LOCK"), &displaced).unwrap();
+                std::fs::write(root.join("LOCK"), b"").unwrap();
+            }
+            assert!(!held.authorizes(&root));
+            assert!(PublicationRootLock::acquire(&root).is_err());
+            for probe_root in if replace_root {
+                vec![&root, &displaced]
+            } else {
+                vec![&root]
+            } {
+                let probe = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "publication::tests::publication_root_lock_child_probe",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("NESTWEAVER_PUBLICATION_LOCK_PROBE_ROOT", probe_root)
+                    .output()
+                    .unwrap();
+                assert!(
+                    probe.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&probe.stderr)
+                );
+                assert!(String::from_utf8_lossy(&probe.stdout).contains("running 1 test"));
+            }
+            PublicationRootLock::acquire(&dir.path().join("sibling")).unwrap();
+            drop(held);
+            PublicationRootLock::acquire(&root).unwrap();
+        }
+    }
+
     #[test]
     fn the_publication_root_lock_excludes_a_second_holder() {
         let dir = tempfile::tempdir().unwrap();

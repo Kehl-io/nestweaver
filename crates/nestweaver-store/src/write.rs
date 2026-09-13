@@ -10765,6 +10765,53 @@ mod tests {
     }
 
     #[test]
+    fn project_copy_over_256_quoted_endpoints_preserves_direction_and_confidence() {
+        let store = GraphStore::in_memory().unwrap();
+        let project = nestweaver_schema::Project {
+            uid: "proj:test,\"quoted\"".into(),
+            name: "quoted".into(),
+            summary: None,
+            instance_id: "test".into(),
+        };
+        store.insert_project(&project).unwrap();
+        let symbols = (0..300)
+            .map(|i| Symbol {
+                uid: format!("sym:{i},\"quoted\""),
+                ..plain_symbol(i)
+            })
+            .collect::<Vec<_>>();
+        // Parameterized seeds isolate relationship COPY from node COPY.
+        for symbol in &symbols {
+            store.insert_symbol(symbol).unwrap();
+        }
+        let uids = symbols
+            .iter()
+            .map(|symbol| symbol.uid.clone())
+            .collect::<Vec<_>>();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, &uids, 0.375)
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let rows = conn.query("MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence")
+            .unwrap().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 300);
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            assert_eq!(row[0], lbug::Value::String(project.uid.clone()));
+            let lbug::Value::String(uid) = &row[1] else {
+                panic!("missing symbol UID")
+            };
+            assert!(seen.insert(uid.clone()));
+            match row[2] {
+                lbug::Value::Double(confidence) => assert!((confidence - 0.375).abs() < 1e-6),
+                lbug::Value::Float(confidence) => assert!((confidence - 0.375).abs() < 1e-6),
+                ref other => panic!("unexpected confidence: {other:?}"),
+            }
+        }
+        assert_eq!(seen, uids.into_iter().collect());
+    }
+
+    #[test]
     fn materialized_project_replacement_bulk_loads_every_relationship_kind() {
         use nestweaver_schema::{Note, NoteKind, Project};
 
@@ -11170,120 +11217,175 @@ mod tests {
     }
 
     #[test]
-    fn disk_backed_late_project_copy_failure_restores_previous_graph() {
+    fn disk_backed_project_copy_failure_matrix_restores_previous_graph() {
         use nestweaver_schema::{Note, NoteKind, Project};
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("project-rollback.lbug");
-        let store = GraphStore::open_or_create(&db_path).unwrap();
-        let old = Project {
-            uid: "proj:test:stable".to_string(),
-            name: "stable".to_string(),
-            summary: Some("old summary".to_string()),
-            instance_id: "test".to_string(),
-        };
-        store.insert_project(&old).unwrap();
-        store
-            .insert_note(&Note {
-                uid: "note:stable".to_string(),
-                vault_uid: "vault:test".to_string(),
-                file_path: "stable.md".to_string(),
-                title: "Stable".to_string(),
-                note_kind: NoteKind::General,
-                word_count: 1,
-                content_hash: "stable".to_string(),
-                frontmatter: None,
-                frontmatter_raw: None,
-                created_at: None,
-                modified_at: None,
-                pagerank_score: None,
-                embedding: None,
-            })
-            .unwrap();
-        store
-            .insert_note(&Note {
-                uid: "note:new".to_string(),
-                vault_uid: "vault:test".to_string(),
-                file_path: "new.md".to_string(),
-                title: "New".to_string(),
-                note_kind: NoteKind::General,
-                word_count: 1,
-                content_hash: "new".to_string(),
-                frontmatter: None,
-                frontmatter_raw: None,
-                created_at: None,
-                modified_at: None,
-                pagerank_score: None,
-                embedding: None,
-            })
-            .unwrap();
-        let symbol_uid = "sym:project-rollback".to_string();
-        store
-            .insert_symbol(&Symbol {
-                uid: symbol_uid.clone(),
-                name: "project_rollback".to_string(),
-                kind: nestweaver_schema::SymbolKind::Function,
-                repo_uid: "repo:project-rollback".to_string(),
-                file_path: "src/lib.rs".to_string(),
-                start_line: 1,
-                end_line: 1,
-                signature: "fn project_rollback()".to_string(),
-                summary: None,
-                content_hash: "symbol-hash".to_string(),
-                embedding: None,
-                pagerank_score: None,
-                is_entry_point: false,
-                entry_point_kind: None,
-                visibility: nestweaver_schema::Visibility::Public,
-                type_info: None,
-                framework_hint: None,
-                canonical_id: None,
-            })
-            .unwrap();
-        store
-            .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
-            .unwrap();
+        for failure_table in [
+            "PROJECT_INCLUDES_NOTE",
+            "PROJECT_INCLUDES_SYMBOL",
+            "PROJECT_HAS_COMPONENT",
+            "PROJECT_HAS_PARENT",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("project-rollback.lbug");
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let old = Project {
+                uid: "proj:test:stable".to_string(),
+                name: "stable".to_string(),
+                summary: Some("old summary".to_string()),
+                instance_id: "test".to_string(),
+            };
+            store.insert_project(&old).unwrap();
+            store
+                .insert_note(&Note {
+                    uid: "note:stable".to_string(),
+                    vault_uid: "vault:test".to_string(),
+                    file_path: "stable.md".to_string(),
+                    title: "Stable".to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "stable".to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .insert_note(&Note {
+                    uid: "note:new".to_string(),
+                    vault_uid: "vault:test".to_string(),
+                    file_path: "new.md".to_string(),
+                    title: "New".to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "new".to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            let symbol_uid = "sym:project-rollback".to_string();
+            store
+                .insert_symbol(&Symbol {
+                    uid: symbol_uid.clone(),
+                    name: "project_rollback".to_string(),
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: "repo:project-rollback".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: "fn project_rollback()".to_string(),
+                    summary: None,
+                    content_hash: "symbol-hash".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            store
+                .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
+                .unwrap();
 
-        let mut replacement = old.clone();
-        replacement.summary = Some("new summary".to_string());
-        let result = store.replace_materialized_projects_transaction(
-            &[replacement],
-            &[("proj:test:stable".to_string(), "note:new".to_string())],
-            &[("proj:test:stable".to_string(), symbol_uid)],
-            &[(
-                "proj:test:stable".to_string(),
-                "proj:test:missing".to_string(),
-            )],
-            &[],
-            &[],
-            true,
-        );
-        let error = result.expect_err("the late component COPY must fail");
-        assert_eq!(
-            error.disposition,
-            ProjectMutationDisposition::ConfirmedRolledBack,
-            "successful snapshot restoration must be exposed to publication callers"
-        );
-        assert!(error.to_string().contains("PROJECT_HAS_COMPONENT"));
-        assert!(
-            !error.to_string().contains("rollback failed"),
-            "automatic rollback should not be misreported: {error}"
-        );
-        drop(store);
+            let child = Project {
+                uid: "proj:test:child".into(),
+                name: "child".into(),
+                ..old.clone()
+            };
+            store.insert_project(&child).unwrap();
+            store
+                .batch_insert_project_symbol_edges(&old.uid, std::slice::from_ref(&symbol_uid), 1.0)
+                .unwrap();
+            store
+                .insert_project_component_edge(&old.uid, &child.uid, 1.0)
+                .unwrap();
+            store
+                .insert_project_parent_edge(&child.uid, &old.uid, 1.0)
+                .unwrap();
+            let tables = [
+                "PROJECT_INCLUDES_NOTE",
+                "PROJECT_INCLUDES_SYMBOL",
+                "PROJECT_HAS_COMPONENT",
+                "PROJECT_HAS_PARENT",
+            ];
+            let before = tables.map(|table| store.list_project_edge_pairs(table).unwrap());
+            let mut replacement = old.clone();
+            replacement.summary = Some("new summary".to_string());
+            let missing = "missing-endpoint".to_string();
+            let note_target = if failure_table == tables[0] {
+                missing.clone()
+            } else {
+                "note:new".into()
+            };
+            let symbol_target = if failure_table == tables[1] {
+                missing.clone()
+            } else {
+                symbol_uid
+            };
+            let component_target = if failure_table == tables[2] {
+                missing.clone()
+            } else {
+                child.uid.clone()
+            };
+            let parent_target = if failure_table == tables[3] {
+                missing
+            } else {
+                child.uid.clone()
+            };
+            let result = store.replace_materialized_projects_transaction(
+                &[replacement],
+                &[(old.uid.clone(), note_target)],
+                &[(child.uid.clone(), symbol_target)],
+                &[(child.uid.clone(), component_target)],
+                &[(old.uid.clone(), parent_target)],
+                &[],
+                true,
+            );
+            let error = result.expect_err("the selected COPY must fail");
+            assert_eq!(
+                error.disposition,
+                ProjectMutationDisposition::ConfirmedRolledBack,
+                "successful snapshot restoration must be exposed to publication callers"
+            );
+            assert!(error.to_string().contains(failure_table));
+            assert!(
+                !error.to_string().contains("rollback failed"),
+                "automatic rollback should not be misreported: {error}"
+            );
+            drop(store);
 
-        let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let restored = reopened
-            .list_projects()
-            .unwrap()
-            .into_iter()
-            .find(|project| project.uid == old.uid)
-            .expect("rollback must restore the previous Project node");
-        assert_eq!(restored.summary, old.summary);
-        assert_eq!(
-            reopened.list_project_note_uids(&old.uid).unwrap(),
-            vec!["note:stable".to_string()],
-            "disk-backed rollback must restore previous membership and remove partial replacement"
-        );
+            let reopened = GraphStore::open_or_create(&db_path).unwrap();
+            for (table, expected) in tables.into_iter().zip(before) {
+                assert_eq!(
+                    reopened.list_project_edge_pairs(table).unwrap(),
+                    expected,
+                    "{failure_table}: {table}"
+                );
+            }
+            assert_eq!(reopened.list_projects().unwrap().len(), 2);
+            let restored = reopened
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == old.uid)
+                .expect("rollback must restore the previous Project node");
+            assert_eq!(restored.summary, old.summary);
+            assert_eq!(
+                reopened.list_project_note_uids(&old.uid).unwrap(),
+                vec!["note:stable".to_string()],
+                "disk-backed rollback must restore previous membership and remove partial replacement"
+            );
+        }
     }
 
     #[test]

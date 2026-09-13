@@ -12,6 +12,7 @@ pub mod read;
 pub mod regex;
 pub mod regex_index;
 pub mod search;
+pub mod stable_anchor;
 pub mod tantivy_index;
 pub mod traverse;
 pub mod write;

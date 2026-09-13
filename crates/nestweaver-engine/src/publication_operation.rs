@@ -190,6 +190,168 @@ pub fn operation_state_path(
     )
 }
 
+/// Durable provenance recorded BEFORE a staged database name is published.
+/// The random seed stays in the plan's private journal directory; its hard link
+/// pins the inode across retries and prevents inode-number reuse after unlink.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlannedCreation {
+    plan: PublicationOperationPlan,
+    target: PathBuf,
+    seed_name: String,
+    device: u64,
+    inode: u64,
+}
+
+/// Complete Planned creation under the exact root authority. A seed and its
+/// durable provenance precede hard-link publication of the target, eliminating
+/// the former zero-byte target / missing provenance crash window.
+pub fn ensure_planned_database(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+) -> anyhow::Result<()> {
+    ensure_planned_database_with_checkpoint(publication_root, state, root_lock, || {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_AUTHORITY").is_some() {
+            std::process::exit(86);
+        }
+        Ok(())
+    })
+}
+
+fn ensure_planned_database_with_checkpoint(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+    after_authority: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let root = root_lock.ensure_authorizes(publication_root)?;
+    anyhow::ensure!(
+        state.phase == PublicationPhase::Planned,
+        "creation requires Planned phase"
+    );
+    let actual = load_operation(root, &state.plan.operation_uuid)?;
+    anyhow::ensure!(actual == *state, "publication creation journal changed");
+    let slot = crate::publication::slot_path(root, &state.plan.target_publication_uuid)?;
+    let target = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+    let operation = crate::publication::operation_path(root, &state.plan.operation_uuid)?;
+    let provenance = operation.join("creation.json");
+    let identity = nestweaver_store::PublicationIdentity {
+        brain_uuid: state.plan.brain_uuid.clone(),
+        publication_uuid: state.plan.target_publication_uuid.clone(),
+    };
+    // Already committed identity is sufficient for an old Planned journal.
+    // Never open a symlink, or adopt a foreign non-empty database.
+    if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+        anyhow::ensure!(metadata.is_file(), "staged target is not a regular file");
+        if metadata.len() != 0 && !provenance.try_exists()? {
+            let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+            anyhow::ensure!(
+                store.publication_identity()? == Some(identity),
+                "staged publication identity mismatch"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            provenance.try_exists()?,
+            "pre-existing empty staged target has no creation provenance"
+        );
+    }
+    let record: PlannedCreation = if provenance.try_exists()? {
+        serde_json::from_slice(&std::fs::read(&provenance)?)?
+    } else {
+        // Keep the seed before recording it. An interrupted record write may
+        // leave an unreferenced seed, but never a target lacking provenance.
+        let seed_name = format!("creation-seed-{}", uuid::Uuid::new_v4());
+        let seed_path = operation.join(&seed_name);
+        let seed = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&seed_path)?;
+        seed.sync_all()?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&seed_path)?;
+        let metadata = seed.metadata()?;
+        let record = PlannedCreation {
+            plan: state.plan.clone(),
+            target: target.clone(),
+            seed_name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(&provenance, |file| {
+            file.write_all(&bytes)
+        })?;
+        record
+    };
+    anyhow::ensure!(
+        record.plan == state.plan && record.target == target,
+        "creation provenance belongs to another plan or target"
+    );
+    let suffix = record
+        .seed_name
+        .strip_prefix("creation-seed-")
+        .ok_or_else(|| anyhow::anyhow!("invalid creation seed name"))?;
+    parse_non_nil_uuid("creation seed", suffix)?;
+    let seed_path = operation.join(&record.seed_name);
+    let seed = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&seed_path)?;
+    let metadata = seed.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.dev() == record.device && metadata.ino() == record.inode,
+        "creation seed was replaced"
+    );
+    if metadata.len() != 0 {
+        anyhow::ensure!(
+            nestweaver_store::stable_anchor::descriptor_matches_path(&seed, &target),
+            "staged target was replaced; refusing resume"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+        anyhow::ensure!(
+            store.publication_identity()? == Some(identity),
+            "staged publication identity mismatch"
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(&slot)?;
+    match std::fs::hard_link(&seed_path, &target) {
+        Ok(()) => nestweaver_store::durable_sidecar::sync_parent_directory_durable(&target)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    anyhow::ensure!(
+        nestweaver_store::stable_anchor::descriptor_matches_path(&seed, &target),
+        "staged target was replaced; refusing creation"
+    );
+    let mut authority = nestweaver_store::acquire_db_write_lease(&target)
+        .map_err(|error| anyhow::anyhow!("acquire staged creation authority: {error:?}"))?;
+    authority
+        .bind_creation_seed(&seed)
+        .map_err(|error| anyhow::anyhow!("bind staged creation provenance: {error:?}"))?;
+    after_authority()?;
+    root_lock.ensure_authorizes(root)?;
+    let store = nestweaver_store::GraphStore::create_with_publication_identity_and_authority(
+        &target, &identity, &authority,
+    )?;
+    drop(store);
+    // Strictly reopen before the caller may advance to Graph.
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+    anyhow::ensure!(
+        store.publication_identity()? == Some(identity),
+        "staged identity did not commit"
+    );
+    drop(store);
+    drop(authority);
+    drop(seed);
+    Ok(())
+}
+
 pub fn create_operation(
     publication_root: &Path,
     plan: PublicationOperationPlan,
@@ -941,6 +1103,87 @@ mod tests {
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             publication_format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
             created_unix_millis: 42,
+        }
+    }
+
+    #[test]
+    fn planned_creation_recovers_two_interruptions_without_adopting_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publications");
+        let lock = crate::publication::PublicationRootLock::acquire(&root).unwrap();
+        let state = create_operation(&root, plan()).unwrap();
+        let target = crate::publication::slot_path(&root, &state.plan.target_publication_uuid)
+            .unwrap()
+            .join(crate::publication::PUBLICATION_GRAPH_FILE);
+        for _ in 0..2 {
+            let error = ensure_planned_database_with_checkpoint(&root, &state, &lock, || {
+                anyhow::bail!("simulated interruption after authority")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("simulated interruption"));
+            assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+            assert_eq!(
+                load_operation(&root, &state.plan.operation_uuid)
+                    .unwrap()
+                    .phase,
+                PublicationPhase::Planned
+            );
+        }
+        ensure_planned_database(&root, &state, &lock).unwrap();
+        ensure_planned_database(&root, &state, &lock).unwrap();
+        let store =
+            nestweaver_store::GraphStore::open_read_only_without_migration(&target).unwrap();
+        assert_eq!(
+            store
+                .publication_identity()
+                .unwrap()
+                .unwrap()
+                .publication_uuid,
+            state.plan.target_publication_uuid
+        );
+    }
+
+    #[test]
+    fn planned_creation_rejects_empty_foreign_symlink_and_replaced_targets() {
+        for control in ["empty", "symlink", "replaced", "nonempty", "wrong-identity"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("publications");
+            let lock = crate::publication::PublicationRootLock::acquire(&root).unwrap();
+            let state = create_operation(&root, plan()).unwrap();
+            let target = crate::publication::slot_path(&root, &state.plan.target_publication_uuid)
+                .unwrap()
+                .join(crate::publication::PUBLICATION_GRAPH_FILE);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            match control {
+                "replaced" => {
+                    ensure_planned_database_with_checkpoint(&root, &state, &lock, || {
+                        anyhow::bail!("interrupt")
+                    })
+                    .unwrap_err();
+                    std::fs::rename(&target, target.with_extension("displaced")).unwrap();
+                    std::fs::write(&target, b"").unwrap();
+                }
+                "symlink" => {
+                    let foreign = dir.path().join("foreign");
+                    std::fs::write(&foreign, b"").unwrap();
+                    std::os::unix::fs::symlink(foreign, &target).unwrap();
+                }
+                "nonempty" => std::fs::write(&target, b"unrelated database bytes").unwrap(),
+                "wrong-identity" => {
+                    drop(nestweaver_store::GraphStore::open_or_create(&target).unwrap());
+                }
+                _ => std::fs::write(&target, b"").unwrap(),
+            }
+            let before = std::fs::read(&target).unwrap();
+            assert!(
+                ensure_planned_database(&root, &state, &lock).is_err(),
+                "{control}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), before, "{control} mutated");
+            assert_eq!(
+                load_operation(&root, &state.plan.operation_uuid).unwrap(),
+                state
+            );
         }
     }
 

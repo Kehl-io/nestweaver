@@ -183,6 +183,7 @@ pub struct DbWriteLease {
     // database and sidecar authorities. Every replaceable data directory also
     // holds this shared namespace descriptor.
     _namespace_file: Option<std::fs::File>,
+    _namespace_anchor: Option<crate::stable_anchor::StableAnchor>,
     _db_file: std::fs::File,
     _lease_file: std::fs::File,
     /// Records that this process owns the sidecar flock. This is diagnostic,
@@ -225,12 +226,14 @@ pub struct DbNamespaceLease {
     // unprotected.
     _process_claim: ProcessNamespaceLeaseClaim,
     _file: std::fs::File,
+    anchor: crate::stable_anchor::StableAnchor,
     data_dir: PathBuf,
 }
 
 impl DbNamespaceLease {
     pub fn authorizes(&self, db_path: &Path) -> bool {
-        data_dir_for_db(db_path).is_some_and(|data_dir| data_dir == self.data_dir)
+        self.anchor.is_current()
+            && data_dir_for_db(db_path).is_some_and(|data_dir| data_dir == self.data_dir)
     }
 }
 
@@ -247,7 +250,33 @@ impl DbWriteLease {
     /// Whether this exact authority atomically created `db_path` while taking
     /// the canonical lease.
     pub fn authorizes_fresh_creation(&self, db_path: &Path) -> bool {
-        self.created_db_file && self.authorizes(db_path)
+        self.created_db_file
+            && self.authorizes(db_path)
+            && crate::stable_anchor::descriptor_matches_path(&self._db_file, db_path)
+    }
+
+    /// Bind a durably journaled creation seed to this authority. The caller
+    /// must prove the seed was created by the same operation before publishing
+    /// its target name; this only validates the descriptor/inode half of that
+    /// protocol. Existing arbitrary empty files are never a creation seed.
+    pub fn bind_creation_seed(&mut self, seed: &std::fs::File) -> Result<(), WriteLeaseError> {
+        use std::os::unix::fs::MetadataExt;
+        let seed_meta = seed.metadata().map_err(WriteLeaseError::Unavailable)?;
+        let db_meta = self
+            ._db_file
+            .metadata()
+            .map_err(WriteLeaseError::Unavailable)?;
+        if seed_meta.dev() != db_meta.dev()
+            || seed_meta.ino() != db_meta.ino()
+            || seed_meta.len() != 0
+            || !crate::stable_anchor::descriptor_matches_path(&self._db_file, &self.db_path)
+        {
+            return Err(WriteLeaseError::Unavailable(std::io::Error::other(
+                "creation seed does not match the empty staged database inode",
+            )));
+        }
+        self.created_db_file = true;
+        Ok(())
     }
 
     /// Re-establish the legacy POSIX writer exclusion after another database
@@ -296,6 +325,7 @@ pub fn acquire_db_write_lease_under_namespace(
 pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, WriteLeaseError> {
     let data_dir = canonical_db_path(data_dir);
     let lease_path = namespace_lease_path(&data_dir)?;
+    let anchor = acquire_namespace_anchor(&data_dir, true)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -312,8 +342,24 @@ pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, W
     Ok(DbNamespaceLease {
         _process_claim: process_claim,
         _file: file,
+        anchor,
         data_dir,
     })
+}
+
+fn acquire_namespace_anchor(
+    data_dir: &Path,
+    exclusive: bool,
+) -> Result<crate::stable_anchor::StableAnchor, WriteLeaseError> {
+    crate::stable_anchor::StableAnchor::acquire("database-namespace", data_dir, exclusive).map_err(
+        |error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                WriteLeaseError::Held
+            } else {
+                WriteLeaseError::Unavailable(error)
+            }
+        },
+    )
 }
 
 fn namespace_lease_path(data_dir: &Path) -> Result<PathBuf, WriteLeaseError> {
@@ -404,6 +450,7 @@ fn acquire_db_write_lease_inner(
     // process's record lock when the failed acquisition closed it.
     let process_claim = ProcessDbLeaseClaim::acquire(&db_path)?;
     let lease_path = write_lease_path(&db_path);
+    let mut namespace_anchor = None;
     let namespace_file = if namespace.is_some() {
         None
     } else {
@@ -433,6 +480,7 @@ fn acquire_db_write_lease_inner(
                 .open(lease_path)
             {
                 Ok(file) => {
+                    namespace_anchor = Some(acquire_namespace_anchor(&data_dir, false)?);
                     lock_flock_with_inheritance_retry(&file, libc::LOCK_SH)?;
                     Some(file)
                 }
@@ -544,6 +592,7 @@ fn acquire_db_write_lease_inner(
     let self_latch = crate::note_self_held_write_lease(&db_path);
     Ok(DbWriteLease {
         _namespace_file: namespace_file,
+        _namespace_anchor: namespace_anchor,
         _db_file: db_file,
         _lease_file: lease_file,
         _self_latch: self_latch,
@@ -891,6 +940,75 @@ mod tests {
         assert!(!crate::self_holds_write_lease(&db));
         assert!(!current_process_claims_write_lease(&db));
         assert!(!crate::live_writer_holds_write_lease(&db));
+    }
+
+    #[test]
+    fn replacement_of_namespace_lock_does_not_admit_writers() {
+        for name in ["live", "live.restoring"] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join(name);
+            std::fs::create_dir(&data).unwrap();
+            let lease = acquire_db_namespace_lease(&data).unwrap();
+            let path = namespace_lease_path(&data).unwrap();
+            std::fs::rename(&path, path.with_extension("displaced")).unwrap();
+            std::fs::write(&path, b"").unwrap();
+            assert!(matches!(
+                acquire_db_namespace_lease(&data),
+                Err(WriteLeaseError::Held)
+            ));
+            assert!(matches!(
+                acquire_db_write_lease(&data.join("new.lbug")),
+                Err(WriteLeaseError::Held)
+            ));
+            assert!(!data.join("new.lbug").exists());
+            let probe = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "write_lease::tests::namespace_replacement_child_probe",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE", &data)
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            assert!(String::from_utf8_lossy(&probe.stdout).contains("running 1 test"));
+            let sibling = dir.path().join("sibling");
+            std::fs::create_dir(&sibling).unwrap();
+            let _independent = acquire_db_namespace_lease(&sibling).unwrap();
+            drop(lease);
+            acquire_db_write_lease(&data.join("new.lbug")).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_replacement_child_probe() {
+        let Some(data) = std::env::var_os("NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE") else {
+            return;
+        };
+        let data = Path::new(&data);
+        assert!(matches!(
+            acquire_db_namespace_lease(data),
+            Err(WriteLeaseError::Held)
+        ));
+        assert!(matches!(
+            acquire_db_write_lease(&data.join("new.lbug")),
+            Err(WriteLeaseError::Held)
+        ));
+    }
+
+    #[test]
+    fn fresh_creation_proof_rejects_a_replaced_empty_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("staged.lbug");
+        let lease = acquire_db_write_lease(&db).unwrap();
+        assert!(lease.authorizes_fresh_creation(&db));
+        std::fs::rename(&db, db.with_extension("displaced")).unwrap();
+        std::fs::write(&db, b"").unwrap();
+        assert!(!lease.authorizes_fresh_creation(&db));
     }
 
     #[test]

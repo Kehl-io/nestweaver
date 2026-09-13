@@ -35326,25 +35326,9 @@ fn run_publication_rebuild(
             use nestweaver_engine::publication_operation::PublicationPhase;
             match state.phase {
                 PublicationPhase::Planned => {
-                    if !target_db.exists() {
-                        std::fs::create_dir_all(&slot)?;
-                        let authority = acquire_publication_write_authority(
-                            &target_db,
-                            "create the staged publication",
-                        )?;
-                        let target_identity = nestweaver_store::PublicationIdentity {
-                            brain_uuid: state.plan.brain_uuid.clone(),
-                            publication_uuid: state.plan.target_publication_uuid.clone(),
-                        };
-                        let store = GraphStore::create_with_publication_identity_and_authority(
-                            &target_db,
-                            &target_identity,
-                            &authority,
-                        )?;
-                        drop(store);
-                    } else {
-                        verify_staged_publication_identity(&target_db, &state.plan)?;
-                    }
+                    nestweaver_engine::publication_operation::ensure_planned_database(
+                        &publication_root, &state, &root_lock,
+                    )?;
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
                         &operation_uuid,
