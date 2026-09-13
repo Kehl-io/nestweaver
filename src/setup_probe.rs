@@ -97,6 +97,41 @@ pub async fn probe(
     result
 }
 
+/// Host-only interpolation and environment policies cannot be emulated by a
+/// generic stdio probe. Refuse to execute a different context accidentally.
+fn validate_probe_context(entry: &Value) -> Result<()> {
+    ensure!(
+        entry.get("disabled").and_then(Value::as_bool) != Some(true)
+            && entry.get("enabled").and_then(Value::as_bool) != Some(false),
+        "registration is disabled"
+    );
+    for key in [
+        "cwd",
+        "env_vars",
+        "envFile",
+        "experimental_environment",
+        "url",
+    ] {
+        ensure!(
+            entry.get(key).is_none(),
+            "host-specific {key} requires activation verification in the host; generic probe skipped"
+        );
+    }
+    fn interpolated(value: &Value) -> bool {
+        match value {
+            Value::String(text) => text.contains("${"),
+            Value::Array(values) => values.iter().any(interpolated),
+            Value::Object(values) => values.values().any(interpolated),
+            _ => false,
+        }
+    }
+    ensure!(
+        !interpolated(entry),
+        "host-specific variable interpolation requires verification in the host; generic probe skipped"
+    );
+    Ok(())
+}
+
 pub fn report(entry: &Value, base: &Path) {
     println!(
         "Host activation: unverified. Restart the host session and confirm NestWeaver tools are available."
@@ -105,6 +140,7 @@ pub fn report(entry: &Value, base: &Path) {
         "Supervision: unknown/unverifiable (the MCP handshake does not report daemon ownership)."
     );
     let parsed = (|| -> Result<_> {
+        validate_probe_context(entry)?;
         let command = entry["command"]
             .as_str()
             .context("registration has no stdio command")?
@@ -173,6 +209,27 @@ pub fn report(entry: &Value, base: &Path) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn host_only_context_is_not_silently_approximated() {
+        let ordinary = json!({"command":"nestweaver","args":["mcp","--db","graph.lbug"],"env":{"MODE":"plain"}});
+        assert!(validate_probe_context(&ordinary).is_ok());
+        for (key, value) in [
+            ("cwd", json!("elsewhere")),
+            ("env_vars", json!(["TOKEN"])),
+            ("envFile", json!(".env")),
+            ("experimental_environment", json!({})),
+            ("disabled", json!(true)),
+            ("enabled", json!(false)),
+        ] {
+            let mut entry = ordinary.clone();
+            entry[key] = value;
+            assert!(validate_probe_context(&entry).is_err(), "ignored {key}");
+        }
+        let mut entry = ordinary;
+        entry["args"][2] = json!("${workspaceFolder}/graph.lbug");
+        assert!(validate_probe_context(&entry).is_err());
+    }
+
     fn mock_server(dir: &Path, initialize: &str, listed: &str) -> Vec<String> {
         let path = dir.join("server.sh");
         std::fs::write(&path, format!("read -r init\nprintf '%s\\n' '{initialize}'\nread -r notification\nread -r list\nprintf '%s\\n' '{listed}'\nexec sleep 20\n")).unwrap();

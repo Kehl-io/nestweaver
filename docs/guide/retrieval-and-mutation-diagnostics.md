@@ -138,3 +138,14 @@ new database. A failed probe is reported independently of the configuration
 write; restart the host and inspect its available tools. The ten-second total
 probe budget includes both requests, and individual responses cannot exceed
 256 KiB. Cursor's generated guide lists only the registered lite capabilities.
+
+The generic setup probe skips disabled registrations and host-specific working
+folder, environment-file, environment-inheritance, remote-URL or interpolation
+settings rather than approximating a different command context. See the
+[Codex MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+and [Cursor MCP configuration reference](https://cursor.com/docs/mcp). These
+registrations must be verified in their host; the configuration remains intact.
+An installed 10.0.0 stdio server was also exercised directly with the generated
+lite arguments: it negotiated `2024-11-05`, advertised tool capability, and
+returned the six registry tools in 0.019 seconds. This confirms server protocol
+compatibility, not a running Cursor/Codex/Claude host session.
