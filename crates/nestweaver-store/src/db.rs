@@ -4287,6 +4287,21 @@ mod tests {
         drop(store);
         drop(fresh);
 
+        let replaced_path = dir.path().join("replaced-empty.lbug");
+        let replaced = acquire_db_write_lease(&replaced_path).unwrap();
+        std::fs::rename(&replaced_path, dir.path().join("original-empty.lbug")).unwrap();
+        std::fs::write(&replaced_path, b"").unwrap();
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &replaced_path,
+            &identity,
+            &replaced,
+        )
+        .err()
+        .expect("a replacement zero-byte inode must not inherit freshness");
+        assert!(error.to_string().contains("pre-existing database"));
+        assert_eq!(std::fs::metadata(&replaced_path).unwrap().len(), 0);
+        drop(replaced);
+
         let existing_path = dir.path().join("existing-empty.lbug");
         std::fs::write(&existing_path, b"").unwrap();
         let existing = acquire_db_write_lease(&existing_path).unwrap();
