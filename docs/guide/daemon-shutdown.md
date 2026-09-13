@@ -277,10 +277,12 @@ Use `daemon inspect-runtime /exact/runtime/root/0123abcd` to report a single
 entry's contents, age and missing ownership proof without changing it. After
 inspection, `daemon prune-runtime /exact/runtime/root/0123abcd --database
 /path/to/brain.lbug` can retire an empty entry or one containing only an empty
-spawnlock. It requires an exact matching database identity, holds spawn admission
+spawnlock. It requires an existing regular database with an exact matching
+current or known legacy hash, holds spawn admission
 and exclusive database authority through removal, and refuses any PID, socket,
 other content, held lock, or ambiguity. A legacy hash whose database identity
-cannot be reconstructed remains spared. There is no age-based or recursive
+cannot be reconstructed remains spared, as does an entry whose database no
+longer exists. Runtime cleanup never creates a database. There is no age-based or recursive
 runtime-root deletion fallback.
 
 ### Watcher controller lifetime

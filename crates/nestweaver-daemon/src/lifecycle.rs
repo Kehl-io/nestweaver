@@ -5335,6 +5335,8 @@ fn prune_runtime_entry_in(
     database: &Path,
     roots: &DaemonGcRoots,
 ) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = exact_runtime_entry(path, roots)?;
     let identity = crate::instance_id_from_db_path(database);
     if path.file_name().and_then(|name| name.to_str()) != Some(identity.as_str()) {
@@ -5342,9 +5344,24 @@ fn prune_runtime_entry_in(
             "database identity does not match the exact runtime entry; legacy identity remains unverifiable",
         ));
     }
-    // Validate before acquisition, since admission creates an absent spawnlock.
-    let validate_contents = || -> std::io::Result<()> {
-        for entry in std::fs::read_dir(&path)? {
+    // A runtime-only operation must not create a missing database. The
+    // existing-only lease below repeats this at the authority boundary.
+    if !std::fs::symlink_metadata(database)?.is_file() {
+        return Err(std::io::Error::other(
+            "database must be an existing regular file",
+        ));
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&path)?;
+    let expected = directory.metadata()?;
+    let same_directory = |candidate: &Path| -> std::io::Result<bool> {
+        let current = std::fs::symlink_metadata(candidate)?;
+        Ok(current.is_dir() && current.dev() == expected.dev() && current.ino() == expected.ino())
+    };
+    let validate_contents = |candidate: &Path| -> std::io::Result<()> {
+        for entry in std::fs::read_dir(candidate)? {
             let entry = entry?;
             let metadata = std::fs::symlink_metadata(entry.path())?;
             if entry.file_name() != "daemon.spawnlock" || !metadata.is_file() || metadata.len() != 0
@@ -5356,19 +5373,51 @@ fn prune_runtime_entry_in(
         }
         Ok(())
     };
-    validate_contents()?;
-    let _admission = gc_spawn_admission(&path)?
-        .ok_or_else(|| std::io::Error::other("spawn admission is held; runtime entry spared"))?;
-    validate_contents()?;
+    validate_contents(&path)?;
     if !db_write_lock(database).is_provably_free() {
         return Err(std::io::Error::other(
             "database writer is live or unverifiable; runtime entry spared",
         ));
     }
-    let _writer = acquire_db_write_lease(database).map_err(|error| {
+    let _writer = nestweaver_store::acquire_existing_db_write_lease(database).map_err(|error| {
         std::io::Error::other(format!("database/instance lease unavailable: {error}"))
     })?;
-    retire_gc_runtime(&path)
+    let _admission = gc_spawn_admission(&path)?
+        .ok_or_else(|| std::io::Error::other("spawn admission is held; runtime entry spared"))?;
+    validate_contents(&path)?;
+    if !same_directory(&path)? {
+        return Err(std::io::Error::other(
+            "runtime directory changed during admission; spared",
+        ));
+    }
+    // Rename first while holding admission; pathname waiters revalidate and
+    // retry against a fresh runtime. Never recursively delete a retired entry:
+    // a concurrent replacement or unexpected new file must remain inspectable.
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("runtime has no parent"))?;
+    let retired = tempfile::Builder::new()
+        .prefix(".prune-retired-")
+        .tempdir_in(parent)?
+        .keep();
+    let destination = retired.join("instance");
+    if let Err(error) = std::fs::rename(&path, &destination) {
+        let _ = std::fs::remove_dir(&retired);
+        return Err(error);
+    }
+    if !same_directory(&destination)? || validate_contents(&destination).is_err() {
+        return Err(std::io::Error::other(format!(
+            "runtime changed during retirement; nothing deleted, inspect {}",
+            retired.display()
+        )));
+    }
+    // Unlink only the admitted lock through the held directory descriptor, so
+    // replacing a pathname cannot redirect deletion into another directory.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), c"daemon.spawnlock".as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::fs::remove_dir(&destination)?;
+    std::fs::remove_dir(&retired)
 }
 
 #[cfg(test)]
@@ -5379,6 +5428,7 @@ mod runtime_inspection_tests {
         let root = temp.path().join("runtime");
         std::fs::create_dir(&root).unwrap();
         let database = temp.path().join("fixture.lbug");
+        std::fs::write(&database, b"fixture lock only").unwrap();
         let entry = root.join(crate::instance_id_from_db_path(&database));
         std::fs::create_dir(&entry).unwrap();
         let roots = DaemonGcRoots {
@@ -5399,6 +5449,25 @@ mod runtime_inspection_tests {
         assert!(!entry.exists());
         assert!(inspect_runtime_entry_in(&roots.state, &roots).is_err());
     }
+    #[test]
+    fn known_legacy_hash_is_prunable_with_exact_database_proof() {
+        let (_temp, roots, database, entry) = fixture();
+        let legacy = roots.state.join(legacy_instance_id_from_db_path(&database));
+        std::fs::rename(&entry, &legacy).unwrap();
+        std::fs::write(legacy.join("daemon.spawnlock"), b"").unwrap();
+        prune_runtime_entry_in(&legacy, &database, &roots).unwrap();
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn absent_database_is_not_created_and_runtime_is_unchanged() {
+        let (_temp, roots, database, entry) = fixture();
+        std::fs::remove_file(&database).unwrap();
+        assert!(prune_runtime_entry_in(&entry, &database, &roots).is_err());
+        assert!(!database.exists());
+        assert!(std::fs::read_dir(&entry).unwrap().next().is_none());
+    }
+
     #[test]
     fn stale_empty_spawnlock_is_removable_but_held_lock_is_spared() {
         use std::os::fd::AsRawFd;
