@@ -135,6 +135,7 @@ jobs:
               - 'scripts/verify-linux-archive.py'
               - 'scripts/verify-release-fault.py'
               - 'scripts/test-verify-release-fault.py'
+              - 'scripts/run-backlog-benchmarks.sh'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
