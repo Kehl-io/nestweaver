@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.0.1](https://github.com/Kehl-io/nestweaver/compare/v10.0.0...v10.0.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* emit hook JSON so Cursor does not block Task subagents ([#384](https://github.com/Kehl-io/nestweaver/issues/384)) ([5149d22](https://github.com/Kehl-io/nestweaver/commit/5149d22cd885107fa5d8f047a00d87e1fff86847))
+* resolve 18 scoped backlog items with validated acceptance evidence ([#389](https://github.com/Kehl-io/nestweaver/issues/389)) ([900deba](https://github.com/Kehl-io/nestweaver/commit/900debaf460fe2615afa3980e48da793dfe270b1))
+
 ## [10.0.0](https://github.com/Kehl-io/nestweaver/compare/v9.3.0...v10.0.0) (2026-09-09)
 
 
