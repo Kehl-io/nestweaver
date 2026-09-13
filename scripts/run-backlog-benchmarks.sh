@@ -8,6 +8,9 @@ rustc --version > backlog-performance/rustc.txt
 uname -a > backlog-performance/kernel.txt
 lscpu > backlog-performance/cpu.txt
 free -b > backlog-performance/memory.txt
+df -T . > backlog-performance/filesystem.txt
+cat /proc/loadavg > backlog-performance/load-before.txt
+ps -eo pid,comm,pcpu,pmem --sort=-pcpu > backlog-performance/processes-before.txt
 cp Cargo.lock backlog-performance/Cargo.lock
 python3 - <<'PY' > backlog-performance/quiet-window.json
 import json, time
@@ -50,3 +53,5 @@ for run in 1 2; do
     --ignored --exact --nocapture --test-threads=1 \
     > "backlog-performance/materialization-paired-${run}.log" 2>&1
 done
+cat /proc/loadavg > backlog-performance/load-after.txt
+ps -eo pid,comm,pcpu,pmem --sort=-pcpu > backlog-performance/processes-after.txt
