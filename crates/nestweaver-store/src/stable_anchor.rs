@@ -155,6 +155,8 @@ mod tests {
         assert!(!anchor.is_current());
         // Replacing trusted registry state is outside the exclusion guarantee;
         // an incumbent can nevertheless detect it and must refuse mutation.
-        std::fs::remove_file(anchor.path.with_extension("displaced")).unwrap();
+        std::fs::remove_file(&anchor.path).unwrap();
+        std::fs::rename(anchor.path.with_extension("displaced"), &anchor.path).unwrap();
+        assert!(anchor.is_current());
     }
 }
