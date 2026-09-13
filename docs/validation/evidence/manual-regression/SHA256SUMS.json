@@ -1,0 +1,17 @@
+{
+  "daemon-results.json": "09cb5e43a8767d51054094c91a54c4d6504f3ccda3400de298d14e6051dc0f21",
+  "impact-found-direct.stdout": "21af902f1f8e14589982bdd4c1db0a5c3b222f3253de7f4e0e2837d1a55da0a8",
+  "impact-missing-direct.stdout": "6d15d671f0f03cfa21442b96d3317ae64ac7a5adb142e508f19b68fb0ea61dba",
+  "impact-updated-daemon.stdout": "a67747b6f2d005e4d56353dd87ad6455c3c297e2f67ee32d87ec6aadd9ddf8e4",
+  "impact-updated-direct.stdout": "a67747b6f2d005e4d56353dd87ad6455c3c297e2f67ee32d87ec6aadd9ddf8e4",
+  "index-forced-again.stdout": "8569262bc64a9bcef5fd1d656aac72570dcb060b76787fc208fb58f475e941a9",
+  "index-full.stdout": "8569262bc64a9bcef5fd1d656aac72570dcb060b76787fc208fb58f475e941a9",
+  "index-incremental.stdout": "43b24e6b09c172878605e6296ece6d69fc08c1adf98c79405141524b03ad79d2",
+  "index-unchanged.stdout": "b9be7dcbad661c7397ebbbbabe9036c848609d4eaa644c33cf026201450c20ae",
+  "manual-assertions.json": "3c1871e85fe60ee0c9450b2b106ef4f939333e94d107fa682f814761a1498c42",
+  "provenance.json": "2fd323613fd63d3260b9a54a7dc43e68aafc6edd95579e2ec376db87e68537a9",
+  "results.json": "5b18f46e9c430d2da1799d6830a0b6917460a51f7306cd889834632af7a8bedd",
+  "socket-case-before.stdout": "baf84b87122d46f8483867b8eb80a41b158fcff00a7e1af55816956db4eb058b",
+  "socket-case-missing.stdout": "112c13874ddd659a7781714ea9fd78f1ab3e37751ff048482247d7404a4be75b",
+  "socket-case-restored.stdout": "baf84b87122d46f8483867b8eb80a41b158fcff00a7e1af55816956db4eb058b"
+}

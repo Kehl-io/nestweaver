@@ -1,0 +1,112 @@
+[
+  {
+    "name": "impact-updated-direct",
+    "command": [
+      "impact",
+      "visible_api_updated",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 2.284
+  },
+  {
+    "name": "daemon-start",
+    "command": [
+      "daemon",
+      "start",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--config",
+      "/tmp/nw18-manual-jd7sfbvn/instance.toml",
+      "--idle-timeout",
+      "300"
+    ],
+    "exit": 0,
+    "seconds": 3.264
+  },
+  {
+    "name": "daemon-status",
+    "command": [
+      "daemon",
+      "status",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 0.112
+  },
+  {
+    "name": "brain-status-daemon",
+    "command": [
+      "brain",
+      "status",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 0.579
+  },
+  {
+    "name": "impact-updated-daemon",
+    "command": [
+      "impact",
+      "visible_api_updated",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 0.618
+  },
+  {
+    "name": "impact-missing-daemon",
+    "command": [
+      "impact",
+      "not_here",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 2,
+    "seconds": 0.133
+  },
+  {
+    "name": "daemon-stop",
+    "command": [
+      "daemon",
+      "stop",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug"
+    ],
+    "exit": 0,
+    "seconds": 44.936
+  },
+  {
+    "name": "daemon-status-stopped",
+    "command": [
+      "daemon",
+      "status",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 0.036
+  },
+  {
+    "name": "prune-unidentified-refusal",
+    "command": [
+      "daemon",
+      "prune-runtime",
+      "/tmp/nw18-manual-jd7sfbvn/unidentified",
+      "--database",
+      "/tmp/nw18-manual-jd7sfbvn/must-not-be-created.lbug"
+    ],
+    "exit": 1,
+    "seconds": 0.054
+  }
+]

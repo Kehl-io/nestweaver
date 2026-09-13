@@ -111,3 +111,28 @@ version update is claimed.
 The implementation PR must pass Required CI on its final head before handoff.
 Evidence/documentation commits do not retroactively change the source SHAs of
 recorded release, benchmark or local replay artifacts.
+
+## Additional manual regression pass
+
+At the user's request while PR CI ran, the orchestrator exercised a disposable
+two-file Rust Git repository through the actual CLI. Full, incremental, unchanged
+and forced indexing preserved the configured exclusion and its exact tracked
+count, while finding the edited visible symbol. Excluded paths were not reported
+as parse failures; the fixture's separate `.claude` default-policy skip was
+truthfully disclosed. Direct/daemon impact JSON matched for found and missing
+symbols, with canonical aliases, counts, provenance and exit 2 on missing targets.
+Repeated hook installation preserved bytes, including an unrelated malformed
+foreign hook container; modifying JSONC was refused without changing it.
+
+The disposable daemon reported ad-hoc supervision, stopped normally, and refused
+unidentified-directory pruning without deleting its marker or creating a DB.
+Renaming only its socket produced `running_but_unreachable` backed by the same
+verified database-holder PID; restoring the socket restored `running`.
+
+Manual inspection found stale impact help describing a bare array. The wording
+now describes the observed canonical envelope and distinguishes score pruning
+from depth/result limits. Workspace test compilation, all 30 existing help
+contract checks and the actual rebuilt help command passed. This wording-only
+correction is reviewed and signed off; updated PR-head CI is still required.
+Selected outputs, command results and provenance are retained in
+[manual evidence](evidence/manual-regression/).

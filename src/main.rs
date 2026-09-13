@@ -5353,7 +5353,7 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so (text note; under --json the output becomes\nan object with `nodes`, `truncated_by_threshold`, `truncated_by_depth` instead of\nthe usual bare array). Pass --min-score 0 for the full traversal."
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
     )]
     Impact {
         /// Symbol name or UID to analyze
