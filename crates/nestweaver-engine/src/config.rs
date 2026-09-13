@@ -1078,34 +1078,51 @@ impl InstanceConfig {
     /// origin, and vault entries use a `file://` url. Requiring one spelling
     /// would make a declared exclude silently do nothing.
     pub fn exclude_globs_for(&self, repo_url: &str, repo_path: Option<&Path>) -> &[String] {
-        let path_str = repo_path.map(|p| p.to_string_lossy().to_string());
-        self.repos
-            .iter()
-            .find(|r| {
-                let declared = normalize_repo_ref(&r.url);
-                declared == normalize_repo_ref(repo_url)
-                    || path_str
-                        .as_deref()
-                        .is_some_and(|p| declared == normalize_repo_ref(p))
-            })
-            .map_or(&[][..], |r| r.exclude.as_slice())
+        self.repo_eligibility_entry(repo_url, repo_path)
+            .map_or(&[][..], |repo| repo.exclude.as_slice())
     }
 
     /// The `SKIP_DIRS` names this repo re-admits. Resolves by URL or by local
     /// checkout path, exactly as [`Self::exclude_globs_for`] does, so the two
     /// halves of the same `[[repos]]` block can never resolve differently.
     pub fn unskip_names_for(&self, repo_url: &str, repo_path: Option<&Path>) -> &[String] {
-        let path_str = repo_path.map(|p| p.to_string_lossy().to_string());
-        self.repos
-            .iter()
-            .find(|r| {
-                let declared = normalize_repo_ref(&r.url);
-                declared == normalize_repo_ref(repo_url)
-                    || path_str
-                        .as_deref()
-                        .is_some_and(|p| declared == normalize_repo_ref(p))
-            })
-            .map_or(&[][..], |r| r.unskip.as_slice())
+        self.repo_eligibility_entry(repo_url, repo_path)
+            .map_or(&[][..], |repo| repo.unskip.as_slice())
+    }
+
+    fn repo_eligibility_entry(
+        &self,
+        repo_url: &str,
+        repo_path: Option<&Path>,
+    ) -> Option<&RepoConfig> {
+        if self.repos.is_empty() {
+            return None;
+        }
+        // Keep lexical matching for remotes and unavailable local paths, but
+        // also recognize aliases of an existing local checkout. In particular,
+        // macOS spells temporary roots through both /var and /private/var.
+        fn canonical_local(value: &str) -> Option<std::path::PathBuf> {
+            let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
+            if path.is_absolute() {
+                path.canonicalize().ok()
+            } else {
+                None
+            }
+        }
+        let path_str = repo_path.map(|path| path.to_string_lossy());
+        let canonical_url = canonical_local(repo_url);
+        let canonical_path = repo_path.and_then(|path| path.canonicalize().ok());
+        self.repos.iter().find(|repo| {
+            let declared = normalize_repo_ref(&repo.url);
+            declared == normalize_repo_ref(repo_url)
+                || path_str
+                    .as_deref()
+                    .is_some_and(|path| declared == normalize_repo_ref(path))
+                || canonical_local(&repo.url).is_some_and(|declared| {
+                    canonical_url.as_ref() == Some(&declared)
+                        || canonical_path.as_ref() == Some(&declared)
+                })
+        })
     }
 
     /// The DB path declared by this instance, if any.
@@ -2174,6 +2191,40 @@ exclude = ["uploads/**"]
                 .is_empty(),
             "an undeclared repo must not inherit another repo's excludes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_eligibility_matches_existing_local_aliases_for_both_policy_halves() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("repo");
+        let alias = dir.path().join("alias");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        for declared in [&real, &alias] {
+            let url = format!("file://{}", declared.display());
+            let config = InstanceConfig::from_toml_str(&format!(
+                "{MINIMAL_TOML}\n[[repos]]\nurl = {url:?}\nexclude = [\"main.js\"]\nunskip = [\"vendor\"]\n",
+            ))
+            .unwrap();
+            for queried in [&real, &alias, &canonical] {
+                for (url, path) in [
+                    (format!("file://{}", queried.display()), None),
+                    (
+                        "git@example.test:repo.git".to_string(),
+                        Some(queried.as_path()),
+                    ),
+                ] {
+                    assert_eq!(config.exclude_globs_for(&url, path), ["main.js"]);
+                    assert_eq!(config.unskip_names_for(&url, path), ["vendor"]);
+                }
+            }
+            assert!(config.exclude_globs_for("other", Some(&other)).is_empty());
+            assert!(config.unskip_names_for("other", Some(&other)).is_empty());
+        }
     }
 
     #[test]

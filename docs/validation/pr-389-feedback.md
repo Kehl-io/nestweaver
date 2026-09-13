@@ -95,9 +95,36 @@ production behavior is unchanged.
 That macOS run passed its engine (1,520), MCP (339) and store (566) tests; its
 daemon suite had 395 passes and this one failure. These are partial results from
 a failed CI job. The manual binary/source provenance explicitly identifies
-`2edadc77`; subsequent changes here only repair the test fixture and document
-validation. A new CI run must validate the corrected PR head.
+`2edadc77`; the following correction repaired that test fixture without changing runtime
+behavior. The later path-alias correction is recorded separately below. A new CI run must validate the corrected PR head.
 
 The corrected fixture was rebuilt with the workspace feature set; all 384 local
 daemon tests passed, including the canonical-path test and watcher lifecycle
 regressions. Formatting and diff checks passed.
+
+
+## Local repository aliases
+
+The next CI run, [34767853323](https://github.com/Kehl-io/nestweaver/actions/runs/34767853323),
+passed all 396 macOS daemon unit tests, then exposed a real integration failure:
+a config naming a `/var` repository did not match the daemon's canonical
+`/private/var` spelling. Exclusion lookup compared only strings, so a config-only
+exclude could still be ignored through a local alias. A Linux CLI replay with a
+symlinked repository reproduced the retained symbol after exclusion.
+
+`exclude` and `unskip` now share one lookup that preserves lexical remote/path
+matching and recognizes canonical aliases of existing local paths. The live
+same-PID/same-SHA regression deliberately names a symlink on every Unix platform;
+a separate matrix checks both policy halves through real, alias and canonical
+paths and refuses unrelated roots. This fixes runtime behavior rather than
+canonicalizing the fixture to hide the failure.
+
+The CLI alias replay now observes `ok` → `not_found` → `ok` across initial index,
+exclusion and re-admission. [Alias replay provenance](evidence/pr-389-feedback/alias-provenance.json)
+records the baseline/candidate binary hashes and changed source hashes. All 70
+configuration tests passed.
+
+The rebuilt MCP suite passed all 339 tests. The focused live-daemon regression
+passed with the explicit symlink fixture, unchanged SHA/PID, fresh inventory,
+re-admission and invalid-config refusal. The broader daemon integration suite
+remains part of the final CI gate.

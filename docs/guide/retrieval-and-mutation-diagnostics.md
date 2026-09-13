@@ -122,6 +122,10 @@ directories and genuine parse failures retain their existing coverage warnings.
 Full, incremental, unchanged, forced and watcher updates apply the same
 compiled repository policy, including deletion of obsolete watcher rows.
 
+Local policy lookup recognizes existing filesystem aliases, including macOS
+`/var` and `/private/var`, for both `exclude` and `unskip`. Remote references and
+unavailable paths retain lexical matching.
+
 A live daemon reloads `exclude` and `unskip` from its canonical bound config
 when admitting an index or registering a code watcher. A running watcher keeps
 its registration-time policy snapshot; restart that watcher to adopt edits.

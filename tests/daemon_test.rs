@@ -6291,6 +6291,14 @@ fn live_daemon_reloads_repo_eligibility_without_sha_or_pid_change() {
     let db = dir.path().join("policy.lbug");
     let config = dir.path().join("instance.toml");
     write_test_repo(&repo);
+    // Exercise macOS /var -> /private/var behavior on every Unix platform:
+    // configuration names an alias while daemon admission canonicalizes it.
+    #[cfg(unix)]
+    let repo = {
+        let alias = dir.path().join("repo-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        alias
+    };
     let head = StdCommand::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&repo)

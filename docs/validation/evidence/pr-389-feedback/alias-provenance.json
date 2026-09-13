@@ -1,0 +1,25 @@
+{
+  "baseline_commit": "1b2a3879a79fde5c7daf5a74a46dc735f8abaf4a",
+  "before": {
+    "binary_sha256": "6a6af78b303986276d719043c9b20cba2c21f102d59c551383208fe4d43ffe41",
+    "before_status": "ok",
+    "excluded_status": "ok",
+    "same_physical_repo": true
+  },
+  "after": {
+    "binary_sha256": "280193d9530b7bdd1bf203e769ae8cee685253c58ab346b7da8348b63c9cb0c4",
+    "before_status": "ok",
+    "excluded_status": "not_found",
+    "same_physical_repo": true,
+    "readmitted_status": "ok"
+  },
+  "source_file_sha256": {
+    "crates/nestweaver-engine/src/config.rs": "af7ba6a3671af6594acf7d90a031faeca5a21e195635ca84a0d4a569bbfc906e",
+    "tests/daemon_test.rs": "8fc4d3f212e7d2aeb5d0b558ca3fe50d0ae76079d5553e7f40e17308ac4645ee"
+  },
+  "notes": [
+    "Configuration names a symlink; daemon uses the same physical repository through its canonical path.",
+    "Only configuration changes between index commands; source commit stays unchanged.",
+    "The first replay reproduced the bug; its cleanup command was corrected separately and no fixture daemon remained running."
+  ]
+}
