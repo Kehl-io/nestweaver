@@ -54,19 +54,7 @@ cleanup() {
 trap cleanup EXIT
 
 rules=$(gh api "repos/$repo/rules/branches/$base_branch")
-jq -e '
-  any(.[]; .type == "pull_request" and
-    (.parameters.required_approving_review_count // 0) >= 1 and
-    (.parameters.require_code_owner_review // false) == true and
-    (.parameters.dismiss_stale_reviews_on_push // false) == true) and
-  any(.[]; .type == "required_status_checks" and
-    (.parameters.strict_required_status_checks_policy // false) == true and
-    any(.parameters.required_status_checks[]?;
-      .context == "Required CI" and .integration_id == 15368))
-' <<< "$rules" >/dev/null || {
-  echo "main lacks the enforced PR/CODEOWNER/up-to-date Required CI rules" >&2
-  exit 1
-}
+bash "$(dirname "$0")/verify-main-rules.sh" <<< "$rules"
 
 current_base=$(gh api "repos/$repo/git/ref/heads/$base_branch" --jq '.object.sha')
 if [[ "$current_base" != "$base_sha" ]]; then

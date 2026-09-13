@@ -222,17 +222,25 @@ jobs:
             exit 0
           fi
 
-          expected_workflow_ref="refs/heads/$DEFAULT_BRANCH"
-          [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
-            echo "::error::manual release operations must run from $expected_workflow_ref" >&2
+          # Maintainers can validate a proposed policy before merging it. Only
+          # dry-run is permitted off main: its jobs never publish a release or
+          # package. Mutating recovery still uses the current default policy.
+          if [ "$OPERATION" != dry-run ]; then
+            expected_workflow_ref="refs/heads/$DEFAULT_BRANCH"
+            [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
+              echo "::error::manual release operations must run from $expected_workflow_ref" >&2
+              exit 1
+            }
+            current_default_sha="$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
+            [ "$WORKFLOW_SHA" = "$current_default_sha" ] || {
+              echo "::error::manual release policy $WORKFLOW_SHA is not current $DEFAULT_BRANCH tip $current_default_sha" >&2
+              exit 1
+            }
+          elif [[ "$WORKFLOW_REF" != refs/heads/* ]]; then
+            echo "::error::dry-run requires an explicit branch ref" >&2
             exit 1
-          }
-          current_default_sha="$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
-          [ "$WORKFLOW_SHA" = "$current_default_sha" ] || {
-            echo "::error::manual release policy $WORKFLOW_SHA is not current $DEFAULT_BRANCH tip $current_default_sha" >&2
-            exit 1
-          }
+          fi
 
           case "$OPERATION" in
             dry-run)
@@ -1232,7 +1240,7 @@ jobs:
             done
 
             # Enforce the declared glibc baseline. The runner pin above sets
-            # this floor, but a pin is a claim about the build host; this reads
+          # this floor, but a pin is a claim about the build host; this reads
             # the requirement back off the ARTIFACT WE ARE ABOUT TO SHIP, which
             # is the only thing users run. Without it, a future runner-image
             # bump raises the floor silently again -- exactly how the v8.0.0
@@ -1294,11 +1302,17 @@ jobs:
           tar xzf "$ARCHIVE" -C "$EXTRACT_DIR"
           BIN="$EXTRACT_DIR/nestweaver"
           test -x "$BIN"
+          if [ "${{ runner.os }}" = Linux ]; then
+            python3 scripts/verify-linux-archive.py "$EXTRACT_DIR" --negative-control
+          fi
           "$BIN" --version
+          "$BIN" diagnostics capabilities --json
+          mkdir -p "$SMOKE_DIR/source"
+          printf '%s\n' 'pub fn release_archive_probe() -> bool { true }' > "$SMOKE_DIR/source/lib.rs"
 
           if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
             "$BIN" index \
-              --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+              --repo "$SMOKE_DIR/source" \
               --name release-artifact-smoke \
               --db "$SMOKE_DIR/smoke.lbug" \
               --with-trigrams \
@@ -1313,7 +1327,7 @@ jobs:
                   -ex run \
                   -ex 'thread apply all backtrace' \
                   --args "$BIN" index \
-                    --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                    --repo "$SMOKE_DIR/source" \
                     --name release-artifact-debug \
                     --db "$DEBUG_DIR/debug.lbug" \
                     --with-trigrams \
@@ -1321,6 +1335,9 @@ jobs:
             fi
             exit "$SMOKE_STATUS"
           fi
+          NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+            "$BIN" search release_archive_probe --db "$SMOKE_DIR/smoke.lbug" --json \
+            | jq -e '[.. | strings | select(. == "release_archive_probe")] | length > 0'
       - name: Exercise a failed target
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.fault_mode == 'fail' && inputs.fault_target == matrix.target }}
         run: |
@@ -1857,8 +1874,11 @@ jobs:
           jq -e '.all_absent == true' <<< "$BASELINE_VISIBILITY" >/dev/null
           jq -e '.all_absent == true' <<< "$final_visibility" >/dev/null
 
+          # Governance is tested against the actual default-branch tip, while
+          # the artifact evidence remains bound to the dispatched candidate.
+          canary_base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_BRANCH" --jq '.object.sha')"
           canary="$(bash scripts/verify-release-canary-pr.sh \
-            "$GITHUB_REPOSITORY" "$CANDIDATE_SHA")"
+            "$GITHUB_REPOSITORY" "$canary_base_sha")"
 
           jq -n \
             --arg candidate_sha "$CANDIDATE_SHA" \

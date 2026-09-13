@@ -14,10 +14,10 @@ on:
   # branch's definition of `Required CI`. That is not a widening -- the
   # `pull_request` trigger above already runs the workflow from the PR's merge
   # ref, so any PR that edits this file already runs its own edited copy. The
-  # control for both is the same and is NOT this trigger: CODEOWNERS requires
-  # maintainer review on `.github/workflows/**`, and branch protection requires
-  # that review before merge. Dispatch additionally requires repository write
-  # access, which already permits strictly more.
+  # control for both is maintainer review of workflow edits. The single-owner
+  # repository requires PRs and exact-head CI, but does not require an impossible
+  # second-owner approval. CODEOWNERS requests review; it is not itself an
+  # enforced approval rule. Dispatch additionally requires repository write access.
   workflow_dispatch:
 
 permissions:
@@ -85,6 +85,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release-please.yml'
               - '.github/CODEOWNERS'
+              - '.github/main-ruleset.json'
               - 'CONTRIBUTING.md'
               - 'release-please-config.json'
               - 'scripts/observe-release-visibility.sh'
@@ -92,6 +93,8 @@ jobs:
               - 'scripts/verify-release-bundle.sh'
               - 'scripts/verify-release-package.sh'
               - 'scripts/verify-required-ci.sh'
+              - 'scripts/verify-main-rules.sh'
+              - 'scripts/verify-linux-archive.py'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
@@ -1281,6 +1284,7 @@ jobs:
           fi
 
           bash scripts/verify-required-ci.sh --self-test
+          bash scripts/verify-main-rules.sh --self-test
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test
