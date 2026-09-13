@@ -5188,9 +5188,9 @@ pub fn process_supervision(pid: i32) -> &'static str {
         if before.is_none() || before != after {
             return "unknown/unverifiable";
         }
-        return groups
+        groups
             .map(|groups| supervision_from_cgroups(&groups))
-            .unwrap_or("unknown/unverifiable");
+            .unwrap_or("unknown/unverifiable")
     }
     #[cfg(not(target_os = "linux"))]
     {
