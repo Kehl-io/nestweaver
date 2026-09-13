@@ -1808,6 +1808,49 @@ mod settings_preservation_tests {
     /// only that the call failed would still pass if it errored after
     /// truncating.
     #[test]
+    #[cfg(unix)]
+    fn automatic_setup_never_executes_a_preserved_custom_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("exists.lbug");
+        std::fs::write(&db, "probe precondition only").unwrap();
+        std::fs::create_dir_all(dir.path().join(".cursor")).unwrap();
+        let marker = dir.path().join("must-not-run");
+        let entry =
+            serde_json::json!({"command":"sh", "args":["-c","touch "$1"","sh",marker,"--db",db]});
+        std::fs::write(
+            dir.path().join(".cursor/mcp.json"),
+            serde_json::json!({"mcpServers":{"nestweaver":entry.clone()}}).to_string(),
+        )
+        .unwrap();
+        run_auto_setup_for_tools(&db, dir.path(), true, &["cursor"]).unwrap();
+        assert!(
+            !marker.exists(),
+            "ordinary indexing must not execute repository MCP configuration"
+        );
+        assert_eq!(configured_mcp_entry("cursor", dir.path()).unwrap(), entry);
+    }
+
+    #[test]
+    fn cursor_guide_uses_only_the_registered_lite_tool_catalogue() {
+        let guide = generate_cursor_rule_content();
+        for name in nestweaver_mcp::tools::LITE_TOOLS {
+            assert!(guide.contains(&format!("`{name}`")));
+        }
+        for unavailable in [
+            "read_symbols",
+            "investigate_hydrate",
+            "dead_code",
+            "project_context",
+        ] {
+            assert!(
+                !guide.contains(&format!("- `{unavailable}`")),
+                "lite guide advertises unavailable tool {unavailable}"
+            );
+        }
+        assert!(guide.contains("unverified"));
+    }
+
+    #[test]
     fn malformed_settings_are_refused_and_left_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         // A real trailing comma, the single most common way this file breaks,

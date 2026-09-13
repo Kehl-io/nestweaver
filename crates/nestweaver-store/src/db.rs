@@ -4206,6 +4206,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_read_timeout_interrupts_work_and_releases_its_connection() {
+        let store = GraphStore::in_memory().unwrap();
+        {
+            let conn = store.conn().unwrap();
+            conn.query("CREATE NODE TABLE DeadlineProbe(id INT64, PRIMARY KEY(id))")
+                .unwrap();
+            conn.query("UNWIND range(1, 500) AS n CREATE (:DeadlineProbe {id: n})")
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let outcome = store.with_read_deadline(started + std::time::Duration::from_millis(30), || {
+            // A positive timeout must reach the native connection. An already
+            // expired scope is tested separately and cannot satisfy this test.
+            let conn = store.conn().unwrap();
+            conn.query("MATCH (a:DeadlineProbe), (b:DeadlineProbe), (c:DeadlineProbe), (d:DeadlineProbe) RETURN sum((a.id * b.id + c.id * d.id) % 7)")
+                .map(|_| ()).map_err(|error| error.to_string())
+        });
+        let error = outcome.expect_err("cross-product read must exhaust the native query timer");
+        assert!(
+            error.to_lowercase().contains("interrupt") || error.to_lowercase().contains("timeout"),
+            "wrong failure: {error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert!(
+            store
+                .conn()
+                .unwrap()
+                .query("MATCH (n:DeadlineProbe) RETURN count(n)")
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn scoped_read_deadlines_refuse_expired_restore_and_cannot_be_extended() {
         let store = GraphStore::in_memory().unwrap();
         let expired = std::time::Instant::now();
