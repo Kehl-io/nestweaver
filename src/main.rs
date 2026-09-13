@@ -11462,6 +11462,35 @@ fn report_runtime_cleanup(outcome: &RuntimeCleanup) {
     }
 }
 
+/// Read-only endpoint identity proof: a listening Unix socket alone does not
+/// prove that it serves the selected database, or even speaks the daemon RPC.
+fn daemon_status_reachable_pid(db_path: &Path, socket: &Path) -> Result<Option<i32>, String> {
+    let Some(peer_pid) = daemon_socket_reported_pid(socket) else {
+        return Ok(None);
+    };
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let health = runtime
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
+                client.health_check().await
+            })
+            .await
+        })
+        .map_err(|_| "endpoint health check timed out".to_string())?
+        .map_err(|error| format!("endpoint health check failed: {error}"))?;
+    if health.pid != peer_pid as u32
+        || health.instance_id != nestweaver_daemon::instance_id_from_db_path(db_path)
+        || nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
+            != nestweaver_daemon::lifecycle::database_path_fingerprint(db_path)
+    {
+        return Err(
+            "socket peer does not verify the selected database/instance identity".to_string(),
+        );
+    }
+    Ok(Some(peer_pid))
+}
+
 /// What proved that something still owns this instance when no client can
 /// reach it. Each variant carries a DIFFERENT amount of knowledge, and the
 /// report must not borrow confidence from one to describe another.
@@ -23209,8 +23238,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
                 DaemonAction::Status { json } => {
+                    let (reachable, endpoint_error) =
+                        match daemon_status_reachable_pid(&db_path, &socket) {
+                            Ok(pid) => (pid, None),
+                            Err(error) => (None, Some(error)),
+                        };
                     if json {
-                        let reachable = daemon_socket_reported_pid(&socket);
                         let owner = if reachable.is_none() {
                             unreachable_daemon_owner(&db_path, &pidfile)
                         } else {
@@ -23232,12 +23265,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             (_, Some(UnreachableOwner::DatabaseLockUnreadable)) => {
                                 ("unknown", "database_lock_unreadable", None)
                             }
+                            _ if endpoint_error.is_some() => {
+                                ("unknown", "endpoint_identity_unverified", None)
+                            }
                             _ => ("not_running", "no_observed_owner", None),
                         };
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
-                                "state": state, "evidence": evidence, "pid": pid,
+                                "state": state, "evidence": evidence, "pid": pid, "endpoint_error": endpoint_error,
                                 "db_path": db_path, "instance_id": instance_id, "socket": socket,
                                 "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
                                 "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
@@ -23245,7 +23281,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         return Ok((EXIT_SUCCESS, None));
                     }
-                    if daemon_socket_reported_pid(&socket).is_none()
+                    if let Some(error) = &endpoint_error {
+                        println!(
+                            "Daemon endpoint is UNREACHABLE or unverifiable: {error}. Do not start another writer or remove runtime files based on this endpoint."
+                        );
+                    }
+                    if reachable.is_none()
                         && !pidfile_flock_held(&pidfile)
                         && let Some(old_id) = selected_slot_legacy_id.as_deref()
                     {
@@ -23265,9 +23306,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     // Check launchd first on macOS
                     #[cfg(target_os = "macos")]
-                    if nestweaver_daemon::launchd::is_running(&instance_id)
-                        && daemon_socket_reported_pid(&socket).is_some()
-                    {
+                    if nestweaver_daemon::launchd::is_running(&instance_id) && reachable.is_some() {
                         println!("Daemon is running (launchd agent)");
                         println!(
                             "  Label:  {}",
@@ -23287,7 +23326,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     {
                         // A live PID is not proof — it may be recycled.
                         if daemon_identity_verified(pid, &db_path, &pidfile, &socket)
-                            && daemon_socket_reported_pid(&socket) == Some(pid)
+                            && reachable == Some(pid)
                         {
                             println!("Daemon is running (PID {pid})");
                             println!(
@@ -23322,7 +23361,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The pidfile may be gone/stale while a detached daemon
                     // still serves the socket — ask the kernel before
                     // declaring "not running".
-                    if let Some(pid) = daemon_socket_reported_pid(&socket)
+                    if let Some(pid) = reachable
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
                         println!("Daemon is running (PID {pid}, serving socket)");

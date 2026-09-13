@@ -6008,3 +6008,65 @@ fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
          was knowable immediately:\n{stderr}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn missing_socket_retains_live_writer_evidence_across_repeated_status_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("status-fixture.lbug");
+    write_test_repo(&repo);
+    create_db(&repo, &db);
+    let _guard = DaemonGuard::new(&db);
+    start_daemon(&db);
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance);
+    let pid_before = std::fs::read(&pidfile).unwrap();
+    let healthy = daemon_action_cmd(&db, "status")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    let healthy: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(healthy["state"], "running");
+    // Restore before DaemonGuard drops, including during assertion unwinding.
+    struct RestoreSocket(std::path::PathBuf, std::path::PathBuf);
+    impl Drop for RestoreSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::rename(&self.0, &self.1);
+        }
+    }
+    let displaced = socket.with_extension("hidden-test");
+    std::fs::rename(&socket, &displaced).unwrap();
+    let restore = RestoreSocket(displaced, socket.clone());
+    for _ in 0..2 {
+        daemon_action_cmd(&db, "status")
+            .assert()
+            .success()
+            .stdout(contains("Daemon is running but UNREACHABLE"));
+        let output = daemon_action_cmd(&db, "status")
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "running_but_unreachable");
+        assert_eq!(report["evidence"], "database_write_lock");
+        assert_eq!(report["db_path"], db.to_string_lossy().as_ref());
+        assert_eq!(std::fs::read(&pidfile).unwrap(), pid_before);
+        assert!(!socket.exists());
+    }
+    let other = dir.path().join("other-instance.lbug");
+    let output = daemon_action_cmd(&other, "status")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["state"], "not_running");
+    drop(restore);
+    daemon_action_cmd(&db, "status")
+        .assert()
+        .success()
+        .stdout(contains("Daemon is running (PID"));
+}
