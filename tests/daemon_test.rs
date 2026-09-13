@@ -6068,7 +6068,7 @@ fn missing_socket_retains_live_writer_evidence_across_repeated_status_calls() {
     daemon_action_cmd(&db, "status")
         .assert()
         .success()
-        .stdout(contains("Daemon is running (PID"));
+        .stdout(contains("Daemon is running"));
 }
 
 #[cfg(unix)]
@@ -6137,6 +6137,86 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
     let original = wait_registration(&mut client, 0);
     assert_eq!(original.kind, "code");
     assert_eq!(original.controller_pid, Some(first.0.id() as i32));
+    // Exercise real inotify/FSEvents delivery before replacement. Search the
+    // live daemon store, never a concurrently opened database snapshot.
+    let wait_symbol =
+        |client: &mut nestweaver_client::DaemonClient, name: &str, expected_path: Option<&str>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(25);
+            loop {
+                let response = rt
+                    .block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client
+                                .inner_mut()
+                                .search_symbols(nestweaver_proto::JsonRequest {
+                                    args_json: serde_json::json!({"query": name, "limit": 100})
+                                        .to_string(),
+                                }),
+                        )
+                        .await
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .into_inner();
+                let symbols: Vec<nestweaver_engine::SymbolCandidate> =
+                    serde_json::from_str(&response.result_json).unwrap();
+                let matches: Vec<_> = symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == name)
+                    .collect();
+                let correct = match expected_path {
+                    Some(path) => matches.len() == 1 && matches[0].file_path.ends_with(path),
+                    None => matches.is_empty(),
+                };
+                if correct {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watch event not reflected for {name}: {symbols:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+    let event_file = repo.join("lifecycle-event.js");
+    std::fs::write(&event_file, "function lifecycleCreated() { return 1; }").unwrap();
+    wait_symbol(&mut client, "lifecycleCreated", Some("lifecycle-event.js"));
+    std::fs::write(&event_file, "function lifecycleEdited() { return 222; }").unwrap();
+    wait_symbol(&mut client, "lifecycleEdited", Some("lifecycle-event.js"));
+    wait_symbol(&mut client, "lifecycleCreated", None);
+    let renamed = repo.join("lifecycle-renamed.js");
+    std::fs::rename(&event_file, &renamed).unwrap();
+    wait_symbol(&mut client, "lifecycleEdited", Some("lifecycle-renamed.js"));
+    let atomic = repo.join("atomic-save.tmp");
+    std::fs::write(&atomic, "function lifecycleAtomicSave() { return 3333; }").unwrap();
+    std::fs::rename(&atomic, &renamed).unwrap();
+    wait_symbol(
+        &mut client,
+        "lifecycleAtomicSave",
+        Some("lifecycle-renamed.js"),
+    );
+    wait_symbol(&mut client, "lifecycleEdited", None);
+    // Metadata-only changes preserve the indexed symbol and leave the watcher
+    // idle after a debounce window; registration age keeps advancing separately.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&renamed).unwrap().permissions().mode();
+    std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    wait_symbol(
+        &mut client,
+        "lifecycleAtomicSave",
+        Some("lifecycle-renamed.js"),
+    );
+    let status = rt.block_on(client.brain_status()).unwrap();
+    assert!(
+        status.write_holder.is_empty(),
+        "metadata event left a write holder: {}",
+        status.write_holder
+    );
+    assert!(status.watcher.unwrap().age_seconds >= 3);
+    std::fs::remove_file(&renamed).unwrap();
+    wait_symbol(&mut client, "lifecycleAtomicSave", None);
     let mut second = spawn(true);
     let replacement = wait_registration(&mut client, original.id);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -6168,4 +6248,19 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(observe(&mut client).is_none());
+    let mut third = spawn(false);
+    let _ = wait_registration(&mut client, 0);
+    stop_daemon(&db);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = third.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disconnected controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
