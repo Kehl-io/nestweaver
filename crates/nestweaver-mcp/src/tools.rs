@@ -16140,11 +16140,28 @@ mod project_context_bug12_tests {
                 populated.get(key).is_some(),
                 "populated project omitted {key}"
             );
+            // Nullable diagnostics legitimately change when populated data
+            // requires semantic ranking or exceeds a result budget.
+            if matches!(key, "semantic_unavailable" | "truncated_by") {
+                continue;
+            }
             assert_eq!(
                 std::mem::discriminant(&named[key]),
                 std::mem::discriminant(&populated[key]),
                 "type mismatch for {key}"
             );
+        }
+        assert_eq!(named["semantic_applied"], false);
+        assert!(named["semantic_unavailable"].is_null());
+        assert_eq!(named["degraded_components"], json!([]));
+        assert_eq!(populated["semantic_applied"], false);
+        assert_eq!(
+            populated["semantic_unavailable"]["reason"],
+            "model_unavailable"
+        );
+        assert_eq!(populated["degraded_components"], json!(["semantic"]));
+        for response in [&named, &populated] {
+            assert!(response["truncated_by"].is_null() || response["truncated_by"].is_string());
         }
         assert!(
             populated["connected"]
