@@ -346,6 +346,7 @@ pub(crate) fn collect_tolerating_corrupt<T>(
     let mut skipped = 0usize;
     let mut first_reason: Option<String> = None;
     for row in rows {
+        GraphStore::check_read_deadline()?;
         match row {
             Ok(value) => out.push(value),
             Err(StoreError::CorruptValue { column, reason }) => {
@@ -2515,6 +2516,7 @@ impl GraphStore {
                 .query(&q)
                 .map_err(|error| StoreError::Query(format!("load_typed_edges {et}: {error}")))?;
             for row in result {
+                GraphStore::check_read_deadline()?;
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 let confidence = extract_f64(&row, 2)?;
@@ -2531,6 +2533,7 @@ impl GraphStore {
         })?;
         {
             for row in result {
+                GraphStore::check_read_deadline()?;
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 edges.push((src, dst, "DEFINES".to_string(), 1.0, String::new()));

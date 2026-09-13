@@ -3160,6 +3160,18 @@ impl GraphStore {
         operation()
     }
 
+    /// Cooperatively stop Rust-side decoding or graph work inside a scoped read.
+    /// With no active scope this leaves ordinary reads unchanged.
+    pub fn check_read_deadline() -> Result<(), StoreError> {
+        if READ_DEADLINE
+            .get()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
+        }
+        Ok(())
+    }
+
     pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
         let conn = lbug::Connection::new(&self.db)?;
         if let Some(deadline) = READ_DEADLINE.get() {
@@ -4204,6 +4216,29 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_read_deadline_bounds_rust_row_collection_and_restores() {
+        let store = GraphStore::in_memory().unwrap();
+        let collect = || {
+            crate::read::collect_tolerating_corrupt(
+                [Ok(1), Ok(2), Ok(3)].into_iter(),
+                "deadline-fixture",
+            )
+        };
+        let normal = collect().unwrap().0;
+        let enough = store.with_read_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            collect,
+        );
+        assert_eq!(enough.unwrap().0, normal);
+        let expired = store.with_read_deadline(std::time::Instant::now(), collect);
+        assert!(matches!(
+            expired,
+            Err(StoreError::Cancelled(crate::CancelReason::Timeout))
+        ));
+        assert_eq!(collect().unwrap().0, normal);
+    }
 
     #[test]
     fn native_read_timeout_interrupts_work_and_releases_its_connection() {

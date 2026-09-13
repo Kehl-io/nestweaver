@@ -389,6 +389,7 @@ fn detect_changes_impact_with_work_budget(
     }
 
     for file_path in &changed_files {
+        GraphStore::check_read_deadline()?;
         let syms = match store.symbols_in_file(file_path) {
             Ok(syms) => syms,
             Err(e) => {
@@ -407,6 +408,7 @@ fn detect_changes_impact_with_work_budget(
             unassessed.push(file_path.as_str());
         }
         for sym in syms {
+            GraphStore::check_read_deadline()?;
             if affected_uids.insert(sym.uid.clone()) {
                 affected_symbols.push(AffectedSymbol {
                     uid: sym.uid.clone(),
@@ -504,6 +506,7 @@ fn detect_changes_impact_with_work_budget(
     // entry-point predicate's root test.
     let mut has_caller: HashSet<String> = HashSet::new();
     for edge in &typed_edges {
+        GraphStore::check_read_deadline()?;
         let (src, dst, etype) = (&edge.0, &edge.1, edge.2.as_str());
         if etype == "CALLS" {
             has_caller.insert(dst.clone());
@@ -533,12 +536,16 @@ fn detect_changes_impact_with_work_budget(
     let mut work_budget_exceeded = ancestors.is_none();
     let mut affected_processes = Vec::new();
     if let Some(ancestors) = ancestors {
-        let mut entries: Vec<_> = symbols
-            .iter()
-            .filter(|sym| ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller))
-            .collect();
+        let mut entries = Vec::new();
+        for sym in &symbols {
+            GraphStore::check_read_deadline()?;
+            if ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller) {
+                entries.push(sym);
+            }
+        }
         entries.sort_by(|a, b| a.uid.cmp(&b.uid));
         for ep in entries {
+            GraphStore::check_read_deadline()?;
             let Some(members) = reachable_in_memory(
                 &fwd_adj,
                 &HashSet::from([ep.uid.clone()]),
