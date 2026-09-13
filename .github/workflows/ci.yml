@@ -133,6 +133,8 @@ jobs:
               - 'scripts/verify-required-ci.sh'
               - 'scripts/verify-main-rules.sh'
               - 'scripts/verify-linux-archive.py'
+              - 'scripts/verify-release-fault.py'
+              - 'scripts/test-verify-release-fault.py'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
@@ -1328,6 +1330,7 @@ jobs:
 
           bash scripts/verify-required-ci.sh --self-test
           bash scripts/verify-main-rules.sh --self-test
+          python3 scripts/test-verify-release-fault.py
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test
