@@ -432,9 +432,9 @@ fn detect_changes_impact_with_work_budget(
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
         let risk = RiskLevel::Low;
-        // nw-467: `false` — this analysis has no configured traversal budget to
-        // stop at, so any non-Complete status here is a genuine degrade (drift,
-        // an undecodable row, or resolver staleness), never a bound.
+        // Traversal has not started, so any non-Complete status here reflects
+        // drift, an undecodable row, or resolver staleness. The outer deadline
+        // guard independently discloses an expired planning budget.
         let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
         return Ok(ChangeImpact {
             affected_symbols,

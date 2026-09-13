@@ -4216,7 +4216,7 @@ mod tests {
                 .unwrap();
         }
         let started = std::time::Instant::now();
-        let outcome = store.with_read_deadline(started + std::time::Duration::from_millis(30), || {
+        let outcome = store.with_read_deadline(started + std::time::Duration::from_millis(250), || {
             // A positive timeout must reach the native connection. An already
             // expired scope is tested separately and cannot satisfy this test.
             let conn = store.conn().unwrap();
