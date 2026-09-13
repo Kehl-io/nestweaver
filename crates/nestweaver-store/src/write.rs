@@ -11602,7 +11602,7 @@ mod tests {
             assert_eq!(
                 error.disposition,
                 ProjectMutationDisposition::ConfirmedRolledBack,
-                "successful snapshot restoration must be exposed to publication callers"
+                "{failure_table}: successful snapshot restoration must be exposed to publication callers: {error}"
             );
             assert!(error.to_string().contains(failure_table));
             assert!(
