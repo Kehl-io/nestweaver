@@ -388,9 +388,18 @@ impl CodeWatcher {
             // are not parser-supported source files. A spec-only edit must
             // refresh the derived Contract nodes and IMPLEMENTS_CONTRACT
             // edges just like an ordinary incremental index.
+            let policy_reader = self.reader_for(&repo_url)?;
             let relevant: Vec<PathBuf> = unique_paths
                 .into_iter()
                 .filter(|p| is_watcher_input(p))
+                .filter(|path| {
+                    path.strip_prefix(&self.repo_root).is_ok_and(|relative| {
+                        !crate::index::path_in_skip_dir_with_unskip(
+                            relative,
+                            policy_reader.unskipped_skip_dirs(),
+                        )
+                    })
+                })
                 .collect();
 
             if relevant.is_empty() {

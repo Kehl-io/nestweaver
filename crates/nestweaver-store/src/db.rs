@@ -4210,6 +4210,15 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         let expired = std::time::Instant::now();
         store.with_read_deadline(expired, || {
+            std::thread::scope(|scope| {
+                assert_eq!(
+                    scope
+                        .spawn(|| store.count_symbols().unwrap())
+                        .join()
+                        .unwrap(),
+                    0
+                );
+            });
             assert!(matches!(
                 store.count_symbols(),
                 Err(StoreError::Cancelled(_))
@@ -4225,6 +4234,10 @@ mod tests {
                 Err(StoreError::Cancelled(_))
             ));
         });
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_read_deadline(expired, || panic!("test unwind"));
+        }));
         assert_eq!(store.count_symbols().unwrap(), 0);
         store.with_read_deadline(
             std::time::Instant::now() + std::time::Duration::from_secs(30),

@@ -304,6 +304,18 @@ pub fn detect_changes_impact(
     max_depth: u32,
 ) -> Result<ChangeImpact> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    detect_changes_impact_until(store, changed_files, max_depth, deadline)
+}
+
+fn detect_changes_impact_until(
+    store: &GraphStore,
+    changed_files: &[String],
+    max_depth: u32,
+    deadline: std::time::Instant,
+) -> Result<ChangeImpact> {
+    // Validate before entering the timed operation so expiry never turns an
+    // invalid/empty request into a successful partial response.
+    crate::changed_files::require_changed_files(changed_files)?;
     let result = store.with_read_deadline(deadline, || {
         detect_changes_impact_with_work_budget(store, changed_files, max_depth, 2_000_000)
     });
@@ -315,13 +327,20 @@ pub fn detect_changes_impact(
             result.notifications.push(deadline_notification());
             Ok(result)
         }
-        Err(_) if std::time::Instant::now() >= deadline => Ok(ChangeImpact {
+        Err(error) if std::time::Instant::now() >= deadline => Ok(ChangeImpact {
             affected_symbols: vec![],
             affected_processes: vec![],
             risk: RiskLevel::Low,
             blast_radius: 0,
             status: AnalysisStatus::Partial,
-            notifications: vec![deadline_notification()],
+            notifications: vec![
+                deadline_notification(),
+                Notification {
+                    level: NotificationLevel::Error,
+                    descriptor: "change-impact-read-failed".into(),
+                    message: format!("database read did not complete: {error:#}"),
+                },
+            ],
             resolver_stale_repos: vec![],
             gate_state: GateState::DegradedUnknown,
             work_budget_exceeded: false,
@@ -588,6 +607,24 @@ fn detect_changes_impact_with_work_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_database_budget_is_unknown_not_empty_success_and_does_not_leak() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = detect_changes_impact_until(
+            &store,
+            &["src/file.rs".into()],
+            10,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(result.deadline_exceeded);
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+        assert!(!result.notifications.is_empty());
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert!(detect_changes_impact_until(&store, &[], 10, std::time::Instant::now()).is_err());
+    }
 
     #[test]
     fn fifty_six_file_analysis_returns_truthful_deterministic_bounded_prefix() {

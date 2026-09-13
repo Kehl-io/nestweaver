@@ -103,7 +103,9 @@ storage stall. The client RPC deadline remains the final transport safeguard.
 `phase_millis` separates planning, graph loading, traversal, and sorting. For
 reference, the first 56 Rust files from `git diff --name-only v7.0.0 5149d22c --
 '*.rs'` completed on the pre-change local graph in 46.076 seconds at `limit=1000`,
-returning 361,171 bytes. This is an equivalent historical-delta fixture, not a
+returning 361,171 bytes. A second run completed in 41.820 seconds while a concurrent
+`brain status` read completed in 3.134 seconds; impact was still running before
+and after the status read. This is an equivalent historical-delta fixture, not a
 claim to have recovered the original timed-out request or a portable benchmark.
 The regression suite also exercises a deterministic smaller work budget over a
 56-file graph and verifies that partial analysis cannot yield a clean gate.
