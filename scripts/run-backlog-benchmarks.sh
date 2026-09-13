@@ -36,10 +36,17 @@ else:
 PY
 mapfile -t binaries < <(find target/release/deps -maxdepth 1 -type f -name 'remove_repo_benchmarks-*' -executable)
 test "${#binaries[@]}" -eq 1
+mapfile -t store_tests < <(find target/release/deps -maxdepth 1 -type f -name 'nestweaver_store-*' -executable)
+test "${#store_tests[@]}" -eq 1
 for run in 1 2; do
   /usr/bin/time -v env BENCH_HUB_DEGREES=1000,8700,86800 \
     "${binaries[0]}" --bench > "backlog-performance/remove-repo-${run}.log" 2>&1
   /usr/bin/time -v env RUST_LOG=info \
     target/release/examples/project_materialization_benchmark \
     > "backlog-performance/materialization-${run}.log" 2>&1
+  if [[ "$run" -eq 2 ]]; then export NW_PROJECT_BENCH_REVERSE=1; fi
+  /usr/bin/time -v "${store_tests[0]}" \
+    write::tests::project_materialization_paired_139509_benchmark \
+    --ignored --exact --nocapture --test-threads=1 \
+    > "backlog-performance/materialization-paired-${run}.log" 2>&1
 done

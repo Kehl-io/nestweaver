@@ -80,6 +80,7 @@ jobs:
         run: |
           cargo bench --locked --bench remove_repo_benchmarks --no-run
           cargo build --locked --release --example project_materialization_benchmark
+          cargo test --locked --release --workspace --lib --no-run
       - name: Record controlled performance evidence
         run: bash scripts/run-backlog-benchmarks.sh
       - name: Preserve raw benchmark evidence
