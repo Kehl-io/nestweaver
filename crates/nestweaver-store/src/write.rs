@@ -10777,6 +10777,205 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    /// Exact historical MATCH+CREATE loop from ad0619fb0e50e65253b52ea74d99f2969f65fbf2
+    /// (parent of COPY migration 598d0c1787fdcbfff1738ff72f1357926fcd2f23),
+    /// write.rs::batch_insert_project_symbol_edges, plus its note/component
+    /// helpers. Both paths use today's pinned engine and identical synthetic-v1
+    /// input on the same machine; this isolates the algorithm, not old binaries.
+    #[test]
+    #[ignore = "paired 139509-edge benchmark requires an isolated quiet runner"]
+    fn project_materialization_paired_139509_benchmark() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+        let projects = (0..11)
+            .map(|i| Project {
+                uid: format!("proj:fixture:{i}"),
+                name: format!("Project {i}"),
+                summary: None,
+                instance_id: "fixture".into(),
+            })
+            .collect::<Vec<_>>();
+        let symbols = (0..12_683)
+            .map(|i| Symbol {
+                uid: format!("sym:fixture:{i}"),
+                name: format!("symbol_{i}"),
+                file_path: format!("src/file_{}.rs", i / 28),
+                repo_uid: "repo:fixture".into(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn symbol_{i}()"),
+                summary: None,
+                content_hash: format!("hash-{i}"),
+                ..plain_symbol(i)
+            })
+            .collect::<Vec<_>>();
+        let notes = (0..91)
+            .map(|i| Note {
+                uid: format!("note:fixture:{i}"),
+                vault_uid: "vault:fixture".into(),
+                file_path: format!("note-{i}.md"),
+                title: format!("Note {i}"),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: format!("hash-{i}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .collect::<Vec<_>>();
+        let planned = std::time::Instant::now();
+        let symbol_edges = (0..139_509)
+            .map(|i| {
+                (
+                    projects[i / symbols.len()].uid.clone(),
+                    symbols[i % symbols.len()].uid.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let note_edges = notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| (projects[i % projects.len()].uid.clone(), note.uid.clone()))
+            .collect::<Vec<_>>();
+        let components = (0..5)
+            .map(|i| (projects[0].uid.clone(), projects[i + 1].uid.clone()))
+            .collect::<Vec<_>>();
+        let planning_ms = planned.elapsed().as_secs_f64() * 1000.0;
+        let mut runs = Vec::new();
+        // A second invocation may reverse order to disclose cache/order bias.
+        let order = if std::env::var_os("NW_PROJECT_BENCH_REVERSE").is_some() {
+            ["copy", "legacy"]
+        } else {
+            ["legacy", "copy"]
+        };
+        for algorithm in order {
+            let scratch = tempfile::tempdir().unwrap();
+            let db = scratch.path().join("materialization.lbug");
+            {
+                let store = GraphStore::open_or_create(&db).unwrap();
+                store.batch_insert_symbols(&symbols).unwrap();
+                store.batch_insert_notes(&notes).unwrap();
+            }
+            let started = std::time::Instant::now();
+            let authority = crate::acquire_db_write_lease(&db).unwrap();
+            let leased = std::time::Instant::now();
+            let store = GraphStore::open_or_create_with_authority(&db, &authority).unwrap();
+            let apply = std::time::Instant::now();
+            if algorithm == "legacy" {
+                for project in &projects {
+                    store.insert_project(project).unwrap();
+                }
+                // Original helper obtains a connection and prepares once per
+                // project, then executes one auto-committing statement per UID.
+                for project in &projects {
+                    let conn = store.conn().unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "MATCH (p:Project {uid: $pid}), (s:Symbol {uid: $sid}) \
+                         CREATE (p)-[:PROJECT_INCLUDES_SYMBOL {confidence: $conf}]->(s)",
+                        )
+                        .unwrap();
+                    for (_, symbol_uid) in symbol_edges.iter().filter(|edge| edge.0 == project.uid)
+                    {
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("pid", lbug::Value::String(project.uid.clone())),
+                                ("sid", lbug::Value::String(symbol_uid.clone())),
+                                ("conf", lbug::Value::Double(1.0)),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                {
+                    let conn = store.conn().unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
+                         CREATE (p)-[:PROJECT_INCLUDES_NOTE {confidence: 1.0}]->(n)",
+                        )
+                        .unwrap();
+                    for (project_uid, note_uid) in &note_edges {
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("pid", lbug::Value::String(project_uid.clone())),
+                                ("nid", lbug::Value::String(note_uid.clone())),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                for (parent, child) in &components {
+                    store
+                        .insert_project_component_edge(parent, child, 1.0)
+                        .unwrap();
+                }
+            } else {
+                store
+                    .replace_materialized_projects(
+                        &projects,
+                        &note_edges,
+                        &symbol_edges,
+                        &components,
+                        &[],
+                    )
+                    .unwrap();
+            }
+            let apply_ms = apply.elapsed().as_secs_f64() * 1000.0;
+            let mut observed = 0;
+            for project in &projects {
+                observed += store.list_project_symbol_uids(&project.uid).unwrap().len();
+            }
+            assert_eq!(observed, 139_509);
+            assert_eq!(
+                store
+                    .list_project_edge_pairs("PROJECT_INCLUDES_NOTE")
+                    .unwrap(),
+                note_edges.iter().cloned().collect()
+            );
+            assert_eq!(
+                store
+                    .list_project_edge_pairs("PROJECT_HAS_COMPONENT")
+                    .unwrap(),
+                components.iter().cloned().collect()
+            );
+            drop(store);
+            let write_lease_ms = leased.elapsed().as_secs_f64() * 1000.0;
+            drop(authority);
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0 + planning_ms;
+            let report = serde_json::json!({"algorithm":algorithm, "planning_ms":planning_ms,
+                "apply_including_commit_ms":apply_ms,"write_lease_ms":write_lease_ms,"total_ms":total_ms});
+            eprintln!("PROJECT_MATERIALIZATION_RUN {report}");
+            runs.push(report);
+        }
+        let legacy = runs
+            .iter()
+            .find(|run| run["algorithm"] == "legacy")
+            .unwrap();
+        let copy = runs.iter().find(|run| run["algorithm"] == "copy").unwrap();
+        let speedup = legacy["apply_including_commit_ms"].as_f64().unwrap()
+            / copy["apply_including_commit_ms"].as_f64().unwrap();
+        eprintln!(
+            "PROJECT_MATERIALIZATION_PAIRED {}",
+            serde_json::json!({
+            "fixture":"synthetic-project-materialization-v1", "symbol_edges":139509,
+            "legacy_source":"ad0619fb0e50e65253b52ea74d99f2969f65fbf2", "runs":runs,
+            "same_machine":true, "historical_dataset":false,"speedup":speedup})
+        );
+        assert!(
+            speedup >= 10.0,
+            "COPY speedup {speedup:.2}x is below 10x target"
+        );
+        assert!(
+            copy["write_lease_ms"].as_f64().unwrap() < 120_000.0,
+            "COPY exclusive phase exceeds two minutes"
+        );
+    }
+
     #[test]
     fn project_copy_over_256_quoted_endpoints_preserves_direction_and_confidence() {
         let store = GraphStore::in_memory().unwrap();
@@ -10787,9 +10986,18 @@ mod tests {
             instance_id: "test".into(),
         };
         store.insert_project(&project).unwrap();
+        let plain_project = nestweaver_schema::Project {
+            uid: "proj:test:plain".into(),
+            ..project.clone()
+        };
+        store.insert_project(&plain_project).unwrap();
         let symbols = (0..300)
             .map(|i| Symbol {
-                uid: format!("sym:{i},\"quoted\""),
+                uid: if i < DIALECT_SAMPLE_ROWS {
+                    format!("sym:plain:{i}")
+                } else {
+                    format!("sym:{i},\"quoted\"")
+                },
                 ..plain_symbol(i)
             })
             .collect::<Vec<_>>();
@@ -10801,16 +11009,41 @@ mod tests {
             .iter()
             .map(|symbol| symbol.uid.clone())
             .collect::<Vec<_>>();
-        store
-            .batch_insert_project_symbol_edges(&project.uid, &uids, 0.375)
-            .unwrap();
+        let edges = uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| {
+                (
+                    if i < DIALECT_SAMPLE_ROWS {
+                        plain_project.uid.clone()
+                    } else {
+                        project.uid.clone()
+                    },
+                    uid.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixture = tempfile::tempdir().unwrap();
+        let csv = fixture.path().join("quoted.csv");
+        write_project_edge_csv(&edges, 0.375, &csv).unwrap();
+        assert_fixture_shape(&csv);
         let conn = store.conn().unwrap();
+        GraphStore::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &edges, 0.375).unwrap();
         let rows = conn.query("MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence")
             .unwrap().collect::<Vec<_>>();
         assert_eq!(rows.len(), 300);
         let mut seen = std::collections::HashSet::new();
         for row in rows {
-            assert_eq!(row[0], lbug::Value::String(project.uid.clone()));
+            let lbug::Value::String(source) = &row[0] else {
+                panic!("missing project UID")
+            };
+            let lbug::Value::String(target) = &row[1] else {
+                panic!("missing symbol UID")
+            };
+            assert!(
+                edges.contains(&(source.clone(), target.clone())),
+                "COPY changed endpoint direction"
+            );
             let lbug::Value::String(uid) = &row[1] else {
                 panic!("missing symbol UID")
             };
