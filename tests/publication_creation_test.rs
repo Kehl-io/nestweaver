@@ -77,6 +77,15 @@ fn planned_worker_resumes_two_crashes_and_commits_exact_identity_before_graph() 
             .phase,
         publication_operation::PublicationPhase::Graph
     );
+    let journal = publication::operation_path(&root, operation).unwrap();
+    assert!(!journal.join("creation.json").exists());
+    assert!(!std::fs::read_dir(&journal).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("creation-seed-")
+    }));
     let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target).unwrap();
     let identity = store.publication_identity().unwrap().unwrap();
     assert_eq!(identity.brain_uuid, state.plan.brain_uuid);

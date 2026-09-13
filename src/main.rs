@@ -35368,15 +35368,15 @@ fn run_publication_rebuild(
                         state.revision,
                         PublicationPhase::Graph,
                     )?;
-                    #[cfg(debug_assertions)]
-                    if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY").is_some() {
-                        std::process::exit(87);
-                    }
                 }
                 PublicationPhase::Graph => {
                     nestweaver_engine::publication_operation::retire_planned_creation(
                         &publication_root, &state, &root_lock,
                     )?;
+                    #[cfg(debug_assertions)]
+                    if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY").is_some() {
+                        std::process::exit(87);
+                    }
                     verify_staged_publication_identity(&target_db, &state.plan)?;
                     let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
                     let mut completed = 0_u64;
