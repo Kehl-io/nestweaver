@@ -1,0 +1,24 @@
+{
+  "coverage_status": "degraded",
+  "edges_found": null,
+  "exclusion_inventory": {
+    "observed_paths": [
+      "external"
+    ],
+    "patterns": [
+      "external/**"
+    ],
+    "tracked_files": 1
+  },
+  "files_processed": 1,
+  "skipped_count": 1,
+  "skipped_files": [
+    {
+      "path": ".claude",
+      "reason": "directory pruned before enumeration by skip-dir policy (.claude); re-admit it with `[[repos]] unskip`",
+      "reason_code": "ignored"
+    }
+  ],
+  "symbols_found": 2,
+  "trigram_refresh": null
+}

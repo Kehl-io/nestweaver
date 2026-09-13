@@ -1,0 +1,9 @@
+{
+  "pr_number": 388,
+  "state": "closed",
+  "merged": false,
+  "closed_at": "2026-09-13T05:38:03Z",
+  "branch": "release-gate-canary-34738154634-1",
+  "branch_api_status": 404,
+  "independent_readback": true
+}

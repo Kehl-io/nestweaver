@@ -1,0 +1,8 @@
+{
+  "source_commit": "a771754e7cccc8be96013194813ff3a2c865ef79",
+  "repository_path": "Cargo.lock",
+  "sha256": "fdd6d68b1b1ad3a1721c8e240162777edb64fd2a63cb401cae909e008140a710",
+  "artifact": "backlog-performance-a771754e7cccc8be96013194813ff3a2c865ef79",
+  "run_id": 34736783556,
+  "note": "The byte-identical lockfile copy is retained in the CI artifact; use this source commit and checksum instead of duplicating it in git."
+}

@@ -222,17 +222,25 @@ jobs:
             exit 0
           fi
 
-          expected_workflow_ref="refs/heads/$DEFAULT_BRANCH"
-          [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
-            echo "::error::manual release operations must run from $expected_workflow_ref" >&2
+          # Maintainers can validate a proposed policy before merging it. Only
+          # dry-run is permitted off main: its jobs never publish a release or
+          # package. Mutating recovery still uses the current default policy.
+          if [ "$OPERATION" != dry-run ]; then
+            expected_workflow_ref="refs/heads/$DEFAULT_BRANCH"
+            [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
+              echo "::error::manual release operations must run from $expected_workflow_ref" >&2
+              exit 1
+            }
+            current_default_sha="$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
+            [ "$WORKFLOW_SHA" = "$current_default_sha" ] || {
+              echo "::error::manual release policy $WORKFLOW_SHA is not current $DEFAULT_BRANCH tip $current_default_sha" >&2
+              exit 1
+            }
+          elif [[ "$WORKFLOW_REF" != refs/heads/* ]]; then
+            echo "::error::dry-run requires an explicit branch ref" >&2
             exit 1
-          }
-          current_default_sha="$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
-          [ "$WORKFLOW_SHA" = "$current_default_sha" ] || {
-            echo "::error::manual release policy $WORKFLOW_SHA is not current $DEFAULT_BRANCH tip $current_default_sha" >&2
-            exit 1
-          }
+          fi
 
           case "$OPERATION" in
             dry-run)
@@ -899,7 +907,8 @@ jobs:
           # the compatibility floor shipped to users. `ubuntu-latest` moved to
           # 24.04 and silently raised that floor to 2.39, which is why the
           # public v8.0.0 GNU archive cannot start on Ubuntu 22.04 (2.35),
-          # Debian 12 (2.36) or RHEL 9 (2.34). Pinning 22.04 covers all three.
+          # Debian 12 (2.36). The declared 2.35 baseline does not cover
+          # RHEL 9's older 2.34 glibc.
           # The `Verify release binary` step enforces the floor rather than
           # trusting this pin.
           - target: x86_64-unknown-linux-gnu
@@ -1232,7 +1241,7 @@ jobs:
             done
 
             # Enforce the declared glibc baseline. The runner pin above sets
-            # this floor, but a pin is a claim about the build host; this reads
+          # this floor, but a pin is a claim about the build host; this reads
             # the requirement back off the ARTIFACT WE ARE ABOUT TO SHIP, which
             # is the only thing users run. Without it, a future runner-image
             # bump raises the floor silently again -- exactly how the v8.0.0
@@ -1294,11 +1303,17 @@ jobs:
           tar xzf "$ARCHIVE" -C "$EXTRACT_DIR"
           BIN="$EXTRACT_DIR/nestweaver"
           test -x "$BIN"
+          if [ "${{ runner.os }}" = Linux ]; then
+            python3 scripts/verify-linux-archive.py "$EXTRACT_DIR" --negative-control
+          fi
           "$BIN" --version
+          "$BIN" diagnostics capabilities --json
+          mkdir -p "$SMOKE_DIR/source"
+          printf '%s\n' 'pub fn release_archive_probe() -> bool { true }' > "$SMOKE_DIR/source/lib.rs"
 
           if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
             "$BIN" index \
-              --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+              --repo "$SMOKE_DIR/source" \
               --name release-artifact-smoke \
               --db "$SMOKE_DIR/smoke.lbug" \
               --with-trigrams \
@@ -1313,7 +1328,7 @@ jobs:
                   -ex run \
                   -ex 'thread apply all backtrace' \
                   --args "$BIN" index \
-                    --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                    --repo "$SMOKE_DIR/source" \
                     --name release-artifact-debug \
                     --db "$DEBUG_DIR/debug.lbug" \
                     --with-trigrams \
@@ -1321,6 +1336,9 @@ jobs:
             fi
             exit "$SMOKE_STATUS"
           fi
+          NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+            "$BIN" search release_archive_probe --db "$SMOKE_DIR/smoke.lbug" --json \
+            | jq -e '[.. | strings | select(. == "release_archive_probe")] | length > 0'
       - name: Exercise a failed target
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.fault_mode == 'fail' && inputs.fault_target == matrix.target }}
         run: |
@@ -1852,13 +1870,30 @@ jobs:
               ;;
           esac
 
+          # Aggregate matrix failure is insufficient: a compiler or smoke
+          # failure must never masquerade as the requested fault injection.
+          # Fetch the exact attempt, not the latest-job view across retries.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            > release-matrix-run.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            > release-matrix-jobs.json
+          python3 scripts/verify-release-fault.py \
+            --run release-matrix-run.json --jobs release-matrix-jobs.json \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --sha "$CANDIDATE_SHA" --mode "$FAULT_MODE" --target "$FAULT_TARGET" \
+            --bundle release-bundle --tag "$RELEASE_TAG" > release-matrix-evidence.json
+
           final_visibility="$(bash scripts/observe-release-visibility.sh \
             "$GITHUB_REPOSITORY" "$RELEASE_TAG" nestweaver "$DRY_RUN_VERSION")"
           jq -e '.all_absent == true' <<< "$BASELINE_VISIBILITY" >/dev/null
           jq -e '.all_absent == true' <<< "$final_visibility" >/dev/null
 
+          # Governance is tested against the actual default-branch tip, while
+          # the artifact evidence remains bound to the dispatched candidate.
+          canary_base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_BRANCH" --jq '.object.sha')"
           canary="$(bash scripts/verify-release-canary-pr.sh \
-            "$GITHUB_REPOSITORY" "$CANDIDATE_SHA")"
+            "$GITHUB_REPOSITORY" "$canary_base_sha")"
 
           jq -n \
             --arg candidate_sha "$CANDIDATE_SHA" \
@@ -1870,17 +1905,23 @@ jobs:
             --argjson before "$BASELINE_VISIBILITY" \
             --argjson after "$final_visibility" \
             --argjson canary "$canary" \
+            --slurpfile matrix release-matrix-evidence.json \
             '{candidate_sha: $candidate_sha, tag: $tag, fault_mode: $fault_mode,
               fault_target: $fault_target, build_result: $build_result,
               bundle_verifier_status: $verifier_status, visibility_before: $before,
-              visibility_after: $after, automation_pr: $canary}' \
+              visibility_after: $after, automation_pr: $canary, matrix: $matrix[0]}' \
             > release-gate-evidence.json
           cat release-gate-evidence.json >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve dry-run evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-gate-evidence.json
+          path: |
+            release-gate-evidence.json
+            release-matrix-run.json
+            release-matrix-jobs.json
+            release-matrix-evidence.json
           if-no-files-found: error
           retention-days: 30
 

@@ -346,6 +346,7 @@ pub(crate) fn collect_tolerating_corrupt<T>(
     let mut skipped = 0usize;
     let mut first_reason: Option<String> = None;
     for row in rows {
+        GraphStore::check_read_deadline()?;
         match row {
             Ok(value) => out.push(value),
             Err(StoreError::CorruptValue { column, reason }) => {
@@ -2501,27 +2502,21 @@ impl GraphStore {
     /// Each tuple is `(source_uid, target_uid, edge_type, confidence, evidence)`.
     /// Used by graph-export functions that need the relationship type.
     pub fn load_typed_edges(&self) -> Result<Vec<TypedEdge>, StoreError> {
-        let conn = self.conn()?;
-
         let edge_types: Vec<&str> = nestweaver_schema::ALL_SYMBOL_EDGE_TYPES
             .iter()
             .map(|et| et.rel_table_name())
             .collect();
         let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
+            let conn = self.conn()?;
             let q = format!(
                 "MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence"
             );
-            let result = match conn.query(&q) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::trace!(
-                        "load_typed_edges: edge type {et} skipped (table may not exist): {e}"
-                    );
-                    continue;
-                }
-            };
+            let result = conn
+                .query(&q)
+                .map_err(|error| StoreError::Query(format!("load_typed_edges {et}: {error}")))?;
             for row in result {
+                GraphStore::check_read_deadline()?;
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 let confidence = extract_f64(&row, 2)?;
@@ -2532,8 +2527,13 @@ impl GraphStore {
 
         // FILE_HAS_SYMBOL (DEFINES) edges: File → Symbol
         let q = "MATCH (f:File)-[r:FILE_HAS_SYMBOL]->(s:Symbol) RETURN f.uid, s.uid";
-        if let Ok(result) = conn.query(q) {
+        let conn = self.conn()?;
+        let result = conn.query(q).map_err(|error| {
+            StoreError::Query(format!("load_typed_edges FILE_HAS_SYMBOL: {error}"))
+        })?;
+        {
             for row in result {
+                GraphStore::check_read_deadline()?;
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 edges.push((src, dst, "DEFINES".to_string(), 1.0, String::new()));
@@ -3518,6 +3518,32 @@ impl GraphStore {
     }
 
     // ── DB-level metadata ───────────────────────────────────────────────────
+
+    /// Eligibility policy used by the last successfully published repository
+    /// index. Missing metadata means an older index needs a full rebuild;
+    /// query failures must never be interpreted as an unchanged policy.
+    pub fn get_repo_index_policy(&self, repo_uid: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+            .map_err(|error| StoreError::Query(format!("prepare repo index policy: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("k", Value::String(format!("repo-index-policy:{repo_uid}")))],
+            )
+            .map_err(|error| StoreError::Query(format!("read repo index policy: {error}")))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let fingerprint = extract_string(&row, 0)?;
+        if fingerprint.is_empty() {
+            return Err(StoreError::Query(
+                "stored repo index policy is empty".into(),
+            ));
+        }
+        Ok(Some(fingerprint))
+    }
 
     /// Read the stored embedding metadata (model ID and dimension).
     ///

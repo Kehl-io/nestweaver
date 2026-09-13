@@ -1147,6 +1147,41 @@ pub struct WatcherRegistration {
     /// connection, or an in-process call — and is deliberately NOT treated as
     /// orphaned. Absence of evidence of death is not evidence of death.
     owner_pid: Option<i32>,
+    kind: String,
+    target: String,
+    started: std::time::Instant,
+    started_unix_seconds: u64,
+}
+
+fn watcher_status(state: &DaemonState) -> Option<nestweaver_proto::WatcherStatus> {
+    let guard = state.watcher_stop.lock().ok()?;
+    let watcher = guard.as_ref()?;
+    Some(nestweaver_proto::WatcherStatus {
+        id: watcher.id,
+        kind: watcher.kind.clone(),
+        target: watcher.target.clone(),
+        controller_pid: watcher.owner_pid,
+        started_unix_seconds: watcher.started_unix_seconds,
+        age_seconds: watcher.started.elapsed().as_secs(),
+    })
+}
+
+fn watcher_status_json(state: &DaemonState) -> serde_json::Value {
+    match watcher_status(state) {
+        Some(w) => serde_json::json!({"id": w.id, "kind": w.kind, "target": w.target,
+            "controller_pid": w.controller_pid, "started_unix_seconds": w.started_unix_seconds,
+            "age_seconds": w.age_seconds}),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn describe_watcher(state: &DaemonState, id: u64, kind: &str, target: &Path) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && let Some(w) = guard.as_mut().filter(|w| w.id == id)
+    {
+        w.kind = kind.to_owned();
+        w.target = target.display().to_string();
+    }
 }
 
 /// A retained watcher worker. The id ties the otherwise-unstructured join
@@ -1698,6 +1733,50 @@ fn load_daemon_instance_config(
     }
 }
 
+/// Reload only the source of per-repository eligibility at operation admission.
+/// Identity, authorization, indexing limits, and other daemon settings remain
+/// the startup snapshot. Configless daemons retain their loaded/default policy.
+fn current_repo_eligibility_config(
+    state: &DaemonState,
+) -> anyhow::Result<Option<Arc<nestweaver_engine::InstanceConfig>>> {
+    match &state.effective_config {
+        EffectiveConfigProvenance::CompiledDefaults => Ok(state.instance_cfg.clone()),
+        EffectiveConfigProvenance::Configured(path) => {
+            let config = nestweaver_engine::InstanceConfig::from_file(path).with_context(|| {
+                format!("reload repository eligibility from {}", path.display())
+            })?;
+            // Invalid patterns must fail before watcher registration can replace
+            // a healthy incumbent, rather than failing in the spawned worker.
+            for repo in &config.repos {
+                nestweaver_engine::content_reader::FilesystemReader::new(Path::new("."))
+                    .excluding(&repo.exclude)?;
+            }
+            Ok(Some(Arc::new(config)))
+        }
+    }
+}
+
+/// Refresh only eligibility disclosure after tool dispatch (including any
+/// cache hit). All other status fields retain the daemon's startup settings.
+fn refresh_status_eligibility(
+    state: &DaemonState,
+    value: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    let config = current_repo_eligibility_config(state)?;
+    let rows = value
+        .get_mut("repos")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("brain_status response has no repository inventory"))?;
+    // Preserve the shared builder's explicit partial-count response when it
+    // could not enumerate any repositories; there is no inventory to overlay.
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let repos = state.store.list_repos(None)?;
+    *rows = nestweaver_mcp::tools::brain_status_repo_inventory(&repos, config.as_deref());
+    Ok(())
+}
+
 fn live_binding_source(
     provenance: &EffectiveConfigProvenance,
 ) -> lifecycle::EffectiveConfigBindingSource {
@@ -1881,6 +1960,9 @@ pub struct DaemonState {
     /// winding down. Each handle is paired with its registration id so an
     /// explicit watcher/UI stop can await its exact worker too.
     pub watcher_tasks: std::sync::Mutex<Vec<WatcherTask>>,
+    /// Serializes registration, worker publication, and stop snapshots. Never
+    /// held while waiting for a worker or acquiring the mutation write gate.
+    watcher_lifecycle: std::sync::Mutex<()>,
     /// Handle to the `serve_ui` web-server task, its bound port, and its
     /// optional canonical watcher registration. `stop_ui` aborts the server
     /// and stops/drains only the watcher this UI session owns.
@@ -2721,11 +2803,18 @@ fn register_watcher(
         }
         existing.handle.stop();
     }
-    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
+    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed) + 1;
     *guard = Some(WatcherRegistration {
         id,
         handle,
         owner_pid,
+        kind: "unknown".to_string(),
+        target: String::new(),
+        started: std::time::Instant::now(),
+        started_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     });
     Ok(id)
 }
@@ -2771,18 +2860,62 @@ fn watcher_registration_is_active(state: &DaemonState, id: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove the retained worker for `id`, if it is still tracked.
-///
-/// The mutex is released before callers await the handle. The watcher worker
-/// clears its registration as it exits and therefore must never be awaited
-/// while either registry lock is held.
-fn take_watcher_task(state: &DaemonState, id: u64) -> Option<tokio::task::JoinHandle<()>> {
-    let mut tasks = state
+/// Snapshot the worker lineage while holding `watcher_lifecycle`. Retired
+/// workers remain tracked until they finish, including across RPC cancellation.
+fn watcher_task_ids(state: &DaemonState, through: Option<u64>) -> Vec<u64> {
+    state
         .watcher_tasks
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let position = tasks.iter().position(|task| task.id == id)?;
-    Some(tasks.swap_remove(position).handle)
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|task| through.is_none_or(|id| task.id <= id))
+        .map(|task| task.id)
+        .collect()
+}
+
+fn watcher_tasks_finished(state: &DaemonState, ids: &[u64]) -> bool {
+    state
+        .watcher_tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|task| ids.contains(&task.id))
+        .all(|task| task.handle.is_finished())
+}
+
+async fn drain_watcher_tasks(state: &DaemonState, ids: &[u64]) {
+    // Do not remove a live JoinHandle before awaiting it: cancellation would
+    // otherwise detach the worker and let a later stop report false completion.
+    while !watcher_tasks_finished(state, ids) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state
+        .watcher_tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|task| !ids.contains(&task.id));
+}
+
+/// A replacement cannot enter its indexing loop until every displaced worker
+/// has finished publication. This wait runs on its blocking worker, before it
+/// holds a write lease, and never holds either registry mutex.
+fn wait_for_watcher_predecessors(state: &DaemonState, ids: &[u64]) {
+    while !watcher_tasks_finished(state, ids) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
+    let (stopped, tasks) = {
+        let _lifecycle = state
+            .watcher_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stopped = stop_watcher_registration(state, id);
+        (stopped, watcher_task_ids(state, Some(id)))
+    };
+    drain_watcher_tasks(state, &tasks).await;
+    stopped
 }
 
 /// Signal `id` only if it still owns the canonical slot.
@@ -2866,16 +2999,26 @@ impl DaemonService {
             .as_ref()
             .map(|config| config.indexing.limits())
             .unwrap_or_default();
+        let eligibility_config = current_repo_eligibility_config(&self.state)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let mut watcher =
             nestweaver_engine::CodeWatcher::new(&self.state.db_path, &repo_path, &instance_id)
-                .with_limits(limits);
+                .with_limits(limits)
+                .with_instance_config(eligibility_config);
         let shutdown_handle = watcher.shutdown_handle();
 
         // Refuse shutdown before mutating the registry. This admission guard
         // covers registration only; each actual watcher batch obtains its own
         // exact-worker lease from the factory below.
         let admission_guard = ConnectionGuard::write(&self.state)?;
+        let _lifecycle = self
+            .state
+            .watcher_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let predecessors = watcher_task_ids(&self.state, None);
         let watcher_id = register_watcher(&self.state, shutdown_handle, force, owner_pid)?;
+        describe_watcher(&self.state, watcher_id, "code", &repo_path);
 
         watcher =
             watcher.with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()));
@@ -2886,6 +3029,7 @@ impl DaemonService {
             self.state.store.clone(),
         );
         let watcher_task = tokio::task::spawn_blocking(move || {
+            wait_for_watcher_predecessors(&state, &predecessors);
             tracing::info!(repo = %repo_path.display(), watcher_id, "code watcher thread started");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 watcher.run_with_store(store, on_change)
@@ -3150,6 +3294,10 @@ impl DaemonService {
                 identity_error.as_deref(),
                 &mut value,
             );
+            if tool_name == "brain_status" {
+                refresh_status_eligibility(&state, &mut value)
+                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+            }
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -3322,6 +3470,10 @@ impl DaemonService {
                 identity_error.as_deref(),
                 &mut value,
             );
+            if tool_name == "brain_status" {
+                refresh_status_eligibility(&state, &mut value)
+                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+            }
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -5777,6 +5929,8 @@ impl NestWeaverDaemon for DaemonService {
             // PID against the socket-reported PID before signaling it.
             pid: std::process::id(),
             embedding_identity_repair: true,
+            watcher: watcher_status(&self.state),
+            supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
         }))
     }
 
@@ -5892,6 +6046,7 @@ impl NestWeaverDaemon for DaemonService {
             return Ok(Response::new(WatchVaultResponse {
                 ok: false,
                 message: format!("vault path is not a directory: {}", vault_path.display()),
+                ..Default::default()
             }));
         }
 
@@ -5941,6 +6096,12 @@ impl NestWeaverDaemon for DaemonService {
         // very next line, on behalf of a request that was rejected: state
         // mutated by a refused RPC.
         let admission_guard = ConnectionGuard::write(&self.state)?;
+        let _lifecycle = self
+            .state
+            .watcher_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let predecessors = watcher_task_ids(&self.state, None);
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         // `force` reaches here, as it always has for `watch_code`. nw-302: the
@@ -5960,10 +6121,12 @@ impl NestWeaverDaemon for DaemonService {
                     message: "A watcher is already running. Stop it with \
                               `nestweaver watch-stop`, or retry with --force to adopt it."
                         .to_string(),
+                    ..Default::default()
                 }));
             }
             Err(e) => return Err(e),
         };
+        describe_watcher(&self.state, watcher_id, "vault", &vault_path);
         let state = self.state.clone();
         let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
         watcher = watcher.with_mutation_lease_factory(mutation_factory);
@@ -5974,6 +6137,7 @@ impl NestWeaverDaemon for DaemonService {
         );
 
         let watcher_task = tokio::task::spawn_blocking(move || {
+            wait_for_watcher_predecessors(&state, &predecessors);
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6015,6 +6179,7 @@ impl NestWeaverDaemon for DaemonService {
                 "Watcher started for {} (vault: {})",
                 req.vault_path, vault_name
             ),
+            watcher_id,
         }))
     }
 
@@ -6039,6 +6204,7 @@ impl NestWeaverDaemon for DaemonService {
             return Ok(Response::new(WatchCodeResponse {
                 ok: false,
                 message: format!("repo path is not a directory: {}", repo_path.display()),
+                ..Default::default()
             }));
         }
 
@@ -6058,22 +6224,25 @@ impl NestWeaverDaemon for DaemonService {
         // ServeUI and WatchCode use this same constructor, so registration,
         // per-batch ownership, task retention, and shutdown behavior cannot
         // drift between the two entry points.
-        match self.start_registered_code_watcher(repo_path, instance_id, force, owner_pid) {
-            Ok(_) => {}
-            Err(e) if e.code() == tonic::Code::AlreadyExists => {
-                return Ok(Response::new(WatchCodeResponse {
-                    ok: false,
-                    message: "A watcher is already running. Stop it with \
+        let watcher_id =
+            match self.start_registered_code_watcher(repo_path, instance_id, force, owner_pid) {
+                Ok(id) => id,
+                Err(e) if e.code() == tonic::Code::AlreadyExists => {
+                    return Ok(Response::new(WatchCodeResponse {
+                        ok: false,
+                        message: "A watcher is already running. Stop it with \
                               `nestweaver watch-stop`, or retry with --force to adopt it."
-                        .to_string(),
-                }));
-            }
-            Err(e) => return Err(e),
-        }
+                            .to_string(),
+                        ..Default::default()
+                    }));
+                }
+                Err(e) => return Err(e),
+            };
 
         Ok(Response::new(WatchCodeResponse {
             ok: true,
             message: format!("Code watcher started for {}", req.repo_path,),
+            watcher_id,
         }))
     }
 
@@ -6086,23 +6255,33 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let watcher_id = self
-            .state
-            .watcher_stop
-            .lock()
-            .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?
-            .as_ref()
-            .map(|registration| registration.id);
-
-        if let Some(watcher_id) = watcher_id {
-            stop_watcher_registration(&self.state, watcher_id);
-            if let Some(task) = take_watcher_task(&self.state, watcher_id) {
-                let _ = task.await;
+        let tasks = {
+            let _lifecycle = self
+                .state
+                .watcher_lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let watcher_id = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?
+                .as_ref()
+                .map(|registration| registration.id);
+            let requested_id = _request.get_ref().watcher_id;
+            let Some(watcher_id) = watcher_id else {
+                return Ok(Response::new(StopWatchResponse { ok: false }));
+            };
+            if requested_id != 0 && requested_id != watcher_id {
+                return Ok(Response::new(StopWatchResponse { ok: false }));
             }
-            Ok(Response::new(StopWatchResponse { ok: true }))
-        } else {
-            Ok(Response::new(StopWatchResponse { ok: false }))
-        }
+            if !stop_watcher_registration(&self.state, watcher_id) {
+                return Ok(Response::new(StopWatchResponse { ok: false }));
+            }
+            watcher_task_ids(&self.state, Some(watcher_id))
+        };
+        drain_watcher_tasks(&self.state, &tasks).await;
+        Ok(Response::new(StopWatchResponse { ok: true }))
     }
 
     // ── Export ───────────────────────────────────────────────────────
@@ -6402,10 +6581,7 @@ impl NestWeaverDaemon for DaemonService {
             guard.take().and_then(|registration| registration.watcher)
         };
         if let Some(watcher) = stale_watcher {
-            stop_watcher_registration(&self.state, watcher.id);
-            if let Some(task) = take_watcher_task(&self.state, watcher.id) {
-                let _ = task.await;
-            }
+            stop_and_drain_watcher(&self.state, watcher.id).await;
         }
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
             return Ok(Response::new(ServeUiResponse {
@@ -6520,10 +6696,7 @@ impl NestWeaverDaemon for DaemonService {
                     registration.handle.abort();
                 }
                 if let Some(watcher) = registration.watcher {
-                    stop_watcher_registration(&self.state, watcher.id);
-                    if let Some(task) = take_watcher_task(&self.state, watcher.id) {
-                        let _ = task.await;
-                    }
+                    stop_and_drain_watcher(&self.state, watcher.id).await;
                 }
                 Ok(Response::new(StopUiResponse {
                     ok: true,
@@ -6605,6 +6778,9 @@ impl NestWeaverDaemon for DaemonService {
             nestweaver_engine::index_limits::IndexLimits::new(req.max_source_file_bytes)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?
         };
+
+        let eligibility_config = current_repo_eligibility_config(&state)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
@@ -6721,27 +6897,13 @@ impl NestWeaverDaemon for DaemonService {
                 ..Default::default()
             }));
 
-            // Per-repo `exclude` globs come from the daemon's own instance
-            // config — the daemon is started with `--config`, so no new field
-            // is needed on the index RPC. A daemon running without a config
-            // resolves to no excludes, which is the prior behaviour.
-            let repo_excludes: Vec<String> = state
-                .instance_cfg
+            // Both halves use one freshly parsed snapshot of the canonical
+            // bound config. Other daemon settings retain startup semantics.
+            let repo_excludes: Vec<String> = eligibility_config
                 .as_ref()
                 .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
                 .unwrap_or_default();
-            // nw-418/nw-422: the `unskip` half of the same `[[repos]]` block,
-            // resolved from the SAME config against the SAME (url, path) pair —
-            // `unskip_names_for` mirrors `exclude_globs_for`'s resolution
-            // exactly so the two halves can never disagree about which repo they
-            // describe.
-            //
-            // WITHOUT THIS the daemon-served index route keeps the bug the CLI
-            // route no longer has, which is the INVERSE of the asymmetry nw-418
-            // was filed for: `--no-daemon` and the daemon would disagree about
-            // what the repo contains.
-            let repo_unskip: Vec<String> = state
-                .instance_cfg
+            let repo_unskip: Vec<String> = eligibility_config
                 .as_ref()
                 .map(|cfg| cfg.unskip_names_for(&repo_url, Some(&repo_path)).to_vec())
                 .unwrap_or_default();
@@ -6767,6 +6929,11 @@ impl NestWeaverDaemon for DaemonService {
                 Some(&cancel_for_index),
             ) {
                 Ok(result) => {
+                    let exclusion_inventory = Some(nestweaver_proto::ExclusionInventory {
+                        patterns: result.exclusion_inventory.patterns.clone(),
+                        tracked_files: result.exclusion_inventory.tracked_files.map(|n| n as u64),
+                        observed_paths: result.exclusion_inventory.observed_paths.clone(),
+                    });
                     let skipped_count = result.skipped_files.len();
                     let skipped_files = index_skip_details(&result.skipped_files);
                     let coverage_status = if skipped_count == 0 {
@@ -6787,6 +6954,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files: skipped_files.clone(),
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: exclusion_inventory.clone(),
                     }));
 
                     // PageRank is deferred to first query (lazy evaluation
@@ -6823,6 +6991,7 @@ impl NestWeaverDaemon for DaemonService {
                             skipped_files: skipped_files.clone(),
                             coverage_status,
                             trigram_refresh: None,
+                            exclusion_inventory: exclusion_inventory.clone(),
                         }));
                         return;
                     }
@@ -6962,6 +7131,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files,
                         coverage_status,
                         trigram_refresh,
+                        exclusion_inventory,
                     }));
                 }
                 Err(e) => {
@@ -7068,6 +7238,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files: skipped_files.clone(),
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
 
                     let mutation = indexed_search_mutation(
@@ -7108,6 +7279,7 @@ impl NestWeaverDaemon for DaemonService {
                             skipped_files,
                             coverage_status,
                             trigram_refresh: None,
+                            exclusion_inventory: None,
                         }));
                         return;
                     }
@@ -7125,6 +7297,7 @@ impl NestWeaverDaemon for DaemonService {
                         skipped_files,
                         coverage_status,
                         trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
                 }
                 Err(e) => {
@@ -8233,6 +8406,8 @@ impl NestWeaverDaemon for DaemonService {
             write_holder,
             write_holder_seconds,
             search_status: Some(search_status_proto(&search_status)),
+            watcher: watcher_status(&self.state),
+            supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
         }))
     }
 
@@ -8286,6 +8461,12 @@ impl NestWeaverDaemon for DaemonService {
         let served = self.state.requests_served.fetch_add(1, Ordering::Relaxed) + 1;
         let mut json_resp = resp.into_inner();
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
+            value["runtime_telemetry"] = serde_json::json!("available");
+            value["watcher"] = watcher_status_json(&self.state);
+            value["watcher_pid"] =
+                serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
+            value["supervision"] =
+                serde_json::json!(lifecycle::process_supervision(std::process::id() as i32));
             value["server_mode"] = serde_json::json!(self.state.server_mode);
             let rpc_repo = self
                 .state
@@ -12346,6 +12527,10 @@ pub async fn run_server(
     let file_appender = tracing_appender::rolling::daily(&log_dir_path, "daemon.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_target(true)
@@ -12806,7 +12991,12 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
-        next_watcher_id: std::sync::atomic::AtomicU64::new(0),
+        next_watcher_id: std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        ),
         instance_cfg,
         effective_config,
         permission_source,
@@ -12830,6 +13020,7 @@ pub async fn run_server(
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
+        watcher_lifecycle: std::sync::Mutex::new(()),
         ui_server: std::sync::Mutex::new(None),
     });
     state.search.attach_recovery_context(&state);
@@ -14365,19 +14556,15 @@ pub async fn run_server(
     //
     // Includes force-retired watchers: `register_watcher(force)` stops an
     // incumbent and registers a replacement, so several may be winding down.
-    let watcher_tasks: Vec<_> = state
-        .watcher_tasks
-        .lock()
-        .map(|mut tasks| std::mem::take(&mut *tasks))
-        .unwrap_or_default();
+    let watcher_tasks = watcher_task_ids(&state, None);
     if !watcher_tasks.is_empty() {
         tracing::info!(
             count = watcher_tasks.len(),
             "draining watcher task(s) before exit"
         );
-        for task in watcher_tasks {
-            let _ = task.handle.await;
-        }
+        // Keep live handles visible to predecessor waits and concurrent stop
+        // RPCs. Taking them first would falsely satisfy those drain checks.
+        drain_watcher_tasks(&state, &watcher_tasks).await;
     }
 
     let _ = std::fs::remove_file(&sock_path);
@@ -20510,6 +20697,7 @@ credential_method = "gh"
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
+            watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -20603,6 +20791,7 @@ credential_method = "gh"
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
+            watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -21124,7 +21313,7 @@ credential_method = "gh"
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
         let config = dir.path().join("instance.toml");
-        std::fs::write(&config, "instance_id = 'test'").unwrap();
+        write_provenance_test_config(&config, dir.path());
         let noncanonical = nested.join("..").join("instance.toml");
 
         let mut state = test_state_with_writer();
@@ -21141,6 +21330,48 @@ credential_method = "gh"
             Some(effective_config::Source::ConfiguredPath(path))
                 if path == std::fs::canonicalize(config).unwrap().to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn status_inventory_keeps_distinct_roots_for_same_url_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        write_provenance_test_config(&path, dir.path());
+        let mut text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("repos = []", "");
+        let roots = [dir.path().join("first"), dir.path().join("second")];
+        for (root, pattern) in roots.iter().zip(["first.js", "second.js"]) {
+            std::fs::create_dir(root).unwrap();
+            text.push_str(&format!(
+                "\n[[repos]]\nurl = \"file://{}\"\nexclude = [\"{}\"]\n",
+                root.display(),
+                pattern
+            ));
+        }
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&text).unwrap();
+        let repos: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| nestweaver_schema::Repo {
+                uid: format!("repo:{index}"),
+                url: "https://example.test/same".into(),
+                indexed_sha: "same-sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: format!("instance-{index}"),
+                name: None,
+                root_path: Some(root.to_string_lossy().into_owned()),
+            })
+            .collect();
+        let rows = nestweaver_mcp::tools::brain_status_repo_inventory(&repos, Some(&config));
+        assert_eq!(
+            rows[0]["exclusion_inventory"]["patterns"],
+            serde_json::json!(["first.js"])
+        );
+        assert_eq!(
+            rows[1]["exclusion_inventory"]["patterns"],
+            serde_json::json!(["second.js"])
+        );
     }
 
     #[test]
@@ -24106,6 +24337,248 @@ external_model = "unavailable-test-model"
         assert!(state.watcher_stop.lock().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn displaced_controller_cannot_stop_replacement_and_status_names_session() {
+        let state = test_state_with_writer();
+        let first = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let second = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(stopped.clone()),
+            true,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        describe_watcher(&state, second, "vault", Path::new("/fixture/vault"));
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(StopWatchRequest { watcher_id: first });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(!service.stop_watch(request).await.unwrap().into_inner().ok);
+        assert!(!stopped.load(Ordering::Relaxed));
+        let health = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let watcher = health.watcher.unwrap();
+        assert_eq!(watcher.id, second);
+        assert_eq!(watcher.kind, "vault");
+        assert_eq!(watcher.target, "/fixture/vault");
+        assert_eq!(watcher.controller_pid, Some(std::process::id() as i32));
+        assert!(watcher.started_unix_seconds > 0);
+        let mut request = Request::new(StopWatchRequest { watcher_id: second });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_watch(request).await.unwrap().into_inner().ok);
+        assert!(watcher_status(&state).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_stop_drains_inflight_batch_before_reporting_completion() {
+        let state = test_state_with_writer();
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        let factory = daemon_mutation_lease_factory(state.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _lease = factory("watch_code_batch").unwrap();
+            let _ = entered_tx.send(());
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            clear_watcher_registration(&worker_state, id);
+        });
+        state
+            .watcher_tasks
+            .lock()
+            .unwrap()
+            .push(WatcherTask { id, handle: worker });
+        entered_rx.await.unwrap();
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(StopWatchRequest { watcher_id: id });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut stopping = tokio::spawn(async move { service.stop_watch(request).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stopping)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.write_gate.holder_snapshot().unwrap().0,
+            "watch_code_batch"
+        );
+        release_tx.send(()).unwrap();
+        assert!(stopping.await.unwrap().unwrap().into_inner().ok);
+        assert!(watcher_status(&state).is_none());
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.write_gate.waiting(), 0);
+        assert!(state.write_gate.holder_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replacement_stop_drains_displaced_batch_and_cancel_keeps_handles() {
+        for force in [true, false] {
+            let state = test_state_with_writer();
+            let owner = if force {
+                std::process::id() as i32
+            } else {
+                spawn_and_reap_a_short_lived_process()
+            };
+            let old = register_watcher(
+                &state,
+                nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+                false,
+                Some(owner),
+            )
+            .unwrap();
+            let factory = daemon_mutation_lease_factory(state.clone());
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let old_state = state.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _lease = factory("displaced_batch").unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                clear_watcher_registration(&old_state, old);
+            });
+            state.watcher_tasks.lock().unwrap().push(WatcherTask {
+                id: old,
+                handle: task,
+            });
+            entered_rx.await.unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            let service = DaemonService::new(state.clone());
+            let replacement = service
+                .start_registered_code_watcher(
+                    repo.path().to_path_buf(),
+                    "fixture".into(),
+                    force,
+                    Some(std::process::id() as i32),
+                )
+                .unwrap();
+            assert_ne!(replacement, old);
+            let mut request = Request::new(StopWatchRequest {
+                watcher_id: replacement,
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            let mut stopping = tokio::spawn(async move { service.stop_watch(request).await });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut stopping)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                state.write_gate.holder_snapshot().unwrap().0,
+                "displaced_batch"
+            );
+            assert_eq!(
+                state.write_gate.waiting(),
+                0,
+                "replacement must not enter its initial index before the predecessor exits"
+            );
+            if force {
+                release_tx.send(()).unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(10), stopping)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .into_inner()
+                        .ok
+                );
+            } else {
+                stopping.abort();
+                let _ = stopping.await;
+                assert_eq!(
+                    state.watcher_tasks.lock().unwrap().len(),
+                    2,
+                    "cancelled stop must retain both live workers"
+                );
+                release_tx.send(()).unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    drain_watcher_tasks(&state, &[old, replacement]),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(state.watcher_tasks.lock().unwrap().is_empty());
+            assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_waits_for_registration_task_publication_and_worker_completion() {
+        let state = test_state_with_writer();
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let publishing_state = state.clone();
+        let publishing = tokio::task::spawn_blocking(move || {
+            let _lifecycle = publishing_state.watcher_lifecycle.lock().unwrap();
+            let id = register_watcher(
+                &publishing_state,
+                nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+                false,
+                None,
+            )
+            .unwrap();
+            registered_tx.send(id).unwrap();
+            publish_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let worker = tokio::task::spawn_blocking(move || {
+                finish_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            publishing_state
+                .watcher_tasks
+                .lock()
+                .unwrap()
+                .push(WatcherTask { id, handle: worker });
+        });
+        let id = registered_rx.await.unwrap();
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(StopWatchRequest { watcher_id: id });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut stopping = tokio::spawn(async move { service.stop_watch(request).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stopping)
+                .await
+                .is_err(),
+            "stop raced past an unpublished task"
+        );
+        publish_tx.send(()).unwrap();
+        publishing.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stopping)
+                .await
+                .is_err(),
+            "stop did not wait for the newly published worker"
+        );
+        finish_tx.send(()).unwrap();
+        assert!(stopping.await.unwrap().unwrap().into_inner().ok);
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+    }
+
     /// Spawn a process, wait for it, and return its pid — a pid that is
     /// provably not live by the time this returns, without guessing at a
     /// number. Reaping matters: a zombie is still `kill(pid, 0)`-visible, so an
@@ -25467,7 +25940,7 @@ mod watcher_e2e_tests {
         // And `StopWatch` empties the slot, which is what the new
         // `nestweaver watch-stop` subcommand issues.
         let stopped = client
-            .stop_watch(nestweaver_proto::StopWatchRequest {})
+            .stop_watch(nestweaver_proto::StopWatchRequest::default())
             .await
             .expect("stop_watch")
             .into_inner();

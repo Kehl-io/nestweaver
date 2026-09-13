@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-13",
+  "source": "65a1a8e8 plus impact-help wording correction; no runtime logic change",
+  "initial_binary_sha256": "865253b05f151ff110a915e5b1bda96f924f47c77d2dd76b7749f93af97bf0c5",
+  "help_corrected_binary_sha256": "1056e20324823ec54c420a9708bc0458b6bdf51c8f65683d092d745fd2a543ce",
+  "fixture": "Disposable two-file Rust Git repository, one configured external/** exclusion; no production database used",
+  "setup_corrections": "First fixture attempts omitted required config fields; first missing-socket expectation used prose hyphens instead of documented JSON underscores. Fixtures corrected and rerun. No product failures inferred from these setup errors."
+}

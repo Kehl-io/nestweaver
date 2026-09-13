@@ -1,0 +1,61 @@
+{
+  "candidate_sha": "a771754e7cccc8be96013194813ff3a2c865ef79",
+  "tag": "dry-run-a771754e7ccc-34736785749-1",
+  "fault_mode": "omit",
+  "fault_target": "aarch64-unknown-linux-gnu",
+  "build_result": "success",
+  "bundle_verifier_status": 1,
+  "visibility_before": {
+    "tag": "dry-run-a771754e7ccc-34736785749-1",
+    "tag_visible": false,
+    "release_count": 0,
+    "draft_count": 0,
+    "public_count": 0,
+    "npm_package": "nestweaver",
+    "npm_version": "0.0.0-release-gate.34736785749.1",
+    "npm_visible": false,
+    "all_absent": true
+  },
+  "visibility_after": {
+    "tag": "dry-run-a771754e7ccc-34736785749-1",
+    "tag_visible": false,
+    "release_count": 0,
+    "draft_count": 0,
+    "public_count": 0,
+    "npm_package": "nestweaver",
+    "npm_version": "0.0.0-release-gate.34736785749.1",
+    "npm_visible": false,
+    "all_absent": true
+  },
+  "automation_pr": {
+    "pr_number": 386,
+    "branch": "release-gate-canary-34736785749-1",
+    "base_sha": "5149d22cd885107fa5d8f047a00d87e1fff86847",
+    "canary_sha": "d111854c04ce53a70c2b927501c06132bedcb948",
+    "workflow_state": "action_required",
+    "workflow_run_id": "34739472835",
+    "workflow_job_count": 0,
+    "required_ci_success_count": 0,
+    "merge_state": "blocked",
+    "mergeable": "true",
+    "cleanup": "completed-on-process-exit"
+  },
+  "matrix": {
+    "fault_mode": "omit",
+    "fault_target": "aarch64-unknown-linux-gnu",
+    "head_sha": "a771754e7cccc8be96013194813ff3a2c865ef79",
+    "matrix_jobs": {
+      "Build aarch64-apple-darwin": 103669545459,
+      "Build aarch64-unknown-linux-gnu": 103669545379,
+      "Build x86_64-apple-darwin": 103669545390,
+      "Build x86_64-unknown-linux-gnu": 103669545440
+    },
+    "run_attempt": 1,
+    "run_id": 34736785749,
+    "staged_targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu"
+    ]
+  }
+}

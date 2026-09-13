@@ -12,6 +12,7 @@ pub mod read;
 pub mod regex;
 pub mod regex_index;
 pub mod search;
+pub mod stable_anchor;
 pub mod tantivy_index;
 pub mod traverse;
 pub mod write;
@@ -72,9 +73,9 @@ pub use write::{
 };
 pub use write_lease::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
-    acquire_db_write_lease, acquire_db_write_lease_under_namespace, canonical_db_path,
-    current_process_claims_namespace_lease, current_process_claims_write_lease, write_lease_path,
-    write_lease_state,
+    acquire_db_write_lease, acquire_db_write_lease_under_namespace,
+    acquire_existing_db_write_lease, canonical_db_path, current_process_claims_namespace_lease,
+    current_process_claims_write_lease, write_lease_path, write_lease_state,
 };
 
 #[cfg(test)]

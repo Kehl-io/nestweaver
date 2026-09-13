@@ -1,0 +1,9 @@
+{
+  "observed_at": "2026-09-13T05:20:32.782039+00:00",
+  "pr": {
+    "headRefName": "release-gate-canary-34736784741-1",
+    "mergedAt": null,
+    "state": "CLOSED"
+  },
+  "branch_absent_http_status": 404
+}

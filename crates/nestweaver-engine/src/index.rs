@@ -68,6 +68,7 @@ pub struct IndexResult {
     /// Symbols removed by replacement/deletion transactions during this run.
     pub symbols_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
+    pub exclusion_inventory: crate::content_reader::ExclusionInventory,
     /// Contract nodes written by the contract phase. `0` on a repo with no
     /// specs and no route handlers — and also `0` when derivation failed, which
     /// is exactly why `contracts_status` exists alongside it.
@@ -2159,6 +2160,15 @@ pub(crate) fn disclose_pruned_dir(
     pruned: crate::content_reader::SkippedDir,
     caller: SkipDirCaller,
 ) -> Option<SkippedFile> {
+    if matches!(caller, SkipDirCaller::Repo)
+        && matches!(
+            pruned.reason.as_str(),
+            crate::content_reader::CONFIGURED_EXCLUDE_REASON
+                | crate::content_reader::CONFIGURED_FILE_EXCLUDE_REASON
+        )
+    {
+        return None; // Reported independently by ExclusionInventory.
+    }
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
     }
@@ -4468,6 +4478,9 @@ where
         store
             .update_repo_sha(&r_uid, indexed_sha)
             .context("update_repo_sha")?;
+        store
+            .set_repo_index_policy(&r_uid, &reader.eligibility_fingerprint())
+            .context("persist indexed reader eligibility")?;
 
         // ── Summary ───────────────────────────────────────────────────────────
         let elapsed = started.elapsed();
@@ -4515,6 +4528,7 @@ where
             files_deleted,
             symbols_deleted,
             skipped_files,
+            exclusion_inventory: reader.exclusion_inventory(),
             contracts_derived,
             contracts_status,
         };
@@ -5549,6 +5563,7 @@ pub struct IncrementalResult {
     pub files_renamed: usize,
     pub files_skipped: usize,
     pub skipped_files: Vec<SkippedFile>,
+    pub exclusion_inventory: crate::content_reader::ExclusionInventory,
     pub symbols_added: usize,
     pub symbols_removed: usize,
     /// UIDs of every Symbol deleted during the run — the RAW delete set, which
@@ -5615,6 +5630,7 @@ fn drain_pruned_dirs_into_incremental(
     reader: &dyn crate::content_reader::ContentReader,
     result: &mut IncrementalResult,
 ) {
+    result.exclusion_inventory = reader.exclusion_inventory();
     for pruned in reader.skipped_dirs() {
         if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             record_incremental_file_outcome(result, IncrementalFileOutcome::PolicySkipped(skipped));
@@ -5974,6 +5990,38 @@ fn incremental_index_with_name_and_io_and_authority(
         );
     }
 
+    // Eligibility can change without a Git commit. Retract incumbent File and
+    // Symbol coverage before the unchanged-SHA shortcut can report freshness.
+    let policy_reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .unskipping(unskip)
+        .excluding(excludes)?;
+    if store.get_repo_index_policy(&r_uid)?.as_deref()
+        != Some(
+            crate::content_reader::ContentReader::eligibility_fingerprint(&policy_reader).as_str(),
+        )
+        || store
+            .list_files_by_repo(&r_uid)?
+            .iter()
+            .any(|(_, path)| !policy_reader.accepts_path(Path::new(path)))
+    {
+        return full_index_fallback(
+            &store,
+            FullIndexFallback {
+                repo_path,
+                db_path,
+                instance_id,
+                repo_url,
+                new_sha: &new_sha,
+                name,
+                force: true,
+                limits,
+                excludes,
+                unskip,
+                epilogue_io,
+            },
+        );
+    }
+
     // 4. Nothing changed.
     if old_sha == new_sha {
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
@@ -6099,6 +6147,7 @@ fn incremental_index_with_name_and_io_and_authority(
                     .get(rel_path.to_string_lossy().as_ref())
                     .expect("parseable added file was prepared")
                 {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6132,6 +6181,11 @@ fn incremental_index_with_name_and_io_and_authority(
                 result.deleted_symbol_uids.extend(removed);
                 result.deleted_symbol_files.push(rel_str.to_string());
                 match prepared {
+                    PreparedIncrementalOutcome::Excluded => {
+                        let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
+                        nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)?;
+                        result.files_deleted += 1;
+                    }
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6222,6 +6276,10 @@ fn incremental_index_with_name_and_io_and_authority(
                         .get(to_str.as_ref())
                         .expect("parseable renamed file was prepared")
                     {
+                        PreparedIncrementalOutcome::Excluded => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)?;
+                        }
                         PreparedIncrementalOutcome::Ready(prepared) => {
                             let outcome = write_prepared_incremental_file_txn(
                                 &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6229,6 +6287,11 @@ fn incremental_index_with_name_and_io_and_authority(
                             record_incremental_file_outcome(&mut result, outcome);
                         }
                         PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)
+                                .with_context(|| {
+                                    format!("delete policy-skipped rename target {to_str}")
+                                })?;
                             record_incremental_file_outcome(
                                 &mut result,
                                 IncrementalFileOutcome::PolicySkipped(skipped.clone()),
@@ -6266,6 +6329,11 @@ fn incremental_index_with_name_and_io_and_authority(
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::set_repo_index_policy_on(
+        &txn,
+        &r_uid,
+        &crate::content_reader::ContentReader::eligibility_fingerprint(&reader),
+    )?;
     nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
         .with_context(|| "mark incremental regex scope dirty")?;
 
@@ -6324,7 +6392,40 @@ where
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
 
-    if old_sha == new_sha {
+    if store.get_repo_index_policy(&r_uid)?.as_deref()
+        != Some(reader.eligibility_fingerprint().as_str())
+    {
+        let result = index_with_reader_and_write_gate(
+            reader,
+            store,
+            instance_id,
+            repo_url,
+            new_sha,
+            None,
+            None,
+            acquire_write_guard,
+        )?;
+        return Ok(IncrementalResult {
+            fell_back_to_full: true,
+            files_added: result.files_count,
+            files_skipped: result.skipped_files.len(),
+            skipped_files: result.skipped_files,
+            exclusion_inventory: result.exclusion_inventory,
+            symbols_added: result.symbols_count,
+            full_edges_count: Some(result.edges_count),
+            files_deleted: result.files_deleted,
+            symbols_removed: result.symbols_deleted,
+            ..Default::default()
+        });
+    }
+
+    let mut policy_removed: std::collections::HashSet<String> = store
+        .list_files_by_repo(&r_uid)?
+        .into_iter()
+        .filter_map(|(_, path)| (!reader.accepts_path(Path::new(&path))).then_some(path))
+        .collect();
+
+    if old_sha == new_sha && policy_removed.is_empty() {
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
         return Ok(IncrementalResult::default());
     }
@@ -6336,8 +6437,28 @@ where
         });
     }
 
-    let changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
+    let mut changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
         .with_context(|| "detect_changes")?;
+    changes.retain(|change| match change {
+        crate::git_diff::FileChange::Added(path)
+        | crate::git_diff::FileChange::Modified(path)
+        | crate::git_diff::FileChange::Deleted(path) => {
+            !policy_removed.contains(path.to_string_lossy().as_ref())
+        }
+        crate::git_diff::FileChange::Renamed { .. } => true,
+    });
+    // Rename already retracts its source. Do not count/delete it twice when
+    // the same path also became ineligible through a policy change.
+    for change in &changes {
+        if let crate::git_diff::FileChange::Renamed { from, .. } = change {
+            policy_removed.remove(from.to_string_lossy().as_ref());
+        }
+    }
+    changes.extend(
+        policy_removed
+            .into_iter()
+            .map(|path| crate::git_diff::FileChange::Deleted(path.into())),
+    );
 
     tracing::info!(
         count = changes.len(),
@@ -6411,6 +6532,7 @@ where
                     .get(rel_path.to_string_lossy().as_ref())
                     .expect("parseable added file was prepared")
                 {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6443,6 +6565,11 @@ where
                 result.deleted_symbol_files.push(rel_str.to_string());
 
                 match prepared {
+                    PreparedIncrementalOutcome::Excluded => {
+                        let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
+                        nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)?;
+                        result.files_deleted += 1;
+                    }
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6531,6 +6658,10 @@ where
                         .get(to_str.as_ref())
                         .expect("parseable renamed file was prepared")
                     {
+                        PreparedIncrementalOutcome::Excluded => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)?;
+                        }
                         PreparedIncrementalOutcome::Ready(prepared) => {
                             let outcome = write_prepared_incremental_file_txn(
                                 reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6538,6 +6669,11 @@ where
                             record_incremental_file_outcome(&mut result, outcome);
                         }
                         PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)
+                                .with_context(|| {
+                                    format!("delete policy-skipped rename target {to_str}")
+                                })?;
                             record_incremental_file_outcome(
                                 &mut result,
                                 IncrementalFileOutcome::PolicySkipped(skipped.clone()),
@@ -6574,6 +6710,11 @@ where
 
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::set_repo_index_policy_on(
+        &txn,
+        &r_uid,
+        &reader.eligibility_fingerprint(),
+    )?;
     nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
         .with_context(|| "mark server incremental regex scope dirty")?;
     store
@@ -6612,6 +6753,7 @@ struct PreparedIncrementalFile {
 }
 
 enum PreparedIncrementalOutcome {
+    Excluded,
     Ready(PreparedIncrementalFile),
     PolicySkipped(SkippedFile),
 }
@@ -6623,6 +6765,9 @@ fn prepare_incremental_file(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
 ) -> Result<PreparedIncrementalOutcome, anyhow::Error> {
+    if !reader.accepts_path(rel_path) {
+        return Ok(PreparedIncrementalOutcome::Excluded);
+    }
     let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
@@ -7049,6 +7194,9 @@ fn build_reresolve_edges(
 
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
+        if !reader.accepts_path(rel_path) {
+            continue;
+        }
         let abs_path = reader.root().join(rel_path);
         let (raw_symbols, raw_references) = if let Some((symbols, references)) =
             prepared_file_data.and_then(|prepared| prepared.get(rel_str))
@@ -7094,6 +7242,9 @@ fn build_reresolve_edges(
     // symbol set, fetched by the caller.
     let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
     for sym in db_symbols {
+        if !reader.accepts_path(Path::new(&sym.file_path)) {
+            continue;
+        }
         if scope.contains(&sym.file_path) {
             // Already in file_data from re-parsing above; just ensure
             // uid_to_file has the DB uid (the re-parsed uid should match,
@@ -7381,6 +7532,7 @@ fn full_index_fallback(
         files_added: result.files_count,
         files_skipped: result.skipped_files.len(),
         skipped_files: result.skipped_files,
+        exclusion_inventory: result.exclusion_inventory,
         symbols_added: result.symbols_count,
         full_edges_count: Some(result.edges_count),
         files_deleted: result.files_deleted,
@@ -7797,27 +7949,9 @@ mod tests {
             .excludes(&["plugins/**".to_string()]);
         let result = index_directory_with_store_opts(&store, &src, &db_path, &opts, None).unwrap();
 
-        let excluded = result
-            .skipped_files
-            .iter()
-            .find(|skipped| skipped.path == "plugins")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the excluded directory must still be disclosed: {:?}",
-                    result.skipped_files
-                )
-            });
-        assert!(
-            excluded.reason.contains("exclude"),
-            "the remedy must name the mechanism that actually pruned it: {:?}",
-            excluded.reason
-        );
-        assert!(
-            !excluded.reason.contains("unskip"),
-            "`unskip` does not govern `exclude`; offering it is a remedy that \
-             does nothing: {:?}",
-            excluded.reason
-        );
+        assert_eq!(result.exclusion_inventory.observed_paths, ["plugins"]);
+        assert_eq!(result.exclusion_inventory.tracked_files, None);
+        assert!(!result.skipped_files.iter().any(|row| row.path == "plugins"));
 
         let default_prune = result
             .skipped_files
@@ -8129,6 +8263,27 @@ mod tests {
             "and that one set must be the re-admitted one — equal-but-empty \
              would satisfy the comparison above while losing every file"
         );
+        for readmit in [false, true] {
+            let authority = nestweaver_store::acquire_db_write_lease(&incremental_db).unwrap();
+            let changed_policy = incremental_index_with_excludes_and_unskip_and_write_lease(
+                &repo,
+                &incremental_db,
+                "test",
+                repo_url,
+                None,
+                crate::index_limits::IndexLimits::default(),
+                &[],
+                if readmit { &unskip } else { &[] },
+                &authority,
+            )
+            .unwrap();
+            assert!(changed_policy.fell_back_to_full);
+            drop(authority);
+            assert_eq!(
+                symbol_names(&incremental_db).len(),
+                if readmit { 3 } else { 1 }
+            );
+        }
     }
 
     #[test]
@@ -11396,6 +11551,287 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn bare_reader_limit_changes_retract_and_readmit_at_the_same_sha() {
+        use crate::content_reader::{ContentReader, GitBareReader};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("small.rs"), "pub fn small() {}\n").unwrap();
+        fs::write(
+            repo.join("large.rs"),
+            format!("// {}\npub fn large() {{}}\n", "x".repeat(1500)),
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        let store = GraphStore::in_memory().unwrap();
+        let make_reader = |limit| {
+            GitBareReader::with_limits(
+                &bare,
+                &sha,
+                crate::index_limits::IndexLimits::new(limit).unwrap(),
+            )
+        };
+        let initial = make_reader(4096);
+        index_with_reader(
+            &initial,
+            &store,
+            "test",
+            "https://example.test/bare-policy",
+            &sha,
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.count_symbols().unwrap(), 2);
+        assert_eq!(
+            initial.eligibility_fingerprint(),
+            GitBareReader::with_limits(
+                &bare,
+                "another-sha",
+                crate::index_limits::IndexLimits::new(4096).unwrap()
+            )
+            .eligibility_fingerprint(),
+            "SHA is not policy"
+        );
+        for (limit, expected) in [(1024, 1), (4096, 2)] {
+            let reader = make_reader(limit);
+            let result = incremental_index_with_reader_and_write_gate(
+                &reader,
+                &bare,
+                &store,
+                "test",
+                "https://example.test/bare-policy",
+                &sha,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(result.fell_back_to_full);
+            assert_eq!(store.count_symbols().unwrap(), expected);
+            let repo = store.list_repos(None).unwrap().remove(0);
+            assert_eq!(store.list_files_by_repo(&repo.uid).unwrap().len(), expected);
+            let steady = incremental_index_with_reader_and_write_gate(
+                &reader,
+                &bare,
+                &store,
+                "test",
+                "https://example.test/bare-policy",
+                &sha,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(!steady.fell_back_to_full);
+        }
+    }
+
+    #[test]
+    fn exclusions_survive_full_incremental_steady_state_and_force_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("plugins")).unwrap();
+        fs::write(root.join("main.rs"), "pub fn visible() {}\n").unwrap();
+        fs::write(root.join("plugins/vendor.rs"), "pub fn hidden() {}\n").unwrap();
+        let git = commit_all_in(&root, "initial");
+        let db = dir.path().join("index.lbug");
+        let excludes = vec!["plugins/**".to_string()];
+        let sha = git(&["rev-parse", "HEAD"]);
+        let opts =
+            IndexOptions::new("test", "https://example.test/excludes", &sha).excludes(&excludes);
+        let initial = index_directory_with_opts(&root, &db, &opts).unwrap();
+        assert_eq!(initial.files_count, 1);
+        assert_eq!(initial.exclusion_inventory.tracked_files, Some(1));
+        assert!(initial.skipped_files.is_empty());
+        for iteration in 0..3 {
+            match iteration {
+                0 => {
+                    fs::write(root.join("plugins/added.rs"), "pub fn added_hidden() {}\n").unwrap();
+                }
+                1 => {
+                    fs::write(
+                        root.join("plugins/vendor.rs"),
+                        "pub fn changed_hidden() {}\n",
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    fs::remove_file(root.join("plugins/added.rs")).unwrap();
+                }
+            }
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", "excluded mutation"]);
+            let incremental = incremental_index_with_excludes(
+                &root,
+                &db,
+                "test",
+                "https://example.test/excludes",
+                None,
+                crate::index_limits::IndexLimits::default(),
+                &excludes,
+            )
+            .unwrap();
+            assert!(!incremental.fell_back_to_full);
+            assert_eq!(incremental.files_added + incremental.files_modified, 0);
+            assert!(incremental.skipped_files.is_empty());
+            assert_eq!(
+                incremental.exclusion_inventory.tracked_files,
+                Some(if iteration < 2 { 2 } else { 1 })
+            );
+        }
+        let steady = incremental_index_with_excludes(
+            &root,
+            &db,
+            "test",
+            "https://example.test/excludes",
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &excludes,
+        )
+        .unwrap();
+        assert_eq!(steady.exclusion_inventory.tracked_files, Some(1));
+        let head = git(&["rev-parse", "HEAD"]);
+        let forced = index_directory_with_opts(
+            &root,
+            &db,
+            &IndexOptions::new("test", "https://example.test/excludes", &head)
+                .excludes(&excludes)
+                .force(true),
+        )
+        .unwrap();
+        assert_eq!(forced.files_count, 1);
+        assert_eq!(forced.exclusion_inventory.tracked_files, Some(1));
+        assert!(forced.skipped_files.is_empty());
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert!(
+            store
+                .symbols_in_file("plugins/vendor.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .symbols_in_file("plugins/added.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.symbols_in_file("main.rs").unwrap().is_empty());
+        drop(store);
+
+        // Introduce policy AFTER both files were indexed, without moving HEAD.
+        // This must retract both File and Symbol nodes despite an empty diff.
+        index_directory_with_opts(
+            &root,
+            &db,
+            &IndexOptions::new("test", "https://example.test/excludes", &head).force(true),
+        )
+        .unwrap();
+        {
+            let store = GraphStore::open(&db).unwrap();
+            let reader = crate::content_reader::FilesystemReader::new(&root)
+                .excluding(&excludes)
+                .unwrap();
+            let server = incremental_index_with_reader_and_write_gate(
+                &reader,
+                &root,
+                &store,
+                "test",
+                "https://example.test/excludes",
+                &head,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(server.fell_back_to_full);
+            let repo = store.list_repos(None).unwrap().remove(0);
+            assert_eq!(store.list_files_by_repo(&repo.uid).unwrap().len(), 1);
+        }
+        index_directory_with_opts(
+            &root,
+            &db,
+            &IndexOptions::new("test", "https://example.test/excludes", &head).force(true),
+        )
+        .unwrap();
+        let reconciled = incremental_index_with_excludes(
+            &root,
+            &db,
+            "test",
+            "https://example.test/excludes",
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &excludes,
+        )
+        .unwrap();
+        assert!(reconciled.fell_back_to_full);
+        let store = GraphStore::open_read_only(&db).unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        assert_eq!(store.list_files_by_repo(&repo.uid).unwrap().len(), 1);
+        assert!(
+            store
+                .symbols_in_file("plugins/vendor.rs")
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let readmitted = incremental_index_with_excludes(
+            &root,
+            &db,
+            "test",
+            "https://example.test/excludes",
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            readmitted.fell_back_to_full,
+            "removing exclusion must re-admit at same SHA"
+        );
+        let steady = incremental_index_with_excludes(
+            &root,
+            &db,
+            "test",
+            "https://example.test/excludes",
+            None,
+            crate::index_limits::IndexLimits::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !steady.fell_back_to_full,
+            "persisted policy must not rebuild forever"
+        );
+        let store = GraphStore::open(&db).unwrap();
+        assert!(
+            !store
+                .symbols_in_file("plugins/vendor.rs")
+                .unwrap()
+                .is_empty()
+        );
+        for excluded in [true, false] {
+            let reader = crate::content_reader::FilesystemReader::new(&root)
+                .excluding(if excluded { &excludes } else { &[] })
+                .unwrap();
+            let result = incremental_index_with_reader_and_write_gate(
+                &reader,
+                &root,
+                &store,
+                "test",
+                "https://example.test/excludes",
+                &head,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(result.fell_back_to_full);
+            assert_eq!(
+                store
+                    .symbols_in_file("plugins/vendor.rs")
+                    .unwrap()
+                    .is_empty(),
+                excluded
+            );
+        }
+    }
+
+    #[test]
     fn index_applies_repo_exclude_globs() {
         // End-to-end: an exclude declared in IndexOptions must reach the real
         // index run, not just the reader. `vendor/**` cannot be relied on here
@@ -14042,6 +14478,102 @@ function hello(name) { return "Hello " + name; }
             store.repo_has_content(&repo_row).unwrap(),
             "full re-index must land content for the repo"
         );
+    }
+
+    fn assert_policy_skipped_rename_retracts_destination(use_bare_reader: bool) {
+        use crate::content_reader::GitBareReader;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("index.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("app.js"),
+            "export function source() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("keep.js"),
+            "export function keep() { return 2; }\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.test/policy-skipped-rename";
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        if !use_bare_reader {
+            index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        }
+        git(&["mv", "app.js", "app.min.js"]);
+        git(&["commit", "-q", "-m", "rename to generated bundle"]);
+        let new_sha = git(&["rev-parse", "HEAD"]);
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        if use_bare_reader {
+            index_with_reader(
+                &GitBareReader::new(&bare, &old_sha),
+                &store,
+                "test",
+                repo_url,
+                &old_sha,
+                None,
+            )
+            .unwrap();
+        }
+        // Simulate stale coverage at the rename destination. It is absent from
+        // the old Git tree, so Git must emit Renamed rather than Modified.
+        let target_uid = nestweaver_schema::file_uid(&r_uid, "app.min.js");
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: target_uid.clone(),
+                path: "app.min.js".into(),
+                repo_uid: r_uid.clone(),
+                content_hash: "stale".into(),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&r_uid, &target_uid).unwrap();
+        assert_eq!(store.list_files_by_repo(&r_uid).unwrap().len(), 3);
+        let result = if use_bare_reader {
+            let result = incremental_index_with_reader_and_write_gate(
+                &GitBareReader::new(&bare, &new_sha),
+                &bare,
+                &store,
+                "test",
+                repo_url,
+                &new_sha,
+                || Ok(()),
+            )
+            .unwrap();
+            drop(store);
+            result
+        } else {
+            drop(store);
+            incremental_index(&repo, &db_path, "test", repo_url).unwrap()
+        };
+        assert!(!result.fell_back_to_full, "must exercise the rename arm");
+        assert_eq!(result.files_renamed, 1);
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Ignored);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        assert_eq!(files.len(), 1, "stale rename File survived: {files:?}");
+        assert_eq!(files[0].1, "keep.js");
+        assert!(store.symbols_in_file("app.js").unwrap().is_empty());
+        assert!(store.symbols_in_file("app.min.js").unwrap().is_empty());
+        assert_eq!(
+            store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
+            new_sha
+        );
+    }
+
+    #[test]
+    fn filesystem_policy_skipped_rename_retracts_destination_file() {
+        assert_policy_skipped_rename_retracts_destination(false);
+    }
+
+    #[test]
+    fn bare_policy_skipped_rename_retracts_destination_file() {
+        assert_policy_skipped_rename_retracts_destination(true);
     }
 
     #[test]

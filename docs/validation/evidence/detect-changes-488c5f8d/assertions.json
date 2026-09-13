@@ -1,0 +1,17 @@
+{
+  "binary_sha256": "865253b05f151ff110a915e5b1bda96f924f47c77d2dd76b7749f93af97bf0c5",
+  "trace_replay_seconds": 34.99719209398609,
+  "symbol_sort_microseconds": 13615,
+  "serialization_microseconds": 41440,
+  "compact_serialized_bytes": 279019,
+  "cli_pretty_bytes": 355462,
+  "final_3_wall_seconds": [
+    51.47623193310574,
+    51.375058956909925,
+    50.2596270670183
+  ],
+  "all_12_status_controls_overlap": true,
+  "repeat_except_timing": true,
+  "all_daemon_stops_successful": true,
+  "ephemeral_log_removal": "Intentional remove_instance_dirs_for_temp_db in lifecycle.rs1821 removes log_dir on clean shutdown for /tmp databases; not a retention defect for non-temporary databases."
+}

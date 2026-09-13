@@ -1,0 +1,23 @@
+{
+  "_meta": {
+    "scope": "local",
+    "sources": [
+      "local"
+    ],
+    "stale_repos": []
+  },
+  "error": "not found",
+  "impact_nodes": [],
+  "name": "not_here",
+  "nodes": [],
+  "note": null,
+  "returned": 0,
+  "status": "not_found",
+  "symbol": "not_here",
+  "target": null,
+  "total": 0,
+  "truncated": false,
+  "truncated_by_depth": false,
+  "truncated_by_limit": false,
+  "truncated_by_threshold": false
+}

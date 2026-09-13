@@ -6008,3 +6008,439 @@ fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
          was knowable immediately:\n{stderr}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn missing_socket_retains_live_writer_evidence_across_repeated_status_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("status-fixture.lbug");
+    write_test_repo(&repo);
+    create_db(&repo, &db);
+    let _guard = DaemonGuard::new(&db);
+    start_daemon(&db);
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance);
+    let pid_before = std::fs::read(&pidfile).unwrap();
+    let healthy = daemon_action_cmd(&db, "status")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    let healthy: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(healthy["state"], "running");
+    // Restore before DaemonGuard drops, including during assertion unwinding.
+    struct RestoreSocket(std::path::PathBuf, std::path::PathBuf);
+    impl Drop for RestoreSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::rename(&self.0, &self.1);
+        }
+    }
+    let displaced = socket.with_extension("hidden-test");
+    std::fs::rename(&socket, &displaced).unwrap();
+    let restore = RestoreSocket(displaced, socket.clone());
+    for _ in 0..2 {
+        daemon_action_cmd(&db, "status")
+            .assert()
+            .success()
+            .stdout(contains("Daemon is running but UNREACHABLE"));
+        let output = daemon_action_cmd(&db, "status")
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "running_but_unreachable");
+        assert_eq!(report["evidence"], "database_write_lock");
+        assert_eq!(report["db_path"], db.to_string_lossy().as_ref());
+        assert_eq!(std::fs::read(&pidfile).unwrap(), pid_before);
+        assert!(!socket.exists());
+    }
+    let other = dir.path().join("other-instance.lbug");
+    let output = daemon_action_cmd(&other, "status")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["state"], "not_running");
+    drop(restore);
+    daemon_action_cmd(&db, "status")
+        .assert()
+        .success()
+        .stdout(contains("Daemon is running"));
+}
+
+#[cfg(unix)]
+#[test]
+fn displaced_watch_controller_exits_without_stopping_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("watch-lifecycle.lbug");
+    write_test_repo(&repo);
+    create_db(&repo, &db);
+    let _daemon = DaemonGuard::new(&db);
+    start_daemon(&db);
+    struct Controller(std::process::Child);
+    impl Drop for Controller {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = |force: bool| {
+        let mut command = StdCommand::new(bin_path());
+        command
+            .args([
+                "watch",
+                repo.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+            ])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if force {
+            command.arg("--force");
+        }
+        Controller(command.spawn().unwrap())
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let observe = |client: &mut nestweaver_client::DaemonClient| {
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), client.health_check()).await
+        })
+        .unwrap()
+        .unwrap()
+        .watcher
+    };
+    let wait_registration = |client: &mut nestweaver_client::DaemonClient, previous: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(watcher) = observe(client)
+                && watcher.id != previous
+            {
+                return watcher;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch registration did not appear"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut first = spawn(false);
+    let original = wait_registration(&mut client, 0);
+    assert_eq!(original.kind, "code");
+    assert_eq!(original.controller_pid, Some(first.0.id() as i32));
+    // Exercise real inotify/FSEvents delivery before replacement. Search the
+    // live daemon store, never a concurrently opened database snapshot.
+    let wait_symbol =
+        |client: &mut nestweaver_client::DaemonClient, name: &str, expected_path: Option<&str>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(25);
+            loop {
+                let response = rt
+                    .block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client
+                                .inner_mut()
+                                .search_symbols(nestweaver_proto::JsonRequest {
+                                    args_json: serde_json::json!({"query": name, "limit": 100})
+                                        .to_string(),
+                                }),
+                        )
+                        .await
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .into_inner();
+                let symbols: Vec<nestweaver_engine::SymbolCandidate> =
+                    serde_json::from_str(&response.result_json).unwrap();
+                let matches: Vec<_> = symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == name)
+                    .collect();
+                let correct = match expected_path {
+                    Some(path) => matches.len() == 1 && matches[0].file_path.ends_with(path),
+                    None => matches.is_empty(),
+                };
+                if correct {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watch event not reflected for {name}: {symbols:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+    let event_file = repo.join("lifecycle-event.js");
+    std::fs::write(&event_file, "function lifecycleCreated() { return 1; }").unwrap();
+    wait_symbol(&mut client, "lifecycleCreated", Some("lifecycle-event.js"));
+    std::fs::write(&event_file, "function lifecycleEdited() { return 222; }").unwrap();
+    wait_symbol(&mut client, "lifecycleEdited", Some("lifecycle-event.js"));
+    wait_symbol(&mut client, "lifecycleCreated", None);
+    let renamed = repo.join("lifecycle-renamed.js");
+    std::fs::rename(&event_file, &renamed).unwrap();
+    wait_symbol(&mut client, "lifecycleEdited", Some("lifecycle-renamed.js"));
+    let atomic = repo.join("atomic-save.tmp");
+    std::fs::write(&atomic, "function lifecycleAtomicSave() { return 3333; }").unwrap();
+    std::fs::rename(&atomic, &renamed).unwrap();
+    wait_symbol(
+        &mut client,
+        "lifecycleAtomicSave",
+        Some("lifecycle-renamed.js"),
+    );
+    wait_symbol(&mut client, "lifecycleEdited", None);
+    // Metadata-only changes preserve the indexed symbol and leave the watcher
+    // idle after a debounce window; registration age keeps advancing separately.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&renamed).unwrap().permissions().mode();
+    std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    wait_symbol(
+        &mut client,
+        "lifecycleAtomicSave",
+        Some("lifecycle-renamed.js"),
+    );
+    // Symbol visibility precedes publication cleanup. Wait for the actual
+    // idle state instead of treating a fixed debounce sleep as a drain fence.
+    let idle_deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let status = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), client.brain_status()).await
+            })
+            .unwrap()
+            .unwrap();
+        if status.write_holder.is_empty() && status.write_queue_depth == 0 {
+            assert!(status.watcher.unwrap().age_seconds >= 3);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < idle_deadline,
+            "metadata event did not drain: holder={}, queued={}",
+            status.write_holder,
+            status.write_queue_depth,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_file(&renamed).unwrap();
+    wait_symbol(&mut client, "lifecycleAtomicSave", None);
+    let mut second = spawn(true);
+    let replacement = wait_registration(&mut client, original.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = first.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "displaced controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(observe(&mut client).unwrap().id, replacement.id);
+    assert!(second.0.try_wait().unwrap().is_none());
+    // Explicit administrative stop also terminates an external controller.
+    assert!(rt.block_on(client.stop_watch()).unwrap().ok);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = second.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(observe(&mut client).is_none());
+    let idle = rt.block_on(client.brain_status()).unwrap();
+    assert_eq!(idle.write_queue_depth, 0);
+    assert!(idle.write_holder.is_empty());
+    assert!(!sidecar_path(&db, ".index-dirty").exists());
+    let mut third = spawn(false);
+    let _ = wait_registration(&mut client, 0);
+    stop_daemon(&db);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = third.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disconnected controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn live_daemon_reloads_repo_eligibility_without_sha_or_pid_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("policy.lbug");
+    let config = dir.path().join("instance.toml");
+    write_test_repo(&repo);
+    // Exercise macOS /var -> /private/var behavior on every Unix platform:
+    // configuration names an alias while daemon admission canonicalizes it.
+    #[cfg(unix)]
+    let repo = {
+        let alias = dir.path().join("repo-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        alias
+    };
+    let head = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap()
+        .stdout;
+    let write_config = |exclude: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+instance_id = "policy-test"
+[snapshot_storage]
+backend = "local"
+path = "{root}/storage"
+[workspace]
+backend = "local"
+path = "{root}/workspace"
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+[git]
+credential_method = "gh"
+[[repos]]
+url = "file://{repo}"
+name = "repo"
+exclude = {exclude}
+"#,
+                root = dir.path().display(),
+                repo = repo.display()
+            ),
+        )
+        .unwrap();
+    };
+    let index = || {
+        daemon_cmd()
+            .args([
+                "index",
+                "--repo",
+                repo.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    };
+    write_config("[]");
+    let _guard = DaemonGuard::new(&db);
+    index();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let pid = rt.block_on(client.health_check()).unwrap().pid;
+    let count_greet = |client: &mut nestweaver_client::DaemonClient| {
+        let response = rt
+            .block_on(
+                client
+                    .inner_mut()
+                    .search_symbols(nestweaver_proto::JsonRequest {
+                        args_json: r#"{"query":"greet","limit":100}"#.into(),
+                    }),
+            )
+            .unwrap()
+            .into_inner();
+        let symbols: Vec<nestweaver_engine::SymbolCandidate> =
+            serde_json::from_str(&response.result_json).unwrap();
+        symbols
+            .iter()
+            .filter(|symbol| symbol.name == "greet")
+            .count()
+    };
+    assert_eq!(count_greet(&mut client), 1);
+    for (exclude, expected) in [(r#"["main.js"]"#, 0), ("[]", 1)] {
+        write_config(exclude);
+        index();
+        assert_eq!(count_greet(&mut client), expected);
+        let status = rt
+            .block_on(
+                client
+                    .inner_mut()
+                    .brain_status_json(nestweaver_proto::JsonRequest {
+                        args_json: "{}".into(),
+                    }),
+            )
+            .unwrap()
+            .into_inner();
+        let status: serde_json::Value = serde_json::from_str(&status.result_json).unwrap();
+        let inventory = &status["repos"][0]["exclusion_inventory"];
+        assert_eq!(
+            inventory["patterns"],
+            serde_json::from_str::<serde_json::Value>(exclude).unwrap()
+        );
+        assert_eq!(
+            inventory["tracked_files"],
+            if expected == 0 { 1 } else { 0 }
+        );
+        assert_eq!(rt.block_on(client.health_check()).unwrap().pid, pid);
+        assert_eq!(
+            StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+            head
+        );
+    }
+    // Direct RPC bypasses CLI prevalidation: the live daemon itself must
+    // reject invalid edits before registering a watcher or indexing anything.
+    for invalid in ["not valid TOML [", ""] {
+        if invalid.is_empty() {
+            write_config(r#"["["]"#);
+        } else {
+            std::fs::write(&config, invalid).unwrap();
+        }
+        assert!(
+            rt.block_on(
+                client
+                    .inner_mut()
+                    .index_repo(nestweaver_proto::IndexRepoRequest {
+                        repo_path: repo.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    })
+            )
+            .is_err()
+        );
+        assert!(
+            rt.block_on(client.watch_code(repo.to_str().unwrap(), ""))
+                .is_err()
+        );
+        assert!(
+            rt.block_on(client.health_check())
+                .unwrap()
+                .watcher
+                .is_none()
+        );
+        assert_eq!(count_greet(&mut client), 1);
+    }
+    write_config("[]");
+    assert_eq!(rt.block_on(client.health_check()).unwrap().pid, pid);
+}

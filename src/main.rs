@@ -82,6 +82,7 @@ macro_rules! println {
 }
 
 mod setup;
+mod setup_probe;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -1486,6 +1487,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR",
         role: EnvRole::Internal,
     },
+    EnvVar {
+        name: "NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE",
+        role: EnvRole::Internal,
+    },
     // REQUESTS the daemon bypass. `NESTWEAVER_ALLOW_NO_DAEMON` permits it.
     // Offering this one as a remedy is nw-318 defect B.
     EnvVar {
@@ -1515,6 +1520,14 @@ const ENV_REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "NESTWEAVER_STOP_GRACE_SECS",
         role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_AUTHORITY",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY",
+        role: EnvRole::Internal,
     },
     EnvVar {
         name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
@@ -2163,8 +2176,10 @@ fn print_json_payload(payload: &serde_json::Value) -> anyhow::Result<()> {
 /// Every other surface here already returns an envelope (`blast_radius`,
 /// `dead-code`, `broken-links`, `contracts drift`); `impact` was the outlier.
 /// `status` is the discriminator a consumer branches on (nw-111).
+#[allow(clippy::too_many_arguments)]
 fn impact_json_ok(
     symbol: &str,
+    target: Option<&str>,
     nodes: serde_json::Value,
     truncated_by_threshold: bool,
     truncated_by_depth: bool,
@@ -2178,6 +2193,7 @@ fn impact_json_ok(
     let mut payload = serde_json::json!({
         "status": "ok",
         "symbol": symbol,
+        "target": target,
         "nodes": nodes,
         "truncated": truncated_by_threshold || truncated_by_depth || capped,
         "truncated_by_threshold": truncated_by_threshold,
@@ -2218,7 +2234,7 @@ fn impact_json_ok(
             obj.insert("note".to_string(), serde_json::json!(note));
         }
     }
-    payload
+    json_payload_with_provenance(nestweaver_schema::responses::impact(payload))
 }
 
 /// Length of a JSON node collection, for envelopes that must report what they
@@ -2676,8 +2692,8 @@ fn print_repo_map_json(
     print_json_payload(&payload)
 }
 
-/// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
-/// mistaken for a result set.
+/// Ambiguous resolution carries `candidates` and empty canonical impact arrays;
+/// `status: ambiguous` distinguishes it from a computed result set.
 ///
 /// nw-328: `repo_filter` is a parameter because the remedy is a FUNCTION of
 /// the state that produced the error, not a constant. `resolve_uid_with_repo_filter`
@@ -2690,37 +2706,26 @@ fn impact_json_ambiguous(
     repo_filter: Option<&str>,
     candidates: serde_json::Value,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "status": "ambiguous",
-        "symbol": symbol,
-        "candidates": candidates,
-        "note": impact_ambiguity_remedy(repo_filter),
-    })
+    json_payload_with_provenance(nestweaver_schema::responses::impact_ambiguous(
+        symbol,
+        repo_filter,
+        candidates,
+    ))
 }
 
 /// The one sentence both the JSON and the text renderings of an ambiguous
 /// `impact` use, so they cannot drift.
 fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
-    match repo_filter {
-        Some(repo) => format!(
-            "the symbol name matched multiple symbols; no impact was computed. \
-             --repo {repo} is already set and every match is inside it, so it \
-             cannot separate them. Pass a full UID instead — each candidate \
-             below carries one."
-        ),
-        None => "the symbol name matched multiple symbols; no impact was computed. \
-                 Disambiguate with --repo <name> or pass a full UID"
-            .to_string(),
-    }
+    nestweaver_schema::responses::impact_ambiguity_remedy(repo_filter)
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
-    serde_json::json!({
+    json_payload_with_provenance(nestweaver_schema::responses::impact(serde_json::json!({
         "status": "not_found",
         "symbol": symbol,
         "error": "not found",
         "name": symbol,
-    })
+    })))
 }
 
 /// Render a `dead-code` result as text from its JSON payload.
@@ -4635,6 +4640,25 @@ fn format_daemon_status_response(
                 "Config: {}",
                 format_effective_config(status.effective_config.as_ref())
             )];
+            lines.push(format!(
+                "Supervision: {}",
+                if status.supervision.is_empty() {
+                    "unknown/unverifiable"
+                } else {
+                    &status.supervision
+                }
+            ));
+            if let Some(watcher) = &status.watcher {
+                lines.push(format!(
+                    "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
+                    watcher.kind,
+                    watcher.target,
+                    watcher.id,
+                    watcher.controller_pid,
+                    watcher.started_unix_seconds,
+                    watcher.age_seconds
+                ));
+            }
             lines.push("Embedding:".to_string());
             if let Some(embedding) = status.embedding_status.as_ref() {
                 lines.push(format_embedding_status(embedding));
@@ -4714,11 +4738,14 @@ mod daemon_status_renderer_tests {
                 )),
             }),
             embedding_status: Some(embedding()),
+            supervision: "systemd-user".to_string(),
             ..Default::default()
         };
 
         let output = format_daemon_status_response(Ok(&status));
-        assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: /canonical/instance.toml\nSupervision: systemd-user\nEmbedding:\n"
+        ));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
     }
@@ -4766,14 +4793,18 @@ mod daemon_status_renderer_tests {
         };
 
         let output = format_daemon_status_response(Ok(&status));
-        assert!(output.starts_with("Config: none — compiled defaults\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: none — compiled defaults\nSupervision: unknown/unverifiable\nEmbedding:\n"
+        ));
     }
 
     #[test]
     fn absent_old_wire_fields_are_reported_as_unknown() {
         let output =
             format_daemon_status_response(Ok(&nestweaver_proto::BrainStatusResponse::default()));
-        assert!(output.starts_with("Config: unknown (older daemon)\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: unknown (older daemon)\nSupervision: unknown/unverifiable\nEmbedding:\n"
+        ));
         assert!(output.contains("  State:            unknown (older daemon)"));
     }
 
@@ -5311,7 +5342,7 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so (text note; under --json the output becomes\nan object with `nodes`, `truncated_by_threshold`, `truncated_by_depth` instead of\nthe usual bare array). Pass --min-score 0 for the full traversal."
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
     )]
     Impact {
         /// Symbol name or UID to analyze
@@ -7215,7 +7246,24 @@ enum DaemonAction {
     /// write lock or pidfile lock with no way for a client to reach it. That
     /// third state is repairable and names the owning PID when the kernel
     /// reports one.
-    Status,
+    Status {
+        /// Emit read-only lifecycle evidence as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one exact runtime entry. Unidentified ownership always refuses pruning.
+    InspectRuntime {
+        /// Exact instance directory directly inside the daemon runtime root.
+        path: PathBuf,
+    },
+    /// Prune one inspected empty runtime entry after proving its database is unowned.
+    PruneRuntime {
+        /// Exact inspected instance directory; roots and wildcard paths are refused.
+        path: PathBuf,
+        /// Existing database whose identity matches the selected runtime entry.
+        #[arg(long)]
+        database: PathBuf,
+    },
     /// Remove orphaned daemon runtime state.
     ///
     /// On macOS, sweeps orphaned launch agents left by ephemeral/test daemons —
@@ -10393,6 +10441,74 @@ fn ui_serve_request(
     Ok(response)
 }
 
+/// Observe the specific registration without reconnecting/autostarting. A
+/// displaced controller never issues an unconditional stop against its successor.
+fn wait_for_daemon_watcher(
+    rt: &tokio::runtime::Runtime,
+    client: &mut nestweaver_client::DaemonClient,
+    watcher_id: u64,
+    rx: &std::sync::mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        watcher_id != 0,
+        "daemon did not provide watcher session identity; upgrade the daemon before controlling this watcher"
+    );
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let health = rt
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            client.health_check(),
+                        )
+                        .await
+                    })
+                    .context(
+                        "watcher status timed out; controller is no longer observing its watcher",
+                    )??;
+                anyhow::ensure!(
+                    health.watcher.as_ref().is_some_and(|w| w.id == watcher_id),
+                    "watcher session {watcher_id} was displaced or stopped; this controller has terminated"
+                );
+            }
+        }
+    }
+}
+
+fn stop_owned_daemon_watcher(
+    rt: &tokio::runtime::Runtime,
+    client: &mut nestweaver_client::DaemonClient,
+    watcher_id: u64,
+) -> anyhow::Result<()> {
+    let response = rt
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client
+                    .inner_mut()
+                    .stop_watch(nestweaver_proto::StopWatchRequest { watcher_id }),
+            )
+            .await
+        })
+        .context("watcher stop is still draining or unreachable; completion is unverified")??
+        .into_inner();
+    anyhow::ensure!(
+        response.ok,
+        "watcher session {watcher_id} was already displaced or stopped"
+    );
+    Ok(())
+}
+
+/// Cleanup precedes propagation, including every supervisor error path.
+fn finish_ui_supervision(result: anyhow::Result<bool>, stop: impl FnOnce()) -> anyhow::Result<()> {
+    if !matches!(result, Ok(false)) {
+        stop();
+    }
+    result.map(|_| ())
+}
+
 /// Supervise the daemon-served web UI until Ctrl-C.
 ///
 /// The UI's listening socket is owned by the daemon process (`serve_ui`
@@ -11385,6 +11501,35 @@ fn report_runtime_cleanup(outcome: &RuntimeCleanup) {
     if let Some(reason) = outcome.refusal() {
         eprintln!("Left daemon runtime files in place: {reason}.");
     }
+}
+
+/// Read-only endpoint identity proof: a listening Unix socket alone does not
+/// prove that it serves the selected database, or even speaks the daemon RPC.
+fn daemon_status_reachable_pid(db_path: &Path, socket: &Path) -> Result<Option<i32>, String> {
+    let Some(peer_pid) = daemon_socket_reported_pid(socket) else {
+        return Ok(None);
+    };
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let health = runtime
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
+                client.health_check().await
+            })
+            .await
+        })
+        .map_err(|_| "endpoint health check timed out".to_string())?
+        .map_err(|error| format!("endpoint health check failed: {error}"))?;
+    if health.pid != peer_pid as u32
+        || health.instance_id != nestweaver_daemon::instance_id_from_db_path(db_path)
+        || nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
+            != nestweaver_daemon::lifecycle::database_path_fingerprint(db_path)
+    {
+        return Err(
+            "socket peer does not verify the selected database/instance identity".to_string(),
+        );
+    }
+    Ok(Some(peer_pid))
 }
 
 /// What proved that something still owns this instance when no client can
@@ -18238,7 +18383,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .block_on(async {
                     client
                         .inner_mut()
-                        .stop_watch(nestweaver_proto::StopWatchRequest {})
+                        .stop_watch(nestweaver_proto::StopWatchRequest::default())
                         .await
                 })
                 .map_err(daemon_status_error)?
@@ -18385,14 +18530,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
                         });
-                        let _ = rx.recv();
+                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
-                        let _ = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .stop_watch(nestweaver_proto::StopWatchRequest {})
-                                .await
-                        });
+                        stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                         eprintln!("Watcher stopped.");
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -18445,8 +18585,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // start.
             let write_lease = require_exclusive_store_access(&db_path, "watch")?;
 
-            let watcher =
-                CodeWatcher::new(&db_path, &repo_path, &instance_id).with_limits(index_limits);
+            let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id)
+                .with_limits(index_limits)
+                .with_instance_config(
+                    config
+                        .as_deref()
+                        .map(nestweaver_engine::InstanceConfig::from_file)
+                        .transpose()?
+                        .map(std::sync::Arc::new),
+                );
             let stop = watcher.shutdown_handle();
 
             let lock_path = {
@@ -18756,7 +18903,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // The listener lives in the daemon process; supervise
                         // it so a daemon outage degrades the UI instead of
                         // leaving a healthy-looking shell with a dead port.
-                        let daemon_up_at_exit = supervise_ui_daemon(
+                        let supervision = supervise_ui_daemon(
                             &rt,
                             &db_path,
                             port,
@@ -18764,12 +18911,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             &watch_repo_path,
                             &rx,
                             &mut client,
-                        )?;
-                        // Tell the daemon to stop serving so
-                        // the listen port is released when the CLI exits.
-                        // Meaningless while the daemon is down — the degraded
-                        // server was already shut down by supervise_ui_daemon.
-                        if daemon_up_at_exit {
+                        );
+                        finish_ui_supervision(supervision, || {
+                            // Tell the daemon to stop serving so
+                            // the listen port is released when the CLI exits.
+                            // Meaningless while the daemon is down — the degraded
+                            // server was already shut down by supervise_ui_daemon.
                             match rt.block_on(client.stop_ui()) {
                                 Ok(resp) if resp.ok => eprintln!("UI server stopped."),
                                 Ok(resp) => eprintln!("note: {}", resp.message),
@@ -18777,7 +18924,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     eprintln!("warning: failed to stop UI server cleanly: {e:#}")
                                 }
                             }
-                        }
+                        })?;
                     }
                     Err(error) => {
                         ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
@@ -20033,6 +20180,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // and made the text path print nothing and exit 0.
                     let envelope = value;
                     let value = brain_impact_local_tier(&envelope).clone();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&envelope)?);
+                        let code = match value.get("status").and_then(serde_json::Value::as_str) {
+                            Some("not_found") => EXIT_NOT_FOUND,
+                            Some("ambiguous") => EXIT_AMBIGUOUS,
+                            _ => EXIT_SUCCESS,
+                        };
+                        return Ok((code, None));
+                    }
+
                     // Honor the daemon tool's status so daemon mode matches the direct path's
                     // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
                     match value.get("status").and_then(|v| v.as_str()) {
@@ -20099,62 +20256,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         _ => {}
                     }
-                    if json {
-                        // nw-086: complete walks emit the bare node array (the direct
-                        // path's shape), NOT the daemon's {_meta, impact_nodes, ...}
-                        // envelope. When the daemon reports traversal pruning, mirror
-                        // the direct path's honest object form instead — a bare array
-                        // would hide that the impact set is a floor.
-                        let truncated_by_threshold = value
-                            .get("truncated_by_threshold")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let truncated_by_depth = value
-                            .get("truncated_by_depth")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        // nw-110: the daemon caps rows with `.take(limit)` and
-                        // reports both `total` and `returned`, but result-set
-                        // capping sets NEITHER truncated_by_* flag — those
-                        // describe traversal pruning. Reading only those flags
-                        // let a 50-of-495 answer print as a bare array of 50:
-                        // a floor presented as the whole set.
-                        let total = value.get("total").and_then(|v| v.as_u64());
-                        let returned = value.get("returned").and_then(|v| v.as_u64());
-                        let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
-                        let payload = value
-                            .get("impact_nodes")
-                            .cloned()
-                            .unwrap_or_else(|| value.clone());
-                        // One envelope for every outcome — a complete walk, a
-                        // pruned traversal and a capped result set all carry the
-                        // same keys, so a consumer parses one shape (nw-111).
-                        let note = if capped {
-                            Some(format!(
-                                "showing {} of {} impacted node(s) — reported impact is a \
-                                 floor; raise --limit or pass --min-score 0 for the full set",
-                                returned.unwrap_or(0),
-                                total.unwrap_or(0)
-                            ))
-                        } else {
-                            value
-                                .get("note")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        };
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&impact_json_ok(
-                                &name_or_uid,
-                                payload,
-                                truncated_by_threshold,
-                                truncated_by_depth,
-                                total,
-                                returned,
-                                note,
-                            ))?
-                        );
-                    } else {
+                    {
                         // nw-451: render BOTH tiers, mirroring
                         // `render_blast_radius_text` (nw-454). Previously only
                         // the local tier was rendered and the org-wide tier was
@@ -20209,7 +20311,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
-                    return Ok((EXIT_SUCCESS, None));
                 }
             }
 
@@ -20285,6 +20386,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ok(
                                 &name_or_uid,
+                                Some(&uid),
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
@@ -20389,9 +20491,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
-                        // Carries `candidates`, never `nodes` — a bare array here
-                        // was indistinguishable from a result set, so a mistyped
-                        // name looked like a successful impact query (nw-111).
+                        // Carries candidates, an ambiguous status and empty impact
+                        // aliases; a bare array was indistinguishable from a
+                        // computed result set (nw-111).
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ambiguous(
@@ -21293,6 +21395,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let terminal = terminal.ok_or_else(|| {
                     anyhow::anyhow!("index completed without a terminal progress payload")
                 })?;
+                if !json
+                    && let Some(excluded) = &terminal.exclusion_inventory
+                    && !excluded.patterns.is_empty()
+                {
+                    out.status(&format!("Configured excludes: {} Git-tracked file(s); {} observed excluded path(s).",
+                        excluded.tracked_files.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+                        excluded.observed_paths.len()));
+                }
                 if let Some(stats) = &terminal.trigram_refresh
                     && !stats.posting_deltas_unavailable.is_empty()
                 {
@@ -21343,6 +21453,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "symbols_found": terminal.symbols_found,
                             "skipped_count": terminal.skipped_count,
                             "skipped_files": skipped,
+                            "exclusion_inventory": terminal.exclusion_inventory.as_ref().map(nestweaver_proto::exclusion_inventory_json),
                             "trigram_refresh": trigram_refresh,
                             "message": terminal.message,
                         }))?
@@ -21422,6 +21533,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
+            let exclusion_inventory;
 
             // Per-repo `exclude` globs and `unskip` names from `--config`. The
             // daemon route resolves these from its own loaded config; this is
@@ -21475,6 +21587,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 skipped_files = result.skipped_files;
+                exclusion_inventory = result.exclusion_inventory;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
                 // nw-418: the `_and_unskip` entry point, not the
@@ -21503,6 +21616,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 symbols_count = inc.symbols_added;
                 edges_count = inc.full_edges_count;
                 skipped_files = inc.skipped_files.clone();
+                exclusion_inventory = inc.exclusion_inventory.clone();
 
                 if inc.fell_back_to_full {
                     out.status(
@@ -21524,6 +21638,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            if !json && !exclusion_inventory.patterns.is_empty() {
+                out.status(&format!(
+                    "Configured excludes: {} Git-tracked file(s); {} observed excluded path(s).",
+                    exclusion_inventory
+                        .tracked_files
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    exclusion_inventory.observed_paths.len()
+                ));
+            }
             if !json && !skipped_files.is_empty() {
                 out.status(&format!(
                     "Done — DEGRADED — skipped {} eligible file(s):",
@@ -21653,6 +21777,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "edges_found": edges_count,
                         "skipped_count": skipped_files.len(),
                         "skipped_files": skipped_files,
+                        "exclusion_inventory": exclusion_inventory,
                         "trigram_refresh": trigram_refresh_stats,
                     }))?
                 );
@@ -23121,8 +23246,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
 
-                DaemonAction::Status => {
-                    if daemon_socket_reported_pid(&socket).is_none()
+                DaemonAction::PruneRuntime { path, database } => {
+                    nestweaver_daemon::lifecycle::prune_runtime_entry(&path, &database)?;
+                    println!("Removed exact runtime entry {}", path.display());
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::InspectRuntime { path } => {
+                    let report = nestweaver_daemon::lifecycle::inspect_runtime_entry(&path)?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::Status { json } => {
+                    let (reachable, endpoint_error) =
+                        match daemon_status_reachable_pid(&db_path, &socket) {
+                            Ok(pid) => (pid, None),
+                            Err(error) => (None, Some(error)),
+                        };
+                    if json {
+                        let owner = if reachable.is_none() {
+                            unreachable_daemon_owner(&db_path, &pidfile)
+                        } else {
+                            None
+                        };
+                        let (state, evidence, pid) = match (reachable, owner) {
+                            (Some(pid), _) => ("running", "kernel_socket_peer", Some(pid)),
+                            (_, Some(UnreachableOwner::DatabaseWriteLock { pid })) => {
+                                ("running_but_unreachable", "database_write_lock", Some(pid))
+                            }
+                            (_, Some(UnreachableOwner::DatabaseWriteLockAnonymous)) => {
+                                ("running_but_unreachable", "database_write_lock", None)
+                            }
+                            (_, Some(UnreachableOwner::PidfileLock)) => (
+                                "running_but_unreachable",
+                                "pidfile_lock_without_pid_identity",
+                                None,
+                            ),
+                            (_, Some(UnreachableOwner::DatabaseLockUnreadable)) => {
+                                ("unknown", "database_lock_unreadable", None)
+                            }
+                            _ if endpoint_error.is_some() => {
+                                ("unknown", "endpoint_identity_unverified", None)
+                            }
+                            _ => ("not_running", "no_observed_owner", None),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "state": state, "evidence": evidence, "pid": pid, "endpoint_error": endpoint_error,
+                                "db_path": db_path, "instance_id": instance_id, "socket": socket,
+                                "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
+                                "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
+                            }))?
+                        );
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    if let Some(error) = &endpoint_error {
+                        println!(
+                            "Daemon endpoint is UNREACHABLE or unverifiable: {error}. Do not start another writer or remove runtime files based on this endpoint."
+                        );
+                    }
+                    if reachable.is_none()
                         && !pidfile_flock_held(&pidfile)
                         && let Some(old_id) = selected_slot_legacy_id.as_deref()
                     {
@@ -23142,7 +23325,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     // Check launchd first on macOS
                     #[cfg(target_os = "macos")]
-                    if nestweaver_daemon::launchd::is_running(&instance_id) {
+                    if nestweaver_daemon::launchd::is_running(&instance_id) && reachable.is_some() {
                         println!("Daemon is running (launchd agent)");
                         println!(
                             "  Label:  {}",
@@ -23161,8 +23344,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
                         // A live PID is not proof — it may be recycled.
-                        if daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
+                        if daemon_identity_verified(pid, &db_path, &pidfile, &socket)
+                            && reachable == Some(pid)
+                        {
                             println!("Daemon is running (PID {pid})");
+                            println!(
+                                "  Supervision: {}",
+                                nestweaver_daemon::lifecycle::process_supervision(pid)
+                            );
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
                             println!("  Log:    {log_hint}");
@@ -23191,10 +23380,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The pidfile may be gone/stale while a detached daemon
                     // still serves the socket — ask the kernel before
                     // declaring "not running".
-                    if let Some(pid) = daemon_socket_reported_pid(&socket)
+                    if let Some(pid) = reachable
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
                         println!("Daemon is running (PID {pid}, serving socket)");
+                        println!(
+                            "  Supervision: {}",
+                            nestweaver_daemon::lifecycle::process_supervision(pid)
+                        );
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {log_hint}");
@@ -26321,48 +26514,9 @@ fn run_brain(
                     let _ = tx.send(());
                 });
 
-                // Periodic health check so we notice daemon death.
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                        Ok(()) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let health = rt.block_on(async {
-                                client
-                                    .inner_mut()
-                                    .health_check(nestweaver_proto::HealthCheckRequest {})
-                                    .await
-                            });
-                            if health.is_err() {
-                                eprintln!("Daemon is no longer running.");
-                                return Ok((EXIT_ERROR, None));
-                            }
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
+                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
-                let stop_req = nestweaver_proto::StopWatchRequest {};
-                if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
-                {
-                    // The watcher thread lives inside the daemon, so when the
-                    // daemon process is gone the watcher has already stopped
-                    // with it - nothing for us to clean up, nothing to warn
-                    // about. Two error shapes indicate "daemon gone":
-                    //   - `Unavailable`: connect failed (socket file removed,
-                    //     or "Connection refused" on a stale socket).
-                    //   - `Unknown` with a tonic transport error: the
-                    //     connection was open when the RPC started but was
-                    //     abruptly closed mid-call (e.g. daemon SIGKILLed).
-                    // Without this filter, `KeepAlive=true` on the watch
-                    // plist turns every daemon restart into a perpetual
-                    // "failed to stop watcher" loop in the watch error log.
-                    let daemon_gone = matches!(e.code(), tonic::Code::Unavailable)
-                        || (matches!(e.code(), tonic::Code::Unknown)
-                            && e.message().contains("transport error"));
-                    if !daemon_gone {
-                        eprintln!("Warning: failed to stop watcher: {e}");
-                    }
-                }
+                stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -27350,6 +27504,12 @@ fn run_brain(
                         "recency_half_life_days": recency_half_life_days,
                 });
                 let mut context_params = context_params;
+                if !no_embed && weight_semantic.is_none() {
+                    context_params
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("weight_semantic");
+                }
                 if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
                     context_params["since"] = serde_json::json!(since);
                 }
@@ -29640,6 +29800,8 @@ mod cli_help_contract_tests {
             | "cross-repo-refs"
             | "daemon"
             | "daemon gc"
+            | "daemon inspect-runtime"
+            | "daemon prune-runtime"
             | "daemon restart"
             | "daemon run"
             | "daemon start"
@@ -32019,9 +32181,10 @@ fn brain_context_json_value(
     // Federation provenance, passed through rather than regenerated — the CLI
     // is not the layer that knows which upstreams answered. Absent on the
     // direct route, which has exactly one source and never wrote a `_meta`.
-    if let Some(meta) = upstream.meta.as_ref() {
-        resp["_meta"] = meta.clone();
-    }
+    resp["_meta"] = upstream
+        .meta
+        .clone()
+        .unwrap_or_else(|| nestweaver_schema::provenance::provenance("direct", &["direct"], &[]));
     resp
 }
 
@@ -35207,25 +35370,9 @@ fn run_publication_rebuild(
             use nestweaver_engine::publication_operation::PublicationPhase;
             match state.phase {
                 PublicationPhase::Planned => {
-                    if !target_db.exists() {
-                        std::fs::create_dir_all(&slot)?;
-                        let authority = acquire_publication_write_authority(
-                            &target_db,
-                            "create the staged publication",
-                        )?;
-                        let target_identity = nestweaver_store::PublicationIdentity {
-                            brain_uuid: state.plan.brain_uuid.clone(),
-                            publication_uuid: state.plan.target_publication_uuid.clone(),
-                        };
-                        let store = GraphStore::create_with_publication_identity_and_authority(
-                            &target_db,
-                            &target_identity,
-                            &authority,
-                        )?;
-                        drop(store);
-                    } else {
-                        verify_staged_publication_identity(&target_db, &state.plan)?;
-                    }
+                    nestweaver_engine::publication_operation::ensure_planned_database(
+                        &publication_root, &state, &root_lock,
+                    )?;
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
                         &operation_uuid,
@@ -35234,6 +35381,13 @@ fn run_publication_rebuild(
                     )?;
                 }
                 PublicationPhase::Graph => {
+                    nestweaver_engine::publication_operation::retire_planned_creation(
+                        &publication_root, &state, &root_lock,
+                    )?;
+                    #[cfg(debug_assertions)]
+                    if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY").is_some() {
+                        std::process::exit(87);
+                    }
                     verify_staged_publication_identity(&target_db, &state.plan)?;
                     let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
                     let mut completed = 0_u64;
@@ -35559,6 +35713,7 @@ fn run_publication_rebuild(
                     let lease = store.acquire_index_publication_lease()?;
                     state = nestweaver_engine::publication_operation::select_operation(
                         &publication_root,
+                        &root_lock,
                         &operation_uuid,
                         state.revision,
                         &lease,
@@ -38434,9 +38589,27 @@ credential_method = "ssh"
     fn impact_envelope_key_set_is_identical_across_truncation_paths() {
         let nodes = serde_json::json!([{"name": "a"}, {"name": "b"}, {"name": "c"}]);
 
-        let by_depth = impact_json_ok("s", nodes.clone(), false, true, Some(9), Some(3), None);
+        let by_depth = impact_json_ok(
+            "s",
+            Some("sym:s"),
+            nodes.clone(),
+            false,
+            true,
+            Some(9),
+            Some(3),
+            None,
+        );
         // The threshold path is the one that used to omit the counts.
-        let by_threshold = impact_json_ok("s", nodes.clone(), true, false, None, None, None);
+        let by_threshold = impact_json_ok(
+            "s",
+            Some("sym:s"),
+            nodes.clone(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
 
         let keys = |v: &serde_json::Value| {
             let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();

@@ -1,0 +1,11 @@
+{
+  "source_sha": "488c5f8d",
+  "fixture_source_sha": "5149d22cd885107fa5d8f047a00d87e1fff86847",
+  "seed_binary_version": "10.0.0",
+  "candidate_binary_sha256": "865253b05f151ff110a915e5b1bda96f924f47c77d2dd76b7749f93af97bf0c5",
+  "original_trace_sha256": "c3b1c2772c4967f4e44c146237416e2266928e15a6fabd096f6953b695717e44",
+  "timing_events": "Verbatim timing-event lines extracted from the retained fixture log; unrelated startup diagnostics omitted.",
+  "resolver_generation": 5,
+  "dirty_publication": false,
+  "historical_graph_reproduction": false
+}

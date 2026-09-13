@@ -787,6 +787,8 @@ impl Drop for ProcessPublicationRootClaim {
 /// Held by rebuild, rollback, discard and prune. Released on drop.
 #[derive(Debug)]
 pub struct PublicationRootLock {
+    anchor: nestweaver_store::stable_anchor::StableAnchor,
+    root_file: std::fs::File,
     _file: std::fs::File,
     root: PathBuf,
     path: PathBuf,
@@ -820,6 +822,17 @@ impl PublicationRootLock {
         let process_claim = ProcessPublicationRootClaim::acquire(&path).ok_or_else(|| {
             publication_lock_contention(&path, std::io::ErrorKind::WouldBlock.into())
         })?;
+        let anchor = nestweaver_store::stable_anchor::StableAnchor::acquire(
+            "publication-root",
+            &canonical_root,
+            true,
+        )
+        .map_err(|error| publication_lock_contention(&path, error))?;
+        // Lock the directory inode as well: its new name after a rename must
+        // not manufacture another owner for the displaced publication tree.
+        let root_file = std::fs::File::open(&canonical_root)?;
+        lock_publication_file(&root_file)
+            .map_err(|error| publication_lock_contention(&path, error))?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -829,6 +842,8 @@ impl PublicationRootLock {
             .with_context(|| format!("open publication lock {}", path.display()))?;
         lock_publication_file(&file).map_err(|error| publication_lock_contention(&path, error))?;
         Ok(Self {
+            anchor,
+            root_file,
             _file: file,
             root: canonical_root,
             path,
@@ -844,7 +859,10 @@ impl PublicationRootLock {
     /// Whether this guard covers exactly this publication root after resolving
     /// relative paths and symlink aliases.
     pub fn authorizes(&self, publication_root: &Path) -> bool {
-        std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
+        self.anchor.is_current()
+            && nestweaver_store::stable_anchor::descriptor_matches_path(&self.root_file, &self.root)
+            && nestweaver_store::stable_anchor::descriptor_matches_path(&self._file, &self.path)
+            && std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
     }
 
     pub(crate) fn ensure_authorizes(&self, publication_root: &Path) -> anyhow::Result<&Path> {
@@ -1190,18 +1208,21 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
 }
 
 /// Durably select `next` when the currently selected publication UUID equals
-/// `expected_current`. The caller must hold the incumbent graph's publication
-/// lease, which serializes switch attempts with graph/sidecar publication.
+/// `expected_current`. The caller must hold both the publication root authority
+/// and incumbent graph's publication lease. The root authority serializes
+/// switches across different graph stores and prevents bypassing root exclusion.
 ///
 /// The target slot's canonical `publication.json` must already exist and hash
 /// to `next.manifest_blake3`; a pointer can never select a missing or differently
 /// sealed slot.
 pub fn compare_and_swap_current(
     publication_root: &Path,
+    root_lock: &PublicationRootLock,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
     expected_current: Option<&str>,
     next: &CurrentPublicationPointer,
 ) -> anyhow::Result<()> {
+    let publication_root = root_lock.ensure_authorizes(publication_root)?;
     lease
         .ensure_clean_for_snapshot()
         .map_err(|error| anyhow::anyhow!("refusing CURRENT switch from dirty graph: {error}"))?;
@@ -1292,6 +1313,7 @@ pub fn compare_and_swap_current(
     std::fs::create_dir_all(publication_root)?;
     let path = current_pointer_path(publication_root);
     let bytes = serde_json::to_vec_pretty(next)?;
+    root_lock.ensure_authorizes(publication_root)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
         file.write_all(&bytes)?;
         file.write_all(b"\n")
@@ -1576,6 +1598,7 @@ pub fn rollback_current_under_lock(
     )?;
     compare_and_swap_current(
         publication_root,
+        root_lock,
         lease,
         Some(&current.publication_uuid),
         &previous,
@@ -2150,6 +2173,31 @@ mod tests {
     }
 
     #[test]
+    fn current_switch_refuses_unrelated_and_replaced_root_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publication");
+        let sibling = dir.path().join("sibling");
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let digest = write_slot(&root, &identity);
+        let pointer = CurrentPublicationPointer::new(&identity, None, digest).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let unrelated = PublicationRootLock::acquire(&sibling).unwrap();
+        let error =
+            compare_and_swap_current(&root, &unrelated, &lease, None, &pointer).unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert!(read_current(&root).unwrap().is_none());
+
+        let held = PublicationRootLock::acquire(&root).unwrap();
+        std::fs::rename(held.path(), root.join("displaced-lock")).unwrap();
+        std::fs::write(held.path(), b"").unwrap();
+        let error = compare_and_swap_current(&root, &held, &lease, None, &pointer).unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert!(read_current(&root).unwrap().is_none());
+        lease.release().unwrap();
+    }
+
+    #[test]
     fn current_pointer_compare_and_swap_is_checked_and_durable() {
         let dir = tempfile::tempdir().unwrap();
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
@@ -2157,7 +2205,14 @@ mod tests {
         let first_digest = write_slot(dir.path(), &incumbent);
         let first = CurrentPublicationPointer::new(&incumbent, None, first_digest).unwrap();
         let lease = store.acquire_index_publication_lease().unwrap();
-        compare_and_swap_current(dir.path(), &lease, None, &first).unwrap();
+        compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &first,
+        )
+        .unwrap();
         assert_eq!(read_current(dir.path()).unwrap(), Some(first.clone()));
 
         let next_identity = incumbent.next_publication().unwrap();
@@ -2168,8 +2223,14 @@ mod tests {
             next_digest,
         )
         .unwrap();
-        compare_and_swap_current(dir.path(), &lease, Some(&incumbent.publication_uuid), &next)
-            .unwrap();
+        compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            Some(&incumbent.publication_uuid),
+            &next,
+        )
+        .unwrap();
         assert_eq!(read_current(dir.path()).unwrap(), Some(next.clone()));
 
         let stale = incumbent.next_publication().unwrap();
@@ -2182,6 +2243,7 @@ mod tests {
         .unwrap();
         let error = compare_and_swap_current(
             dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
             &lease,
             Some(&incumbent.publication_uuid),
             &stale_pointer,
@@ -2218,6 +2280,50 @@ mod tests {
     /// This proves the replacement is a real, root-anchored, cross-process
     /// lock: a SECOND acquisition of the same root is refused, including from
     /// another process.
+    #[test]
+    fn publication_root_and_lock_replacement_do_not_admit_another_owner() {
+        for replace_root in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("publications");
+            let held = PublicationRootLock::acquire(&root).unwrap();
+            let displaced = dir.path().join("displaced");
+            if replace_root {
+                std::fs::rename(&root, &displaced).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                assert!(PublicationRootLock::acquire(&displaced).is_err());
+            } else {
+                std::fs::rename(root.join("LOCK"), &displaced).unwrap();
+                std::fs::write(root.join("LOCK"), b"").unwrap();
+            }
+            assert!(!held.authorizes(&root));
+            assert!(PublicationRootLock::acquire(&root).is_err());
+            for probe_root in if replace_root {
+                vec![&root, &displaced]
+            } else {
+                vec![&root]
+            } {
+                let probe = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "publication::tests::publication_root_lock_child_probe",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("NESTWEAVER_PUBLICATION_LOCK_PROBE_ROOT", probe_root)
+                    .output()
+                    .unwrap();
+                assert!(
+                    probe.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&probe.stderr)
+                );
+                assert!(String::from_utf8_lossy(&probe.stdout).contains("running 1 test"));
+            }
+            PublicationRootLock::acquire(&dir.path().join("sibling")).unwrap();
+            drop(held);
+            PublicationRootLock::acquire(&root).unwrap();
+        }
+    }
+
     #[test]
     fn the_publication_root_lock_excludes_a_second_holder() {
         let dir = tempfile::tempdir().unwrap();
@@ -2478,7 +2584,14 @@ mod tests {
         // the retained rollback target.
         let lease = store.acquire_index_publication_lease().unwrap();
         let first = CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
-        compare_and_swap_current(root, &lease, None, &first).unwrap();
+        compare_and_swap_current(
+            root,
+            &PublicationRootLock::acquire(root).unwrap(),
+            &lease,
+            None,
+            &first,
+        )
+        .unwrap();
         let pointer = CurrentPublicationPointer::new(
             &current_identity,
             Some(predecessor.publication_uuid.clone()),
@@ -2487,6 +2600,7 @@ mod tests {
         .unwrap();
         compare_and_swap_current(
             root,
+            &PublicationRootLock::acquire(root).unwrap(),
             &lease,
             Some(predecessor.publication_uuid.as_str()),
             &pointer,
@@ -2575,17 +2689,29 @@ mod tests {
         let foreign_pointer =
             CurrentPublicationPointer::new(&foreign, None, foreign_digest).unwrap();
         let lease = store.acquire_index_publication_lease().unwrap();
-        let error = compare_and_swap_current(dir.path(), &lease, None, &foreign_pointer)
-            .unwrap_err()
-            .to_string();
+        let error = compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &foreign_pointer,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("across brains"), "{error}");
 
         let next = incumbent.next_publication().unwrap();
         let missing_digest = "a".repeat(64);
         let missing = CurrentPublicationPointer::new(&next, None, missing_digest).unwrap();
-        let error = compare_and_swap_current(dir.path(), &lease, None, &missing)
-            .unwrap_err()
-            .to_string();
+        let error = compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &missing,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("read target publication manifest"),
             "{error}"

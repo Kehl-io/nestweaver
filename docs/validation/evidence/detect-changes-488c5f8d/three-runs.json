@@ -1,0 +1,220 @@
+{
+  "binary_sha256": "865253b05f151ff110a915e5b1bda96f924f47c77d2dd76b7749f93af97bf0c5",
+  "load_before": [
+    19.50830078125,
+    20.1162109375,
+    22.63916015625
+  ],
+  "runs": [
+    {
+      "name": "detect-1000-0",
+      "limit": 1000,
+      "exit": 0,
+      "seconds": 51.47623193310574,
+      "bytes": 355462,
+      "controls": [
+        {
+          "exit": 0,
+          "seconds": 2.140587077010423,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 1.341859427979216,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 0.5820666400250047,
+          "bytes": 2288,
+          "request_running_before": true,
+          "request_running_after": true
+        }
+      ],
+      "metadata": {
+        "_meta": {
+          "scope": "local",
+          "sources": [
+            "local"
+          ],
+          "stale_repos": []
+        },
+        "affected_process_count": 5955,
+        "affected_process_count_relation": "eq",
+        "affected_symbol_count": 6304,
+        "affected_symbol_count_relation": "eq",
+        "blast_radius": 12259,
+        "deadline_exceeded": false,
+        "gate_state": "risk-flagged",
+        "limit": 1000,
+        "notifications": [],
+        "phase_millis": {
+          "graph_load": 5746,
+          "planning": 36963,
+          "sorting": 19,
+          "traversal": 8205
+        },
+        "process_analysis_unavailable": false,
+        "processes_omitted": 4955,
+        "resolver_stale_repos": [],
+        "risk": "high",
+        "status": "complete",
+        "symbols_omitted": 5304,
+        "traversal_steps": 1950009,
+        "truncated": true,
+        "work_budget_exceeded": false
+      },
+      "returned_symbols": 1000,
+      "returned_processes": 1000
+    },
+    {
+      "name": "detect-1-1",
+      "limit": 1,
+      "exit": 0,
+      "seconds": 51.375058956909925,
+      "bytes": 3946,
+      "controls": [
+        {
+          "exit": 0,
+          "seconds": 1.3313431920250878,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 1.2917784110177308,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 1.4969567130319774,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        }
+      ],
+      "metadata": {
+        "_meta": {
+          "scope": "local",
+          "sources": [
+            "local"
+          ],
+          "stale_repos": []
+        },
+        "affected_process_count": 5955,
+        "affected_process_count_relation": "eq",
+        "affected_symbol_count": 6304,
+        "affected_symbol_count_relation": "eq",
+        "blast_radius": 12259,
+        "deadline_exceeded": false,
+        "gate_state": "risk-flagged",
+        "limit": 1,
+        "notifications": [],
+        "phase_millis": {
+          "graph_load": 6364,
+          "planning": 30968,
+          "sorting": 33,
+          "traversal": 13719
+        },
+        "process_analysis_unavailable": false,
+        "processes_omitted": 5954,
+        "resolver_stale_repos": [],
+        "risk": "high",
+        "status": "complete",
+        "symbols_omitted": 6303,
+        "traversal_steps": 1950009,
+        "truncated": true,
+        "work_budget_exceeded": false
+      },
+      "returned_symbols": 1,
+      "returned_processes": 1
+    },
+    {
+      "name": "detect-1000-2",
+      "limit": 1000,
+      "exit": 0,
+      "seconds": 50.2596270670183,
+      "bytes": 355462,
+      "controls": [
+        {
+          "exit": 0,
+          "seconds": 1.8481779630528763,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 1.3542480809846893,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        },
+        {
+          "exit": 0,
+          "seconds": 1.689577221055515,
+          "bytes": 2289,
+          "request_running_before": true,
+          "request_running_after": true
+        }
+      ],
+      "metadata": {
+        "_meta": {
+          "scope": "local",
+          "sources": [
+            "local"
+          ],
+          "stale_repos": []
+        },
+        "affected_process_count": 5955,
+        "affected_process_count_relation": "eq",
+        "affected_symbol_count": 6304,
+        "affected_symbol_count_relation": "eq",
+        "blast_radius": 12259,
+        "deadline_exceeded": false,
+        "gate_state": "risk-flagged",
+        "limit": 1000,
+        "notifications": [],
+        "phase_millis": {
+          "graph_load": 4191,
+          "planning": 39979,
+          "sorting": 18,
+          "traversal": 5710
+        },
+        "process_analysis_unavailable": false,
+        "processes_omitted": 4955,
+        "resolver_stale_repos": [],
+        "risk": "high",
+        "status": "complete",
+        "symbols_omitted": 5304,
+        "traversal_steps": 1950009,
+        "truncated": true,
+        "work_budget_exceeded": false
+      },
+      "returned_symbols": 1000,
+      "returned_processes": 1000
+    }
+  ],
+  "daemon_start": {
+    "exit": 0,
+    "seconds": 7.175248416955583,
+    "bytes": 0
+  },
+  "daemon_stop": {
+    "exit": 0,
+    "seconds": 0.43215033994056284,
+    "bytes": 0
+  },
+  "load_after": [
+    22.00048828125,
+    21.19677734375,
+    22.65576171875
+  ]
+}

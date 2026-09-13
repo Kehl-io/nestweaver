@@ -1,0 +1,11 @@
+{
+  "db_path": "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+  "endpoint_error": null,
+  "evidence": "kernel_socket_peer",
+  "instance_id": "ed29a85e",
+  "next_action": "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped.",
+  "pid": 3282550,
+  "socket": "/run/user/1000/nestweaver/ed29a85e/daemon.sock",
+  "state": "running",
+  "supervision": "ad-hoc"
+}

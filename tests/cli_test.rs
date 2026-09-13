@@ -2774,10 +2774,12 @@ fn cli_impact_json_is_one_envelope_for_every_outcome() {
         Some("not_found"),
         "not-found must be discriminated by status, got: {v}"
     );
-    assert!(
-        v.get("nodes").is_none(),
-        "a not-found envelope must not carry nodes, got: {v}"
-    );
+    // Canonical route parity keeps the same keys for empty and populated
+    // results. Status and exit code distinguish not-found from an empty hit.
+    assert_eq!(v["nodes"], serde_json::json!([]));
+    assert_eq!(v["impact_nodes"], v["nodes"]);
+    assert!(v["target"].is_null());
+    assert_eq!(v["returned"], 0);
 }
 
 #[test]

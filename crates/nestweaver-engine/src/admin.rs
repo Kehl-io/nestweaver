@@ -309,8 +309,8 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Erro
         );
     };
     let mut settings = Value::Object(existing.clone());
-    validate_claude_hook_containers(&settings)?;
     if !has_exact_claude_hook(&settings) {
+        validate_claude_hook_containers(&settings)?;
         let hooks = settings["hooks"].take();
         let mut hooks = if hooks.is_null() { json!({}) } else { hooks };
         if hooks.get("PreToolUse").is_none() {
@@ -338,19 +338,8 @@ fn validate_claude_hook_containers(existing: &Value) -> anyhow::Result<()> {
                 entries.is_array(),
                 "hooks.PreToolUse must be an array; fix the settings structure before installing"
             );
-            if let Some(entries) = entries.as_array() {
-                for entry in entries {
-                    anyhow::ensure!(
-                        entry.is_object()
-                            && entry.get("matcher").is_none_or(Value::is_string)
-                            && entry
-                                .get("hooks")
-                                .and_then(Value::as_array)
-                                .is_some_and(|hooks| hooks.iter().all(Value::is_object)),
-                        "each PreToolUse entry requires an array of hook objects and, when present, a string matcher"
-                    );
-                }
-            }
+            // We append a new entry; existing entries belong to other hooks.
+            // Their shape is immaterial to this lossless operation.
         }
     }
     Ok(())
@@ -391,7 +380,7 @@ pub fn compute_hook_patch(runtime: Runtime, existing: &Value) -> Result<Value, a
 ///
 /// When the exact NestWeaver command/event/matcher already exists the `PreToolUse` array is empty
 /// (nothing to add).
-pub fn compute_claude_hook_delta(existing: &Value) -> Value {
+fn compute_claude_hook_delta(existing: &Value) -> Value {
     let already_present = has_exact_claude_hook(existing);
 
     let to_add = if already_present {
@@ -407,7 +396,9 @@ pub fn compute_claude_hook_delta(existing: &Value) -> Value {
 pub fn compute_hook_delta(runtime: Runtime, existing: &Value) -> Result<Value, anyhow::Error> {
     match runtime {
         Runtime::Claude => {
-            validate_claude_hook_containers(existing)?;
+            if !has_exact_claude_hook(existing) {
+                validate_claude_hook_containers(existing)?;
+            }
             Ok(compute_claude_hook_delta(existing))
         }
     }
@@ -1063,9 +1054,6 @@ mod exact_hook_regressions {
             json!({"hooks":[]}),
             json!({"hooks":null}),
             json!({"hooks":{"PreToolUse":{}}}),
-            json!({"hooks":{"PreToolUse":[null]}}),
-            json!({"hooks":{"PreToolUse":[{"matcher":"Task","hooks":[null]}]}}),
-            json!({"hooks":{"PreToolUse":[{"hooks":["command"]}]}}),
         ] {
             let bytes = value.to_string();
             std::fs::write(&path, &bytes).unwrap();
@@ -1074,6 +1062,35 @@ mod exact_hook_regressions {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
         }
     }
+    #[test]
+    fn unrelated_entries_are_preserved_and_repeat_install_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for foreign in [
+            json!(null),
+            json!({"matcher": "Other"}),
+            json!({"matcher": 42, "hooks": {"command": "foreign"}}),
+            json!({"matcher": "Task", "hooks": [null, "foreign"]}),
+        ] {
+            let existing = json!({"hooks": {"PreToolUse": [foreign.clone()]}});
+            let patched = compute_claude_hook_patch(&existing).unwrap();
+            assert_eq!(patched["hooks"]["PreToolUse"][0], foreign);
+            assert_eq!(patched["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+            let bytes = serde_json::to_string_pretty(&patched).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                install_hook(Runtime::Claude, &path).unwrap(),
+                HookInstall::AlreadyPresent
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            assert_eq!(
+                compute_hook_delta(Runtime::Claude, &patched).unwrap(),
+                json!({"hooks":{"PreToolUse":[]}})
+            );
+            assert_eq!(compute_claude_hook_patch(&patched).unwrap(), patched);
+        }
+    }
+
     #[test]
     fn only_the_exact_event_matcher_type_and_command_suppress_install() {
         for value in [

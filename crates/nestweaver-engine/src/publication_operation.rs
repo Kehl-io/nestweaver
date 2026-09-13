@@ -190,6 +190,229 @@ pub fn operation_state_path(
     )
 }
 
+/// Durable provenance recorded BEFORE a staged database name is published.
+/// The random seed stays in the plan's private journal directory; its hard link
+/// pins the inode across retries and prevents inode-number reuse after unlink.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlannedCreation {
+    plan: PublicationOperationPlan,
+    target: PathBuf,
+    seed_name: String,
+    device: u64,
+    inode: u64,
+}
+
+/// Complete Planned creation under the exact root authority. A seed and its
+/// durable provenance precede hard-link publication of the target, eliminating
+/// the former zero-byte target / missing provenance crash window.
+pub fn ensure_planned_database(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+) -> anyhow::Result<()> {
+    ensure_planned_database_with_checkpoint(publication_root, state, root_lock, || {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("NESTWEAVER_TEST_CRASH_AFTER_STAGED_AUTHORITY").is_some() {
+            std::process::exit(86);
+        }
+        Ok(())
+    })
+}
+
+fn ensure_planned_database_with_checkpoint(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+    after_authority: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let root = root_lock.ensure_authorizes(publication_root)?;
+    anyhow::ensure!(
+        state.phase == PublicationPhase::Planned,
+        "creation requires Planned phase"
+    );
+    let actual = load_operation(root, &state.plan.operation_uuid)?;
+    anyhow::ensure!(actual == *state, "publication creation journal changed");
+    let slot = crate::publication::slot_path(root, &state.plan.target_publication_uuid)?;
+    let target = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+    let operation = crate::publication::operation_path(root, &state.plan.operation_uuid)?;
+    let provenance = operation.join("creation.json");
+    let identity = nestweaver_store::PublicationIdentity {
+        brain_uuid: state.plan.brain_uuid.clone(),
+        publication_uuid: state.plan.target_publication_uuid.clone(),
+    };
+    // Already committed identity is sufficient for an old Planned journal.
+    // Never open a symlink, or adopt a foreign non-empty database.
+    if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+        anyhow::ensure!(metadata.is_file(), "staged target is not a regular file");
+        if metadata.len() != 0 && !provenance.try_exists()? {
+            let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+            anyhow::ensure!(
+                store.publication_identity()? == Some(identity),
+                "staged publication identity mismatch"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            provenance.try_exists()?,
+            "pre-existing empty staged target has no creation provenance"
+        );
+    }
+    let record: PlannedCreation = if provenance.try_exists()? {
+        serde_json::from_slice(&std::fs::read(&provenance)?)?
+    } else {
+        // Keep the seed before recording it. An interrupted record write may
+        // leave an unreferenced seed, but never a target lacking provenance.
+        let seed_name = format!("creation-seed-{}", uuid::Uuid::new_v4());
+        let seed_path = operation.join(&seed_name);
+        let seed = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&seed_path)?;
+        seed.sync_all()?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&seed_path)?;
+        let metadata = seed.metadata()?;
+        let record = PlannedCreation {
+            plan: state.plan.clone(),
+            target: target.clone(),
+            seed_name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(&provenance, |file| {
+            file.write_all(&bytes)
+        })?;
+        record
+    };
+    anyhow::ensure!(
+        record.plan == state.plan && record.target == target,
+        "creation provenance belongs to another plan or target"
+    );
+    let suffix = record
+        .seed_name
+        .strip_prefix("creation-seed-")
+        .ok_or_else(|| anyhow::anyhow!("invalid creation seed name"))?;
+    parse_non_nil_uuid("creation seed", suffix)?;
+    let seed_path = operation.join(&record.seed_name);
+    let seed = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&seed_path)?;
+    let metadata = seed.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.dev() == record.device && metadata.ino() == record.inode,
+        "creation seed was replaced"
+    );
+    if metadata.len() != 0 {
+        anyhow::ensure!(
+            nestweaver_store::stable_anchor::descriptor_matches_path(&seed, &target),
+            "staged target was replaced; refusing resume"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+        anyhow::ensure!(
+            store.publication_identity()? == Some(identity),
+            "staged publication identity mismatch"
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(&slot)?;
+    match std::fs::hard_link(&seed_path, &target) {
+        Ok(()) => nestweaver_store::durable_sidecar::sync_parent_directory_durable(&target)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    anyhow::ensure!(
+        nestweaver_store::stable_anchor::descriptor_matches_path(&seed, &target),
+        "staged target was replaced; refusing creation"
+    );
+    let mut authority = nestweaver_store::acquire_db_write_lease(&target)
+        .map_err(|error| anyhow::anyhow!("acquire staged creation authority: {error:?}"))?;
+    authority
+        .bind_creation_seed(&seed)
+        .map_err(|error| anyhow::anyhow!("bind staged creation provenance: {error:?}"))?;
+    after_authority()?;
+    root_lock.ensure_authorizes(root)?;
+    let store = nestweaver_store::GraphStore::create_with_publication_identity_and_authority(
+        &target, &identity, &authority,
+    )?;
+    drop(store);
+    // Strictly reopen before the caller may advance to Graph.
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(&target)?;
+    anyhow::ensure!(
+        store.publication_identity()? == Some(identity),
+        "staged identity did not commit"
+    );
+    drop(store);
+    drop(authority);
+    drop(seed);
+    Ok(())
+}
+
+/// Drop creation-only hard links after Graph is durable. Retrying this cleanup
+/// on Graph entry prevents successful journals from retaining pruned graph
+/// storage forever, including after a crash between phase commit and cleanup.
+pub fn retire_planned_creation(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root = root_lock.ensure_authorizes(publication_root)?;
+    anyhow::ensure!(
+        state.phase != PublicationPhase::Planned,
+        "creation still needs its provenance"
+    );
+    let actual = load_operation(root, &state.plan.operation_uuid)?;
+    anyhow::ensure!(actual == *state, "publication creation journal changed");
+    let operation = crate::publication::operation_path(root, &state.plan.operation_uuid)?;
+    let provenance = operation.join("creation.json");
+    if !provenance.try_exists()? {
+        return Ok(());
+    }
+    let record: PlannedCreation = serde_json::from_slice(&std::fs::read(&provenance)?)?;
+    let target = crate::publication::slot_path(root, &state.plan.target_publication_uuid)?
+        .join(crate::publication::PUBLICATION_GRAPH_FILE);
+    anyhow::ensure!(
+        record.plan == state.plan && record.target == target,
+        "creation provenance belongs to another plan or target"
+    );
+    let suffix = record
+        .seed_name
+        .strip_prefix("creation-seed-")
+        .ok_or_else(|| anyhow::anyhow!("invalid creation seed name"))?;
+    parse_non_nil_uuid("creation seed", suffix)?;
+    let target_metadata = std::fs::symlink_metadata(&target)?;
+    anyhow::ensure!(
+        target_metadata.is_file()
+            && target_metadata.len() != 0
+            && target_metadata.dev() == record.device
+            && target_metadata.ino() == record.inode,
+        "staged target was replaced; refusing creation cleanup"
+    );
+    let seed = operation.join(record.seed_name);
+    match std::fs::symlink_metadata(&seed) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.dev() == record.device
+                    && metadata.ino() == record.inode,
+                "creation seed was replaced; refusing cleanup"
+            );
+            std::fs::remove_file(&seed)?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&seed)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::remove_file(&provenance)?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&provenance)?;
+    Ok(())
+}
+
 pub fn create_operation(
     publication_root: &Path,
     plan: PublicationOperationPlan,
@@ -285,6 +508,40 @@ fn checkpoint_operation(
     expected_revision: u64,
     update: impl FnOnce(&mut PublicationOperationState) -> anyhow::Result<()>,
 ) -> anyhow::Result<PublicationOperationState> {
+    let journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
+    checkpoint_operation_locked(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        &journal_lock,
+        update,
+    )
+}
+
+// Separate from PublicationRootLock: an operator must be able to request
+// cancellation while a worker holds the root lock for a long rebuild. This
+// stable per-journal authority serializes read/check/update/fsync/rename across
+// threads and processes, without coupling independent operations or roots.
+fn lock_operation_journal(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<nestweaver_store::stable_anchor::StableAnchor> {
+    let path = operation_state_path(publication_root, operation_uuid)?;
+    let path = nestweaver_store::canonical_db_path(&path);
+    Ok(nestweaver_store::stable_anchor::StableAnchor::acquire(
+        "publication-operation-journal",
+        &path,
+        true,
+    )?)
+}
+
+fn checkpoint_operation_locked(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    journal_lock: &nestweaver_store::stable_anchor::StableAnchor,
+    update: impl FnOnce(&mut PublicationOperationState) -> anyhow::Result<()>,
+) -> anyhow::Result<PublicationOperationState> {
     let incumbent = load_operation(publication_root, operation_uuid)?;
     if incumbent.revision != expected_revision {
         anyhow::bail!(
@@ -300,6 +557,9 @@ fn checkpoint_operation(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("publication operation revision exhausted"))?;
     next.updated_unix_millis = unix_millis().max(incumbent.updated_unix_millis);
+    if !journal_lock.is_current() {
+        anyhow::bail!("publication journal authority was replaced before checkpoint");
+    }
     persist_state(
         &operation_state_path(publication_root, operation_uuid)?,
         &next,
@@ -433,11 +693,18 @@ pub fn mark_ready(
 /// checkpoint is performed.
 pub fn activate_operation(
     publication_root: &Path,
+    root_lock: &crate::publication::PublicationRootLock,
     operation_uuid: &str,
     expected_revision: u64,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
 ) -> anyhow::Result<PublicationOperationState> {
-    let state = select_operation(publication_root, operation_uuid, expected_revision, lease)?;
+    let state = select_operation(
+        publication_root,
+        root_lock,
+        operation_uuid,
+        expected_revision,
+        lease,
+    )?;
     complete_activation(publication_root, operation_uuid, state.revision)
 }
 
@@ -473,10 +740,13 @@ impl PermanentPublicationFailure {
 /// operation is made terminal.
 pub fn select_operation(
     publication_root: &Path,
+    root_lock: &crate::publication::PublicationRootLock,
     operation_uuid: &str,
     expected_revision: u64,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
 ) -> anyhow::Result<PublicationOperationState> {
+    let publication_root = root_lock.ensure_authorizes(publication_root)?;
+    let journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     let mut state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -488,11 +758,16 @@ pub fn select_operation(
         anyhow::bail!("publication operation is failed or cancelled");
     }
     if state.phase == PublicationPhase::Ready {
-        state = advance_phase(
+        state = checkpoint_operation_locked(
             publication_root,
             operation_uuid,
             state.revision,
-            PublicationPhase::Activating,
+            &journal_lock,
+            |state| {
+                state.phase = PublicationPhase::Activating;
+                state.progress = None;
+                Ok(())
+            },
         )?;
     } else if state.phase != PublicationPhase::Activating {
         anyhow::bail!("publication activation requires ready or activating phase");
@@ -522,8 +797,12 @@ pub fn select_operation(
             state.plan.expected_current_publication_uuid.clone(),
             digest,
         )?;
+        if !journal_lock.is_current() {
+            anyhow::bail!("publication journal authority was replaced before activation");
+        }
         crate::publication::compare_and_swap_current(
             publication_root,
+            root_lock,
             lease,
             state.plan.expected_current_publication_uuid.as_deref(),
             &pointer,
@@ -684,6 +963,7 @@ pub fn discard_operation(
     lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
     let publication_root = lock.ensure_authorizes(publication_root)?;
+    let _journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     let state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -751,6 +1031,7 @@ pub fn discard_invalid_operation(
     lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
     let publication_root = lock.ensure_authorizes(publication_root)?;
+    let _journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     parse_non_nil_uuid("operation_uuid", operation_uuid)?;
     let operation_dir = crate::publication::operation_path(publication_root, operation_uuid)?;
     let tombstone = publication_root.join("operations").join(format!(
@@ -944,6 +1225,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn planned_creation_recovers_two_interruptions_without_adopting_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publications");
+        let lock = crate::publication::PublicationRootLock::acquire(&root).unwrap();
+        let state = create_operation(&root, plan()).unwrap();
+        let target = crate::publication::slot_path(&root, &state.plan.target_publication_uuid)
+            .unwrap()
+            .join(crate::publication::PUBLICATION_GRAPH_FILE);
+        for _ in 0..2 {
+            let error = ensure_planned_database_with_checkpoint(&root, &state, &lock, || {
+                anyhow::bail!("simulated interruption after authority")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("simulated interruption"));
+            assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+            assert_eq!(
+                load_operation(&root, &state.plan.operation_uuid)
+                    .unwrap()
+                    .phase,
+                PublicationPhase::Planned
+            );
+        }
+        ensure_planned_database(&root, &state, &lock).unwrap();
+        ensure_planned_database(&root, &state, &lock).unwrap();
+        let store =
+            nestweaver_store::GraphStore::open_read_only_without_migration(&target).unwrap();
+        assert_eq!(
+            store
+                .publication_identity()
+                .unwrap()
+                .unwrap()
+                .publication_uuid,
+            state.plan.target_publication_uuid
+        );
+    }
+
+    #[test]
+    fn graph_checkpoint_retires_seed_without_retaining_pruned_database_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = crate::publication::PublicationRootLock::acquire(dir.path()).unwrap();
+        let state = create_operation(dir.path(), plan()).unwrap();
+        ensure_planned_database(dir.path(), &state, &lock).unwrap();
+        let state = advance_phase(
+            dir.path(),
+            &state.plan.operation_uuid,
+            state.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        let operation =
+            crate::publication::operation_path(dir.path(), &state.plan.operation_uuid).unwrap();
+        let record: PlannedCreation =
+            serde_json::from_slice(&std::fs::read(operation.join("creation.json")).unwrap())
+                .unwrap();
+        let seed = operation.join(record.seed_name);
+        assert!(seed.exists());
+        retire_planned_creation(dir.path(), &state, &lock).unwrap();
+        retire_planned_creation(dir.path(), &state, &lock).unwrap();
+        assert!(!seed.exists());
+        assert!(!operation.join("creation.json").exists());
+        assert!(record.target.exists());
+    }
+
+    #[test]
+    fn planned_creation_rejects_empty_foreign_symlink_and_replaced_targets() {
+        for control in ["empty", "symlink", "replaced", "nonempty", "wrong-identity"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("publications");
+            let lock = crate::publication::PublicationRootLock::acquire(&root).unwrap();
+            let state = create_operation(&root, plan()).unwrap();
+            let target = crate::publication::slot_path(&root, &state.plan.target_publication_uuid)
+                .unwrap()
+                .join(crate::publication::PUBLICATION_GRAPH_FILE);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            match control {
+                "replaced" => {
+                    ensure_planned_database_with_checkpoint(&root, &state, &lock, || {
+                        anyhow::bail!("interrupt")
+                    })
+                    .unwrap_err();
+                    std::fs::rename(&target, target.with_extension("displaced")).unwrap();
+                    std::fs::write(&target, b"").unwrap();
+                }
+                "symlink" => {
+                    let foreign = dir.path().join("foreign");
+                    std::fs::write(&foreign, b"").unwrap();
+                    std::os::unix::fs::symlink(foreign, &target).unwrap();
+                }
+                "nonempty" => std::fs::write(&target, b"unrelated database bytes").unwrap(),
+                "wrong-identity" => {
+                    drop(nestweaver_store::GraphStore::open_or_create(&target).unwrap());
+                }
+                _ => std::fs::write(&target, b"").unwrap(),
+            }
+            let before = std::fs::read(&target).unwrap();
+            assert!(
+                ensure_planned_database(&root, &state, &lock).is_err(),
+                "{control}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), before, "{control} mutated");
+            assert_eq!(
+                load_operation(&root, &state.plan.operation_uuid).unwrap(),
+                state
+            );
+        }
+    }
+
     fn advance_to_validating(
         root: &Path,
         plan: &PublicationOperationPlan,
@@ -1031,6 +1420,94 @@ mod tests {
         )
         .unwrap();
         crate::hash::blake3_hex_bytes(&bytes)
+    }
+
+    #[test]
+    fn selection_refuses_unrelated_root_authority_before_changing_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publication");
+        let created = create_operation(&root, plan()).unwrap();
+        let unrelated =
+            crate::publication::PublicationRootLock::acquire(&dir.path().join("unrelated"))
+                .unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let error = select_operation(
+            &root,
+            &unrelated,
+            &created.plan.operation_uuid,
+            created.revision,
+            &lease,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert_eq!(
+            load_operation(&root, &created.plan.operation_uuid).unwrap(),
+            created
+        );
+        assert!(crate::publication::read_current(&root).unwrap().is_none());
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_serializes_concurrent_cancellation_without_losing_either_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create_operation(dir.path(), plan()).unwrap();
+        let independent = create_operation(dir.path(), plan()).unwrap();
+        let _root_lock = crate::publication::PublicationRootLock::acquire(dir.path()).unwrap();
+        let operation_uuid = created.plan.operation_uuid.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = dir.path();
+            let worker_uuid = &operation_uuid;
+            let revision = created.revision;
+            let worker = scope.spawn(move || {
+                checkpoint_operation(root, worker_uuid, revision, |state| {
+                    // Stop after reading/checking the old revision, before
+                    // rename: exactly the former lost-cancellation window.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    state.phase = PublicationPhase::Graph;
+                    Ok(())
+                })
+            });
+            entered_rx.recv().unwrap();
+            let concurrent = request_cancel(dir.path(), &operation_uuid, created.revision);
+            // The short journal lock fails busy after its bounded wait. It
+            // must never permit cancellation to commit behind the paused writer.
+            let while_paused = load_operation(dir.path(), &operation_uuid);
+            let independent_cancel = request_cancel(
+                dir.path(),
+                &independent.plan.operation_uuid,
+                independent.revision,
+            );
+            release_tx.send(()).unwrap();
+            let progressed = worker.join().unwrap().unwrap();
+            assert!(concurrent.is_err());
+            assert!(independent_cancel.unwrap().cancel_requested);
+            assert_eq!(while_paused.unwrap(), created);
+            let cancelled =
+                request_cancel(dir.path(), &operation_uuid, progressed.revision).unwrap();
+            assert_eq!(cancelled.phase, PublicationPhase::Graph);
+            assert!(cancelled.cancel_requested);
+            assert_eq!(cancelled.revision, created.revision + 2);
+            assert!(
+                advance_phase(
+                    dir.path(),
+                    &operation_uuid,
+                    progressed.revision,
+                    PublicationPhase::TextSearch,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("stale publication-operation writer")
+            );
+            assert_eq!(
+                load_operation(dir.path(), &operation_uuid).unwrap(),
+                cancelled
+            );
+        });
     }
 
     #[test]
@@ -1229,8 +1706,14 @@ mod tests {
             Some(expected_digest.as_str())
         );
         let lease = incumbent.acquire_index_publication_lease().unwrap();
-        let activated =
-            activate_operation(dir.path(), &plan.operation_uuid, ready.revision, &lease).unwrap();
+        let activated = activate_operation(
+            dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+            &plan.operation_uuid,
+            ready.revision,
+            &lease,
+        )
+        .unwrap();
         assert_eq!(activated.phase, PublicationPhase::Activated);
         let current = crate::publication::read_current(dir.path())
             .unwrap()
@@ -1274,6 +1757,7 @@ mod tests {
         let lease = incumbent.acquire_index_publication_lease().unwrap();
         crate::publication::compare_and_swap_current(
             dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
             &lease,
             recovery_plan.expected_current_publication_uuid.as_deref(),
             &pointer,
@@ -1281,6 +1765,7 @@ mod tests {
         .unwrap();
         let recovered = activate_operation(
             dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
             &recovery_plan.operation_uuid,
             activating.revision,
             &lease,

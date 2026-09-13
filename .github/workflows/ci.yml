@@ -14,11 +14,16 @@ on:
   # branch's definition of `Required CI`. That is not a widening -- the
   # `pull_request` trigger above already runs the workflow from the PR's merge
   # ref, so any PR that edits this file already runs its own edited copy. The
-  # control for both is the same and is NOT this trigger: CODEOWNERS requires
-  # maintainer review on `.github/workflows/**`, and branch protection requires
-  # that review before merge. Dispatch additionally requires repository write
-  # access, which already permits strictly more.
+  # control for both is maintainer review of workflow edits. The single-owner
+  # repository requires PRs and exact-head CI, but does not require an impossible
+  # second-owner approval. CODEOWNERS requests review; it is not itself an
+  # enforced approval rule. Dispatch additionally requires repository write access.
   workflow_dispatch:
+    inputs:
+      performance_validation:
+        description: Run the scoped backlog benchmarks on an isolated runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,6 +58,39 @@ env:
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
+  backlog-performance:
+    name: Scoped backlog performance evidence
+    if: github.event_name == 'workflow_dispatch' && inputs.performance_validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: backlog-performance
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev protobuf-compiler mold time
+      - name: Build benchmarks before measuring
+        run: |
+          cargo bench --locked --bench remove_repo_benchmarks --no-run
+          cargo build --locked --release --example project_materialization_benchmark
+          cargo test --locked --release --workspace --lib --no-run
+      - name: Record controlled performance evidence
+        run: bash scripts/run-backlog-benchmarks.sh
+      - name: Preserve raw benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: backlog-performance-${{ github.sha }}
+          path: backlog-performance/
+          if-no-files-found: error
+
   # Detect what actually changed so we don't recompile the entire Rust
   # workspace (~50 min) for a frontend-only PR, or run the frontend/e2e
   # stack for a pure-Rust change. Branch protection requires only the stable
@@ -85,6 +123,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release-please.yml'
               - '.github/CODEOWNERS'
+              - '.github/main-ruleset.json'
               - 'CONTRIBUTING.md'
               - 'release-please-config.json'
               - 'scripts/observe-release-visibility.sh'
@@ -92,6 +131,11 @@ jobs:
               - 'scripts/verify-release-bundle.sh'
               - 'scripts/verify-release-package.sh'
               - 'scripts/verify-required-ci.sh'
+              - 'scripts/verify-main-rules.sh'
+              - 'scripts/verify-linux-archive.py'
+              - 'scripts/verify-release-fault.py'
+              - 'scripts/test-verify-release-fault.py'
+              - 'scripts/run-backlog-benchmarks.sh'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
@@ -202,7 +246,12 @@ jobs:
       # test Linux CI can never run, and one gc test that passes on Linux but
       # diverges on macOS. Both are fixed; this keeps them fixed.
       - name: Daemon integration tests (macOS portability gate)
-        run: cargo test --locked --release --features metal --test daemon_test
+        run: |
+          cargo test --locked --release --features metal --test daemon_test --no-run
+          codesign --force --sign - target/release/nestweaver
+          codesign --verify --strict --verbose=2 target/release/nestweaver
+          codesign --display --verbose=2 target/release/nestweaver
+          cargo test --locked --release --features metal --test daemon_test
       # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
       #
       # A test binary has died with `signal: 11` on ~15% of runs of this job,
@@ -655,8 +704,8 @@ jobs:
         # The `daemon_` filter is the exact complement of the main job's skip.
         run: cargo test --locked --workspace --no-fail-fast -- daemon_
       - name: MCP daemon-feature tests
-        # `cargo test --workspace` builds nestweaver-mcp without its optional
-        # `daemon` feature, so these tests never run in the main job.
+        # Check the standalone daemon-feature configuration separately from
+        # workspace feature unification (which also enables embedding support).
         run: cargo test --locked -p nestweaver-mcp --features daemon --no-fail-fast
 
   coverage:
@@ -1281,6 +1330,9 @@ jobs:
           fi
 
           bash scripts/verify-required-ci.sh --self-test
+          bash scripts/verify-main-rules.sh --ruleset .github/main-ruleset.json
+          bash scripts/verify-main-rules.sh --self-test
+          python3 scripts/test-verify-release-fault.py
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test

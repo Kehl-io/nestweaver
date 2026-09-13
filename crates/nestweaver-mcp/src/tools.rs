@@ -630,7 +630,7 @@ fn redact_response_for_visibility(
 
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
-const LITE_TOOLS: &[&str] = &[
+pub const LITE_TOOLS: &[&str] = &[
     "brain_context",
     "brain_search",
     "brain_impact",
@@ -3489,6 +3489,12 @@ fn semantic_cache_salt(name: &str, embed_model: Option<&dyn EmbedQueryFn>) -> u6
     hasher.finish()
 }
 
+fn response_is_transient(name: &str, value: &Value) -> bool {
+    semantic_response_is_degraded(name, value)
+        || (name == "detect_changes"
+            && value.get("deadline_exceeded").and_then(Value::as_bool) == Some(true))
+}
+
 fn semantic_response_is_degraded(name: &str, value: &Value) -> bool {
     matches!(name, "brain_context" | "project_context" | "brain_search")
         && value
@@ -3705,7 +3711,7 @@ fn maybe_cached(
         // Defense in depth for persisted entries produced by an older binary:
         // degraded semantic responses are transient readiness/inference states,
         // never durable answers. Ignore them even if their legacy key matches.
-        if !semantic_response_is_degraded(name, &value) {
+        if !response_is_transient(name, &value) {
             CACHE_HITS.with(|c| c.set(c.get() + 1));
             return Ok(value);
         }
@@ -3729,7 +3735,7 @@ fn maybe_cached(
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
         return Ok(result);
     }
-    if semantic_response_is_degraded(name, &result) {
+    if response_is_transient(name, &result) {
         return Ok(result);
     }
     match serde_json::to_vec(&result) {
@@ -8108,6 +8114,28 @@ fn counts_disclosure(
     (unavailable, counts_complete)
 }
 
+/// Render each status repository using its own stored root. URLs are not
+/// unique across instances, so callers must not reassociate rows by URL alone.
+pub fn brain_status_repo_inventory(
+    repos: &[nestweaver_schema::Repo],
+    config: Option<&nestweaver_engine::InstanceConfig>,
+) -> Vec<Value> {
+    repos
+        .iter()
+        .map(|repo| {
+            use nestweaver_engine::content_reader::{ContentReader, FilesystemReader};
+            let root = repo.local_root().map(Path::new);
+            let excludes = config
+                .map(|config| config.exclude_globs_for(&repo.url, root))
+                .unwrap_or(&[]);
+            let inventory = root
+                .and_then(|root| FilesystemReader::new(root).excluding(excludes).ok())
+                .map(|reader| reader.exclusion_inventory());
+            json!({ "url": repo.url, "sha": repo.indexed_sha, "exclusion_inventory": inventory })
+        })
+        .collect()
+}
+
 /// The ONE `brain_status` document builder, shared by every serving path:
 /// the daemon's gRPC surface (which overwrites the daemon-runtime fields with
 /// live values), the in-process MCP server, and the CLI's direct
@@ -8224,10 +8252,8 @@ pub fn brain_status_json(
     // (`--no-daemon`) path forwards the SAME array instead of re-deriving a
     // subset locally.
     let warnings = brain_status_warnings_for(store, store.db_path(), publication_status.as_ref());
-    let repos_json: Vec<Value> = repos
-        .iter()
-        .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
-        .collect();
+    let eligibility_config = current_instance_config();
+    let repos_json = brain_status_repo_inventory(&repos, eligibility_config.as_deref());
 
     // Every instance id present in this database, sorted for a stable
     // document. Previously a direct-path-only key; the daemon path gains it
@@ -8385,6 +8411,9 @@ pub fn brain_status_json(
         // values, and the CLI's direct fallback re-nulls the two tantivy
         // fields (a process without the daemon's index open cannot claim
         // `false`/`0` honestly) and marks the document degraded.
+        "runtime_telemetry": "unavailable",
+        "watcher": Value::Null,
+        "supervision": "unknown/unverifiable",
         "embedding_status": Value::Null,
         "search_status": Value::Null,
         "indexing_active": Value::Null,
@@ -8797,6 +8826,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "coverage_status": if result.skipped_files.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped_files.len(),
                 "skipped_files": result.skipped_files,
+                "exclusion_inventory": result.exclusion_inventory,
             }));
         }
 
@@ -9581,13 +9611,13 @@ fn tool_brain_impact(
         match store.lookup_symbol(symbol) {
             Ok(sym) if uid_is_visible(&sym.uid) => sym.uid,
             Ok(_) | Err(nestweaver_store::StoreError::NotFound) => {
-                return Ok(json!({
+                return Ok(nestweaver_schema::responses::impact(json!({
                     "status": "not_found",
                     "symbol": symbol,
                     "impact_nodes": [],
                     "total": 0,
                     "returned": 0,
-                }));
+                })));
             }
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
@@ -9598,13 +9628,13 @@ fn tool_brain_impact(
         matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
         match matches.len() {
             0 => {
-                return Ok(json!({
+                return Ok(nestweaver_schema::responses::impact(json!({
                     "status": "not_found",
                     "symbol": symbol,
                     "impact_nodes": [],
                     "total": 0,
                     "returned": 0,
-                }));
+                })));
             }
             1 => matches.into_iter().next().unwrap().uid,
             _ => {
@@ -9619,11 +9649,11 @@ fn tool_brain_impact(
                         })
                     })
                     .collect();
-                return Ok(json!({
-                    "status": "ambiguous",
-                    "symbol": symbol,
-                    "candidates": candidates,
-                }));
+                return Ok(nestweaver_schema::responses::impact_ambiguous(
+                    symbol,
+                    None,
+                    json!(candidates),
+                ));
             }
         }
     };
@@ -9674,8 +9704,9 @@ fn tool_brain_impact(
         })
         .collect();
 
-    Ok(json!({
+    Ok(nestweaver_schema::responses::impact(json!({
         "status": "ok",
+        "symbol": symbol,
         "target": uid,
         "impact_nodes": rows,
         "total": total,
@@ -9696,7 +9727,7 @@ fn tool_brain_impact(
         // order, so blaming exactly one would discard two live remedies.
         "truncated_by_limit": rows.len() < total,
         "note": note,
-    }))
+    })))
 }
 
 // ── 9. brain_guide ──────────────────────────────────────────────────────────
@@ -10482,6 +10513,12 @@ fn tool_detect_changes_scoped(
             "affected_processes": [],
             "affected_process_count": 0,
             "process_analysis_unavailable": true,
+            "work_budget_exceeded": false,
+            "deadline_exceeded": false,
+            "traversal_steps": 0,
+            "phase_millis": {},
+            "affected_symbol_count_relation": "eq",
+            "affected_process_count_relation": "gte",
             "limit": limit,
             "truncated": symbols_omitted > 0,
             "symbols_omitted": symbols_omitted,
@@ -10502,8 +10539,16 @@ fn tool_detect_changes_scoped(
     // importance the way blast_radius does. Sorting by (file_path, name) buys
     // determinism and nothing more — which is why the schema says the cut is
     // positional rather than implying the first N matter most.
+    let sorting_started = std::time::Instant::now();
     let mut ranked_symbols: Vec<_> = impact.affected_symbols.iter().collect();
     ranked_symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+    tracing::debug!(
+        tool = "detect_changes",
+        phase = "symbol_sorting",
+        elapsed_us = sorting_started.elapsed().as_micros() as u64,
+        symbols = ranked_symbols.len(),
+        "response symbol sorting completed"
+    );
 
     let affected_symbols: Vec<Value> = ranked_symbols
         .iter()
@@ -10562,8 +10607,14 @@ fn tool_detect_changes_scoped(
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
         "process_analysis_unavailable": false,
+        "work_budget_exceeded": impact.work_budget_exceeded,
+        "deadline_exceeded": impact.deadline_exceeded,
+        "affected_symbol_count_relation": if impact.deadline_exceeded { "gte" } else { "eq" },
+        "traversal_steps": impact.traversal_steps,
+        "phase_millis": impact.phase_millis,
+        "affected_process_count_relation": if impact.work_budget_exceeded || impact.deadline_exceeded { "gte" } else { "eq" },
         "limit": limit,
-        "truncated": symbols_omitted > 0 || processes_omitted > 0,
+        "truncated": symbols_omitted > 0 || processes_omitted > 0 || impact.work_budget_exceeded || impact.deadline_exceeded,
         "symbols_omitted": symbols_omitted,
         "processes_omitted": processes_omitted,
     }))
@@ -11718,6 +11769,55 @@ fn project_member_uid(uid: &str, members: &std::collections::HashSet<String>) ->
         .is_some_and(|(note, _)| members.contains(note))
 }
 
+/// Fit and measure the final compact JSON contract, including its own budget
+/// fields. Retain at most one row when the minimum useful answer cannot fit.
+fn finalize_project_budget(response: &mut Value) -> Result<(), anyhow::Error> {
+    let budget = response["token_budget"].as_u64().unwrap_or(0) as usize;
+    let available = response["connected"].as_array().map_or(0, Vec::len)
+        + response["more_available"].as_u64().unwrap_or(0) as usize;
+    // Each pass either removes a row or adds irreducible-overhead metadata.
+    // Allow one final measurement after the last row/metadata change, and fail
+    // explicitly rather than depending on serialized-size convergence forever.
+    let max_passes = response["connected"].as_array().map_or(0, Vec::len).max(1) + 1;
+    for _ in 0..max_passes {
+        for _ in 0..4 {
+            let tokens = serde_json::to_vec(response)?.len().div_ceil(4);
+            response["tokens_used"] = json!(tokens);
+            response["budget_exceeded"] = json!(tokens > budget);
+        }
+        let actual = serde_json::to_vec(response)?.len().div_ceil(4);
+        let count = response["connected"].as_array().map_or(0, Vec::len);
+        let stable = response["tokens_used"] == json!(actual)
+            && response["budget_exceeded"] == json!(actual > budget);
+        if stable && (actual <= budget || count <= 1) {
+            return Ok(());
+        }
+        if count > 1 {
+            response["connected"].as_array_mut().unwrap().pop();
+            response["more_available"] = json!(available - (count - 1));
+            response["truncated"] = json!(true);
+            response["truncated_by"] = json!("token_budget");
+        } else {
+            // At the exact boundary, `false` is one byte longer than `true`,
+            // so the budget flag itself can oscillate by one token. Explain
+            // the irreducible overhead; the final, larger overrun is stable.
+            // Grow an existing note too: replacing it with identical text could
+            // leave a re-finalized response at the same oscillating boundary.
+            let note = response["budget_note"].as_str().map_or_else(
+                || {
+                    "Response metadata and minimum context exceed the requested token budget."
+                        .to_owned()
+                },
+                |note| format!("{note} Final serialized metadata is included in this accounting."),
+            );
+            response["budget_note"] = json!(note);
+        }
+    }
+    Err(anyhow!(
+        "project response budget accounting did not converge within its bounded passes"
+    ))
+}
+
 fn tool_project_context(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -11877,13 +11977,21 @@ fn tool_project_context(
     member_uids.retain(|u| seen.insert(u.clone()));
 
     if member_uids.is_empty() {
-        return Ok(json!({
+        let mut response = json!({
             "project": project.name,
             "project_uid": project.uid,
             "seeds_expanded": 0,
             "connected": [],
             "tokens_used": 0,
             "token_budget": token_budget,
+            "more_available": 0,
+            "truncated": false,
+            "truncated_by": Value::Null,
+            "seed_tokens_charged": 0,
+            "budget_exceeded": false,
+            "semantic_applied": false,
+            "semantic_unavailable": Value::Null,
+            "degraded_components": [],
             "note": "No notes or symbols are associated with this project yet.",
             // Disclosed here too: an empty answer is still AN answer, and two
             // routes disagreeing about whether a project has members is
@@ -11892,7 +12000,17 @@ fn tool_project_context(
                 "answered_by": answering_config_disclosure(),
                 "answer_shaping": answer_shaping_disclosure(store, embed_model),
             },
-        }));
+        });
+        if args
+            .get("include_seeds")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            response["seeds"] = json!([]);
+        }
+        response = provenance_seam::stamp(Unstamped::new(response));
+        finalize_project_budget(&mut response)?;
+        return Ok(response);
     }
 
     // 4. Seed PPR from the project node, its components, and — critically —
@@ -12178,12 +12296,6 @@ fn tool_project_context(
     // budget FIRST, so a budget smaller than the seed overhead leaves zero for
     // connected and drops every one of them silently — reproduced as
     // token_budget 200 / tokens_used 257 / connected [] / seeds_expanded 114.
-    // Provisional: `budgeted_cut` decided this, but the probe loop below can
-    // drop more. The authoritative count is recomputed after it.
-    let provisional_dropped = result.connected.len().saturating_sub(cut);
-    // Overwritten by the probe block with the ACTUAL serialized size.
-    #[allow(unused_assignments)]
-    let mut final_payload_tokens = used_tokens;
 
     // 7. Load external_refs from extension sidecar.
     let ext_store = load_extensions(&db_path);
@@ -12239,8 +12351,7 @@ fn tool_project_context(
         row
     };
 
-    let mut connected_json: Vec<Value> =
-        result.connected.iter().take(cut).map(render_node).collect();
+    let connected_json: Vec<Value> = result.connected.iter().take(cut).map(render_node).collect();
 
     let include_seeds = args
         .get("include_seeds")
@@ -12253,56 +12364,7 @@ fn tool_project_context(
         None
     };
 
-    // Final budget enforcement: measure actual serialized size including
-    // response wrapper metadata (project, project_uid, seeds_expanded,
-    // token_budget, tokens_used, external_refs) which the per-node
-    // render_cost does not account for.
-    {
-        let mut probe = json!({
-            "project": project.name,
-            "project_uid": project.uid,
-            "seeds_expanded": result.seeds.len(),
-            "connected": connected_json,
-            "tokens_used": used_tokens,
-            "token_budget": token_budget,
-            "more_available": provisional_dropped,
-            "truncated": provisional_dropped > 0,
-            "budget_exceeded": used_tokens > token_budget,
-            "semantic_applied": result.semantic_applied,
-        "semantic_unavailable": result.semantic_unavailable,
-            "degraded_components": &result.degraded_components,
-        });
-        if let Some(ref sj) = seeds_json {
-            probe["seeds"] = json!(sj);
-        }
-        if !result.unresolved_seeds.is_empty() {
-            probe["unresolved_seeds"] = json!(result.unresolved_seeds);
-        }
-        if !external_refs.is_null() {
-            probe["external_refs"] = external_refs.clone();
-        }
-        let serialized = serde_json::to_string(&probe)?;
-        let mut actual_tokens = serialized.len().div_ceil(4);
-        if actual_tokens > token_budget {
-            while connected_json.len() > 1 {
-                connected_json.pop();
-                probe["connected"] = json!(connected_json);
-                let check = serde_json::to_string(&probe)?;
-                actual_tokens = check.len().div_ceil(4);
-                if actual_tokens <= token_budget {
-                    break;
-                }
-            }
-        }
-        final_payload_tokens = actual_tokens;
-    }
-
-    // RECOMPUTED after the probe loop, not before it. The loop above pops
-    // further entries off `connected_json` to fit the SERIALIZED payload under
-    // the budget, so a count taken from `budgeted_cut` alone understates what
-    // the caller actually lost — the response would have reported a smaller
-    // `more_available` than the number of items genuinely missing, which is the
-    // same class of dishonesty this item exists to remove.
+    // This initial cut can shrink further once the complete wrapper is sized.
     let connected_dropped = result.connected.len().saturating_sub(connected_json.len());
 
     // nw-188: `more_available` and `truncated` name what was dropped;
@@ -12318,6 +12380,7 @@ fn tool_project_context(
         "token_budget": token_budget,
         "more_available": connected_dropped,
         "truncated": connected_dropped > 0,
+        "truncated_by": if connected_dropped > 0 { Some("token_budget") } else { None },
         // The ACTUAL serialized size, not the pre-serialization estimate.
         //
         // The estimate charges `seed_tokens` against the budget even when
@@ -12326,9 +12389,9 @@ fn tool_project_context(
         // for a response that serialized to a fraction of that. Reporting the
         // estimate as "used" was itself the dishonesty; `seed_tokens_charged`
         // below explains where the budget actually went.
-        "tokens_used": final_payload_tokens,
+        "tokens_used": used_tokens,
         "seed_tokens_charged": seed_tokens,
-        "budget_exceeded": final_payload_tokens > token_budget,
+        "budget_exceeded": used_tokens > token_budget,
         "semantic_applied": result.semantic_applied,
         "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": &result.degraded_components,
@@ -12353,6 +12416,10 @@ fn tool_project_context(
     // it is byte-identical across routes that answer differently. Carry the
     // answer-shaping state that actually explains a divergence alongside it.
     resp["_meta"]["answer_shaping"] = answer_shaping_disclosure(store, embed_model);
+
+    resp = provenance_seam::stamp(Unstamped::new(resp));
+
+    finalize_project_budget(&mut resp)?;
 
     Ok(resp)
 }
@@ -14926,6 +14993,7 @@ fn dispatch_add_source_via_daemon(
                 "path": path,
                 "type": "vault",
                 "message": last_msg,
+                "exclusion_inventory": terminal.as_ref().and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
                 "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
                 "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
                 "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
@@ -14971,6 +15039,7 @@ fn dispatch_add_source_via_daemon(
                 "path": path,
                 "type": "repo",
                 "message": last_msg,
+                "exclusion_inventory": terminal.as_ref().and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
                 "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
                 "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
                 "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
@@ -15981,6 +16050,47 @@ mod project_context_bug12_tests {
     /// be confirmed OR eliminated as the cause — the item's own recommendation
     /// is that this disclosure comes first, because it is the diagnostic.
     #[test]
+    fn project_budget_boundary_counts_final_metadata_without_boolean_oscillation() {
+        let mut saw_boundary_note = false;
+        for width in 0..40 {
+            for budget in 20..100 {
+                let mut response = json!({"connected":[{"title":"x".repeat(width)}],
+                    "tokens_used":0,"token_budget":budget,"budget_exceeded":false});
+                finalize_project_budget(&mut response).unwrap();
+                let actual = serde_json::to_vec(&response).unwrap().len().div_ceil(4);
+                assert_eq!(response["tokens_used"], actual);
+                assert_eq!(response["budget_exceeded"], actual > budget);
+                saw_boundary_note |= response.get("budget_note").is_some();
+            }
+        }
+        assert!(
+            saw_boundary_note,
+            "fixture must exercise the one-byte boolean boundary"
+        );
+    }
+
+    #[test]
+    fn project_budget_existing_note_boundary_terminates_with_exact_accounting() {
+        // With the old loop, true measures 44 tokens and false measures 45:
+        // replacing the existing note with itself never breaks the cycle.
+        let mut response = json!({
+            "connected": [{"title": "x"}],
+            "tokens_used": 0,
+            "token_budget": 44,
+            "budget_exceeded": false,
+            "budget_note": "Response metadata and minimum context exceed the requested token budget.",
+        });
+        finalize_project_budget(&mut response).unwrap();
+        let actual = serde_json::to_vec(&response).unwrap().len().div_ceil(4);
+        assert_eq!(response["tokens_used"], actual);
+        assert_eq!(response["budget_exceeded"], actual > 44);
+        assert_eq!(response["connected"].as_array().unwrap().len(), 1);
+        let finalized = response.clone();
+        finalize_project_budget(&mut response).unwrap();
+        assert_eq!(response, finalized, "stable accounting must be idempotent");
+    }
+
+    #[test]
     fn project_context_discloses_which_instance_config_answered() {
         let store = GraphStore::in_memory().unwrap();
         store
@@ -16065,6 +16175,57 @@ mod project_context_bug12_tests {
         set_current_instance_config(Some(std::sync::Arc::new(cfg2)));
         let populated = ask();
         set_current_instance_config(None);
+        for key in [
+            "project",
+            "project_uid",
+            "seeds_expanded",
+            "connected",
+            "tokens_used",
+            "token_budget",
+            "more_available",
+            "truncated",
+            "truncated_by",
+            "seed_tokens_charged",
+            "budget_exceeded",
+            "semantic_applied",
+            "semantic_unavailable",
+            "degraded_components",
+            "_meta",
+        ] {
+            assert!(named.get(key).is_some(), "empty project omitted {key}");
+            assert!(
+                populated.get(key).is_some(),
+                "populated project omitted {key}"
+            );
+            // Nullable diagnostics legitimately change when populated data
+            // requires semantic ranking or exceeds a result budget.
+            if matches!(key, "semantic_unavailable" | "truncated_by") {
+                continue;
+            }
+            assert_eq!(
+                std::mem::discriminant(&named[key]),
+                std::mem::discriminant(&populated[key]),
+                "type mismatch for {key}"
+            );
+        }
+        assert_eq!(named["semantic_applied"], false);
+        assert!(named["semantic_unavailable"].is_null());
+        assert_eq!(named["degraded_components"], json!([]));
+        assert_eq!(populated["semantic_applied"], false);
+        assert_eq!(
+            populated["semantic_unavailable"]["reason"],
+            "model_unavailable"
+        );
+        assert_eq!(populated["degraded_components"], json!(["semantic"]));
+        for response in [&named, &populated] {
+            assert!(response["truncated_by"].is_null() || response["truncated_by"].is_string());
+            let actual = serde_json::to_vec(response).unwrap().len().div_ceil(4);
+            assert_eq!(response["tokens_used"], actual);
+            assert_eq!(
+                response["budget_exceeded"],
+                actual > response["token_budget"].as_u64().unwrap() as usize
+            );
+        }
         assert!(
             populated["connected"]
                 .as_array()
@@ -20545,6 +20706,11 @@ mod blast_radius_visibility_tests {
             has_descriptor(&restricted),
             "the restricted route must carry the same descriptor: {restricted}"
         );
+        assert_eq!(restricted["deadline_exceeded"], false);
+        assert_eq!(restricted["work_budget_exceeded"], false);
+        assert_eq!(restricted["affected_process_count_relation"], "gte");
+        assert_eq!(restricted["affected_symbol_count_relation"], "eq");
+        assert!(restricted["phase_millis"].is_object());
     }
 
     #[test]
@@ -24398,5 +24564,21 @@ mod hardening_aggregate_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_cache_tests {
+    use super::*;
+    #[test]
+    fn deadline_limited_impact_is_never_a_durable_cache_answer() {
+        assert!(response_is_transient(
+            "detect_changes",
+            &json!({"deadline_exceeded":true,"status":"partial"})
+        ));
+        assert!(!response_is_transient(
+            "detect_changes",
+            &json!({"deadline_exceeded":false,"status":"complete"})
+        ));
     }
 }

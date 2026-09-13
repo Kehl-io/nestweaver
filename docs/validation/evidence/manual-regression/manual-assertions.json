@@ -1,0 +1,12 @@
+{
+  "index-full": "one tracked configured exclusion; excluded path is not a parse/coverage failure",
+  "index-incremental": "one tracked configured exclusion; excluded path is not a parse/coverage failure",
+  "index-unchanged": "one tracked configured exclusion; excluded path is not a parse/coverage failure",
+  "index-forced-again": "one tracked configured exclusion; excluded path is not a parse/coverage failure",
+  "search-excluded": "empty results",
+  "search-excluded-updated": "empty results",
+  "source-edit": "initial and renamed visible API found",
+  "impact-shape": "canonical aliases, counts, provenance; direct/daemon exact parity",
+  "daemon-status": "ad-hoc and configured exclusion inventory",
+  "shutdown": "not_running after normal drain"
+}

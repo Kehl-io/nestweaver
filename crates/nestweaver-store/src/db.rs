@@ -8,6 +8,19 @@ use crate::error::StoreError;
 use crate::ranking::QueryIntent;
 use crate::write_lease::{DbWriteLease, WriteLeaseError, acquire_db_write_lease};
 
+thread_local! {
+    /// Applies only inside a synchronous read operation. Never propagated to
+    /// unrelated requests or pooled threads after the scope returns/unwinds.
+    static READ_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+struct ReadDeadlineRestore(Option<std::time::Instant>);
+impl Drop for ReadDeadlineRestore {
+    fn drop(&mut self) {
+        READ_DEADLINE.set(self.0);
+    }
+}
+
 /// Dead fraction at which the embedding base is worth rewriting. 20% matches
 /// the threshold shape used by segment-merge reclaim in Lucene and by Milvus's
 /// automatic compaction.
@@ -3132,8 +3145,45 @@ impl GraphStore {
     }
 
     /// Return a new connection to the underlying database.
+    /// Bound a synchronous read operation's database queries by one shared
+    /// deadline. Nested calls may shorten, but cannot extend, an outer budget.
+    /// Callers must not perform writes inside this scope: an interrupted write
+    /// has different transaction/recovery requirements from a partial read.
+    pub fn with_read_deadline<T>(
+        &self,
+        deadline: std::time::Instant,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let previous = READ_DEADLINE.get();
+        let _restore = ReadDeadlineRestore(previous);
+        READ_DEADLINE.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
+        operation()
+    }
+
+    /// Cooperatively stop Rust-side decoding or graph work inside a scoped read.
+    /// With no active scope this leaves ordinary reads unchanged.
+    pub fn check_read_deadline() -> Result<(), StoreError> {
+        if READ_DEADLINE
+            .get()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
+        }
+        Ok(())
+    }
+
     pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
-        Ok(lbug::Connection::new(&self.db)?)
+        let conn = lbug::Connection::new(&self.db)?;
+        if let Some(deadline) = READ_DEADLINE.get() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
+            }
+            // Zero disables Ladybug's timer, so round a sub-millisecond budget
+            // up to one millisecond instead of accidentally removing it.
+            conn.set_query_timeout((remaining.as_millis() as u64).max(1));
+        }
+        Ok(conn)
     }
 
     fn publication_meta_value_on(
@@ -4168,6 +4218,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scoped_read_deadline_bounds_rust_row_collection_and_restores() {
+        let store = GraphStore::in_memory().unwrap();
+        let collect = || {
+            crate::read::collect_tolerating_corrupt(
+                [Ok(1), Ok(2), Ok(3)].into_iter(),
+                "deadline-fixture",
+            )
+        };
+        let normal = collect().unwrap().0;
+        let enough = store.with_read_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            collect,
+        );
+        assert_eq!(enough.unwrap().0, normal);
+        let expired = store.with_read_deadline(std::time::Instant::now(), collect);
+        assert!(matches!(
+            expired,
+            Err(StoreError::Cancelled(crate::CancelReason::Timeout))
+        ));
+        assert_eq!(collect().unwrap().0, normal);
+    }
+
+    #[test]
+    fn native_read_timeout_interrupts_work_and_releases_its_connection() {
+        let store = GraphStore::in_memory().unwrap();
+        {
+            let conn = store.conn().unwrap();
+            conn.query("CREATE NODE TABLE DeadlineProbe(id INT64, PRIMARY KEY(id))")
+                .unwrap();
+            conn.query("UNWIND range(1, 500) AS n CREATE (:DeadlineProbe {id: n})")
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let outcome = store.with_read_deadline(started + std::time::Duration::from_millis(250), || {
+            // A positive timeout must reach the native connection. An already
+            // expired scope is tested separately and cannot satisfy this test.
+            let conn = store.conn().unwrap();
+            conn.query("MATCH (a:DeadlineProbe), (b:DeadlineProbe), (c:DeadlineProbe), (d:DeadlineProbe) RETURN sum((a.id * b.id + c.id * d.id) % 7)")
+                .map(|_| ()).map_err(|error| error.to_string())
+        });
+        let error = outcome.expect_err("cross-product read must exhaust the native query timer");
+        assert!(
+            error.to_lowercase().contains("interrupt") || error.to_lowercase().contains("timeout"),
+            "wrong failure: {error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert!(
+            store
+                .conn()
+                .unwrap()
+                .query("MATCH (n:DeadlineProbe) RETURN count(n)")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn scoped_read_deadlines_refuse_expired_restore_and_cannot_be_extended() {
+        let store = GraphStore::in_memory().unwrap();
+        let expired = std::time::Instant::now();
+        store.with_read_deadline(expired, || {
+            std::thread::scope(|scope| {
+                assert_eq!(
+                    scope
+                        .spawn(|| store.count_symbols().unwrap())
+                        .join()
+                        .unwrap(),
+                    0
+                );
+            });
+            assert!(matches!(
+                store.count_symbols(),
+                Err(StoreError::Cancelled(_))
+            ));
+            store.with_read_deadline(expired + std::time::Duration::from_secs(30), || {
+                assert!(matches!(
+                    store.count_symbols(),
+                    Err(StoreError::Cancelled(_))
+                ));
+            });
+            assert!(matches!(
+                store.count_symbols(),
+                Err(StoreError::Cancelled(_))
+            ));
+        });
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_read_deadline(expired, || panic!("test unwind"));
+        }));
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        store.with_read_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || {
+                store.with_read_deadline(std::time::Instant::now(), || {
+                    assert!(matches!(
+                        store.count_symbols(),
+                        Err(StoreError::Cancelled(_))
+                    ));
+                });
+                assert_eq!(store.count_symbols().unwrap(), 0);
+            },
+        );
+    }
+
+    #[test]
     fn constructors_fix_the_store_access_capability() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mode.lbug");
@@ -4286,6 +4441,21 @@ mod tests {
         );
         drop(store);
         drop(fresh);
+
+        let replaced_path = dir.path().join("replaced-empty.lbug");
+        let replaced = acquire_db_write_lease(&replaced_path).unwrap();
+        std::fs::rename(&replaced_path, dir.path().join("original-empty.lbug")).unwrap();
+        std::fs::write(&replaced_path, b"").unwrap();
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &replaced_path,
+            &identity,
+            &replaced,
+        )
+        .err()
+        .expect("a replacement zero-byte inode must not inherit freshness");
+        assert!(error.to_string().contains("pre-existing database"));
+        assert_eq!(std::fs::metadata(&replaced_path).unwrap().len(), 0);
+        drop(replaced);
 
         let existing_path = dir.path().join("existing-empty.lbug");
         std::fs::write(&existing_path, b"").unwrap();

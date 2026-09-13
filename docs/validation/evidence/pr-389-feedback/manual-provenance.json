@@ -1,0 +1,42 @@
+{
+  "reviewed_baseline": "d7bc6583b7da8ccbfbfe6a86851f3df814f363ac",
+  "candidate_binary_sha256": "64ed06221180597392d14f215102f31648016ab01399f882a35947c276208f4b",
+  "source_file_sha256": {
+    ".github/workflows/ci.yml": "39f82a1a36b281c50b0834d5fbb2654855901c8f9add140bdb71e0c6db97a30f",
+    "crates/nestweaver-daemon/src/server.rs": "e239b6f8c0be7741547c9a8647d0b264946146b67ffeb4830c00e2c91f6810a4",
+    "crates/nestweaver-engine/src/content_reader.rs": "d839666d1a4e8b9b006a89101b988bda417296c52c4f65fb6773f953b5b75d7a",
+    "crates/nestweaver-engine/src/index.rs": "ae3390fc1d0db96d95a0ae8bb74fcde1074661fd8939db4d9487f5d66cce2c15",
+    "crates/nestweaver-engine/src/process.rs": "9672f149bd3ad0ddf0afbb72eaf7528087ffe612ab3f698867f495bd0ed29c66",
+    "crates/nestweaver-engine/src/publication.rs": "06d4c7c4d986f99c37d592aef722674c8ae16119fd9785acc8d041d18f5d65dc",
+    "crates/nestweaver-engine/src/publication_operation.rs": "f5ccfeb8ecbc622485a934581e5306367c9aad13977280515320e0efe182f841",
+    "crates/nestweaver-engine/src/watch_code.rs": "a4a850a6485c6765f203976e3ab9cbc4e431849f1af152fa4d2f89517e5b841e",
+    "crates/nestweaver-mcp/src/tools.rs": "3da6ff1b19e8120aecc822793f9d60351995c606c5bf5cb7c55c3edd967384dc",
+    "crates/nestweaver-schema/src/responses.rs": "118427094daf17ec66a481fda90a9c60dad9a29ac34c2dba913824634a3e600d",
+    "crates/nestweaver-store/src/read.rs": "6ae6cf7c57ff6913e2a67a134a19d784393878ec8c70baecfdc548d40098da59",
+    "crates/nestweaver-store/src/stable_anchor.rs": "e894e8993d5a1fd8ebb70d9807ac86894f588bb5040c6b87b87ebe09c36c2064",
+    "crates/nestweaver-store/src/write.rs": "f27b7b915b157e28a975db2e010e4014c42306a6139962577f95bbafbcaee302",
+    "crates/nestweaver-store/src/write_lease.rs": "10d3441528cfdd889e9babcf8356092c6e0a525459982788aa06eaabefe6c9b4",
+    "scripts/verify-main-rules.sh": "3d372b5d843a245ea6e41e5fd8cff81d94d7c93c525e214111cd9b520d097219",
+    "src/main.rs": "6724ec87683bf995a97224c273a6ad642636b9bbbf4834dc9ba0fb45e4a9fb7f",
+    "src/setup_probe.rs": "f5fb59558b5125083a67b635b85124f1cec77bc29d1055da272bef7020b34064",
+    "tests/daemon_test.rs": "ad54de42dae4e7c57eb8df66abffdedabad2255c2baa10bc6fb4ecaf9d1994d8"
+  },
+  "setup": {
+    "baseline_binary_sha256": "1056e20324823ec54c420a9708bc0458b6bdf51c8f65683d092d745fd2a543ce",
+    "baseline_repository_wrapper_executed": true,
+    "candidate_repository_wrapper_executed": false,
+    "candidate_absolute_current_binary_handshake": "initialize + tools/list passed, 6 lite tools",
+    "candidate_path_current_binary_handshake": "initialize + tools/list passed, 6 lite tools",
+    "host_activation": "unverified"
+  },
+  "ambiguous_impact": {
+    "complete_envelopes_equal": true,
+    "direct_exit": 3,
+    "daemon_exit": 3,
+    "candidates": 2,
+    "direct_stdout_sha256": "4ec47f76257d991e3664f2fcf427b766f702b409f52ede9c0da120cdaa126047",
+    "daemon_stdout_sha256": "4ec47f76257d991e3664f2fcf427b766f702b409f52ede9c0da120cdaa126047",
+    "retained_response": "impact-ambiguous.json"
+  },
+  "source_commit": "2edadc77d7c5983fd6b34a0a0076e6c0bfbd3228"
+}

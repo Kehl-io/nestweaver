@@ -23,7 +23,9 @@ use nestweaver_store::{GraphScope, GraphStore};
 use notify::{Event, RecursiveMode, Watcher};
 
 use crate::content_reader::ContentReader;
-use crate::index::{is_minified_or_bundled, path_in_skip_dir};
+use crate::index::is_minified_or_bundled;
+#[cfg(test)]
+use crate::index::path_in_skip_dir;
 use crate::watcher::{
     RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
     WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
@@ -40,6 +42,7 @@ pub struct CodeWatcher {
     mutation_lease_factory: Option<WatchMutationLeaseFactory>,
     debounce: Duration,
     limits: crate::index_limits::IndexLimits,
+    instance_config: Option<Arc<crate::InstanceConfig>>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -102,6 +105,7 @@ impl CodeWatcher {
             mutation_lease_factory: None,
             debounce: Duration::from_secs(2),
             limits: crate::index_limits::IndexLimits::default(),
+            instance_config: None,
             #[cfg(test)]
             ready_signal: None,
         }
@@ -110,6 +114,25 @@ impl CodeWatcher {
     pub fn with_limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_instance_config(mut self, config: Option<Arc<crate::InstanceConfig>>) -> Self {
+        self.instance_config = config;
+        self
+    }
+
+    fn reader_for(
+        &self,
+        repo_url: &str,
+    ) -> anyhow::Result<crate::content_reader::FilesystemReader> {
+        let mut reader =
+            crate::content_reader::FilesystemReader::with_limits(&self.repo_root, self.limits);
+        if let Some(config) = &self.instance_config {
+            reader = reader
+                .excluding(config.exclude_globs_for(repo_url, Some(&self.repo_root)))?
+                .unskipping(config.unskip_names_for(repo_url, Some(&self.repo_root)));
+        }
+        Ok(reader)
     }
 
     // Used only by `one_code_edit_settles_after_one_hot_batch`, which is
@@ -237,17 +260,13 @@ impl CodeWatcher {
         // contract snapshot through the exact same atomic batch seam.
         if store.lookup_repo(&r_uid)?.is_none() {
             loop {
-                let reader = crate::content_reader::FilesystemReader::with_limits(
-                    &self.repo_root,
-                    self.limits,
-                );
+                let reader = self.reader_for(&repo_url)?;
                 let initial_paths: Vec<PathBuf> = reader
                     .list_files()
                     .context("list files for initial watcher snapshot")?
                     .into_iter()
                     .map(|path| self.repo_root.join(path))
                     .filter(|path| is_watcher_input(path))
-                    .filter(|path| !path_in_skip_dir(path))
                     .collect();
                 let _mutation_lease = match self.acquire_mutation_lease("watch_code_initial") {
                     Ok(lease) => lease,
@@ -369,10 +388,18 @@ impl CodeWatcher {
             // are not parser-supported source files. A spec-only edit must
             // refresh the derived Contract nodes and IMPLEMENTS_CONTRACT
             // edges just like an ordinary incremental index.
+            let policy_reader = self.reader_for(&repo_url)?;
             let relevant: Vec<PathBuf> = unique_paths
                 .into_iter()
-                .filter(|p| !path_in_skip_dir(p))
                 .filter(|p| is_watcher_input(p))
+                .filter(|path| {
+                    path.strip_prefix(&self.repo_root).is_ok_and(|relative| {
+                        !crate::index::path_in_skip_dir_with_unskip(
+                            relative,
+                            policy_reader.unskipped_skip_dirs(),
+                        )
+                    })
+                })
                 .collect();
 
             if relevant.is_empty() {
@@ -453,8 +480,7 @@ impl CodeWatcher {
         F: FnOnce(),
     {
         let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
-        let reader =
-            crate::content_reader::FilesystemReader::with_limits(&self.repo_root, self.limits);
+        let reader = self.reader_for(repo_url)?;
         let contract_plan =
             match crate::index::prepare_watcher_contract_derivation(&reader, r_uid, repo_url) {
                 Ok(plan) => plan,
@@ -484,10 +510,17 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if is_minified_or_bundled(path) {
+            let exclusion_reason = if !reader.accepts_path(rel_path) {
+                Some("configured repository exclusion")
+            } else if is_minified_or_bundled(path) {
+                Some("minified/generated file policy")
+            } else {
+                None
+            };
+            if let Some(reason) = exclusion_reason {
                 tracing::warn!(
-                    path = %rel_path.display(),
-                    "watched source is policy-skipped as minified/generated; removing stale graph coverage"
+                    path = %rel_path.display(), reason,
+                    "watched source is policy-excluded; removing stale graph coverage"
                 );
                 removed.insert(rel_str.clone());
                 prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
@@ -1193,6 +1226,34 @@ mod tests {
                 &crate::index::FileSystemIndexEpilogueIo,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn watcher_configured_excludes_remove_stale_rows_and_never_reintroduce_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let config: crate::InstanceConfig = serde_json::from_value(serde_json::json!({
+            "instance_id":"test", "repos":[{"url":format!("file://{}",root.display()),"exclude":["src/a.js"]}],
+            "snapshot_storage":{"backend":"local","path":"/tmp"}, "workspace":{"backend":"local","path":"/tmp"},
+            "inference":{"endpoint":"","embedding_model":"","summary_model":""}, "git":{"credential_method":"ssh"}
+        })).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
+            .with_instance_config(Some(Arc::new(config)));
+        let path = root.join("src/a.js");
+        for source in [
+            "export function hidden_one() {}",
+            "export function hidden_two() {}",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let outcome =
+                process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&path));
+            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
+            assert!(!store.symbols_in_file("src/b.js").unwrap().is_empty());
+        }
+        std::fs::remove_file(&path).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&path));
+        assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
     }
 
     #[test]

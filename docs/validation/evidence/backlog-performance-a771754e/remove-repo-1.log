@@ -1,0 +1,53 @@
+Benchmarking remove_repo/hub_degree=1000
+Benchmarking remove_repo/hub_degree=1000: Warming up for 3.0000 s
+Benchmarking remove_repo/hub_degree=1000: Collecting 10 samples in estimated 6.7678 s (30 iterations)
+Benchmarking remove_repo/hub_degree=1000: Analyzing
+remove_repo/hub_degree=1000
+                        time:   [121.30 ms 122.19 ms 123.59 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking remove_repo/hub_degree=8700
+Benchmarking remove_repo/hub_degree=8700: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 10.4s.
+Benchmarking remove_repo/hub_degree=8700: Collecting 10 samples in estimated 10.415 s (10 iterations)
+Benchmarking remove_repo/hub_degree=8700: Analyzing
+remove_repo/hub_degree=8700
+                        time:   [776.77 ms 778.29 ms 780.40 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+remove_repo/hub_degree=86800 (manual, 1 run): 10.912034457s
+
+
+── remove-repo hub-degree report ──────────────────────────────
+hub_degree=1000: mean 83.719248ms over 45 run(s)
+hub_degree=8700: mean 737.974507ms over 13 run(s)
+hub_degree=86800: mean 10.912034457s over 1 run(s)
+ratio time(8700)/time(1000) = 8.8× (degree ratio 8.7×)
+interpretation: ≈8.7× is linear; ≈76× is quadratic-in-degree
+ratio time(86800)/time(8700) = 14.8× (degree ratio 10.0×)
+interpretation: ≈10.0× is linear; ≈100× is quadratic-in-degree
+	Command being timed: "env BENCH_HUB_DEGREES=1000,8700,86800 target/release/deps/remove_repo_benchmarks-64e0bc795a33b0f9 --bench"
+	User time (seconds): 34.08
+	System time (seconds): 1.78
+	Percent of CPU this job got: 97%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:36.81
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 284568
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1
+	Minor (reclaiming a frame) page faults: 46043
+	Voluntary context switches: 80799
+	Involuntary context switches: 207
+	Swaps: 0
+	File system inputs: 96
+	File system outputs: 1042992
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

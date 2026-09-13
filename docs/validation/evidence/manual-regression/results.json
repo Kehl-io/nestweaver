@@ -1,0 +1,184 @@
+[
+  {
+    "name": "index-full",
+    "command": [
+      "index",
+      "--repo",
+      "/tmp/nw18-manual-jd7sfbvn/repo",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--config",
+      "/tmp/nw18-manual-jd7sfbvn/instance.toml",
+      "--json",
+      "--force"
+    ],
+    "exit": 0,
+    "seconds": 3.833
+  },
+  {
+    "name": "search-visible",
+    "command": [
+      "search",
+      "visible_api",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 1.088
+  },
+  {
+    "name": "search-excluded",
+    "command": [
+      "search",
+      "hidden_dependency",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 1.028
+  },
+  {
+    "name": "impact-found-direct",
+    "command": [
+      "impact",
+      "visible_api",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 1.359
+  },
+  {
+    "name": "impact-missing-direct",
+    "command": [
+      "impact",
+      "not_here",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 2,
+    "seconds": 1.091
+  },
+  {
+    "name": "context-empty-direct",
+    "command": [
+      "context",
+      "not_here",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 2,
+    "seconds": 1.056
+  },
+  {
+    "name": "hook-install",
+    "command": [
+      "admin",
+      "install-hook"
+    ],
+    "exit": 0,
+    "seconds": 0.035
+  },
+  {
+    "name": "hook-repeat",
+    "command": [
+      "admin",
+      "install-hook"
+    ],
+    "exit": 0,
+    "seconds": 0.034
+  },
+  {
+    "name": "hook-repeat-foreign-container",
+    "command": [
+      "admin",
+      "install-hook"
+    ],
+    "exit": 0,
+    "seconds": 0.03
+  },
+  {
+    "name": "hook-jsonc-refusal",
+    "command": [
+      "admin",
+      "install-hook"
+    ],
+    "exit": 1,
+    "seconds": 0.036
+  },
+  {
+    "name": "index-incremental",
+    "command": [
+      "index",
+      "--repo",
+      "/tmp/nw18-manual-jd7sfbvn/repo",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--config",
+      "/tmp/nw18-manual-jd7sfbvn/instance.toml",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 4.856
+  },
+  {
+    "name": "search-updated",
+    "command": [
+      "search",
+      "visible_api_updated",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 0.973
+  },
+  {
+    "name": "search-excluded-updated",
+    "command": [
+      "search",
+      "hidden_dependency_updated",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 1.005
+  },
+  {
+    "name": "index-unchanged",
+    "command": [
+      "index",
+      "--repo",
+      "/tmp/nw18-manual-jd7sfbvn/repo",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--config",
+      "/tmp/nw18-manual-jd7sfbvn/instance.toml",
+      "--json"
+    ],
+    "exit": 0,
+    "seconds": 1.575
+  },
+  {
+    "name": "index-forced-again",
+    "command": [
+      "index",
+      "--repo",
+      "/tmp/nw18-manual-jd7sfbvn/repo",
+      "--db",
+      "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+      "--config",
+      "/tmp/nw18-manual-jd7sfbvn/instance.toml",
+      "--json",
+      "--force"
+    ],
+    "exit": 0,
+    "seconds": 4.255
+  }
+]

@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "scope": "local",
+    "sources": [
+      "local"
+    ],
+    "stale_repos": []
+  },
+  "impact_nodes": [
+    {
+      "confidence": 0.949999988079071,
+      "depth": 1,
+      "edge_type": "CALLS",
+      "file_path": "src/lib.rs",
+      "impact_score": 0.949999988079071,
+      "name": "caller",
+      "start_line": 2,
+      "uid": "sym:repo:manual-regression:5d1fc8472105:b1a35a68f14e:61de55ba3388:2"
+    }
+  ],
+  "nodes": [
+    {
+      "confidence": 0.949999988079071,
+      "depth": 1,
+      "edge_type": "CALLS",
+      "file_path": "src/lib.rs",
+      "impact_score": 0.949999988079071,
+      "name": "caller",
+      "start_line": 2,
+      "uid": "sym:repo:manual-regression:5d1fc8472105:b1a35a68f14e:61de55ba3388:2"
+    }
+  ],
+  "note": null,
+  "returned": 1,
+  "status": "ok",
+  "symbol": "visible_api_updated",
+  "target": "sym:repo:manual-regression:5d1fc8472105:b1a35a68f14e:fff3dc022aae:1",
+  "total": 1,
+  "truncated": false,
+  "truncated_by_depth": false,
+  "truncated_by_limit": false,
+  "truncated_by_threshold": false
+}

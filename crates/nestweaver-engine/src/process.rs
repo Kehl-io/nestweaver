@@ -51,6 +51,14 @@ pub struct ChangeImpact {
     pub resolver_stale_repos: Vec<String>,
     #[serde(default)]
     pub gate_state: GateState,
+    #[serde(default)]
+    pub work_budget_exceeded: bool,
+    #[serde(default)]
+    pub deadline_exceeded: bool,
+    #[serde(default)]
+    pub traversal_steps: usize,
+    #[serde(default)]
+    pub phase_millis: std::collections::BTreeMap<String, u64>,
 }
 
 /// A symbol affected by a file change.
@@ -151,95 +159,40 @@ type Adjacency = std::collections::HashMap<String, Vec<String>>;
 
 /// Breadth-first reachability over a prebuilt adjacency, from every seed up to
 /// `max_depth` hops (seeds included at depth 0). Pure in-memory — O(edges).
+/// Count edge inspections globally, including repeated visits from different
+/// entry points. A display limit cannot bound this work.
 fn reachable_in_memory(
     adj: &Adjacency,
-    seeds: &HashSet<String>,
+    starts: &HashSet<String>,
     max_depth: u32,
-) -> HashSet<String> {
-    let mut visited: HashSet<String> = seeds.iter().cloned().collect();
-    let mut queue: VecDeque<(String, u32)> = seeds.iter().map(|u| (u.clone(), 0u32)).collect();
+    remaining_steps: &mut usize,
+    deadline: std::time::Instant,
+) -> Option<HashSet<String>> {
+    let mut starts: Vec<_> = starts.iter().cloned().collect();
+    starts.sort();
+    let mut visited: HashSet<_> = starts.iter().cloned().collect();
+    let mut queue: VecDeque<_> = starts.into_iter().map(|uid| (uid, 0)).collect();
     while let Some((uid, depth)) = queue.pop_front() {
+        if *remaining_steps == 0 || std::time::Instant::now() >= deadline {
+            return None;
+        }
+        *remaining_steps -= 1;
         if depth >= max_depth {
             continue;
         }
         if let Some(neighbors) = adj.get(&uid) {
-            for n in neighbors {
-                if visited.insert(n.clone()) {
-                    queue.push_back((n.clone(), depth + 1));
+            for next in neighbors {
+                if *remaining_steps == 0 || std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                *remaining_steps -= 1;
+                if visited.insert(next.clone()) {
+                    queue.push_back((next.clone(), depth + 1));
                 }
             }
         }
     }
-    visited
-}
-
-/// Forward trace of one entry point over a prebuilt adjacency — the in-memory
-/// twin of [`trace_single_process`], with member metadata looked up from
-/// `sym_by_uid`.
-fn trace_single_process_in_memory(
-    entry_point: &nestweaver_schema::Symbol,
-    fwd_adj: &Adjacency,
-    sym_by_uid: &std::collections::HashMap<String, &nestweaver_schema::Symbol>,
-    max_depth: u32,
-) -> ProcessResult {
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(entry_point.uid.clone());
-    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
-    queue.push_back((entry_point.uid.clone(), 0));
-
-    let mut members = vec![ProcessMember {
-        uid: entry_point.uid.clone(),
-        name: entry_point.name.clone(),
-        file_path: entry_point.file_path.clone(),
-        call_depth: 0,
-    }];
-    let mut deepest: u32 = 0;
-
-    while let Some((current_uid, depth)) = queue.pop_front() {
-        if depth >= max_depth {
-            continue;
-        }
-        let Some(callees) = fwd_adj.get(&current_uid) else {
-            continue;
-        };
-        for callee in callees {
-            if !visited.insert(callee.clone()) {
-                continue;
-            }
-            let member_depth = depth + 1;
-            deepest = deepest.max(member_depth);
-            // Prefer rich metadata; fall back to the uid if the callee isn't in
-            // the symbol table (e.g. an unresolved foreign leaf).
-            let (name, file_path) = sym_by_uid
-                .get(callee)
-                .map(|s| (s.name.clone(), s.file_path.clone()))
-                .unwrap_or_else(|| (callee.clone(), String::new()));
-            members.push(ProcessMember {
-                uid: callee.clone(),
-                name,
-                file_path,
-                call_depth: member_depth,
-            });
-            queue.push_back((callee.clone(), member_depth));
-        }
-    }
-    // Deterministic member order regardless of adjacency iteration.
-    members.sort_by(|a, b| (a.call_depth, &a.uid).cmp(&(b.call_depth, &b.uid)));
-
-    let uid = {
-        let key = format!("process:{}", entry_point.uid);
-        let hash = crate::hash::blake3_hex(&key);
-        format!("proc:{}", &hash[..16])
-    };
-    ProcessResult {
-        uid,
-        name: derive_process_name(entry_point),
-        entry_point_uid: entry_point.uid.clone(),
-        repo_uid: entry_point.repo_uid.clone(),
-        depth: deepest,
-        symbol_count: members.len() as u32,
-        members,
-    }
+    Some(visited)
 }
 
 /// BFS forward from a single entry point to build one `ProcessResult`.
@@ -350,6 +303,69 @@ pub fn detect_changes_impact(
     changed_files: &[String],
     max_depth: u32,
 ) -> Result<ChangeImpact> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    detect_changes_impact_until(store, changed_files, max_depth, deadline)
+}
+
+fn detect_changes_impact_until(
+    store: &GraphStore,
+    changed_files: &[String],
+    max_depth: u32,
+    deadline: std::time::Instant,
+) -> Result<ChangeImpact> {
+    // Validate before entering the timed operation so expiry never turns an
+    // invalid/empty request into a successful partial response.
+    crate::changed_files::require_changed_files(changed_files)?;
+    let result = store.with_read_deadline(deadline, || {
+        detect_changes_impact_with_work_budget(store, changed_files, max_depth, 2_000_000, deadline)
+    });
+    match result {
+        Ok(mut result) if std::time::Instant::now() >= deadline => {
+            result.deadline_exceeded = true;
+            result.status = result.status.max(AnalysisStatus::Partial);
+            result.gate_state = GateState::DegradedUnknown;
+            result.notifications.push(deadline_notification());
+            Ok(result)
+        }
+        Err(error) if std::time::Instant::now() >= deadline => Ok(ChangeImpact {
+            affected_symbols: vec![],
+            affected_processes: vec![],
+            risk: RiskLevel::Low,
+            blast_radius: 0,
+            status: AnalysisStatus::Partial,
+            notifications: vec![
+                deadline_notification(),
+                Notification {
+                    level: NotificationLevel::Error,
+                    descriptor: "change-impact-read-failed".into(),
+                    message: format!("database read did not complete: {error:#}"),
+                },
+            ],
+            resolver_stale_repos: vec![],
+            gate_state: GateState::DegradedUnknown,
+            work_budget_exceeded: false,
+            deadline_exceeded: true,
+            traversal_steps: 0,
+            phase_millis: std::collections::BTreeMap::new(),
+        }),
+        other => other,
+    }
+}
+
+fn deadline_notification() -> Notification {
+    Notification { level: NotificationLevel::Warning, descriptor: "change-impact-deadline".into(),
+        message: "change impact exceeded its 60-second database/read budget; all counts and risk are lower bounds and cannot justify skipping tests. Split the request or run the full suite.".into() }
+}
+
+fn detect_changes_impact_with_work_budget(
+    store: &GraphStore,
+    changed_files: &[String],
+    max_depth: u32,
+    work_budget: usize,
+    deadline: std::time::Instant,
+) -> Result<ChangeImpact> {
+    let started = std::time::Instant::now();
+    let mut phase_millis = std::collections::BTreeMap::new();
     let changed_files = crate::changed_files::require_changed_files(changed_files)?;
 
     // Step 1: collect all symbols in changed files.
@@ -373,6 +389,7 @@ pub fn detect_changes_impact(
     }
 
     for file_path in &changed_files {
+        GraphStore::check_read_deadline()?;
         let syms = match store.symbols_in_file(file_path) {
             Ok(syms) => syms,
             Err(e) => {
@@ -391,6 +408,7 @@ pub fn detect_changes_impact(
             unassessed.push(file_path.as_str());
         }
         for sym in syms {
+            GraphStore::check_read_deadline()?;
             if affected_uids.insert(sym.uid.clone()) {
                 affected_symbols.push(AffectedSymbol {
                     uid: sym.uid.clone(),
@@ -416,9 +434,9 @@ pub fn detect_changes_impact(
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
         let risk = RiskLevel::Low;
-        // nw-467: `false` — this analysis has no configured traversal budget to
-        // stop at, so any non-Complete status here is a genuine degrade (drift,
-        // an undecodable row, or resolver staleness), never a bound.
+        // Traversal has not started, so any non-Complete status here reflects
+        // drift, an undecodable row, or resolver staleness. The outer deadline
+        // guard independently discloses an expired planning budget.
         let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
         return Ok(ChangeImpact {
             affected_symbols,
@@ -429,6 +447,10 @@ pub fn detect_changes_impact(
             notifications,
             resolver_stale_repos,
             gate_state,
+            work_budget_exceeded: false,
+            deadline_exceeded: false,
+            traversal_steps: 0,
+            phase_millis,
         });
     }
 
@@ -452,6 +474,8 @@ pub fn detect_changes_impact(
     // that make a completeness claim and named this one as the follow-up; this
     // is that follow-up, reusing its descriptor rather than minting a second
     // string for one condition.
+    phase_millis.insert("planning".into(), started.elapsed().as_millis() as u64);
+    let graph_started = std::time::Instant::now();
     let symbols = match store.list_all_symbols_with_integrity() {
         Ok((symbols, integrity)) => {
             if let Some(disclosure) = integrity.disclosure() {
@@ -472,8 +496,6 @@ pub fn detect_changes_impact(
             return Err(anyhow::Error::new(e).context("list_all_symbols for change impact"));
         }
     };
-    let sym_by_uid: std::collections::HashMap<String, &nestweaver_schema::Symbol> =
-        symbols.iter().map(|s| (s.uid.clone(), s)).collect();
 
     let typed_edges = store
         .load_typed_edges()
@@ -484,6 +506,7 @@ pub fn detect_changes_impact(
     // entry-point predicate's root test.
     let mut has_caller: HashSet<String> = HashSet::new();
     for edge in &typed_edges {
+        GraphStore::check_read_deadline()?;
         let (src, dst, etype) = (&edge.0, &edge.1, edge.2.as_str());
         if etype == "CALLS" {
             has_caller.insert(dst.clone());
@@ -494,38 +517,74 @@ pub fn detect_changes_impact(
         }
     }
 
-    // Reverse-reachable ancestors of the affected symbols, then keep the entry
-    // points among them (deterministic order via the symbols list).
-    let ancestors = reachable_in_memory(&rev_adj, &affected_uids, max_depth);
-    let relevant_entry_points: Vec<&nestweaver_schema::Symbol> = symbols
-        .iter()
-        .filter(|sym| ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller))
-        .collect();
-    let processes: Vec<ProcessResult> = relevant_entry_points
-        .iter()
-        .map(|ep| trace_single_process_in_memory(ep, &fwd_adj, &sym_by_uid, max_depth))
-        .collect();
-
-    // Step 3: cross-reference.
+    // Stable entry-point order makes a bounded prefix reproducible for an
+    // identical graph. Members need only counts here, not names, source text,
+    // sorting or a retained ProcessResult per entry point.
+    phase_millis.insert(
+        "graph_load".into(),
+        graph_started.elapsed().as_millis() as u64,
+    );
+    let traversal_started = std::time::Instant::now();
+    let mut remaining_steps = work_budget;
+    let ancestors = reachable_in_memory(
+        &rev_adj,
+        &affected_uids,
+        max_depth,
+        &mut remaining_steps,
+        deadline,
+    );
+    let mut work_budget_exceeded = ancestors.is_none();
     let mut affected_processes = Vec::new();
-    for proc in &processes {
-        let member_uids: HashSet<&str> = proc.members.iter().map(|m| m.uid.as_str()).collect();
-        let overlap: u32 = affected_uids
-            .iter()
-            .filter(|uid| member_uids.contains(uid.as_str()))
-            .count() as u32;
-        if overlap > 0 {
-            affected_processes.push(AffectedProcess {
-                name: proc.name.clone(),
-                uid: proc.uid.clone(),
-                affected_symbol_count: overlap,
-                total_symbol_count: proc.symbol_count,
-            });
+    if let Some(ancestors) = ancestors {
+        let mut entries = Vec::new();
+        for sym in &symbols {
+            GraphStore::check_read_deadline()?;
+            if ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller) {
+                entries.push(sym);
+            }
+        }
+        entries.sort_by(|a, b| a.uid.cmp(&b.uid));
+        for ep in entries {
+            GraphStore::check_read_deadline()?;
+            let Some(members) = reachable_in_memory(
+                &fwd_adj,
+                &HashSet::from([ep.uid.clone()]),
+                max_depth,
+                &mut remaining_steps,
+                deadline,
+            ) else {
+                work_budget_exceeded = true;
+                break; // Never publish the counts of an unfinished process.
+            };
+            let overlap = affected_uids.intersection(&members).count();
+            if overlap > 0 {
+                let hash = crate::hash::blake3_hex(&format!("process:{}", ep.uid));
+                affected_processes.push(AffectedProcess {
+                    name: derive_process_name(ep),
+                    uid: format!("proc:{}", &hash[..16]),
+                    affected_symbol_count: overlap as u32,
+                    total_symbol_count: members.len() as u32,
+                });
+            }
         }
     }
-
-    // Deterministic output order (entry-point iteration order is not stable).
+    phase_millis.insert(
+        "traversal".into(),
+        traversal_started.elapsed().as_millis() as u64,
+    );
+    let sort_started = std::time::Instant::now();
     affected_processes.sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
+    phase_millis.insert("sorting".into(), sort_started.elapsed().as_millis() as u64);
+    if work_budget_exceeded {
+        status = status.max(AnalysisStatus::Partial);
+    }
+    if work_budget_exceeded && remaining_steps == 0 {
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            descriptor: "change-impact-work-budget".into(),
+            message: format!("process analysis reached its {work_budget}-step traversal budget; process counts and risk are lower bounds. Split the changed-file request or run the full test suite; raising the display limit does not raise this budget."),
+        });
+    }
 
     // Step 4: risk level.
     let risk = match affected_processes.len() {
@@ -535,9 +594,7 @@ pub fn detect_changes_impact(
     };
 
     let blast_radius = affected_symbols.len() + affected_processes.len();
-    // nw-467: `false` — this analysis has no configured traversal budget to
-    // stop at, so any non-Complete status here is a genuine degrade (drift,
-    // an undecodable row, or resolver staleness), never a bound.
+    // A bounded partial traversal is distinct from independent graph degradation.
     let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
 
     Ok(ChangeImpact {
@@ -549,12 +606,131 @@ pub fn detect_changes_impact(
         notifications,
         resolver_stale_repos,
         gate_state,
+        work_budget_exceeded: work_budget_exceeded && remaining_steps == 0,
+        deadline_exceeded: std::time::Instant::now() >= deadline,
+        traversal_steps: work_budget - remaining_steps,
+        phase_millis,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_database_budget_is_unknown_not_empty_success_and_does_not_leak() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = detect_changes_impact_until(
+            &store,
+            &["src/file.rs".into()],
+            10,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(result.deadline_exceeded);
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+        assert!(!result.notifications.is_empty());
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert!(detect_changes_impact_until(&store, &[], 10, std::time::Instant::now()).is_err());
+    }
+
+    #[test]
+    fn fifty_six_file_analysis_returns_truthful_deterministic_bounded_prefix() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().unwrap();
+        let mk = |uid: &str, name: &str, file: &str, entry: bool| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let files: Vec<_> = (0..56).map(|n| format!("src/file{n:02}.rs")).collect();
+        for (n, file) in files.iter().enumerate() {
+            store
+                .insert_symbol(&mk(
+                    &format!("sym:{n:02}"),
+                    &format!("entry{n:02}"),
+                    file,
+                    true,
+                ))
+                .unwrap();
+            if n > 0 {
+                store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: format!("sym:{:02}", n - 1),
+                        target_uid: format!("sym:{n:02}"),
+                        edge_type: EdgeType::Calls,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: vec![],
+                    })
+                    .unwrap();
+            }
+        }
+        let complete = detect_changes_impact(&store, &files, 10).unwrap();
+        assert_eq!(complete.affected_symbols.len(), 56);
+        assert_eq!(complete.affected_processes.len(), 56);
+        assert!(!complete.work_budget_exceeded);
+        assert_eq!(complete.status, AnalysisStatus::Complete);
+        let limited = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            150,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let repeated = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            150,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(limited.work_budget_exceeded);
+        assert_eq!(limited.traversal_steps, 150);
+        assert_eq!(limited.status, AnalysisStatus::Partial);
+        assert_ne!(limited.gate_state, GateState::Ok);
+        assert_eq!(
+            serde_json::to_value(&limited.affected_processes).unwrap(),
+            serde_json::to_value(&repeated.affected_processes).unwrap()
+        );
+        for phase in ["planning", "graph_load", "traversal", "sorting"] {
+            assert!(limited.phase_millis.contains_key(phase));
+        }
+        // The traversal receives the caller's deadline, even when no native
+        // read scope is installed: graph loading cannot reset its clock.
+        let expired = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            2_000_000,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(expired.deadline_exceeded);
+        assert!(!expired.work_budget_exceeded);
+        assert_eq!(expired.traversal_steps, 0);
+        assert_ne!(expired.gate_state, GateState::Ok);
+        // A bounded request leaves the store responsive for an independent read.
+        assert_eq!(store.count_symbols().unwrap(), 56);
+    }
 
     #[test]
     fn trace_processes_returns_empty_for_empty_store() {

@@ -1,0 +1,11 @@
+{
+  "db_path": "/tmp/nw18-manual-jd7sfbvn/fixture.lbug",
+  "endpoint_error": null,
+  "evidence": "database_write_lock",
+  "instance_id": "ed29a85e",
+  "next_action": "Inspect the verified holder. Do not start another writer or remove runtime files.",
+  "pid": 3282550,
+  "socket": "/run/user/1000/nestweaver/ed29a85e/daemon.sock",
+  "state": "running_but_unreachable",
+  "supervision": "ad-hoc"
+}

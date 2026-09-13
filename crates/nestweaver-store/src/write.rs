@@ -5396,6 +5396,7 @@ impl GraphStore {
         if edges.is_empty() {
             return Ok(());
         }
+        let copy_started = std::time::Instant::now();
         let tmp_dir =
             tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join(format!("{relationship}.csv"));
@@ -5405,6 +5406,50 @@ impl GraphStore {
             "COPY {relationship} FROM '{csv_str}' {COPY_CSV_OPTS}"
         ))
         .map_err(|e| StoreError::Query(format!("COPY {relationship}: {e}")))?;
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "copy", relationship, rows = edges.len(),
+            elapsed_ms = copy_started.elapsed().as_secs_f64() * 1000.0,
+            "project materialization phase");
+        Ok(())
+    }
+
+    /// Use transactional CREATE for the small Project-to-Project topology.
+    /// LadybugDB 0.19.1 can leave an unreadable component adjacency chunk when
+    /// a later parent COPY aborts after a component COPY (including self edges).
+    /// Keep bulk COPY for the high-volume Note/Symbol memberships, but avoid
+    /// that unsafe native COPY rollback combination for topology relationships.
+    fn insert_project_topology_edges_on(
+        conn: &lbug::Connection<'_>,
+        relationship: &'static str,
+        edges: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let mut statement = conn
+            .prepare(&format!(
+                "MATCH (source:Project {{uid: $source}}), (target:Project {{uid: $target}}) \
+                 CREATE (source)-[:{relationship} {{confidence: 1.0}}]->(target) RETURN source.uid"
+            ))
+            .map_err(|error| StoreError::Query(format!("prepare {relationship}: {error}")))?;
+        for (source, target) in edges {
+            let mut rows = conn
+                .execute(
+                    &mut statement,
+                    vec![
+                        ("source", lbug::Value::String(source.clone())),
+                        ("target", lbug::Value::String(target.clone())),
+                    ],
+                )
+                .map_err(|error| StoreError::Query(format!("insert {relationship}: {error}")))?;
+            // MATCH without an endpoint succeeds with zero rows. Reject that
+            // explicitly so incomplete topology can never be committed.
+            if rows.next().is_none() {
+                return Err(StoreError::Query(format!(
+                    "insert {relationship}: missing endpoint for {source} -> {target}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -5881,6 +5926,7 @@ impl GraphStore {
         stale_uids: &[String],
         recover_on_failure: bool,
     ) -> Result<ReplaceMaterializedProjectsOutcome, ReplaceMaterializedProjectsError> {
+        let planning_started = std::time::Instant::now();
         let existing_note_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_NOTE")?;
         let existing_symbol_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_SYMBOL")?;
         let existing_component_edges = self.list_project_edge_pairs("PROJECT_HAS_COMPONENT")?;
@@ -5992,6 +6038,9 @@ impl GraphStore {
             });
         }
 
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "planning", elapsed_ms = planning_started.elapsed().as_secs_f64() * 1000.0,
+            "project materialization phase");
         let conn = self.begin_transaction()?;
         let mutation = (|| {
             for project in projects
@@ -6005,8 +6054,12 @@ impl GraphStore {
             // never relies on LadybugDB to resurrect detached relationships.
             Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_NOTE", &note_additions, 1.0)?;
             Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &symbol_additions, 1.0)?;
-            Self::copy_project_edges_on(&conn, "PROJECT_HAS_COMPONENT", &component_additions, 1.0)?;
-            Self::copy_project_edges_on(&conn, "PROJECT_HAS_PARENT", &parent_additions, 1.0)?;
+            Self::insert_project_topology_edges_on(
+                &conn,
+                "PROJECT_HAS_COMPONENT",
+                &component_additions,
+            )?;
+            Self::insert_project_topology_edges_on(&conn, "PROJECT_HAS_PARENT", &parent_additions)?;
             for project in projects
                 .iter()
                 .filter(|project| existing_project_uids.contains(&project.uid))
@@ -6046,18 +6099,23 @@ impl GraphStore {
             }
             Ok(())
         })();
+        let commit_started = std::time::Instant::now();
         let publication = match mutation {
             Ok(()) => self.commit_transaction(&conn).map_err(|error| {
                 StoreError::Query(format!("Project materialization commit: {error}"))
             }),
             Err(error) => Err(error),
         };
+        tracing::info!(target: "nestweaver_store::materialization_timing",
+            phase = "commit", elapsed_ms = commit_started.elapsed().as_secs_f64() * 1000.0,
+            success = publication.is_ok(), "project materialization phase");
         let Err(error) = publication else {
             return Ok(ReplaceMaterializedProjectsOutcome {
                 disposition: ProjectMutationDisposition::Changed,
             });
         };
         let primary = Self::rollback_project_transaction(&conn, error, "Project materialization");
+        drop(conn);
         if !recover_on_failure {
             return Err(ReplaceMaterializedProjectsError::ambiguous(primary));
         }
@@ -8245,6 +8303,52 @@ impl GraphStore {
         result
     }
 
+    /// Record the eligibility policy after the repository's graph has been
+    /// rebuilt and before its publication marker is cleared. Callers retain
+    /// their normal mutation/publication authority for this operation.
+    pub fn set_repo_index_policy(
+        &self,
+        repo_uid: &str,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let result = Self::set_repo_index_policy_on(&conn, repo_uid, fingerprint)
+            .and_then(|()| self.commit_transaction(&conn));
+        if result.is_err() {
+            let _ = conn.query("ROLLBACK");
+        }
+        result
+    }
+
+    /// Update policy metadata in the caller's existing graph transaction.
+    /// This function never commits: graph changes and their policy proof must
+    /// become visible together, or both roll back.
+    pub fn set_repo_index_policy_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        if fingerprint.is_empty() {
+            return Err(StoreError::Query(
+                "repo index policy must not be empty".into(),
+            ));
+        }
+        let key = format!("repo-index-policy:{repo_uid}");
+        exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String(key.clone()))],
+        )?;
+        exec_params(
+            conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String(key)),
+                ("v", lbug::Value::String(fingerprint.to_string())),
+            ],
+        )
+    }
+
     /// Record that contract derivation failed for `repo_uid`.
     ///
     /// Contract derivation is best-effort: a malformed spec or a rejected bulk
@@ -8674,7 +8778,7 @@ mod copy_from_tests {
     // top passes on the unpinned build and proves nothing.
 
     /// Rows lbug's CSV dialect detector samples before deciding the dialect.
-    const DIALECT_SAMPLE_ROWS: usize = 256;
+    pub(super) const DIALECT_SAMPLE_ROWS: usize = 256;
 
     /// A field value that needs quoting: it carries both an embedded delimiter
     /// (exercises `DELIM`/`QUOTE`) and an embedded quote (exercises `ESCAPE`,
@@ -8684,7 +8788,7 @@ mod copy_from_tests {
     /// Assert a generated CSV really can reproduce the auto-detect bug: no row
     /// inside the detector's sample window may need quoting, and the first row
     /// after it must.
-    fn assert_fixture_shape(csv_path: &Path) {
+    pub(super) fn assert_fixture_shape(csv_path: &Path) {
         let text = std::fs::read_to_string(csv_path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert!(
@@ -8722,7 +8826,7 @@ mod copy_from_tests {
             .collect()
     }
 
-    fn plain_symbol(i: usize) -> Symbol {
+    pub(super) fn plain_symbol(i: usize) -> Symbol {
         Symbol {
             uid: format!("sym:plain:{i:04}"),
             name: format!("plain_{i:04}"),
@@ -9016,6 +9120,7 @@ mod copy_from_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::copy_from_tests::{DIALECT_SAMPLE_ROWS, assert_fixture_shape, plain_symbol};
     use super::*;
 
     fn seed_classified_vault(store: &GraphStore, vault_uid: &str) {
@@ -10718,6 +10823,44 @@ mod tests {
     }
 
     #[test]
+    fn repo_index_policy_migrates_and_changes_only_with_its_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index-policy.lbug");
+        let store = GraphStore::create(&db_path).unwrap();
+        let repo = "repo:quoted'\"policy";
+        assert_eq!(store.get_repo_index_policy(repo).unwrap(), None);
+        store
+            .set_repo_index_policy(repo, "eligibility-v1:first")
+            .unwrap();
+        assert_eq!(store.get_repo_index_policy("repo:other").unwrap(), None);
+        {
+            let conn = store.begin_transaction().unwrap();
+            GraphStore::set_repo_index_policy_on(&conn, repo, "eligibility-v1:discarded").unwrap();
+            conn.query("ROLLBACK").unwrap();
+        }
+        assert_eq!(
+            store.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:first")
+        );
+        assert!(store.set_repo_index_policy(repo, "").is_err());
+        assert_eq!(
+            store.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:first")
+        );
+        {
+            let conn = store.begin_transaction().unwrap();
+            GraphStore::set_repo_index_policy_on(&conn, repo, "eligibility-v1:changed").unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let reopened = GraphStore::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:changed")
+        );
+    }
+
+    #[test]
     fn test_update_repo_sha_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_sha.lbug");
@@ -10762,6 +10905,286 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// Exact historical MATCH+CREATE loop from ad0619fb0e50e65253b52ea74d99f2969f65fbf2
+    /// (parent of COPY migration 598d0c1787fdcbfff1738ff72f1357926fcd2f23),
+    /// write.rs::batch_insert_project_symbol_edges, plus its note/component
+    /// helpers. Both paths use today's pinned engine and identical synthetic-v1
+    /// input on the same machine; this isolates the algorithm, not old binaries.
+    #[test]
+    #[ignore = "paired 139509-edge benchmark requires an isolated quiet runner"]
+    fn project_materialization_paired_139509_benchmark() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+        let projects = (0..11)
+            .map(|i| Project {
+                uid: format!("proj:fixture:{i}"),
+                name: format!("Project {i}"),
+                summary: None,
+                instance_id: "fixture".into(),
+            })
+            .collect::<Vec<_>>();
+        let symbols = (0..12_683)
+            .map(|i| Symbol {
+                uid: format!("sym:fixture:{i}"),
+                name: format!("symbol_{i}"),
+                file_path: format!("src/file_{}.rs", i / 28),
+                repo_uid: "repo:fixture".into(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn symbol_{i}()"),
+                summary: None,
+                content_hash: format!("hash-{i}"),
+                ..plain_symbol(i)
+            })
+            .collect::<Vec<_>>();
+        let notes = (0..91)
+            .map(|i| Note {
+                uid: format!("note:fixture:{i}"),
+                vault_uid: "vault:fixture".into(),
+                file_path: format!("note-{i}.md"),
+                title: format!("Note {i}"),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: format!("hash-{i}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .collect::<Vec<_>>();
+        let planned = std::time::Instant::now();
+        let symbol_edges = (0..139_509)
+            .map(|i| {
+                (
+                    projects[i / symbols.len()].uid.clone(),
+                    symbols[i % symbols.len()].uid.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let note_edges = notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| (projects[i % projects.len()].uid.clone(), note.uid.clone()))
+            .collect::<Vec<_>>();
+        let components = (0..5)
+            .map(|i| (projects[0].uid.clone(), projects[i + 1].uid.clone()))
+            .collect::<Vec<_>>();
+        let planning_ms = planned.elapsed().as_secs_f64() * 1000.0;
+        let mut runs = Vec::new();
+        // A second invocation may reverse order to disclose cache/order bias.
+        let order = if std::env::var_os("NW_PROJECT_BENCH_REVERSE").is_some() {
+            ["copy", "legacy"]
+        } else {
+            ["legacy", "copy"]
+        };
+        for algorithm in order {
+            let scratch = tempfile::tempdir().unwrap();
+            let db = scratch.path().join("materialization.lbug");
+            {
+                let store = GraphStore::open_or_create(&db).unwrap();
+                store.batch_insert_symbols(&symbols).unwrap();
+                store.batch_insert_notes(&notes).unwrap();
+            }
+            let started = std::time::Instant::now();
+            let authority = crate::acquire_db_write_lease(&db).unwrap();
+            let leased = std::time::Instant::now();
+            let store = GraphStore::open_or_create_with_authority(&db, &authority).unwrap();
+            let apply = std::time::Instant::now();
+            if algorithm == "legacy" {
+                for project in &projects {
+                    store.insert_project(project).unwrap();
+                }
+                // Original helper obtains a connection and prepares once per
+                // project, then executes one auto-committing statement per UID.
+                for project in &projects {
+                    let conn = store.conn().unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "MATCH (p:Project {uid: $pid}), (s:Symbol {uid: $sid}) \
+                         CREATE (p)-[:PROJECT_INCLUDES_SYMBOL {confidence: $conf}]->(s)",
+                        )
+                        .unwrap();
+                    for (_, symbol_uid) in symbol_edges.iter().filter(|edge| edge.0 == project.uid)
+                    {
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("pid", lbug::Value::String(project.uid.clone())),
+                                ("sid", lbug::Value::String(symbol_uid.clone())),
+                                ("conf", lbug::Value::Double(1.0)),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                {
+                    let conn = store.conn().unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
+                         CREATE (p)-[:PROJECT_INCLUDES_NOTE {confidence: 1.0}]->(n)",
+                        )
+                        .unwrap();
+                    for (project_uid, note_uid) in &note_edges {
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("pid", lbug::Value::String(project_uid.clone())),
+                                ("nid", lbug::Value::String(note_uid.clone())),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                for (parent, child) in &components {
+                    store
+                        .insert_project_component_edge(parent, child, 1.0)
+                        .unwrap();
+                }
+            } else {
+                store
+                    .replace_materialized_projects(
+                        &projects,
+                        &note_edges,
+                        &symbol_edges,
+                        &components,
+                        &[],
+                    )
+                    .unwrap();
+            }
+            let apply_ms = apply.elapsed().as_secs_f64() * 1000.0;
+            let mut observed = 0;
+            for project in &projects {
+                observed += store.list_project_symbol_uids(&project.uid).unwrap().len();
+            }
+            assert_eq!(observed, 139_509);
+            assert_eq!(
+                store
+                    .list_project_edge_pairs("PROJECT_INCLUDES_NOTE")
+                    .unwrap(),
+                note_edges.iter().cloned().collect()
+            );
+            assert_eq!(
+                store
+                    .list_project_edge_pairs("PROJECT_HAS_COMPONENT")
+                    .unwrap(),
+                components.iter().cloned().collect()
+            );
+            drop(store);
+            let write_lease_ms = leased.elapsed().as_secs_f64() * 1000.0;
+            drop(authority);
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0 + planning_ms;
+            let report = serde_json::json!({"algorithm":algorithm, "planning_ms":planning_ms,
+                "apply_including_commit_ms":apply_ms,"write_lease_ms":write_lease_ms,"total_ms":total_ms});
+            eprintln!("PROJECT_MATERIALIZATION_RUN {report}");
+            runs.push(report);
+        }
+        let legacy = runs
+            .iter()
+            .find(|run| run["algorithm"] == "legacy")
+            .unwrap();
+        let copy = runs.iter().find(|run| run["algorithm"] == "copy").unwrap();
+        let speedup = legacy["apply_including_commit_ms"].as_f64().unwrap()
+            / copy["apply_including_commit_ms"].as_f64().unwrap();
+        eprintln!(
+            "PROJECT_MATERIALIZATION_PAIRED {}",
+            serde_json::json!({
+            "fixture":"synthetic-project-materialization-v1", "symbol_edges":139509,
+            "legacy_source":"ad0619fb0e50e65253b52ea74d99f2969f65fbf2", "runs":runs,
+            "same_machine":true, "historical_dataset":false,"speedup":speedup})
+        );
+        assert!(
+            speedup >= 10.0,
+            "COPY speedup {speedup:.2}x is below 10x target"
+        );
+        assert!(
+            copy["write_lease_ms"].as_f64().unwrap() < 120_000.0,
+            "COPY exclusive phase exceeds two minutes"
+        );
+    }
+
+    #[test]
+    fn project_copy_over_256_quoted_endpoints_preserves_direction_and_confidence() {
+        let store = GraphStore::in_memory().unwrap();
+        let project = nestweaver_schema::Project {
+            uid: "proj:test,\"quoted\"".into(),
+            name: "quoted".into(),
+            summary: None,
+            instance_id: "test".into(),
+        };
+        store.insert_project(&project).unwrap();
+        let plain_project = nestweaver_schema::Project {
+            uid: "proj:test:plain".into(),
+            ..project.clone()
+        };
+        store.insert_project(&plain_project).unwrap();
+        let symbols = (0..300)
+            .map(|i| Symbol {
+                uid: if i < DIALECT_SAMPLE_ROWS {
+                    format!("sym:plain:{i}")
+                } else {
+                    format!("sym:{i},\"quoted\"")
+                },
+                ..plain_symbol(i)
+            })
+            .collect::<Vec<_>>();
+        // Parameterized seeds isolate relationship COPY from node COPY.
+        for symbol in &symbols {
+            store.insert_symbol(symbol).unwrap();
+        }
+        let uids = symbols
+            .iter()
+            .map(|symbol| symbol.uid.clone())
+            .collect::<Vec<_>>();
+        let edges = uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| {
+                (
+                    if i < DIALECT_SAMPLE_ROWS {
+                        plain_project.uid.clone()
+                    } else {
+                        project.uid.clone()
+                    },
+                    uid.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixture = tempfile::tempdir().unwrap();
+        let csv = fixture.path().join("quoted.csv");
+        write_project_edge_csv(&edges, 0.375, &csv).unwrap();
+        assert_fixture_shape(&csv);
+        let conn = store.conn().unwrap();
+        GraphStore::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &edges, 0.375).unwrap();
+        let rows = conn.query("MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence")
+            .unwrap().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 300);
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let lbug::Value::String(source) = &row[0] else {
+                panic!("missing project UID")
+            };
+            let lbug::Value::String(target) = &row[1] else {
+                panic!("missing symbol UID")
+            };
+            assert!(
+                edges.contains(&(source.clone(), target.clone())),
+                "COPY changed endpoint direction"
+            );
+            let lbug::Value::String(uid) = &row[1] else {
+                panic!("missing symbol UID")
+            };
+            assert!(seen.insert(uid.clone()));
+            match row[2] {
+                lbug::Value::Double(confidence) => assert!((confidence - 0.375).abs() < 1e-6),
+                lbug::Value::Float(confidence) => assert!((confidence - 0.375).abs() < 1e-6),
+                ref other => panic!("unexpected confidence: {other:?}"),
+            }
+        }
+        assert_eq!(seen, uids.into_iter().collect());
     }
 
     #[test]
@@ -11170,120 +11593,175 @@ mod tests {
     }
 
     #[test]
-    fn disk_backed_late_project_copy_failure_restores_previous_graph() {
+    fn disk_backed_project_copy_failure_matrix_restores_previous_graph() {
         use nestweaver_schema::{Note, NoteKind, Project};
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("project-rollback.lbug");
-        let store = GraphStore::open_or_create(&db_path).unwrap();
-        let old = Project {
-            uid: "proj:test:stable".to_string(),
-            name: "stable".to_string(),
-            summary: Some("old summary".to_string()),
-            instance_id: "test".to_string(),
-        };
-        store.insert_project(&old).unwrap();
-        store
-            .insert_note(&Note {
-                uid: "note:stable".to_string(),
-                vault_uid: "vault:test".to_string(),
-                file_path: "stable.md".to_string(),
-                title: "Stable".to_string(),
-                note_kind: NoteKind::General,
-                word_count: 1,
-                content_hash: "stable".to_string(),
-                frontmatter: None,
-                frontmatter_raw: None,
-                created_at: None,
-                modified_at: None,
-                pagerank_score: None,
-                embedding: None,
-            })
-            .unwrap();
-        store
-            .insert_note(&Note {
-                uid: "note:new".to_string(),
-                vault_uid: "vault:test".to_string(),
-                file_path: "new.md".to_string(),
-                title: "New".to_string(),
-                note_kind: NoteKind::General,
-                word_count: 1,
-                content_hash: "new".to_string(),
-                frontmatter: None,
-                frontmatter_raw: None,
-                created_at: None,
-                modified_at: None,
-                pagerank_score: None,
-                embedding: None,
-            })
-            .unwrap();
-        let symbol_uid = "sym:project-rollback".to_string();
-        store
-            .insert_symbol(&Symbol {
-                uid: symbol_uid.clone(),
-                name: "project_rollback".to_string(),
-                kind: nestweaver_schema::SymbolKind::Function,
-                repo_uid: "repo:project-rollback".to_string(),
-                file_path: "src/lib.rs".to_string(),
-                start_line: 1,
-                end_line: 1,
-                signature: "fn project_rollback()".to_string(),
-                summary: None,
-                content_hash: "symbol-hash".to_string(),
-                embedding: None,
-                pagerank_score: None,
-                is_entry_point: false,
-                entry_point_kind: None,
-                visibility: nestweaver_schema::Visibility::Public,
-                type_info: None,
-                framework_hint: None,
-                canonical_id: None,
-            })
-            .unwrap();
-        store
-            .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
-            .unwrap();
+        for failure_table in [
+            "PROJECT_INCLUDES_NOTE",
+            "PROJECT_INCLUDES_SYMBOL",
+            "PROJECT_HAS_COMPONENT",
+            "PROJECT_HAS_PARENT",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("project-rollback.lbug");
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let old = Project {
+                uid: "proj:test:stable".to_string(),
+                name: "stable".to_string(),
+                summary: Some("old summary".to_string()),
+                instance_id: "test".to_string(),
+            };
+            store.insert_project(&old).unwrap();
+            store
+                .insert_note(&Note {
+                    uid: "note:stable".to_string(),
+                    vault_uid: "vault:test".to_string(),
+                    file_path: "stable.md".to_string(),
+                    title: "Stable".to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "stable".to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .insert_note(&Note {
+                    uid: "note:new".to_string(),
+                    vault_uid: "vault:test".to_string(),
+                    file_path: "new.md".to_string(),
+                    title: "New".to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "new".to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            let symbol_uid = "sym:project-rollback".to_string();
+            store
+                .insert_symbol(&Symbol {
+                    uid: symbol_uid.clone(),
+                    name: "project_rollback".to_string(),
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: "repo:project-rollback".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: "fn project_rollback()".to_string(),
+                    summary: None,
+                    content_hash: "symbol-hash".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            store
+                .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
+                .unwrap();
 
-        let mut replacement = old.clone();
-        replacement.summary = Some("new summary".to_string());
-        let result = store.replace_materialized_projects_transaction(
-            &[replacement],
-            &[("proj:test:stable".to_string(), "note:new".to_string())],
-            &[("proj:test:stable".to_string(), symbol_uid)],
-            &[(
-                "proj:test:stable".to_string(),
-                "proj:test:missing".to_string(),
-            )],
-            &[],
-            &[],
-            true,
-        );
-        let error = result.expect_err("the late component COPY must fail");
-        assert_eq!(
-            error.disposition,
-            ProjectMutationDisposition::ConfirmedRolledBack,
-            "successful snapshot restoration must be exposed to publication callers"
-        );
-        assert!(error.to_string().contains("PROJECT_HAS_COMPONENT"));
-        assert!(
-            !error.to_string().contains("rollback failed"),
-            "automatic rollback should not be misreported: {error}"
-        );
-        drop(store);
+            let child = Project {
+                uid: "proj:test:child".into(),
+                name: "child".into(),
+                ..old.clone()
+            };
+            store.insert_project(&child).unwrap();
+            store
+                .batch_insert_project_symbol_edges(&old.uid, std::slice::from_ref(&symbol_uid), 1.0)
+                .unwrap();
+            store
+                .insert_project_component_edge(&old.uid, &child.uid, 1.0)
+                .unwrap();
+            store
+                .insert_project_parent_edge(&child.uid, &old.uid, 1.0)
+                .unwrap();
+            let tables = [
+                "PROJECT_INCLUDES_NOTE",
+                "PROJECT_INCLUDES_SYMBOL",
+                "PROJECT_HAS_COMPONENT",
+                "PROJECT_HAS_PARENT",
+            ];
+            let before = tables.map(|table| store.list_project_edge_pairs(table).unwrap());
+            let mut replacement = old.clone();
+            replacement.summary = Some("new summary".to_string());
+            let missing = "missing-endpoint".to_string();
+            let note_target = if failure_table == tables[0] {
+                missing.clone()
+            } else {
+                "note:new".into()
+            };
+            let symbol_target = if failure_table == tables[1] {
+                missing.clone()
+            } else {
+                symbol_uid
+            };
+            let component_target = if failure_table == tables[2] {
+                missing.clone()
+            } else {
+                child.uid.clone()
+            };
+            let parent_target = if failure_table == tables[3] {
+                missing
+            } else {
+                child.uid.clone()
+            };
+            let result = store.replace_materialized_projects_transaction(
+                &[replacement],
+                &[(old.uid.clone(), note_target)],
+                &[(child.uid.clone(), symbol_target)],
+                &[(child.uid.clone(), component_target)],
+                &[(old.uid.clone(), parent_target)],
+                &[],
+                true,
+            );
+            let error = result.expect_err("the selected relationship insertion must fail");
+            assert_eq!(
+                error.disposition,
+                ProjectMutationDisposition::ConfirmedRolledBack,
+                "{failure_table}: successful snapshot restoration must be exposed to publication callers: {error}"
+            );
+            assert!(error.to_string().contains(failure_table));
+            assert!(
+                !error.to_string().contains("rollback failed"),
+                "automatic rollback should not be misreported: {error}"
+            );
+            drop(store);
 
-        let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let restored = reopened
-            .list_projects()
-            .unwrap()
-            .into_iter()
-            .find(|project| project.uid == old.uid)
-            .expect("rollback must restore the previous Project node");
-        assert_eq!(restored.summary, old.summary);
-        assert_eq!(
-            reopened.list_project_note_uids(&old.uid).unwrap(),
-            vec!["note:stable".to_string()],
-            "disk-backed rollback must restore previous membership and remove partial replacement"
-        );
+            let reopened = GraphStore::open_or_create(&db_path).unwrap();
+            for (table, expected) in tables.into_iter().zip(before) {
+                assert_eq!(
+                    reopened.list_project_edge_pairs(table).unwrap(),
+                    expected,
+                    "{failure_table}: {table}"
+                );
+            }
+            assert_eq!(reopened.list_projects().unwrap().len(), 2);
+            let restored = reopened
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == old.uid)
+                .expect("rollback must restore the previous Project node");
+            assert_eq!(restored.summary, old.summary);
+            assert_eq!(
+                reopened.list_project_note_uids(&old.uid).unwrap(),
+                vec!["note:stable".to_string()],
+                "disk-backed rollback must restore previous membership and remove partial replacement"
+            );
+        }
     }
 
     #[test]

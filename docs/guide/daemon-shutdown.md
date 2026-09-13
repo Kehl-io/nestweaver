@@ -255,3 +255,44 @@ graph store is crash-safe.** Widening supervisor timeouts moves the deadline out
 to where a legitimate drain usually fits; it does not make the kill safe, and a
 drain longer than the configured timeout still ends in the nw-126 crash. The
 real fix is crash safety in the store, not a larger number here.
+
+### Observe the selected runtime before recovery
+
+`nestweaver daemon --db /path/to/brain.lbug status --json` reports the selected
+instance, socket, observed ownership evidence and supervision. A held database
+lock with a missing socket is `running_but_unreachable`; an unreadable lock is
+`unknown`, not proof that the database is stopped. Neither status path starts a
+daemon or removes runtime files. Identify the lock holder before signaling it:
+a direct indexing process can own the same write lock as a daemon.
+
+Linux supervision is `systemd-user` only when the live process belongs to a
+user-manager service cgroup, with its process generation unchanged across the
+probe. `ad-hoc` means the observed cgroup has no service owner. Unreadable process
+state, system services and unsupported platforms report `unknown/unverifiable`.
+Unit-file existence is not evidence. A systemd-owned process may restart until
+its owning unit is stopped; `daemon stop` addresses the selected database's
+verified daemon, while `systemctl --user stop UNIT` addresses that unit.
+
+Use `daemon inspect-runtime /exact/runtime/root/0123abcd` to report a single
+entry's contents, age and missing ownership proof without changing it. After
+inspection, `daemon prune-runtime /exact/runtime/root/0123abcd --database
+/path/to/brain.lbug` can retire an empty entry or one containing only an empty
+spawnlock. It requires an existing regular database with an exact matching
+current or known legacy hash, holds spawn admission
+and exclusive database authority through removal, and refuses any PID, socket,
+other content, held lock, or ambiguity. A legacy hash whose database identity
+cannot be reconstructed remains spared, as does an entry whose database no
+longer exists. Runtime cleanup never creates a database. There is no age-based or recursive
+runtime-root deletion fallback.
+
+### Watcher controller lifetime
+
+Code and vault watchers report one registration containing kind, target,
+controller PID, session id, start time and age through health and brain status.
+Registration age is distinct from `write_holder_seconds`: an idle watcher does
+not hold the write gate, so a zero write-holder age while idle is correct.
+Controllers poll their registration with bounded RPC waits. Replacement, stop
+or disconnect terminates the displaced controller; Ctrl-C stops only its own
+session, so an old controller cannot stop its replacement. A daemon restart
+creates a new session sequence. Existing explicit `watch-stop` remains the
+administrator operation that stops the current watcher.
