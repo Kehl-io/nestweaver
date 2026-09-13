@@ -10460,6 +10460,30 @@ fn wait_for_daemon_watcher(
     }
 }
 
+fn stop_owned_daemon_watcher(
+    rt: &tokio::runtime::Runtime,
+    client: &mut nestweaver_client::DaemonClient,
+    watcher_id: u64,
+) -> anyhow::Result<()> {
+    let response = rt
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client
+                    .inner_mut()
+                    .stop_watch(nestweaver_proto::StopWatchRequest { watcher_id }),
+            )
+            .await
+        })
+        .context("watcher stop is still draining or unreachable; completion is unverified")??
+        .into_inner();
+    anyhow::ensure!(
+        response.ok,
+        "watcher session {watcher_id} was already displaced or stopped"
+    );
+    Ok(())
+}
+
 /// Cleanup precedes propagation, including every supervisor error path.
 fn finish_ui_supervision(result: anyhow::Result<bool>, stop: impl FnOnce()) -> anyhow::Result<()> {
     if !matches!(result, Ok(false)) {
@@ -18491,14 +18515,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         });
                         wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
-                        let _ = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .stop_watch(nestweaver_proto::StopWatchRequest {
-                                    watcher_id: resp.watcher_id,
-                                })
-                                .await
-                        });
+                        stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                         eprintln!("Watcher stopped.");
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -26497,30 +26514,7 @@ fn run_brain(
 
                 wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
 
-                let stop_req = nestweaver_proto::StopWatchRequest {
-                    watcher_id: resp.watcher_id,
-                };
-                if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
-                {
-                    // The watcher thread lives inside the daemon, so when the
-                    // daemon process is gone the watcher has already stopped
-                    // with it - nothing for us to clean up, nothing to warn
-                    // about. Two error shapes indicate "daemon gone":
-                    //   - `Unavailable`: connect failed (socket file removed,
-                    //     or "Connection refused" on a stale socket).
-                    //   - `Unknown` with a tonic transport error: the
-                    //     connection was open when the RPC started but was
-                    //     abruptly closed mid-call (e.g. daemon SIGKILLed).
-                    // Without this filter, `KeepAlive=true` on the watch
-                    // plist turns every daemon restart into a perpetual
-                    // "failed to stop watcher" loop in the watch error log.
-                    let daemon_gone = matches!(e.code(), tonic::Code::Unavailable)
-                        || (matches!(e.code(), tonic::Code::Unknown)
-                            && e.message().contains("transport error"));
-                    if !daemon_gone {
-                        eprintln!("Warning: failed to stop watcher: {e}");
-                    }
-                }
+                stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
             }

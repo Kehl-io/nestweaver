@@ -6070,3 +6070,102 @@ fn missing_socket_retains_live_writer_evidence_across_repeated_status_calls() {
         .success()
         .stdout(contains("Daemon is running (PID"));
 }
+
+#[cfg(unix)]
+#[test]
+fn displaced_watch_controller_exits_without_stopping_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("watch-lifecycle.lbug");
+    write_test_repo(&repo);
+    create_db(&repo, &db);
+    let _daemon = DaemonGuard::new(&db);
+    start_daemon(&db);
+    struct Controller(std::process::Child);
+    impl Drop for Controller {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = |force: bool| {
+        let mut command = StdCommand::new(bin_path());
+        command
+            .args([
+                "watch",
+                repo.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+            ])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if force {
+            command.arg("--force");
+        }
+        Controller(command.spawn().unwrap())
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let observe = |client: &mut nestweaver_client::DaemonClient| {
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), client.health_check()).await
+        })
+        .unwrap()
+        .unwrap()
+        .watcher
+    };
+    let wait_registration = |client: &mut nestweaver_client::DaemonClient, previous: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(watcher) = observe(client)
+                && watcher.id != previous
+            {
+                return watcher;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch registration did not appear"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut first = spawn(false);
+    let original = wait_registration(&mut client, 0);
+    assert_eq!(original.kind, "code");
+    assert_eq!(original.controller_pid, Some(first.0.id() as i32));
+    let mut second = spawn(true);
+    let replacement = wait_registration(&mut client, original.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = first.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "displaced controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(observe(&mut client).unwrap().id, replacement.id);
+    assert!(second.0.try_wait().unwrap().is_none());
+    // Explicit administrative stop also terminates an external controller.
+    assert!(rt.block_on(client.stop_watch()).unwrap().ok);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = second.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped controller stayed alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(observe(&mut client).is_none());
+}
