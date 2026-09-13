@@ -570,6 +570,8 @@ fn detect_changes_impact_with_work_budget(
     phase_millis.insert("sorting".into(), sort_started.elapsed().as_millis() as u64);
     if work_budget_exceeded {
         status = status.max(AnalysisStatus::Partial);
+    }
+    if work_budget_exceeded && remaining_steps == 0 {
         notifications.push(Notification {
             level: NotificationLevel::Warning,
             descriptor: "change-impact-work-budget".into(),

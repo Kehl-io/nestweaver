@@ -2511,15 +2511,9 @@ impl GraphStore {
             let q = format!(
                 "MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence"
             );
-            let result = match conn.query(&q) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::trace!(
-                        "load_typed_edges: edge type {et} skipped (table may not exist): {e}"
-                    );
-                    continue;
-                }
-            };
+            let result = conn
+                .query(&q)
+                .map_err(|error| StoreError::Query(format!("load_typed_edges {et}: {error}")))?;
             for row in result {
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
@@ -2531,7 +2525,11 @@ impl GraphStore {
 
         // FILE_HAS_SYMBOL (DEFINES) edges: File → Symbol
         let q = "MATCH (f:File)-[r:FILE_HAS_SYMBOL]->(s:Symbol) RETURN f.uid, s.uid";
-        if let Ok(result) = conn.query(q) {
+        let conn = self.conn()?;
+        let result = conn.query(q).map_err(|error| {
+            StoreError::Query(format!("load_typed_edges FILE_HAS_SYMBOL: {error}"))
+        })?;
+        {
             for row in result {
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;

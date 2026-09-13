@@ -85,6 +85,10 @@ fn configure_tool(
         "hermes" => setup_hermes(db_path, base)?,
         _ => {}
     }
+    Ok(())
+}
+
+fn probe_configured_tool(name: &str, base: &Path) {
     if name != "aider" {
         match configured_mcp_entry(name, base) {
             Ok(entry) => crate::setup_probe::report(&entry, base),
@@ -93,7 +97,6 @@ fn configure_tool(
             ),
         }
     }
-    Ok(())
 }
 
 /// Read back what setup actually left on disk, including preserved custom
@@ -171,6 +174,7 @@ pub fn run_setup(
 
         any_configured = true;
         configure_tool(t.name, db_path, force_overwrite, base)?;
+        probe_configured_tool(t.name, base);
     }
 
     if let Some(specific) = tool

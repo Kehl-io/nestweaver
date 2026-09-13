@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-const PROTOCOL: &str = "2024-11-05";
+const PROTOCOL: &str = nestweaver_mcp::protocol::PROTOCOL_VERSION;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
 async fn response(reader: &mut BufReader<tokio::process::ChildStdout>, id: u64) -> Result<Value> {
@@ -72,8 +72,20 @@ pub async fn probe(
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n").await?;
         let listed = response(&mut output, 2).await?;
         let tools = listed["tools"].as_array().context("tools/list has no tools array")?;
-        for required in nestweaver_mcp::tools::LITE_TOOLS {
-            ensure!(tools.iter().any(|tool| tool["name"] == *required && tool["inputSchema"].is_object()), "configured MCP profile is missing {required}");
+        let lite = args.iter().any(|arg| arg == "--lite");
+        let catalogue = nestweaver_mcp::tools::tool_list(lite);
+        let mut expected: Vec<String> = catalogue["tools"].as_array().context("invalid built-in catalogue")?
+            .iter().filter_map(|tool| tool["name"].as_str().map(String::from)).collect();
+        if let Some(selection) = args.windows(2).find(|pair| pair[0] == "--tools") {
+            let names: Vec<_> = selection[1].split(',').collect();
+            ensure!(names.iter().all(|name| expected.iter().any(|candidate| candidate == name)), "configured MCP tool selection is unavailable in this profile");
+            expected.retain(|name| names.contains(&name.as_str()));
+        }
+        for required in &expected {
+            ensure!(tools.iter().any(|tool| tool["name"] == required.as_str() && tool["inputSchema"].is_object()), "configured MCP profile is missing {required}");
+        }
+        if lite || args.iter().any(|arg| arg == "--tools") {
+            ensure!(tools.len() == expected.len(), "MCP server did not honor the selected tool profile");
         }
         ensure!(listed.get("nextCursor").is_none_or(Value::is_null), "unexpected paginated NestWeaver tool catalogue");
         Ok(tools.len())
@@ -164,7 +176,7 @@ mod tests {
     fn mock_server(dir: &Path, initialize: &str, listed: &str) -> Vec<String> {
         let path = dir.join("server.sh");
         std::fs::write(&path, format!("read -r init\nprintf '%s\\n' '{initialize}'\nread -r notification\nread -r list\nprintf '%s\\n' '{listed}'\nexec sleep 20\n")).unwrap();
-        vec![path.to_string_lossy().to_string()]
+        vec![path.to_string_lossy().to_string(), "--lite".into()]
     }
 
     #[tokio::test]
@@ -189,6 +201,14 @@ mod tests {
                 .await
                 .unwrap(),
             6
+        );
+        let mut full_args = args.clone();
+        full_args.retain(|arg| arg != "--lite");
+        assert!(
+            probe("sh", &full_args, dir.path(), &[], Duration::from_secs(2))
+                .await
+                .is_err(),
+            "lite catalogue must not pass as full registration"
         );
         for (bad_init, bad_list) in [
             ("not-json".to_string(), list.to_string()),
