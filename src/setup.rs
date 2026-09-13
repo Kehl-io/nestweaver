@@ -1815,8 +1815,7 @@ mod settings_preservation_tests {
         std::fs::write(&db, "probe precondition only").unwrap();
         std::fs::create_dir_all(dir.path().join(".cursor")).unwrap();
         let marker = dir.path().join("must-not-run");
-        let entry =
-            serde_json::json!({"command":"sh", "args":["-c",r#"touch "$1""#,"sh",marker,"--db",db]});
+        let entry = serde_json::json!({"command":"sh", "args":["-c",r#"touch "$1""#,"sh",marker,"--db",db]});
         std::fs::write(
             dir.path().join(".cursor/mcp.json"),
             serde_json::json!({"mcpServers":{"nestweaver":entry.clone()}}).to_string(),
