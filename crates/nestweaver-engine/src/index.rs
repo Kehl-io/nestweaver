@@ -6287,6 +6287,11 @@ fn incremental_index_with_name_and_io_and_authority(
                             record_incremental_file_outcome(&mut result, outcome);
                         }
                         PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)
+                                .with_context(|| {
+                                    format!("delete policy-skipped rename target {to_str}")
+                                })?;
                             record_incremental_file_outcome(
                                 &mut result,
                                 IncrementalFileOutcome::PolicySkipped(skipped.clone()),
@@ -6664,6 +6669,11 @@ where
                             record_incremental_file_outcome(&mut result, outcome);
                         }
                         PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            let target_uid = nestweaver_schema::file_uid(&r_uid, &to_str);
+                            nestweaver_store::GraphStore::delete_file_node_on(&txn, &target_uid)
+                                .with_context(|| {
+                                    format!("delete policy-skipped rename target {to_str}")
+                                })?;
                             record_incremental_file_outcome(
                                 &mut result,
                                 IncrementalFileOutcome::PolicySkipped(skipped.clone()),
@@ -14468,6 +14478,102 @@ function hello(name) { return "Hello " + name; }
             store.repo_has_content(&repo_row).unwrap(),
             "full re-index must land content for the repo"
         );
+    }
+
+    fn assert_policy_skipped_rename_retracts_destination(use_bare_reader: bool) {
+        use crate::content_reader::GitBareReader;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("index.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("app.js"),
+            "export function source() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("keep.js"),
+            "export function keep() { return 2; }\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.test/policy-skipped-rename";
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        if !use_bare_reader {
+            index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        }
+        git(&["mv", "app.js", "app.min.js"]);
+        git(&["commit", "-q", "-m", "rename to generated bundle"]);
+        let new_sha = git(&["rev-parse", "HEAD"]);
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        if use_bare_reader {
+            index_with_reader(
+                &GitBareReader::new(&bare, &old_sha),
+                &store,
+                "test",
+                repo_url,
+                &old_sha,
+                None,
+            )
+            .unwrap();
+        }
+        // Simulate stale coverage at the rename destination. It is absent from
+        // the old Git tree, so Git must emit Renamed rather than Modified.
+        let target_uid = nestweaver_schema::file_uid(&r_uid, "app.min.js");
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: target_uid.clone(),
+                path: "app.min.js".into(),
+                repo_uid: r_uid.clone(),
+                content_hash: "stale".into(),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&r_uid, &target_uid).unwrap();
+        assert_eq!(store.list_files_by_repo(&r_uid).unwrap().len(), 3);
+        let result = if use_bare_reader {
+            let result = incremental_index_with_reader_and_write_gate(
+                &GitBareReader::new(&bare, &new_sha),
+                &bare,
+                &store,
+                "test",
+                repo_url,
+                &new_sha,
+                || Ok(()),
+            )
+            .unwrap();
+            drop(store);
+            result
+        } else {
+            drop(store);
+            incremental_index(&repo, &db_path, "test", repo_url).unwrap()
+        };
+        assert!(!result.fell_back_to_full, "must exercise the rename arm");
+        assert_eq!(result.files_renamed, 1);
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Ignored);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        assert_eq!(files.len(), 1, "stale rename File survived: {files:?}");
+        assert_eq!(files[0].1, "keep.js");
+        assert!(store.symbols_in_file("app.js").unwrap().is_empty());
+        assert!(store.symbols_in_file("app.min.js").unwrap().is_empty());
+        assert_eq!(
+            store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
+            new_sha
+        );
+    }
+
+    #[test]
+    fn filesystem_policy_skipped_rename_retracts_destination_file() {
+        assert_policy_skipped_rename_retracts_destination(false);
+    }
+
+    #[test]
+    fn bare_policy_skipped_rename_retracts_destination_file() {
+        assert_policy_skipped_rename_retracts_destination(true);
     }
 
     #[test]

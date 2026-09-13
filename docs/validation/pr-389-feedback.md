@@ -128,3 +128,32 @@ The rebuilt MCP suite passed all 339 tests. The focused live-daemon regression
 passed with the explicit symlink fixture, unchanged SHA/PID, fresh inventory,
 re-admission and invalid-config refusal. The broader daemon integration suite
 remains part of the final CI gate.
+
+## Final two suggestions
+
+Reviewed against `4334776c1f2da3171ae42b4d8ad4f7e32ad86f56` (whose
+[CI run passed](https://github.com/Kehl-io/nestweaver/actions/runs/34769866023)).
+Both suggestions are valid:
+
+- `finalize_project_budget` had no outer termination bound. A response with one
+  title `x`, budget 44, and the existing metadata-overrun note repeats the
+  true/false size cycle: the stored count is 45 while the final JSON measures
+  44. Replacing that note with itself cannot resolve it. The loop now allows
+  only the row-removal passes plus a final measurement; exhausted accounting
+  returns an error rather than unmeasured success. Boundary handling grows an
+  existing note so this case returns a correctly measured response, and a
+  repeated finalization is stable.
+- Both filesystem and bare-reader incremental rename arms removed destination
+  symbols but retained a destination File when preparation returned
+  `PolicySkipped`. Both now delete the destination File in the same transaction
+  before recording the skip. The regression seeds stale destination coverage,
+  performs a Git rename to `app.min.js`, and explicitly asserts that the
+  incremental rename arm ran. Both routes failed before the correction with
+  the stale File still present; the unaffected `keep.js` remains the control.
+
+After correction, all 11 rename tests and all 10 policy tests passed, including
+both previously failing destination-File cases and the watcher rename control.
+All 340 MCP tests passed. The budget boundary tests cover the existing-note
+cycle, exact final token counts, and idempotent repeated finalization. Fresh full-suite/CI validation is
+recorded in the PR description; the prior green run above is baseline evidence,
+not validation of the new commit.

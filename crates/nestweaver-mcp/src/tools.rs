@@ -11775,7 +11775,11 @@ fn finalize_project_budget(response: &mut Value) -> Result<(), anyhow::Error> {
     let budget = response["token_budget"].as_u64().unwrap_or(0) as usize;
     let available = response["connected"].as_array().map_or(0, Vec::len)
         + response["more_available"].as_u64().unwrap_or(0) as usize;
-    loop {
+    // Each pass either removes a row or adds irreducible-overhead metadata.
+    // Allow one final measurement after the last row/metadata change, and fail
+    // explicitly rather than depending on serialized-size convergence forever.
+    let max_passes = response["connected"].as_array().map_or(0, Vec::len).max(1) + 1;
+    for _ in 0..max_passes {
         for _ in 0..4 {
             let tokens = serde_json::to_vec(response)?.len().div_ceil(4);
             response["tokens_used"] = json!(tokens);
@@ -11797,10 +11801,21 @@ fn finalize_project_budget(response: &mut Value) -> Result<(), anyhow::Error> {
             // At the exact boundary, `false` is one byte longer than `true`,
             // so the budget flag itself can oscillate by one token. Explain
             // the irreducible overhead; the final, larger overrun is stable.
-            response["budget_note"] =
-                json!("Response metadata and minimum context exceed the requested token budget.");
+            // Grow an existing note too: replacing it with identical text could
+            // leave a re-finalized response at the same oscillating boundary.
+            let note = response["budget_note"].as_str().map_or_else(
+                || {
+                    "Response metadata and minimum context exceed the requested token budget."
+                        .to_owned()
+                },
+                |note| format!("{note} Final serialized metadata is included in this accounting."),
+            );
+            response["budget_note"] = json!(note);
         }
     }
+    Err(anyhow!(
+        "project response budget accounting did not converge within its bounded passes"
+    ))
 }
 
 fn tool_project_context(
@@ -16052,6 +16067,27 @@ mod project_context_bug12_tests {
             saw_boundary_note,
             "fixture must exercise the one-byte boolean boundary"
         );
+    }
+
+    #[test]
+    fn project_budget_existing_note_boundary_terminates_with_exact_accounting() {
+        // With the old loop, true measures 44 tokens and false measures 45:
+        // replacing the existing note with itself never breaks the cycle.
+        let mut response = json!({
+            "connected": [{"title": "x"}],
+            "tokens_used": 0,
+            "token_budget": 44,
+            "budget_exceeded": false,
+            "budget_note": "Response metadata and minimum context exceed the requested token budget.",
+        });
+        finalize_project_budget(&mut response).unwrap();
+        let actual = serde_json::to_vec(&response).unwrap().len().div_ceil(4);
+        assert_eq!(response["tokens_used"], actual);
+        assert_eq!(response["budget_exceeded"], actual > 44);
+        assert_eq!(response["connected"].as_array().unwrap().len(), 1);
+        let finalized = response.clone();
+        finalize_project_budget(&mut response).unwrap();
+        assert_eq!(response, finalized, "stable accounting must be idempotent");
     }
 
     #[test]
