@@ -41,9 +41,10 @@ target name. The surviving seed link prevents inode reuse while the plan is
 recoverable. A retry validates that exact seed and target before binding writer
 authority. Unrelated empty files, changed plans, symlinks and replacement inodes
 are refused. A nonempty target must reopen without migration and carry the
-exact planned identity before the worker advances to Graph. The seed lives with
-the journal until the journal is discarded; deleting its link does not delete
-the publication's data link.
+exact planned identity before the worker advances to Graph. After Graph is durably checkpointed, the worker retires the seed and its
+creation record before indexing. Graph-entry cleanup is idempotent across
+interruption; completed journals cannot keep pruned database storage alive.
+Deleting the seed link does not delete the publication's data link.
 
 Checks at authority and mutation boundaries detect completed substitutions; they
 are not an atomic filesystem sandbox against a same-UID actor racing every

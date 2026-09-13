@@ -352,6 +352,67 @@ fn ensure_planned_database_with_checkpoint(
     Ok(())
 }
 
+/// Drop creation-only hard links after Graph is durable. Retrying this cleanup
+/// on Graph entry prevents successful journals from retaining pruned graph
+/// storage forever, including after a crash between phase commit and cleanup.
+pub fn retire_planned_creation(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+    root_lock: &crate::publication::PublicationRootLock,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root = root_lock.ensure_authorizes(publication_root)?;
+    anyhow::ensure!(
+        state.phase != PublicationPhase::Planned,
+        "creation still needs its provenance"
+    );
+    let actual = load_operation(root, &state.plan.operation_uuid)?;
+    anyhow::ensure!(actual == *state, "publication creation journal changed");
+    let operation = crate::publication::operation_path(root, &state.plan.operation_uuid)?;
+    let provenance = operation.join("creation.json");
+    if !provenance.try_exists()? {
+        return Ok(());
+    }
+    let record: PlannedCreation = serde_json::from_slice(&std::fs::read(&provenance)?)?;
+    let target = crate::publication::slot_path(root, &state.plan.target_publication_uuid)?
+        .join(crate::publication::PUBLICATION_GRAPH_FILE);
+    anyhow::ensure!(
+        record.plan == state.plan && record.target == target,
+        "creation provenance belongs to another plan or target"
+    );
+    let suffix = record
+        .seed_name
+        .strip_prefix("creation-seed-")
+        .ok_or_else(|| anyhow::anyhow!("invalid creation seed name"))?;
+    parse_non_nil_uuid("creation seed", suffix)?;
+    let target_metadata = std::fs::symlink_metadata(&target)?;
+    anyhow::ensure!(
+        target_metadata.is_file()
+            && target_metadata.len() != 0
+            && target_metadata.dev() == record.device
+            && target_metadata.ino() == record.inode,
+        "staged target was replaced; refusing creation cleanup"
+    );
+    let seed = operation.join(record.seed_name);
+    match std::fs::symlink_metadata(&seed) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.dev() == record.device
+                    && metadata.ino() == record.inode,
+                "creation seed was replaced; refusing cleanup"
+            );
+            std::fs::remove_file(&seed)?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&seed)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::remove_file(&provenance)?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&provenance)?;
+    Ok(())
+}
+
 pub fn create_operation(
     publication_root: &Path,
     plan: PublicationOperationPlan,
@@ -1141,6 +1202,33 @@ mod tests {
                 .publication_uuid,
             state.plan.target_publication_uuid
         );
+    }
+
+    #[test]
+    fn graph_checkpoint_retires_seed_without_retaining_pruned_database_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = crate::publication::PublicationRootLock::acquire(dir.path()).unwrap();
+        let state = create_operation(dir.path(), plan()).unwrap();
+        ensure_planned_database(dir.path(), &state, &lock).unwrap();
+        let state = advance_phase(
+            dir.path(),
+            &state.plan.operation_uuid,
+            state.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        let operation =
+            crate::publication::operation_path(dir.path(), &state.plan.operation_uuid).unwrap();
+        let record: PlannedCreation =
+            serde_json::from_slice(&std::fs::read(operation.join("creation.json")).unwrap())
+                .unwrap();
+        let seed = operation.join(record.seed_name);
+        assert!(seed.exists());
+        retire_planned_creation(dir.path(), &state, &lock).unwrap();
+        retire_planned_creation(dir.path(), &state, &lock).unwrap();
+        assert!(!seed.exists());
+        assert!(!operation.join("creation.json").exists());
+        assert!(record.target.exists());
     }
 
     #[test]

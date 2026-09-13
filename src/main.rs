@@ -35374,6 +35374,9 @@ fn run_publication_rebuild(
                     }
                 }
                 PublicationPhase::Graph => {
+                    nestweaver_engine::publication_operation::retire_planned_creation(
+                        &publication_root, &state, &root_lock,
+                    )?;
                     verify_staged_publication_identity(&target_db, &state.plan)?;
                     let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
                     let mut completed = 0_u64;
