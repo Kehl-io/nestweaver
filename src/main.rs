@@ -2234,7 +2234,7 @@ fn impact_json_ok(
             obj.insert("note".to_string(), serde_json::json!(note));
         }
     }
-    nestweaver_schema::responses::impact(payload)
+    json_payload_with_provenance(nestweaver_schema::responses::impact(payload))
 }
 
 /// Length of a JSON node collection, for envelopes that must report what they
@@ -2706,12 +2706,12 @@ fn impact_json_ambiguous(
     repo_filter: Option<&str>,
     candidates: serde_json::Value,
 ) -> serde_json::Value {
-    nestweaver_schema::responses::impact(serde_json::json!({
+    json_payload_with_provenance(nestweaver_schema::responses::impact(serde_json::json!({
         "status": "ambiguous",
         "symbol": symbol,
         "candidates": candidates,
         "note": impact_ambiguity_remedy(repo_filter),
-    }))
+    })))
 }
 
 /// The one sentence both the JSON and the text renderings of an ambiguous
@@ -2731,12 +2731,12 @@ fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
-    nestweaver_schema::responses::impact(serde_json::json!({
+    json_payload_with_provenance(nestweaver_schema::responses::impact(serde_json::json!({
         "status": "not_found",
         "symbol": symbol,
         "error": "not found",
         "name": symbol,
-    }))
+    })))
 }
 
 /// Render a `dead-code` result as text from its JSON payload.
@@ -4749,11 +4749,14 @@ mod daemon_status_renderer_tests {
                 )),
             }),
             embedding_status: Some(embedding()),
+            supervision: "systemd-user".to_string(),
             ..Default::default()
         };
 
         let output = format_daemon_status_response(Ok(&status));
-        assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: /canonical/instance.toml\nSupervision: systemd-user\nEmbedding:\n"
+        ));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
     }
@@ -4801,14 +4804,18 @@ mod daemon_status_renderer_tests {
         };
 
         let output = format_daemon_status_response(Ok(&status));
-        assert!(output.starts_with("Config: none — compiled defaults\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: none — compiled defaults\nSupervision: unknown/unverifiable\nEmbedding:\n"
+        ));
     }
 
     #[test]
     fn absent_old_wire_fields_are_reported_as_unknown() {
         let output =
             format_daemon_status_response(Ok(&nestweaver_proto::BrainStatusResponse::default()));
-        assert!(output.starts_with("Config: unknown (older daemon)\nEmbedding:\n"));
+        assert!(output.starts_with(
+            "Config: unknown (older daemon)\nSupervision: unknown/unverifiable\nEmbedding:\n"
+        ));
         assert!(output.contains("  State:            unknown (older daemon)"));
     }
 
