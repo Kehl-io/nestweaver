@@ -64,6 +64,12 @@ pub struct ExclusionInventory {
 /// reads from blobless bare clones via a pooled, persistent `git cat-file --batch`
 /// subprocess (one process per reader, reused for every file read).
 pub trait ContentReader: Send + Sync {
+    /// Persisted with the indexed graph so policy-only changes cannot reuse a
+    /// same-SHA answer. Readers with configurable eligibility override this.
+    fn eligibility_fingerprint(&self) -> String {
+        "reader-default-v1".to_string()
+    }
+
     /// Apply configured eligibility to a single changed or deleted relative path.
     /// Readers without additional exclusions retain their existing policy.
     fn accepts_path(&self, _rel: &Path) -> bool {
@@ -673,6 +679,18 @@ fn load_git_tracked_files(root: &Path) -> Option<HashSet<PathBuf>> {
 }
 
 impl ContentReader for FilesystemReader {
+    fn eligibility_fingerprint(&self) -> String {
+        let mut excludes = self.exclude_patterns.clone();
+        excludes.sort();
+        excludes.dedup();
+        let mut unskip: Vec<_> = self.unskip.iter().collect();
+        unskip.sort();
+        crate::hash::blake3_hex(&serde_json::json!({
+            "version": 1, "excludes": excludes, "unskip": unskip,
+            "skip_dirs": self.skip_dirs, "max_source_file_bytes": self.limits.max_source_file_bytes(),
+        }).to_string())
+    }
+
     fn accepts_path(&self, rel: &Path) -> bool {
         FilesystemReader::accepts_path(self, rel)
     }
@@ -1387,6 +1405,16 @@ fn decode_git_blob(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
 }
 
 impl ContentReader for GitBareReader {
+    fn eligibility_fingerprint(&self) -> String {
+        crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v1",
+                "max_source_file_bytes": self.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        )
+    }
+
     fn read_file(&self, rel_path: &Path) -> Result<String> {
         let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1519,6 +1547,23 @@ impl ContentReader for GitBareReader {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn eligibility_fingerprint_tracks_policy_but_not_pattern_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = FilesystemReader::new(dir.path());
+        let original = base.eligibility_fingerprint();
+        let unskipped = FilesystemReader::new(dir.path()).unskipping(&["public".to_string()]);
+        assert_ne!(original, unskipped.eligibility_fingerprint());
+        let a = FilesystemReader::new(dir.path())
+            .excluding(&["plugins/**".into(), "*.gen.rs".into()])
+            .unwrap();
+        let b = FilesystemReader::new(dir.path())
+            .excluding(&["*.gen.rs".into(), "plugins/**".into()])
+            .unwrap();
+        assert_ne!(original, a.eligibility_fingerprint());
+        assert_eq!(a.eligibility_fingerprint(), b.eligibility_fingerprint());
+    }
 
     #[test]
     fn filesystem_reader_read_file() {

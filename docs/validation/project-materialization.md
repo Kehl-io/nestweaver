@@ -70,7 +70,8 @@ matching zero rows. The paired benchmark measures this complete production path.
 
 The [isolated performance job](https://github.com/Kehl-io/nestweaver/actions/runs/34736783556/job/103669515714)
 passed on `a771754e7cccc8be96013194813ff3a2c865ef79`. Its measured materialization
-implementation is unchanged by the later logging and response-contract fixes.
+algorithm is unchanged by the follow-up fixes. These timings describe the
+recorded source and have not been remeasured on the follow-up head.
 This successful job is distinct from the same run's failed, subsequently fixed
 contract tests.
 

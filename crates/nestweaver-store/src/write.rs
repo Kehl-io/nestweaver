@@ -8303,6 +8303,52 @@ impl GraphStore {
         result
     }
 
+    /// Record the eligibility policy after the repository's graph has been
+    /// rebuilt and before its publication marker is cleared. Callers retain
+    /// their normal mutation/publication authority for this operation.
+    pub fn set_repo_index_policy(
+        &self,
+        repo_uid: &str,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let result = Self::set_repo_index_policy_on(&conn, repo_uid, fingerprint)
+            .and_then(|()| self.commit_transaction(&conn));
+        if result.is_err() {
+            let _ = conn.query("ROLLBACK");
+        }
+        result
+    }
+
+    /// Update policy metadata in the caller's existing graph transaction.
+    /// This function never commits: graph changes and their policy proof must
+    /// become visible together, or both roll back.
+    pub fn set_repo_index_policy_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        if fingerprint.is_empty() {
+            return Err(StoreError::Query(
+                "repo index policy must not be empty".into(),
+            ));
+        }
+        let key = format!("repo-index-policy:{repo_uid}");
+        exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String(key.clone()))],
+        )?;
+        exec_params(
+            conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String(key)),
+                ("v", lbug::Value::String(fingerprint.to_string())),
+            ],
+        )
+    }
+
     /// Record that contract derivation failed for `repo_uid`.
     ///
     /// Contract derivation is best-effort: a malformed spec or a rejected bulk
@@ -10773,6 +10819,44 @@ mod tests {
         assert_eq!(
             store.get_embedding_metadata().unwrap(),
             Some((weird.to_string(), 384))
+        );
+    }
+
+    #[test]
+    fn repo_index_policy_migrates_and_changes_only_with_its_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index-policy.lbug");
+        let store = GraphStore::create(&db_path).unwrap();
+        let repo = "repo:quoted'\"policy";
+        assert_eq!(store.get_repo_index_policy(repo).unwrap(), None);
+        store
+            .set_repo_index_policy(repo, "eligibility-v1:first")
+            .unwrap();
+        assert_eq!(store.get_repo_index_policy("repo:other").unwrap(), None);
+        {
+            let conn = store.begin_transaction().unwrap();
+            GraphStore::set_repo_index_policy_on(&conn, repo, "eligibility-v1:discarded").unwrap();
+            conn.query("ROLLBACK").unwrap();
+        }
+        assert_eq!(
+            store.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:first")
+        );
+        assert!(store.set_repo_index_policy(repo, "").is_err());
+        assert_eq!(
+            store.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:first")
+        );
+        {
+            let conn = store.begin_transaction().unwrap();
+            GraphStore::set_repo_index_policy_on(&conn, repo, "eligibility-v1:changed").unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let reopened = GraphStore::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_repo_index_policy(repo).unwrap().as_deref(),
+            Some("eligibility-v1:changed")
         );
     }
 

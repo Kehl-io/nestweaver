@@ -508,6 +508,40 @@ fn checkpoint_operation(
     expected_revision: u64,
     update: impl FnOnce(&mut PublicationOperationState) -> anyhow::Result<()>,
 ) -> anyhow::Result<PublicationOperationState> {
+    let journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
+    checkpoint_operation_locked(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        &journal_lock,
+        update,
+    )
+}
+
+// Separate from PublicationRootLock: an operator must be able to request
+// cancellation while a worker holds the root lock for a long rebuild. This
+// stable per-journal authority serializes read/check/update/fsync/rename across
+// threads and processes, without coupling independent operations or roots.
+fn lock_operation_journal(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<nestweaver_store::stable_anchor::StableAnchor> {
+    let path = operation_state_path(publication_root, operation_uuid)?;
+    let path = nestweaver_store::canonical_db_path(&path);
+    Ok(nestweaver_store::stable_anchor::StableAnchor::acquire(
+        "publication-operation-journal",
+        &path,
+        true,
+    )?)
+}
+
+fn checkpoint_operation_locked(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    journal_lock: &nestweaver_store::stable_anchor::StableAnchor,
+    update: impl FnOnce(&mut PublicationOperationState) -> anyhow::Result<()>,
+) -> anyhow::Result<PublicationOperationState> {
     let incumbent = load_operation(publication_root, operation_uuid)?;
     if incumbent.revision != expected_revision {
         anyhow::bail!(
@@ -523,6 +557,9 @@ fn checkpoint_operation(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("publication operation revision exhausted"))?;
     next.updated_unix_millis = unix_millis().max(incumbent.updated_unix_millis);
+    if !journal_lock.is_current() {
+        anyhow::bail!("publication journal authority was replaced before checkpoint");
+    }
     persist_state(
         &operation_state_path(publication_root, operation_uuid)?,
         &next,
@@ -656,11 +693,18 @@ pub fn mark_ready(
 /// checkpoint is performed.
 pub fn activate_operation(
     publication_root: &Path,
+    root_lock: &crate::publication::PublicationRootLock,
     operation_uuid: &str,
     expected_revision: u64,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
 ) -> anyhow::Result<PublicationOperationState> {
-    let state = select_operation(publication_root, operation_uuid, expected_revision, lease)?;
+    let state = select_operation(
+        publication_root,
+        root_lock,
+        operation_uuid,
+        expected_revision,
+        lease,
+    )?;
     complete_activation(publication_root, operation_uuid, state.revision)
 }
 
@@ -696,10 +740,13 @@ impl PermanentPublicationFailure {
 /// operation is made terminal.
 pub fn select_operation(
     publication_root: &Path,
+    root_lock: &crate::publication::PublicationRootLock,
     operation_uuid: &str,
     expected_revision: u64,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
 ) -> anyhow::Result<PublicationOperationState> {
+    let publication_root = root_lock.ensure_authorizes(publication_root)?;
+    let journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     let mut state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -711,11 +758,16 @@ pub fn select_operation(
         anyhow::bail!("publication operation is failed or cancelled");
     }
     if state.phase == PublicationPhase::Ready {
-        state = advance_phase(
+        state = checkpoint_operation_locked(
             publication_root,
             operation_uuid,
             state.revision,
-            PublicationPhase::Activating,
+            &journal_lock,
+            |state| {
+                state.phase = PublicationPhase::Activating;
+                state.progress = None;
+                Ok(())
+            },
         )?;
     } else if state.phase != PublicationPhase::Activating {
         anyhow::bail!("publication activation requires ready or activating phase");
@@ -745,8 +797,12 @@ pub fn select_operation(
             state.plan.expected_current_publication_uuid.clone(),
             digest,
         )?;
+        if !journal_lock.is_current() {
+            anyhow::bail!("publication journal authority was replaced before activation");
+        }
         crate::publication::compare_and_swap_current(
             publication_root,
+            root_lock,
             lease,
             state.plan.expected_current_publication_uuid.as_deref(),
             &pointer,
@@ -907,6 +963,7 @@ pub fn discard_operation(
     lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
     let publication_root = lock.ensure_authorizes(publication_root)?;
+    let _journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     let state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -974,6 +1031,7 @@ pub fn discard_invalid_operation(
     lock: &crate::publication::PublicationRootLock,
 ) -> anyhow::Result<()> {
     let publication_root = lock.ensure_authorizes(publication_root)?;
+    let _journal_lock = lock_operation_journal(publication_root, operation_uuid)?;
     parse_non_nil_uuid("operation_uuid", operation_uuid)?;
     let operation_dir = crate::publication::operation_path(publication_root, operation_uuid)?;
     let tombstone = publication_root.join("operations").join(format!(
@@ -1365,6 +1423,94 @@ mod tests {
     }
 
     #[test]
+    fn selection_refuses_unrelated_root_authority_before_changing_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publication");
+        let created = create_operation(&root, plan()).unwrap();
+        let unrelated =
+            crate::publication::PublicationRootLock::acquire(&dir.path().join("unrelated"))
+                .unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let error = select_operation(
+            &root,
+            &unrelated,
+            &created.plan.operation_uuid,
+            created.revision,
+            &lease,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert_eq!(
+            load_operation(&root, &created.plan.operation_uuid).unwrap(),
+            created
+        );
+        assert!(crate::publication::read_current(&root).unwrap().is_none());
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_serializes_concurrent_cancellation_without_losing_either_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create_operation(dir.path(), plan()).unwrap();
+        let independent = create_operation(dir.path(), plan()).unwrap();
+        let _root_lock = crate::publication::PublicationRootLock::acquire(dir.path()).unwrap();
+        let operation_uuid = created.plan.operation_uuid.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = dir.path();
+            let worker_uuid = &operation_uuid;
+            let revision = created.revision;
+            let worker = scope.spawn(move || {
+                checkpoint_operation(root, worker_uuid, revision, |state| {
+                    // Stop after reading/checking the old revision, before
+                    // rename: exactly the former lost-cancellation window.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    state.phase = PublicationPhase::Graph;
+                    Ok(())
+                })
+            });
+            entered_rx.recv().unwrap();
+            let concurrent = request_cancel(dir.path(), &operation_uuid, created.revision);
+            // The short journal lock fails busy after its bounded wait. It
+            // must never permit cancellation to commit behind the paused writer.
+            let while_paused = load_operation(dir.path(), &operation_uuid);
+            let independent_cancel = request_cancel(
+                dir.path(),
+                &independent.plan.operation_uuid,
+                independent.revision,
+            );
+            release_tx.send(()).unwrap();
+            let progressed = worker.join().unwrap().unwrap();
+            assert!(concurrent.is_err());
+            assert!(independent_cancel.unwrap().cancel_requested);
+            assert_eq!(while_paused.unwrap(), created);
+            let cancelled =
+                request_cancel(dir.path(), &operation_uuid, progressed.revision).unwrap();
+            assert_eq!(cancelled.phase, PublicationPhase::Graph);
+            assert!(cancelled.cancel_requested);
+            assert_eq!(cancelled.revision, created.revision + 2);
+            assert!(
+                advance_phase(
+                    dir.path(),
+                    &operation_uuid,
+                    progressed.revision,
+                    PublicationPhase::TextSearch,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("stale publication-operation writer")
+            );
+            assert_eq!(
+                load_operation(dir.path(), &operation_uuid).unwrap(),
+                cancelled
+            );
+        });
+    }
+
+    #[test]
     fn operation_checkpoints_are_durable_sequential_and_revision_cas_protected() {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan();
@@ -1560,8 +1706,14 @@ mod tests {
             Some(expected_digest.as_str())
         );
         let lease = incumbent.acquire_index_publication_lease().unwrap();
-        let activated =
-            activate_operation(dir.path(), &plan.operation_uuid, ready.revision, &lease).unwrap();
+        let activated = activate_operation(
+            dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
+            &plan.operation_uuid,
+            ready.revision,
+            &lease,
+        )
+        .unwrap();
         assert_eq!(activated.phase, PublicationPhase::Activated);
         let current = crate::publication::read_current(dir.path())
             .unwrap()
@@ -1605,6 +1757,7 @@ mod tests {
         let lease = incumbent.acquire_index_publication_lease().unwrap();
         crate::publication::compare_and_swap_current(
             dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
             &lease,
             recovery_plan.expected_current_publication_uuid.as_deref(),
             &pointer,
@@ -1612,6 +1765,7 @@ mod tests {
         .unwrap();
         let recovered = activate_operation(
             dir.path(),
+            &crate::publication::PublicationRootLock::acquire(dir.path()).unwrap(),
             &recovery_plan.operation_uuid,
             activating.revision,
             &lease,

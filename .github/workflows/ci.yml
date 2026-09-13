@@ -1330,6 +1330,7 @@ jobs:
           fi
 
           bash scripts/verify-required-ci.sh --self-test
+          bash scripts/verify-main-rules.sh --ruleset .github/main-ruleset.json
           bash scripts/verify-main-rules.sh --self-test
           python3 scripts/test-verify-release-fault.py
           node npm/nestweaver.test.js

@@ -1,7 +1,10 @@
 # Validation of the 18 scoped backlog fixes
 
-Status: reviewed, validated and signed off by the orchestrator on 2026-09-13
-for opening the implementation PR. Final PR-head CI remains a separate gate.
+Status: follow-up fixes reviewed and locally validated. User feedback identified
+valid concurrency, execution-boundary and response-contract gaps after the
+initial signoff. The [follow-up record](pr-389-feedback.md) documents their fixes,
+new regressions and local harness limitations. Exact final PR-head CI remains
+the merge acceptance gate; the historical evidence below is not a substitute.
 
 The integration branch starts at main `5149d22cd885107fa5d8f047a00d87e1fff86847`.
 The successful release/CI validation candidate is `f4a1bc3ddb0b7cdd71b9becff8aadc25a8b7f9e1`.
@@ -62,7 +65,7 @@ its exact branch independently confirmed absent.
 | Linux archive baseline | Extracted binary and bundled runtimes checked against GLIBC 2.35, real negative ELF fixture | Earlier ARM archive passes; both f4a1bc3d Linux archive targets and complete normal dry-run proof pass |
 | Missing daemon socket | Verified live writer reported as running but unreachable | Real missing-socket process regression passes |
 | Watcher lifecycle | Session identities, conditional stop, displacement and drain semantics | Portable event/displacement/drain matrix passes locally; ad-hoc signed macOS fixture passes with all 63 daemon process tests |
-| Explicit setup MCP probe | Stored command/args/env initialize and tools/list handshake; bounded output/time; unsupported host context disclosed | Nine setup tests and real candidate lite/full handshakes pass |
+| Explicit setup MCP probe | Canonical current-binary MCP invocation with bounded arguments, output and time; custom commands/environment preserved but unexecuted; unsupported host context disclosed | Nine setup tests and real candidate lite/full handshakes pass |
 | Large detect-changes | Independent traversal work cap, cooperative DB/engine deadline, honest partial gate and uncached timeout | Native timeout/recovery and 56-file work-budget regression pass; four full-source instrumented requests pass with exact totals and responsive concurrent status |
 | Linux supervision | PID-generation-checked cgroup provenance and unknown fallback | Cgroup fixtures and rebuilt status rendering pass |
 | Production-degree remove-repo | Two isolated complete degree ladders with preselected repeat/decision criteria | Two ladders pass repeatability; no further scaling mitigation justified by fixture |

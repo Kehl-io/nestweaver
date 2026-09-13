@@ -317,7 +317,7 @@ fn detect_changes_impact_until(
     // invalid/empty request into a successful partial response.
     crate::changed_files::require_changed_files(changed_files)?;
     let result = store.with_read_deadline(deadline, || {
-        detect_changes_impact_with_work_budget(store, changed_files, max_depth, 2_000_000)
+        detect_changes_impact_with_work_budget(store, changed_files, max_depth, 2_000_000, deadline)
     });
     match result {
         Ok(mut result) if std::time::Instant::now() >= deadline => {
@@ -362,9 +362,9 @@ fn detect_changes_impact_with_work_budget(
     changed_files: &[String],
     max_depth: u32,
     work_budget: usize,
+    deadline: std::time::Instant,
 ) -> Result<ChangeImpact> {
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(60);
     let mut phase_millis = std::collections::BTreeMap::new();
     let changed_files = crate::changed_files::require_changed_files(changed_files)?;
 
@@ -687,8 +687,22 @@ mod tests {
         assert_eq!(complete.affected_processes.len(), 56);
         assert!(!complete.work_budget_exceeded);
         assert_eq!(complete.status, AnalysisStatus::Complete);
-        let limited = detect_changes_impact_with_work_budget(&store, &files, 10, 150).unwrap();
-        let repeated = detect_changes_impact_with_work_budget(&store, &files, 10, 150).unwrap();
+        let limited = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            150,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let repeated = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            150,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
         assert!(limited.work_budget_exceeded);
         assert_eq!(limited.traversal_steps, 150);
         assert_eq!(limited.status, AnalysisStatus::Partial);
@@ -700,6 +714,20 @@ mod tests {
         for phase in ["planning", "graph_load", "traversal", "sorting"] {
             assert!(limited.phase_millis.contains_key(phase));
         }
+        // The traversal receives the caller's deadline, even when no native
+        // read scope is installed: graph loading cannot reset its clock.
+        let expired = detect_changes_impact_with_work_budget(
+            &store,
+            &files,
+            10,
+            2_000_000,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(expired.deadline_exceeded);
+        assert!(!expired.work_budget_exceeded);
+        assert_eq!(expired.traversal_steps, 0);
+        assert_ne!(expired.gate_state, GateState::Ok);
         // A bounded request leaves the store responsive for an independent read.
         assert_eq!(store.count_symbols().unwrap(), 56);
     }

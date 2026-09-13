@@ -1208,18 +1208,21 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
 }
 
 /// Durably select `next` when the currently selected publication UUID equals
-/// `expected_current`. The caller must hold the incumbent graph's publication
-/// lease, which serializes switch attempts with graph/sidecar publication.
+/// `expected_current`. The caller must hold both the publication root authority
+/// and incumbent graph's publication lease. The root authority serializes
+/// switches across different graph stores and prevents bypassing root exclusion.
 ///
 /// The target slot's canonical `publication.json` must already exist and hash
 /// to `next.manifest_blake3`; a pointer can never select a missing or differently
 /// sealed slot.
 pub fn compare_and_swap_current(
     publication_root: &Path,
+    root_lock: &PublicationRootLock,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
     expected_current: Option<&str>,
     next: &CurrentPublicationPointer,
 ) -> anyhow::Result<()> {
+    let publication_root = root_lock.ensure_authorizes(publication_root)?;
     lease
         .ensure_clean_for_snapshot()
         .map_err(|error| anyhow::anyhow!("refusing CURRENT switch from dirty graph: {error}"))?;
@@ -1310,6 +1313,7 @@ pub fn compare_and_swap_current(
     std::fs::create_dir_all(publication_root)?;
     let path = current_pointer_path(publication_root);
     let bytes = serde_json::to_vec_pretty(next)?;
+    root_lock.ensure_authorizes(publication_root)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
         file.write_all(&bytes)?;
         file.write_all(b"\n")
@@ -1594,6 +1598,7 @@ pub fn rollback_current_under_lock(
     )?;
     compare_and_swap_current(
         publication_root,
+        root_lock,
         lease,
         Some(&current.publication_uuid),
         &previous,
@@ -2168,6 +2173,31 @@ mod tests {
     }
 
     #[test]
+    fn current_switch_refuses_unrelated_and_replaced_root_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publication");
+        let sibling = dir.path().join("sibling");
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let digest = write_slot(&root, &identity);
+        let pointer = CurrentPublicationPointer::new(&identity, None, digest).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let unrelated = PublicationRootLock::acquire(&sibling).unwrap();
+        let error =
+            compare_and_swap_current(&root, &unrelated, &lease, None, &pointer).unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert!(read_current(&root).unwrap().is_none());
+
+        let held = PublicationRootLock::acquire(&root).unwrap();
+        std::fs::rename(held.path(), root.join("displaced-lock")).unwrap();
+        std::fs::write(held.path(), b"").unwrap();
+        let error = compare_and_swap_current(&root, &held, &lease, None, &pointer).unwrap_err();
+        assert!(error.to_string().contains("does not authorize"));
+        assert!(read_current(&root).unwrap().is_none());
+        lease.release().unwrap();
+    }
+
+    #[test]
     fn current_pointer_compare_and_swap_is_checked_and_durable() {
         let dir = tempfile::tempdir().unwrap();
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
@@ -2175,7 +2205,14 @@ mod tests {
         let first_digest = write_slot(dir.path(), &incumbent);
         let first = CurrentPublicationPointer::new(&incumbent, None, first_digest).unwrap();
         let lease = store.acquire_index_publication_lease().unwrap();
-        compare_and_swap_current(dir.path(), &lease, None, &first).unwrap();
+        compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &first,
+        )
+        .unwrap();
         assert_eq!(read_current(dir.path()).unwrap(), Some(first.clone()));
 
         let next_identity = incumbent.next_publication().unwrap();
@@ -2186,8 +2223,14 @@ mod tests {
             next_digest,
         )
         .unwrap();
-        compare_and_swap_current(dir.path(), &lease, Some(&incumbent.publication_uuid), &next)
-            .unwrap();
+        compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            Some(&incumbent.publication_uuid),
+            &next,
+        )
+        .unwrap();
         assert_eq!(read_current(dir.path()).unwrap(), Some(next.clone()));
 
         let stale = incumbent.next_publication().unwrap();
@@ -2200,6 +2243,7 @@ mod tests {
         .unwrap();
         let error = compare_and_swap_current(
             dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
             &lease,
             Some(&incumbent.publication_uuid),
             &stale_pointer,
@@ -2540,7 +2584,14 @@ mod tests {
         // the retained rollback target.
         let lease = store.acquire_index_publication_lease().unwrap();
         let first = CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
-        compare_and_swap_current(root, &lease, None, &first).unwrap();
+        compare_and_swap_current(
+            root,
+            &PublicationRootLock::acquire(root).unwrap(),
+            &lease,
+            None,
+            &first,
+        )
+        .unwrap();
         let pointer = CurrentPublicationPointer::new(
             &current_identity,
             Some(predecessor.publication_uuid.clone()),
@@ -2549,6 +2600,7 @@ mod tests {
         .unwrap();
         compare_and_swap_current(
             root,
+            &PublicationRootLock::acquire(root).unwrap(),
             &lease,
             Some(predecessor.publication_uuid.as_str()),
             &pointer,
@@ -2637,17 +2689,29 @@ mod tests {
         let foreign_pointer =
             CurrentPublicationPointer::new(&foreign, None, foreign_digest).unwrap();
         let lease = store.acquire_index_publication_lease().unwrap();
-        let error = compare_and_swap_current(dir.path(), &lease, None, &foreign_pointer)
-            .unwrap_err()
-            .to_string();
+        let error = compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &foreign_pointer,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("across brains"), "{error}");
 
         let next = incumbent.next_publication().unwrap();
         let missing_digest = "a".repeat(64);
         let missing = CurrentPublicationPointer::new(&next, None, missing_digest).unwrap();
-        let error = compare_and_swap_current(dir.path(), &lease, None, &missing)
-            .unwrap_err()
-            .to_string();
+        let error = compare_and_swap_current(
+            dir.path(),
+            &PublicationRootLock::acquire(dir.path()).unwrap(),
+            &lease,
+            None,
+            &missing,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("read target publication manifest"),
             "{error}"

@@ -3519,6 +3519,32 @@ impl GraphStore {
 
     // ── DB-level metadata ───────────────────────────────────────────────────
 
+    /// Eligibility policy used by the last successfully published repository
+    /// index. Missing metadata means an older index needs a full rebuild;
+    /// query failures must never be interpreted as an unchanged policy.
+    pub fn get_repo_index_policy(&self, repo_uid: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+            .map_err(|error| StoreError::Query(format!("prepare repo index policy: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("k", Value::String(format!("repo-index-policy:{repo_uid}")))],
+            )
+            .map_err(|error| StoreError::Query(format!("read repo index policy: {error}")))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let fingerprint = extract_string(&row, 0)?;
+        if fingerprint.is_empty() {
+            return Err(StoreError::Query(
+                "stored repo index policy is empty".into(),
+            ));
+        }
+        Ok(Some(fingerprint))
+    }
+
     /// Read the stored embedding metadata (model ID and dimension).
     ///
     /// Returns `Some((model_id, dimension))` when a valid record has been

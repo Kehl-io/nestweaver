@@ -137,6 +137,20 @@ impl StableAnchor {
         Ok(anchor)
     }
 
+    // Duplicate the existing open description so derived authorities retain
+    // both exclusion and the ability to detect registry substitution.
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            path: self.path.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn is_current(&self) -> bool {
         descriptor_matches_path(&self.file, &self.path)
     }

@@ -6283,3 +6283,156 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn live_daemon_reloads_repo_eligibility_without_sha_or_pid_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("policy.lbug");
+    let config = dir.path().join("instance.toml");
+    write_test_repo(&repo);
+    let head = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap()
+        .stdout;
+    let write_config = |exclude: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+instance_id = "policy-test"
+[snapshot_storage]
+backend = "local"
+path = "{root}/storage"
+[workspace]
+backend = "local"
+path = "{root}/workspace"
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+[git]
+credential_method = "gh"
+[[repos]]
+url = "file://{repo}"
+name = "repo"
+exclude = {exclude}
+"#,
+                root = dir.path().display(),
+                repo = repo.display()
+            ),
+        )
+        .unwrap();
+    };
+    let index = || {
+        daemon_cmd()
+            .args([
+                "index",
+                "--repo",
+                repo.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    };
+    write_config("[]");
+    let _guard = DaemonGuard::new(&db);
+    index();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let pid = rt.block_on(client.health_check()).unwrap().pid;
+    let count_greet = |client: &mut nestweaver_client::DaemonClient| {
+        let response = rt
+            .block_on(
+                client
+                    .inner_mut()
+                    .search_symbols(nestweaver_proto::JsonRequest {
+                        args_json: r#"{"query":"greet","limit":100}"#.into(),
+                    }),
+            )
+            .unwrap()
+            .into_inner();
+        let symbols: Vec<nestweaver_engine::SymbolCandidate> =
+            serde_json::from_str(&response.result_json).unwrap();
+        symbols
+            .iter()
+            .filter(|symbol| symbol.name == "greet")
+            .count()
+    };
+    assert_eq!(count_greet(&mut client), 1);
+    for (exclude, expected) in [(r#"["main.js"]"#, 0), ("[]", 1)] {
+        write_config(exclude);
+        index();
+        assert_eq!(count_greet(&mut client), expected);
+        let status = rt
+            .block_on(
+                client
+                    .inner_mut()
+                    .brain_status_json(nestweaver_proto::JsonRequest {
+                        args_json: "{}".into(),
+                    }),
+            )
+            .unwrap()
+            .into_inner();
+        let status: serde_json::Value = serde_json::from_str(&status.result_json).unwrap();
+        let inventory = &status["repos"][0]["exclusion_inventory"];
+        assert_eq!(
+            inventory["patterns"],
+            serde_json::from_str::<serde_json::Value>(exclude).unwrap()
+        );
+        assert_eq!(
+            inventory["tracked_files"],
+            if expected == 0 { 1 } else { 0 }
+        );
+        assert_eq!(rt.block_on(client.health_check()).unwrap().pid, pid);
+        assert_eq!(
+            StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+            head
+        );
+    }
+    // Direct RPC bypasses CLI prevalidation: the live daemon itself must
+    // reject invalid edits before registering a watcher or indexing anything.
+    for invalid in ["not valid TOML [", ""] {
+        if invalid.is_empty() {
+            write_config(r#"["["]"#);
+        } else {
+            std::fs::write(&config, invalid).unwrap();
+        }
+        assert!(
+            rt.block_on(
+                client
+                    .inner_mut()
+                    .index_repo(nestweaver_proto::IndexRepoRequest {
+                        repo_path: repo.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    })
+            )
+            .is_err()
+        );
+        assert!(
+            rt.block_on(client.watch_code(repo.to_str().unwrap(), ""))
+                .is_err()
+        );
+        assert!(
+            rt.block_on(client.health_check())
+                .unwrap()
+                .watcher
+                .is_none()
+        );
+        assert_eq!(count_greet(&mut client), 1);
+    }
+    write_config("[]");
+    assert_eq!(rt.block_on(client.health_check()).unwrap().pid, pid);
+}

@@ -2692,8 +2692,8 @@ fn print_repo_map_json(
     print_json_payload(&payload)
 }
 
-/// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
-/// mistaken for a result set.
+/// Ambiguous resolution carries `candidates` and empty canonical impact arrays;
+/// `status: ambiguous` distinguishes it from a computed result set.
 ///
 /// nw-328: `repo_filter` is a parameter because the remedy is a FUNCTION of
 /// the state that produced the error, not a constant. `resolve_uid_with_repo_filter`
@@ -2706,28 +2706,17 @@ fn impact_json_ambiguous(
     repo_filter: Option<&str>,
     candidates: serde_json::Value,
 ) -> serde_json::Value {
-    json_payload_with_provenance(nestweaver_schema::responses::impact(serde_json::json!({
-        "status": "ambiguous",
-        "symbol": symbol,
-        "candidates": candidates,
-        "note": impact_ambiguity_remedy(repo_filter),
-    })))
+    json_payload_with_provenance(nestweaver_schema::responses::impact_ambiguous(
+        symbol,
+        repo_filter,
+        candidates,
+    ))
 }
 
 /// The one sentence both the JSON and the text renderings of an ambiguous
 /// `impact` use, so they cannot drift.
 fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
-    match repo_filter {
-        Some(repo) => format!(
-            "the symbol name matched multiple symbols; no impact was computed. \
-             --repo {repo} is already set and every match is inside it, so it \
-             cannot separate them. Pass a full UID instead — each candidate \
-             below carries one."
-        ),
-        None => "the symbol name matched multiple symbols; no impact was computed. \
-                 Disambiguate with --repo <name> or pass a full UID"
-            .to_string(),
-    }
+    nestweaver_schema::responses::impact_ambiguity_remedy(repo_filter)
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
@@ -20502,9 +20491,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
-                        // Carries `candidates`, never `nodes` — a bare array here
-                        // was indistinguishable from a result set, so a mistyped
-                        // name looked like a successful impact query (nw-111).
+                        // Carries candidates, an ambiguous status and empty impact
+                        // aliases; a bare array was indistinguishable from a
+                        // computed result set (nw-111).
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ambiguous(
@@ -35724,6 +35713,7 @@ fn run_publication_rebuild(
                     let lease = store.acquire_index_publication_lease()?;
                     state = nestweaver_engine::publication_operation::select_operation(
                         &publication_root,
+                        &root_lock,
                         &operation_uuid,
                         state.revision,
                         &lease,

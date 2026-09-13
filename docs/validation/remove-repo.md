@@ -32,8 +32,9 @@ recorded on its parent backlog item before acceptance.
 [Performance job](https://github.com/Kehl-io/nestweaver/actions/runs/34736783556/job/103669515714)
 passed on `a771754e7cccc8be96013194813ff3a2c865ef79`. The run's other CI jobs
 contained subsequently fixed contract failures; only this successful job supplies
-performance acceptance. The measured store/engine/benchmark sources are unchanged
-in the later logging and response-contract fixes.
+performance acceptance for that recorded source. Later feedback fixes change
+authority, eligibility and query code; these timings have not been remeasured
+on the follow-up head. The benchmark and removal algorithm remain unchanged.
 
 | Hub degree | Run 1 (seconds) | Run 2 (seconds) | Repeat difference |
 | --- | ---: | ---: | ---: |
@@ -57,4 +58,5 @@ ext4, Rust 1.98.1 and locked lbug 0.19.1. Three consecutive five-second CPU samp
 were 1.402%, 0.150% and 0.200% busy before measurement; process snapshots show no
 competing compiler or benchmark. Retained load averages include earlier builds.
 [Raw evidence and checksums](evidence/backlog-performance-a771754e/SHA256SUMS.json)
-include both removal logs, hardware/load snapshots and the exact lockfile.
+include both removal logs, hardware/load snapshots and lockfile source/checksum
+provenance. The exact lockfile copy remains in the CI artifact.

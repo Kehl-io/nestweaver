@@ -1,0 +1,35 @@
+{
+  "_meta": {
+    "scope": "local",
+    "sources": [
+      "local"
+    ],
+    "stale_repos": []
+  },
+  "candidates": [
+    {
+      "file_path": "one.py",
+      "name": "duplicated",
+      "start_line": 1,
+      "uid": "sym:repo:default:2255df770338:f5130dc092bd:e79158609a2a:1"
+    },
+    {
+      "file_path": "two.py",
+      "name": "duplicated",
+      "start_line": 1,
+      "uid": "sym:repo:default:2255df770338:d67aa13e336c:e79158609a2a:1"
+    }
+  ],
+  "impact_nodes": [],
+  "nodes": [],
+  "note": "the symbol name matched multiple symbols; no impact was computed. Disambiguate with --repo <name> or pass a full UID",
+  "returned": 0,
+  "status": "ambiguous",
+  "symbol": "duplicated",
+  "target": null,
+  "total": 0,
+  "truncated": false,
+  "truncated_by_depth": false,
+  "truncated_by_limit": false,
+  "truncated_by_threshold": false
+}

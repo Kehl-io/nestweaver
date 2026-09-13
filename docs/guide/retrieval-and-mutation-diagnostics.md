@@ -92,7 +92,7 @@ implement a shared SubagentStart adapter across hosts.
 `detect_changes` keeps the display limit separate from its computation budget.
 It now limits reverse/forward traversal to 2,000,000 node/edge inspections and
 uses a shared 60-second deadline for database reads and traversal. A stopped
-analysis returns `status: partial`, `gate_state: degraded_unknown`, notifications,
+analysis returns `status: partial`, `gate_state: degraded-unknown`, notifications,
 `work_budget_exceeded` and/or `deadline_exceeded`. Counts marked `gte` are lower
 bounds, including an empty result after a database deadline; they do not mean
 no impact. Raising `limit` does not raise these budgets. Split the request or run
@@ -122,6 +122,14 @@ directories and genuine parse failures retain their existing coverage warnings.
 Full, incremental, unchanged, forced and watcher updates apply the same
 compiled repository policy, including deletion of obsolete watcher rows.
 
+A live daemon reloads `exclude` and `unskip` from its canonical bound config
+when admitting an index or registering a code watcher. A running watcher keeps
+its registration-time policy snapshot; restart that watcher to adopt edits.
+Status exclusion inventory reflects the current configured boundary, even before
+another index applies it to the graph. Invalid config edits fail these operations
+instead of silently reusing stale policy. Identity, authorization, indexing
+limits and other daemon settings retain their startup semantics.
+
 Impact JSON preserves both `local_impact` and `org_wide_impact` when federated.
 Within an impact result, `nodes` and `impact_nodes` are additive aliases of the
 same list; `symbol` is the caller's query, `target` is a resolved UID or null,
@@ -131,8 +139,11 @@ null runtime fields do not establish health. Deliberately disabling semantic
 retrieval is distinct from a missing semantic capability.
 
 After `setup` writes or reconciles a registration, it reads back the stored
-command, arguments and environment and performs a bounded MCP `initialize` /
-`tools/list` probe. It never invokes a tool or claims that the host session has
+invocation. A bounded MCP `initialize` / `tools/list` probe runs only when the
+command resolves to the running NestWeaver executable, its arguments use the
+allowlisted MCP form and its database is an existing nonempty file. Repository
+wrappers, other binaries, custom environment overrides and unsupported arguments
+are preserved but not executed; their activation must be verified in the host. It never invokes a tool or claims that the host session has
 activated the server. Missing databases skip the probe to avoid creating a
 new database. A failed probe is reported independently of the configuration
 write; restart the host and inspect its available tools. The ten-second total

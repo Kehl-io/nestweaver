@@ -510,10 +510,17 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if !reader.accepts_path(rel_path) || is_minified_or_bundled(path) {
+            let exclusion_reason = if !reader.accepts_path(rel_path) {
+                Some("configured repository exclusion")
+            } else if is_minified_or_bundled(path) {
+                Some("minified/generated file policy")
+            } else {
+                None
+            };
+            if let Some(reason) = exclusion_reason {
                 tracing::warn!(
-                    path = %rel_path.display(),
-                    "watched source is policy-skipped as minified/generated; removing stale graph coverage"
+                    path = %rel_path.display(), reason,
+                    "watched source is policy-excluded; removing stale graph coverage"
                 );
                 removed.insert(rel_str.clone());
                 prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });

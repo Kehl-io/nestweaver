@@ -244,7 +244,10 @@ impl DbWriteLease {
 
     /// Prove this authority belongs to the exact canonical database.
     pub fn authorizes(&self, db_path: &Path) -> bool {
-        self.db_path == canonical_db_path(db_path)
+        self._namespace_anchor
+            .as_ref()
+            .is_none_or(|anchor| anchor.is_current())
+            && self.db_path == canonical_db_path(db_path)
     }
 
     /// Whether this exact authority atomically created `db_path` while taking
@@ -461,8 +464,19 @@ fn acquire_db_write_lease_inner(
     let process_claim = ProcessDbLeaseClaim::acquire(&db_path)?;
     let lease_path = write_lease_path(&db_path);
     let mut namespace_anchor = None;
-    let namespace_file = if namespace.is_some() {
-        None
+    let namespace_file = if let Some(namespace) = namespace {
+        namespace_anchor = Some(
+            namespace
+                .anchor
+                .try_clone()
+                .map_err(WriteLeaseError::Unavailable)?,
+        );
+        Some(
+            namespace
+                ._file
+                .try_clone()
+                .map_err(WriteLeaseError::Unavailable)?,
+        )
     } else {
         let data_dir = data_dir_for_db(&db_path).ok_or_else(|| {
             WriteLeaseError::Unavailable(std::io::Error::new(
@@ -1124,6 +1138,34 @@ mod tests {
             !data_dir.exists(),
             "a writer that loses namespace admission must not obstruct restore cutover"
         );
+    }
+
+    #[test]
+    fn registry_substitution_revokes_writer_and_fresh_creation_authority() {
+        for under_namespace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("registry-substitution.lbug");
+            let namespace =
+                under_namespace.then(|| acquire_db_namespace_lease(dir.path()).unwrap());
+            let lease = match &namespace {
+                Some(namespace) => acquire_db_write_lease_under_namespace(&db, namespace).unwrap(),
+                None => acquire_db_write_lease(&db).unwrap(),
+            };
+            assert!(lease.authorizes(&db));
+            assert!(lease.authorizes_fresh_creation(&db));
+            let path = lease._namespace_anchor.as_ref().unwrap().test_path();
+            let displaced = path.with_extension("writer-test-displaced");
+            std::fs::rename(path, &displaced).unwrap();
+            std::fs::write(path, b"").unwrap();
+            let authorized = lease.authorizes(&db);
+            let fresh_authorized = lease.authorizes_fresh_creation(&db);
+            // Restore the private registry even if the regression assertion fails.
+            std::fs::remove_file(path).unwrap();
+            std::fs::rename(displaced, path).unwrap();
+            assert!(!authorized);
+            assert!(!fresh_authorized);
+            assert!(lease.authorizes(&db));
+        }
     }
 
     #[cfg(unix)]
