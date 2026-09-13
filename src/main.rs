@@ -1487,6 +1487,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR",
         role: EnvRole::Internal,
     },
+    EnvVar {
+        name: "NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE",
+        role: EnvRole::Internal,
+    },
     // REQUESTS the daemon bypass. `NESTWEAVER_ALLOW_NO_DAEMON` permits it.
     // Offering this one as a remedy is nw-318 defect B.
     EnvVar {
@@ -1516,6 +1520,14 @@ const ENV_REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "NESTWEAVER_STOP_GRACE_SECS",
         role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_AUTHORITY",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY",
+        role: EnvRole::Internal,
     },
     EnvVar {
         name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
@@ -7244,10 +7256,15 @@ enum DaemonAction {
         json: bool,
     },
     /// Inspect one exact runtime entry. Unidentified ownership always refuses pruning.
-    InspectRuntime { path: PathBuf },
+    InspectRuntime {
+        /// Exact instance directory directly inside the daemon runtime root.
+        path: PathBuf,
+    },
     /// Prune one inspected empty runtime entry after proving its database is unowned.
     PruneRuntime {
+        /// Exact inspected instance directory; roots and wildcard paths are refused.
         path: PathBuf,
+        /// Existing database whose identity matches the selected runtime entry.
         #[arg(long)]
         database: PathBuf,
     },
@@ -29787,6 +29804,8 @@ mod cli_help_contract_tests {
             | "cross-repo-refs"
             | "daemon"
             | "daemon gc"
+            | "daemon inspect-runtime"
+            | "daemon prune-runtime"
             | "daemon restart"
             | "daemon run"
             | "daemon start"
