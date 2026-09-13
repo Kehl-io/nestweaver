@@ -6112,6 +6112,7 @@ fn incremental_index_with_name_and_io_and_authority(
                     .get(rel_path.to_string_lossy().as_ref())
                     .expect("parseable added file was prepared")
                 {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6145,6 +6146,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 result.deleted_symbol_uids.extend(removed);
                 result.deleted_symbol_files.push(rel_str.to_string());
                 match prepared {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6235,6 +6237,7 @@ fn incremental_index_with_name_and_io_and_authority(
                         .get(to_str.as_ref())
                         .expect("parseable renamed file was prepared")
                     {
+                        PreparedIncrementalOutcome::Excluded => {}
                         PreparedIncrementalOutcome::Ready(prepared) => {
                             let outcome = write_prepared_incremental_file_txn(
                                 &reader, prepared, &r_uid, repo_url, &store, &txn,
@@ -6424,6 +6427,7 @@ where
                     .get(rel_path.to_string_lossy().as_ref())
                     .expect("parseable added file was prepared")
                 {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6456,6 +6460,7 @@ where
                 result.deleted_symbol_files.push(rel_str.to_string());
 
                 match prepared {
+                    PreparedIncrementalOutcome::Excluded => {}
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
                             reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6544,6 +6549,7 @@ where
                         .get(to_str.as_ref())
                         .expect("parseable renamed file was prepared")
                     {
+                        PreparedIncrementalOutcome::Excluded => {}
                         PreparedIncrementalOutcome::Ready(prepared) => {
                             let outcome = write_prepared_incremental_file_txn(
                                 reader, prepared, &r_uid, repo_url, store, &txn,
@@ -6625,6 +6631,7 @@ struct PreparedIncrementalFile {
 }
 
 enum PreparedIncrementalOutcome {
+    Excluded,
     Ready(PreparedIncrementalFile),
     PolicySkipped(SkippedFile),
 }
@@ -6636,6 +6643,9 @@ fn prepare_incremental_file(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
 ) -> Result<PreparedIncrementalOutcome, anyhow::Error> {
+    if !reader.accepts_path(rel_path) {
+        return Ok(PreparedIncrementalOutcome::Excluded);
+    }
     let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 

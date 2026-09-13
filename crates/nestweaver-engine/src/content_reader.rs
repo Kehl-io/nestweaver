@@ -64,6 +64,12 @@ pub struct ExclusionInventory {
 /// reads from blobless bare clones via a pooled, persistent `git cat-file --batch`
 /// subprocess (one process per reader, reused for every file read).
 pub trait ContentReader: Send + Sync {
+    /// Apply configured eligibility to a single changed or deleted relative path.
+    /// Readers without additional exclusions retain their existing policy.
+    fn accepts_path(&self, _rel: &Path) -> bool {
+        true
+    }
+
     /// Read the full content of a file at `rel_path` (repo-relative).
     fn read_file(&self, rel_path: &Path) -> Result<String>;
 
@@ -667,6 +673,10 @@ fn load_git_tracked_files(root: &Path) -> Option<HashSet<PathBuf>> {
 }
 
 impl ContentReader for FilesystemReader {
+    fn accepts_path(&self, rel: &Path) -> bool {
+        FilesystemReader::accepts_path(self, rel)
+    }
+
     fn read_file(&self, rel_path: &Path) -> Result<String> {
         let abs = self.repo_path.join(rel_path);
         let observed_bytes = std::fs::metadata(&abs)
