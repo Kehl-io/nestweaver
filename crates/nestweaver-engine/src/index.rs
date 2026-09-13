@@ -7072,6 +7072,9 @@ fn build_reresolve_edges(
 
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
+        if !reader.accepts_path(rel_path) {
+            continue;
+        }
         let abs_path = reader.root().join(rel_path);
         let (raw_symbols, raw_references) = if let Some((symbols, references)) =
             prepared_file_data.and_then(|prepared| prepared.get(rel_str))
@@ -7117,6 +7120,9 @@ fn build_reresolve_edges(
     // symbol set, fetched by the caller.
     let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
     for sym in db_symbols {
+        if !reader.accepts_path(Path::new(&sym.file_path)) {
+            continue;
+        }
         if scope.contains(&sym.file_path) {
             // Already in file_data from re-parsing above; just ensure
             // uid_to_file has the DB uid (the re-parsed uid should match,
