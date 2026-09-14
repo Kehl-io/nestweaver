@@ -2189,12 +2189,19 @@ impl GraphStore {
 
     pub fn upsert_vault(&self, vault: &Vault) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let _ = exec_params(
+        // Updating metadata must retain containment and other incident edges.
+        // Watcher startup calls this for vaults that are already indexed.
+        exec_params(
             &conn,
-            "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
-            vec![("uid", lbug::Value::String(vault.uid.clone()))],
-        );
-        self.insert_vault(vault)
+            "MERGE (v:Vault {uid: $uid}) \
+             SET v.name = $name, v.root_path = $rp, v.instance_id = $iid",
+            vec![
+                ("uid", lbug::Value::String(vault.uid.clone())),
+                ("name", lbug::Value::String(vault.name.clone())),
+                ("rp", lbug::Value::String(vault.root_path.clone())),
+                ("iid", lbug::Value::String(vault.instance_id.clone())),
+            ],
+        )
     }
 
     pub fn insert_note(&self, note: &Note) -> Result<(), StoreError> {
@@ -3254,6 +3261,56 @@ impl GraphStore {
         typed_edges: &[ResolvedEdge],
         project_note_edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
+        self.incremental_vault_refresh_with_tag_cleanup(
+            vault,
+            delete_note_uids,
+            rebuild_link_source_uids,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+            unresolved_wikilinks,
+            typed_edges,
+            project_note_edges,
+            true,
+        )
+    }
+
+    /// Transactional refresh with optional deferred orphan-tag cleanup for a
+    /// watcher batch whose later prepared notes may reuse incumbent tags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incremental_vault_refresh_with_tag_cleanup(
+        &self,
+        vault: &Vault,
+        delete_note_uids: &[String],
+        rebuild_link_source_uids: &[String],
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
+        unresolved_wikilinks: &[UnresolvedWikilinkRecord],
+        typed_edges: &[ResolvedEdge],
+        project_note_edges: &[(&str, &str)],
+        prune_tags: bool,
+    ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         let mutation = (|| {
             exec_params(
@@ -3313,13 +3370,15 @@ impl GraphStore {
             Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
             Self::batch_insert_edges_on(&conn, typed_edges)?;
             Self::batch_insert_project_note_edges_on(&conn, project_note_edges)?;
-            exec_params(
-                &conn,
-                "MATCH (t:Tag) WHERE t.vault_uid = $vid \
+            if prune_tags {
+                exec_params(
+                    &conn,
+                    "MATCH (t:Tag) WHERE t.vault_uid = $vid \
                  AND NOT (t)<-[:NOTE_TAGGED_WITH]-() \
                  AND NOT (t)<-[:SECTION_TAGGED_WITH]-() DETACH DELETE t",
-                vec![("vid", lbug::Value::String(vault.uid.clone()))],
-            )?;
+                    vec![("vid", lbug::Value::String(vault.uid.clone()))],
+                )?;
+            }
             Self::mark_regex_scope_dirty_on(&conn, &vault.uid, false)?;
             Ok(())
         })();

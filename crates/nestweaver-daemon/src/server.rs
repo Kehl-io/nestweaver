@@ -2905,6 +2905,29 @@ fn wait_for_watcher_predecessors(state: &DaemonState, ids: &[u64]) {
     }
 }
 
+/// Cancellation of a start RPC must not leave an unacknowledged watcher alive.
+/// The retained handle remains available to targeted stop and daemon shutdown.
+struct PendingVaultWatch {
+    state: Arc<DaemonState>,
+    id: u64,
+    stop: nestweaver_engine::ShutdownHandle,
+    armed: bool,
+}
+
+impl Drop for PendingVaultWatch {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stop.stop();
+            let state = self.state.clone();
+            let id = self.id;
+            tokio::spawn(async move {
+                drain_watcher_tasks(&state, &[id]).await;
+                clear_watcher_registration(&state, id);
+            });
+        }
+    }
+}
+
 async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
     let (stopped, tasks) = {
         let _lifecycle = state
@@ -6087,91 +6110,148 @@ impl NestWeaverDaemon for DaemonService {
         }
 
         let shutdown_handle = watcher.shutdown_handle();
+        let pending_stop = shutdown_handle.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let ready_sender = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
+        let ready_callback_sender = ready_sender.clone();
+        watcher = watcher.with_ready_callback(move || {
+            if let Some(sender) = ready_callback_sender
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = sender.send(Ok(()));
+            }
+        });
+        let watcher_id = {
+            // Refuse BEFORE registering. `register_watcher` mutates
+            // `state.watcher_stop`, and the only thing that clears it is
+            // `clear_watcher_registration` inside the spawned thread below — which
+            // never runs if the guard refuses. Registering first therefore left the
+            // daemon holding a shutdown handle for a `BrainWatcher` dropped on the
+            // very next line, on behalf of a request that was rejected: state
+            // mutated by a refused RPC.
+            let admission_guard = ConnectionGuard::write(&self.state)?;
+            let _lifecycle = self
+                .state
+                .watcher_lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let predecessors = watcher_task_ids(&self.state, None);
 
-        // Refuse BEFORE registering. `register_watcher` mutates
-        // `state.watcher_stop`, and the only thing that clears it is
-        // `clear_watcher_registration` inside the spawned thread below — which
-        // never runs if the guard refuses. Registering first therefore left the
-        // daemon holding a shutdown handle for a `BrainWatcher` dropped on the
-        // very next line, on behalf of a request that was rejected: state
-        // mutated by a refused RPC.
-        let admission_guard = ConnectionGuard::write(&self.state)?;
-        let _lifecycle = self
-            .state
-            .watcher_lifecycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let predecessors = watcher_task_ids(&self.state, None);
+            // register_watcher holds the lock across check + store (TOCTOU-safe).
+            // `force` reaches here, as it always has for `watch_code`. nw-302: the
+            // slot is still global, but it is no longer ownerless — the incumbent
+            // records the pid of the client that asked for it, so a registration
+            // orphaned by a killed CLI is reclaimed automatically instead of
+            // blocking every later vault watch until the daemon restarts. `force`
+            // remains the override for an incumbent whose owner is ALIVE.
+            let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid)
+            {
+                Ok(id) => id,
+                Err(e) if e.code() == tonic::Code::AlreadyExists => {
+                    return Ok(Response::new(WatchVaultResponse {
+                        ok: false,
+                        // Names COMMANDS, not an RPC. The previous wording said
+                        // "Stop it first with StopWatch" — an RPC no CLI
+                        // subcommand exposed, so the advice could not be followed.
+                        message: "A watcher is already running. Stop it with \
+                              `nestweaver watch-stop`, or retry with --force to adopt it."
+                            .to_string(),
+                        ..Default::default()
+                    }));
+                }
+                Err(e) => return Err(e),
+            };
+            describe_watcher(&self.state, watcher_id, "vault", &vault_path);
+            let state = self.state.clone();
+            let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
+            watcher = watcher.with_mutation_lease_factory(mutation_factory);
+            let store = self.state.store.clone();
+            let on_change = Self::make_embed_on_change(
+                self.state.embedding_runtime.clone(),
+                self.state.store.clone(),
+            );
 
-        // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // `force` reaches here, as it always has for `watch_code`. nw-302: the
-        // slot is still global, but it is no longer ownerless — the incumbent
-        // records the pid of the client that asked for it, so a registration
-        // orphaned by a killed CLI is reclaimed automatically instead of
-        // blocking every later vault watch until the daemon restarts. `force`
-        // remains the override for an incumbent whose owner is ALIVE.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
-            Ok(id) => id,
-            Err(e) if e.code() == tonic::Code::AlreadyExists => {
+            let watcher_task = tokio::task::spawn_blocking(move || {
+                wait_for_watcher_predecessors(&state, &predecessors);
+                tracing::info!(vault = %vault_path.display(), "watcher thread started");
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    watcher.run_with_store(store, on_change)
+                }));
+
+                let startup_error = match &result {
+                    Ok(Ok(())) => "vault watcher stopped before readiness".to_string(),
+                    Ok(Err(error)) => format!("vault watcher startup failed: {error:#}"),
+                    Err(_) => "vault watcher panicked during startup".to_string(),
+                };
+                if let Some(sender) = ready_sender
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = sender.send(Err(startup_error));
+                }
+                match result {
+                    Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
+                    Ok(Err(e)) => tracing::error!(error = %e, "watcher exited with error"),
+                    Err(_) => tracing::error!("watcher thread panicked"),
+                }
+
+                clear_watcher_registration(&state, watcher_id);
+            });
+            // Retained so shutdown can AWAIT it before releasing the socket,
+            // pidfile and instance lock — a watcher write that outlives teardown
+            // is the hazard the reconcile loops already guard against.
+            let mut tasks = self
+                .state
+                .watcher_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Drop handles for tasks that already finished, so a long-lived
+            // daemon that starts and stops many watchers does not accumulate
+            // them.
+            tasks.retain(|task| !task.handle.is_finished());
+            tasks.push(WatcherTask {
+                id: watcher_id,
+                handle: watcher_task,
+            });
+            // Registration, spawn, and handle retention are one admitted unit.
+            // Only now may the drain observe it as complete; later watcher batches
+            // take their own exact-worker leases.
+            drop(admission_guard);
+            watcher_id
+        };
+        // All ownership is retained before awaiting, with no registry mutex or
+        // database gate held. Cancellation stops only this worker and arranges
+        // an asynchronous drain without losing its retained JoinHandle.
+        let mut pending = PendingVaultWatch {
+            state: self.state.clone(),
+            id: watcher_id,
+            stop: pending_stop,
+            armed: true,
+        };
+        match ready_rx.await {
+            Ok(Ok(())) if !pending.stop.is_stopped() => {
+                pending.armed = false;
+            }
+            result => {
+                pending.stop.stop();
+                drain_watcher_tasks(&self.state, &[watcher_id]).await;
+                clear_watcher_registration(&self.state, watcher_id);
+                pending.armed = false;
+                let message = match result {
+                    Ok(Err(error)) => error,
+                    _ => "vault watcher stopped before readiness".to_string(),
+                };
                 return Ok(Response::new(WatchVaultResponse {
                     ok: false,
-                    // Names COMMANDS, not an RPC. The previous wording said
-                    // "Stop it first with StopWatch" — an RPC no CLI
-                    // subcommand exposed, so the advice could not be followed.
-                    message: "A watcher is already running. Stop it with \
-                              `nestweaver watch-stop`, or retry with --force to adopt it."
-                        .to_string(),
+                    message,
                     ..Default::default()
                 }));
             }
-            Err(e) => return Err(e),
-        };
-        describe_watcher(&self.state, watcher_id, "vault", &vault_path);
-        let state = self.state.clone();
-        let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
-        watcher = watcher.with_mutation_lease_factory(mutation_factory);
-        let store = self.state.store.clone();
-        let on_change = Self::make_embed_on_change(
-            self.state.embedding_runtime.clone(),
-            self.state.store.clone(),
-        );
-
-        let watcher_task = tokio::task::spawn_blocking(move || {
-            wait_for_watcher_predecessors(&state, &predecessors);
-            tracing::info!(vault = %vault_path.display(), "watcher thread started");
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, on_change)
-            }));
-
-            match result {
-                Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
-                Ok(Err(e)) => tracing::error!(error = %e, "watcher exited with error"),
-                Err(_) => tracing::error!("watcher thread panicked"),
-            }
-
-            clear_watcher_registration(&state, watcher_id);
-        });
-        // Retained so shutdown can AWAIT it before releasing the socket,
-        // pidfile and instance lock — a watcher write that outlives teardown
-        // is the hazard the reconcile loops already guard against.
-        let mut tasks = self
-            .state
-            .watcher_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Drop handles for tasks that already finished, so a long-lived
-        // daemon that starts and stops many watchers does not accumulate
-        // them.
-        tasks.retain(|task| !task.handle.is_finished());
-        tasks.push(WatcherTask {
-            id: watcher_id,
-            handle: watcher_task,
-        });
-        // Registration, spawn, and handle retention are one admitted unit.
-        // Only now may the drain observe it as complete; later watcher batches
-        // take their own exact-worker leases.
-        drop(admission_guard);
+        }
 
         Ok(Response::new(WatchVaultResponse {
             ok: true,
@@ -24376,6 +24456,182 @@ external_model = "unavailable-test-model"
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         assert!(service.stop_watch(request).await.unwrap().into_inner().ok);
         assert!(watcher_status(&state).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vault_watch_acknowledgement_waits_for_initialization_and_first_edit() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Ready.md"), "# Ready\n\ninitial\n").unwrap();
+        let holder = state.write_gate.lock("test_startup_barrier").await;
+        let service = DaemonService::new(state.clone());
+        let path = vault.path().to_string_lossy().into_owned();
+        let mut starting = tokio::spawn(async move {
+            service
+                .watch_vault(Request::new(WatchVaultRequest {
+                    vault_path: path,
+                    vault_name: "test".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        // Observe admission before measuring acknowledgement: a slow task
+        // scheduler must not make the old immediate-success behavior look safe.
+        // Polling registration does not consume an already-completed handle.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while watcher_status(&state).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher registration must become visible at the startup barrier");
+        let premature =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut starting).await;
+        drop(holder);
+        let premature_success = premature.is_ok();
+        let response = match premature {
+            Ok(result) => result.unwrap().unwrap().into_inner(),
+            Err(_) => starting.await.unwrap().unwrap().into_inner(),
+        };
+        assert!(response.ok, "{}", response.message);
+        std::fs::write(
+            vault.path().join("Ready.md"),
+            "# Ready\n\nfirst acknowledged edit\n",
+        )
+        .unwrap();
+        let indexed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notes = state.store.list_notes(None).unwrap();
+                if let Some(note) = notes.first() {
+                    let sections = state.store.sections_in_note(&note.uid).unwrap();
+                    if sections
+                        .iter()
+                        .any(|section| section.text_content.contains("first acknowledged edit"))
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        stop_and_drain_watcher(&state, response.watcher_id).await;
+        assert!(
+            !premature_success,
+            "WatchVault acknowledged before initialization completed"
+        );
+        assert!(
+            indexed.is_ok(),
+            "first post-acknowledgement edit was missed"
+        );
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_vault_start_drains_worker_and_registration() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let holder = state.write_gate.lock("test_cancel_start").await;
+        let service = DaemonService::new(state.clone());
+        let path = vault.path().to_string_lossy().into_owned();
+        let starting = tokio::spawn(async move {
+            service
+                .watch_vault(Request::new(WatchVaultRequest {
+                    vault_path: path,
+                    vault_name: "test".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        starting.abort();
+        assert!(starting.await.unwrap_err().is_cancelled());
+        drop(holder);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.watcher_tasks.lock().unwrap().is_empty()
+                    && watcher_status(&state).is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled startup must drain its retained worker");
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_vault_replacement_reports_subscription_error_and_drains_predecessor() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        let old_stop =
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false)));
+        let old_id = register_watcher(
+            &state,
+            old_stop.clone(),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_state = state.clone();
+        let old = tokio::task::spawn_blocking(move || {
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            clear_watcher_registration(&old_state, old_id);
+        });
+        state.watcher_tasks.lock().unwrap().push(WatcherTask {
+            id: old_id,
+            handle: old,
+        });
+        let service = DaemonService::new(state.clone());
+        let path = root.to_string_lossy().into_owned();
+        let mut starting = tokio::spawn(async move {
+            service
+                .watch_vault(Request::new(WatchVaultRequest {
+                    vault_path: path,
+                    vault_name: "test".into(),
+                    force: true,
+                    ..Default::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !old_stop.is_stopped() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut starting)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir(&root).unwrap();
+        release_tx.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), starting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(!response.ok, "subscription failure must reach caller");
+        assert!(response.message.contains("watch"), "{}", response.message);
+        assert!(watcher_status(&state).is_none());
+        drain_watcher_tasks(&state, &[old_id]).await;
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

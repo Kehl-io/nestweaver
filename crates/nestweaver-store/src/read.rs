@@ -3489,22 +3489,24 @@ impl GraphStore {
 
         // Note-level tags.
         let qn = "MATCH (n:Note)-[:NOTE_TAGGED_WITH]->(t:Tag) RETURN n.uid, t.name";
-        if let Ok(result) = conn.query(qn) {
-            for row in result {
-                let note = extract_string(&row, 0)?;
-                let tag = extract_string(&row, 1)?;
-                by_note.entry(note).or_default().insert(tag);
-            }
+        let result = conn
+            .query(qn)
+            .map_err(|error| StoreError::Query(format!("read note tag sets: {error}")))?;
+        for row in result {
+            let note = extract_string(&row, 0)?;
+            let tag = extract_string(&row, 1)?;
+            by_note.entry(note).or_default().insert(tag);
         }
         // Section-level tags roll up to the parent note.
         let qs = "MATCH (n:Note)-[:NOTE_HAS_SECTION]->(s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag) \
                   RETURN n.uid, t.name";
-        if let Ok(result) = conn.query(qs) {
-            for row in result {
-                let note = extract_string(&row, 0)?;
-                let tag = extract_string(&row, 1)?;
-                by_note.entry(note).or_default().insert(tag);
-            }
+        let result = conn
+            .query(qs)
+            .map_err(|error| StoreError::Query(format!("read section tag sets: {error}")))?;
+        for row in result {
+            let note = extract_string(&row, 0)?;
+            let tag = extract_string(&row, 1)?;
+            by_note.entry(note).or_default().insert(tag);
         }
 
         Ok(by_note
@@ -4267,5 +4269,18 @@ mod frontmatter_backfill_tests {
             "and the deficit that explains the empty result is COUNTABLE, \
              which is what makes the silence fixable"
         );
+    }
+    #[test]
+    fn note_tag_sets_propagates_each_relationship_query_failure() {
+        for relationship in ["NOTE_TAGGED_WITH", "SECTION_TAGGED_WITH"] {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .conn()
+                .unwrap()
+                .query(&format!("DROP TABLE {relationship}"))
+                .unwrap();
+            let error = store.note_tag_sets().unwrap_err().to_string();
+            assert!(error.contains("tag sets"), "{relationship}: {error}");
+        }
     }
 }
