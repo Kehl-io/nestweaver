@@ -1825,14 +1825,24 @@ mod tests {
         let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
             .with_instance_config(Some(Arc::new(config)));
         let path = root.join("src/a.js");
-        for source in [
+        for (iteration, source) in [
             "export function hidden_one() {}",
             "export function hidden_two() {}",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             std::fs::write(&path, source).unwrap();
+            let generation = store.graph_generation();
             let outcome =
                 process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&path));
-            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            if iteration == 0 {
+                assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+                assert!(store.graph_generation() > generation);
+            } else {
+                assert!(matches!(outcome, WatchBatchOutcome::Unchanged));
+                assert_eq!(store.graph_generation(), generation);
+            }
             assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
             assert!(!store.symbols_in_file("src/b.js").unwrap().is_empty());
         }

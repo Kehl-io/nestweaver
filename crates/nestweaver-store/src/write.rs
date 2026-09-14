@@ -2189,12 +2189,19 @@ impl GraphStore {
 
     pub fn upsert_vault(&self, vault: &Vault) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let _ = exec_params(
+        // Updating metadata must retain containment and other incident edges.
+        // Watcher startup calls this for vaults that are already indexed.
+        exec_params(
             &conn,
-            "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
-            vec![("uid", lbug::Value::String(vault.uid.clone()))],
-        );
-        self.insert_vault(vault)
+            "MERGE (v:Vault {uid: $uid}) \
+             SET v.name = $name, v.root_path = $rp, v.instance_id = $iid",
+            vec![
+                ("uid", lbug::Value::String(vault.uid.clone())),
+                ("name", lbug::Value::String(vault.name.clone())),
+                ("rp", lbug::Value::String(vault.root_path.clone())),
+                ("iid", lbug::Value::String(vault.instance_id.clone())),
+            ],
+        )
     }
 
     pub fn insert_note(&self, note: &Note) -> Result<(), StoreError> {

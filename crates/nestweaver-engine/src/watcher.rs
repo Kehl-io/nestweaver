@@ -1099,6 +1099,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("vault");
         fs::create_dir_all(&root).unwrap();
+        // Match indexer identities and canonical filesystem notifications,
+        // including macOS's /var -> /private/var temporary-directory alias.
+        let root = fs::canonicalize(root).unwrap();
         for (rel, content) in files {
             let p = root.join(rel);
             if let Some(parent) = p.parent() {
@@ -1107,6 +1110,43 @@ mod tests {
             fs::write(&p, content).unwrap();
         }
         (dir, root)
+    }
+
+    #[test]
+    fn watcher_startup_preserves_untouched_vault_relationships() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]]\n"),
+            ("Beta.md", "# Beta\n\n[[Gamma]]\n"),
+            ("Gamma.md", "# Gamma\n\nUntouched content.\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let edges = || {
+            let mut edges = store.load_vault_typed_edges(false).unwrap();
+            edges.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+            edges
+        };
+        let before = edges();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|edge| edge.2 == "VAULT_HAS_NOTE")
+                .count(),
+            3
+        );
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        assert_eq!(
+            edges(),
+            before,
+            "startup must preserve untouched graph relationships"
+        );
     }
 
     #[test]
