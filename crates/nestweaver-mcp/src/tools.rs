@@ -3910,10 +3910,12 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = args
+    let explicit_root = args
         .get("root")
         .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
+        .map(std::path::PathBuf::from);
+    let fallback_root = explicit_root
+        .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     // In server mode, try to read source spans from bare clones via
@@ -3924,7 +3926,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             Some(res) => serde_json::to_value(res)?,
             None => {
                 let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-                    &root,
+                    &fallback_root,
                     configured_index_limits(),
                 );
                 let res = nestweaver_engine::read_symbols::read_symbols(
@@ -3937,9 +3939,20 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                 serde_json::to_value(res)?
             }
         }
+    } else if explicit_root.is_none() {
+        // nw-478: the daemon cwd is `/`, so a missing `root` used to yield
+        // empty bodies. Resolve each symbol from its repo's local_root.
+        let res = read_symbols_from_repo_roots(
+            store,
+            &targets,
+            neighbors,
+            token_budget,
+            &fallback_root,
+        );
+        serde_json::to_value(res)?
     } else {
         let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-            &root,
+            &fallback_root,
             configured_index_limits(),
         );
         let res = nestweaver_engine::read_symbols::read_symbols(
@@ -3995,9 +4008,9 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         if unreadable > 0 {
             value["note"] = serde_json::json!(format!(
                 "{unreadable} symbol(s) returned an empty body because their source file could \
-                 not be read from the working directory ({}). Pass `root` (the repo path) or run \
-                 from the repo root to get source spans.",
-                root.display()
+                 not be read from the owning repo's local_root or the working directory ({}). \
+                 Pass `root` (the repo path) or run from the repo root to get source spans.",
+                fallback_root.display()
             ));
         }
     }
@@ -4018,8 +4031,6 @@ fn try_read_symbols_from_bare(
     neighbors: u8,
     token_budget: Option<usize>,
 ) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
-    use std::collections::HashMap;
-
     // Derive workspace root from the thread-local db_path.
     let db_path = current_db_path(store).ok()?;
     let workspace_root = db_path.parent()?.join("workspace");
@@ -4027,26 +4038,7 @@ fn try_read_symbols_from_bare(
         return None;
     }
 
-    // Group targets by repo_uid, preserving input order within each group.
-    // Targets that cannot be resolved go into a special "unresolved" bucket
-    // so they appear in the final not_found list.
-    let mut repo_groups: Vec<(String, Vec<String>)> = Vec::new();
-    let mut repo_index: HashMap<String, usize> = HashMap::new();
-    let mut unresolved: Vec<String> = Vec::new();
-
-    for spec in targets {
-        if let Some(repo_uid) = resolve_repo_for_spec(store, spec) {
-            if let Some(&idx) = repo_index.get(&repo_uid) {
-                repo_groups[idx].1.push(spec.clone());
-            } else {
-                let idx = repo_groups.len();
-                repo_index.insert(repo_uid.clone(), idx);
-                repo_groups.push((repo_uid, vec![spec.clone()]));
-            }
-        } else {
-            unresolved.push(spec.clone());
-        }
-    }
+    let (repo_groups, unresolved) = group_targets_by_repo(store, targets);
 
     if repo_groups.is_empty() {
         return None;
@@ -4152,6 +4144,94 @@ fn inline_body_reader_resolver(store: &GraphStore) -> Option<BoxedInlineBodyReso
     }))
 }
 
+/// Group symbol specs by owning repo, preserving input order within each group.
+fn group_targets_by_repo(
+    store: &GraphStore,
+    targets: &[String],
+) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+    use std::collections::HashMap;
+
+    let mut repo_groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut repo_index: HashMap<String, usize> = HashMap::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for spec in targets {
+        if let Some(repo_uid) = resolve_repo_for_spec(store, spec) {
+            if let Some(&idx) = repo_index.get(&repo_uid) {
+                repo_groups[idx].1.push(spec.clone());
+            } else {
+                let idx = repo_groups.len();
+                repo_index.insert(repo_uid.clone(), idx);
+                repo_groups.push((repo_uid, vec![spec.clone()]));
+            }
+        } else {
+            unresolved.push(spec.clone());
+        }
+    }
+    (repo_groups, unresolved)
+}
+
+/// Read symbol spans from each owning repo's `local_root` when `root` is omitted.
+fn read_symbols_from_repo_roots(
+    store: &GraphStore,
+    targets: &[String],
+    neighbors: u8,
+    token_budget: Option<usize>,
+    fallback_root: &std::path::Path,
+) -> nestweaver_engine::read_symbols::ReadSymbolsResult {
+    use std::path::PathBuf;
+
+    let (repo_groups, unresolved) = group_targets_by_repo(store, targets);
+    if repo_groups.is_empty() {
+        let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
+            fallback_root,
+            configured_index_limits(),
+        );
+        return nestweaver_engine::read_symbols::read_symbols(
+            store,
+            targets,
+            &reader,
+            neighbors,
+            token_budget,
+        );
+    }
+
+    let mut merged = nestweaver_engine::read_symbols::ReadSymbolsResult::default();
+    merged.not_found.extend(unresolved);
+    let mut remaining_budget = token_budget;
+
+    for (repo_uid, group_targets) in &repo_groups {
+        let root = store
+            .lookup_repo(repo_uid)
+            .ok()
+            .flatten()
+            .and_then(|r| r.local_root().map(PathBuf::from))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| fallback_root.to_path_buf());
+        let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
+            &root,
+            configured_index_limits(),
+        );
+        let partial = nestweaver_engine::read_symbols::read_symbols(
+            store,
+            group_targets,
+            &reader,
+            neighbors,
+            remaining_budget,
+        );
+        if let Some(budget) = remaining_budget {
+            let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
+            remaining_budget = Some(budget.saturating_sub(used));
+        }
+        merged.symbols.extend(partial.symbols);
+        merged.not_found.extend(partial.not_found);
+        merged.ambiguous.extend(partial.ambiguous);
+        merged.dropped.extend(partial.dropped);
+        merged.truncated = merged.truncated || partial.truncated;
+    }
+    merged
+}
+
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
 fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
     if spec.starts_with("sym:") {
@@ -4174,7 +4254,7 @@ fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4210,7 +4290,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "root": {
                     "type": "string",
-                    "description": "Repository root for resolving file paths (default: server working directory)."
+                    "description": "Repository root for resolving file paths. When omitted, each symbol is read from its owning repo's local_root in the graph; falls back to the server working directory if that path is missing."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -5253,6 +5333,10 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     Ok(payload)
 }
 
+fn is_tag_kind(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("tag")
+}
+
 fn tool_brain_context(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -5407,9 +5491,17 @@ fn tool_brain_context(
     };
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
-    let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+    //
+    // nw-471: Tag *seeds* are the walk origin. `kinds=["Note"]` and
+    // `tags=["project/…"]` describe the connected list, not the Tag node
+    // itself — dropping the seed made `seeds_expanded=0` while notes still
+    // returned, which reads as a successful walk from nowhere.
+    let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>, keep_tag_seeds: bool| {
         if let Some(ref kinds) = filter_kinds {
             nodes.retain(|n| {
+                if keep_tag_seeds && is_tag_kind(&n.kind) {
+                    return true;
+                }
                 let kind_lower = n.kind.to_lowercase();
                 kinds.iter().any(|k| kind_lower.starts_with(k.as_str()))
             });
@@ -5424,8 +5516,8 @@ fn tool_brain_context(
             retain_nodes_under_path_prefix(nodes, prefix.as_str());
         }
     };
-    apply_filters(&mut result.seeds);
-    apply_filters(&mut result.connected);
+    apply_filters(&mut result.seeds, true);
+    apply_filters(&mut result.connected, false);
 
     // tags filter: keep only note/section nodes tagged with any of these tags.
     //
@@ -5455,13 +5547,16 @@ fn tool_brain_context(
             let tagged_sections = store
                 .list_section_uids_with_tags(&tag_names)
                 .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
-            let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-                nodes.retain(|item| {
-                    tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
-                });
-            };
-            filter_tagged(&mut result.seeds);
-            filter_tagged(&mut result.connected);
+            let filter_tagged =
+                |nodes: &mut Vec<nestweaver_engine::BrainNode>, keep_tag_seeds: bool| {
+                    nodes.retain(|item| {
+                        (keep_tag_seeds && is_tag_kind(&item.kind))
+                            || tagged_notes.contains(&item.uid)
+                            || tagged_sections.contains(&item.uid)
+                    });
+                };
+            filter_tagged(&mut result.seeds, true);
+            filter_tagged(&mut result.connected, false);
         }
     }
 
@@ -10580,6 +10675,7 @@ fn tool_detect_changes_scoped(
         nestweaver_engine::RiskLevel::Low => "low",
         nestweaver_engine::RiskLevel::Medium => "medium",
         nestweaver_engine::RiskLevel::High => "high",
+        nestweaver_engine::RiskLevel::Unknown => "unknown",
     };
 
     let symbols_omitted = impact
@@ -13065,6 +13161,7 @@ fn tool_blast_radius(
         nestweaver_engine::RiskLevel::Low => "low",
         nestweaver_engine::RiskLevel::Medium => "medium",
         nestweaver_engine::RiskLevel::High => "high",
+        nestweaver_engine::RiskLevel::Unknown => "unknown",
     };
 
     let changed_json: Vec<Value> = result
@@ -16421,6 +16518,82 @@ mod project_context_bug12_tests {
             "resolved seed should be visible when it has no connected neighbors: {connected:?}"
         );
         assert_eq!(resp["seeds_expanded"].as_u64(), Some(1));
+    }
+
+    /// nw-471: a Tag seed plus `tags=["project/nestweaver"]` and
+    /// `kinds=["Note"]` used to drop the Tag (`seeds_expanded=0`) while
+    /// still returning tagged notes — a walk that claimed no origin.
+    #[test]
+    fn brain_context_keeps_tag_seed_when_tags_and_kinds_filter() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".into(),
+                name: "t".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        store
+            .insert_tag(&nestweaver_schema::Tag {
+                uid: "tag:t:project/nestweaver".into(),
+                vault_uid: "vlt:t".into(),
+                name: "project/nestweaver".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&mk_note(
+                "note:t:overview",
+                "vlt:t",
+                "overview.md",
+                "Overview",
+            ))
+            .unwrap();
+
+        let hashed = tool_brain_context(
+            &store,
+            None,
+            json!({
+                "seeds": ["#project/nestweaver"],
+                "include_seeds": true,
+                "token_budget": 5000
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            hashed["seeds_expanded"].as_u64(),
+            Some(1),
+            "control: #tag without tags filter must expand: {hashed}"
+        );
+
+        let filtered = tool_brain_context(
+            &store,
+            None,
+            json!({
+                "seeds": ["project/nestweaver"],
+                "tags": ["project/nestweaver"],
+                "kinds": ["Note"],
+                "include_seeds": true,
+                "token_budget": 5000
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered["seeds_expanded"].as_u64(),
+            Some(1),
+            "Tag seed must survive tags+kinds filters: {filtered}"
+        );
+        let seeds = filtered["seeds"].as_array().expect("seeds array");
+        assert!(
+            seeds.iter().any(|n| n["kind"].as_str() == Some("Tag")),
+            "include_seeds must still show the Tag origin: {seeds:?}"
+        );
     }
 
     // Feature F8: brain_context with include_bodies embeds the source span of
@@ -23726,6 +23899,66 @@ mod request_bound_tests {
         assert!(text.contains("1001"), "{text}");
         assert!(text.contains("REJECTED"), "{text}");
         assert!(text.contains("targets"), "{text}");
+    }
+
+    /// nw-478: omitting `root` must still read the span from the symbol's
+    /// repo `local_root`. The daemon cwd is `/`, so defaulting to cwd
+    /// produced empty bodies for every local symbol.
+    #[test]
+    fn read_symbols_resolves_repo_root_when_root_omitted() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        std::fs::write(src.join("main.js"), "function greet(name) {\n  return name;\n}\n").unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:t:abc".into(),
+                url: format!("file://{}", src.display()),
+                indexed_sha: "local".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: Some("t".into()),
+                root_path: Some(src.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:repo:t:abc:greet".into(),
+                name: "greet".into(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:t:abc".into(),
+                file_path: "main.js".into(),
+                start_line: 1,
+                end_line: 3,
+                signature: "function greet(name)".into(),
+                summary: None,
+                content_hash: "hash-greet".into(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let resp = tool_read_symbols(&store, json!({ "targets": ["greet"] })).unwrap();
+        let symbols = resp["symbols"].as_array().expect("symbols");
+        assert_eq!(symbols.len(), 1, "{resp}");
+        assert_eq!(
+            symbols[0]["body_available"],
+            true,
+            "body must be read from repo local_root without `root`: {resp}"
+        );
+        let body = symbols[0]["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains("function greet"),
+            "expected greet span from repo root, got: {body:?}"
+        );
     }
 
     /// The safety leg. `affected_tests` decides which tests a PR must run; its

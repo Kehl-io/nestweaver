@@ -69,6 +69,7 @@ fn risk_level_label(level: RiskLevel) -> &'static str {
         RiskLevel::Low => "low",
         RiskLevel::Medium => "medium",
         RiskLevel::High => "high",
+        RiskLevel::Unknown => "unknown",
     }
 }
 

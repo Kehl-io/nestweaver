@@ -79,11 +79,16 @@ pub struct AffectedProcess {
 }
 
 /// Risk level derived from the number of affected processes.
+///
+/// [`Self::Unknown`] is not a fourth severity band — it means the change
+/// was not assessed (missing/unindexed source, empty graph, path drift).
+/// Callers must not treat it as a green "nothing affected" finding.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RiskLevel {
     Low,
     Medium,
     High,
+    Unknown,
 }
 
 /// Heuristic entry-point names — symbols with these names are treated as
@@ -330,7 +335,7 @@ fn detect_changes_impact_until(
         Err(error) if std::time::Instant::now() >= deadline => Ok(ChangeImpact {
             affected_symbols: vec![],
             affected_processes: vec![],
-            risk: RiskLevel::Low,
+            risk: RiskLevel::Unknown,
             blast_radius: 0,
             status: AnalysisStatus::Partial,
             notifications: vec![
@@ -433,7 +438,9 @@ fn detect_changes_impact_with_work_budget(
 
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
-        let risk = RiskLevel::Low;
+        // nw-472: a missing/unindexed source is not a confident Low finding.
+        // README.md and other non-source files stay Complete + Low.
+        let risk = crate::blast_radius::risk_if_unassessed(RiskLevel::Low, &notifications);
         // Traversal has not started, so any non-Complete status here reflects
         // drift, an undecodable row, or resolver staleness. The outer deadline
         // guard independently discloses an expired planning budget.
@@ -744,7 +751,7 @@ mod tests {
         let store = GraphStore::in_memory().expect("in_memory store");
         let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10)
             .expect("detect_changes_impact");
-        assert_eq!(impact.risk, RiskLevel::Low);
+        assert_eq!(impact.risk, RiskLevel::Unknown);
         assert_eq!(impact.status, AnalysisStatus::Partial);
         assert_eq!(impact.gate_state, GateState::DegradedUnknown);
         assert!(
@@ -764,6 +771,7 @@ mod tests {
             .expect("detect_changes_impact");
 
         assert_eq!(impact.status, AnalysisStatus::Complete);
+        assert_eq!(impact.risk, RiskLevel::Low);
         assert_eq!(impact.gate_state, GateState::Ok);
         assert!(
             !impact

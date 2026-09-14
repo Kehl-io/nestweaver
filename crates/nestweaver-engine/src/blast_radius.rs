@@ -324,6 +324,31 @@ pub(crate) fn derive_gate_state(
     }
 }
 
+/// Low is a green finding ("nothing much is affected"). When the change
+/// itself was not mapped onto the graph, that finding is a lie — emit
+/// [`RiskLevel::Unknown`] instead of inventing a confident Low.
+///
+/// Medium/High from symbols that *were* assessed stay as a lower bound.
+pub(crate) fn risk_if_unassessed(
+    computed: RiskLevel,
+    notifications: &[Notification],
+) -> RiskLevel {
+    if !matches!(computed, RiskLevel::Low) {
+        return computed;
+    }
+    let unassessed = notifications.iter().any(|n| {
+        matches!(
+            n.descriptor.as_str(),
+            "changed-file-no-symbols" | "index-empty" | "changed-file-wrong-repo-scope"
+        )
+    });
+    if unassessed {
+        RiskLevel::Unknown
+    } else {
+        computed
+    }
+}
+
 /// Render the human summary line from result counts. Shared between the analysis
 /// path and the R9b redaction path so a redacted result's summary is regenerated
 /// from its (redacted) vecs and can never echo pre-redaction, cross-repo counts.
@@ -409,10 +434,11 @@ impl Default for BlastRadiusOptions {
 /// 4. Scores risk based on: number of affected symbols, PageRank centrality
 ///    of changed symbols, and number of clusters touched.
 ///
-/// Risk levels (`RiskLevel` has three variants):
+/// Risk levels (`RiskLevel` variants):
 /// - Low: <10 affected symbols
 /// - Medium: 10-50 affected symbols
 /// - High: 50+ affected symbols (everything >200 also maps to High)
+/// - Unknown: the change was not assessed (empty index, missing source)
 ///
 /// Centrality and cluster boosts can escalate a level (see `compute_risk_level`).
 pub fn analyze_blast_radius(
@@ -950,7 +976,10 @@ pub fn analyze_blast_radius(
         avg_pagerank > 0.01
     };
 
-    let risk_level = compute_risk_level(total_affected, clusters_touched, high_centrality);
+    let risk_level = risk_if_unassessed(
+        compute_risk_level(total_affected, clusters_touched, high_centrality),
+        &notifications,
+    );
 
     // nw-105: a truncated traversal must not report as Complete.
     //
@@ -1461,7 +1490,7 @@ mod tests {
         .unwrap();
         assert!(result.changed_symbols.is_empty());
         assert!(result.affected_symbols.is_empty());
-        assert_eq!(result.risk_level, RiskLevel::Low);
+        assert_eq!(result.risk_level, RiskLevel::Unknown);
         // An empty/missing index with changes to assess must NOT read as a
         // confident "nothing affected" — it is a degraded, unknown result.
         assert_eq!(result.status, AnalysisStatus::Degraded);
