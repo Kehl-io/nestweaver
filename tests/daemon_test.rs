@@ -1998,11 +1998,7 @@ fn brain_status_adopts_the_incumbent_daemon_after_pidfile_unlink() {
         second["embedding_status"].is_object(),
         "embedding_status must be a real object when the daemon answers: {second}"
     );
-    assert_eq!(
-        second["degraded_components"],
-        serde_json::json!([]),
-        "an adopted answer is not degraded: {second}"
-    );
+    assert_daemon_status_degradation_is_exactly_semantic_state(&second);
 }
 
 /// The other side of the anti-impersonation gate: a rogue process squatting
@@ -2152,9 +2148,45 @@ fn brain_status_json_schema_parity_between_daemon_and_direct_paths() {
     assert!(direct["embedding_status"].is_null());
     assert!(direct["index_publication"].is_object());
     assert!(direct.get("warnings").is_some());
-    // The daemon answer is not degraded.
-    assert_eq!(served["degraded_components"], serde_json::json!([]));
+    // The daemon answer is not degraded by transport; semantic availability is
+    // disclosed from its own embedder state and nothing else.
     assert!(served["embedding_status"].is_object());
+    assert_daemon_status_degradation_is_exactly_semantic_state(&served);
+}
+
+/// A daemon-served `brain status` is never degraded by transport, and it lists
+/// `semantic` exactly when its own `embedding_status.state` means semantic
+/// retrieval cannot be served (nw-474). Test machines may or may not have a
+/// model cache — Linux CI reports `failed`, a macOS runner `loading` — so the
+/// assertion is keyed on the reported state rather than pinned to `[]`, and it
+/// checks BOTH directions so dropping the disclosure (or adding it
+/// unconditionally) still fails.
+fn assert_daemon_status_degradation_is_exactly_semantic_state(status: &serde_json::Value) {
+    let components: Vec<&str> = status["degraded_components"]
+        .as_array()
+        .unwrap_or_else(|| panic!("degraded_components must be an array: {status}"))
+        .iter()
+        .map(|c| c.as_str().expect("component names are strings"))
+        .collect();
+    assert!(
+        !components.contains(&"daemon_runtime"),
+        "a daemon-served answer must not claim the daemon bypass: {status}"
+    );
+    let state = status["embedding_status"]["state"]
+        .as_str()
+        .unwrap_or_else(|| panic!("daemon status must report embedding_status.state: {status}"));
+    // Mirrors the daemon's rule: only a `ready` runtime (shown as `embedding`
+    // while a pass runs) hands ranked tools a model.
+    let semantic_unavailable = !matches!(state, "ready" | "embedding");
+    assert_eq!(
+        components.contains(&"semantic"),
+        semantic_unavailable,
+        "`semantic` must be listed iff the embedder state ({state}) cannot serve it: {status}"
+    );
+    assert!(
+        components.iter().all(|c| *c == "semantic"),
+        "no other degradation is expected on a healthy scratch daemon: {status}"
+    );
 }
 
 /// A configless `daemon start` must REUSE the last configuration that reached

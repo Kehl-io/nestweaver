@@ -1616,10 +1616,14 @@ fn embedding_status_proto(
     }
 }
 
-/// Ranked tools already emit `degraded_components: ["semantic"]` when the
-/// embedder is down. `brain status` must say the same thing: an
-/// `embedding_status.state` of `failed` / `identity_unreadable` with an
-/// empty `degraded_components` is a lie (nw-474).
+/// Ranked tools emit `degraded_components: ["semantic"]` whenever semantic
+/// retrieval was requested and no model was applied. `brain status` must say
+/// the same thing (nw-474). Only a `ready` runtime hands ranked tools a model
+/// (`embedding` is a display refinement of `ready` while a pass runs), and the
+/// default `weight_semantic` requests the semantic leg whether or not the
+/// `embed` feature is compiled in — so `loading`, `failed`,
+/// `identity_unreadable` AND `disabled` all surface as degraded there, and
+/// must here.
 fn disclose_semantic_degradation(value: &mut serde_json::Value, embedding_state: &str) {
     if matches!(embedding_state, "ready" | "embedding") {
         return;
@@ -20905,7 +20909,10 @@ credential_method = "gh"
     fn failed_embedding_state_discloses_semantic_degradation() {
         let mut failed = serde_json::json!({ "degraded_components": [] });
         disclose_semantic_degradation(&mut failed, "failed");
-        assert_eq!(failed["degraded_components"], serde_json::json!(["semantic"]));
+        assert_eq!(
+            failed["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
         disclose_semantic_degradation(&mut failed, "failed");
         assert_eq!(
             failed["degraded_components"],
@@ -20918,8 +20925,27 @@ credential_method = "gh"
         assert_eq!(ready["degraded_components"], serde_json::json!([]));
         disclose_semantic_degradation(&mut ready, "embedding");
         assert_eq!(ready["degraded_components"], serde_json::json!([]));
+        let mut disabled = serde_json::json!({ "degraded_components": [] });
+        disclose_semantic_degradation(&mut disabled, "disabled");
+        assert_eq!(
+            disabled["degraded_components"],
+            serde_json::json!(["semantic"]),
+            "ranked tools still request the semantic leg without the embed feature, \
+             so status must disclose it the same way"
+        );
+
+        let mut loading = serde_json::json!({ "degraded_components": [] });
+        disclose_semantic_degradation(&mut loading, "loading");
+        assert_eq!(
+            loading["degraded_components"],
+            serde_json::json!(["semantic"]),
+            "a model still loading cannot serve semantic retrieval yet"
+        );
         disclose_semantic_degradation(&mut ready, "identity_unreadable");
-        assert_eq!(ready["degraded_components"], serde_json::json!(["semantic"]));
+        assert_eq!(
+            ready["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
     }
 
     #[tokio::test]
