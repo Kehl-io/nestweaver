@@ -654,6 +654,9 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
 
+type WatchLeaseAcquirer<'a> =
+    dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error> + 'a;
+
 /// Incremental watcher inventory: retain indexed identities unless an explicit
 /// event proves removal. This avoids a recursive vault scan for each batch.
 struct WatchedNoteReader {
@@ -693,7 +696,7 @@ pub(crate) fn refresh_watched_paths(
     vault_name: &str,
     paths: &[PathBuf],
     ignore_set: &GlobSet,
-    lease: &dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error>,
+    lease: &WatchLeaseAcquirer<'_>,
 ) -> Result<(), anyhow::Error> {
     let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
     let mut files: HashSet<PathBuf> = store
@@ -773,9 +776,7 @@ fn index_markdown_since_with_reader_mode(
     vault_name: &str,
     since: std::time::SystemTime,
     ignore_set: &GlobSet,
-    watch_lease: Option<
-        &dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error>,
-    >,
+    watch_lease: Option<&WatchLeaseAcquirer<'_>>,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
@@ -1470,10 +1471,7 @@ impl VaultRefreshPlan {
     fn commit_watched(
         &self,
         store: &GraphStore,
-        lease: &dyn Fn() -> Result<
-            Option<Box<dyn crate::watcher::WatchMutationLease>>,
-            anyhow::Error,
-        >,
+        lease: &WatchLeaseAcquirer<'_>,
     ) -> Result<(), anyhow::Error> {
         // Each transaction installs a complete note, and can yield to another
         // admitted writer before the next file. No source reads under the gate.
