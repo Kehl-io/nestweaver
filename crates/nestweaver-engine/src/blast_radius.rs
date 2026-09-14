@@ -329,10 +329,7 @@ pub(crate) fn derive_gate_state(
 /// [`RiskLevel::Unknown`] instead of inventing a confident Low.
 ///
 /// Medium/High from symbols that *were* assessed stay as a lower bound.
-pub(crate) fn risk_if_unassessed(
-    computed: RiskLevel,
-    notifications: &[Notification],
-) -> RiskLevel {
+pub(crate) fn risk_if_unassessed(computed: RiskLevel, notifications: &[Notification]) -> RiskLevel {
     if !matches!(computed, RiskLevel::Low) {
         return computed;
     }

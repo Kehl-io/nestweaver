@@ -3942,13 +3942,8 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     } else if explicit_root.is_none() {
         // nw-478: the daemon cwd is `/`, so a missing `root` used to yield
         // empty bodies. Resolve each symbol from its repo's local_root.
-        let res = read_symbols_from_repo_roots(
-            store,
-            &targets,
-            neighbors,
-            token_budget,
-            &fallback_root,
-        );
+        let res =
+            read_symbols_from_repo_roots(store, &targets, neighbors, token_budget, &fallback_root);
         serde_json::to_value(res)?
     } else {
         let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
@@ -5547,14 +5542,14 @@ fn tool_brain_context(
             let tagged_sections = store
                 .list_section_uids_with_tags(&tag_names)
                 .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
-            let filter_tagged =
-                |nodes: &mut Vec<nestweaver_engine::BrainNode>, keep_tag_seeds: bool| {
-                    nodes.retain(|item| {
-                        (keep_tag_seeds && is_tag_kind(&item.kind))
-                            || tagged_notes.contains(&item.uid)
-                            || tagged_sections.contains(&item.uid)
-                    });
-                };
+            let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>,
+                                 keep_tag_seeds: bool| {
+                nodes.retain(|item| {
+                    (keep_tag_seeds && is_tag_kind(&item.kind))
+                        || tagged_notes.contains(&item.uid)
+                        || tagged_sections.contains(&item.uid)
+                });
+            };
             filter_tagged(&mut result.seeds, true);
             filter_tagged(&mut result.connected, false);
         }
@@ -10452,7 +10447,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -12943,7 +12938,7 @@ fn tool_bridge_nodes(
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -23910,7 +23905,11 @@ mod request_bound_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path();
-        std::fs::write(src.join("main.js"), "function greet(name) {\n  return name;\n}\n").unwrap();
+        std::fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return name;\n}\n",
+        )
+        .unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_repo(&nestweaver_schema::Repo {
@@ -23950,8 +23949,7 @@ mod request_bound_tests {
         let symbols = resp["symbols"].as_array().expect("symbols");
         assert_eq!(symbols.len(), 1, "{resp}");
         assert_eq!(
-            symbols[0]["body_available"],
-            true,
+            symbols[0]["body_available"], true,
             "body must be read from repo local_root without `root`: {resp}"
         );
         let body = symbols[0]["body"].as_str().unwrap_or_default();
