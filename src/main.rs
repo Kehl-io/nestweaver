@@ -2045,24 +2045,6 @@ fn parse_non_blank_query(value: &str) -> Result<String, String> {
     }
 }
 
-/// First-line clap usage text for `--json` stdout. Prefer the shared
-/// predicate wording so `search` and `brain search` emit the same object.
-fn clap_usage_json_message(error: &clap::Error) -> String {
-    let rendered = error.to_string();
-    if rendered.contains("empty query strings are not allowed") {
-        "empty query strings are not allowed".to_string()
-    } else if rendered.contains("empty pattern strings are not allowed") {
-        "empty pattern strings are not allowed".to_string()
-    } else {
-        rendered
-            .lines()
-            .next()
-            .unwrap_or("invalid arguments")
-            .trim_start_matches("error: ")
-            .to_string()
-    }
-}
-
 /// [`parse_non_blank_query`] with `regex_search`/`count_patterns`'s existing
 /// wording, so `--help` and the parse-time rejection state the same noun the
 /// MCP tools already use for these two.
@@ -13532,10 +13514,6 @@ fn main() {
                     EXIT_SUCCESS
                 }
                 _ => {
-                    if std::env::args().any(|a| a == "--json") {
-                        let message = clap_usage_json_message(&error);
-                        println!("{}", serde_json::json!({ "error": message }));
-                    }
                     let _ = error.print();
                     EXIT_USAGE
                 }
