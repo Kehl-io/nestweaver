@@ -233,9 +233,9 @@ pub fn export_graphml_scoped(
     writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
         writer,
-        r#"<graphml xmlns="http://graphml.graphdrawing.org/graphml"
+        r#"<graphml xmlns="http://graphml.graphdrawing.org/xmlns"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://graphml.graphdrawing.org/graphml http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">"#
+         xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">"#
     )?;
 
     // Key definitions for node attributes
