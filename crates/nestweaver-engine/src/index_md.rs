@@ -654,6 +654,98 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
 
+/// Incremental watcher inventory: retain indexed identities unless an explicit
+/// event proves removal. This avoids a recursive vault scan for each batch.
+struct WatchedNoteReader {
+    filesystem: crate::content_reader::FilesystemReader,
+    files: Vec<PathBuf>,
+    changed: HashSet<PathBuf>,
+}
+
+impl ContentReader for WatchedNoteReader {
+    fn root(&self) -> &Path {
+        self.filesystem.root()
+    }
+    fn version_id(&self) -> &str {
+        "watched-events"
+    }
+    fn list_files(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+        Ok(self.files.clone())
+    }
+    fn read_file(&self, path: &Path) -> Result<String, anyhow::Error> {
+        self.filesystem.read_file(path)
+    }
+    fn file_meta_nanos(&self, path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+        if self.changed.contains(path) {
+            let size = std::fs::metadata(self.root().join(path))?.len();
+            Ok(Some((u64::MAX, size)))
+        } else {
+            Ok(Some((0, 0)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_watched_paths(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    paths: &[PathBuf],
+    ignore_set: &GlobSet,
+    lease: &dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
+    let mut files: HashSet<PathBuf> = store
+        .list_notes(Some(&v_uid))?
+        .into_iter()
+        .map(|n| PathBuf::from(n.file_path))
+        .collect();
+    let mut changed = HashSet::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(vault_root)
+            .context("watched path outside vault")?
+            .to_path_buf();
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let canonical = std::fs::canonicalize(path)?;
+                if !canonical.starts_with(vault_root) {
+                    anyhow::bail!("watched note escapes vault: {}", path.display());
+                }
+                files.insert(relative.clone());
+                changed.insert(relative);
+            }
+            Ok(_) => anyhow::bail!("watched note is not a file: {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                files.remove(&relative);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat watched note {}", path.display()));
+            }
+        }
+    }
+    let reader = WatchedNoteReader {
+        filesystem: crate::content_reader::FilesystemReader::with_limits(
+            vault_root,
+            note_reader_limits(),
+        )
+        .with_skip_dirs(SKIP_DIRS),
+        files: files.into_iter().collect(),
+        changed,
+    };
+    index_markdown_since_with_reader_mode(
+        store,
+        &reader,
+        instance_id,
+        vault_name,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        ignore_set,
+        Some(lease),
+    )?;
+    Ok(())
+}
+
 fn index_markdown_since_with_reader(
     store: &GraphStore,
     reader: &dyn ContentReader,
@@ -661,6 +753,29 @@ fn index_markdown_since_with_reader(
     vault_name: &str,
     since: std::time::SystemTime,
     ignore_set: &GlobSet,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
+    index_markdown_since_with_reader_mode(
+        store,
+        reader,
+        instance_id,
+        vault_name,
+        since,
+        ignore_set,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_markdown_since_with_reader_mode(
+    store: &GraphStore,
+    reader: &dyn ContentReader,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    ignore_set: &GlobSet,
+    watch_lease: Option<
+        &dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error>,
+    >,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
@@ -798,7 +913,11 @@ fn index_markdown_since_with_reader(
     // With an empty scan every indexed note falls into `removed_uids` below, so
     // an unreadable or unmounted vault empties the graph here too. Same guard,
     // same reason: a deletion must be observed, never inferred from silence.
-    if eligible_note_uids.is_empty() && vault_existed && !existing_notes.is_empty() {
+    if watch_lease.is_none()
+        && eligible_note_uids.is_empty()
+        && vault_existed
+        && !existing_notes.is_empty()
+    {
         anyhow::bail!(
             "refusing to refresh vault '{vault_name}': the scan found no note files, but {} \
              note(s) are indexed. Committing this would delete every one of them. Check that \
@@ -1189,21 +1308,6 @@ fn index_markdown_since_with_reader(
         note_tag_edges.extend(graph.note_tag_edges);
         section_tag_edges.extend(graph.section_tag_edges);
     }
-    let vault_note_refs = string_edge_refs(&vault_note_edges);
-    let note_heading_refs = string_edge_refs(&note_heading_edges);
-    let note_section_refs = string_edge_refs(&note_section_edges);
-    let heading_section_refs = string_edge_refs(&heading_section_edges);
-    let heading_parent_refs = string_edge_refs(&heading_parent_edges);
-    let note_tag_refs = string_edge_refs(&note_tag_edges);
-    let section_tag_refs = string_edge_refs(&section_tag_edges);
-    let wikilink_note_refs: Vec<_> = wikilink_to_note
-        .iter()
-        .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
-        .collect();
-    let wikilink_heading_refs: Vec<_> = wikilink_to_heading
-        .iter()
-        .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
-        .collect();
     // A replacement DETACH-deletes the incumbent Note. Preserve materialized
     // project membership for replacements, but intentionally not for notes
     // that are truly removed from the vault.
@@ -1223,40 +1327,42 @@ fn index_markdown_since_with_reader(
             }
         }
     }
-    let project_note_refs = string_edge_refs(&project_note_edges);
-    // Publication completion reconciles vectors against the committed graph.
-    let graph_publication =
-        crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
-    store
-        .incremental_vault_refresh_atomically(
-            &Vault {
-                uid: v_uid.clone(),
-                name: vault_name.to_string(),
-                root_path: root_str,
-                instance_id: instance_id.to_string(),
-            },
-            &delete_note_uids,
-            &rebuild_link_source_uids,
-            &notes,
-            &headings,
-            &sections,
-            &vault_note_refs,
-            &note_heading_refs,
-            &note_section_refs,
-            &heading_section_refs,
-            &heading_parent_refs,
-            &tags,
-            &note_tag_refs,
-            &section_tag_refs,
-            &wikilink_note_refs,
-            &wikilink_heading_refs,
-            &unresolved,
-            &typed_edges,
-            &project_note_refs,
-        )
-        .context("atomic incremental vault refresh")?;
-
-    let publication = graph_publication.finish(true)?;
+    let plan = VaultRefreshPlan {
+        vault: Vault {
+            uid: v_uid.clone(),
+            name: vault_name.to_string(),
+            root_path: root_str,
+            instance_id: instance_id.to_string(),
+        },
+        delete_note_uids,
+        rebuild_link_source_uids,
+        notes,
+        headings,
+        sections,
+        vault_note_edges,
+        note_heading_edges,
+        note_section_edges,
+        heading_section_edges,
+        heading_parent_edges,
+        tags,
+        note_tag_edges,
+        section_tag_edges,
+        wikilink_to_note,
+        wikilink_to_heading,
+        unresolved,
+        typed_edges,
+        project_note_edges,
+    };
+    let publication = if let Some(lease) = watch_lease {
+        plan.commit_watched(store, lease)?;
+        // The watcher owns one dirty marker and one publication for its batch.
+        crate::manifest::finalize_committed_graph_mutation(store, false)
+    } else {
+        let publication =
+            crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
+        plan.commit(store, true)?;
+        publication.finish(true)?
+    };
 
     // Publication completion reconciles vectors against the committed live graph.
 
@@ -1271,6 +1377,248 @@ fn index_markdown_since_with_reader(
         changed_note_link_edges: changed_wikilinks,
         publication,
     })
+}
+
+/// Fully prepared before the first destructive write. The ordinary refresh
+/// commits it atomically; watching preserves per-file admission fairness and
+/// reconciles affected source links only after all target identities exist.
+#[derive(Clone)]
+struct VaultRefreshPlan {
+    vault: Vault,
+    delete_note_uids: Vec<String>,
+    rebuild_link_source_uids: Vec<String>,
+    notes: Vec<Note>,
+    headings: Vec<Heading>,
+    sections: Vec<Section>,
+    vault_note_edges: Vec<(String, String)>,
+    note_heading_edges: Vec<(String, String)>,
+    note_section_edges: Vec<(String, String)>,
+    heading_section_edges: Vec<(String, String)>,
+    heading_parent_edges: Vec<(String, String)>,
+    note_tag_edges: Vec<(String, String)>,
+    section_tag_edges: Vec<(String, String)>,
+    project_note_edges: Vec<(String, String)>,
+    tags: Vec<Tag>,
+    wikilink_to_note: Vec<(String, String, f32, String, String)>,
+    wikilink_to_heading: Vec<(String, String, f32, String, String)>,
+    unresolved: Vec<(String, String, String, String, String)>,
+    typed_edges: Vec<ResolvedEdge>,
+}
+
+impl VaultRefreshPlan {
+    fn commit(&self, store: &GraphStore, prune_tags: bool) -> Result<(), anyhow::Error> {
+        let note_links: Vec<_> = self
+            .wikilink_to_note
+            .iter()
+            .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
+            .collect();
+        let heading_links: Vec<_> = self
+            .wikilink_to_heading
+            .iter()
+            .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
+            .collect();
+        store
+            .incremental_vault_refresh_with_tag_cleanup(
+                &self.vault,
+                &self.delete_note_uids,
+                &self.rebuild_link_source_uids,
+                &self.notes,
+                &self.headings,
+                &self.sections,
+                &string_edge_refs(&self.vault_note_edges),
+                &string_edge_refs(&self.note_heading_edges),
+                &string_edge_refs(&self.note_section_edges),
+                &string_edge_refs(&self.heading_section_edges),
+                &string_edge_refs(&self.heading_parent_edges),
+                &self.tags,
+                &string_edge_refs(&self.note_tag_edges),
+                &string_edge_refs(&self.section_tag_edges),
+                &note_links,
+                &heading_links,
+                &self.unresolved,
+                &self.typed_edges,
+                &string_edge_refs(&self.project_note_edges),
+                prune_tags,
+            )
+            .context("atomic incremental vault refresh")
+    }
+
+    fn empty(&self) -> Self {
+        Self {
+            vault: self.vault.clone(),
+            delete_note_uids: Vec::new(),
+            rebuild_link_source_uids: Vec::new(),
+            notes: Vec::new(),
+            headings: Vec::new(),
+            sections: Vec::new(),
+            vault_note_edges: Vec::new(),
+            note_heading_edges: Vec::new(),
+            note_section_edges: Vec::new(),
+            heading_section_edges: Vec::new(),
+            heading_parent_edges: Vec::new(),
+            tags: Vec::new(),
+            note_tag_edges: Vec::new(),
+            section_tag_edges: Vec::new(),
+            wikilink_to_note: Vec::new(),
+            wikilink_to_heading: Vec::new(),
+            unresolved: Vec::new(),
+            typed_edges: Vec::new(),
+            project_note_edges: Vec::new(),
+        }
+    }
+
+    fn commit_watched(
+        &self,
+        store: &GraphStore,
+        lease: &dyn Fn() -> Result<
+            Option<Box<dyn crate::watcher::WatchMutationLease>>,
+            anyhow::Error,
+        >,
+    ) -> Result<(), anyhow::Error> {
+        // Each transaction installs a complete note, and can yield to another
+        // admitted writer before the next file. No source reads under the gate.
+        let mut changed: Vec<_> = self
+            .delete_note_uids
+            .iter()
+            .cloned()
+            .chain(self.notes.iter().map(|n| n.uid.clone()))
+            .collect();
+        changed.sort();
+        changed.dedup();
+        let mut inserted_tags = HashSet::new();
+        for uid in changed {
+            let mut part = self.empty();
+            part.delete_note_uids = self
+                .delete_note_uids
+                .iter()
+                .filter(|n| **n == uid)
+                .cloned()
+                .collect();
+            part.notes = self
+                .notes
+                .iter()
+                .filter(|n| n.uid == uid)
+                .cloned()
+                .collect();
+            part.headings = self
+                .headings
+                .iter()
+                .filter(|h| h.note_uid == uid)
+                .cloned()
+                .collect();
+            part.sections = self
+                .sections
+                .iter()
+                .filter(|s| s.note_uid == uid)
+                .cloned()
+                .collect();
+            let headings: HashSet<_> = part.headings.iter().map(|h| h.uid.as_str()).collect();
+            let sections: HashSet<_> = part.sections.iter().map(|s| s.uid.as_str()).collect();
+            part.vault_note_edges = self
+                .vault_note_edges
+                .iter()
+                .filter(|(_, n)| *n == uid)
+                .cloned()
+                .collect();
+            part.note_heading_edges = self
+                .note_heading_edges
+                .iter()
+                .filter(|(n, _)| *n == uid)
+                .cloned()
+                .collect();
+            part.note_section_edges = self
+                .note_section_edges
+                .iter()
+                .filter(|(n, _)| *n == uid)
+                .cloned()
+                .collect();
+            part.heading_section_edges = self
+                .heading_section_edges
+                .iter()
+                .filter(|(h, _)| headings.contains(h.as_str()))
+                .cloned()
+                .collect();
+            part.heading_parent_edges = self
+                .heading_parent_edges
+                .iter()
+                .filter(|(h, _)| headings.contains(h.as_str()))
+                .cloned()
+                .collect();
+            part.note_tag_edges = self
+                .note_tag_edges
+                .iter()
+                .filter(|(n, _)| *n == uid)
+                .cloned()
+                .collect();
+            part.section_tag_edges = self
+                .section_tag_edges
+                .iter()
+                .filter(|(s, _)| sections.contains(s.as_str()))
+                .cloned()
+                .collect();
+            let tags: HashSet<_> = part
+                .note_tag_edges
+                .iter()
+                .chain(part.section_tag_edges.iter())
+                .map(|(_, t)| t.as_str())
+                .collect();
+            part.tags = self
+                .tags
+                .iter()
+                .filter(|t| tags.contains(t.uid.as_str()) && !inserted_tags.contains(&t.uid))
+                .cloned()
+                .collect();
+            part.project_note_edges = self
+                .project_note_edges
+                .iter()
+                .filter(|(_, n)| *n == uid)
+                .cloned()
+                .collect();
+            let _lease = lease()?;
+            // Orphan cleanup is deferred: a later prepared note may reuse a
+            // preexisting tag not included in its new-tag insertion list.
+            part.commit(store, false)?;
+            inserted_tags.extend(part.tags.iter().map(|tag| tag.uid.clone()));
+        }
+        // Unchanged affected sources retain their own nodes and tags. Replace
+        // just their outgoing relationship rows, one source transaction at a time.
+        for uid in &self.rebuild_link_source_uids {
+            let mut part = self.empty();
+            part.rebuild_link_source_uids.push(uid.clone());
+            let sections: HashSet<_> = store
+                .sections_in_note(uid)?
+                .into_iter()
+                .map(|s| s.uid)
+                .collect();
+            part.wikilink_to_note = self
+                .wikilink_to_note
+                .iter()
+                .filter(|(s, ..)| sections.contains(s))
+                .cloned()
+                .collect();
+            part.wikilink_to_heading = self
+                .wikilink_to_heading
+                .iter()
+                .filter(|(s, ..)| sections.contains(s))
+                .cloned()
+                .collect();
+            part.unresolved = self
+                .unresolved
+                .iter()
+                .filter(|(_, n, ..)| n == uid)
+                .cloned()
+                .collect();
+            part.typed_edges = self
+                .typed_edges
+                .iter()
+                .filter(|e| &e.source_uid == uid)
+                .cloned()
+                .collect();
+            let _lease = lease()?;
+            part.commit(store, false)?;
+        }
+        Ok(())
+    }
 }
 
 struct PreparedNoteGraph {
