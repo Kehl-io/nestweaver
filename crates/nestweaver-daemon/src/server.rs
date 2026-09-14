@@ -24475,6 +24475,16 @@ external_model = "unavailable-test-model"
                 }))
                 .await
         });
+        // Observe admission before measuring acknowledgement: a slow task
+        // scheduler must not make the old immediate-success behavior look safe.
+        // Polling registration does not consume an already-completed handle.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while watcher_status(&state).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher registration must become visible at the startup barrier");
         let premature =
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut starting).await;
         drop(holder);
