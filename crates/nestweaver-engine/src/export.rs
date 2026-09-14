@@ -759,6 +759,152 @@ mod tests {
         store
     }
 
+    /// Namespace-aware consumers must see the nonempty graph at every scope.
+    #[test]
+    fn graphml_standard_namespace_preserves_scoped_nodes_and_edges() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Vault};
+        use std::collections::BTreeSet;
+
+        const NS: &str = "http://graphml.graphdrawing.org/xmlns";
+        const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
+        let store = populated_store();
+        store
+            .insert_vault(&Vault {
+                uid: "vault&雪".into(),
+                name: "Vault & 雪".into(),
+                root_path: "/tmp/vault".into(),
+                instance_id: "test".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note&雪".into(),
+                vault_uid: "vault&雪".into(),
+                file_path: "雪 & note.md".into(),
+                title: "Note & 雪".into(),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: "hash".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        for (line, uid) in [(1, "heading&1"), (2, "heading&2")] {
+            store
+                .insert_heading(&Heading {
+                    uid: uid.into(),
+                    note_uid: "note&雪".into(),
+                    level: 1,
+                    text: "Repeated & 雪".into(),
+                    slug: format!("repeat-{line}"),
+                    start_line: line,
+                    end_line: line,
+                    content_hash: "hash".into(),
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        store
+            .batch_insert_vault_note_edges(&[("vault&雪", "note&雪")])
+            .unwrap();
+        store
+            .batch_insert_note_heading_edges(&[("note&雪", "heading&1"), ("note&雪", "heading&2")])
+            .unwrap();
+
+        for scope in [ExportScope::All, ExportScope::Code, ExportScope::Vault] {
+            // Exercise the engine writer and the shared CLI/daemon text route.
+            for shared_route in [false, true] {
+                let mut output = Vec::new();
+                if shared_route {
+                    assert!(
+                        export_text_format(&store, &mut output, "graphml", scope, 20)
+                            .unwrap()
+                            .is_none()
+                    );
+                } else {
+                    export_graphml_scoped(&store, &mut output, scope).unwrap();
+                }
+                let output = String::from_utf8(output).unwrap();
+                let doc = roxmltree::Document::parse(&output).unwrap();
+                let root = doc.root_element();
+                assert!(
+                    root.has_tag_name((NS, "graphml")),
+                    "wrong GraphML expanded name"
+                );
+                assert_eq!(root.lookup_namespace_uri(None), Some(NS));
+                assert_eq!(root.lookup_namespace_uri(Some("xsi")), Some(XSI));
+                assert_eq!(
+                    root.attribute((XSI, "schemaLocation")),
+                    Some(
+                        "http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd"
+                    )
+                );
+                let graph = root
+                    .children()
+                    .find(|n| n.has_tag_name((NS, "graph")))
+                    .unwrap();
+                assert_eq!(graph.attribute("id"), Some("G"));
+                assert_eq!(graph.attribute("edgedefault"), Some("directed"));
+                let nodes: Vec<_> = graph
+                    .children()
+                    .filter(|n| n.has_tag_name((NS, "node")))
+                    .collect();
+                let ids: BTreeSet<_> = nodes.iter().map(|n| n.attribute("id").unwrap()).collect();
+                assert_eq!(nodes.len(), ids.len(), "duplicate node IDs");
+                let mut expected_ids = BTreeSet::new();
+                let mut expected_edges = BTreeSet::new();
+                if scope.includes_code() {
+                    expected_ids.extend(["repo-1", "sym-a", "sym-b"]);
+                    expected_edges.insert(("sym-a", "sym-b"));
+                }
+                if scope.includes_vault() {
+                    expected_ids.extend(["vault&雪", "note&雪", "heading&1", "heading&2"]);
+                    expected_edges.extend([
+                        ("vault&雪", "note&雪"),
+                        ("note&雪", "heading&1"),
+                        ("note&雪", "heading&2"),
+                    ]);
+                    for uid in ["heading&1", "heading&2"] {
+                        let node = nodes
+                            .iter()
+                            .find(|n| n.attribute("id") == Some(uid))
+                            .unwrap();
+                        let label = node
+                            .children()
+                            .find(|n| {
+                                n.has_tag_name((NS, "data")) && n.attribute("key") == Some("label")
+                            })
+                            .unwrap();
+                        assert_eq!(label.text(), Some("Repeated & 雪"));
+                    }
+                }
+                assert_eq!(ids, expected_ids, "scope {scope:?}");
+                let edges: Vec<_> = graph
+                    .children()
+                    .filter(|n| n.has_tag_name((NS, "edge")))
+                    .collect();
+                let endpoints: BTreeSet<_> = edges
+                    .iter()
+                    .map(|n| {
+                        (
+                            n.attribute("source").unwrap(),
+                            n.attribute("target").unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(edges.len(), expected_edges.len());
+                assert_eq!(endpoints, expected_edges, "scope {scope:?}");
+                for (source, target) in endpoints {
+                    assert!(ids.contains(source) && ids.contains(target));
+                }
+            }
+        }
+    }
+
     /// nw-173. A full export must contain the VAULT subgraph, not just code.
     ///
     /// It contained none: a real graph with 1,088 notes and 12,439 headings
