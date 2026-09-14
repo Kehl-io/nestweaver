@@ -4567,11 +4567,24 @@ mod tests {
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let mut fds = [0 as libc::c_int; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Computed before fork: the child may only make async-signal-safe calls.
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(256, 65_536) as libc::c_int;
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                libc::close(fds[0]);
+                // A forked child inherits EVERY descriptor the multi-threaded
+                // test harness has open, and `flock` locks belong to the open
+                // file description — so this long-lived child would silently
+                // co-hold any other concurrently running test's flock (e.g.
+                // `gc_spares_spawn_handshakes_and_collects_unrelated_orphans`'s
+                // spawn lock, which then reads as a live spawn and is spared).
+                // Keep only stdio and the readiness pipe.
+                for fd in 3..max_fd {
+                    if fd != fds[1] {
+                        libc::close(fd);
+                    }
+                }
                 let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
                 if fd < 0 {
                     libc::_exit(11);
