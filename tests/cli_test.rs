@@ -3494,6 +3494,7 @@ fn an_empty_query_or_pattern_is_a_usage_error_on_every_swept_command() {
 
     for args in [
         vec!["search", ""],
+        vec!["brain", "search", ""],
         vec!["investigate", ""],
         vec!["regex-search", ""],
         vec!["count-patterns", ""],
@@ -3506,6 +3507,32 @@ fn an_empty_query_or_pattern_is_a_usage_error_on_every_swept_command() {
             .code(64)
             .stderr(contains("empty").and(contains("not allowed")));
     }
+}
+
+/// nw-480: `brain search "" --json` must fail at the CLI (exit 64) with a
+/// JSON error object, not a daemon Internal error and empty stdout.
+#[test]
+fn brain_search_empty_query_is_json_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let assert = nestweaver_cmd()
+        .args(["brain", "search", "", "--json", "--db"])
+        .arg(&db)
+        .assert()
+        .code(64)
+        .stderr(contains("empty").and(contains("not allowed")));
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("JSON usage error on stdout");
+    assert_eq!(
+        value["error"].as_str(),
+        Some("empty query strings are not allowed"),
+        "{stdout}"
+    );
 }
 
 /// The help text used to advertise "orphaned daemon state directories" on
