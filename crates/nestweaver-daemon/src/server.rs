@@ -1616,6 +1616,26 @@ fn embedding_status_proto(
     }
 }
 
+/// Ranked tools already emit `degraded_components: ["semantic"]` when the
+/// embedder is down. `brain status` must say the same thing: an
+/// `embedding_status.state` of `failed` / `identity_unreadable` with an
+/// empty `degraded_components` is a lie (nw-474).
+fn disclose_semantic_degradation(value: &mut serde_json::Value, embedding_state: &str) {
+    if matches!(embedding_state, "ready" | "embedding") {
+        return;
+    }
+    let Some(arr) = value
+        .get_mut("degraded_components")
+        .and_then(|v| v.as_array_mut())
+    else {
+        value["degraded_components"] = serde_json::json!(["semantic"]);
+        return;
+    };
+    if !arr.iter().any(|v| v.as_str() == Some("semantic")) {
+        arr.push(serde_json::json!("semantic"));
+    }
+}
+
 fn embedding_status_json(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
@@ -8593,6 +8613,11 @@ impl NestWeaverDaemon for DaemonService {
                 self.state.store.embedding_index_occupancy(),
                 &self.state.store,
             );
+            let embedding_state = value["embedding_status"]["state"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            disclose_semantic_degradation(&mut value, &embedding_state);
             value["search_status"] = search_status_json(&search_capability_status(&self.state));
             // Daemon-side witness counter in the `cache` block (the
             // `hit_rate_pct` session-counter precedent): an adopted client
@@ -20876,6 +20901,27 @@ credential_method = "gh"
         })
     }
 
+    #[test]
+    fn failed_embedding_state_discloses_semantic_degradation() {
+        let mut failed = serde_json::json!({ "degraded_components": [] });
+        disclose_semantic_degradation(&mut failed, "failed");
+        assert_eq!(failed["degraded_components"], serde_json::json!(["semantic"]));
+        disclose_semantic_degradation(&mut failed, "failed");
+        assert_eq!(
+            failed["degraded_components"],
+            serde_json::json!(["semantic"]),
+            "must not duplicate semantic"
+        );
+
+        let mut ready = serde_json::json!({ "degraded_components": [] });
+        disclose_semantic_degradation(&mut ready, "ready");
+        assert_eq!(ready["degraded_components"], serde_json::json!([]));
+        disclose_semantic_degradation(&mut ready, "embedding");
+        assert_eq!(ready["degraded_components"], serde_json::json!([]));
+        disclose_semantic_degradation(&mut ready, "identity_unreadable");
+        assert_eq!(ready["degraded_components"], serde_json::json!(["semantic"]));
+    }
+
     #[tokio::test]
     async fn embedding_status_is_exposed_by_typed_and_json_status_rpcs() {
         let state = test_state_with_writer();
@@ -20928,6 +20974,13 @@ credential_method = "gh"
         let value: serde_json::Value =
             serde_json::from_str(&json.result_json).expect("valid status JSON");
         assert_eq!(value["embedding_status"]["state"], "failed");
+        assert!(
+            value["degraded_components"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("semantic"))),
+            "failed embedder must disclose semantic degradation: {}",
+            value["degraded_components"]
+        );
         assert_eq!(value["embedding_status"]["requested_device"], "metal");
         assert_eq!(value["embedding_status"]["selected_device"], "");
         assert_eq!(value["embedding_status"]["fallback_used"], false);
