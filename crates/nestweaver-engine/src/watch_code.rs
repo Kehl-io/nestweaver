@@ -434,6 +434,7 @@ impl CodeWatcher {
         events: &[PathBuf],
     ) -> anyhow::Result<Vec<PathBuf>> {
         let mut paths = HashSet::new();
+        let mut incumbent_paths = HashSet::new();
         let mut subtrees = Vec::new();
         for path in events.iter().collect::<HashSet<_>>() {
             let Ok(rel) = path.strip_prefix(&self.repo_root) else {
@@ -487,6 +488,7 @@ impl CodeWatcher {
             for (_, rel) in store.list_files_by_repo(r_uid)? {
                 let path = self.repo_root.join(&rel);
                 if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                    incumbent_paths.insert(path.clone());
                     paths.insert(path);
                 }
             }
@@ -497,6 +499,7 @@ impl CodeWatcher {
             for contract in store.list_contracts(Some(r_uid))? {
                 let path = self.repo_root.join(contract.source_path);
                 if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                    incumbent_paths.insert(path.clone());
                     paths.insert(path);
                 }
             }
@@ -546,6 +549,12 @@ impl CodeWatcher {
                 }
             }
         }
+        paths.retain(|path| {
+            incumbent_paths.contains(path)
+                || path
+                    .strip_prefix(&self.repo_root)
+                    .is_ok_and(|rel| reader.accepts_path(rel))
+        });
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort();
         Ok(paths)
@@ -1497,6 +1506,25 @@ mod tests {
                 "returned/inner/new.js".into()
             ])
         );
+    }
+
+    #[test]
+    fn ignored_build_subtree_events_do_not_publish_empty_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target/generated.rs"), "fn generated() {}").unwrap();
+        assert!(matches!(
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &r_uid,
+                &root,
+                &[root.join("target"), root.join("target/generated.rs")]
+            ),
+            WatchBatchOutcome::Unchanged
+        ));
     }
 
     #[test]
