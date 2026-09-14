@@ -1466,6 +1466,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_directory_rename_then_edit_has_one_live_symbol_and_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let store = Arc::new(store);
+        let observed = store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
+            .with_debounce_ms(100)
+            .with_ready_signal(ready_tx);
+        let stop = watcher.shutdown_handle();
+        let handle = std::thread::spawn(move || {
+            watcher.run_with_store(
+                store,
+                Some(Box::new(move || {
+                    let _ = changed_tx.send(());
+                })),
+            )
+        });
+        let result = (|| -> anyhow::Result<()> {
+            ready_rx.recv_timeout(Duration::from_secs(10))?;
+            std::fs::rename(root.join("src"), root.join("moved"))?;
+            changed_rx.recv_timeout(Duration::from_secs(15))?;
+            anyhow::ensure!(
+                observed.symbols_in_file("src/a.js")?.is_empty(),
+                "stale old symbols after move"
+            );
+            anyhow::ensure!(
+                observed.symbols_in_file("moved/a.js")?.len() == 1,
+                "moved source absent"
+            );
+            std::fs::write(
+                root.join("moved/a.js"),
+                "export function helper() { return 99; }",
+            )?;
+            changed_rx.recv_timeout(Duration::from_secs(15))?;
+            anyhow::ensure!(
+                observed
+                    .lookup_symbols_by_repo(&r_uid)?
+                    .iter()
+                    .filter(|s| s.name == "helper")
+                    .count()
+                    == 1,
+                "duplicate symbol after edit"
+            );
+            Ok(())
+        })();
+        stop.stop();
+        handle.join().unwrap().unwrap();
+        result.unwrap();
+        let before = observed.lookup_symbols_by_repo(&r_uid).unwrap().len();
+        std::fs::write(
+            root.join("moved/after_stop.js"),
+            "export function late() {}",
+        )
+        .unwrap();
+        assert_eq!(
+            observed.lookup_symbols_by_repo(&r_uid).unwrap().len(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_events_do_not_follow_external_symlinks_or_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.js"), "export function secret() {}").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[
+                root.join("link"),
+                root.join("link/secret.js"),
+                root.join("../outside/secret.js"),
+            ],
+        );
+        assert!(
+            !store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "secret")
+        );
+        assert_eq!(store.list_files_by_repo(&r_uid).unwrap().len(), 3);
+    }
+
     #[test]
     fn watcher_configured_excludes_remove_stale_rows_and_never_reintroduce_changes() {
         let dir = tempfile::tempdir().unwrap();
