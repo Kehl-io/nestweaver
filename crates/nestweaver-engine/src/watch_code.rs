@@ -1229,6 +1229,50 @@ mod tests {
     }
 
     #[test]
+    fn directory_events_reconcile_moves_deletions_and_prefix_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("src2")).unwrap();
+        std::fs::write(root.join("src2/control.js"), "export function control() {}").unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("src2/control.js")]);
+        std::fs::rename(root.join("src"), root.join("nested.js")).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root,
+            &[root.join("src"), root.join("nested.js"), root.join("nested.js/a.js")]);
+        let paths: HashSet<_> = store.list_files_by_repo(&r_uid).unwrap().into_iter().map(|(_, p)| p).collect();
+        assert_eq!(paths, HashSet::from(["nested.js/a.js".into(), "nested.js/b.js".into(), "nested.js/c.js".into(), "src2/control.js".into()]));
+        std::fs::write(root.join("nested.js/a.js"), "export function helper() { return 9; }").unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("nested.js/a.js")]);
+        assert_eq!(store.lookup_symbols_by_repo(&r_uid).unwrap().iter().filter(|s| s.name == "helper").count(), 1);
+        std::fs::remove_dir_all(root.join("nested.js")).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("nested.js")]);
+        assert_eq!(store.list_files_by_repo(&r_uid).unwrap().into_iter().map(|(_, p)| p).collect::<Vec<_>>(), vec!["src2/control.js"]);
+    }
+
+    #[test]
+    fn directory_events_move_out_and_in_respect_exclusions_and_nested_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let config: crate::InstanceConfig = serde_json::from_value(serde_json::json!({
+            "instance_id":"test", "repos":[{"url":format!("file://{}",root.display()),"exclude":["returned/b.js"]}],
+            "snapshot_storage":{"backend":"local","path":"/tmp"}, "workspace":{"backend":"local","path":"/tmp"},
+            "inference":{"endpoint":"","embedding_model":"","summary_model":""}, "git":{"credential_method":"ssh"}
+        })).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
+            .with_instance_config(Some(Arc::new(config)));
+        let outside = dir.path().join("outside");
+        std::fs::rename(root.join("src"), &outside).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("src"), outside.clone()]);
+        assert!(store.list_files_by_repo(&r_uid).unwrap().is_empty());
+        std::fs::create_dir(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner/new.js"), "export function nested() {}").unwrap();
+        std::fs::rename(&outside, root.join("returned")).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("returned"), root.join("returned/inner")]);
+        let paths: HashSet<_> = store.list_files_by_repo(&r_uid).unwrap().into_iter().map(|(_, p)| p).collect();
+        assert_eq!(paths, HashSet::from(["returned/a.js".into(), "returned/c.js".into(), "returned/inner/new.js".into()]));
+    }
+
+    #[test]
     fn watcher_configured_excludes_remove_stale_rows_and_never_reintroduce_changes() {
         let dir = tempfile::tempdir().unwrap();
         let (store, r_uid, root) = index_fixture_repo(&dir);
