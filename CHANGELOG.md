@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.0.2](https://github.com/Kehl-io/nestweaver/compare/v10.0.1...v10.0.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* **deps:** upgrade Rust dependencies and migrate Tree-sitter APIs ([f120568](https://github.com/Kehl-io/nestweaver/commit/f1205680dd9166e31f2b1c8b8cc027976ca523cc))
+* preserve watched graphs and emit interoperable GraphML ([#392](https://github.com/Kehl-io/nestweaver/issues/392)) ([0212ba6](https://github.com/Kehl-io/nestweaver/commit/0212ba6d9f5f534984478ad85a94ba1cc578ddc0))
+
 ## [10.0.1](https://github.com/Kehl-io/nestweaver/compare/v10.0.0...v10.0.1) (2026-09-13)
 
 
