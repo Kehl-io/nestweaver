@@ -49,6 +49,7 @@ pub struct CodeWatcher {
 
 #[derive(Debug)]
 enum WatchBatchOutcome {
+    Unchanged,
     Published { files_processed: usize },
     Skipped { reason: anyhow::Error },
 }
@@ -291,7 +292,7 @@ impl CodeWatcher {
                     &crate::index::FileSystemIndexEpilogueIo,
                     on_change.as_deref().map(|callback| callback as &dyn Fn()),
                 )? {
-                    WatchBatchOutcome::Published { .. } => break,
+                    WatchBatchOutcome::Published { .. } | WatchBatchOutcome::Unchanged => break,
                     WatchBatchOutcome::Skipped { reason } => {
                         // A save racing the cold snapshot is expected to be
                         // queued because notification was registered first.
@@ -377,35 +378,6 @@ impl CodeWatcher {
                 }
             };
 
-            // Deduplicate paths within the batch — the debouncer may
-            // fire multiple events for the same file.
-            let mut unique_paths: HashSet<PathBuf> = HashSet::new();
-            for path in batch {
-                unique_paths.insert(path);
-            }
-
-            // Contract specs are first-class watcher inputs even though they
-            // are not parser-supported source files. A spec-only edit must
-            // refresh the derived Contract nodes and IMPLEMENTS_CONTRACT
-            // edges just like an ordinary incremental index.
-            let policy_reader = self.reader_for(&repo_url)?;
-            let relevant: Vec<PathBuf> = unique_paths
-                .into_iter()
-                .filter(|p| is_watcher_input(p))
-                .filter(|path| {
-                    path.strip_prefix(&self.repo_root).is_ok_and(|relative| {
-                        !crate::index::path_in_skip_dir_with_unskip(
-                            relative,
-                            policy_reader.unskipped_skip_dirs(),
-                        )
-                    })
-                })
-                .collect();
-
-            if relevant.is_empty() {
-                continue;
-            }
-
             let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -419,12 +391,13 @@ impl CodeWatcher {
                 &store,
                 &r_uid,
                 &repo_url,
-                &relevant,
+                &batch,
                 &crate::index::FileSystemIndexEpilogueIo,
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
             )?;
             let files_processed = match outcome {
                 WatchBatchOutcome::Published { files_processed } => files_processed,
+                WatchBatchOutcome::Unchanged => continue,
                 WatchBatchOutcome::Skipped { reason } => {
                     tracing::warn!(
                         error = %reason,
@@ -446,6 +419,145 @@ impl CodeWatcher {
             // `process_batch_and_notify`; skipped/dirty batches cannot emit a
             // false-positive SSE change event.
         }
+    }
+
+    /// Expand only affected subtrees. Missing directories require the indexed
+    /// inventory: filesystem metadata alone cannot recover their descendants.
+    /// Keep indexed paths even when policy now excludes them so publication
+    /// retracts stale coverage instead of silently leaving it behind.
+    fn expand_event_paths(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        reader: &crate::content_reader::FilesystemReader,
+        repo_url: &str,
+        events: &[PathBuf],
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = HashSet::new();
+        let mut incumbent_paths = HashSet::new();
+        let mut subtrees = Vec::new();
+        for path in events.iter().collect::<HashSet<_>>() {
+            let Ok(rel) = path.strip_prefix(&self.repo_root) else {
+                continue;
+            };
+            if rel
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(path);
+            match metadata {
+                Ok(meta) if meta.is_dir() => subtrees.push(path.clone()),
+                Ok(meta) if meta.is_file() => {
+                    subtrees.push(path.clone());
+                    if is_watcher_input(path) {
+                        paths.insert(path.clone());
+                    }
+                }
+                Ok(meta) if meta.file_type().is_symlink() => subtrees.push(path.clone()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    subtrees.push(path.clone());
+                    if is_watcher_input(path) {
+                        paths.insert(path.clone());
+                    }
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect watcher event {}", path.display()));
+                }
+                _ => {}
+            }
+        }
+        // Collapse overlapping directory notifications before walking. A
+        // directory and its file notifications still publish each file once.
+        subtrees.sort();
+        subtrees.dedup();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for subtree in subtrees {
+            if !roots.iter().any(|root| subtree.starts_with(root)) {
+                roots.push(subtree);
+            }
+        }
+        if !roots.is_empty() {
+            for (_, rel) in store.list_files_by_repo(r_uid)? {
+                let path = self.repo_root.join(&rel);
+                if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                    incumbent_paths.insert(path.clone());
+                    paths.insert(path);
+                }
+            }
+        }
+        // Specs need not have File nodes, but their declared contracts retain
+        // the input path needed to retract a removed spec-only directory.
+        if !roots.is_empty() {
+            for contract in store.list_contracts(Some(r_uid))? {
+                let path = self.repo_root.join(contract.source_path);
+                if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                    incumbent_paths.insert(path.clone());
+                    paths.insert(path);
+                }
+            }
+        }
+        for root in roots {
+            let relative = root.strip_prefix(&self.repo_root)?;
+            if path_has_symlink(&self.repo_root, relative)? || !reader.accepts_path(relative) {
+                continue;
+            }
+            match std::fs::read_dir(&root) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("enumerate watched subtree {}", root.display()));
+                }
+            }
+            let policy = self.reader_for(repo_url)?;
+            let repo_root = self.repo_root.clone();
+            for entry in ignore::WalkBuilder::new(&root)
+                .follow_links(false)
+                .hidden(false)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .filter_entry(move |entry| {
+                    entry
+                        .path()
+                        .strip_prefix(&repo_root)
+                        .is_ok_and(|rel| policy.accepts_path(rel))
+                })
+                .build()
+            {
+                let entry = entry.context("enumerate watched subtree")?;
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && is_watcher_input(entry.path())
+                    && reader.accepts_path(entry.path().strip_prefix(&self.repo_root)?)
+                {
+                    paths.insert(entry.into_path());
+                }
+            }
+        }
+        paths.retain(|path| {
+            incumbent_paths.contains(path)
+                || path
+                    .strip_prefix(&self.repo_root)
+                    .is_ok_and(|rel| reader.accepts_path(rel))
+        });
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort();
+        Ok(paths)
     }
 
     /// Prepare and atomically publish one watcher batch.
@@ -481,6 +593,13 @@ impl CodeWatcher {
     {
         let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
         let reader = self.reader_for(repo_url)?;
+        let relevant = match self.expand_event_paths(store, r_uid, &reader, repo_url, relevant) {
+            Ok(paths) => paths,
+            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+        };
+        if relevant.is_empty() && !insert_initial_repo {
+            return Ok(WatchBatchOutcome::Unchanged);
+        }
         let contract_plan =
             match crate::index::prepare_watcher_contract_derivation(&reader, r_uid, repo_url) {
                 Ok(plan) => plan,
@@ -510,7 +629,9 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            let exclusion_reason = if !reader.accepts_path(rel_path) {
+            let exclusion_reason = if path_has_symlink(&self.repo_root, rel_path)? {
+                Some("symlink outside the admitted source tree")
+            } else if !reader.accepts_path(rel_path) {
                 Some("configured repository exclusion")
             } else if is_minified_or_bundled(path) {
                 Some("minified/generated file policy")
@@ -560,11 +681,19 @@ impl CodeWatcher {
                     changed.insert(rel_str);
                     prepared_paths.push(PreparedPath::Replace(Box::new(prepared)));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
                     removed.insert(rel_str.clone());
                     prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
                 }
-                Ok(_) => continue,
+                Ok(_) => {
+                    removed.insert(rel_str.clone());
+                    prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
+                }
                 Err(error) => {
                     return Ok(WatchBatchOutcome::Skipped {
                         reason: anyhow::Error::new(error)
@@ -756,6 +885,35 @@ impl CodeWatcher {
         }
         Ok(outcome)
     }
+}
+
+// Do not admit a symlink in any component, including an ancestor replaced
+// between events. Missing components are legitimate deletion candidates.
+fn path_has_symlink(root: &Path, relative: &Path) -> anyhow::Result<bool> {
+    let mut path = root.to_path_buf();
+    for part in relative.components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Ok(true);
+        }
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect watched path {}", path.display()));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn drain_queued_events(rx: &std::sync::mpsc::Receiver<RawWatchResult>) -> Vec<PathBuf> {
@@ -1229,6 +1387,433 @@ mod tests {
     }
 
     #[test]
+    fn directory_events_reconcile_moves_deletions_and_prefix_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("src2")).unwrap();
+        std::fs::write(root.join("src2/control.js"), "export function control() {}").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("src2/control.js")],
+        );
+        std::fs::rename(root.join("src"), root.join("nested.js")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[
+                root.join("src"),
+                root.join("nested.js"),
+                root.join("nested.js/a.js"),
+            ],
+        );
+        let paths: HashSet<_> = store
+            .list_files_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "nested.js/a.js".into(),
+                "nested.js/b.js".into(),
+                "nested.js/c.js".into(),
+                "src2/control.js".into()
+            ])
+        );
+        std::fs::write(
+            root.join("nested.js/a.js"),
+            "export function helper() { return 9; }",
+        )
+        .unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("nested.js/a.js")],
+        );
+        assert_eq!(
+            store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .filter(|s| s.name == "helper")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root.join("nested.js")).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("nested.js")]);
+        assert_eq!(
+            store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect::<Vec<_>>(),
+            vec!["src2/control.js"]
+        );
+    }
+
+    #[test]
+    fn directory_events_move_out_and_in_respect_exclusions_and_nested_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let config: crate::InstanceConfig = serde_json::from_value(serde_json::json!({
+            "instance_id":"test", "repos":[{"url":format!("file://{}",root.display()),"exclude":["returned/b.js"]}],
+            "snapshot_storage":{"backend":"local","path":"/tmp"}, "workspace":{"backend":"local","path":"/tmp"},
+            "inference":{"endpoint":"","embedding_model":"","summary_model":""}, "git":{"credential_method":"ssh"}
+        })).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
+            .with_instance_config(Some(Arc::new(config)));
+        let outside = dir.path().join("outside");
+        std::fs::rename(root.join("src"), &outside).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("src"), outside.clone()],
+        );
+        assert!(store.list_files_by_repo(&r_uid).unwrap().is_empty());
+        std::fs::create_dir(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner/new.js"), "export function nested() {}").unwrap();
+        std::fs::rename(&outside, root.join("returned")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("returned"), root.join("returned/inner")],
+        );
+        let paths: HashSet<_> = store
+            .list_files_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "returned/a.js".into(),
+                "returned/c.js".into(),
+                "returned/inner/new.js".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn ignored_build_subtree_events_do_not_publish_empty_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target/generated.rs"), "fn generated() {}").unwrap();
+        assert!(matches!(
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &r_uid,
+                &root,
+                &[root.join("target"), root.join("target/generated.rs")]
+            ),
+            WatchBatchOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn directory_replaced_by_regular_file_retracts_descendants() {
+        for target in ["src", "folder.js"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root) = index_fixture_repo(&dir);
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            if target != "src" {
+                std::fs::rename(root.join("src"), root.join(target)).unwrap();
+                process_fixture_batch(
+                    &watcher,
+                    &store,
+                    &r_uid,
+                    &root,
+                    &[root.join("src"), root.join(target)],
+                );
+            }
+            std::fs::remove_dir_all(root.join(target)).unwrap();
+            std::fs::write(root.join(target), "export function replacement() {}").unwrap();
+            let outcome =
+                process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join(target)]);
+            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            let files = store.list_files_by_repo(&r_uid).unwrap();
+            assert!(files.iter().all(|(_, path)| path == target));
+            assert_eq!(files.len(), usize::from(target.ends_with(".js")));
+        }
+    }
+
+    #[test]
+    fn file_replaced_by_directory_retracts_exact_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::remove_file(root.join("src/a.js")).unwrap();
+        std::fs::create_dir(root.join("src/a.js")).unwrap();
+        std::fs::write(
+            root.join("src/a.js/new.js"),
+            "export function replacement() {}",
+        )
+        .unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("src/a.js")]);
+        assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
+        assert!(
+            !store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|(_, p)| p == "src/a.js")
+        );
+        assert!(!store.symbols_in_file("src/a.js/new.js").unwrap().is_empty());
+    }
+
+    #[test]
+    fn removed_spec_only_directory_retracts_declared_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, _, root) = index_contract_fixture(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("specs")).unwrap();
+        std::fs::rename(root.join("openapi.yaml"), root.join("specs/openapi.yaml")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("openapi.yaml"), root.join("specs")],
+        );
+        assert!(
+            store
+                .list_contracts(Some(&r_uid))
+                .unwrap()
+                .iter()
+                .any(|c| c.source_path == "specs/openapi.yaml")
+        );
+        std::fs::rename(root.join("specs"), dir.path().join("outside-specs")).unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("specs")]);
+        assert!(
+            store
+                .list_contracts(Some(&r_uid))
+                .unwrap()
+                .iter()
+                .all(|c| c.source_path != "specs/openapi.yaml")
+        );
+    }
+
+    #[test]
+    fn directory_move_repairs_unchanged_callers_and_matches_fresh_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::write(
+            root.join("caller.js"),
+            "import { helper } from './src/a.js'; export function caller() { return helper(); }",
+        )
+        .unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("caller.js")]);
+        let caller = uid_of(&store, &r_uid, "caller");
+        assert!(
+            store
+                .callees_of(&caller)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "helper")
+        );
+        std::fs::rename(root.join("src"), root.join("moved")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("src"), root.join("moved")],
+        );
+        let (_, fresh) = crate::index::index_directory_in_memory(
+            &root,
+            "test",
+            &format!("file://{}", root.display()),
+            "fresh",
+        )
+        .unwrap();
+        let topology = |db: &GraphStore| {
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(a, b, kind, _, _)| (a, b, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(topology(&store), topology(&fresh));
+        let symbols = |db: &GraphStore| {
+            db.lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.uid, s.file_path, s.name))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(symbols(&store), symbols(&fresh));
+    }
+
+    #[test]
+    fn directory_move_rebuilds_mixed_controller_and_spec_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir(root.join("group")).unwrap();
+        for file in ["openapi.yaml", "ItemsController.java"] {
+            std::fs::rename(root.join(file), root.join("group").join(file)).unwrap();
+        }
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[
+                root.join("openapi.yaml"),
+                root.join("ItemsController.java"),
+                root.join("group"),
+            ],
+        );
+        std::fs::rename(root.join("group"), root.join("renamed")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("group"), root.join("renamed")],
+        );
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+        let contracts = |db: &GraphStore| {
+            db.list_contracts(Some(&r_uid))
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.uid, c.source_path))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(contracts(&store), contracts(&fresh));
+        assert_eq!(
+            store.list_implemented_contract_uids().unwrap(),
+            fresh.list_implemented_contract_uids().unwrap()
+        );
+        assert!(
+            store
+                .symbols_in_file("group/ItemsController.java")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .symbols_in_file("renamed/ItemsController.java")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_directory_rename_then_edit_has_one_live_symbol_and_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let store = Arc::new(store);
+        let observed = store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
+            .with_debounce_ms(100)
+            .with_ready_signal(ready_tx);
+        let stop = watcher.shutdown_handle();
+        let handle = std::thread::spawn(move || {
+            watcher.run_with_store(
+                store,
+                Some(Box::new(move || {
+                    let _ = changed_tx.send(());
+                })),
+            )
+        });
+        let result = (|| -> anyhow::Result<()> {
+            ready_rx.recv_timeout(Duration::from_secs(10))?;
+            std::fs::rename(root.join("src"), root.join("moved"))?;
+            changed_rx.recv_timeout(Duration::from_secs(15))?;
+            anyhow::ensure!(
+                observed.symbols_in_file("src/a.js")?.is_empty(),
+                "stale old symbols after move"
+            );
+            anyhow::ensure!(
+                observed.symbols_in_file("moved/a.js")?.len() == 1,
+                "moved source absent"
+            );
+            std::fs::write(
+                root.join("moved/a.js"),
+                "export function helper() { return 99; }",
+            )?;
+            changed_rx.recv_timeout(Duration::from_secs(15))?;
+            anyhow::ensure!(
+                observed
+                    .lookup_symbols_by_repo(&r_uid)?
+                    .iter()
+                    .filter(|s| s.name == "helper")
+                    .count()
+                    == 1,
+                "duplicate symbol after edit"
+            );
+            Ok(())
+        })();
+        stop.stop();
+        handle.join().unwrap().unwrap();
+        result.unwrap();
+        let before = observed.lookup_symbols_by_repo(&r_uid).unwrap().len();
+        std::fs::write(
+            root.join("moved/after_stop.js"),
+            "export function late() {}",
+        )
+        .unwrap();
+        assert_eq!(
+            observed.lookup_symbols_by_repo(&r_uid).unwrap().len(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_events_do_not_follow_external_symlinks_or_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.js"), "export function secret() {}").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[
+                root.join("link"),
+                root.join("link/secret.js"),
+                root.join("../outside/secret.js"),
+            ],
+        );
+        assert!(
+            !store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "secret")
+        );
+        assert_eq!(store.list_files_by_repo(&r_uid).unwrap().len(), 3);
+    }
+
+    #[test]
     fn watcher_configured_excludes_remove_stale_rows_and_never_reintroduce_changes() {
         let dir = tempfile::tempdir().unwrap();
         let (store, r_uid, root) = index_fixture_repo(&dir);
@@ -1240,14 +1825,24 @@ mod tests {
         let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test")
             .with_instance_config(Some(Arc::new(config)));
         let path = root.join("src/a.js");
-        for source in [
+        for (iteration, source) in [
             "export function hidden_one() {}",
             "export function hidden_two() {}",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             std::fs::write(&path, source).unwrap();
+            let generation = store.graph_generation();
             let outcome =
                 process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&path));
-            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            if iteration == 0 {
+                assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+                assert!(store.graph_generation() > generation);
+            } else {
+                assert!(matches!(outcome, WatchBatchOutcome::Unchanged));
+                assert_eq!(store.graph_generation(), generation);
+            }
             assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
             assert!(!store.symbols_in_file("src/b.js").unwrap().is_empty());
         }

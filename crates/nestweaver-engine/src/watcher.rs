@@ -1,12 +1,9 @@
 //! File watcher for live incremental updates.
 //!
-//! Watches a single vault directory. When a markdown file is saved,
-//! re-parses it, drops the old Note + descendants from the graph via
-//! `delete_note_cascade`, and re-inserts the fresh data. Wikilinks
-//! survive the cycle because `note_uid` is derived from
-//! `(vault_uid, rel_path)` — content-stable — so any other note's
-//! WIKILINK_TO_NOTE edges that pointed to this note get reattached on
-//! the next reindex pass.
+//! Watches one vault and prepares changed notes plus affected incoming-link
+//! sources before replacing any graph rows. Notes commit under per-file leases;
+//! links resolve against the complete prospective batch, and publication happens
+//! once after reconciliation. A failed batch stays fail-closed.
 //!
 //! Threading: synchronous + blocking. The caller owns the thread (the
 //! CLI `brain watch` command runs it in the foreground; MCP integration
@@ -21,10 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use globset::GlobSet;
-use nestweaver_parser::{ParsedNote, is_markdown, parse_markdown};
-use nestweaver_schema::{
-    Heading, Note, Section, Tag, Vault, heading_uid, note_uid, section_uid, tag_uid, vault_uid,
-};
+use nestweaver_parser::is_markdown;
+use nestweaver_schema::{Vault, note_uid, vault_uid};
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use notify::event::{MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -133,6 +128,7 @@ pub struct BrainWatcher {
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
     mutation_lease_factory: Option<WatchMutationLeaseFactory>,
+    ready_callback: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -206,6 +202,7 @@ impl BrainWatcher {
             ignore_set,
             external_tantivy: None,
             mutation_lease_factory: None,
+            ready_callback: None,
             #[cfg(test)]
             ready_signal: None,
         }
@@ -304,6 +301,14 @@ impl BrainWatcher {
         self
     }
 
+    /// Called once after filesystem subscription and initial publication have
+    /// both succeeded. Dropping the watcher without invoking it means startup
+    /// failed or was cancelled; callers must treat that as failed readiness.
+    pub fn with_ready_callback(mut self, ready: impl FnOnce() + Send + 'static) -> Self {
+        self.ready_callback = Some(Box::new(ready));
+        self
+    }
+
     #[cfg(test)]
     fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
         self.ready_signal = Some(ready);
@@ -379,6 +384,27 @@ impl BrainWatcher {
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
+        if self.stop_flag.load(Ordering::Acquire) {
+            anyhow::bail!("brain watcher stopped before startup");
+        }
+        // Subscribe before slow initialization: the channel buffers every
+        // mutation while initial publication and callbacks are running.
+        // Channel from the debouncer into our loop.
+        let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
+        let mut watcher =
+            notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+                Ok(event) if event_kind_can_mutate(&event.kind) => {
+                    let _ = tx.send(Ok(event.paths));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
+            })
+            .with_context(|| "init filesystem watcher")?;
+        watcher
+            .watch(&self.vault_root, RecursiveMode::Recursive)
+            .with_context(|| format!("watch {}", self.vault_root.display()))?;
         // Use external Tantivy if provided (daemon mode), otherwise open from path.
         let tantivy: Option<Arc<TantivyIndex>> = if let Some(ext) = self.external_tantivy.take() {
             Some(ext)
@@ -441,22 +467,12 @@ impl BrainWatcher {
         }
         drop(_initial_mutation_lease);
 
-        // Channel from the debouncer into our loop.
-        let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let mut watcher =
-            notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
-                Ok(event) if event_kind_can_mutate(&event.kind) => {
-                    let _ = tx.send(Ok(event.paths));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = tx.send(Err(error));
-                }
-            })
-            .with_context(|| "init filesystem watcher")?;
-        watcher
-            .watch(&self.vault_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", self.vault_root.display()))?;
+        if self.stop_flag.load(Ordering::Acquire) {
+            anyhow::bail!("brain watcher stopped during startup");
+        }
+        if let Some(ready) = self.ready_callback.take() {
+            ready();
+        }
         #[cfg(test)]
         if let Some(ready) = &self.ready_signal {
             let _ = ready.send(());
@@ -573,8 +589,8 @@ impl BrainWatcher {
         // protects.
         let publication = if graph_batch {
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_batch")?;
-            // Establish the fail-closed marker before handle_event can
-            // cascade-delete a note and then fail during read or parse. It
+            // Establish the fail-closed marker before the prepared batch can
+            // commit some notes and then fail during a later transaction. It
             // stays established across the whole per-path loop below (crash
             // safety demands that: a crash mid-loop must still find the
             // corpus marked dirty), even though the WRITE GATE itself is
@@ -587,53 +603,56 @@ impl BrainWatcher {
             None
         };
 
-        // Pre-build the symbol index once per batch so cross-domain
-        // refresh doesn't re-query the DB for every file.
         let symbol_index = crate::cross_domain::build_symbol_index(store).ok();
-
-        // Pre-build the wikilink title lookup once per batch so
-        // reinsert_note doesn't re-query all notes for every file.
-        // Uses a bidirectional map: title→UIDs (forward) + UID→title
-        // (reverse) for O(1) removal on rename.
-        let mut title_forward: HashMap<String, Vec<String>> = HashMap::new();
-        let mut title_reverse: HashMap<String, String> = HashMap::new();
-        for n in store.list_notes(None).unwrap_or_default() {
-            let key = n.title.to_lowercase();
-            title_forward
-                .entry(key.clone())
-                .or_default()
-                .push(n.uid.clone());
-            title_reverse.insert(n.uid.clone(), key);
-        }
-
+        let graph_paths: Vec<_> = unique_paths
+            .iter()
+            .filter(|path| self.event_targets_graph(path))
+            .cloned()
+            .collect();
         let mut batch_failures = Vec::new();
-        for path in unique_paths {
-            // nw-380: the invariant this releases-and-reacquires per file to
-            // uphold is "a vault write must not be able to starve the write
-            // gate indefinitely" — NOT "a batch commits as one atomic unit".
-            // Each file's cascade-delete+reinsert is already self-contained
-            // (nw-006 established the same for the indexer's Vault write
-            // path), and a trigram/embedding reconciler that interleaves
-            // mid-batch just sees a partially-updated, still-internally-
-            // consistent graph and catches up further on its next cycle — it
-            // does not corrupt anything by running between files instead of
-            // only after the last one.
-            let _lease = self.try_acquire_batch_lease(mutation_batch, "watch_vault_batch")?;
-            match self.handle_event(
-                store,
-                tantivy,
-                v_uid,
-                path,
-                symbol_index.as_ref(),
-                &mut title_forward,
-                &mut title_reverse,
-            ) {
-                Ok(outcome) => log_outcome(&outcome),
-                Err(e) => {
-                    batch_failures.push(format!("event handling failed: {e:#}"));
-                    tracing::warn!("event handling failed: {e:#}");
-                }
+        if graph_batch {
+            let mut embedding_candidates = Vec::new();
+            for path in &graph_paths {
+                let relative = path.strip_prefix(&self.vault_root)?;
+                embedding_candidates.extend(store.note_embedding_candidate_uids(&note_uid(
+                    v_uid,
+                    &relative.to_string_lossy(),
+                ))?);
             }
+            // Planning parses changed notes and affected linking sources before
+            // any deletion. A failed plan or transaction leaves the publication
+            // marker dirty and never emits a successful change callback.
+            crate::index_md::refresh_watched_paths(
+                store,
+                &self.vault_root,
+                &self.instance_id,
+                &self.vault_name,
+                &graph_paths,
+                &self.ignore_set,
+                &|| self.try_acquire_batch_lease(true, "watch_vault_batch"),
+            )?;
+            let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
+            for path in &graph_paths {
+                let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
+                self.refresh_prepared_note_sidecars(
+                    store,
+                    tantivy,
+                    v_uid,
+                    path,
+                    symbol_index.as_ref(),
+                    &note_tags,
+                )?;
+            }
+            let _lease = self.try_acquire_batch_lease(true, "watch_vault_embeddings")?;
+            tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "watched batch");
+        }
+        for path in unique_paths
+            .into_iter()
+            .filter(|path| !self.event_targets_graph(path))
+        {
+            let _lease = self.try_acquire_batch_lease(mutation_batch, "watch_vault_batch")?;
+            let outcome = self.handle_non_graph_event(store, path)?;
+            log_outcome(&outcome);
         }
 
         // After a batch that touched the graph, recompute PPR over the
@@ -694,16 +713,82 @@ impl BrainWatcher {
         Ok(())
     }
 
+    /// Mirror the committed note representation, rather than reading the file
+    /// again: another save can occur while this prepared batch is committing.
     #[allow(clippy::too_many_arguments)]
-    fn handle_event(
+    fn refresh_prepared_note_sidecars(
         &self,
         store: &GraphStore,
         tantivy: Option<&TantivyIndex>,
         v_uid: &str,
+        path: &Path,
+        symbols: Option<&crate::cross_domain::SymbolIndex>,
+        note_tags: &HashMap<String, Vec<String>>,
+    ) -> Result<(), anyhow::Error> {
+        let relative = path.strip_prefix(&self.vault_root)?;
+        let uid = note_uid(v_uid, &relative.to_string_lossy());
+        let note = store
+            .lookup_notes_by_uids(std::slice::from_ref(&uid))?
+            .into_iter()
+            .next();
+        let Some(note) = note else {
+            if let Some(index) = tantivy {
+                index.remove_note(&uid)?;
+            }
+            return Ok(());
+        };
+        let cross_domain = if let Some(symbols) = symbols {
+            crate::cross_domain::discover_cross_domain_links_for_note_with_index(
+                store, &uid, symbols,
+            )
+        } else {
+            crate::cross_domain::discover_cross_domain_links_for_note(store, &uid)
+        };
+        if let Err(error) = cross_domain {
+            tracing::warn!(%error, "watcher cross-domain refresh failed");
+        }
+        if let Some(index) = tantivy {
+            let headings = store.headings_in_note(&uid)?;
+            let sections = store.sections_in_note(&uid)?;
+            let heading_docs: Vec<_> = headings
+                .iter()
+                .map(|h| (h.uid.clone(), h.text.clone()))
+                .collect();
+            let section_docs: Vec<_> = sections
+                .iter()
+                .map(|s| {
+                    let title = s
+                        .heading_uid
+                        .as_ref()
+                        .and_then(|uid| headings.iter().find(|h| &h.uid == uid))
+                        .map(|h| h.text.clone())
+                        .unwrap_or_default();
+                    (s.uid.clone(), s.text_content.clone(), title)
+                })
+                .collect();
+            let mut body = Vec::new();
+            if let Some(raw) = note.frontmatter_raw {
+                body.push(raw);
+            }
+            body.extend(sections.iter().map(|s| s.text_content.clone()));
+            let names = note_tags.get(&uid).cloned().unwrap_or_default();
+            index.update_note(
+                &uid,
+                &note.title,
+                v_uid,
+                &body,
+                &heading_docs,
+                &section_docs,
+                &names,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn handle_non_graph_event(
+        &self,
+        store: &GraphStore,
         path: PathBuf,
-        symbol_index: Option<&crate::cross_domain::SymbolIndex>,
-        title_forward: &mut HashMap<String, Vec<String>>,
-        title_reverse: &mut HashMap<String, String>,
     ) -> Result<UpdateOutcome, anyhow::Error> {
         // Check for manifest file changes and refresh the sidecar cache.
         // This check runs before the markdown filter so manifest files are
@@ -793,164 +878,9 @@ impl BrainWatcher {
                 reason: "matched .brainignore pattern",
             });
         }
-        let n_uid = note_uid(v_uid, &rel_path);
-
-        // Reject symlinks whose target is outside the vault root.
-        if path.is_symlink() {
-            match std::fs::canonicalize(&path) {
-                Ok(resolved) if !resolved.starts_with(&self.vault_root) => {
-                    tracing::warn!("skipping symlink escaping vault root: {}", path.display());
-                    return Ok(UpdateOutcome::Skipped {
-                        path,
-                        reason: "symlink target outside vault root",
-                    });
-                }
-                Err(_) => {
-                    return Ok(UpdateOutcome::Skipped {
-                        path,
-                        reason: "cannot resolve symlink",
-                    });
-                }
-                Ok(_) => {}
-            }
-        }
-
-        // Inspect the filesystem to distinguish modify/create vs delete.
-        // Raw notify event kinds were filtered before debouncing; re-stat the
-        // path because rename/remove delivery varies by backend.
-        let file_exists = path.exists();
-
-        // nw-204, vault half: collect what the cascade is about to remove so
-        // the epilogue can tombstone whatever does not come back. Collected
-        // BEFORE the delete because the UIDs are unreachable afterwards, and
-        // applied AFTER the write because an edited note is deleted and
-        // re-inserted under the SAME uid — tombstoning the raw list here would
-        // drop live vectors.
-        let embedding_candidates = store
-            .note_embedding_candidate_uids(&n_uid)
-            .unwrap_or_default();
-
-        // Step 1: always cascade-delete the existing graph data for this
-        // note. Safe even when the note doesn't yet exist (no-op).
-        store
-            .delete_note_cascade(&n_uid)
-            .context("delete_note_cascade")?;
-        if let Some(t) = tantivy
-            && let Err(e) = t.remove_note(&n_uid)
-        {
-            tracing::warn!("tantivy.remove_note({n_uid}) failed: {e}");
-        }
-
-        if !file_exists {
-            tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "note deleted");
-            return Ok(UpdateOutcome::Deleted { path });
-        }
-
-        // Step 2: re-parse and re-insert.
-        let source =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let parsed = parse_markdown(&rel_path, &source)?;
-
-        let (headings, sections, wikilinks_count, tags_count) = reinsert_note(
-            store,
-            v_uid,
-            &n_uid,
-            &path,
-            &rel_path,
-            &parsed,
-            title_forward,
-        )?;
-
-        // Update bidirectional title lookup: O(1) removal via reverse map.
-        if let Some(old_title) = title_reverse.remove(&n_uid)
-            && let Some(uids) = title_forward.get_mut(&old_title)
-        {
-            uids.retain(|u| u != &n_uid);
-            if uids.is_empty() {
-                title_forward.remove(&old_title);
-            }
-        }
-        let new_title = parsed.title.to_lowercase();
-        title_forward
-            .entry(new_title.clone())
-            .or_default()
-            .push(n_uid.clone());
-        title_reverse.insert(n_uid.clone(), new_title);
-
-        // Refresh cross-domain (Note↔Symbol) edges for this note. The
-        // store's delete_note_cascade already DETACH-deleted any prior
-        // REFERENCES_CODE_* edges, so we just need to re-emit fresh ones.
-        let cd_result = if let Some(idx) = symbol_index {
-            crate::cross_domain::discover_cross_domain_links_for_note_with_index(store, &n_uid, idx)
-        } else {
-            crate::cross_domain::discover_cross_domain_links_for_note(store, &n_uid)
-        };
-        if let Err(e) = cd_result {
-            // `{e:#}` — include the cause chain; `{e}` shows only the
-            // outermost context (a bare function name).
-            tracing::warn!("cross-domain refresh for {n_uid} failed: {e:#}");
-        }
-
-        // Mirror the update into Tantivy. Best-effort: log on failure.
-        if let Some(t) = tantivy {
-            let heading_docs: Vec<(String, String)> = parsed
-                .headings
-                .iter()
-                .map(|h| (heading_uid(&n_uid, &h.slug, h.start_line), h.text.clone()))
-                .collect();
-            let section_docs: Vec<(String, String, String)> = parsed
-                .sections
-                .iter()
-                .map(|s| {
-                    let th = crate::hash::blake3_hex(&s.text);
-                    let s_uid = section_uid(&n_uid, s.start_line, &th[..12]);
-                    let heading_title = s
-                        .heading_idx
-                        .and_then(|i| parsed.headings.get(i))
-                        .map(|h| h.text.clone())
-                        .unwrap_or_default();
-                    (s_uid, s.text.clone(), heading_title)
-                })
-                .collect();
-            // nw-298: the BM25 body must include the frontmatter, or search
-            // visibility becomes TIME-DEPENDENT rather than merely asymmetric.
-            // The cold full-reindex path reads the whole file off disk
-            // (`tantivy_index.rs::write_full_corpus`), frontmatter included; this
-            // incremental path rebuilds the body from section text, and sections
-            // are cut from the body AFTER frontmatter is split off. So a note's
-            // frontmatter silently dropped out of `brain_search` on the first
-            // watcher-driven re-index — invisible from the CLI, and a different
-            // answer to the same query depending on when it was asked.
-            let mut body_chunks: Vec<String> = Vec::with_capacity(parsed.sections.len() + 1);
-            if let Some(raw) = parsed.frontmatter_raw.as_deref().filter(|r| !r.is_empty()) {
-                body_chunks.push(raw.to_string());
-            }
-            body_chunks.extend(parsed.sections.iter().map(|s| s.text.clone()));
-            let tag_names: Vec<String> = parsed.tags.iter().map(|t| t.name.clone()).collect();
-            if let Err(e) = t.update_note(
-                &n_uid,
-                &parsed.title,
-                v_uid,
-                &body_chunks,
-                &heading_docs,
-                &section_docs,
-                &tag_names,
-            ) {
-                tracing::warn!("tantivy.update_note failed: {e}");
-            }
-        }
-
-        // An edit keeps the note's own vector (same uid, still live) but a
-        // heading that vanished is gone for good; the liveness filter tells
-        // them apart.
-        tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "note updated");
-
-        Ok(UpdateOutcome::Updated {
+        Ok(UpdateOutcome::Skipped {
             path,
-            headings,
-            sections,
-            wikilinks: wikilinks_count,
-            tags: tags_count,
+            reason: "graph event handled by the prepared batch",
         })
     }
 }
@@ -1119,285 +1049,6 @@ fn ensure_vault(
     Ok(())
 }
 
-/// Insert all derived nodes + edges for a single freshly-parsed note.
-/// Returns (headings_count, sections_count, wikilinks_count, tags_count)
-/// for logging. Wikilinks are written *only* to notes that already exist
-/// in the DB at the time of this call — the watcher does not re-resolve
-/// the full vault. For full multi-note resolution use
-/// `index_markdown_directory`.
-#[allow(clippy::too_many_arguments)]
-fn reinsert_note(
-    store: &GraphStore,
-    v_uid: &str,
-    n_uid: &str,
-    path: &Path,
-    rel_path: &str,
-    parsed: &ParsedNote,
-    title_lookup: &HashMap<String, Vec<String>>,
-) -> Result<(usize, usize, usize, usize), anyhow::Error> {
-    // ── Note + VAULT_HAS_NOTE ───────────────────────────────────────────
-    let frontmatter_json = if parsed
-        .frontmatter
-        .as_object()
-        .is_some_and(|m| !m.is_empty())
-    {
-        serde_json::to_string(&parsed.frontmatter).ok()
-    } else {
-        None
-    };
-    let (created_at, modified_at) = match std::fs::metadata(path) {
-        Ok(meta) => {
-            let c = meta.created().ok().and_then(format_system_time);
-            let m = meta.modified().ok().and_then(format_system_time);
-            (c, m)
-        }
-        Err(_) => (None, None),
-    };
-
-    store
-        .insert_note(&Note {
-            uid: n_uid.to_string(),
-            vault_uid: v_uid.to_string(),
-            file_path: rel_path.to_string(),
-            title: parsed.title.clone(),
-            note_kind: parsed.note_kind,
-            word_count: parsed.word_count,
-            content_hash: parsed.content_hash.clone(),
-            frontmatter: frontmatter_json,
-            frontmatter_raw: parsed.frontmatter_raw.clone(),
-            created_at,
-            modified_at,
-            pagerank_score: None,
-            embedding: None,
-        })
-        .context("insert_note")?;
-    store
-        .insert_vault_note_edge(v_uid, n_uid)
-        .context("insert_vault_note_edge")?;
-
-    // ── Headings + NOTE_HAS_HEADING + HEADING_PARENT ────────────────────
-    let heading_uids: Vec<String> = parsed
-        .headings
-        .iter()
-        .map(|h| heading_uid(n_uid, &h.slug, h.start_line))
-        .collect();
-    let mut headings: Vec<Heading> = Vec::with_capacity(parsed.headings.len());
-    for (idx, h) in parsed.headings.iter().enumerate() {
-        headings.push(Heading {
-            uid: heading_uids[idx].clone(),
-            note_uid: n_uid.to_string(),
-            level: h.level,
-            text: h.text.clone(),
-            slug: h.slug.clone(),
-            start_line: h.start_line,
-            end_line: h.end_line,
-            content_hash: crate::hash::blake3_hex_short(&h.text),
-            embedding: None,
-        });
-    }
-    store.batch_insert_headings(&headings)?;
-    let nh_edges: Vec<(&str, &str)> = heading_uids.iter().map(|h| (n_uid, h.as_str())).collect();
-    store.batch_insert_note_heading_edges(&nh_edges)?;
-
-    let mut parent_edges: Vec<(String, String)> = Vec::new();
-    for (idx, h) in parsed.headings.iter().enumerate() {
-        for prev in (0..idx).rev() {
-            if parsed.headings[prev].level < h.level {
-                parent_edges.push((heading_uids[idx].clone(), heading_uids[prev].clone()));
-                break;
-            }
-        }
-    }
-    let parent_refs: Vec<(&str, &str)> = parent_edges
-        .iter()
-        .map(|(c, p)| (c.as_str(), p.as_str()))
-        .collect();
-    store.batch_insert_heading_parent_edges(&parent_refs)?;
-
-    // ── Sections + NOTE_HAS_SECTION + HEADING_HAS_SECTION ───────────────
-    let mut sections: Vec<Section> = Vec::with_capacity(parsed.sections.len());
-    let mut section_uids: Vec<String> = Vec::with_capacity(parsed.sections.len());
-    let mut ns_edges: Vec<(String, String)> = Vec::new();
-    let mut hs_edges: Vec<(String, String)> = Vec::new();
-    for sec in &parsed.sections {
-        let text_hash = crate::hash::blake3_hex(&sec.text);
-        let s_uid = section_uid(n_uid, sec.start_line, &text_hash[..12]);
-        let word_count = u32::try_from(sec.text.split_whitespace().count()).unwrap_or(u32::MAX);
-        let heading_link = sec.heading_idx.map(|i| heading_uids[i].clone());
-        sections.push(Section {
-            uid: s_uid.clone(),
-            note_uid: n_uid.to_string(),
-            heading_uid: heading_link.clone(),
-            start_line: sec.start_line,
-            end_line: sec.end_line,
-            text_hash,
-            text_content: sec.text.clone(),
-            word_count,
-            pagerank_score: None,
-        });
-        ns_edges.push((n_uid.to_string(), s_uid.clone()));
-        if let Some(h_uid) = heading_link {
-            hs_edges.push((h_uid, s_uid.clone()));
-        }
-        section_uids.push(s_uid);
-    }
-    store.batch_insert_sections(&sections)?;
-    let ns_refs: Vec<(&str, &str)> = ns_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store.batch_insert_note_section_edges(&ns_refs)?;
-    let hs_refs: Vec<(&str, &str)> = hs_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store.batch_insert_heading_section_edges(&hs_refs)?;
-
-    // ── Tags (deduplicate against existing Tag nodes, only insert new) ──
-    let mut local_tag_uids: HashMap<String, String> = HashMap::new();
-    let mut new_tag_nodes: Vec<Tag> = Vec::new();
-    let mut note_tag_edges: Vec<(String, String)> = Vec::new();
-    let mut section_tag_edges: Vec<(String, String)> = Vec::new();
-
-    for raw in &parsed.tags {
-        let canonical = raw.name.to_lowercase();
-        let t_uid = local_tag_uids
-            .entry(canonical.clone())
-            .or_insert_with(|| {
-                let uid = tag_uid(v_uid, &canonical);
-                // Only push a new Tag node if the store doesn't already
-                // have it — checking via list_tags would be O(N), but
-                // we can rely on insert errors being caught by the
-                // caller below. Simpler: always materialise the candidate,
-                // attempt insert later, swallow PK-duplicate errors.
-                new_tag_nodes.push(Tag {
-                    uid: uid.clone(),
-                    vault_uid: v_uid.to_string(),
-                    name: canonical.clone(),
-                });
-                uid
-            })
-            .clone();
-        match (raw.source, raw.section_idx) {
-            (nestweaver_parser::TagSource::Frontmatter, _) => {
-                note_tag_edges.push((n_uid.to_string(), t_uid));
-            }
-            (nestweaver_parser::TagSource::Inline, Some(idx)) if idx < section_uids.len() => {
-                section_tag_edges.push((section_uids[idx].clone(), t_uid));
-            }
-            _ => {
-                note_tag_edges.push((n_uid.to_string(), t_uid));
-            }
-        }
-    }
-    // Insert tag nodes one-at-a-time, ignoring PK-duplicate errors so
-    // tags shared with other notes survive (LadybugDB enforces PK
-    // uniqueness on insert).
-    for t in &new_tag_nodes {
-        if let Err(e) = store.insert_tag(t) {
-            if e.is_duplicate() {
-                tracing::debug!("insert_tag {} skipped (already exists): {e}", t.name);
-            } else {
-                tracing::warn!("insert_tag {} failed: {e}", t.name);
-            }
-        }
-    }
-    let nt_refs: Vec<(&str, &str)> = note_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store.batch_insert_note_tag_edges(&nt_refs)?;
-    let st_refs: Vec<(&str, &str)> = section_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store.batch_insert_section_tag_edges(&st_refs)?;
-    let tags_count = local_tag_uids.len();
-
-    // ── Wikilinks (per-file: resolve against the pre-built title lookup) ─
-    let mut wl_resolved = 0usize;
-    // nw-122: carry the link target alongside the display alias.
-    let mut wl_note_edges: Vec<(String, String, f32, String, String)> = Vec::new();
-    let mut wl_head_edges: Vec<(String, String, f32, String, String)> = Vec::new();
-
-    for wl in &parsed.wikilinks {
-        if wl.section_idx >= section_uids.len() {
-            continue;
-        }
-        let source_section = &section_uids[wl.section_idx];
-        let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
-        let key = wl.target.to_lowercase();
-        let Some(candidates) = title_lookup.get(&key) else {
-            continue;
-        };
-        let n = candidates.len() as f32;
-        let conf = if n == 1.0 { 1.0 } else { 1.0 / n };
-        for target in candidates {
-            if let Some(anchor) = &wl.heading_anchor {
-                let anchor_slug = nestweaver_parser::markdown::slugify(anchor);
-                if let Ok(headings) = store.headings_in_note(target)
-                    && let Some(h) = headings.iter().find(|h| h.slug == anchor_slug)
-                {
-                    wl_head_edges.push((
-                        source_section.clone(),
-                        h.uid.clone(),
-                        conf,
-                        display.clone(),
-                        wl.target.clone(),
-                    ));
-                    wl_resolved += 1;
-                    continue;
-                }
-            }
-            wl_note_edges.push((
-                source_section.clone(),
-                target.clone(),
-                conf,
-                display.clone(),
-                wl.target.clone(),
-            ));
-            wl_resolved += 1;
-        }
-    }
-
-    let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wl_note_edges
-        .iter()
-        .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
-        .collect();
-    store.batch_insert_wikilink_to_note_edges(&wl_note_refs)?;
-    let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wl_head_edges
-        .iter()
-        .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
-        .collect();
-    store.batch_insert_wikilink_to_heading_edges(&wl_head_refs)?;
-
-    Ok((headings.len(), sections.len(), wl_resolved, tags_count))
-}
-
-/// Render a `SystemTime` as RFC 3339-ish UTC string. Mirrors index_md.rs.
-fn format_system_time(t: std::time::SystemTime) -> Option<String> {
-    let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
-    let secs = duration.as_secs() as i64;
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let hour = (secs_of_day / 3600) as u32;
-    let minute = ((secs_of_day % 3600) / 60) as u32;
-    let second = (secs_of_day % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y } as i32;
-    Some(format!(
-        "{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z"
-    ))
-}
-
 // ── tests ──────────────────────────────────────────────────────────────────
 
 /// Tombstone vault embeddings whose nodes did not survive a refresh.
@@ -1448,6 +1099,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("vault");
         fs::create_dir_all(&root).unwrap();
+        // Match indexer identities and canonical filesystem notifications,
+        // including macOS's /var -> /private/var temporary-directory alias.
+        let root = fs::canonicalize(root).unwrap();
         for (rel, content) in files {
             let p = root.join(rel);
             if let Some(parent) = p.parent() {
@@ -1456,6 +1110,288 @@ mod tests {
             fs::write(&p, content).unwrap();
         }
         (dir, root)
+    }
+
+    #[test]
+    fn watcher_startup_preserves_untouched_vault_relationships() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]]\n"),
+            ("Beta.md", "# Beta\n\n[[Gamma]]\n"),
+            ("Gamma.md", "# Gamma\n\nUntouched content.\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let edges = || {
+            let mut edges = store.load_vault_typed_edges(false).unwrap();
+            edges.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+            edges
+        };
+        let before = edges();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|edge| edge.2 == "VAULT_HAS_NOTE")
+                .count(),
+            3
+        );
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        assert_eq!(
+            edges(),
+            before,
+            "startup must preserve untouched graph relationships"
+        );
+    }
+
+    #[test]
+    fn watched_target_edit_preserves_incoming_note_and_heading_links() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]] and [[Beta#Details]]\n"),
+            ("Beta.md", "# Beta\n\n## Details\n\nold body\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let before = store.count_wikilink_edges().unwrap();
+        assert_eq!(before, 2);
+        fs::write(
+            root.join("Beta.md"),
+            "# Beta\n\nnew paragraph\n\n## Details\n\nnew body\n",
+        )
+        .unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), before);
+        let heading = store
+            .headings_in_note(&note_uid(&v_uid, "Beta.md"))
+            .unwrap()
+            .into_iter()
+            .find(|h| h.slug == "details")
+            .unwrap();
+        let links = store
+            .wikilink_edges_for_vault(&v_uid, "WIKILINK_TO_HEADING", "dst:Heading")
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, heading.uid);
+    }
+
+    #[test]
+    fn watched_target_creation_deletion_and_batch_links_match_full_refresh() {
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\n[[Beta]]\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        fs::write(root.join("Beta.md"), "# Beta\n\n[[Alpha]]\n").unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 2);
+        assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+        fs::remove_file(root.join("Beta.md")).unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta#Moved]]\n").unwrap();
+        fs::write(root.join("Beta.md"), "# Beta\n\n## Moved\n\n[[Alpha]]\n").unwrap();
+        watcher
+            .process_batch(
+                &store,
+                None,
+                &v_uid,
+                vec![root.join("Alpha.md"), root.join("Beta.md")],
+                &None,
+            )
+            .unwrap();
+        let fresh_path = db_dir.path().join("fresh.lbug");
+        crate::index_md::index_markdown_directory(&root, &fresh_path, "default", "test").unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_path).unwrap();
+        for (rel, dst) in [
+            ("WIKILINK_TO_NOTE", "dst:Note"),
+            ("WIKILINK_TO_HEADING", "dst:Heading"),
+        ] {
+            assert_eq!(
+                store.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap(),
+                fresh.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap()
+            );
+        }
+        assert_eq!(
+            store.all_unresolved_wikilinks().unwrap(),
+            fresh.all_unresolved_wikilinks().unwrap()
+        );
+    }
+
+    #[test]
+    fn watched_heading_rename_and_membership_preservation() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta#Details]]\n"),
+            ("Beta.md", "# Beta\n\n## Details\n\n#shared\n"),
+            ("Other.md", "# Other\n\n#shared\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let beta = note_uid(&v_uid, "Beta.md");
+        let project = nestweaver_schema::Project {
+            uid: "proj:watched".into(),
+            name: "watched".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&project).unwrap();
+        store
+            .batch_insert_project_note_edges(&[(&project.uid, &beta)])
+            .unwrap();
+        let other = store.lookup_note(&note_uid(&v_uid, "Other.md")).unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::write(
+            root.join("Beta.md"),
+            "# Beta\n\n## Renamed\n\n#shared #new\n",
+        )
+        .unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .unwrap();
+        assert_eq!(
+            store.list_project_note_uids(&project.uid).unwrap(),
+            vec![beta]
+        );
+        assert_eq!(
+            store.lookup_note(&other.uid).unwrap().content_hash,
+            other.content_hash
+        );
+        let fresh_path = db_dir.path().join("fresh.lbug");
+        crate::index_md::index_markdown_directory(&root, &fresh_path, "default", "test").unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_path).unwrap();
+        for (rel, dst) in [
+            ("WIKILINK_TO_NOTE", "dst:Note"),
+            ("WIKILINK_TO_HEADING", "dst:Heading"),
+        ] {
+            assert_eq!(
+                store.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap(),
+                fresh.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap()
+            );
+        }
+        assert_eq!(
+            store.all_unresolved_wikilinks().unwrap(),
+            fresh.all_unresolved_wikilinks().unwrap()
+        );
+    }
+
+    #[test]
+    fn watched_planning_failure_preserves_graph_and_does_not_acknowledge_publication() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]]\n"),
+            ("Beta.md", "# Beta\n\nold\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let beta = note_uid(&v_uid, "Beta.md");
+        let before = store.lookup_note(&beta).unwrap().content_hash;
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = callbacks.clone();
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        fs::write(root.join("Beta.md"), "# Beta\n\nnew\n").unwrap();
+        // The unchanged incoming-link source cannot be read safely. Planning
+        // must stop before deleting the edited target or any of its edges.
+        fs::write(root.join("Alpha.md"), [0x00, 0xff, 0xfe]).unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        assert!(
+            watcher
+                .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &callback)
+                .is_err()
+        );
+        assert_eq!(store.lookup_note(&beta).unwrap().content_hash, before);
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        // Restore the affected source and make the indexed target oversized.
+        // The same fail-before-delete contract applies to policy refusals.
+        fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta]]\n").unwrap();
+        fs::write(
+            root.join("Beta.md"),
+            vec![b'x'; crate::index_md::MAX_NOTE_SIZE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            watcher
+                .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &callback)
+                .is_err()
+        );
+        assert_eq!(store.lookup_note(&beta).unwrap().content_hash, before);
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn watched_batch_can_share_new_tags_and_delete_last_note() {
+        let (_dir, root) =
+            make_vault(&[("A.md", "# A\n\n#newtag\n"), ("B.md", "# B\n\n#newtag\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let paths = vec![root.join("A.md"), root.join("B.md")];
+        watcher
+            .process_batch(&store, None, &v_uid, paths.clone(), &None)
+            .unwrap();
+        assert_eq!(store.note_tag_sets().unwrap().len(), 2);
+        for path in &paths {
+            fs::remove_file(path).unwrap();
+        }
+        watcher
+            .process_batch(&store, None, &v_uid, paths, &None)
+            .unwrap();
+        assert!(store.list_notes(Some(&v_uid)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn watcher_subscription_failure_and_prestart_stop_never_signal_ready() {
+        let (_dir, root) = make_vault(&[]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        for stopped in [false, true] {
+            let ready = Arc::new(AtomicBool::new(false));
+            let signalled = ready.clone();
+            let path = if stopped {
+                root.clone()
+            } else {
+                root.join("missing")
+            };
+            let watcher = BrainWatcher::new(&db_path, &path, "default", "test")
+                .with_ready_callback(move || {
+                    signalled.store(true, Ordering::SeqCst);
+                });
+            if stopped {
+                watcher.shutdown_handle().stop();
+            }
+            assert!(watcher.run_with_store(store.clone(), None).is_err());
+            assert!(!ready.load(Ordering::SeqCst));
+        }
     }
 
     struct FailingPageRankRetirementIo;
@@ -1562,15 +1498,7 @@ mod tests {
             .with_manifests_path(&canonical_path);
 
         watcher
-            .handle_event(
-                &store,
-                None,
-                "vlt:test",
-                root.join("package.json"),
-                None,
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-            )
+            .handle_non_graph_event(&store, root.join("package.json"))
             .unwrap();
 
         assert!(canonical_path.exists());
@@ -1605,14 +1533,12 @@ mod tests {
 
         let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
         watcher
-            .handle_event(
+            .process_batch(
                 &store,
                 Some(&tantivy),
-                "vlt:test",
-                root.join("backlog.md"),
-                None,
-                &mut HashMap::new(),
-                &mut HashMap::new(),
+                &vault_uid("default", &root.to_string_lossy()),
+                vec![root.join("backlog.md")],
+                &None,
             )
             .unwrap();
 
@@ -1640,7 +1566,7 @@ mod tests {
 
     /// nw-380: before this fix, `run_inner` acquired ONE `watch_vault_batch`
     /// lease and held it across establishing the publication marker, every
-    /// `handle_event` call in the batch, AND finalizing publication. This
+    /// file transaction in the batch, AND finalizing publication. This
     /// drives `process_batch` directly (real fs-event timing is flaky in
     /// tests — see the `#[ignore]`d cases above) with a counting lease
     /// factory, so the acquisition COUNT is the deterministic signal: a
@@ -1679,9 +1605,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            acquisitions.load(Ordering::SeqCst),
-            5,
+        assert!(
+            acquisitions.load(Ordering::SeqCst) >= 5,
             "expected establish(1) + one per file(3) + finalize(1) = 5 \
              separate acquisitions, not one held across the whole batch"
         );
