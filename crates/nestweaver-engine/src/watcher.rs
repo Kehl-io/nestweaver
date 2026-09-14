@@ -1458,6 +1458,59 @@ mod tests {
         (dir, root)
     }
 
+    #[test]
+    fn watched_target_edit_preserves_incoming_note_and_heading_links() {
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]] and [[Beta#Details]]\n"),
+            ("Beta.md", "# Beta\n\n## Details\n\nold body\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let before = store.count_wikilink_edges().unwrap();
+        assert_eq!(before, 2);
+        fs::write(root.join("Beta.md"), "# Beta\n\nnew paragraph\n\n## Details\n\nnew body\n").unwrap();
+        watcher.process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None).unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), before);
+        let heading = store.headings_in_note(&note_uid(&v_uid, "Beta.md")).unwrap().into_iter().find(|h| h.slug == "details").unwrap();
+        let links = store.wikilink_edges_for_vault(&v_uid, "WIKILINK_TO_HEADING", "dst:Heading").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, heading.uid);
+    }
+
+    #[test]
+    fn watched_target_creation_deletion_and_batch_links_match_full_refresh() {
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\n[[Beta]]\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        fs::write(root.join("Beta.md"), "# Beta\n\n[[Alpha]]\n").unwrap();
+        watcher.process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None).unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 2);
+        assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+        fs::remove_file(root.join("Beta.md")).unwrap();
+        watcher.process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None).unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta#Moved]]\n").unwrap();
+        fs::write(root.join("Beta.md"), "# Beta\n\n## Moved\n\n[[Alpha]]\n").unwrap();
+        watcher.process_batch(&store, None, &v_uid, vec![root.join("Alpha.md"), root.join("Beta.md")], &None).unwrap();
+        let fresh_path = db_dir.path().join("fresh.lbug");
+        crate::index_md::index_markdown_directory(&root, &fresh_path, "default", "test").unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_path).unwrap();
+        for (rel, dst) in [("WIKILINK_TO_NOTE", "dst:Note"), ("WIKILINK_TO_HEADING", "dst:Heading")] {
+            assert_eq!(store.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap(), fresh.wikilink_edges_for_vault(&v_uid, rel, dst).unwrap());
+        }
+        assert_eq!(store.all_unresolved_wikilinks().unwrap(), fresh.all_unresolved_wikilinks().unwrap());
+    }
+
     struct FailingPageRankRetirementIo;
 
     impl crate::index::IndexEpilogueIo for FailingPageRankRetirementIo {

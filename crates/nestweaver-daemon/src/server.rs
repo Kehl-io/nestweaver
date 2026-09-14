@@ -24379,6 +24379,44 @@ external_model = "unavailable-test-model"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vault_watch_acknowledgement_waits_for_initialization_and_first_edit() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Ready.md"), "# Ready\n\ninitial\n").unwrap();
+        let holder = state.write_gate.lock("test_startup_barrier").await;
+        let service = DaemonService::new(state.clone());
+        let path = vault.path().to_string_lossy().into_owned();
+        let mut starting = tokio::spawn(async move {
+            service.watch_vault(Request::new(WatchVaultRequest {
+                vault_path: path, vault_name: "test".into(), ..Default::default()
+            })).await
+        });
+        let premature = tokio::time::timeout(std::time::Duration::from_millis(150), &mut starting).await;
+        drop(holder);
+        let premature_success = premature.is_ok();
+        let response = match premature {
+            Ok(result) => result.unwrap().unwrap().into_inner(),
+            Err(_) => starting.await.unwrap().unwrap().into_inner(),
+        };
+        assert!(response.ok, "{}", response.message);
+        std::fs::write(vault.path().join("Ready.md"), "# Ready\n\nfirst acknowledged edit\n").unwrap();
+        let indexed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notes = state.store.list_notes(None).unwrap();
+                if let Some(note) = notes.first() {
+                    let sections = state.store.sections_in_note(&note.uid).unwrap();
+                    if sections.iter().any(|section| section.text.contains("first acknowledged edit")) { break; }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }).await;
+        stop_and_drain_watcher(&state, response.watcher_id).await;
+        assert!(!premature_success, "WatchVault acknowledged before initialization completed");
+        assert!(indexed.is_ok(), "first post-acknowledgement edit was missed");
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conditional_stop_drains_inflight_batch_before_reporting_completion() {
         let state = test_state_with_writer();
         let id = register_watcher(
