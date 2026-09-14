@@ -35,7 +35,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
 libc = "0.2"
-dirs = "6"
+dirs = "7"
 governor = { version = "0.10", features = ["dashmap"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = { workspace = true }

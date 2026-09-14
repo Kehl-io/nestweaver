@@ -1168,9 +1168,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
     while let Some(m) = matches.next() {
-        let name_text = find_name_capture(m.captures, &capture_names, source_bytes);
+        let name_text = find_name_capture(m.captures(), &capture_names, source_bytes);
 
-        for capture in m.captures {
+        for capture in m.captures() {
             let capture_name = &capture_names[capture.index as usize];
             let node = capture.node;
 
@@ -1961,7 +1961,7 @@ fn extract_types_from_tree(
         let mut var_line: u32 = 0;
         let mut kind = AstBindingKind::Annotation;
 
-        for capture in m.captures {
+        for capture in m.captures() {
             let name = &capture_names[capture.index as usize];
             let text = capture.node.utf8_text(source).unwrap_or("").trim();
             let line = capture.node.start_position().row as u32 + 1;

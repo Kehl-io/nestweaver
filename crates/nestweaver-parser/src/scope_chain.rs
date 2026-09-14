@@ -71,7 +71,7 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
         let mut parts = Vec::new();
         let hcl_count = node.child_count();
         for i in 0..hcl_count {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 match child.kind() {
                     "identifier" => {
                         if let Ok(text) = child.utf8_text(source_bytes) {
@@ -99,7 +99,7 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
     // 5. Walk children looking for an identifier
     let count = node.child_count();
     for i in 0..count {
-        if let Some(child) = node.child(i as u32)
+        if let Some(child) = node.child(i)
             && (child.kind() == "identifier"
                 || child.kind() == "type_identifier"
                 || child.kind() == "name"
@@ -267,7 +267,7 @@ mod tests {
             }
             let n = node.child_count();
             for i in 0..n {
-                if let Some(child) = node.child(i as u32)
+                if let Some(child) = node.child(i)
                     && let Some(found) = find_node(child, kind, substr, source)
                 {
                     return Some(found);
