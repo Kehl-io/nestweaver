@@ -157,6 +157,10 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release-please.yml'
               - 'tests/metal_smoke.rs'
+              # nw-461: metal-smoke now also runs this file's process-level
+              # regression tests (see the "Ready-regression integration
+              # tests" step below), so a change to it must re-run the job.
+              - 'tests/ready_regression_test.rs'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
 
@@ -269,6 +273,35 @@ jobs:
           codesign --verify --strict --verbose=2 target/release/nestweaver
           codesign --display --verbose=2 target/release/nestweaver
           cargo test --locked --release --features metal --test daemon_test
+      # nw-461: THE THREE macOS-divergent regressions in this repo's history
+      # (nw-450 GNU-vs-BSD `tar | grep -q` under `pipefail`, nw-440 GNU-only
+      # `find -printf`/`mapfile` in both release verifiers, and an
+      # uncanonicalised `/var` vs `/private/var` path comparison from PR
+      # #373) were each invisible to CI until a human hit them locally on
+      # macOS, because `tests/ready_regression_test.rs` sits outside both the
+      # `--lib` gate above and `--test daemon_test`. This step closes that
+      # gap. Same `--locked --release --features metal` shape as the two test
+      # steps above it, so it links a new test binary against artifacts this
+      # job already built instead of forcing a second full compile, and its
+      # fixtures spawn the SAME already-codesigned `target/release/nestweaver`
+      # (via `assert_cmd::Command::cargo_bin`), so no extra codesign step is
+      # needed. 17 of the file's 18 tests compile and run here; the 18th
+      # (`selected_pull_rejects_unknown_instance_and_uses_registered_workspace`)
+      # is `#[cfg(target_os = "linux")]`, since it depends on XDG registry
+      # paths this platform does not use, so it does not add to this job's
+      # time. CI time: on the order of single-digit minutes -- each test
+      # spawns a real CLI subprocess against a temp git repo and a temp
+      # database, comparable in shape to the daemon_test step above, well
+      # inside this job's 90-minute budget (which already assumes a cold
+      # 36-minute build). Deliberately placed BETWEEN the nw-483 real-model-
+      # cache baseline step above and its verify step below, so a regression
+      # this suite might introduce there is still caught by that guard, and
+      # BEFORE "Collect macOS crash reports" so a SIGSEGV in these fixtures
+      # (nw-222, a ~15% flake on this job) still produces a diagnostic
+      # report. `--no-fail-fast` for the same reason nw-205 added it to the
+      # step above: one failing test must not hide the other 15.
+      - name: Ready-regression integration tests (macOS portability gate)
+        run: cargo test --locked --release --features metal --test ready_regression_test --no-fail-fast
       # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
       #
       # A test binary has died with `signal: 11` on ~15% of runs of this job,

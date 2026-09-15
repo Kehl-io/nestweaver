@@ -311,6 +311,16 @@ ubuntu in `Required CI` and in the release workflow, which is the only place
 they are load-bearing. `verify-required-ci.sh --self-test` and the `bash -n`
 checks work everywhere.
 
+The `metal-smoke` job (Cold Metal daemon smoke, macOS-only, in `Required CI`
+itself) runs the opposite direction of coverage: `--workspace --lib`,
+`tests/daemon_test.rs`, and `tests/ready_regression_test.rs` (nw-461) all run
+there too, so a macOS-only regression in the Rust suite — the kind that
+`find -printf` above misses in the other direction — is caught by CI instead
+of only on a contributor's own Mac (the project is developed on macOS and
+released from Linux runners, so both directions of platform divergence are
+real; see the nw-461 backlog item for three that were not caught until a human
+hit them).
+
 The release workflow also has positive and negative controls. They build and
 attest artifacts but never call Release Please, create a tag/release, or publish
 npm. Each run creates a temporary automation-authored canary branch and PR,

@@ -1619,6 +1619,7 @@ fn ci_metal_smoke_is_required_and_narrowly_routed_to_apple_hardware_changes() {
         ".github/workflows/ci.yml",
         ".github/workflows/release-please.yml",
         "tests/metal_smoke.rs",
+        "tests/ready_regression_test.rs",
     ] {
         assert!(
             metal_filter.contains(&format!("- '{selected_path}'")),
@@ -1803,6 +1804,78 @@ fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
         setup_position < cold_position && cold_position < direct_position,
         "CPU cache population must precede the daemon's first Metal operation, and direct Metal \
          verification must run only afterward"
+    );
+}
+
+// nw-461: extend Cold Metal to tests/ready_regression_test.rs.
+#[test]
+fn ci_metal_smoke_runs_ready_regression_between_the_real_cache_guards() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+
+    let ready_regression = workflow_step(
+        job,
+        "Ready-regression integration tests (macOS portability gate)",
+    );
+    // Same shape as the workspace/daemon steps above it: `--locked --release
+    // --features metal`, so this step links a new test binary against
+    // artifacts the job already built instead of forcing a second full
+    // compile (see CONTRIBUTING.md's `just test-crate` / `-p` re-fingerprint
+    // warning for why a differing shape is expensive here).
+    for required in [
+        "cargo test --locked --release --features metal --test ready_regression_test",
+        "--no-fail-fast",
+    ] {
+        assert!(
+            ready_regression.contains(required),
+            "ready-regression step must contain `{required}`\nstep:\n{ready_regression}"
+        );
+    }
+    // No codesign call: it must reuse the binary the daemon-integration step
+    // above already signed, not rebuild and leave a fresh unsigned one.
+    assert!(
+        !ready_regression.contains("codesign"),
+        "ready-regression step must not re-codesign; it reuses the already-signed release binary"
+    );
+
+    // Land it between the nw-483 baseline and verify guards so any real
+    // model-cache regression this suite introduces is still caught, and this
+    // is additive coverage: the daemon/workspace steps stay unchanged.
+    let baseline_position = job
+        .find("- name: Record real model cache baseline (nw-483)")
+        .unwrap();
+    let daemon_integration_position = job
+        .find("- name: Daemon integration tests (macOS portability gate)")
+        .unwrap();
+    let ready_regression_position = job
+        .find("- name: Ready-regression integration tests (macOS portability gate)")
+        .unwrap();
+    let verify_position = job
+        .find("- name: Verify no test reached the real model cache (nw-483)")
+        .unwrap();
+    assert!(
+        baseline_position < daemon_integration_position
+            && daemon_integration_position < ready_regression_position
+            && ready_regression_position < verify_position,
+        "ready-regression must run after daemon integration tests and stay between the nw-483 \
+         baseline and verify guards"
+    );
+    assert!(
+        job.contains(
+            "cargo test --locked --release --features metal --workspace --lib --no-fail-fast"
+        ),
+        "the pre-existing workspace --lib gate must stay in place unchanged"
+    );
+    assert!(
+        job.contains("cargo test --locked --release --features metal --test daemon_test"),
+        "the pre-existing daemon_test gate must stay in place unchanged"
     );
 }
 
