@@ -306,7 +306,10 @@ impl ScanIntegrity {
         }
         Some(format!(
             "coverage DEGRADED: {} corrupt row(s) skipped, {} kept; first: {}. \
-             Counts are a floor. Re-index to repair (`nestweaver brain add --force`).",
+             Counts are a floor. Repair by re-writing the affected source: \
+             `nestweaver index --repo <path> --force` for code, `nestweaver brain refresh \
+             <vault>` for notes, or restore a backup with `nestweaver backup restore <archive> \
+             --data-dir <dir>`.",
             self.skipped_corrupt,
             self.returned,
             self.first_reason.as_deref().unwrap_or("unknown")

@@ -12048,11 +12048,15 @@ async fn restart_verified_live_under_lock(
                     };
                     Err(commit_error.context(format!(
                         "restart failed after the incumbent daemon was stopped; {restoration}. \
-                         Resolve the cause above, then retry `nestweaver daemon --db {} restart{}`",
-                        db_path.display(),
-                        explicit_config
-                            .map(|config| format!(" --config {}", config.display()))
-                            .unwrap_or_default(),
+                         Resolve the cause above, then retry `{retry_command}`",
+                        retry_command = {
+                            let mut cmd =
+                                format!("nestweaver daemon --db {} restart", db_path.display());
+                            if let Some(config) = explicit_config {
+                                cmd.push_str(&format!(" --config {}", config.display()));
+                            }
+                            cmd
+                        },
                     )))
                 }
                 // Bare `daemon start` fails closed on unreadable persisted
@@ -31336,17 +31340,21 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
 
     /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
     ///
-    /// It answers "does this subcommand still exist?", which catches a future
-    /// rename and catches NONE of nw-310/318/328/329. Scoped to backtick-
-    /// quoted commands because that is the convention this codebase already
-    /// uses for pasteable text, which keeps prose out of the sweep.
+    /// It answers "does this subcommand PATH still exist?", which catches a
+    /// future rename and catches NONE of nw-310/318/328/329. Scoped to
+    /// backtick-quoted commands because that is the convention this codebase
+    /// already uses for pasteable text, which keeps prose out of the sweep.
+    /// Shares `nestweaver_spans_in_file` (join-then-extract, so a remedy
+    /// split by a Rust `\` line-continuation is not invisible to this sweep)
+    /// and `check_remedy_subcommand_path` (the same nested-path walk
+    /// `check_remedy_flags` below uses) with the flag check, so a bad SECOND
+    /// word (`daemon bogus`) is caught here too, not only a bad first one.
     #[test]
     fn backtick_quoted_remedies_still_name_a_real_subcommand() {
-        let subcommands = on_big_stack(|| {
-            let root = Cli::command();
-            root.get_subcommands()
-                .map(|sub| sub.get_name().to_string())
-                .collect::<std::collections::HashSet<String>>()
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
         });
 
         // Deliberate exceptions, in the explicit-inventory idiom this module
@@ -31361,25 +31369,16 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
 
         let mut unknown: Vec<String> = Vec::new();
         for (file, body) in sweep_sources() {
-            for (index, line) in body.lines().enumerate() {
-                if is_comment(line) {
+            for (line, span) in nestweaver_spans_in_file(&body) {
+                let first_word: String = span
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if NOT_A_SUBCOMMAND.contains(&first_word.as_str()) {
                     continue;
                 }
-                let mut at = 0usize;
-                while let Some(found) = line[at..].find("`nestweaver ") {
-                    let start = at + found + "`nestweaver ".len();
-                    let rest = &line[start..];
-                    let word: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                        .collect();
-                    at = start.max(at + 1);
-                    if word.is_empty() {
-                        continue;
-                    }
-                    if !subcommands.contains(&word) && !NOT_A_SUBCOMMAND.contains(&word.as_str()) {
-                        unknown.push(format!("{file}:{}: `nestweaver {word}`", index + 1));
-                    }
+                if let Err(reason) = check_remedy_subcommand_path(&root, &span) {
+                    unknown.push(format!("{file}:{line}: `nestweaver {span}` — {reason}"));
                 }
             }
         }
@@ -31387,9 +31386,446 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
         unknown.dedup();
         assert!(
             unknown.is_empty(),
-            "these backtick-quoted remedies name a subcommand the CLI does not \
-             have, so a user who pastes them gets a clap parse error instead of \
-             a fix: {unknown:#?}"
+            "these backtick-quoted remedies name a subcommand path the CLI \
+             does not have, so a user who pastes them gets a clap parse \
+             error instead of a fix: {unknown:#?}"
+        );
+
+        // Counterweight: a REAL positional following a real command must not
+        // be mistaken for a mistyped subcommand.
+        assert!(
+            check_remedy_subcommand_path(&root, "impact <symbol>").is_ok(),
+            "a placeholder positional after a real subcommand must pass"
+        );
+        assert!(
+            check_remedy_subcommand_path(&root, "impact formatNumber").is_ok(),
+            "`impact` declares its own positional (`name_or_uid`) and has no \
+             subcommands of its own, so a literal value that doesn't match \
+             any subcommand name must not be reported"
+        );
+        assert!(
+            check_remedy_subcommand_path(&root, "brain refresh <vault>").is_ok(),
+            "a real nested path ending in a placeholder positional must pass"
+        );
+
+        // FAIL: `brain` HAS subcommands (Add/Refresh/Search/…) and declares
+        // NO positional of its own, so an unmatched second word must be
+        // reported as a bad subcommand rather than silently accepted as a
+        // value nobody asked for.
+        assert!(
+            check_remedy_subcommand_path(&root, "brain seach").is_err(),
+            "a command with subcommands and no positional of its own must \
+             report an unmatched second word as a bad subcommand, not \
+             silently accept it as a positional value"
+        );
+    }
+
+    /// Runs the `\`-continuation join ONCE per file, then finds every
+    /// `` `nestweaver ...` `` span, pairing each with the 1-based PHYSICAL
+    /// line its OPENING backtick came from — not merely the join's first
+    /// line, so a span deep inside a long continued message still reports
+    /// precisely. A plain `body.lines()` scan silently drops a span whose
+    /// opening backtick has no closing backtick on the SAME physical line —
+    /// exactly the shape of a real remedy in this codebase,
+    /// `` `nestweaver brain\n add <vault>` `` (rustc folds the two SOURCE
+    /// lines into one string at compile time inside a `\`-continued string
+    /// literal; a line-at-a-time sweep sees an unclosed backtick on the
+    /// first line and an unopened one on the second, and reports NEITHER —
+    /// silently checking nothing rather than failing loudly). Shared by both
+    /// S1/T1 checks (subcommand-path and flag validation) so that blind spot
+    /// is closed for both at once, not patched into only one.
+    fn nestweaver_spans_in_file(body: &str) -> Vec<(usize, String)> {
+        let physical: Vec<&str> = body.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < physical.len() {
+            if is_comment(physical[i]) {
+                i += 1;
+                continue;
+            }
+            // Accumulate one `\`-continued run into a joined string,
+            // recording the byte offset in `joined` at which each
+            // contributing physical line's own text begins — the same
+            // dropped-backslash, stripped-leading-whitespace join rustc
+            // performs on a `\`-continued string literal.
+            let mut joined = String::new();
+            let mut offsets: Vec<(usize, usize)> = Vec::new();
+            loop {
+                let line_no = i + 1;
+                let raw = physical[i];
+                // A trailing backslash continues the line ONLY when its
+                // count is ODD. Inside a string literal, `\\` is an escaped
+                // backslash followed by a real newline — it does NOT
+                // continue the line — while `\` (one) or `\\\` (three) do,
+                // because the last backslash in an odd run has no partner
+                // and is rustc's line-continuation escape. Counting and
+                // parity-checking (rather than a single `strip_suffix`)
+                // is what tells these apart.
+                let trailing_backslashes = raw.len() - raw.trim_end_matches('\\').len();
+                let continues = trailing_backslashes % 2 == 1;
+                let text = if continues {
+                    &raw[..raw.len() - 1]
+                } else {
+                    raw
+                };
+                let piece = if offsets.is_empty() {
+                    text
+                } else {
+                    text.trim_start()
+                };
+                offsets.push((joined.len(), line_no));
+                joined.push_str(piece);
+                i += 1;
+                if !continues || i >= physical.len() {
+                    break;
+                }
+            }
+            let mut at = 0usize;
+            while let Some(found) = joined[at..].find("`nestweaver ") {
+                let backtick_offset = at + found;
+                let start = backtick_offset + "`nestweaver ".len();
+                let rest = &joined[start..];
+                let Some(end) = rest.find('`') else {
+                    break;
+                };
+                let line = offsets
+                    .iter()
+                    .rev()
+                    .find(|(off, _)| *off <= backtick_offset)
+                    .map(|(_, l)| *l)
+                    .unwrap_or(offsets[0].1);
+                out.push((line, rest[..end].to_string()));
+                at = start + end + 1;
+            }
+        }
+        out
+    }
+
+    /// Walks a span's leading non-flag tokens against the live command tree,
+    /// following nested subcommand names (`daemon stop`, `brain context`) as
+    /// far as they go. Flag tokens (`-`-led) are entirely out of scope here
+    /// — that is `check_remedy_flags`'s job — so they are skipped, not
+    /// evaluated. A non-flag token that matches NEITHER a subcommand name
+    /// NOR is explainable as a positional (the CURRENT command has
+    /// subcommands of its own AND declares no positional of its own) is
+    /// reported: that shape is a typo a pasting user cannot recover from
+    /// (`` `nestweaver brain seach` ``), not a legitimate value. A command
+    /// that DOES take a positional (`impact <symbol>`) or has no
+    /// subcommands left to mismatch against is left alone from that token on
+    /// — everything after is a value, out of scope for a subcommand-path
+    /// check.
+    fn check_remedy_subcommand_path(root: &clap::Command, span: &str) -> Result<(), String> {
+        let mut current = root;
+        let mut path = current.get_name().to_string();
+        for token in span.split_whitespace() {
+            if token == "--" || token.starts_with('-') {
+                continue;
+            }
+            if token.starts_with('{') || token.starts_with('<') {
+                continue;
+            }
+            if let Some(sub) = current.find_subcommand(token) {
+                current = sub;
+                path.push(' ');
+                path.push_str(token);
+                continue;
+            }
+            if current.has_subcommands() && current.get_positionals().next().is_none() {
+                return Err(format!("`{token}` is not a subcommand of `{path}`"));
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// Every `--long` (plus its aliases) and `-s` a command accepts. Called
+    /// only on a command reached from a root that has already had
+    /// `.build()` run on it, so this already includes every arg clap itself
+    /// copied in — a `global = true` arg propagated down from an ancestor,
+    /// and the injected `--help`/`-h` (and, on this tree, `--version`/`-V`
+    /// per command — see `check_remedy_flags`'s doc comment) — not only the
+    /// args declared directly on this command's own `Commands`/`*Action`
+    /// variant.
+    fn command_flag_names(cmd: &clap::Command) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        for arg in cmd.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                names.insert(format!("--{long}"));
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                for alias in aliases {
+                    names.insert(format!("--{alias}"));
+                }
+            }
+            if let Some(short) = arg.get_short() {
+                names.insert(format!("-{short}"));
+            }
+            if let Some(shorts) = arg.get_all_short_aliases() {
+                for short in shorts {
+                    names.insert(format!("-{short}"));
+                }
+            }
+        }
+        names
+    }
+
+    /// Walks one backtick span's tokens against a BUILT `Cli::command()`
+    /// tree (`root.build()` already run — see the two test functions):
+    /// descends into nested subcommands by name (`daemon stop`, `brain
+    /// context`) while consecutive leading tokens keep matching one, and
+    /// checks every `-`/`--` token against ONLY the CURRENT command's own
+    /// `command_flag_names`. There is no separate global-flag tracking here
+    /// on purpose: `build()` is clap's OWN propagation pass, and it already
+    /// copies a `global = true` arg into every descendant's own
+    /// `get_arguments()` — root's globals AND any declared on an
+    /// intermediate command, e.g. `Commands::Daemon`'s `--db`
+    /// (src/main.rs ~6978-6982) — recursively, all the way down, so
+    /// `daemon stop --db <path>` is valid even though `DaemonAction::Stop`
+    /// declares no `--db` of its own. That propagation runs one direction —
+    /// `daemon --force` (a flag `Stop` declares on itself, not `daemon`) is
+    /// still refused, since a CHILD's own flag never propagates back to its
+    /// parent. The same `build()` pass injects `--help`/`-h` onto every
+    /// command, so no manual allow-list is needed for it either — but NOT
+    /// `--version`/`-V` the way one might expect: this CLI's root
+    /// `#[command(version)]` has no `propagate_version`, and clap only
+    /// copies the VERSION STRING via that setting, not the `--version` ARG
+    /// itself onto every command regardless — empirically (see the
+    /// `impact --version` counterweight below) it stays root-only on this
+    /// tree, so it is validated the same as any other flag rather than
+    /// hand-listed as always-on. `{…}`/`<…>` placeholders and a bare `--`
+    /// (clap's end-of-flags marker) are not flags and are skipped; so is any
+    /// `-`-led token that is not letter-led (e.g. a negative number `-5`),
+    /// since only true flag tokens are in scope here — not the values that
+    /// follow them. Combined short flags (`-vq`) are NOT split apart — no
+    /// remedy in this codebase currently uses that shorthand, so it stays
+    /// unhandled rather than guessed at.
+    fn check_remedy_flags(root: &clap::Command, span: &str) -> Result<(), String> {
+        let mut current = root;
+        let mut path = current.get_name().to_string();
+        let mut still_descending = true;
+        for token in span.split_whitespace() {
+            if token == "--" {
+                continue;
+            }
+            if token.starts_with('{') || token.starts_with('<') {
+                continue;
+            }
+            let flagish = token.starts_with('-')
+                && token
+                    .trim_start_matches('-')
+                    .starts_with(|c: char| c.is_ascii_alphabetic());
+            if flagish {
+                let name = token.split('=').next().unwrap_or(token);
+                if !command_flag_names(current).contains(name) {
+                    return Err(format!("`{name}` is not a flag on `{path}`"));
+                }
+                continue;
+            }
+            if token.starts_with('-') {
+                // Not letter-led after the dash(es) — a value like `-5`, not
+                // a flag token. Nothing to validate.
+                continue;
+            }
+            if still_descending {
+                if let Some(sub) = current.find_subcommand(token) {
+                    current = sub;
+                    path.push(' ');
+                    path.push_str(token);
+                    continue;
+                }
+                still_descending = false;
+            }
+            // A positional argument value (symbol name, path, timestamp,
+            // …) — out of scope for this check; subcommand-path shape is
+            // `check_remedy_subcommand_path`'s job.
+        }
+        Ok(())
+    }
+
+    /// S1/T1's companion for the other half of a pasted remedy: the flag
+    /// tokens after the subcommand. `backtick_quoted_remedies_still_name_a_
+    /// real_subcommand` (above) proves the SUBCOMMAND PATH exists; it says
+    /// nothing about what follows, so `` `nestweaver impact --bogus-flag` ``
+    /// already passes it and still hands a pasting user a clap parse error.
+    /// This walks the full nested path (`daemon stop`, `brain context`, …)
+    /// against a BUILT `Cli::command()` tree (shared `nestweaver_spans_in_file`
+    /// extraction, so a `\`-continued span is not invisible here either) and
+    /// checks every flag token against that command's own, post-`build()`
+    /// arguments — see `check_remedy_flags`'s doc comment for exactly what
+    /// `build()` buys over hand-tracking global/help/version flags.
+    ///
+    /// Deliberately scoped, same as the subcommand check above: a remedy
+    /// assembled at runtime via `format!` (no literal backtick span in
+    /// source) is invisible to this sweep, and a flag that is valid on the
+    /// named command in general but wrong given what THIS specific
+    /// invocation already passed (nw-328/nw-329's actual shape) cannot be
+    /// expressed as a static per-string check. Both stay covered only by the
+    /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    #[test]
+    fn backtick_quoted_remedies_name_real_flags_on_real_command_paths() {
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
+        });
+
+        // Counterweight for a clap-introspection regression: if this were
+        // empty, the sweep below would pass by finding nothing to check on a
+        // multi-flag subcommand, not because every remedy is honest.
+        let impact = root
+            .find_subcommand("impact")
+            .expect("`impact` must exist for this counterweight to mean anything");
+        let impact_flags = command_flag_names(impact);
+        assert!(
+            impact_flags.len() > 1,
+            "expected `impact` to expose multiple flags via clap introspection \
+             (get_arguments()/get_long()); got {impact_flags:#?} — a clap API \
+             change here would make the whole check below pass by checking \
+             nothing"
+        );
+
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (line, span) in nestweaver_spans_in_file(&body) {
+                if let Err(reason) = check_remedy_flags(&root, &span) {
+                    unknown.push(format!("{file}:{line}: `nestweaver {span}` — {reason}"));
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these remedies name a flag the named command path does not \
+             accept, so pasting them is a clap parse error: {unknown:#?}"
+        );
+
+        // Step 2, the counterweight: run the same checker on synthetic
+        // inputs so the assertion above is proven to discriminate, not just
+        // to pass vacuously. `--json` is per-subcommand on this CLI (every
+        // `Commands` variant that supports it declares its own `json: bool`
+        // field), not one of the six `global = true` root args, so the
+        // "global flag written before the subcommand" case below uses
+        // `--quiet` — a real global flag — rather than the hypothetical
+        // `--json` the spec sketch used.
+        assert!(
+            check_remedy_flags(&root, "impact --not-a-flag").is_err(),
+            "the checker must catch an invented flag on a real subcommand"
+        );
+        assert!(
+            check_remedy_flags(&root, "daemon stop --force").is_ok(),
+            "`daemon stop --force` is a real nested path + flag and must pass"
+        );
+        assert!(
+            check_remedy_flags(&root, "brain context --since").is_ok(),
+            "`brain context --since` is a real nested path + flag and must pass"
+        );
+        assert!(
+            check_remedy_flags(&root, "--quiet search").is_ok(),
+            "a global flag written before the subcommand must still be \
+             recognised, order-independent of where the subcommand token \
+             falls"
+        );
+        // PASS: `--db` is `global = true` declared on `Commands::Daemon`
+        // ITSELF (src/main.rs ~6978-6982), not the root, and
+        // `DaemonAction::Stop` declares no `--db` of its own — reachable
+        // only via clap's OWN global-arg propagation on a built command
+        // tree (no hand-rolled ancestor tracking left to get this wrong).
+        assert!(
+            check_remedy_flags(&root, "daemon stop --db <path>").is_ok(),
+            "`--db` is `global = true` on `Commands::Daemon` itself (src/main.rs \
+             ~6978-6982), and `DaemonAction::Stop` declares no `--db` of its \
+             own, so this is only reachable via clap's OWN `build()` \
+             propagation, not just the root's own args"
+        );
+        // FAIL counterweight: `--force` is declared only on the CHILD
+        // `DaemonAction::Stop` (src/main.rs ~7239-7240), not on `daemon`
+        // itself (which has only `action` and the global `--db`). clap's
+        // propagation runs one direction — ancestor to descendant — so a
+        // child's own flag must NOT be usable on its parent, proving the fix
+        // didn't overcorrect into accepting everything everywhere.
+        assert!(
+            check_remedy_flags(&root, "daemon --force").is_err(),
+            "`--force` is declared only on `DaemonAction::Stop`, a CHILD of \
+             `daemon` — it must not be usable on the parent `daemon` command \
+             itself"
+        );
+        // FAIL counterweight: this CLI's root `#[command(version)]` has no
+        // `propagate_version`, so `--version`/`-V` must stay ROOT-only,
+        // unlike `--help`/`-h` which clap injects onto every command
+        // regardless. Removing the old hand-rolled `--version` allow-list
+        // is exactly what makes this checkable at all.
+        assert!(
+            check_remedy_flags(&root, "impact --version").is_err(),
+            "`--version` must not be accepted on a subcommand: only the root \
+             carries a version flag on a tree with no `propagate_version`"
+        );
+
+        // Documented skips: neither a bare `--` (clap's end-of-flags marker)
+        // nor a non-letter-led dash token (a negative number, not a flag)
+        // should be treated as an unknown flag.
+        assert!(
+            check_remedy_flags(&root, "impact -- -5").is_ok(),
+            "a bare `--` and a non-letter-led dash token like `-5` must be \
+             skipped, not reported as unknown flags"
+        );
+
+        // Multi-line blind spot: a span split by a Rust `\` line-
+        // continuation must still be found and checked, not silently
+        // dropped by a line-at-a-time scan. The literal below has a REAL
+        // backslash followed by a REAL newline and leading whitespace —
+        // i.e. it simulates raw FILE TEXT, not a Rust-source continuation
+        // (which the compiler would already have folded before this test
+        // ever ran).
+        // Built via a `backtick` variable, not a literal `` `nestweaver ``
+        // substring, so this FIXTURE does not trip the outer sweep on
+        // itself when it scans main.rs's own source text (the risk
+        // `sweep_sources`'s own doc comment names).
+        let backtick = '`';
+        let split_body = format!("{backtick}nestweaver impact --not-\\\n    a-flag{backtick}\n");
+        let spans = nestweaver_spans_in_file(&split_body);
+        assert_eq!(
+            spans,
+            vec![(1, "impact --not-a-flag".to_string())],
+            "a `\\`-continued span must be joined before extraction — \
+             body.lines() alone would see an unclosed backtick on line 1 \
+             and an unopened one on line 2, and silently check neither: \
+             {spans:#?}"
+        );
+        assert!(
+            check_remedy_flags(&root, &spans[0].1).is_err(),
+            "the (now-joined) split span must still be checked and caught \
+             as bogus, proving the join feeds real validation rather than \
+             just concatenating text nobody looks at"
+        );
+
+        // Counterweight: an EVEN number of trailing backslashes is an
+        // escaped backslash plus a real newline — NOT a continuation. This
+        // has to be observed through an UNCLOSED opener, not two
+        // independently self-closed spans: this function tracks each
+        // physical line's own byte offset regardless of where a chunk
+        // boundary falls, so two already-complete spans report the same
+        // `(line, span)` pairs whether or not an inert prose line between
+        // them gets wrongly merged in — merging alone doesn't corrupt
+        // anything by itself. The bug only becomes OBSERVABLE when a wrong
+        // merge lets one line's unclosed backtick adopt a CLOSING backtick
+        // that belongs to an unrelated next line, fabricating a span that
+        // spans two physical lines and never existed. That is exactly what
+        // a real multi-line `bail!`/`format!` message risks if one of its
+        // continuation lines happens to end in an escaped backslash (e.g. a
+        // literal Windows path).
+        let unclosed_before_even_backslashes =
+            format!("{backtick}nestweaver impact --flag \\\\\nunrelated text{backtick}\n");
+        let spans = nestweaver_spans_in_file(&unclosed_before_even_backslashes);
+        assert_eq!(
+            spans,
+            Vec::<(usize, String)>::new(),
+            "a line ending in an EVEN number of `\\` must NOT continue: \
+             this line's own unclosed backtick must find no span at all \
+             (matching the documented 'unclosed backtick contributes \
+             nothing further' behavior), not wrongly adopt the NEXT, \
+             unrelated line's closing backtick and fabricate a span that \
+             never existed: {spans:#?}"
         );
     }
 
@@ -34499,8 +34935,8 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
         // restore is destructive → fail closed.
         Err(e) => anyhow::bail!(
             "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
-             ({e}) — refusing a destructive restore. Stop the daemon (`nestweaver daemon stop` \
-             / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+             ({e}) — refusing a destructive restore. Stop the daemon \
+             (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
         // Present but EMPTY → claims no PID at all, which is the same fact as
@@ -34513,16 +34949,16 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
                 "a pidfile exists at {} but could not be parsed to confirm the daemon is \
-                 stopped — refusing a destructive restore. Stop the daemon (`nestweaver daemon \
-                 stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+                 stopped — refusing a destructive restore. Stop the daemon \
+                 (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
                 pidfile.display(),
             ),
             // Live pid → daemon is running → refuse.
             Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
                 "a daemon (pid {pid}) is running on the target data directory {} — restoring \
                  would rename its live files aside and delete them while it keeps writing to the \
-                 unlinked inodes, silently diverging the restored state. Stop it with `nestweaver \
-                 daemon stop` (or `nestweaver server stop`) and retry.",
+                 unlinked inodes, silently diverging the restored state. Stop it with \
+                 `nestweaver daemon stop` and retry.",
                 data_dir.display(),
             ),
             // Dead/stale pid → daemon is gone → permit.
@@ -34553,8 +34989,8 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
         // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
         Err(e) => anyhow::bail!(
             "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
-             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon (`nestweaver \
-             daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon \
+             (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
         // Present but EMPTY → no PID is claimed → quiesced, exactly as an
@@ -34566,8 +35002,7 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
             Err(_) => anyhow::bail!(
                 "a pidfile exists at {} but could not be parsed to confirm the daemon is \
                  stopped — refusing to build a possibly-torn snapshot. Stop the daemon \
-                 (`nestweaver daemon stop` / `nestweaver server stop`) or remove the stale \
-                 pidfile, then retry.",
+                 (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
                 pidfile.display(),
             ),
             // Live pid → daemon is writing this DB → refuse.

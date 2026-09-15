@@ -382,7 +382,7 @@ pub fn generate_guide_with_tools(
     out.push_str(
         "| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA-vs-HEAD **and** resolver generation |\n",
     );
-    out.push_str("| Batch/scripted queries | CLI `nestweaver context/search/impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
+    out.push_str("| Batch/scripted queries | CLI `nestweaver context --json`, `nestweaver search --json`, `nestweaver impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
     out.push_str("| Subagent code exploration | CLI `nestweaver context <seed> --json` | CLI is cheaper for focused lookups |\n");
     out.push_str("| Known-path file read | `Read` tool | Graph can't beat a direct file read |\n");
     out.push('\n');

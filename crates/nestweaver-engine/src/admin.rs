@@ -41,7 +41,7 @@ This workspace is indexed by NestWeaver. Use its tools instead of grepping:
 | Find text by regex | `regex_search` | `rg`, `grep` |
 | Project overview | `project_context <name>` | reading _Overview.md |
 
-For subagents and batch work, prefer CLI (`nestweaver context/search --json`) over MCP — 40-60% cheaper in tokens.
+For subagents and batch work, prefer CLI (`nestweaver context --json`, `nestweaver search --json`) over MCP — 40-60% cheaper in tokens.
 
 These instructions are guidance, not enforcement — follow them when they apply.
 "#;
