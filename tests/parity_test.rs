@@ -2416,6 +2416,65 @@ fn no_cli_command_discloses_more_than_its_mcp_twin() {
     );
 }
 
+/// nw-215(a). `note_get` was MCP-only — an agent could read a note's body but
+/// an operator debugging the same graph had no CLI command to reproduce it.
+/// `note get` is the new CLI twin; this asserts its direct `--json` output
+/// carries exactly the same field set as the MCP tool answers for the same
+/// note, in both directions (not mere containment): a field on either side
+/// only is the drift this test exists to catch.
+#[test]
+fn note_get_cli_matches_mcp_shape() {
+    let fixture = setup_fixture_with_vault_note();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(db, &["note", "get", "Beta", "--json"]);
+    assert!(
+        cli.status.success(),
+        "note get (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("note get", &cli);
+    let mcp_json = run_via_mcp(db, "note_get", serde_json::json!({ "title": "Beta" }));
+
+    let mut cli_keys = json_key_paths(&cli_json);
+    let mut mcp_keys = json_key_paths(&mcp_json);
+    cli_keys.sort();
+    mcp_keys.sort();
+    assert_eq!(
+        cli_keys, mcp_keys,
+        "`note get` (CLI) and `note_get` (MCP) emit different keys for the same note.\n\
+         CLI: {cli_json}\n  MCP: {mcp_json}"
+    );
+}
+
+/// nw-215(a). `brain_diff` was MCP-only. `brain diff` is the new CLI twin;
+/// this asserts its direct `--json` output carries exactly the same field set
+/// as the MCP tool for the same repo, in both directions.
+#[test]
+fn brain_diff_cli_matches_mcp_shape() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(db, &["brain", "diff", "repo", "--json"]);
+    assert!(
+        cli.status.success(),
+        "brain diff (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("brain diff", &cli);
+    let mcp_json = run_via_mcp(db, "brain_diff", serde_json::json!({ "repo": "repo" }));
+
+    let mut cli_keys = json_key_paths(&cli_json);
+    let mut mcp_keys = json_key_paths(&mcp_json);
+    cli_keys.sort();
+    mcp_keys.sort();
+    assert_eq!(
+        cli_keys, mcp_keys,
+        "`brain diff` (CLI) and `brain_diff` (MCP) emit different keys for the same repo.\n\
+         CLI: {cli_json}\n  MCP: {mcp_json}"
+    );
+}
+
 /// The structural guard: for a tool with a CLI twin, any key the CLI emits and
 /// MCP does not is a field an agent cannot see. The known gaps are listed
 /// explicitly with the finding that owns them, and the assertion is
@@ -2575,6 +2634,30 @@ fn mcp_stale_check_reports_which_repos_not_merely_that_some_do() {
 fn parity_backlinks_direct_vs_daemon() {
     let fixture = setup_fixture_with_vault_note();
     check_parity_json_semantic(&fixture.db_path, "backlinks", &["backlinks", "Beta"]);
+}
+
+/// nw-215(a). `note get` direct-vs-daemon: the new CLI twin of the MCP-only
+/// `note_get` tool must answer identically (human and `--json`) whether or
+/// not a daemon owns the database, the same guarantee every other CLI twin
+/// in this file carries. The direct route's fallback calls the same
+/// `nestweaver_mcp::tools::dispatch("note_get", ...)` the daemon RPC
+/// (`get_note`) and the MCP tool call, so this guards against a future
+/// divergence between them.
+#[test]
+fn parity_note_get_direct_vs_daemon() {
+    let fixture = setup_fixture_with_vault_note();
+    check_parity_json_semantic(&fixture.db_path, "note get", &["note", "get", "Beta"]);
+}
+
+/// nw-215(a). `brain diff` direct-vs-daemon: the new CLI twin of the
+/// MCP-only `brain_diff` tool. The fixture's single commit means base and
+/// head SHAs are equal, so both routes answer the trivial "graph is up to
+/// date with HEAD" shape — still a real parity check, since it fails if
+/// either route's dispatch diverges from `tool_brain_diff`.
+#[test]
+fn parity_brain_diff_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_json_semantic(&fixture.db_path, "brain diff", &["brain", "diff", "repo"]);
 }
 
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this

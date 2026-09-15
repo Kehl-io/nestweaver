@@ -5625,6 +5625,19 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
+    /// Read a vault note's content and metadata — the read-only CLI twin of
+    /// the `note_get` MCP tool an agent already has.
+    //
+    // nw-215(a). `note_get` was MCP-only: an agent could read a note's full
+    // body, but an operator debugging the same graph from a terminal had no
+    // command to reproduce what the agent saw. Nested under its own `note`
+    // group, mirroring `brain`/`extensions`/`contracts`, so a future related
+    // verb has somewhere to land without a breaking rename.
+    Note {
+        #[command(subcommand)]
+        command: NoteCommands,
+    },
+
     /// Show cross-repo references for a symbol (legacy command)
     CrossRepoRefs {
         /// Symbol name or UID
@@ -7526,6 +7539,30 @@ enum RtsEvalCommands {
 }
 
 #[derive(Subcommand)]
+enum NoteCommands {
+    /// Fetch a vault note's full markdown body plus structural metadata
+    /// (frontmatter, heading outline, section count) — the read-only CLI
+    /// twin of the `note_get` MCP tool.
+    #[command(
+        name = "get",
+        after_help = "Examples:\n  nestweaver note get 'Architecture Overview'\n  nestweaver note get note:vault:Notes:abc123 --json"
+    )]
+    Get {
+        /// Target note UID (`note:...`) or title
+        target: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExtensionCommands {
     /// List annotations. With no filter, every annotated node.
     List {
@@ -8193,6 +8230,37 @@ enum BrainCommands {
             help = "Max entries in top_tags (1-1000; default 10; matches the MCP brain_doc_stats schema)"
         )]
         top_tags_limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Show what changed in a repo since it was last indexed: files added,
+    /// modified or deleted, plus the symbols they affect — the read-only
+    /// CLI twin of the `brain_diff` MCP tool. Local repos only.
+    #[command(
+        name = "diff",
+        after_help = "Examples:\n  nestweaver brain diff my-service\n  nestweaver brain diff my-service --since-sha abc123 --json"
+    )]
+    Diff {
+        /// Repo name or substring of its URL, matched against indexed repos.
+        repo: String,
+        #[arg(
+            long,
+            help = "Git SHA to compare against (default: the repo's indexed SHA)"
+        )]
+        since_sha: Option<String>,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max affected symbols to return (1-1000; default 50; matches the MCP brain_diff schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15127,6 +15195,101 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             backlink["confidence"].as_f64().unwrap_or(0.0)
                         );
                     }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Note {
+            command:
+                NoteCommands::Get {
+                    target,
+                    json,
+                    db,
+                    config,
+                },
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let args = if target.starts_with("note:") {
+                serde_json::json!({ "uid": target })
+            } else {
+                serde_json::json!({ "title": target })
+            };
+            // Mirrors `backlinks`: daemon route first via the shared JSON-RPC
+            // dispatch, falling back to the same `nestweaver_mcp::tools::dispatch`
+            // the daemon and MCP routes call, so all three surfaces answer from
+            // one implementation.
+            let routed = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "note_get",
+                args.clone(),
+            ) {
+                Ok(Some(value)) => Ok(Some(value)),
+                Ok(None) => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::dispatch(&store, None, "note_get", args, None).map(Some)
+                }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `tool_note_get` reports a title miss as "no note found with
+                // title '<t>'" and a uid miss as a context-wrapped
+                // `StoreError::NotFound` ("failed to look up note with uid
+                // '<uid>': not found") — both are classified as not-found
+                // here rather than a hard error, matching `backlinks`.
+                Err(error)
+                    if {
+                        let message = format!("{error:#}");
+                        message.contains("no note found with title")
+                            || message.contains("failed to look up note with uid")
+                    } =>
+                {
+                    if json {
+                        print_json_not_found("target", &target);
+                    }
+                    eprintln!("Note '{target}' not found.");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
+            };
+            if json {
+                print_json_payload(&payload)?;
+            } else {
+                if out.verbose {
+                    println!(
+                        "Note: {} [{}]",
+                        payload["title"].as_str().unwrap_or("?"),
+                        payload["uid"].as_str().unwrap_or("?")
+                    );
+                } else {
+                    println!("Note: {}", payload["title"].as_str().unwrap_or("?"));
+                }
+                println!("Path: {}", payload["path"].as_str().unwrap_or("?"));
+                println!("Kind: {}", payload["note_kind"].as_str().unwrap_or("?"));
+                println!("Words: {}", payload["word_count"].as_u64().unwrap_or(0));
+                if let Some(outline) = payload["outline"].as_array()
+                    && !outline.is_empty()
+                {
+                    println!(
+                        "\nOutline ({} section(s)):",
+                        payload["section_count"].as_u64().unwrap_or(0)
+                    );
+                    for heading in outline {
+                        let level = heading["level"].as_u64().unwrap_or(1) as usize;
+                        println!(
+                            "  {} {}",
+                            "#".repeat(level.max(1)),
+                            heading["text"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                if let Some(body) = payload["body"].as_str() {
+                    println!("\n{body}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -28456,6 +28619,77 @@ fn run_brain(
             }
             Ok((EXIT_SUCCESS, None))
         }
+
+        BrainCommands::Diff {
+            repo,
+            since_sha,
+            limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let mut args = serde_json::json!({ "repo": repo });
+            if let Some(sha) = since_sha.as_deref() {
+                args["since_sha"] = serde_json::json!(sha);
+            }
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
+            }
+            // Mirrors `backlinks`/`note get`: daemon route first via the
+            // shared JSON-RPC dispatch, falling back to the same
+            // `nestweaver_mcp::tools::dispatch` the daemon and MCP routes
+            // call, so all three surfaces answer from one implementation.
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_diff",
+                args.clone(),
+            )? {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None)?
+                }
+            };
+            if json {
+                print_json_payload(&payload)?;
+            } else {
+                println!(
+                    "Diff for {}: {} -> {}",
+                    payload["repo"].as_str().unwrap_or(&repo),
+                    payload["base_sha"].as_str().unwrap_or("?"),
+                    payload["head_sha"].as_str().unwrap_or("?")
+                );
+                if let Some(message) = payload["message"].as_str() {
+                    println!("{message}");
+                } else {
+                    println!(
+                        "  {} added, {} modified, {} deleted",
+                        payload["files_added"].as_u64().unwrap_or(0),
+                        payload["files_modified"].as_u64().unwrap_or(0),
+                        payload["files_deleted"].as_u64().unwrap_or(0),
+                    );
+                    if let Some(symbols) = payload["affected_symbols"].as_array()
+                        && !symbols.is_empty()
+                    {
+                        println!("Affected symbols ({}):", symbols.len());
+                        for sym in symbols {
+                            println!(
+                                "  {} [{}] {}:{}",
+                                sym["name"].as_str().unwrap_or("?"),
+                                sym["kind"].as_str().unwrap_or("?"),
+                                sym["file_path"].as_str().unwrap_or("?"),
+                                sym["start_line"].as_u64().unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
     }
 }
 
@@ -29666,6 +29900,7 @@ mod cli_help_contract_tests {
     /// compile-time completeness from an enum match; a clap tree is not an
     /// enum, so this gets the same guarantee at test time instead -- an
     /// undeclared path is a test FAILURE, not a `continue`.
+    #[derive(Debug, PartialEq)]
     enum CliMcpTwin {
         /// This CLI command's MCP counterpart, by registry name.
         Tool(&'static str),
@@ -29700,6 +29935,9 @@ mod cli_help_contract_tests {
             "brain add" => Tool("brain_add_source"),
             "brain broken-links" => Tool("brain_broken_links"),
             "brain context" => Tool("brain_context"),
+            // nw-215(a): `brain diff` is the CLI twin added alongside `note
+            // get` to close the two read-only MCP-only gaps this item found.
+            "brain diff" => Tool("brain_diff"),
             "brain doc-stats" => Tool("brain_doc_stats"),
             // nw-217b hole: mechanical guess was "brain_orphans"; the real
             // tool is `brain_orphan_documents`. `brain orphans --limit` was
@@ -29733,7 +29971,11 @@ mod cli_help_contract_tests {
             // `extensions list`/`extensions unset` rather than exposing a
             // literal `extensions_list`/`extensions_unset` tool pair.
             "extensions list" => Tool("query_extensions"),
-            "extensions unset" => Tool("set_extension"),
+            // nw-215(a) fix: this used to read `Tool("set_extension")`, a
+            // stale mapping predating `unset_extension`'s existence (nw-281).
+            // `extensions unset` (`ExtensionCommands::Unset`) calls
+            // `client.unset_extension(&uid, &key)` -- the real twin.
+            "extensions unset" => Tool("unset_extension"),
             "flow-trace" => Tool("flow_trace"),
             // nw-217b hole: `brain_guide`'s own description names this exact
             // CLI command as its local-path equivalent.
@@ -29755,6 +29997,8 @@ mod cli_help_contract_tests {
             "memory consolidate" => Tool("brain_memory_consolidate"),
             "memory lint" => Tool("brain_memory_lint"),
             "memory related" => Tool("brain_memory_related"),
+            // nw-215(a): `note_get` was MCP-only; `note get` is its CLI twin.
+            "note get" => Tool("note_get"),
             "project-context" => Tool("project_context"),
             "prune-stale" => Tool("prune_stale"),
             "read-symbols" => Tool("read_symbols"),
@@ -29851,6 +30095,9 @@ mod cli_help_contract_tests {
             | "materialize-projects"
             | "mcp"
             | "memory"
+            // The bare group has no operation of its own; its only member,
+            // `note get`, is declared separately above as `Tool("note_get")`.
+            | "note"
             | "pr-impact"
             | "pre-push-impact"
             | "publication"
@@ -30004,6 +30251,23 @@ mod cli_help_contract_tests {
              classify each as `Tool(\"...\")` or `NoTwin(\"...\")`:\n{}",
             undeclared.len(),
             undeclared.join("\n")
+        );
+    }
+
+    /// nw-215(a). `declared_cli_mcp_twin("extensions unset")` used to read
+    /// `Tool("set_extension")`, a mapping that predates `unset_extension`'s
+    /// existence (nw-281) and was never updated once the CLI's `extensions
+    /// unset` (`ExtensionCommands::Unset`, handler calls
+    /// `client.unset_extension`) got its own gated RPC. This pins the fix
+    /// directly rather than relying on the completeness walk above, which
+    /// only checks that SOME arm exists for the path, not that it names the
+    /// right tool.
+    #[test]
+    fn extensions_unset_twin_mapping_names_the_real_tool() {
+        assert_eq!(
+            declared_cli_mcp_twin("extensions unset"),
+            Some(CliMcpTwin::Tool("unset_extension")),
+            "`extensions unset` calls `client.unset_extension`, not `set_extension`"
         );
     }
 
@@ -30214,6 +30478,11 @@ mod cli_help_contract_tests {
             "nestweaver brain add",
             "nestweaver brain broken-links",
             "nestweaver brain context",
+            // nw-215(a): added deliberately, alongside `note get`. Both are
+            // new read-only CLI twins of MCP-only tools (`brain_diff`,
+            // `note_get`) and resolve through the same `resolve_db_with_config`
+            // every read command in this inventory uses.
+            "nestweaver brain diff",
             "nestweaver brain doc-stats",
             // nw-280: added deliberately. The upgrade runbook's step 4
             // ("verify one convention everywhere") tells a config-driven user
@@ -30285,6 +30554,7 @@ mod cli_help_contract_tests {
             "nestweaver memory consolidate",
             "nestweaver memory lint",
             "nestweaver memory related",
+            "nestweaver note get",
             "nestweaver project-context",
             "nestweaver publication rebuild",
             "nestweaver publication rollback",
