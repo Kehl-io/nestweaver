@@ -167,6 +167,30 @@ use std::path::Path;
 ///     cannot seed a reachability walk no matter which binary asks — only
 ///     re-indexing (`nestweaver index --repo <path> --force`) writes the
 ///     corrected flag.
+///
+///     nw-491 (same generation as nw-435/nw-356/nw-490 above — the branch is
+///     still unreleased). `queries/bash.scm` had no capture for a command's
+///     ARGUMENTS, only its own name, so `trap cleanup EXIT` referenced the
+///     literal word `trap` and never `cleanup`; the handler had in-degree
+///     zero and nw-435's rooting had nothing to promote (its
+///     `top_level_called` set comes from `Call` references, and `trap`
+///     produced none pointing at the handler). A registration-macro-style
+///     post-pass, `collect_bash_trap_targets` in `nestweaver-parser/src/
+///     parse.rs`, now parses a bash `trap`'s operands per the GNU Bash
+///     manual grammar (`-l`/`-p`/`-P` print or list and register nothing; a
+///     leading `--` is consumed; the first remaining operand is the action
+///     only when a sigspec also remains; an action of `-` or empty text is a
+///     reset/ignore) and promotes the first word of the action text to
+///     `is_entry_point: true`, `entry_point_kind:
+///     Some(EntryPointKind::EventListener)` on any same-file `Function` of
+///     that name — `EventListener`, not `Main`, because a trap handler is
+///     triggered by an external OS signal rather than being the script's own
+///     entry point, keeping it out of `process.rs`'s `{dir}::main` bucket.
+///     Same persisted-column shape as nw-435/nw-490: a symbol in an
+///     already-indexed graph keeps `is_entry_point: false` forever and
+///     cannot seed a reachability walk no matter which binary asks — only
+///     re-indexing (`nestweaver index --repo <path> --force`) writes the
+///     corrected flag.
 pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must

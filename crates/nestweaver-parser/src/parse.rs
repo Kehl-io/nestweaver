@@ -1836,6 +1836,31 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // nw-491: promote same-file `Function` symbols registered by a bash
+    // `trap NAME SIGSPEC` command to reachability roots. See
+    // `collect_bash_trap_targets` for the grammar this parses and why the
+    // whole tree is scanned rather than gating on an enclosing function body.
+    // `EntryPointKind::EventListener`, not `Main`: a trap handler is
+    // triggered by an external OS signal — the same relationship
+    // `EventListener` already models for JS/TS hooks/contexts/providers —
+    // not "the" program entry point the way `main`/a directly-run script is,
+    // and reusing `Main` would conflate trap-registered callbacks with
+    // top-level-called functions in `process.rs`'s `{dir}::main` bucket.
+    if lang == Language::Bash {
+        let trapped = collect_bash_trap_targets(tree.root_node(), source_bytes);
+        if !trapped.is_empty() {
+            for symbol in &mut symbols {
+                if !symbol.is_entry_point
+                    && symbol.kind == SymbolKind::Function
+                    && trapped.contains(symbol.name.as_str())
+                {
+                    symbol.is_entry_point = true;
+                    symbol.entry_point_kind = Some(EntryPointKind::EventListener);
+                }
+            }
+        }
+    }
+
     // nw-435: promote same-file `Function` symbols called with no enclosing
     // function body to reachability roots. `detect_python`/`detect_bash`
     // (entry_points.rs) only recognise a function literally named `main`, so a
@@ -2005,6 +2030,148 @@ fn collect_identifiers_in_token_tree<'a>(
         for child in current.children(&mut cursor) {
             stack.push(child);
         }
+    }
+}
+
+/// Every candidate callback name registered by a bash `trap NAME SIGSPEC`
+/// command — nw-491. `queries/bash.scm` has exactly one `@reference.call`
+/// rule, which captures a command's own NAME (`"trap"`), never its
+/// arguments, so `trap cleanup EXIT` produced a `Call` reference to `trap`
+/// and none at all to `cleanup`. The handler then had in-degree zero and
+/// nw-435's top-level-call rooting could not help either, because its
+/// `top_level_called` set is populated from `Call` references and `cleanup`
+/// has none.
+///
+/// This is a REGISTRATION, not an ordinary call — the shell runtime invokes
+/// the handler on receipt of a signal, not any call site in the script — the
+/// same relationship `collect_rust_registered_entry_points` already models
+/// for `criterion_group!`. Follow that precedent exactly: walk the whole
+/// tree for `trap` commands (unlike `is_top_level_reference`, this does NOT
+/// check for an enclosing function body — see
+/// `bash_trap_inside_a_function_body_still_roots_the_handler`'s doc comment
+/// for why: a `setup_traps() { trap cleanup EXIT; }` helper still really
+/// registers the handler once it runs), collect candidate names, and let the
+/// caller intersect them against the file's own `Function` definitions —
+/// which is what keeps `trap - EXIT` (reset) or `trap '' EXIT` (ignore) from
+/// inventing an entry point out of nothing.
+///
+/// Operand parsing follows the GNU Bash manual's `trap` grammar exactly
+/// (JUDGE-VERDICT-2b nw-491; confirmed against a tree-sitter-bash 0.25.1
+/// grammar dump, not guessed):
+///  * `-l`, `-p` and `-P` are print/list forms and register nothing.
+///  * A leading `--` ends option parsing and is consumed.
+///  * Among the remaining operands, the first is the ACTION only when at
+///    least one sigspec also remains — a single remaining operand is itself
+///    a sigspec, and the action is implicitly `-` (reset).
+///  * An action of literal `-`, or empty text, is a reset/ignore and
+///    registers nothing.
+///
+/// The action text comes from three possible argument node shapes: a bare
+/// `word`, a single-quoted `raw_string` (unquoted via the existing
+/// `strip_quotes`), or a double-quoted `string` built only from
+/// `string_content` children — a `string` containing any `expansion`,
+/// `simple_expansion` or `command_substitution` child (`trap "$HANDLER"
+/// EXIT`) is rejected outright, since its real value is not knowable
+/// statically. Any other argument node shape (`concatenation`,
+/// `simple_expansion` used directly, `command_substitution`, ...) is
+/// likewise rejected.
+///
+/// The manual's action is "a command that is read and executed" — it can be
+/// an entire shell command line, not just a function name (`trap 'rm -f x'
+/// EXIT`). Only the FIRST WORD of the (quote-stripped) action text is taken
+/// as the candidate, so `trap 'cleanup $?' EXIT` roots `cleanup` (a real
+/// call the trap actually makes) while `trap 'rm -f x' EXIT` only ever
+/// candidates `rm` — which the caller's intersection step then correctly
+/// rejects unless the file genuinely defines a function named `rm`.
+fn collect_bash_trap_targets<'a>(
+    root: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "command"
+            && let Some(cmd_name) = current
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source_bytes).ok())
+            && cmd_name == "trap"
+        {
+            collect_one_bash_trap_target(current, source_bytes, &mut names);
+            continue;
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    names
+}
+
+/// Parse one `trap` command's operands per the grammar described on
+/// [`collect_bash_trap_targets`], inserting its candidate action name (if
+/// any) into `names`.
+fn collect_one_bash_trap_target(
+    command: tree_sitter::Node,
+    source_bytes: &[u8],
+    names: &mut std::collections::HashSet<String>,
+) {
+    let mut cursor = command.walk();
+    let args: Vec<tree_sitter::Node> = command
+        .children_by_field_name("argument", &mut cursor)
+        .collect();
+    if args.is_empty() {
+        return;
+    }
+    // `-l` (list), `-p`/`-P` (print) register nothing regardless of what
+    // follows them.
+    let first_text = args[0].utf8_text(source_bytes).unwrap_or("");
+    if matches!(first_text, "-l" | "-p" | "-P") {
+        return;
+    }
+    let mut idx = 0;
+    if args[idx].utf8_text(source_bytes).unwrap_or("") == "--" {
+        idx += 1;
+    }
+    let operands = &args[idx..];
+    // The action is present only when at least one sigspec also remains; a
+    // lone remaining operand is the sigspec of an implicit reset (`trap
+    // INT`), never a candidate name.
+    if operands.len() < 2 {
+        return;
+    }
+    let Some(text) = bash_trap_action_text(operands[0], source_bytes) else {
+        return;
+    };
+    if text == "-" || text.trim().is_empty() {
+        return;
+    }
+    if let Some(first_word) = text.split_whitespace().next() {
+        names.insert(first_word.to_string());
+    }
+}
+
+/// The unquoted text of a `trap` action argument, or `None` when its shape
+/// cannot be statically resolved to literal text (an unquoted expansion, a
+/// concatenation, a `string` containing any expansion/substitution, ...).
+fn bash_trap_action_text(action: tree_sitter::Node, source_bytes: &[u8]) -> Option<String> {
+    match action.kind() {
+        "word" => action.utf8_text(source_bytes).ok().map(str::to_string),
+        "raw_string" => action.utf8_text(source_bytes).ok().map(strip_quotes),
+        "string" => {
+            let mut cursor = action.walk();
+            let mut text = String::new();
+            for child in action.children(&mut cursor) {
+                match child.kind() {
+                    "string_content" => {
+                        text.push_str(child.utf8_text(source_bytes).ok()?);
+                    }
+                    "\"" => continue,
+                    _ => return None, // expansion / simple_expansion / command_substitution
+                }
+            }
+            Some(text)
+        }
+        _ => None,
     }
 }
 
@@ -9077,6 +9244,278 @@ mod reachability_recovery_tests {
         assert!(
             !f.is_entry_point,
             "a global let initializer in a non-main.swift file is lazy, not executed at load time -- the file-name/shebang gate must still apply"
+        );
+    }
+
+    // nw-491: bash `trap NAME SIGSPEC` registers `NAME` as a signal-handler
+    // callback with the shell runtime, not with any call site in the script,
+    // so it needs the same registration-macro-shaped rooting
+    // `collect_rust_registered_entry_points` already gives `criterion_group!`.
+    // Parsed strictly per the GNU Bash manual's `trap` grammar (JUDGE-VERDICT-2b
+    // nw-491): `-l`/`-p`/`-P` print or list and register nothing; a leading
+    // `--` is consumed; the first remaining operand is the action only when at
+    // least one sigspec also remains; an action of `-` or empty text is a
+    // reset/ignore and registers nothing.
+
+    /// The dominant real bash idiom: `trap cleanup EXIT` with a bare,
+    /// unquoted handler name.
+    #[test]
+    fn bash_trap_with_bare_name_roots_the_handler() {
+        let src = "trap cleanup EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a bare trap action roots its handler"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap 'cleanup' INT TERM` — a single-quoted action whose unquoted text
+    /// is exactly one word still names one function, just spelled with
+    /// quotes. The literal DONE WHEN case from the backlog item.
+    #[test]
+    fn bash_trap_with_quoted_single_name_roots_the_handler() {
+        let src = "trap 'cleanup' INT TERM\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap -- cleanup EXIT` — a leading `--` ends option parsing per the
+    /// manual; the action still follows and must still root.
+    #[test]
+    fn bash_trap_double_dash_then_name_roots_the_handler() {
+        let src = "trap -- cleanup EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a `--` before the action must not be mistaken for the action itself"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap cleanup INT TERM EXIT` — several sigspecs after one action; only
+    /// the action (the first operand) is ever a candidate name.
+    #[test]
+    fn bash_trap_multiple_sigspecs_roots_the_handler() {
+        let src = "trap cleanup INT TERM EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap 'cleanup $?' EXIT` — the action is a real shell command line,
+    /// not a bare function name, but its FIRST WORD is `cleanup`. The manual
+    /// says the action is "a command that is read and executed", so rooting
+    /// the first word is what a user calling this a callback would expect.
+    #[test]
+    fn bash_trap_with_dollar_question_calls_its_first_word_function() {
+        let src = "trap 'cleanup $?' EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "the action's first word is a real call the trap actually makes"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT (backlog item's own DONE WHEN counterweight, corrected by
+    /// the judge to intersect on the first word rather than reject the whole
+    /// string): `trap 'rm -f x' EXIT`'s first word is `rm`, and no function
+    /// named `rm` is defined anywhere in the file — only an unrelated,
+    /// differently-named `rm_f_x` is. Nothing must root.
+    #[test]
+    fn bash_trap_command_string_with_no_matching_function_roots_nothing() {
+        let src = "trap 'rm -f x' EXIT\nrm_f_x() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let rm_f_x = find(&parsed, "rm_f_x");
+        assert!(
+            !rm_f_x.is_entry_point,
+            "the trap's first word is `rm`, which does not match `rm_f_x` -- \
+             a multi-word action must never invent a match against an \
+             unrelated same-file function"
+        );
+    }
+
+    /// The other half of the same case: when the file genuinely DOES define a
+    /// function named after the action's first word, the trap really does
+    /// call it, so rooting is correct.
+    #[test]
+    fn bash_trap_command_string_roots_its_first_word_function() {
+        let src = "trap 'rm -f x' EXIT\nrm() { echo would-remove; }\n";
+        let parsed = parse("script.sh", src);
+        let rm = find(&parsed, "rm");
+        assert!(
+            rm.is_entry_point,
+            "trap really does invoke `rm` as its first word, so a same-named \
+             function in the file is a real callee"
+        );
+        assert_eq!(rm.entry_point_kind, Some(EntryPointKind::EventListener));
+    }
+
+    /// COUNTERWEIGHT named explicitly in the task: a quoted action naming a
+    /// function that does not exist anywhere in the file roots nothing. This
+    /// exercises the intersection-with-real-definitions step, not just
+    /// candidate collection.
+    #[test]
+    fn bash_trap_quoted_action_naming_a_non_existent_function_roots_nothing() {
+        let src = "trap 'ghost' EXIT\nother() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let other = find(&parsed, "other");
+        assert!(!other.is_entry_point);
+        assert!(
+            parsed.symbols.iter().all(|s| s.name != "ghost"),
+            "the fixture defines no `ghost` function, so nothing can be found rooted under that name"
+        );
+    }
+
+    /// COUNTERWEIGHT, unquoted variant: `trap ghost EXIT` with no `ghost`
+    /// function anywhere in the file.
+    #[test]
+    fn bash_trap_naming_an_undefined_function_roots_nothing() {
+        let src = "trap ghost EXIT\nother() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let other = find(&parsed, "other");
+        assert!(!other.is_entry_point);
+    }
+
+    /// COUNTERWEIGHT: `trap - EXIT` (explicit reset) and `trap '' EXIT`
+    /// (ignore) must both register nothing. The same file defines a function
+    /// literally named `EXIT` (legal in bash) so this test can only pass for
+    /// the right reason -- the sketch's naive "skip every `-`-prefixed
+    /// argument" bug would otherwise treat `EXIT` itself as the candidate
+    /// name and this test would pass by accident.
+    #[test]
+    fn bash_trap_reset_and_ignore_forms_root_nothing() {
+        let reset = parse("reset.sh", "trap - EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&reset, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap - EXIT` is an explicit reset; `-` is the action, not a name, \
+             and EXIT is a sigspec, never a candidate"
+        );
+
+        let ignore = parse("ignore.sh", "trap '' EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&ignore, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap '' EXIT` ignores the signal; an empty action registers nothing"
+        );
+    }
+
+    /// COUNTERWEIGHT: `-l`, `-p` and `-P` are print/list forms per the manual
+    /// and register nothing, even though their next operand looks exactly
+    /// like a bare trap action. Each fixture defines a function named after
+    /// the sigspec that follows the flag, so the naive "skip every
+    /// `-`-prefixed argument" bug (which would treat the sigspec text as the
+    /// candidate) has something real to wrongly root.
+    #[test]
+    fn bash_trap_print_and_list_options_root_nothing() {
+        let printed = parse("printed.sh", "trap -p EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&printed, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap -p EXIT` prints; it does not register"
+        );
+
+        let printed_upper = parse("printed_upper.sh", "trap -P INT\nINT() { :; }\n");
+        let int_fn = find(&printed_upper, "INT");
+        assert!(
+            !int_fn.is_entry_point,
+            "`trap -P INT` prints; it does not register"
+        );
+
+        let listed = parse("listed.sh", "trap -l\nl() { :; }\n");
+        let l_fn = find(&listed, "l");
+        assert!(
+            !l_fn.is_entry_point,
+            "`trap -l` lists signal names; it does not register"
+        );
+    }
+
+    /// COUNTERWEIGHT: `trap INT` (a single remaining operand) is a reset per
+    /// the manual -- the action is ABSENT, and the lone operand is the
+    /// sigspec, never a candidate name. The sketch's naive "skip every
+    /// `-`-prefixed argument, take the next" bug would otherwise treat `INT`
+    /// itself as the action.
+    #[test]
+    fn bash_trap_single_operand_is_a_sigspec_not_an_action() {
+        let src = "trap INT\nINT() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let int_fn = find(&parsed, "INT");
+        assert!(
+            !int_fn.is_entry_point,
+            "a single operand after `trap` is the sigspec of a reset, not an action"
+        );
+    }
+
+    /// COUNTERWEIGHT: `trap "$HANDLER" EXIT` -- a double-quoted action that is
+    /// entirely a variable expansion. Its unquoted text is not literal source
+    /// naming a function; it is resolved at RUN time to whatever `$HANDLER`
+    /// holds, which this static analysis cannot know. Must not be guessed at
+    /// by, say, treating the literal text `$HANDLER` as a candidate.
+    #[test]
+    fn bash_trap_double_quoted_variable_expansion_roots_nothing() {
+        let src = "trap \"$HANDLER\" EXIT\nHANDLER() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let handler_fn = find(&parsed, "HANDLER");
+        assert!(
+            !handler_fn.is_entry_point,
+            "a trap action that is a variable expansion is not statically knowable and must not be guessed at"
+        );
+    }
+
+    /// DECISION: a `trap` command inside a function body still roots its
+    /// target, the same way `collect_rust_registered_entry_points` scans the
+    /// whole file for `criterion_group!` without checking whether the macro
+    /// invocation itself is lexically top level. Unlike nw-435/nw-490's
+    /// ordinary-call rooting (which asks "does this call run merely by
+    /// loading the file"), a `trap` line is a REGISTRATION action: bash
+    /// scripts commonly wrap trap setup in a helper such as
+    /// `setup_traps() { trap cleanup EXIT; }`, and as long as that helper
+    /// itself ever runs, the trap line still executes and really does
+    /// register the handler. Gating this on "no enclosing function_definition
+    /// ancestor" would silently miss that whole common pattern, so
+    /// `collect_bash_trap_targets` intentionally does not check
+    /// `is_top_level_reference` at all -- it walks the entire tree, exactly
+    /// like the Rust registration-macro precedent it is modelled on.
+    #[test]
+    fn bash_trap_inside_a_function_body_still_roots_the_handler() {
+        let src = concat!(
+            "setup_traps() {\n",
+            "    trap cleanup EXIT\n",
+            "}\n",
+            "cleanup() { :; }\n",
+        );
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a trap registered from inside a function body still really registers when that function runs"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
         );
     }
 }

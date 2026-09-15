@@ -10256,3 +10256,78 @@ fn dead_code_does_not_report_swift_main_swift_top_level_calls() {
         "shebang_unused is never called and must still be reported dead: {payload}"
     );
 }
+
+/// nw-491, end to end. bash `trap NAME SIGSPEC` registers `NAME` as a
+/// signal-handler callback with the shell runtime -- `queries/bash.scm` had
+/// no capture for a command's own ARGUMENTS, only its own name, so `trap
+/// cleanup EXIT` referenced the literal word `trap` and never `cleanup`. The
+/// handler then had in-degree zero and nw-435's top-level-call rooting could
+/// not help either, since its `top_level_called` set is populated from
+/// `Call` references and `trap` produces none pointing at the handler. The
+/// fix is a registration-macro-style `parse.rs` post-pass,
+/// `collect_bash_trap_targets`, modelled on the existing Rust
+/// `criterion_group!` promotion. This exercises it through the real CLI
+/// index + `dead-code --json` route, not just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_bash_trap_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("run.sh"),
+        concat!(
+            "trap cleanup EXIT\n",
+            "trap - INT\n",
+            "\n",
+            "cleanup() {\n",
+            "  echo cleaning up\n",
+            "}\n",
+            "\n",
+            "unused_helper() {\n",
+            "  :\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"cleanup".to_string()),
+        "cleanup is registered by `trap cleanup EXIT` and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: a genuinely never-called, never-trapped function in the
+    // same script must still be reported dead, proving the fix is scoped to
+    // "registered by trap" rather than "everything in a script with a trap
+    // is alive".
+    assert!(
+        unreachable_names.contains(&"unused_helper".to_string()),
+        "unused_helper is never called or trapped and must still be reported dead: {payload}"
+    );
+}
