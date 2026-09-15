@@ -2083,6 +2083,10 @@ fn collect_identifiers_in_token_tree<'a>(
 /// call the trap actually makes) while `trap 'rm -f x' EXIT` only ever
 /// candidates `rm` — which the caller's intersection step then correctly
 /// rejects unless the file genuinely defines a function named `rm`.
+///
+/// KNOWN GAP, same shape as nw-435/nw-490's disclosed cross-file gaps: only
+/// SAME-FILE `Function` definitions are matched, so a handler defined in a
+/// `source`d file (`source lib.sh; trap cleanup EXIT`) is not resolved.
 fn collect_bash_trap_targets<'a>(
     root: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
@@ -2123,13 +2127,17 @@ fn collect_one_bash_trap_target(
         return;
     }
     // `-l` (list), `-p`/`-P` (print) register nothing regardless of what
-    // follows them.
-    let first_text = args[0].utf8_text(source_bytes).unwrap_or("");
-    if matches!(first_text, "-l" | "-p" | "-P") {
+    // follows them. Quote-stripped via `bash_trap_action_text`, not raw
+    // `utf8_text`, so `trap '-p' EXIT` and `trap "--" cleanup EXIT` are
+    // recognised the same as their unquoted spellings — the shell strips
+    // quotes before `trap` ever sees the argument, so bash treats them
+    // identically.
+    let first_text = bash_trap_action_text(args[0], source_bytes).unwrap_or_default();
+    if matches!(first_text.as_str(), "-l" | "-p" | "-P") {
         return;
     }
     let mut idx = 0;
-    if args[idx].utf8_text(source_bytes).unwrap_or("") == "--" {
+    if first_text == "--" {
         idx += 1;
     }
     let operands = &args[idx..];
@@ -9517,6 +9525,84 @@ mod reachability_recovery_tests {
             cleanup.entry_point_kind,
             Some(EntryPointKind::EventListener)
         );
+    }
+
+    /// FOLLOW-UP counterweight: `-l`/`-p`/`-P` and `--` must be recognised
+    /// even quoted. Bash strips quotes before `trap` ever sees its own
+    /// argument text, so `trap '-p' EXIT` is indistinguishable from `trap -p
+    /// EXIT` at the shell level, and `trap "--" cleanup EXIT` still ends
+    /// option parsing the same as an unquoted `--`.
+    #[test]
+    fn bash_trap_quoted_flags_are_recognised() {
+        let printed = parse("printed.sh", "trap '-p' EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&printed, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "a quoted `-p` still prints; it does not register"
+        );
+
+        let parsed = parse("script.sh", "trap \"--\" cleanup EXIT\ncleanup() { :; }\n");
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a quoted `--` still ends option parsing; the action still follows and must still root"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: a double-quoted action with no expansion is just as much a
+    /// bare name as an unquoted or single-quoted one.
+    #[test]
+    fn bash_trap_double_quoted_bare_name_roots_the_handler() {
+        let src = "trap \"cleanup\" EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: leading whitespace inside a quoted action must not defeat
+    /// `split_whitespace().next()`'s first-word extraction.
+    #[test]
+    fn bash_trap_quoted_action_with_leading_whitespace_roots_its_first_word() {
+        let src = "trap ' cleanup' EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "leading whitespace in the quoted action must not defeat first-word extraction"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: two independent `trap` commands in one file must both
+    /// root, proving `collect_bash_trap_targets`'s whole-tree walk visits
+    /// every `trap` command rather than stopping at the first.
+    #[test]
+    fn bash_trap_multiple_trap_commands_in_one_file_all_root() {
+        let src = "trap a EXIT\ntrap b INT\na() { :; }\nb() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let a = find(&parsed, "a");
+        let b = find(&parsed, "b");
+        assert!(
+            a.is_entry_point,
+            "the first trap command must root its handler"
+        );
+        assert!(
+            b.is_entry_point,
+            "the second trap command must also root its handler"
+        );
+        assert_eq!(a.entry_point_kind, Some(EntryPointKind::EventListener));
+        assert_eq!(b.entry_point_kind, Some(EntryPointKind::EventListener));
     }
 }
 
