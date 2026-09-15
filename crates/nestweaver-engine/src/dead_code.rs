@@ -956,6 +956,19 @@ fn detect_dead_code_inner(
     // file path and name for a total, deterministic order. The path/name tail
     // is kept so equal-importance rows still sort stably; it is no longer the
     // primary discriminator.
+    //
+    // nw-444: `uid` is the FINAL tie-break. `Vec::sort_by` is a stable sort,
+    // so once confidence, PageRank, file_path AND name all tie, the prior
+    // four-key comparator returned `Equal` and let the store's own (unordered
+    // -- `list_all_symbols_with_integrity` runs a plain `MATCH` with no
+    // `ORDER BY`) scan order leak through untouched. That is not a property
+    // of the symbols, so two same-named dead siblings in one file (duplicate
+    // overloads, `impl`-block twins) could swap position between two runs on
+    // an unchanged graph, or between two nodes that scan rows differently --
+    // exactly the non-determinism a `--limit` prefix or a full-set export
+    // must not have. `uid` is unique per symbol, so appending it as a fifth
+    // key closes the only remaining gap without disturbing any ranking that
+    // was already decided by the first four keys.
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.confidence
             .cmp(&a.confidence)
@@ -966,6 +979,7 @@ fn detect_dead_code_inner(
             })
             .then_with(|| a.file_path.cmp(&b.file_path))
             .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.uid.cmp(&b.uid))
     });
     let unreachable_symbols: Vec<UnreachableSymbol> =
         ranked.into_iter().map(|(_, sym)| sym).collect();
@@ -2234,6 +2248,175 @@ mod tests {
 
         let result = detect_dead_code(&store).unwrap();
         assert_eq!(result.unreachable_symbols[0].name, "Important");
+    }
+
+    /// nw-444 (verdict addendum): the sort at `:959-969` (confidence desc ->
+    /// PageRank desc -> file_path asc -> name asc) already claims "a total,
+    /// deterministic order", but it stops discriminating once all four keys
+    /// tie -- which does not need a one-in-a-million coincidence, just two
+    /// same-named dead symbols in the same file (duplicate overloads,
+    /// `impl`-block twins). `Vec::sort_by` is STABLE, so a true 4-way tie
+    /// falls back to whatever order the store's own scan handed back --
+    /// `list_all_symbols_with_integrity` runs a plain `MATCH` with no
+    /// `ORDER BY`, so that order is an implementation detail of the scan,
+    /// not a property of the symbols. That makes a `--limit` prefix or a
+    /// full-set export non-reproducible across two otherwise-identical
+    /// runs that only differ in insertion/scan order. Prove it by building
+    /// the SAME two symbols in both insertion orders and asserting both
+    /// stores agree on one canonical order.
+    #[test]
+    fn dead_code_sort_breaks_ties_by_uid() {
+        let run = |order: &[&str]| {
+            let store = GraphStore::in_memory().unwrap();
+            for uid in order {
+                store
+                    .insert_symbol(&make_symbol_with_kind(
+                        uid,
+                        "new",
+                        SymbolKind::Function,
+                        "src/lib.rs",
+                        false,
+                    ))
+                    .unwrap();
+            }
+            let result = detect_dead_code(&store).unwrap();
+            result
+                .unreachable_symbols
+                .into_iter()
+                .map(|s| s.uid)
+                .collect::<Vec<_>>()
+        };
+
+        let order_a = run(&["zzz-second", "aaa-first"]);
+        let order_b = run(&["aaa-first", "zzz-second"]);
+
+        assert_eq!(
+            order_a, order_b,
+            "two rows tied on confidence, PageRank, file_path and name must \
+             sort identically regardless of insertion order"
+        );
+        assert_eq!(
+            order_a,
+            vec!["aaa-first".to_string(), "zzz-second".to_string()],
+            "the uid tie-break must resolve a full tie ascending by uid"
+        );
+    }
+
+    /// Counterweight to [`dead_code_sort_breaks_ties_by_uid`]: the uid
+    /// tie-break must only ever decide a full tie, never outrank any of the
+    /// four existing keys. Four independent pairs, one per key, each pair
+    /// given uids that point the OPPOSITE way from the expected result -- if
+    /// uid ever won early, at least one of these would flip.
+    #[test]
+    fn dead_code_sort_primary_ranking_unaffected_by_uid_for_non_ties() {
+        // 1. Confidence: High (leading underscore) must still outrank
+        //    Medium even though the High row's uid sorts alphabetically
+        //    LAST.
+        {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "zzz-high",
+                    "_private_helper",
+                    SymbolKind::Function,
+                    "src/lib.rs",
+                    false,
+                ))
+                .unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "aaa-medium",
+                    "plain_helper",
+                    SymbolKind::Function,
+                    "src/lib.rs",
+                    false,
+                ))
+                .unwrap();
+            let result = detect_dead_code(&store).unwrap();
+            assert_eq!(result.unreachable_symbols[0].uid, "zzz-high");
+            assert_eq!(
+                result.unreachable_symbols[0].confidence,
+                DeadCodeConfidence::High
+            );
+        }
+
+        // 2. PageRank importance (same confidence tier): the higher-
+        //    importance row must still lead even though its uid sorts LAST.
+        {
+            let store = GraphStore::in_memory().unwrap();
+            let mut high_rank = make_symbol_with_kind(
+                "zzz-important",
+                "plain_a",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            );
+            high_rank.pagerank_score = Some(0.9);
+            let mut low_rank = make_symbol_with_kind(
+                "aaa-trivial",
+                "plain_b",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            );
+            low_rank.pagerank_score = Some(0.01);
+            store.insert_symbol(&high_rank).unwrap();
+            store.insert_symbol(&low_rank).unwrap();
+            let result = detect_dead_code(&store).unwrap();
+            assert_eq!(result.unreachable_symbols[0].uid, "zzz-important");
+        }
+
+        // 3. file_path (same confidence + importance): the earlier path
+        //    must still lead even though its uid sorts LAST.
+        {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "zzz-early-path",
+                    "plain_c",
+                    SymbolKind::Function,
+                    "aaa/early.rs",
+                    false,
+                ))
+                .unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "aaa-late-path",
+                    "plain_d",
+                    SymbolKind::Function,
+                    "zzz/late.rs",
+                    false,
+                ))
+                .unwrap();
+            let result = detect_dead_code(&store).unwrap();
+            assert_eq!(result.unreachable_symbols[0].uid, "zzz-early-path");
+        }
+
+        // 4. name (same confidence + importance + file_path): the earlier
+        //    name must still lead even though its uid sorts LAST.
+        {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "zzz-early-name",
+                    "aaa_name",
+                    SymbolKind::Function,
+                    "src/lib.rs",
+                    false,
+                ))
+                .unwrap();
+            store
+                .insert_symbol(&make_symbol_with_kind(
+                    "aaa-late-name",
+                    "zzz_name",
+                    SymbolKind::Function,
+                    "src/lib.rs",
+                    false,
+                ))
+                .unwrap();
+            let result = detect_dead_code(&store).unwrap();
+            assert_eq!(result.unreachable_symbols[0].uid, "zzz-early-name");
+        }
     }
 
     #[test]
