@@ -10331,3 +10331,126 @@ fn dead_code_does_not_report_bash_trap_handlers() {
         "unused_helper is never called or trapped and must still be reported dead: {payload}"
     );
 }
+
+/// nw-492 (Task 2.7A), end to end via the no-daemon route `nestweaver_cmd()`
+/// pins (`NESTWEAVER_NO_DAEMON=1` + `NESTWEAVER_ALLOW_NO_DAEMON=1`). Mirrors
+/// the real witness: a nested, wasm-bindgen-style glue package declares its
+/// `main` in a `package.json` that is NOT at the repo root, and the root
+/// itself has no `package.json` at all (nothing here should need one to
+/// work). Before the fix, `parse_manifest` only ever read a repo-ROOT
+/// `package.json`, so this nested manifest was never parsed, its `main` file
+/// contributed no entry point, and the file's own top-level symbols
+/// (including a list-form, aliased export) were reported dead.
+#[test]
+fn nested_package_json_main_roots_every_symbol_in_its_entry_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("crates/wasm")).unwrap();
+    std::fs::write(
+        repo_dir.join("crates/wasm/package.json"),
+        r#"{"name": "glue", "main": "nestweaver_wasm.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("crates/wasm/nestweaver_wasm.js"),
+        concat!(
+            "export class WasmGraph {\n",
+            "  helper() { return privateHelper(); }\n",
+            "}\n",
+            "function privateHelper() { return 1; }\n",
+            "function initSync() { return privateHelper(); }\n",
+            "function __wbg_init() { return privateHelper(); }\n",
+            "export { initSync, __wbg_init as default };\n",
+        ),
+    )
+    .unwrap();
+    // COUNTERWEIGHT fixture: a sibling module with no package.json entry
+    // pointing at it. Its export must still be reported dead (at Low
+    // confidence, per `infer_confidence`'s public-visibility tier) — proving
+    // this fix roots only the declared entry FILE, not "every export in the
+    // repo".
+    std::fs::write(
+        repo_dir.join("crates/wasm/other.js"),
+        "export function unusedExport() { return 1; }\n",
+    )
+    .unwrap();
+    // node_modules must be ignored by manifest discovery exactly like the
+    // main index walk already ignores it for symbols — a dependency's
+    // package.json must not root anything, and its own file must never be
+    // indexed at all.
+    std::fs::create_dir_all(repo_dir.join("node_modules/some-dep")).unwrap();
+    std::fs::write(
+        repo_dir.join("node_modules/some-dep/package.json"),
+        r#"{"name": "some-dep", "main": "index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("node_modules/some-dep/index.js"),
+        "export function shouldNeverBeIndexed() { return 1; }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable: Vec<&serde_json::Value> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .collect();
+    let unreachable_names: Vec<String> = unreachable
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    // Nested glue rooted: the manifest-declared entry file's inline export,
+    // its private callee, and both names in the trailing list-form/aliased
+    // export must all be reachable.
+    for name in ["WasmGraph", "privateHelper", "initSync", "__wbg_init"] {
+        assert!(
+            !unreachable_names.contains(&name.to_string()),
+            "{name} is rooted by crates/wasm/package.json's \"main\" and must \
+             not be reported dead: {payload}"
+        );
+    }
+
+    // Non-entry export still reported, at Low confidence specifically (not
+    // just present) — pins that this fix does not become "every export is a
+    // root", which is the exact defect nw-492's original spec was rejected
+    // for.
+    let unused_export = unreachable
+        .iter()
+        .find(|s| s["name"].as_str() == Some("unusedExport"))
+        .unwrap_or_else(|| panic!("unusedExport must still be reported dead: {payload}"));
+    assert_eq!(
+        unused_export["confidence"].as_str(),
+        Some("low"),
+        "a public export outside any manifest entry file stays at Low \
+         confidence, never excluded: {payload}"
+    );
+
+    // node_modules ignored, end to end: a dependency's declared entry never
+    // roots anything, and its file's own export is never even indexed.
+    assert!(
+        !unreachable_names.contains(&"shouldNeverBeIndexed".to_string()),
+        "node_modules must be skipped entirely, so this symbol should not \
+         exist in the graph at all: {payload}"
+    );
+}

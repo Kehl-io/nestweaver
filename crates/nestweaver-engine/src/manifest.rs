@@ -14,53 +14,60 @@ pub(crate) const MANIFEST_ALGORITHM_FINGERPRINT: &str = "nestweaver-repo-manifes
 pub struct ManifestInfo {
     pub package_name: Option<String>,
     pub dependencies: Vec<String>,
-    /// File paths referenced by `main`, `bin`, and `exports` in package.json.
-    /// These are entry points for the package and their symbols should not be
+    /// Repo-relative file paths declared as package entry points by every
+    /// `package.json` found in the repo at any depth (root or nested;
+    /// `node_modules` and the other shared skip-dirs are excluded, and
+    /// `.gitignore` is respected — see [`discover_package_json_entry_files`]).
+    /// Extracted from `main`, `bin` (string or object), `exports` (a string,
+    /// an array fallback list, or a nested condition/subpath map — every
+    /// string target at any depth is collected), and `browser` only when its
+    /// value is a string (the object form is a bundler replacement map, not
+    /// an entry point). Each raw path is rebased onto the directory
+    /// containing its own manifest and normalized to a repo-relative,
+    /// `/`-joined path (`.`/`..` resolved); an entry is dropped when it is
+    /// empty/whitespace-only, contains a `*` pattern, is absolute (`/...`),
+    /// contains `\` or a `://` scheme, ends in `/` (a directory reference),
+    /// or would escape the repo root — see
+    /// [`rebase_package_json_entry`] for the exact rules. A non-JSON manifest
+    /// format (e.g. CMake) may also contribute its own entries here. These
+    /// are entry points for the package(s) and their symbols should not be
     /// flagged as dead code.
     #[serde(default)]
     pub entry_files: Vec<String>,
 }
 
 /// Parse the manifest file(s) found in `repo_path` and return extracted
-/// package name and dependency list. The first recognized manifest format wins.
+/// package name and dependency list. The first recognized manifest format
+/// wins for `package_name`/`dependencies`.
+///
+/// `entry_files` is independent of that first-format-wins choice: every
+/// `package.json` in the repo, at any depth and including the root, is
+/// discovered and unioned in (see [`discover_package_json_entry_files`]), so
+/// a root manifest of a different format (e.g. `Cargo.toml`) does not hide a
+/// nested `package.json`'s entry points, and a root `package.json` missing a
+/// `name` field still contributes its entries even though it cannot win the
+/// name/dependencies choice above.
 pub fn parse_manifest(reader: &dyn ContentReader) -> ManifestInfo {
-    if let Some(info) = parse_package_json(reader) {
-        return info;
+    let mut info = parse_package_json(reader)
+        .or_else(|| parse_go_mod(reader))
+        .or_else(|| parse_cargo_toml(reader))
+        .or_else(|| parse_pyproject_toml(reader))
+        .or_else(|| parse_requirements_txt(reader))
+        .or_else(|| parse_composer_json(reader))
+        .or_else(|| parse_gemfile(reader))
+        .or_else(|| parse_pubspec_yaml(reader))
+        .or_else(|| parse_package_swift(reader))
+        .or_else(|| parse_csproj(reader))
+        .or_else(|| parse_build_gradle_kts(reader))
+        .or_else(|| parse_cmake(reader))
+        .unwrap_or_default();
+
+    for entry in discover_package_json_entry_files(reader) {
+        if !info.entry_files.contains(&entry) {
+            info.entry_files.push(entry);
+        }
     }
-    if let Some(info) = parse_go_mod(reader) {
-        return info;
-    }
-    if let Some(info) = parse_cargo_toml(reader) {
-        return info;
-    }
-    if let Some(info) = parse_pyproject_toml(reader) {
-        return info;
-    }
-    if let Some(info) = parse_requirements_txt(reader) {
-        return info;
-    }
-    if let Some(info) = parse_composer_json(reader) {
-        return info;
-    }
-    if let Some(info) = parse_gemfile(reader) {
-        return info;
-    }
-    if let Some(info) = parse_pubspec_yaml(reader) {
-        return info;
-    }
-    if let Some(info) = parse_package_swift(reader) {
-        return info;
-    }
-    if let Some(info) = parse_csproj(reader) {
-        return info;
-    }
-    if let Some(info) = parse_build_gradle_kts(reader) {
-        return info;
-    }
-    if let Some(info) = parse_cmake(reader) {
-        return info;
-    }
-    ManifestInfo::default()
+    info
 }
 
 /// Persist a `HashMap<repo_uid, ManifestInfo>` as a JSON sidecar file.
@@ -549,38 +556,22 @@ fn parse_package_json(reader: &dyn ContentReader) -> Option<ManifestInfo> {
         }
     }
 
-    // Extract entry files from main, bin, and exports fields.
-    let mut entry_files = Vec::new();
-    if let Some(main) = json.get("main").and_then(|v| v.as_str()) {
-        entry_files.push(main.to_string());
-    }
-    if let Some(bin) = json.get("bin") {
-        match bin {
-            serde_json::Value::String(s) => entry_files.push(s.clone()),
-            serde_json::Value::Object(obj) => {
-                for v in obj.values() {
-                    if let Some(s) = v.as_str() {
-                        entry_files.push(s.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(exports) = json.get("exports") {
-        collect_export_paths(exports, &mut entry_files);
-    }
-
+    // `entry_files` is populated separately by `discover_package_json_entry_files`,
+    // which walks every package.json in the repo (root included) independent of
+    // whether it has a `name` — see that function's doc comment.
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
-        entry_files,
+        entry_files: Vec::new(),
     })
 }
 
 /// Recursively collect string values from the `exports` field of package.json.
-/// The `exports` field can be a string, an object with condition keys mapping
-/// to strings or nested objects, or an object with subpath keys.
+/// The `exports` field can be a string, an array (Node's documented fallback
+/// list — the first entry a resolver understands wins at runtime, but every
+/// entry is a candidate entry point, and over-rooting a symbol is the safe
+/// direction for a deletion aid), an object with condition keys mapping to
+/// strings/arrays/nested objects, or an object with subpath keys.
 fn collect_export_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => out.push(s.clone()),
@@ -589,8 +580,136 @@ fn collect_export_paths(value: &serde_json::Value, out: &mut Vec<String>) {
                 collect_export_paths(v, out);
             }
         }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_export_paths(v, out);
+            }
+        }
         _ => {}
     }
+}
+
+/// Extract the raw (as-written, not yet rebased) entry-point strings from one
+/// parsed `package.json` document: `main`, `bin` (string or object), `exports`
+/// (string or nested condition/subpath map), and `browser` only when it is a
+/// string — the object form is a bundler replacement map, not a documented
+/// npm/Node entry point.
+fn collect_package_json_raw_entries(json: &serde_json::Value) -> Vec<String> {
+    let mut entries = Vec::new();
+    if let Some(main) = json.get("main").and_then(|v| v.as_str()) {
+        entries.push(main.to_string());
+    }
+    if let Some(bin) = json.get("bin") {
+        match bin {
+            serde_json::Value::String(s) => entries.push(s.clone()),
+            serde_json::Value::Object(obj) => {
+                for v in obj.values() {
+                    if let Some(s) = v.as_str() {
+                        entries.push(s.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(exports) = json.get("exports") {
+        collect_export_paths(exports, &mut entries);
+    }
+    if let Some(browser) = json.get("browser").and_then(|v| v.as_str()) {
+        entries.push(browser.to_string());
+    }
+    entries
+}
+
+/// Rebase one raw `package.json` entry path onto the repo-root-relative
+/// directory containing that manifest, producing a `/`-joined, lexically
+/// normalized path (`.` dropped, `..` resolved against what came before it).
+///
+/// Returns `None` for anything that cannot be a literal repo-relative file
+/// path:
+/// - empty or whitespace-only (on a nested manifest this would otherwise
+///   rebase to the manifest's own directory, which is not a file);
+/// - contains a `*` (a subpath-pattern target, not a literal file —
+///   expanding it is out of scope);
+/// - starts with `/` (an absolute filesystem path, never repo-relative —
+///   rebasing it under the manifest's directory would be silently wrong,
+///   not merely inert);
+/// - contains `\` or a `://` scheme (a Windows-style path or a URL; neither
+///   is ever a repo-relative path here — Windows paths are unsupported);
+/// - ends with `/` (a directory reference, e.g. `"lib/"`; npm resolves a
+///   directory `main`/`exports` target via its own `index.js`/`package.json`
+///   lookup, which this function does not implement — filed as follow-up
+///   nw-499, not silently mis-rooted as the literal directory name);
+/// - a leading `..` that would walk outside the repo root (nothing left to
+///   pop).
+fn rebase_package_json_entry(manifest_dir: &Path, entry: &str) -> Option<String> {
+    let entry = entry.trim();
+    if entry.is_empty()
+        || entry.contains('*')
+        || entry.starts_with('/')
+        || entry.contains('\\')
+        || entry.contains("://")
+        || entry.ends_with('/')
+    {
+        return None;
+    }
+    let mut segments: Vec<&str> = manifest_dir
+        .iter()
+        .filter_map(|c| c.to_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for part in entry.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// Discover every `package.json` in the repo, at any depth and including the
+/// root, and return the union of their rebased, repo-relative entry-point
+/// paths.
+///
+/// Reuses `reader.list_files()`, the same repo-relative file listing the
+/// index's own file walk uses, so `node_modules` and the other shared
+/// skip-dirs, plus `.gitignore`/`.git/info/exclude`, are already applied —
+/// no separate exclusion logic is needed here. The root is included
+/// deliberately (not skipped as "already covered" by [`parse_package_json`]):
+/// a root `package.json` without a `name` field is invisible to
+/// `parse_package_json`, and this is the only place its entries are
+/// recovered.
+fn discover_package_json_entry_files(reader: &dyn ContentReader) -> Vec<String> {
+    let Ok(files) = reader.list_files() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for path in files {
+        if path.file_name().and_then(|n| n.to_str()) != Some("package.json") {
+            continue;
+        }
+        let Ok(content) = reader.read_file(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let manifest_dir = path.parent().unwrap_or(Path::new(""));
+        for raw in collect_package_json_raw_entries(&json) {
+            if let Some(rebased) = rebase_package_json_entry(manifest_dir, &raw)
+                && !entries.contains(&rebased)
+            {
+                entries.push(rebased);
+            }
+        }
+    }
+    entries
 }
 
 fn parse_go_mod(reader: &dyn ContentReader) -> Option<ManifestInfo> {
@@ -1573,17 +1692,14 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         )
         .unwrap();
         let info = parse_manifest(&FilesystemReader::new(dir.path()));
-        assert!(info.entry_files.contains(&"./dist/index.js".to_string()));
-        assert!(info.entry_files.contains(&"./bin/cli.js".to_string()));
-        assert!(
-            info.entry_files
-                .contains(&"./dist/esm/index.js".to_string())
-        );
-        assert!(
-            info.entry_files
-                .contains(&"./dist/cjs/index.js".to_string())
-        );
-        assert!(info.entry_files.contains(&"./dist/utils.js".to_string()));
+        // Root-relative entries are rebased/normalized like every other
+        // package.json's, so the leading `./` is dropped (parent() of the
+        // root "package.json" is "", which is an identity join).
+        assert!(info.entry_files.contains(&"dist/index.js".to_string()));
+        assert!(info.entry_files.contains(&"bin/cli.js".to_string()));
+        assert!(info.entry_files.contains(&"dist/esm/index.js".to_string()));
+        assert!(info.entry_files.contains(&"dist/cjs/index.js".to_string()));
+        assert!(info.entry_files.contains(&"dist/utils.js".to_string()));
     }
 
     #[test]
@@ -1599,7 +1715,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         )
         .unwrap();
         let info = parse_manifest(&FilesystemReader::new(dir.path()));
-        assert!(info.entry_files.contains(&"./bin/main.js".to_string()));
+        assert!(info.entry_files.contains(&"bin/main.js".to_string()));
     }
 
     #[test]
@@ -1615,6 +1731,381 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         .unwrap();
         let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.entry_files.is_empty());
+    }
+
+    // ── nw-492 (Task 2.7A): nested package.json entry-point discovery ──────
+
+    /// The witness shape: a repo whose root manifest is NOT package.json
+    /// (mirrors this very repo's own root Cargo.toml) with a nested
+    /// wasm-bindgen-style glue package deeper in the tree. `main` must come
+    /// back rebased onto the nested manifest's own directory, not the bare
+    /// literal string package.json wrote.
+    #[test]
+    fn nested_package_json_main_is_rebased_onto_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host-crate\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/x/pkg")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/x/pkg/package.json"),
+            r#"{"name": "glue", "main": "./a.js"}"#,
+        )
+        .unwrap();
+
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert_eq!(info.package_name.as_deref(), Some("host-crate"));
+        assert!(
+            info.entry_files.contains(&"crates/x/pkg/a.js".to_string()),
+            "{:?}",
+            info.entry_files
+        );
+        assert!(
+            !info.entry_files.contains(&"a.js".to_string()),
+            "the unrebased literal must not appear: {:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn root_package_json_with_name_yields_identical_entries_to_nameless_root() {
+        let named_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            named_dir.path().join("package.json"),
+            r#"{"name": "has-a-name", "main": "./index.js"}"#,
+        )
+        .unwrap();
+        let named = parse_manifest(&FilesystemReader::new(named_dir.path()));
+
+        let nameless_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nameless_dir.path().join("package.json"),
+            r#"{"main": "./index.js"}"#,
+        )
+        .unwrap();
+        let nameless = parse_manifest(&FilesystemReader::new(nameless_dir.path()));
+
+        assert_eq!(named.package_name.as_deref(), Some("has-a-name"));
+        assert_eq!(nameless.package_name, None);
+        assert_eq!(
+            named.entry_files, nameless.entry_files,
+            "entry-file discovery must not depend on the `name` field"
+        );
+        assert_eq!(named.entry_files, vec!["index.js".to_string()]);
+    }
+
+    #[test]
+    fn nameless_root_package_json_still_contributes_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"main": "./index.js", "bin": "./cli.js"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.package_name.is_none());
+        assert!(info.entry_files.contains(&"index.js".to_string()));
+        assert!(info.entry_files.contains(&"cli.js".to_string()));
+    }
+
+    #[test]
+    fn exports_string_form_is_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "x", "exports": "./index.js"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.entry_files.contains(&"index.js".to_string()));
+    }
+
+    #[test]
+    fn exports_conditions_map_is_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "x",
+                "exports": {
+                    ".": { "import": "./esm.js", "require": "./cjs.js" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.entry_files.contains(&"esm.js".to_string()));
+        assert!(info.entry_files.contains(&"cjs.js".to_string()));
+    }
+
+    #[test]
+    fn browser_string_is_included_but_object_form_is_ignored() {
+        let string_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            string_dir.path().join("package.json"),
+            r#"{"name": "x", "browser": "./web.js"}"#,
+        )
+        .unwrap();
+        let string_info = parse_manifest(&FilesystemReader::new(string_dir.path()));
+        assert!(string_info.entry_files.contains(&"web.js".to_string()));
+
+        let object_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            object_dir.path().join("package.json"),
+            r#"{"name": "x", "browser": {"./server.js": "./client.js"}}"#,
+        )
+        .unwrap();
+        let object_info = parse_manifest(&FilesystemReader::new(object_dir.path()));
+        assert!(
+            !object_info.entry_files.contains(&"client.js".to_string()),
+            "{:?}",
+            object_info.entry_files
+        );
+        assert!(
+            !object_info.entry_files.contains(&"server.js".to_string()),
+            "{:?}",
+            object_info.entry_files
+        );
+    }
+
+    #[test]
+    fn rebase_entry_normalizes_dot_dot_within_the_repo() {
+        // "crates/x/pkg/package.json" declaring "../shared/util.js" should
+        // land at "crates/x/shared/util.js" — one `..` pops the manifest's
+        // own directory, not the repo root.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/x/pkg")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/x/pkg/package.json"),
+            r#"{"name": "glue", "main": "../shared/util.js"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files
+                .contains(&"crates/x/shared/util.js".to_string()),
+            "{:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn rebase_entry_dropped_when_dot_dot_escapes_the_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/x")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/x/package.json"),
+            r#"{"name": "glue", "main": "../../../etc/passwd"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files.is_empty(),
+            "an entry that walks above the repo root must be dropped: {:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn star_pattern_export_target_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "x",
+                "main": "./index.js",
+                "exports": { "./*": "./src/*.js" }
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.entry_files.contains(&"index.js".to_string()));
+        assert!(
+            !info.entry_files.iter().any(|e| e.contains('*')),
+            "{:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn node_modules_package_json_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/some-dep")).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/some-dep/package.json"),
+            r#"{"name": "some-dep", "main": "./index.js"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files.is_empty(),
+            "a node_modules package.json must not contribute entry files: {:?}",
+            info.entry_files
+        );
+    }
+
+    /// Counterweight: `suggest_links` (`suggest.rs`) reads only
+    /// `package_name`/`dependencies` off `ManifestInfo`. This pins that a
+    /// root `Cargo.toml`'s name/dependencies are unaffected by entry-file
+    /// discovery, and that no package.json anywhere means no entry files.
+    #[test]
+    fn root_cargo_toml_keeps_its_name_and_dependencies_with_no_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert_eq!(info.package_name.as_deref(), Some("my-crate"));
+        assert!(info.dependencies.contains(&"serde".to_string()));
+        assert!(info.entry_files.is_empty());
+    }
+
+    /// Counterweight: a root `package.json`'s `package_name`/`dependencies`
+    /// are unaffected by folding entry-file discovery into `parse_manifest`.
+    #[test]
+    fn root_package_json_keeps_its_name_and_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "@myorg/api-client",
+                "dependencies": { "axios": "^1.0.0" }
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert_eq!(info.package_name.as_deref(), Some("@myorg/api-client"));
+        assert!(info.dependencies.contains(&"axios".to_string()));
+    }
+
+    // ── 2.7A review follow-up: absolute/array/directory/empty/backslash ────
+
+    /// IMPORTANT (review): an absolute path must never be silently rebased
+    /// under a nested manifest's own directory — that would produce a
+    /// plausible-looking but wrong repo-relative path instead of being
+    /// dropped.
+    #[test]
+    fn absolute_entry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/x")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/x/package.json"),
+            r#"{"name": "glue", "main": "/dist/index.js"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files.is_empty(),
+            "an absolute path must be dropped, not rebased under the \
+             manifest's directory: {:?}",
+            info.entry_files
+        );
+    }
+
+    /// `exports` may be Node's documented array fallback list; every string
+    /// target in it is a candidate entry point.
+    #[test]
+    fn exports_array_form_is_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "x", "exports": ["./modern.js", "./legacy.js"]}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.entry_files.contains(&"modern.js".to_string()));
+        assert!(info.entry_files.contains(&"legacy.js".to_string()));
+    }
+
+    #[test]
+    fn trailing_slash_directory_entry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "x", "main": "lib/"}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files.is_empty(),
+            "a directory-main target must not become the inert literal \
+             \"lib\" — npm's directory-main resolution is unimplemented \
+             (nw-499), so it must be dropped, not mis-rooted: {:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn empty_string_entry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/x")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/x/package.json"),
+            r#"{"name": "glue", "main": "   "}"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(
+            info.entry_files.is_empty(),
+            "a blank entry must not rebase to the manifest's own directory: {:?}",
+            info.entry_files
+        );
+    }
+
+    #[test]
+    fn backslash_and_url_entries_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "x",
+                "main": "./ok.js",
+                "bin": {
+                    "win": "src\\win.js",
+                    "remote": "https://example.com/cli.js"
+                }
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert!(info.entry_files.contains(&"ok.js".to_string()));
+        assert!(
+            !info
+                .entry_files
+                .iter()
+                .any(|e| e.contains('\\') || e.contains("example.com")),
+            "{:?}",
+            info.entry_files
+        );
     }
 }
 
