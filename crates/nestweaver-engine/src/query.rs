@@ -2866,17 +2866,83 @@ pub fn populate_inline_bodies(
     token_budget: Option<usize>,
     reader_resolver: Option<&InlineBodyReaderResolver>,
 ) {
+    populate_inline_bodies_with_overrides(
+        store,
+        nodes,
+        root,
+        threshold,
+        max_body_tokens,
+        token_budget,
+        &InlineBodyOverrides {
+            reader_resolver,
+            always_include: &std::collections::HashSet::new(),
+        },
+    )
+}
+
+/// nw-476 (quality review, round 3). Bundles [`populate_inline_bodies_with_overrides`]'s
+/// two less-common knobs into one value, keeping that function (and
+/// [`populate_inline_bodies`]) at 7 positional parameters instead of 8 —
+/// under clippy's `too_many_arguments` threshold without an `#[allow]`.
+#[derive(Clone, Copy)]
+pub struct InlineBodyOverrides<'a> {
+    pub reader_resolver: Option<&'a InlineBodyReaderResolver<'a>>,
+    /// UIDs that bypass the normalized-relevance threshold check entirely —
+    /// they inline (budget permitting) regardless of their `relevance`
+    /// value. See [`populate_inline_bodies_with_overrides`] for why this
+    /// exists.
+    pub always_include: &'a std::collections::HashSet<String>,
+}
+
+/// nw-476 (quality review, round 3). Like [`populate_inline_bodies`], but
+/// `overrides.always_include` names UIDs that bypass the normalized-
+/// relevance threshold check entirely — they inline (budget permitting)
+/// regardless of their `relevance` value. Additive: `populate_inline_bodies`
+/// is now a thin wrapper over this function with an empty override set, so
+/// its signature and every existing call site are unchanged.
+///
+/// Added for `investigate()`'s render-cap-injection fix (nw-476, quality
+/// review): a pinned exact match rescued from beyond `RenderCap`'s margin
+/// gets its `relevance` set to an honest display-only floor (`0.0`, since
+/// its true fused score was never computed — see the injection site in
+/// `investigate.rs`), and that floor must NOT also decide inlining
+/// eligibility for the very entry this fix exists to surface. `matched_query
+/// == Some(Exact)` entries are always in `always_include`, independent of
+/// what `relevance` says.
+pub fn populate_inline_bodies_with_overrides(
+    store: &GraphStore,
+    nodes: &mut [BrainNode],
+    root: &std::path::Path,
+    threshold: f64,
+    max_body_tokens: usize,
+    token_budget: Option<usize>,
+    overrides: &InlineBodyOverrides<'_>,
+) {
+    let InlineBodyOverrides {
+        reader_resolver,
+        always_include,
+    } = *overrides;
     let max_relevance = nodes.iter().map(|n| n.relevance).fold(0.0_f64, f64::max);
-    if max_relevance <= 0.0 {
+    if max_relevance <= 0.0 && always_include.is_empty() {
         return;
     }
     let max_body_chars = max_body_tokens.saturating_mul(4);
     let mut used_tokens = 0usize;
 
     for node in nodes.iter_mut() {
-        let normalized = node.relevance / max_relevance;
-        if normalized < threshold {
-            continue;
+        if !always_include.contains(&node.uid) {
+            // `max_relevance` can still be `<= 0.0` here (e.g. every OTHER
+            // node also has non-positive relevance while `always_include`
+            // is non-empty) — guard the division rather than let a `0.0 /
+            // 0.0` NaN silently pass or fail the threshold unpredictably.
+            let normalized = if max_relevance > 0.0 {
+                node.relevance / max_relevance
+            } else {
+                0.0
+            };
+            if normalized < threshold {
+                continue;
+            }
         }
         let Some(body) = fetch_node_body(store, &node.uid, root, reader_resolver) else {
             continue;
