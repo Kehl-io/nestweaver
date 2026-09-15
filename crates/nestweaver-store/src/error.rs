@@ -409,9 +409,9 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
         //     move-aside-your-WAL runbook against a healthy database the daemon
         //     is appending to. A verdict must not be overturned by the evidence
         //     it was careful to preserve;
-        //   * the daemon's boot refusal in `server.rs` ("another process holds
-        //     the write lease for {db}. Stop it before starting a daemon — two
-        //     writers ... risk corruption."), which proves nothing about a WAL
+        //   * the daemon's boot refusal in `server.rs`, which leads with
+        //     "another process holds the write lease for {db}" and goes on to
+        //     say the store risks "corruption" — proves nothing about a WAL
         //     and lands in this arm only because it says "corrupt" and a db path
         //     may contain "wal";
         //   * `require_exclusive_store_access` in `src/main.rs`, same shape,
@@ -1135,10 +1135,15 @@ mod corruption_classification_tests {
         // path: a directory called `walnut` puts "wal" in the message and the
         // sentence already says "corruption", so this lands in the
         // unreadable-WAL arm on prose alone. It must still be retracted — this
-        // message is about a lease, not a log.
+        // message is about a lease, not a log. The restore-in-progress clause
+        // added after this sentence neither removes "corruption" nor adds a
+        // word this classifier keys on (`restore`/`backup` are not part of
+        // its vocabulary), so the bait is unchanged and this fixture still
+        // proves the same thing.
         const DAEMON_REFUSAL: &str = "another process holds the write lease for \
              /home/u/walnut/brain.lbug. Stop it before starting a daemon — two writers \
-             against this store risk corruption.";
+             against this store risk corruption — unless a `nestweaver backup restore` \
+             is in progress against this database, in which case wait for it to finish.";
         assert_eq!(
             classify_engine_corruption(DAEMON_REFUSAL),
             None,

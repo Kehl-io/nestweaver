@@ -1019,6 +1019,63 @@ mod tests {
         }
     }
 
+    /// nw-375. Deterministic re-verification of the mid-cutover hammer: an
+    /// ordinary writer's boot acquisition — `acquire_db_write_lease`, the
+    /// exact call `crates/nestweaver-daemon/src/server.rs`'s daemon-start
+    /// path uses — must be REFUSED, not raced, while a restore holds the
+    /// destructive namespace authority (`acquire_db_namespace_lease`) over
+    /// the same `data_dir`. Unlike a spawned-process hammer, this drives both
+    /// sides of the contention in one process with no timing window to miss,
+    /// so it cannot be flaky and cannot mistake a crash for a clean refusal.
+    ///
+    /// Uses a subdirectory of `tempdir()`, not `/tmp` itself:
+    /// `is_system_scratch_data_dir` matches only the two exact paths `/tmp`
+    /// and `/var/tmp`, not a prefix, so a `live` subdirectory under the OS
+    /// temp root is deliberately NOT scratch-classified here — the whole
+    /// point is to exercise the ordinary, coordinated path, not the
+    /// documented scratch-directory exemption.
+    ///
+    /// This is a REGRESSION test, not a fix landing alongside it: the
+    /// exclusion below was already correct at HEAD before this test existed.
+    /// That the assertion can actually fail was verified by hand — temporarily
+    /// dropping `restore_authority` immediately after acquiring it (bypassing
+    /// the namespace-anchor check the assertion depends on) before running
+    /// this test, which failed with the expected panic, then reverting.
+    #[test]
+    fn restore_namespace_refuses_daemon_boot_lease_during_cutover() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("live");
+        std::fs::create_dir(&data_dir).unwrap();
+        assert!(
+            !is_system_scratch_data_dir(&data_dir),
+            "the fixture must exercise namespace coordination, not the scratch exemption"
+        );
+        let db_path = data_dir.join("brain.lbug");
+
+        // Hold restore authority: the same LOCK_EX namespace lock
+        // `acquire_restore_authority` (crates/nestweaver-engine/src/backup.rs)
+        // takes for a real cutover.
+        let restore_authority = acquire_db_namespace_lease(&data_dir).unwrap();
+
+        // The SAME acquisition the daemon boot path calls.
+        assert!(
+            matches!(acquire_db_write_lease(&db_path), Err(WriteLeaseError::Held)),
+            "an ordinary writer must be refused, not admitted, while restore holds \
+             the namespace authority"
+        );
+        assert!(
+            !db_path.exists(),
+            "a refused boot acquisition must not create the database"
+        );
+
+        // Counterweight: once restore's authority drops, the identical call
+        // succeeds — the refusal is scoped to the cutover window, not permanent.
+        drop(restore_authority);
+        let lease = acquire_db_write_lease(&db_path)
+            .expect("an ordinary writer must acquire once restore authority is released");
+        drop(lease);
+    }
+
     #[test]
     fn namespace_replacement_child_probe() {
         let Some(data) = std::env::var_os("NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE") else {
