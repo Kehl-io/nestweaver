@@ -2280,5 +2280,3 @@ mod tests {
         );
     }
 }
-
-// mutants-canary: no-op comment to exercise the mutants job on an engine+daemon diff (reverted before Gate 1).
