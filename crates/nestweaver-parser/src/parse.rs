@@ -448,10 +448,43 @@ fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
 /// Unbounded walk (unlike `has_export_ancestor`'s fixed 3 hops): function
 /// nesting depth is not bounded the way export-wrapping is, and the walk is
 /// still O(depth) per call reference — negligible next to parsing itself.
+///
+/// Swift (nw-490, gated further at the call site to files
+/// `is_swift_top_level_entry_file` recognises): a call is top level when none
+/// of its ancestors is a `function_declaration` (an ordinary function/method
+/// body), `init_declaration` / `deinit_declaration` / `subscript_declaration`
+/// (bodies that run once per instance, not at load time), a
+/// `computed_property` (evaluated on access, not at load), or a
+/// `class_declaration` / `protocol_declaration` (a stored-property
+/// initializer inside a type body runs per instance, not at load — struct/
+/// enum/extension/actor declarations share the `class_declaration` node per
+/// `swift.scm`'s own comment). Node kinds confirmed against a tree-sitter-
+/// swift 0.7.3 grammar dump, not guessed.
+///
+/// Deliberately does NOT disqualify `lambda_literal`: `Task { await run() }`
+/// and `DispatchQueue.main.async { ... }` are the standard Swift concurrency
+/// idioms for top-level async work, and excluding closures would recreate
+/// the exact false positive this item fixes.
+///
+/// KNOWN GAP, deliberate: `willSet`/`didSet` observer blocks on a top-level
+/// stored var are not disqualified either, so a callee reached only from one
+/// reads as top level and gets rooted even though the observer runs on
+/// assignment, not at load time. Over-rooting is the safe direction for a
+/// deletion list — the callee is live code either way — so this is left
+/// alone rather than adding another disqualifying node kind.
 fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
     let disqualifying: &[&str] = match lang_str {
         "python" => &["function_definition", "lambda"],
         "bash" => &["function_definition"],
+        "swift" => &[
+            "function_declaration",
+            "init_declaration",
+            "deinit_declaration",
+            "subscript_declaration",
+            "computed_property",
+            "class_declaration",
+            "protocol_declaration",
+        ],
         _ => return false,
     };
     let mut current = node.parent();
@@ -485,6 +518,17 @@ fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
 /// Bash: `queries/bash.scm` has no attribute-call syntax at all — its only
 /// `@reference.call` rule is `(command name: (command_name (word) @name))` —
 /// so every `command` node reaching here is already bare by construction.
+///
+/// Swift (nw-490): unlike Python/bash, `call_expression` has NO fields in
+/// tree-sitter-swift 0.7.3 (confirmed with a grammar dump, not guessed), so
+/// `child_by_field_name` cannot be used the way the Python arm uses it. A
+/// bare call (`helper()`, `AppDelegate()`) has a `simple_identifier` as its
+/// first named child; an attribute/method call (`obj.run()`) has a
+/// `navigation_expression` there instead — checking the first named child's
+/// kind distinguishes the two shapes. `Foo<T>()` and `[Int]()` parse as
+/// `constructor_expression`, a different node kind not reached here at all —
+/// `swift.scm`'s own `@reference.call` rule cannot see them either, a
+/// pre-existing, disclosed gap this rule does not attempt to close.
 fn callee_is_bare_identifier(node: &tree_sitter::Node, lang_str: &str) -> bool {
     match lang_str {
         "python" => match node.kind() {
@@ -495,8 +539,45 @@ fn callee_is_bare_identifier(node: &tree_sitter::Node, lang_str: &str) -> bool {
             _ => false,
         },
         "bash" => node.kind() == "command",
+        "swift" => {
+            node.kind() == "call_expression"
+                && node
+                    .named_child(0)
+                    .is_some_and(|c| c.kind() == "simple_identifier")
+        }
         _ => false,
     }
+}
+
+/// True for a Swift file whose top-level statements the compiler actually
+/// executes: a file literally named `main.swift` (the SwiftPM
+/// executable-target convention, `Sources/<target>/main.swift`), or a script
+/// invoked directly with a shebang first line (`#!/usr/bin/env swift`, run as
+/// `swift file.swift`). See nw-490.
+///
+/// The Swift book describes several mutually exclusive ways a module
+/// designates its entry point: a file that contains top-level executable
+/// code (which, outside a shebang script, means `main.swift`), the `main`
+/// attribute, or the `NSApplicationMain`/`UIApplicationMain` attributes. The
+/// `@main` case is unrelated to this gate — it is already handled by
+/// `detect_swift`'s own signature check (`entry_points.rs` ~814-817), because
+/// an `@main`-attributed type's static `main()` is an ordinary function-body
+/// call site, not bare top-level code.
+///
+/// The gate is necessary, not just descriptive: an ordinary (non-`main.swift`,
+/// non-script) Swift file can hold a global `let x = f()`, and that
+/// initializer is LAZY — evaluated on first access, not at load time.
+/// Treating every Swift file as "top level executes on load" would wrongly
+/// root `f` for a global that may never be touched.
+///
+/// KNOWN GAP: a single-file build with neither a `main.swift` name nor a
+/// shebang (`swiftc foo.swift`) is missed — not attempted here.
+fn is_swift_top_level_entry_file(file_path_str: &str, source: &str) -> bool {
+    file_path_str.rsplit('/').next() == Some("main.swift")
+        || source
+            .strip_prefix('\u{feff}')
+            .unwrap_or(source)
+            .starts_with("#!")
 }
 
 /// Collect the text of `attribute_item` siblings immediately preceding `node`.
@@ -1239,6 +1320,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     };
     let file_path_str = path.to_string_lossy();
+    // nw-490: computed once per file, not per call reference, since it reads
+    // the whole source's first bytes (the shebang check) and the file name.
+    let swift_top_level_entry_file =
+        lang_str == "swift" && is_swift_top_level_entry_file(&file_path_str, source);
 
     let mut symbols: Vec<RawSymbol> = Vec::new();
     let mut references: Vec<RawReference> = Vec::new();
@@ -1562,15 +1647,17 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
                 let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
-                // nw-435: a call/command with no enclosing function body
-                // executes as soon as the file is loaded (Python: at import
-                // time; bash: as soon as the interpreter reaches it), so its
-                // callee is a reachability ROOT rather than an ordinary call
-                // target. Collected here, not derived from `references`
-                // afterward, because `node` — the actual call/command node —
-                // is only in scope inside this capture loop.
+                // nw-435 / nw-490: a call/command with no enclosing function
+                // body executes as soon as the file is loaded (Python: at
+                // import time; bash: as soon as the interpreter reaches it;
+                // Swift: only in `main.swift` or a shebang script — see
+                // `is_swift_top_level_entry_file`), so its callee is a
+                // reachability ROOT rather than an ordinary call target.
+                // Collected here, not derived from `references` afterward,
+                // because `node` — the actual call/command node — is only in
+                // scope inside this capture loop.
                 if kind == ReferenceKind::Call
-                    && matches!(lang_str, "python" | "bash")
+                    && (matches!(lang_str, "python" | "bash") || swift_top_level_entry_file)
                     && is_top_level_reference(&node, lang_str)
                     && callee_is_bare_identifier(&node, lang_str)
                 {
@@ -1758,11 +1845,20 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // module-scope `obj.run()` captures only the bare method name `run`, and
     // matching it against any same-named `Method` on any class in the file
     // would root a symbol the call site never actually referenced.
+    //
+    // nw-490: Swift additionally widens the kind gate to `SymbolKind::Class`
+    // — a bare top-level call can also be an implicit constructor call (the
+    // `AppDelegate()` witness), and Swift classes/structs/enums/extensions/
+    // actors are all minted as `SymbolKind::Class` (`swift.scm`'s own
+    // comment). This widening is Swift-only and does not touch Python/bash's
+    // existing, already-shipped `Function`-only behaviour.
     if !top_level_called.is_empty() {
         for symbol in &mut symbols {
-            if !symbol.is_entry_point
-                && symbol.kind == SymbolKind::Function
-                && top_level_called.contains(symbol.name.as_str())
+            let kind_ok = match lang_str {
+                "swift" => matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class),
+                _ => symbol.kind == SymbolKind::Function,
+            };
+            if !symbol.is_entry_point && kind_ok && top_level_called.contains(symbol.name.as_str())
             {
                 symbol.is_entry_point = true;
                 symbol.entry_point_kind = Some(EntryPointKind::Main);
@@ -8750,6 +8846,238 @@ mod reachability_recovery_tests {
         // Counterweight: a defined-but-never-invoked function stays dead.
         let unused = find(&parsed, "unused");
         assert!(!unused.is_entry_point);
+    }
+
+    /// nw-490. `main.swift`'s top-level statements execute directly, the same
+    /// "script executed directly" class nw-435 fixed for Python/bash, just
+    /// outside its scope. A bare top-level call must root its callee.
+    #[test]
+    fn swift_function_called_at_top_level_of_main_swift_is_an_entry_point() {
+        let src = concat!(
+            "func helper() {}\n",
+            "func unused_helper() {}\n",
+            "helper()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a top-level call in main.swift roots its callee"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a never-called function stays dead.
+        let unused = find(&parsed, "unused_helper");
+        assert!(!unused.is_entry_point);
+    }
+
+    /// The `AppDelegate()` witness: a bare top-level call can also be an
+    /// implicit constructor call, whose callee resolves to `SymbolKind::Class`
+    /// rather than `SymbolKind::Function`. nw-435's Python/bash promotion is
+    /// deliberately `Function`-only to avoid rooting through an attribute
+    /// call; that reasoning does not apply to a bare constructor call, which
+    /// Swift's grammar already distinguishes from an attribute call at the
+    /// node-shape level.
+    #[test]
+    fn swift_bare_constructor_call_at_top_level_of_main_swift_roots_the_class() {
+        let src = concat!(
+            "class AppDelegate {\n",
+            "    func launch() {}\n",
+            "}\n",
+            "AppDelegate()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let app_delegate = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "AppDelegate" && s.kind == SymbolKind::Class)
+            .expect("fixture defines the AppDelegate class");
+        assert!(
+            app_delegate.is_entry_point,
+            "a bare top-level constructor call roots the Class"
+        );
+        assert_eq!(app_delegate.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// Struct-constructor variant: `swift.scm` mints struct declarations as
+    /// `SymbolKind::Class` too (comment: "Class, struct, enum, extension,
+    /// actor declarations all use class_declaration node"), so the same
+    /// widening must cover a bare struct constructor call, not only classes.
+    #[test]
+    fn swift_bare_constructor_call_at_top_level_of_main_swift_roots_the_struct() {
+        let src = concat!(
+            "struct Config {\n",
+            "    var value: Int = 0\n",
+            "}\n",
+            "Config()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let config = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .expect("fixture defines the Config struct, minted as SymbolKind::Class");
+        assert!(
+            config.is_entry_point,
+            "structs are minted as SymbolKind::Class too, so the constructor widening covers them"
+        );
+        assert_eq!(config.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// COUNTERWEIGHT: Swift only executes top-level code in `main.swift` (or a
+    /// shebang script) — a bare top-level call in any other Swift file must
+    /// not root anything.
+    #[test]
+    fn swift_top_level_call_outside_main_swift_does_not_root_anything() {
+        let src = concat!("func helper() {}\n", "helper()\n",);
+        let parsed = parse("Sources/Helper.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "only main.swift (or a shebang script) executes top-level statements directly"
+        );
+    }
+
+    /// COUNTERWEIGHT mirroring `python_attribute_call_does_not_root_a_same_named_module_function`:
+    /// `obj.run()` is an attribute call (first named child is a
+    /// `navigation_expression`, not a `simple_identifier`) and must never root
+    /// an unrelated, same-named top-level `Function` — it can only ever invoke
+    /// `C.run`, a `Method`.
+    #[test]
+    fn swift_attribute_call_at_top_level_does_not_root_a_same_named_function() {
+        let src = concat!(
+            "func run() {}\n",
+            "\n",
+            "class C {\n",
+            "    func run() {}\n",
+            "}\n",
+            "let obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let run_fn = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Function)
+            .expect("fixture defines a top-level run function");
+        assert!(
+            !run_fn.is_entry_point,
+            "obj.run() is an attribute call and must never root a same-named top-level Function"
+        );
+    }
+
+    /// A script run with `swift file.swift` (or `#!/usr/bin/env swift`) also
+    /// executes its top-level statements directly, outside the `main.swift`
+    /// naming convention.
+    #[test]
+    fn swift_shebang_script_top_level_call_is_an_entry_point() {
+        let src = concat!("#!/usr/bin/env swift\n", "func helper() {}\n", "helper()\n",);
+        let parsed = parse("scripts/tool.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a shebang-first Swift script executes its top-level statements directly, same as main.swift"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// A UTF-8 BOM before the shebang line is common from Windows editors and
+    /// must not defeat the shebang check — mirrors the existing
+    /// `strip_prefix('\u{feff}')` precedent in `markdown.rs`.
+    #[test]
+    fn swift_bom_prefixed_shebang_script_top_level_call_is_an_entry_point() {
+        let src = concat!(
+            "\u{feff}#!/usr/bin/env swift\n",
+            "func helper() {}\n",
+            "helper()\n",
+        );
+        let parsed = parse("scripts/tool.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a leading UTF-8 BOM must not defeat the shebang check"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// COUNTERWEIGHT for the ancestor list: a call inside `init()` runs once
+    /// per instance construction, not when the file loads, even inside
+    /// `main.swift`.
+    #[test]
+    fn swift_call_inside_init_in_main_swift_does_not_root() {
+        let src = concat!(
+            "func helper() {}\n",
+            "class Foo {\n",
+            "    init() {\n",
+            "        helper()\n",
+            "    }\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "a call inside init() runs once per instance construction, not at file-load time"
+        );
+    }
+
+    /// COUNTERWEIGHT for the ancestor list: a class stored-property
+    /// initializer runs per instance, not at load time, even inside
+    /// `main.swift`.
+    #[test]
+    fn swift_class_property_initializer_in_main_swift_does_not_root() {
+        let src = concat!(
+            "func helper() -> Int { 1 }\n",
+            "class Foo {\n",
+            "    var x = helper()\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "a stored-property initializer runs per instance, not at load time"
+        );
+    }
+
+    /// `Task { await run() }` is the standard Swift concurrency idiom for
+    /// top-level async work. Closures must NOT be disqualifying ancestors —
+    /// excluding them would recreate the false positive this item fixes.
+    #[test]
+    fn swift_task_closure_at_top_level_of_main_swift_roots_its_callee() {
+        let src = concat!(
+            "func run() {}\n",
+            "func unused() {}\n",
+            "Task {\n",
+            "    await run()\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let run_fn = find(&parsed, "run");
+        assert!(
+            run_fn.is_entry_point,
+            "Task {{ await run() }} is the standard top-level async idiom and must root its callee"
+        );
+        assert_eq!(run_fn.entry_point_kind, Some(EntryPointKind::Main));
+
+        let unused = find(&parsed, "unused");
+        assert!(!unused.is_entry_point);
+    }
+
+    /// The reason the file-name/shebang gate is necessary, not just
+    /// descriptive: a global `let` initializer in an ordinary Swift file is
+    /// LAZY (evaluated on first access), not executed at load time, so it
+    /// must not be treated as a top-level root just because it sits outside
+    /// any function body.
+    #[test]
+    fn swift_global_initializer_call_outside_main_swift_does_not_root() {
+        let src = concat!("func f() -> Int { 1 }\n", "let x = f()\n",);
+        let parsed = parse("Sources/Globals.swift", src);
+        let f = find(&parsed, "f");
+        assert!(
+            !f.is_entry_point,
+            "a global let initializer in a non-main.swift file is lazy, not executed at load time -- the file-name/shebang gate must still apply"
+        );
     }
 }
 

@@ -149,6 +149,24 @@ use std::path::Path;
 ///     struct-typed-local symbol can participate in, invisibly to anyone not
 ///     re-indexing. Same remedy as every other bump in this file: `nestweaver
 ///     index --repo <path> --force`.
+///
+///     nw-490 (same generation as nw-435/nw-356 above, per the branch's own
+///     coordination note — one bump covers all three; the branch is
+///     unreleased). Extends nw-435's exact mechanism (a call/command with no
+///     enclosing function body promotes its same-file callee to
+///     `is_entry_point: true`, `entry_point_kind: Some(EntryPointKind::Main)`)
+///     to Swift, gated to files `main.swift` or a shebang first line — the
+///     only Swift files whose top-level statements the compiler executes
+///     directly (`@main`-attributed types were already handled by
+///     `detect_swift`'s signature check and are untouched). Also widens the
+///     promoted-kind gate to `SymbolKind::Class` for Swift only, since a bare
+///     top-level call can be an implicit constructor call (`AppDelegate()`),
+///     and Swift mints classes/structs/enums/extensions/actors all as
+///     `SymbolKind::Class`. Same persisted-column shape as nw-435: a symbol in
+///     an already-indexed graph keeps `is_entry_point: false` forever and
+///     cannot seed a reachability walk no matter which binary asks — only
+///     re-indexing (`nestweaver index --repo <path> --force`) writes the
+///     corrected flag.
 pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
