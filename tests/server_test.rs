@@ -3430,6 +3430,13 @@ fn isolate_nestweaver_env(cmd: &mut StdCommand, home: &std::path::Path) {
 fn stop_daemon_quietly(db_path: &std::path::Path, home: &std::path::Path) {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
     cmd.args(["daemon", "--db", &db_path.display().to_string(), "stop"]);
+    // Pin daemon routing explicitly, visibly to `every_cli_invocation_pins_its_daemon_routing`
+    // (tests/cli_test.rs ~4908): that guard scans the literal source text
+    // following each `CARGO_BIN_EXE_nestweaver` constructor for
+    // `NESTWEAVER_NO_DAEMON`, so a pin buried inside `isolate_nestweaver_env`'s
+    // OWN body (a different function) is invisible to it. `isolate_nestweaver_env`
+    // still removes it too, redundantly but harmlessly.
+    cmd.env_remove("NESTWEAVER_NO_DAEMON");
     isolate_nestweaver_env(&mut cmd, home);
     let _ = cmd.output();
 }
@@ -3534,6 +3541,13 @@ async fn daemon_impact_cli_renders_org_wide_tier_text() {
         "--config",
         &cfg_path.display().to_string(),
     ]);
+    // Pin daemon routing explicitly, visibly to `every_cli_invocation_pins_its_daemon_routing`
+    // (tests/cli_test.rs ~4908): that guard scans the literal source text
+    // following each `CARGO_BIN_EXE_nestweaver` constructor for
+    // `NESTWEAVER_NO_DAEMON`, so a pin buried inside `isolate_nestweaver_env`'s
+    // OWN body (a different function) is invisible to it. `isolate_nestweaver_env`
+    // still removes it too, redundantly but harmlessly.
+    cmd.env_remove("NESTWEAVER_NO_DAEMON");
     isolate_nestweaver_env(&mut cmd, &home);
     let output = cmd.output().expect("failed to run nestweaver impact");
 
@@ -3604,6 +3618,13 @@ async fn daemon_impact_cli_renders_org_wide_tier_unavailable() {
         "--config",
         &cfg_path.display().to_string(),
     ]);
+    // Pin daemon routing explicitly, visibly to `every_cli_invocation_pins_its_daemon_routing`
+    // (tests/cli_test.rs ~4908): that guard scans the literal source text
+    // following each `CARGO_BIN_EXE_nestweaver` constructor for
+    // `NESTWEAVER_NO_DAEMON`, so a pin buried inside `isolate_nestweaver_env`'s
+    // OWN body (a different function) is invisible to it. `isolate_nestweaver_env`
+    // still removes it too, redundantly but harmlessly.
+    cmd.env_remove("NESTWEAVER_NO_DAEMON");
     isolate_nestweaver_env(&mut cmd, &home);
     let output = cmd.output().expect("failed to run nestweaver impact");
 
