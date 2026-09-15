@@ -1030,10 +1030,23 @@ jobs:
           # every one would misreport as "caught" (a false all-clear, not a
           # false alarm — the dangerous direction, since it hides real
           # coverage gaps behind an apparently-clean mutation report).
+          # Combined stdout+stderr is captured to mutants-console.log for the
+          # next step, WITHOUT losing the real exit status: `tee` is the last
+          # command in the pipeline, so a bare `$?` here would be `tee`'s own
+          # status (always 0 on a healthy write), not `timeout`'s/
+          # cargo-mutants'. `${PIPESTATUS[0]}` is bash's array of each
+          # pipeline stage's own exit code, taken BEFORE anything else can
+          # overwrite `$?` — index 0 is the `timeout ... cargo mutants ...`
+          # stage, i.e. exactly what `status=$?` captured before this was a
+          # pipeline. This is deliberately independent of whether `pipefail`
+          # is set (GitHub's default bash invocation already sets it, but
+          # relying on that default rather than reading it off the array
+          # would be silently wrong the day that default changes).
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
             cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
-              --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast
-          status=$?
+              --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
+            2>&1 | tee mutants-console.log
+          status="${PIPESTATUS[0]}"
           set -e
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           # GNU timeout reports 124 when it had to interrupt, 137 when the
@@ -1095,6 +1108,34 @@ jobs:
             summary "### Mutation testing"
             summary "No Rust package in this diff, so no mutants were generated. Nothing to report."
             exit 0
+          fi
+
+          # cargo-mutants itself (not just this job's own NO_PACKAGES check
+          # above) has a second, legitimate "nothing to mutate" outcome: an
+          # empty `--in-diff` diff, a diff touching no Rust source files, or
+          # a diff that resolves to zero mutants after filtering. Verified in
+          # the pinned source (cargo-mutants v27.1.0, `src/in_diff.rs`):
+          # `DiffFilterError::{EmptyDiff, NoSourceFiles, NoMutants}` all map
+          # to `ExitCode::Success` (0) and are logged via `info!("{err}")`
+          # BEFORE any lab/output is written — so `mutants.out/` is genuinely
+          # absent, not missing-because-something-broke. RE-VERIFY these
+          # three strings (`grep -n Display -A6 src/in_diff.rs` at the pinned
+          # tag) if the `cargo-mutants@` version in the "Install cargo-mutants"
+          # step above ever changes — they are Display-impl text, not a
+          # stable machine-readable contract.
+          CARGO_MUTANTS_NO_MUTANTS_MESSAGES=(
+            "Diff file is empty"
+            "Diff changes no Rust source files"
+            "No mutants to filter"
+          )
+          if [ "${MUTANTS_STATUS}" = "0" ] && [ ! -d mutants.out ] && [ -f mutants-console.log ]; then
+            for msg in "${CARGO_MUTANTS_NO_MUTANTS_MESSAGES[@]}"; do
+              if grep -qF -- "${msg}" mutants-console.log; then
+                summary "### Mutation testing"
+                summary "cargo-mutants reported \"${msg}\" — nothing to mutate in this diff. Nothing to report."
+                exit 0
+              fi
+            done
           fi
 
           # `total` MUST come from mutants.out/mutants.json, unconditionally,
@@ -1247,7 +1288,23 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-report
-          path: mutants.out/
+          # Multiple paths, one per line (actions/upload-artifact's own
+          # README at this pinned SHA, "Upload using Multiple Paths and
+          # Exclusions") — mutants-console.log is the raw stdout+stderr
+          # capture the mutate step now writes (`tee`) for the "legitimate
+          # zero mutants" evaluation branch, and is useful on its own for
+          # diagnosing a genuine failure too.
+          path: |
+            mutants.out/
+            mutants-console.log
+          # `if-no-files-found` only fires when NONE of the paths above
+          # match anything — per the same README ("If a path (or paths),
+          # result in no files being found for the artifact..."). So
+          # mutants.out/ being absent (the legitimate no-mutants case, or
+          # any other run that never produced a report) does not trigger
+          # this on its own as long as mutants-console.log exists; `ignore`
+          # only matters for the true no-packages-in-diff case, where
+          # neither path has anything to upload.
           if-no-files-found: ignore
 
   audit:
