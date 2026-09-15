@@ -11816,11 +11816,11 @@ fn tool_schema_project_context() -> Value {
                 "repos": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Use on a returning session to skip the broad load."
+                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load."
                 },
                 "path_prefix": {
                     "type": "string",
-                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\"). Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded."
+                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\"). Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a prefix-scoped call can surface symbols that an unscoped call would never reach, because they were never in the unscoped call's top-ranked seed set."
                 },
                 "tags": {
                     "type": "array",
@@ -12104,6 +12104,22 @@ fn tool_project_context(
         return Ok(response);
     }
 
+    // nw-470: resolve the `repos` selector scope BEFORE the PageRank
+    // seed-selection cut below, not just before the post-hoc `.retain()` at
+    // 5b. A restrictive `path_prefix`/`repos` applied only after
+    // `list_project_symbol_uids_by_pagerank`'s global top-K-by-PageRank cut
+    // has nothing left to select from on a project this size — the same
+    // "filter before you truncate, not after" defect nw-378 already fixed
+    // one call frame later (`RenderCap::admit`). `resolve_repo_filter` needs
+    // only `store`/`filter_repos`/`visible`, all already in scope.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
+    };
+    let seed_repo_uids: Option<Vec<String>> = repo_scope
+        .as_ref()
+        .map(|uids| uids.iter().cloned().collect());
+
     // 4. Seed PPR from the project node, its components, and — critically —
     //    the project's member notes (Bug #12). Seeding the notes guarantees
     //    they survive the `min_score` filter in PPR: when a project declares
@@ -12117,16 +12133,30 @@ fn tool_project_context(
     //    that declares any repo returns notes-only context even after
     //    `materialize-projects` writes hundreds of thousands of
     //    PROJECT_INCLUDES_SYMBOL edges.
+    //
+    //    `path_prefix`/`repos` are pushed into the seed query itself (nw-470)
+    //    so a narrow scope still has a candidate pool to rank within, instead
+    //    of narrowing an already-truncated global top-100.
     const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
     let mut member_symbol_uids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let top_symbols = store
-        .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+        .list_project_symbol_uids_by_pagerank(
+            &project.uid,
+            PROJECT_SYMBOL_SEED_LIMIT,
+            path_prefix.as_deref(),
+            seed_repo_uids.as_deref(),
+        )
         .map_err(|e| anyhow!("list_project_symbol_uids_by_pagerank: {e}"))?;
     member_symbol_uids.extend(top_symbols);
     for comp_uid in &component_uids {
         let comp_top = store
-            .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+            .list_project_symbol_uids_by_pagerank(
+                comp_uid,
+                PROJECT_SYMBOL_SEED_LIMIT,
+                path_prefix.as_deref(),
+                seed_repo_uids.as_deref(),
+            )
             .unwrap_or_default();
         member_symbol_uids.extend(comp_top);
     }
@@ -12246,10 +12276,10 @@ fn tool_project_context(
     //     predicate, which is why one grooming pass had to fix the same defect
     //     in two places. Both now route through the shared resolver and the
     //     shared retain helpers, so the next correction lands once.
-    let repo_scope = match filter_repos {
-        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
-        None => None,
-    };
+    //     `repo_scope` was already resolved above (nw-470) so the seed-cut
+    //     query could use it; kept here too as defence-in-depth for nodes
+    //     that arrive via PPR graph-proximity rather than direct seeding
+    //     (e.g. a non-member neighbor that happens to satisfy path_prefix).
     let apply_scope = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
         if let Some(ref repo_uids) = repo_scope {
             retain_nodes_in_repos(nodes, repo_uids);
@@ -16653,6 +16683,214 @@ mod project_context_bug12_tests {
         assert!(
             bodied.iter().any(|b| b.contains("function")),
             "opted-in path should embed at least one symbol body; got connected={connected:?}"
+        );
+    }
+
+    /// nw-470. `path_prefix`/`kinds:["Symbol"]` used to collapse to (at most)
+    /// one generic result, because `list_project_symbol_uids_by_pagerank`'s
+    /// top-`PROJECT_SYMBOL_SEED_LIMIT`-by-PageRank seed cut ran BEFORE
+    /// `path_prefix` was ever consulted: on a project with a large noisy
+    /// symbol mass elsewhere, a handful of low-PageRank symbols under one
+    /// specific prefix never made the global top-100 cut and so were never
+    /// even PPR seeds, regardless of how well they matched the requested
+    /// scope. Fixed by pushing `path_prefix`/`repos` into the seed query
+    /// itself (read.rs `list_project_symbol_uids_by_pagerank`).
+    #[test]
+    fn project_context_path_prefix_kinds_symbol_returns_symbols_under_prefix() {
+        fn mk_ranked_symbol(uid: &str, file_path: &str, pagerank: f64) -> Symbol {
+            Symbol {
+                uid: uid.to_string(),
+                name: uid.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:noisy".to_string(),
+                file_path: file_path.to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {uid}()"),
+                summary: None,
+                content_hash: format!("hash-{uid}"),
+                embedding: None,
+                pagerank_score: Some(pagerank),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            }
+        }
+
+        let store = GraphStore::in_memory().unwrap();
+        let proj = Project {
+            uid: "proj:nw470".into(),
+            name: "NW470".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        // 150 unrelated, high-PageRank "noise" symbols elsewhere in the repo
+        // — enough to fill PROJECT_SYMBOL_SEED_LIMIT (100) on their own, so
+        // an unfiltered top-K seed cut leaves zero room for the target-prefix
+        // symbols below.
+        let mut all_uids: Vec<String> = Vec::new();
+        for i in 0..150 {
+            let uid = format!("sym:noise{i}");
+            store
+                .insert_symbol(&mk_ranked_symbol(
+                    &uid,
+                    &format!("src/elsewhere/file{i}.rs"),
+                    10_000.0 - i as f64,
+                ))
+                .unwrap();
+            all_uids.push(uid);
+        }
+
+        // 5 low-PageRank symbols under the prefix under test.
+        let mut target_uids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let uid = format!("sym:target{i}");
+            store
+                .insert_symbol(&mk_ranked_symbol(
+                    &uid,
+                    &format!("src/target/file{i}.rs"),
+                    1.0 + i as f64,
+                ))
+                .unwrap();
+            all_uids.push(uid.clone());
+            target_uids.push(uid);
+        }
+
+        store
+            .batch_insert_project_symbol_edges("proj:nw470", &all_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "NW470",
+                "token_budget": 8000,
+                "response_format": "detailed",
+                "path_prefix": "src/target/",
+                "kinds": ["Symbol"],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        let symbol_nodes: Vec<&Value> = connected
+            .iter()
+            .filter(|n| n["kind"].as_str().is_some_and(|k| k.starts_with("Symbol")))
+            .collect();
+        assert!(
+            symbol_nodes.len() > 1,
+            "expected more than one Symbol under the prefix; got {connected:?}"
+        );
+        for node in &symbol_nodes {
+            let location = node["location"].as_str().unwrap_or_default();
+            assert!(
+                location.starts_with("src/target/"),
+                "every returned Symbol must be under the requested prefix; got {location}"
+            );
+        }
+        let returned_uids: std::collections::HashSet<&str> = symbol_nodes
+            .iter()
+            .filter_map(|n| n["uid"].as_str())
+            .collect();
+        for target in &target_uids {
+            assert!(
+                returned_uids.contains(target.as_str()),
+                "target-prefix symbol {target} must survive the seed cut; got {connected:?}"
+            );
+        }
+    }
+
+    /// nw-470 follow-up (code-quality review). `"repos": []` (an explicit
+    /// empty array, distinct from omitting `repos` entirely) must keep
+    /// meaning "zero repos selected, so nothing matches" — the SAME
+    /// contract this tool already had before nw-470 pushed `repos` into the
+    /// PageRank seed-selection query. Before nw-470, `repos: []` resolved
+    /// to an empty `HashSet` via `resolve_repo_filter` and was applied only
+    /// by the post-hoc `retain_nodes_in_repos` at step 5b, which keeps
+    /// nothing against an empty set (and drops vault content unconditionally
+    /// whenever `repos` is set at all, per the tool's schema). nw-470 must
+    /// not change this: seeding now also passes the same empty set into
+    /// `list_project_symbol_uids_by_pagerank`, which must independently
+    /// match nothing rather than falling back to "unrestricted".
+    #[test]
+    fn project_context_repos_empty_array_matches_nothing_same_as_before_nw470() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:nw470b".into(),
+                name: "nw470b".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        let proj = Project {
+            uid: "proj:nw470b".into(),
+            name: "NW470B".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        store
+            .insert_note(&mk_note(
+                "note:nw470b",
+                "vlt:nw470b",
+                "Projects/nw470b/doc.md",
+                "note:nw470b",
+            ))
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:nw470b", "note:nw470b")])
+            .unwrap();
+
+        let sym_uids: Vec<String> = (0..10)
+            .map(|i| {
+                let uid = format!("sym:nw470b{i}");
+                store
+                    .insert_symbol(&mk_symbol(
+                        &uid,
+                        "repo:nw470b",
+                        &format!("src/f{i}.rs"),
+                        &uid,
+                    ))
+                    .unwrap();
+                uid
+            })
+            .collect();
+        store
+            .batch_insert_project_symbol_edges("proj:nw470b", &sym_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "NW470B",
+                "token_budget": 5000,
+                "response_format": "detailed",
+                "repos": [],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        assert!(
+            connected.is_empty(),
+            "\"repos\": [] must match NOTHING (same pre-nw-470 contract as \
+             resolve_repo_filter + retain_nodes_in_repos on an empty set), \
+             not fall back to unrestricted; got {connected:?}"
         );
     }
 }

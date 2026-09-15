@@ -12685,7 +12685,9 @@ pub async fn run_server(
             Err(lifecycle::WriteLeaseError::Held) => {
                 anyhow::bail!(
                     "another process holds the write lease for {}. Stop it before starting a \
-                     daemon — two writers against this store risk corruption.",
+                     daemon — two writers against this store risk corruption — unless a \
+                     `nestweaver backup restore` is in progress against this database, in \
+                     which case wait for it to finish.",
                     db_path.display()
                 );
             }

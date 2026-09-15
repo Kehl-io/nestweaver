@@ -784,13 +784,30 @@ jobs:
   mutants:
     name: Mutation testing (advisory)
     needs: changes
-    # ADVISORY ONLY — nothing gates on this, and there is deliberately no
-    # mutation-score threshold.
+    # ADVISORY, NOT ABSENT: this job is not in `required-ci`'s `needs` (nw-282),
+    # so it can never block a merge, and there is deliberately no
+    # mutation-score threshold — a score target invites tests written to kill
+    # mutants rather than to check behaviour (Goodhart). Google's deployment
+    # reports surface individual SURVIVING mutants on the diff under review and
+    # never show developers a score; that is the model here.
     #
-    # A score target invites tests written to kill mutants rather than to check
-    # behaviour (Goodhart). Google's deployment reports surface individual
-    # SURVIVING mutants on the diff under review and never show developers a
-    # score; that is the model here.
+    # But "advisory" no longer means `continue-on-error: true`. Through
+    # 2026-09 that flag forced this job's own conclusion to `success`
+    # regardless of what any step reported, and cargo-mutants' `--timeout 300`
+    # baseline (see below) truncated on every cross-cutting diff (nw-445:
+    # PR #389 jobs 103681801425/103757379892/103770556730, PR #392 job
+    # 103841693321 — three truncations in a row, each rendered green with
+    # ZERO mutants tested). The contract as of this change:
+    #   - a genuine cargo-mutants error/timeout, or a run that tested zero
+    #     mutants when it should have tested some, is now a real job
+    #     `failure` (red X on the PR, `::error::` annotation, step summary
+    #     line) — see the "Surviving mutants" step;
+    #   - "no Rust package in the diff" and "diff generated zero mutants" stay
+    #     `success` with an explicit summary line, because both are legitimate
+    #     nothing-to-do outcomes, not missing signal;
+    #   - surviving mutants (status 2) stay `success` with a report table —
+    #     mutation SCORE is still not a merge gate, only mutation ABSENCE-OF-
+    #     SIGNAL is.
     #
     # Why it exists: the post-7.0.0 review found ~20 tests that pass with the
     # fix they guard reverted — several guarding named tickets, so they read as
@@ -802,7 +819,6 @@ jobs:
     # runtime tolerable — a full baseline is a separate, occasional run.
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     # Backstop only. The mutation run bounds itself with `timeout` (see the
     # "Mutate only what this PR changed" step) so that the reporting steps
     # still run and can DISCLOSE a truncated run. This job-level limit exists
@@ -843,7 +859,20 @@ jobs:
       - name: Install cargo-mutants
         uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2
         with:
-          tool: cargo-mutants
+          # Pinned to the exact version the exit-code and outcomes.json
+          # field-name comments below were verified against (`src/outcome.rs`
+          # and `src/exit_code.rs` at the `v27.1.0` tag in
+          # sourcefrog/cargo-mutants, byte-identical to that repo's `main` at
+          # verification time). `tool: cargo-mutants` alone would still be a
+          # PARTIAL pin — taiki-e/install-action's own README states an
+          # unversioned tool name resolves to "upstream releases with a delay
+          # of one to a few days" tied to the action's own version, not a
+          # specific tool version — so an unpinned tool name could silently
+          # install a newer cargo-mutants whose exit codes or JSON shape have
+          # moved out from under these comments without this file changing at
+          # all. Bump this deliberately, alongside re-verifying the cited
+          # source files, not by drift.
+          tool: cargo-mutants@27.1.0
       - name: Compute the PR diff
         # ONE range expression, two artifacts. nw-272: the package list and the
         # mutant list must come from the SAME diff — computing the range twice
@@ -866,15 +895,58 @@ jobs:
         # in this diff" this job printed was therefore uninformative — the same
         # manifest shape the Coverage job already works around with --workspace.
         #
-        # `--timeout 300` bounds ONE cargo command, not the job: an unkilled
-        # mutant can hang a test that would otherwise exit, and without it one
-        # pathological mutant stalls everything. It says nothing about total
-        # runtime, and cargo-mutants (27.x) has no total-time flag — `--help`
-        # offers only per-command `--timeout`/`--build-timeout` and `--shard`.
-        # So the budget is enforced here with `timeout`, chosen over sharding
-        # (a shard matrix multiplies runners and cold builds for an advisory
-        # job) and over a mutant cap (which would silently drop mutants with no
-        # wall-clock guarantee anyway).
+        # `--timeout 600` bounds ONE cargo command (one mutant's test run, or
+        # the baseline), not the job: an unkilled mutant can hang a test that
+        # would otherwise exit, and without it one pathological mutant stalls
+        # everything. It says nothing about total runtime, and cargo-mutants
+        # (pinned to 27.1.0 — see "Install cargo-mutants" above) has no
+        # total-time flag — `--help` offers only per-command
+        # `--timeout`/`--build-timeout` and `--shard`. So the budget is
+        # enforced here with `timeout`, chosen over sharding (a shard matrix
+        # multiplies runners and cold builds for an advisory job) and over a
+        # mutant cap (which would silently drop mutants with no wall-clock
+        # guarantee anyway).
+        #
+        # `--baseline skip` (nw-282/445): cargo-mutants' own unmutated-baseline
+        # build+test run was the thing actually blowing the budget — measured
+        # on PR #392 job 103841693321 (packages nestweaver-daemon,
+        # nestweaver-engine, nestweaver-store): "TIMEOUT Unmutated baseline in
+        # 1715s build + 300s test" (MUTANTS_STATUS 4). The build (1715s) was
+        # NOT the problem — cargo-mutants pays that cost again for the first
+        # mutant anyway, baseline or not. The TEST phase was: it hit the old
+        # `--timeout 300` ceiling mid-suite (nestweaver-daemon's 358 tests in
+        # 26.22s + nestweaver-engine's 1543 lib tests in 214.72s + 5 small
+        # nestweaver-engine integration binaries in 12.23s = 253.17s, then
+        # nestweaver-store's own ~74s lib-test binary started and was still
+        # running when the ceiling hit). `--baseline skip` removes that
+        # redundant pre-mutation run entirely — see the "relies on the main
+        # job" note below for why this is safe. `--minimum-test-timeout` is
+        # deliberately NOT set: per the cargo-mutants book, it only raises the
+        # floor on the timeout cargo-mutants AUTO-CALCULATES from the baseline
+        # test's own measured duration (5x baseline, min 20s); with
+        # `--baseline skip` there is no baseline measurement to calibrate
+        # from, and an explicit `--timeout` is used instead, so the flag would
+        # be silently ignored dead weight, per https://mutants.rs/baseline.html.
+        #
+        # 600s is deliberately more than 1.5x the worst combined figure above
+        # (253.17s measured + ~74s for the interrupted nestweaver-store lib
+        # suite, taken from a same-day `--workspace`-shaped main-CI run,
+        # ≈327s total): CI-runner jitter alone moved nestweaver-engine's suite
+        # from 172.60s (`--workspace` shape, job 103902930743) to 214.72s
+        # (`-p` shape, job 103841693321) on the same day, and `--no-fail-fast`
+        # (below) means EVERY scenario — caught or missed — runs the full,
+        # non-short-circuited suite, so `--timeout` must clear the whole
+        # suite's duration on every single mutant, not just the baseline.
+        # PR #389 (job 103770556730, 8 packages: nestweaver, nestweaver-client,
+        # nestweaver-daemon, nestweaver-engine, nestweaver-mcp,
+        # nestweaver-proto, nestweaver-schema, nestweaver-store) never reached
+        # the test phase at all — the BUILD alone exhausted the whole 35m
+        # MUTANTS_BUDGET and was killed mid `Lab::run_baseline` (exit 124).
+        # `--timeout` cannot fix that; it is scoped to the test phase only, and
+        # it is exactly the scope-narrowing this job's `-p` diff-scoping (below)
+        # already targets — a cross-cutting diff blowing the whole budget on
+        # the BUILD is a distinct failure mode from the TEST-time ceiling this
+        # `--timeout` value addresses.
         #
         # SIGINT rather than SIGKILL so cargo-mutants shuts down cleanly and
         # mutants.out/ keeps the results it had already written; --kill-after
@@ -931,10 +1003,50 @@ jobs:
           pkg_args=()
           for pkg in "${pkgs[@]}"; do pkg_args+=(-p "${pkg}"); done
           echo "mutating packages: ${pkgs[*]}"
+          # `--baseline skip` relies on THIS PR's commit already being GREEN in
+          # the `build-and-check` job before this job's result means anything
+          # (per the cargo-mutants book: "If you use --baseline=skip, you must
+          # make sure that the tests are actually passing, otherwise the
+          # results of cargo-mutants will be meaningless" —
+          # https://mutants.rs/baseline.html). That green run is NOT the same
+          # shape as this one, though: `build-and-check` runs
+          # `cargo test --workspace` (unified feature resolution across every
+          # crate) while this job runs `cargo test -p <touched-crate>` per
+          # package (see the nw-272 comment above for why). CLAUDE.md's "Build
+          # & Test" section documents concretely that `-p` and `--workspace`
+          # can resolve to DIFFERENT feature sets and therefore run different
+          # test counts for the same crate (nestweaver-daemon: 238 vs 264;
+          # nestweaver-mcp: 154 vs 180). Both shapes also set
+          # NESTWEAVER_NO_DAEMON=1 (this job further sets
+          # NESTWEAVER_ALLOW_NO_DAEMON=1, since CI/GITHUB_ACTIONS confer
+          # nothing per CLAUDE.md's daemon-architecture section), so daemon
+          # bypass itself is not the divergence — feature unification is. THE
+          # RISK: a test that is genuinely red only under the `-p` feature
+          # shape (never exercised, or exercised differently, under
+          # `--workspace`) would be invisible to `build-and-check`'s green
+          # checkmark, and with `--baseline skip` this job has no baseline run
+          # of its own left to catch it — every mutant's test run would then
+          # fail for a reason that has NOTHING to do with the mutation, and
+          # every one would misreport as "caught" (a false all-clear, not a
+          # false alarm — the dangerous direction, since it hides real
+          # coverage gaps behind an apparently-clean mutation report).
+          # Combined stdout+stderr is captured to mutants-console.log for the
+          # next step, WITHOUT losing the real exit status: `tee` is the last
+          # command in the pipeline, so a bare `$?` here would be `tee`'s own
+          # status (always 0 on a healthy write), not `timeout`'s/
+          # cargo-mutants'. `${PIPESTATUS[0]}` is bash's array of each
+          # pipeline stage's own exit code, taken BEFORE anything else can
+          # overwrite `$?` — index 0 is the `timeout ... cargo mutants ...`
+          # stage, i.e. exactly what `status=$?` captured before this was a
+          # pipeline. This is deliberately independent of whether `pipefail`
+          # is set (GitHub's default bash invocation already sets it, but
+          # relying on that default rather than reading it off the array
+          # would be silently wrong the day that default changes).
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
             cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
-              --timeout 300 --no-shuffle -- --no-fail-fast
-          status=$?
+              --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
+            2>&1 | tee mutants-console.log
+          status="${PIPESTATUS[0]}"
           set -e
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           # GNU timeout reports 124 when it had to interrupt, 137 when the
@@ -948,8 +1060,22 @@ jobs:
           else
             echo "truncated=false" >> "$GITHUB_OUTPUT"
           fi
-          # Advisory job: surviving mutants (2), timeouts (3) and unviable
-          # mutants (4) are findings to report, not build failures.
+          # Exit status is a REPORT for the next step to classify, not a
+          # verdict on its own — the wrapper always exits 0 so `if: always()`
+          # below runs unconditionally. cargo-mutants' own exit codes
+          # (https://mutants.rs/exit-codes.html, confirmed against
+          # `src/exit_code.rs` in sourcefrog/cargo-mutants): 0 all caught,
+          # 1 usage error, 2 some mutants survived (a finding to report, not a
+          # build failure — mutation SCORE is not a merge gate), 3 some tests
+          # timed out, 4 the BASELINE failed or hung before any mutant ran
+          # (NOT "unviable mutants" — unviable mutants have no exit code of
+          # their own; they land in outcomes.json's `unviable` count but do
+          # not change `exit_code()`, whose only inputs are a non-mutant
+          # scenario failing, `timeout > 0`, or `missed > 0`), 5/6 the
+          # `--in-diff` diff didn't match the tree / couldn't be parsed,
+          # 70 an internal cargo-mutants error (`sysexit`'s EX_SOFTWARE). GNU
+          # `timeout`'s 124/137 below are a distinct, OUTER signal — this
+          # wrapper's own, not cargo-mutants'.
           exit 0
         env:
           # Deliberately shorter than the job's timeout-minutes so this wrapper,
@@ -967,60 +1093,171 @@ jobs:
           TRUNCATED: ${{ steps.mutate.outputs.truncated }}
           NO_PACKAGES: ${{ steps.mutate.outputs.no_packages }}
           MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
+          # Same value as the "Mutate only what this PR changed" step's env —
+          # only needed here to name the budget in the failure summary.
+          MUTANTS_BUDGET: 35m
         run: |
+          set -uo pipefail
           summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
 
           # nw-272: no Rust package in the diff is legitimately nothing to do —
-          # distinct from "the report is missing", which the branch below treats
-          # as a non-result. Saying the wrong one of those is the whole defect
-          # this job keeps re-learning.
+          # distinct from "the report is missing", which the branches below
+          # treat as a non-result. Saying the wrong one of those is the whole
+          # defect this job keeps re-learning.
           if [ "${NO_PACKAGES}" = "true" ]; then
             summary "### Mutation testing"
             summary "No Rust package in this diff, so no mutants were generated. Nothing to report."
             exit 0
           fi
 
-          # How far did it actually get? Every mutant that produced a verdict
-          # lands in exactly one of these files; mutants.json is the full list
-          # generated up front.
-          tested=0
-          for f in caught missed timeout unviable; do
-            if [ -f "mutants.out/${f}.txt" ]; then
-              tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
-            fi
-          done
+          # cargo-mutants itself (not just this job's own NO_PACKAGES check
+          # above) has a second, legitimate "nothing to mutate" outcome: an
+          # empty `--in-diff` diff, a diff touching no Rust source files, or
+          # a diff that resolves to zero mutants after filtering. Verified in
+          # the pinned source (cargo-mutants v27.1.0, `src/in_diff.rs`):
+          # `DiffFilterError::{EmptyDiff, NoSourceFiles, NoMutants}` all map
+          # to `ExitCode::Success` (0) and are logged via `info!("{err}")`
+          # BEFORE any lab/output is written — so `mutants.out/` is genuinely
+          # absent, not missing-because-something-broke. RE-VERIFY these
+          # three strings (`grep -n Display -A6 src/in_diff.rs` at the pinned
+          # tag) if the `cargo-mutants@` version in the "Install cargo-mutants"
+          # step above ever changes — they are Display-impl text, not a
+          # stable machine-readable contract.
+          CARGO_MUTANTS_NO_MUTANTS_MESSAGES=(
+            "Diff file is empty"
+            "Diff changes no Rust source files"
+            "No mutants to filter"
+          )
+          if [ "${MUTANTS_STATUS}" = "0" ] && [ ! -d mutants.out ] && [ -f mutants-console.log ]; then
+            for msg in "${CARGO_MUTANTS_NO_MUTANTS_MESSAGES[@]}"; do
+              if grep -qF -- "${msg}" mutants-console.log; then
+                summary "### Mutation testing"
+                summary "cargo-mutants reported \"${msg}\" — nothing to mutate in this diff. Nothing to report."
+                exit 0
+              fi
+            done
+          fi
+
+          # `total` MUST come from mutants.out/mutants.json, unconditionally,
+          # whenever that file exists — never from outcomes.json's
+          # `total_mutants`. cargo-mutants writes mutants.json UP FRONT,
+          # before any build or test (`cargo_mutants::lab`, src/lab.rs ~44),
+          # so its length is the PLANNED mutant count regardless of how many
+          # have actually been processed. `total_mutants` in outcomes.json is
+          # NOT that: `LabOutcome::add()` (src/outcome.rs) increments
+          # `total_mutants` in the SAME call that increments a
+          # caught/missed/timeout/unviable counter, so on outcomes.json alone
+          # `total_mutants` always equals the already-processed count — a run
+          # that planned N mutants and was killed (or crashed) before testing
+          # any of them would read `total_mutants=0`, `tested=0`, and fall
+          # into the "diff generated no mutants" branch below: the exact
+          # nw-445 false all-clear this job exists to catch, just moved one
+          # layer down. If mutants.json is itself missing, `total` stays
+          # unknown (""). That case is NOT left to the "status not in
+          # {0,2,3}" rule to catch incidentally — an unknown total is
+          # EXPLICITLY failed below (`[ -z "${total}" ] && fail=true`),
+          # because outcomes.json can exist and parse cleanly with
+          # MUTANTS_STATUS=0 even when mutants.json is gone (e.g. it was
+          # deleted between steps, or a future cargo-mutants version moves
+          # where it's written), and that combination must not silently pass
+          # just because no other rule happened to fire.
           total=""
           if [ -f mutants.out/mutants.json ]; then
             total=$(jq 'length' mutants.out/mutants.json 2>/dev/null || echo "")
           fi
+
+          # `tested` (the caught/missed/timeout/unviable breakdown) still
+          # prefers mutants.out/outcomes.json — cargo-mutants' own summary;
+          # field names confirmed against `LabOutcome` in
+          # sourcefrog/cargo-mutants `src/outcome.rs`, since the mutants.rs
+          # book documents the file's existence but not its exact fields.
+          # `write_lab_outcome()` runs "multiple times as the lab runs, and
+          # once at the end" per that source, so even a run cut short by the
+          # outer `timeout` (SIGINT) below should leave a last-written, if
+          # incomplete, outcomes.json. Fall back to the historical
+          # *.txt-line-count method (every mutant that produced a verdict
+          # lands in exactly one of caught/missed/timeout/unviable.txt) both
+          # for a run killed before outcomes.json's first write, AND for a
+          # SIGINT that lands mid-write and leaves a half-flushed,
+          # unparseable outcomes.json — `jq -e .` below rejects that case
+          # rather than trusting a torn read.
+          report_present=false
+          tested=""
+          if [ -f mutants.out/outcomes.json ] && jq -e . mutants.out/outcomes.json >/dev/null 2>&1; then
+            report_present=true
+            caught=$(jq -r '.caught // 0' mutants.out/outcomes.json)
+            missed_n=$(jq -r '.missed // 0' mutants.out/outcomes.json)
+            timeout_n=$(jq -r '.timeout // 0' mutants.out/outcomes.json)
+            unviable=$(jq -r '.unviable // 0' mutants.out/outcomes.json)
+            tested=$(( caught + missed_n + timeout_n + unviable ))
+          elif [ -d mutants.out ]; then
+            report_present=true
+            tested=0
+            for f in caught missed timeout unviable; do
+              if [ -f "mutants.out/${f}.txt" ]; then
+                tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
+              fi
+            done
+          fi
+          tested="${tested:-0}"
+
           progress="${tested} mutants"
           if [ -n "${total}" ]; then
             progress="${tested} of ${total} mutants"
           fi
 
+          # FAIL — a real job failure, not a hidden warning — whenever
+          # cargo-mutants' own exit code isn't one that leaves a trustworthy
+          # report (0 all caught, 2 some survived, 3 some timed out; see the
+          # exit-code comment on the step above, confirmed against
+          # `src/exit_code.rs`), OR the planned mutant count can't be
+          # verified at all (mutants.json missing), OR mutants were planned
+          # but NONE were actually tested. Succeed — with an explicit summary
+          # line, never a silent no-op — only for the two legitimate
+          # all-clears: nothing to mutate (handled above) or a complete run
+          # that planned zero mutants. Surviving mutants (status 2) alone are
+          # NOT a failure: mutation testing is a report, not a merge gate.
+          fail=false
+          if [ "${MUTANTS_STATUS}" != "0" ] && [ "${MUTANTS_STATUS}" != "2" ] && [ "${MUTANTS_STATUS}" != "3" ]; then
+            fail=true
+          fi
+          if [ "${report_present}" = "false" ]; then
+            fail=true
+          fi
+          # An unverifiable total is ALWAYS a failure, independent of status —
+          # this must not depend on MUTANTS_STATUS happening to also be bad.
+          # Without this line, a parseable outcomes.json plus MUTANTS_STATUS=0
+          # and a missing mutants.json passed every other check above and
+          # fell through to the "diff generated no mutants" success message,
+          # which is a false all-clear (nw-445) hiding behind a status the
+          # other two conditions treat as trustworthy.
+          if [ -z "${total}" ]; then
+            fail=true
+          fi
+          if [ -n "${total}" ] && [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
+            fail=true
+          fi
+
           summary "## Mutation testing (advisory)"
           summary ""
 
-          incomplete=false
-          if [ "${TRUNCATED}" = "true" ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **TRUNCATED — this run hit its time budget and did not finish.**"
-            summary "> It got through **${progress}** before being stopped."
-            summary "> The list below is PARTIAL. A mutant missing from it was not"
-            summary "> killed — it was never reached. Do not read this as an all-clear."
-            summary ""
-          elif [ ! -d mutants.out ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **cargo-mutants produced no report** (exit status \`${MUTANTS_STATUS:-unknown}\`)."
-            summary "> Nothing was mutated. This is a missing result, not a passing one."
-            summary ""
-          elif [ "${MUTANTS_STATUS}" = "1" ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **cargo-mutants exited with an error** (status 1) — the run did not"
-            summary "> complete normally. Treat any list below as partial."
+          if [ "${fail}" = "true" ]; then
+            if [ "${report_present}" = "false" ]; then
+              reason="cargo-mutants produced no report at all (exit status \`${MUTANTS_STATUS:-unknown}\`) — mutants.out/ is missing."
+            elif [ "${TRUNCATED}" = "true" ]; then
+              reason="the run hit its \`${MUTANTS_BUDGET}\` budget and was cut short (exit status \`${MUTANTS_STATUS}\`), reaching only ${progress} before being stopped."
+            elif [ -z "${total}" ]; then
+              reason="mutants.out/mutants.json (the planned mutant list, written before any build or test) is missing, so the planned mutant count cannot be verified (exit status \`${MUTANTS_STATUS}\`)."
+            elif [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
+              reason="${total} mutants were planned but zero were tested (exit status \`${MUTANTS_STATUS}\`)."
+            else
+              reason="cargo-mutants exited with status \`${MUTANTS_STATUS}\`, which is not one of the trustworthy codes (0, 2, 3)."
+            fi
+            echo "::error::Mutation testing produced no usable signal: ${reason}"
+            summary "> [!CAUTION]"
+            summary "> **FAILED — no usable mutation signal.**"
+            summary "> ${reason}"
+            summary "> An absent signal must not read as an all-clear — see this job's own header comment for the full pass/fail contract."
             summary ""
           fi
 
@@ -1034,25 +1271,40 @@ jobs:
             summary '```'
             cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
             summary '```'
-          elif [ "${incomplete}" = "true" ]; then
-            if [ "${tested}" -eq 0 ]; then
-              summary "**No mutants were tested at all.** There is no result here to read."
-            else
-              summary "No surviving mutants among the ones this run did reach (${progress})."
-              summary "The rest were not tested."
-            fi
+          elif [ "${fail}" = "true" ]; then
+            summary "No mutants were tested (or the report was missing) — see the failure above."
           elif [ "${tested}" -eq 0 ]; then
             # Not a pass and not a failure: the diff touched nothing mutable.
             summary "This PR's diff generated no mutants — nothing in it was mutable."
           else
             summary "No surviving mutants in this diff (${progress} tested)."
           fi
+
+          if [ "${fail}" = "true" ]; then
+            exit 1
+          fi
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-report
-          path: mutants.out/
+          # Multiple paths, one per line (actions/upload-artifact's own
+          # README at this pinned SHA, "Upload using Multiple Paths and
+          # Exclusions") — mutants-console.log is the raw stdout+stderr
+          # capture the mutate step now writes (`tee`) for the "legitimate
+          # zero mutants" evaluation branch, and is useful on its own for
+          # diagnosing a genuine failure too.
+          path: |
+            mutants.out/
+            mutants-console.log
+          # `if-no-files-found` only fires when NONE of the paths above
+          # match anything — per the same README ("If a path (or paths),
+          # result in no files being found for the artifact..."). So
+          # mutants.out/ being absent (the legitimate no-mutants case, or
+          # any other run that never produced a report) does not trigger
+          # this on its own as long as mutants-console.log exists; `ignore`
+          # only matters for the true no-packages-in-diff case, where
+          # neither path has anything to upload.
           if-no-files-found: ignore
 
   audit:
