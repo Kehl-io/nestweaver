@@ -212,6 +212,23 @@ jobs:
           brew install protobuf
       - name: Build Metal-enabled CLI
         run: cargo build --locked --release --features metal
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: distinct from this job's own $MODEL_CACHE (set up below by
+        # "Configure isolated smoke paths" and deliberately exercised by the
+        # Metal smoke steps) — this is the REAL platform default a test can
+        # still reach via EmbedConfig::default() / EmbeddingConfig::default()
+        # if it forgets to override cache_dir. Runners are ephemeral, so this
+        # only has to prove the directory did not exist before this job's
+        # tests ran and does after — not survive across jobs/runs.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/Library/Caches/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       # `--features metal`, NOT `--features embed`. `metal` is additive on top
       # of `default = ["embed"]`, so this step was verifying the daemon's
       # cache-only contract under a DIFFERENT feature set than the binary the
@@ -454,6 +471,28 @@ jobs:
             sort -z |
             xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-after.sha256"
           diff -u "$SETUP_ROOT/cache-before.sha256" "$SETUP_ROOT/cache-after.sha256"
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would extend this
+        # already 90-minute-budgeted job) — it only inspects the filesystem
+        # side effect the cargo test steps above may have left in the REAL
+        # cache, as opposed to this job's own isolated $MODEL_CACHE (checked
+        # separately by the before/after sha256 diff above). `if: always()`
+        # so a failure above still gets this check; only a cancelled job
+        # skips it.
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/Library/Caches/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
       - name: Collect Metal smoke evidence
         if: failure()
         shell: bash
@@ -590,6 +629,20 @@ jobs:
         # unnoticed. `check --benches` catches a bench that stops compiling
         # without paying for a full release-profile `bench --no-run`.
         run: cargo check --locked --benches
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: a test can still reach EmbedConfig::default() /
+        # EmbeddingConfig::default() and download into the REAL platform
+        # cache instead of a test-owned tempdir. Runners are ephemeral, so
+        # this only has to prove the directory did not exist before this
+        # job's tests ran and does after — not survive across jobs/runs.
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's
@@ -603,6 +656,24 @@ jobs:
           # the escape hatch now says so.
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would double this job's
+        # duration) — it only inspects the filesystem side effect the tests
+        # above may have left. `if: always()` so a test FAILURE above still
+        # gets this check; only a cancelled job skips it.
+        if: always()
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
 
   clippy:
     name: Clippy
@@ -697,6 +768,20 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: a test can still reach EmbedConfig::default() /
+        # EmbeddingConfig::default() and download into the REAL platform
+        # cache instead of a test-owned tempdir. Runners are ephemeral, so
+        # this only has to prove the directory did not exist before this
+        # job's tests ran and does after — not survive across jobs/runs.
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       - name: Daemon-named tests (skipped in the main job)
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
@@ -707,6 +792,24 @@ jobs:
         # Check the standalone daemon-feature configuration separately from
         # workspace feature unification (which also enables embedding support).
         run: cargo test --locked -p nestweaver-mcp --features daemon --no-fail-fast
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would double this job's
+        # duration) — it only inspects the filesystem side effect the tests
+        # above may have left. `if: always()` so a test FAILURE above still
+        # gets this check; only a cancelled job skips it.
+        if: always()
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
 
   coverage:
     name: Coverage

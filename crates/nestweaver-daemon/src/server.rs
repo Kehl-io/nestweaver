@@ -11393,19 +11393,25 @@ mod embedding_status_tests {
     }
 }
 
+/// Shared HF-cache fixture writer for daemon embedding tests. A module-level
+/// item (rather than `pub(super)` inside a single test module) so both
+/// `embedding_load_config_tests` and `startup_helper_tests` can build a
+/// complete, offline-resolvable cache — nw-483: a test config that reaches
+/// `ArtifactMode::DownloadMissing` with an incomplete/absent cache hits the
+/// real network AND the developer's real platform model cache. A COMPLETE
+/// cache makes `DownloadMissing` a no-op (see the comment on
+/// `seed_embedding_artifact_cache`), which is what lets a test exercise that
+/// path hermetically.
 #[cfg(all(test, feature = "embed"))]
-mod embedding_load_config_tests {
-    use super::*;
+fn write_complete_hf_cache(cache_dir: &std::path::Path) -> nestweaver_embed::ModelArtifacts {
     use candle_core::{DType, Device};
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-    use std::path::Path;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
-    fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
-        const CONFIG_JSON: &str = r#"{
+    const CONFIG_JSON: &str = r#"{
             "vocab_size": 3,
             "hidden_size": 4,
             "num_hidden_layers": 1,
@@ -11423,27 +11429,25 @@ mod embedding_load_config_tests {
             "classifier_dropout": null,
             "model_type": "bert"
         }"#;
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let repo_dir = cache_dir.join("models--test-owner--test-model");
-        let snapshot_dir = repo_dir.join("snapshots").join(commit);
-        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
-        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
-        std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
-        let artifacts = nestweaver_embed::ModelArtifacts {
-            config: snapshot_dir.join("config.json"),
-            tokenizer: snapshot_dir.join("tokenizer.json"),
-            weights: snapshot_dir.join("model.safetensors"),
-            modules: snapshot_dir.join("modules.json"),
-            sentence_transformer_config: Some(
-                snapshot_dir.join("config_sentence_transformers.json"),
-            ),
-            transformer_config: snapshot_dir.join("sentence_bert_config.json"),
-            pooling_config: snapshot_dir.join("1_Pooling/config.json"),
-            dense_modules: Vec::new(),
-        };
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let repo_dir = cache_dir.join("models--test-owner--test-model");
+    let snapshot_dir = repo_dir.join("snapshots").join(commit);
+    std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+    std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
+    let artifacts = nestweaver_embed::ModelArtifacts {
+        config: snapshot_dir.join("config.json"),
+        tokenizer: snapshot_dir.join("tokenizer.json"),
+        weights: snapshot_dir.join("model.safetensors"),
+        modules: snapshot_dir.join("modules.json"),
+        sentence_transformer_config: Some(snapshot_dir.join("config_sentence_transformers.json")),
+        transformer_config: snapshot_dir.join("sentence_bert_config.json"),
+        pooling_config: snapshot_dir.join("1_Pooling/config.json"),
+        dense_modules: Vec::new(),
+    };
 
-        std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
-        std::fs::write(
+    std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
+    std::fs::write(
             &artifacts.modules,
             r#"[
                 {"idx":0,"name":"0","path":"","type":"sentence_transformers.models.Transformer"},
@@ -11452,51 +11456,55 @@ mod embedding_load_config_tests {
             ]"#,
         )
         .expect("write modules fixture");
-        std::fs::write(
-            artifacts
-                .sentence_transformer_config
-                .as_ref()
-                .expect("fixture publishes a sentence-transformer config"),
-            r#"{"similarity_fn_name":"cosine"}"#,
-        )
-        .expect("write sentence-transformer fixture");
-        std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
-            .expect("write transformer fixture");
-        std::fs::write(
-            &artifacts.pooling_config,
-            r#"{"pooling_mode_mean_tokens":true,"include_prompt":true}"#,
-        )
-        .expect("write pooling fixture");
-
-        std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
-        let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
-        let varmap = VarMap::new();
-        let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-        BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
-        varmap
-            .save(&artifacts.weights)
-            .expect("write model weights");
-
-        let vocab = [
-            ("[PAD]".to_string(), 0_u32),
-            ("[UNK]".to_string(), 1_u32),
-            ("test".to_string(), 2_u32),
-        ]
-        .into_iter()
-        .collect();
-        let tokenizer_model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("[UNK]".to_string())
-            .build()
-            .expect("build tokenizer model");
-        let mut tokenizer = Tokenizer::new(tokenizer_model);
-        tokenizer.with_pre_tokenizer(Some(Whitespace));
-        tokenizer
-            .save(&artifacts.tokenizer, false)
-            .expect("write tokenizer");
-
+    std::fs::write(
         artifacts
-    }
+            .sentence_transformer_config
+            .as_ref()
+            .expect("fixture publishes a sentence-transformer config"),
+        r#"{"similarity_fn_name":"cosine"}"#,
+    )
+    .expect("write sentence-transformer fixture");
+    std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
+        .expect("write transformer fixture");
+    std::fs::write(
+        &artifacts.pooling_config,
+        r#"{"pooling_mode_mean_tokens":true,"include_prompt":true}"#,
+    )
+    .expect("write pooling fixture");
+
+    std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
+    let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
+    let varmap = VarMap::new();
+    let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+    BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
+    varmap
+        .save(&artifacts.weights)
+        .expect("write model weights");
+
+    let vocab = [
+        ("[PAD]".to_string(), 0_u32),
+        ("[UNK]".to_string(), 1_u32),
+        ("test".to_string(), 2_u32),
+    ]
+    .into_iter()
+    .collect();
+    let tokenizer_model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .expect("build tokenizer model");
+    let mut tokenizer = Tokenizer::new(tokenizer_model);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer
+        .save(&artifacts.tokenizer, false)
+        .expect("write tokenizer");
+
+    artifacts
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod embedding_load_config_tests {
+    use super::*;
 
     #[test]
     fn daemon_accelerator_maps_each_policy() {
@@ -21609,9 +21617,67 @@ credential_method = "gh"
         );
     }
 
+    /// nw-483: build a `test_state_with_writer()` state whose `instance_cfg`
+    /// points the embedding cache at `cache_dir` (pre-filled with a complete,
+    /// offline-resolvable fixture via `write_complete_hf_cache`) instead of
+    /// leaving `instance_cfg: None`, which falls back to
+    /// `EmbeddingConfig::default()` — the real, non-test platform cache dir.
+    #[cfg(feature = "embed")]
+    fn state_with_isolated_embedding_cache(cache_dir: &std::path::Path) -> Arc<DaemonState> {
+        write_complete_hf_cache(cache_dir);
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "embed-rpc-not-ready-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+model_id = "test-owner/test-model"
+cache_dir = {:?}
+accelerator = "cpu"
+"#,
+            cache_dir.display().to_string()
+        ))
+        .expect("valid embedding fixture config");
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config));
+        state
+    }
+
+    /// nw-483: this test's whole point is a `model: None` snapshot, which
+    /// drives the `embed` RPC into `seed_embedding_artifact_cache` — the
+    /// operator-initiated `DownloadMissing` path. With `test_state_with_writer`'s
+    /// bare `instance_cfg: None` that resolves `EmbeddingConfig::default()`'s
+    /// REAL platform cache dir and hits the REAL Hugging Face endpoint (that is
+    /// exactly how this bug was found: a plain `cargo test --workspace` run
+    /// downloaded `sentence-transformers/all-MiniLM-L6-v2` into the developer's
+    /// `~/Library/Caches/nestweaver/models`). `state_with_isolated_embedding_cache`
+    /// points `cache_dir` at a tempdir pre-filled by `write_complete_hf_cache`,
+    /// which makes `DownloadMissing` resolve as a no-op cache hit (see the
+    /// comment on `seed_embedding_artifact_cache`) — no network, no write
+    /// outside the tempdir. The assertions below are unchanged from before the
+    /// fix: this only confines WHERE the seed attempt looks, not what the RPC
+    /// reports.
+    #[cfg(feature = "embed")]
     #[tokio::test]
     async fn embedding_status_blocks_embed_rpc_until_ready() {
-        let state = test_state_with_writer();
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let state = state_with_isolated_embedding_cache(cache.path());
         let expected_state = state.embedding_runtime.status().state;
         let service = DaemonService::new(state);
         let mut request = Request::new(EmbedRequest {
@@ -21629,9 +21695,81 @@ credential_method = "gh"
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(
-            error.message().contains(&expected_state)
-                || error.message().contains("without the `embed` feature"),
+            error.message().contains(&expected_state),
             "error should identify the structured readiness failure: {error}"
+        );
+    }
+
+    /// This variant only compiles with the `embed` feature OFF, and nothing
+    /// sanctioned builds that: the root crate's `default = ["embed"]` means
+    /// every `--workspace` build — every CI job in this repo included — unifies
+    /// `embed` ON for `nestweaver-daemon` too. So this branch is UNVERIFIED;
+    /// no test run anyone here does compiles or executes it. It is kept
+    /// anyway as executable documentation of the RPC's own
+    /// `#[cfg(not(feature = "embed"))]` refusal branch above — the one place
+    /// that behavior is pinned at all — for the sole build shape that would
+    /// exercise it (`--no-default-features`), should one ever get added.
+    #[cfg(not(feature = "embed"))]
+    #[tokio::test]
+    async fn embedding_status_blocks_embed_rpc_until_ready() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(request)
+            .await
+            .expect_err("a daemon built without the embed feature must refuse the embed RPC");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("without the `embed` feature"),
+            "error should identify the structured readiness failure: {error}"
+        );
+    }
+
+    /// nw-483 guard. Proves `state_with_isolated_embedding_cache`'s own
+    /// contract: the state it builds resolves the embed RPC's artifact-seed
+    /// path (`embedding_cache_dir_for_load_with`, the same resolution
+    /// `seed_embedding_artifact_cache` performs before calling
+    /// `resolve_model_artifacts(.., DownloadMissing)`) inside the tempdir it
+    /// was given. Fails against a bare `test_state_with_writer()`
+    /// (`instance_cfg: None` falls back to `EmbeddingConfig::default()`'s
+    /// real, non-test platform cache dir); passes once built through the
+    /// helper.
+    ///
+    /// It does NOT prove that `embedding_status_blocks_embed_rpc_until_ready`
+    /// or `embed_handler_never_observes_ready_without_exact_model` still call
+    /// this helper — either could silently revert to a bare
+    /// `test_state_with_writer()` and this test would keep passing, since it
+    /// exercises the helper directly rather than those tests. The backstop
+    /// for that regression is ci.yml's "Verify no test reached the real model
+    /// cache (nw-483)" step, which inspects the real cache directory after
+    /// the daemon test job runs regardless of which test path wrote to it.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn embed_rpc_test_state_never_resolves_the_platform_model_cache() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let state = state_with_isolated_embedding_cache(cache.path());
+        let cfg = state
+            .instance_cfg
+            .as_ref()
+            .map(|c| c.embedding.clone())
+            .unwrap_or_default();
+        let resolved =
+            embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path)
+                .expect("embedding cache dir must resolve");
+        assert!(
+            resolved.starts_with(cache.path()),
+            "the embed RPC's artifact-seed path must resolve inside this test's \
+             tempdir, not the real platform model cache — got {}",
+            resolved.display()
         );
     }
 
@@ -21971,10 +22109,22 @@ external_model = "unavailable-test-model"
         assert!(!typed.fallback_used);
     }
 
+    /// nw-483: before the model is ever published, the loop below races real
+    /// `embed` RPCs against `state.embedding_runtime`'s initial `model: None`
+    /// snapshot — that race is the whole point of this test (it pins that the
+    /// handler never reports "ready" without an exact model, even mid-race).
+    /// But `model: None` + `repair_identity: false` is exactly the branch that
+    /// calls `seed_embedding_artifact_cache`, so a bare `test_state_with_writer()`
+    /// let this test's early iterations reach the real network and the
+    /// developer's real platform model cache too — bisected empirically (a
+    /// static read mistook it for safe because it publishes a ready model
+    /// eventually, missing that every iteration before the writer's first
+    /// `publish_ready` starts from `instance_cfg: None`).
     #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embed_handler_never_observes_ready_without_exact_model() {
-        let state = test_state_with_writer();
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let state = state_with_isolated_embedding_cache(cache.path());
         insert_unembedded_symbol(&state.store, "sym-atomic-handler");
         let calls = Arc::new(AtomicU32::new(0));
         let model = Arc::new(CountingEmbed {

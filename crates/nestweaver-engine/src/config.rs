@@ -2800,4 +2800,124 @@ url = "https://github.com/example/keep-me"
         assert_eq!(cfg.min_poll, "45s");
         assert_eq!(cfg.max_poll, "8h");
     }
+
+    /// nw-483 counterweight. The bug was tests reaching a real model
+    /// load/download through `EmbeddingConfig::default()` without ever
+    /// overriding `cache_dir` — the fix belongs at those call sites, NOT
+    /// here. This pins the other half of the contract: the production
+    /// default itself must keep resolving to the platform-native cache
+    /// (computed independently via `dirs::cache_dir()`, not by calling
+    /// `default_embedding_cache_dir()` — that would just test the function
+    /// against itself), so a future nw-483 change doesn't accidentally
+    /// sandbox every real, non-test daemon.
+    #[test]
+    fn default_embedding_cache_dir_is_the_platform_cache_in_production() {
+        let expected = dirs::cache_dir()
+            .expect("test environment must have a resolvable platform cache dir")
+            .join("nestweaver")
+            .join("models");
+        assert_eq!(
+            std::path::PathBuf::from(EmbeddingConfig::default().cache_dir),
+            expected,
+            "the production default must stay the platform cache — tests that \
+             load or download a model are responsible for overriding cache_dir \
+             themselves, never the other way around"
+        );
+    }
+
+    /// nw-483, the other half of `default_embedding_cache_dir_is_the_platform_cache_in_production`:
+    /// proves the mechanism every isolated test call site (daemon's
+    /// `state_with_isolated_embedding_cache`, this crate's own isolated
+    /// tests) actually relies on — that `EmbeddingConfig::default().cache_dir`
+    /// follows an overridden `HOME`/`XDG_CACHE_HOME` rather than hard-coding
+    /// the platform default some other way.
+    ///
+    /// Mutating `HOME`/`XDG_CACHE_HOME` in this shared test process would be
+    /// unsound (tests run concurrently on other threads), so — following the
+    /// `NESTWEAVER_EMBED_CACHE_ISOLATION_CHILD` pattern in
+    /// `nestweaver-embed`'s `local.rs` — the parent re-execs the current test
+    /// binary for just this test in a child process with `HOME`/
+    /// `XDG_CACHE_HOME` pointed at a tempdir, and the child does the actual
+    /// assertion. Unlike the embed-crate pattern, this one uses a single
+    /// marker env var (`NESTWEAVER_ENGINE_CACHE_DIR_ISOLATION_ROOT`) rather
+    /// than a separate boolean flag plus path: its mere presence selects the
+    /// child branch, and its value doubles as the expected root.
+    ///
+    /// `XDG_CACHE_HOME` is nested INSIDE the same tempdir as `HOME` (not a
+    /// sibling), so `starts_with(tempdir)` is correct on both resolution
+    /// strategies `dirs::cache_dir()` uses: macOS ignores `XDG_CACHE_HOME`
+    /// and resolves `$HOME/Library/Caches`, while Linux (what CI runs)
+    /// honours `$XDG_CACHE_HOME` directly. Either way the resolved path is
+    /// still under the outer tempdir.
+    #[test]
+    fn test_embedding_config_cache_dir_is_under_tempdir() {
+        // Single marker: its mere PRESENCE selects the child branch, and its
+        // VALUE carries the isolation root — one registry entry instead of a
+        // separate flag + path pair.
+        const ISOLATION_ROOT: &str = "NESTWEAVER_ENGINE_CACHE_DIR_ISOLATION_ROOT";
+
+        if let Some(root) = std::env::var_os(ISOLATION_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let resolved = std::path::PathBuf::from(EmbeddingConfig::default().cache_dir);
+            assert!(
+                resolved.starts_with(&root),
+                "EmbeddingConfig::default().cache_dir must resolve under the \
+                 isolated HOME/XDG_CACHE_HOME tempdir, not the developer's \
+                 real cache — got {} (expected under {})",
+                resolved.display(),
+                root.display()
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("cache-dir isolation tempdir");
+        let xdg_cache_home = root.path().join("xdg-cache");
+        std::fs::create_dir_all(&xdg_cache_home).expect("create isolated XDG_CACHE_HOME");
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "config::tests::test_embedding_config_cache_dir_is_under_tempdir",
+                    "--nocapture",
+                ])
+                .env(ISOLATION_ROOT, root.path())
+                .env("HOME", root.path())
+                .env("XDG_CACHE_HOME", &xdg_cache_home)
+                .output()
+                .expect("run isolated cache-dir test child");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated cache-dir child failed:\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter-name typo (e.g. after a rename in this file) makes
+        // `--exact <nonmatching>` match nothing and libtest exits 0 with "0
+        // passed" — a silently vacuous green. Parsing the summary line and
+        // requiring exactly 1 closes that gap; `output.status.success()`
+        // alone cannot distinguish "the isolated assertion held" from "the
+        // child ran no test at all".
+        let passed = parse_passed_count(&stdout)
+            .unwrap_or_else(|| panic!("child produced no libtest summary line:\n{stdout}"));
+        assert_eq!(
+            passed, 1,
+            "the child must run exactly the one named test — got this summary:\n{stdout}"
+        );
+    }
+
+    /// Extracts N from a libtest summary line ("test result: ok. N passed; ...").
+    /// A free function (not inlined into the one caller above) so the parsing
+    /// itself is easy to eyeball independently of the assertion that uses it.
+    fn parse_passed_count(stdout: &str) -> Option<u32> {
+        stdout.lines().find_map(|line| {
+            line.strip_prefix("test result: ok. ")?
+                .split(' ')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+    }
 }

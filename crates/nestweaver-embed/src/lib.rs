@@ -323,4 +323,21 @@ mod tests {
 
         assert_eq!(model.backend_kind(), EmbeddingBackendKind::External);
     }
+
+    /// nw-483 counterweight, mirroring
+    /// `nestweaver_engine::config::default_embedding_cache_dir_is_the_platform_cache_in_production`.
+    /// Tests that load or download a model are responsible for pointing
+    /// `cache_dir` at a tempdir themselves (see `local::tests::test_config`
+    /// and `local::tests::configured_cache_roots_are_isolated`); this crate's
+    /// production default must never change to compensate, or a real,
+    /// non-test caller would stop finding/writing models where every doc and
+    /// remediation message says they live.
+    #[test]
+    fn default_cache_dir_is_the_platform_cache_in_production() {
+        let expected = dirs::cache_dir()
+            .expect("test environment must have a resolvable platform cache dir")
+            .join("nestweaver")
+            .join("models");
+        assert_eq!(EmbedConfig::default().cache_dir, expected);
+    }
 }

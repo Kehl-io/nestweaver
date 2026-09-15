@@ -1416,6 +1416,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_ENGINE_CACHE_DIR_ISOLATION_ROOT",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_GIT_CLONE_TIMEOUT_SECS",
         role: EnvRole::Configures,
     },

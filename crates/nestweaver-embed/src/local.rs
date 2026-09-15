@@ -1254,12 +1254,37 @@ mod tests {
             .output()
             .expect("run isolated cache test child");
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
             "isolated cache child failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
+            stdout,
             String::from_utf8_lossy(&output.stderr)
         );
+        // A filter-name typo (e.g. after a rename in this file) makes
+        // `--exact <nonmatching>` match nothing and libtest exits 0 with "0
+        // passed" — a silently vacuous green. `output.status.success()` alone
+        // cannot tell that apart from "the isolated assertions held", so
+        // require the summary line to say exactly 1.
+        let passed = parse_passed_count(&stdout)
+            .unwrap_or_else(|| panic!("child produced no libtest summary line:\n{stdout}"));
+        assert_eq!(
+            passed, 1,
+            "the child must run exactly the one named test — got this summary:\n{stdout}"
+        );
+    }
+
+    /// Extracts N from a libtest summary line ("test result: ok. N passed; ...").
+    /// A free function (not inlined into the one caller above) so the parsing
+    /// itself is easy to eyeball independently of the assertion that uses it.
+    fn parse_passed_count(stdout: &str) -> Option<u32> {
+        stdout.lines().find_map(|line| {
+            line.strip_prefix("test result: ok. ")?
+                .split(' ')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
     }
 
     #[test]
