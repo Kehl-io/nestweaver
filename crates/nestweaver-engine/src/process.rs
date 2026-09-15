@@ -79,11 +79,16 @@ pub struct AffectedProcess {
 }
 
 /// Risk level derived from the number of affected processes.
+///
+/// [`Self::Unknown`] is not a fourth severity band — it means the change
+/// was not assessed (missing/unindexed source, empty graph, path drift).
+/// Callers must not treat it as a green "nothing affected" finding.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RiskLevel {
     Low,
     Medium,
     High,
+    Unknown,
 }
 
 /// Heuristic entry-point names — symbols with these names are treated as
@@ -330,7 +335,7 @@ fn detect_changes_impact_until(
         Err(error) if std::time::Instant::now() >= deadline => Ok(ChangeImpact {
             affected_symbols: vec![],
             affected_processes: vec![],
-            risk: RiskLevel::Low,
+            risk: RiskLevel::Unknown,
             blast_radius: 0,
             status: AnalysisStatus::Partial,
             notifications: vec![
@@ -433,7 +438,9 @@ fn detect_changes_impact_with_work_budget(
 
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
-        let risk = RiskLevel::Low;
+        // nw-472: a missing/unindexed source is not a confident Low finding.
+        // README.md and other non-source files stay Complete + Low.
+        let risk = crate::blast_radius::risk_if_unassessed(RiskLevel::Low, &notifications);
         // Traversal has not started, so any non-Complete status here reflects
         // drift, an undecodable row, or resolver staleness. The outer deadline
         // guard independently discloses an expired planning budget.
@@ -586,12 +593,17 @@ fn detect_changes_impact_with_work_budget(
         });
     }
 
-    // Step 4: risk level.
-    let risk = match affected_processes.len() {
-        0 => RiskLevel::Low,
-        1..=3 => RiskLevel::Medium,
-        _ => RiskLevel::High,
-    };
+    // Step 4: risk level. nw-472: a mixed change set — some files assessed,
+    // others with no indexed symbols — must not report a confident Low for the
+    // part it never looked at, exactly like the all-unassessed early out above.
+    let risk = crate::blast_radius::risk_if_unassessed(
+        match affected_processes.len() {
+            0 => RiskLevel::Low,
+            1..=3 => RiskLevel::Medium,
+            _ => RiskLevel::High,
+        },
+        &notifications,
+    );
 
     let blast_radius = affected_symbols.len() + affected_processes.len();
     // A bounded partial traversal is distinct from independent graph degradation.
@@ -744,7 +756,7 @@ mod tests {
         let store = GraphStore::in_memory().expect("in_memory store");
         let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10)
             .expect("detect_changes_impact");
-        assert_eq!(impact.risk, RiskLevel::Low);
+        assert_eq!(impact.risk, RiskLevel::Unknown);
         assert_eq!(impact.status, AnalysisStatus::Partial);
         assert_eq!(impact.gate_state, GateState::DegradedUnknown);
         assert!(
@@ -764,6 +776,7 @@ mod tests {
             .expect("detect_changes_impact");
 
         assert_eq!(impact.status, AnalysisStatus::Complete);
+        assert_eq!(impact.risk, RiskLevel::Low);
         assert_eq!(impact.gate_state, GateState::Ok);
         assert!(
             !impact
@@ -771,6 +784,85 @@ mod tests {
                 .iter()
                 .any(|n| n.descriptor == "changed-file-no-symbols")
         );
+    }
+
+    /// nw-472, second path: when SOME changed files map to symbols, the early
+    /// out is skipped and risk is computed from process counts — which must
+    /// still yield Unknown, not Low, while another changed file went unassessed.
+    #[test]
+    fn detect_changes_impact_mixed_assessed_and_unassessed_is_unknown_not_low() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let function = |uid: &str, name: &str, file_path: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file_path.to_string(),
+            start_line: 5,
+            end_line: 5,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h-{name}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // A two-function call cycle: each has a caller and neither has an
+        // entry-point name, so no process roots exist. That keeps the risk on
+        // the zero-process (Low) branch this test is about — a lone function
+        // would be a root and yield a Medium process instead.
+        store
+            .insert_symbol(&function("sym:helper", "helper", "src/lib.rs"))
+            .expect("insert helper");
+        store
+            .insert_symbol(&function("sym:other", "other", "src/other.rs"))
+            .expect("insert other");
+        for (source, target) in [("sym:helper", "sym:other"), ("sym:other", "sym:helper")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.to_string(),
+                    target_uid: target.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .expect("insert cycle edge");
+        }
+
+        let mixed = detect_changes_impact(
+            &store,
+            &["src/lib.rs".to_string(), "src/missing.rs".to_string()],
+            10,
+        )
+        .expect("detect_changes_impact");
+        assert!(
+            !mixed.affected_symbols.is_empty(),
+            "the assessed file must take the non-early-out path"
+        );
+        assert!(mixed.affected_processes.is_empty());
+        assert!(
+            mixed
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
+        assert_eq!(mixed.risk, RiskLevel::Unknown);
+        assert_eq!(mixed.gate_state, GateState::DegradedUnknown);
+
+        // COUNTERWEIGHT: the same assessed file alone is a confident Low, so
+        // the assertion above cannot pass by marking every change Unknown.
+        let assessed_only = detect_changes_impact(&store, &["src/lib.rs".to_string()], 10)
+            .expect("detect_changes_impact");
+        assert_eq!(assessed_only.risk, RiskLevel::Low);
+        assert_ne!(assessed_only.gate_state, GateState::DegradedUnknown);
     }
 
     #[test]

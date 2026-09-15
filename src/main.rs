@@ -7770,6 +7770,7 @@ enum BrainCommands {
     )]
     Search {
         /// Search query string.
+        #[arg(value_parser = parse_non_blank_query)]
         query: String,
         #[arg(
             long,

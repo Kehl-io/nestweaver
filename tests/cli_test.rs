@@ -3494,6 +3494,7 @@ fn an_empty_query_or_pattern_is_a_usage_error_on_every_swept_command() {
 
     for args in [
         vec!["search", ""],
+        vec!["brain", "search", ""],
         vec!["investigate", ""],
         vec!["regex-search", ""],
         vec!["count-patterns", ""],
@@ -3505,6 +3506,40 @@ fn an_empty_query_or_pattern_is_a_usage_error_on_every_swept_command() {
             .assert()
             .code(64)
             .stderr(contains("empty").and(contains("not allowed")));
+    }
+}
+
+/// nw-480: `brain search "" --json` must fail at the CLI exactly like
+/// top-level `search ""` — clap usage error, exit 64, reason on stderr — and
+/// never reach the daemon as an Internal error. Like every clap rejection it
+/// writes NOTHING to stdout: the `--json` help contract (pinned by
+/// `the_json_error_contract_holds_as_behaviour_not_only_as_documentation`)
+/// says exit 64 carries no envelope, so this must not become the exception.
+#[test]
+fn brain_search_empty_query_is_a_usage_error_like_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    for args in [
+        ["search", "", "--json"].as_slice(),
+        ["brain", "search", "", "--json"].as_slice(),
+    ] {
+        let assert = nestweaver_cmd()
+            .args(args)
+            .arg("--db")
+            .arg(&db)
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .assert()
+            .code(64)
+            .stderr(contains("empty query strings are not allowed"));
+        assert!(
+            assert.get_output().stdout.is_empty(),
+            "{args:?}: a clap usage error writes nothing to stdout, even with --json"
+        );
     }
 }
 

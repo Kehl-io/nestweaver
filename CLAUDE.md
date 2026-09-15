@@ -222,7 +222,7 @@ nestweaver summary --level symbol        # hierarchical code summaries (symbol/f
 nestweaver hubs                          # most connected hub nodes (degree centrality + PageRank)
 nestweaver bridges                       # architectural chokepoints (betweenness centrality)
 nestweaver clusters                      # functional communities (adaptive resolution: 0.3 for >10K symbols, 0.5 default)
-nestweaver pr-impact                     # PR blast radius with risk scoring (Low/Medium/High)
+nestweaver pr-impact                     # PR blast radius with risk scoring (Low/Medium/High; Unknown when a changed file was not assessed)
 nestweaver pr-impact --sarif             # SARIF 2.1.0 for GitHub code scanning / VS Code SARIF viewer
 nestweaver pr-impact --strict            # exit 2 on a contract-verified breaking change (advisory by default)
 nestweaver affected-tests --base-ref main  # tiered regression-test selection for a diff
