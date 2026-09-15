@@ -922,19 +922,53 @@ jobs:
     # runtime tolerable — a full baseline is a separate, occasional run.
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    # Backstop only. The mutation run bounds itself with `timeout` (see the
-    # "Mutate only what this PR changed" step) so that the reporting steps
-    # still run and can DISCLOSE a truncated run. This job-level limit exists
-    # for everything the wrapper can't cover — a wedged apt/cargo install, a
-    # hung cache restore. Cancelling the job here skips the disclosure, so it
-    # is set well above the mutation budget and should never be what fires.
+    # Backstop only. Both budgeted steps bound themselves with their own
+    # `timeout` wrapper (see "Warm the -p build shape" and "Mutate only what
+    # this PR changed") so that the reporting steps still run and can DISCLOSE
+    # a truncated run. This job-level limit exists for everything those
+    # wrappers can't cover — a wedged apt/cargo install, a hung cache restore.
+    # Cancelling the job here skips the disclosure, so it is set well above
+    # the sum of both budgets and should never be what fires.
     #
-    # Nothing bounded total runtime before: `--timeout` is PER CARGO COMMAND,
-    # not per job. On PR #319 this job ran 2h04m without finishing (~5m was
-    # the norm) and was still holding a runner. With one shared runner pool
-    # that is head-of-line blocking for every other PR — see the `concurrency`
-    # note at the top of this file.
-    timeout-minutes: 55
+    # Task 0.2b (mutants-build-cost.md): raised from 55 after adding the
+    # pre-warm step. Budget: PREWARM_BUDGET (30m — one cargo invocation PER
+    # PACKAGE, looped, not one combined invocation; see the pre-warm step's
+    # own comment for what is and is not measured — this is NOT "cold cost
+    # plus a covered second/third package," it is one number sized to what we
+    # actually know: run 34922651945 measured nestweaver-daemon's own
+    # first-package cold build at 1200.9s (≈20.0m) and nestweaver-mcp's,
+    # built second (i.e. already benefiting from daemon's dependency build),
+    # at 97.1s first + 12.4s repeat; nestweaver-store's first `-p` build was
+    # never measured — that run was killed mid-build on store's 4th mutant.
+    # 30m is 1200.9s plus roughly 10m of unmeasured headroom, not a value
+    # derived from summing per-package figures) + MUTANTS_BUDGET (35m,
+    # unchanged) + setup/checkout/toolchain/cache-restore/report steps (~5m
+    # observed) = 70m.
+    #
+    # Margin above that 70m sum is 10m (80−70), stated plainly rather than as
+    # "the same margin as before" — it is NOT the same: applying the
+    # identical timeout-minus-budget-minus-setup accounting to the PRE-Task-
+    # 0.2b job (55 − 35 MUTANTS_BUDGET − ~5m setup) gives 15m, so this change
+    # nets a SMALLER margin (10m), not an equal one, because PREWARM_BUDGET
+    # is new spend this backstop must also clear.
+    #
+    # Worst case is larger than 70m: both budgeted steps' `timeout` wrappers
+    # use `--kill-after` (pre-warm 60s, mutate 120s — see each step's own
+    # `run:`), so a step that ignores SIGINT can run 60s/120s past its stated
+    # budget before SIGKILL. Worst-case total is therefore 30m + 60s + 35m +
+    # 120s + ~5m setup ≈ 73m, leaving a worst-case margin of ~7m under this
+    # 80m backstop — still comfortably positive, and still well short of the
+    # PR #319 2h04m failure mode this backstop exists to catch.
+    #
+    # See "Alternatives considered" in the design doc for why raising a
+    # budget instead of this backstop was rejected.
+    #
+    # Nothing bounded total runtime before either budget existed: `--timeout`
+    # is PER CARGO COMMAND, not per job. On PR #319 this job ran 2h04m without
+    # finishing (~5m was the norm) and was still holding a runner. With one
+    # shared runner pool that is head-of-line blocking for every other PR —
+    # see the `concurrency` note at the top of this file.
+    timeout-minutes: 80
     steps:
       - name: Free disk space
         run: |
@@ -977,15 +1011,277 @@ jobs:
           # source files, not by drift.
           tool: cargo-mutants@27.1.0
       - name: Compute the PR diff
-        # ONE range expression, two artifacts. nw-272: the package list and the
-        # mutant list must come from the SAME diff — computing the range twice
-        # lets them drift silently, so `--in-diff` could generate a mutant in a
+        id: prdiff
+        # ONE range expression, TWO artifacts (the diff and the file list) and
+        # ONE package computation. nw-272: the package list and the mutant
+        # list must come from the SAME diff — computing the range twice lets
+        # them drift silently, so `--in-diff` could generate a mutant in a
         # package `-p` never built (skipped, invisible) or `-p` could baseline
         # packages with no mutants (the exact cost this scoping removes). Both
         # failure modes look like a normal run.
+        #
+        # Task 0.2b: the touched-package list is now ALSO consumed by the new
+        # "Warm the -p build shape" step below, so it is computed here — once
+        # — and written to /tmp/pr.pkgs, instead of being recomputed by each
+        # consumer. Recomputing it twice would reopen exactly the
+        # same-diff-two-computations drift risk described above, just between
+        # two steps instead of two artifacts. `package_count` is exposed as a
+        # step output so the pre-warm step can skip cleanly (`if:`) rather
+        # than starting and immediately no-op'ing.
+        #
+        # `print $2` is the crate DIRECTORY name. That is only valid because
+        # every directory under crates/ is named for its package; a future
+        # crate where those differ would emit `-p <dir>` and fail loudly,
+        # which is the right way for that assumption to break.
+        #
+        # Patterns are anchored: `/^src\//` and `/^build\.rs$/`, not
+        # `/^(src|build\.rs)/`, which would also match `srcgen/` and print a
+        # package the diff never touched — a wasted baseline/pre-warm, which
+        # is the resource this whole change exists to conserve.
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
           git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.files
+          mapfile -t pkgs < <(awk -F/ '
+            /^crates\/[^\/]+\// { print $2 }
+            /^src\//            { print "nestweaver" }
+            /^build\.rs$/       { print "nestweaver" }
+          ' /tmp/pr.files | sort -u)
+          printf '%s\n' "${pkgs[@]}" > /tmp/pr.pkgs
+          echo "package_count=${#pkgs[@]}" >> "$GITHUB_OUTPUT"
+      - name: Warm the -p build shape before the mutation budget starts
+        if: steps.prdiff.outputs.package_count != '0'
+        # Task 0.2b (mutants-build-cost.md), root causes #1 and #2. Canary run
+        # 34922651945 spent 1200.9s (≈20.0m) in the BUILD phase alone for its
+        # first mutant (nestweaver-daemon), inside the 35m MUTANTS_BUDGET,
+        # before a single mutant's TEST phase ran — verified in that run's
+        # `mutants.out/outcomes.json` `phase_results`. Two compounding causes,
+        # both verified against the pinned cargo-mutants v27.1.0 source/book:
+        #
+        # 1. cargo-mutants copies the source tree — including `target/` — into
+        #    a scratch dir by default (`Options::copy_target`, src/options.rs).
+        #    The book (mutants.rs/in-place.html) says plainly: "the Rust
+        #    toolchain currently doesn't reuse build products after
+        #    cargo-mutants copies the tree, but it will reuse them with
+        #    --in-place." `--in-place`, added to the mutate step below, builds
+        #    in THIS checkout — the same one this step just warmed — so none
+        #    of the absolute build paths cargo's fingerprints depend on move.
+        # 2. Switching `-p` target (daemon → mcp → store, CLAUDE.md's `-p` vs
+        #    `--workspace` feature-resolution table) re-resolves features,
+        #    which re-fingerprints and rebuilds whatever differs from the
+        #    `--workspace`-shaped `build`-keyed Swatinem/rust-cache restored
+        #    above. That run showed this is a ONE-TIME-PER-PACKAGE cost within
+        #    a run, not a per-mutant one (nestweaver-mcp's build: 97.1s then
+        #    12.4s on its 2nd mutant) — the defect was paying it lazily,
+        #    serially, inside the budget, so the first package hit ate most of
+        #    it before a single mutant's test even ran.
+        #
+        # ONE INVOCATION PER PACKAGE, LOOPED — not one invocation with every
+        # `-p`/`--package` flag together. Verified against the pinned
+        # cargo-mutants v27.1.0 source AND this run's own debug.log, because a
+        # combined-flags pre-warm would defeat itself:
+        #   - `src/lab.rs` `Worker::run_queue`: for the default
+        #     `TestPackages::Mutated` (`TestsForMutant::Mutated` — this job
+        #     does not set `--test-workspace`/configure `test_package`, so
+        #     this is the arm taken), the package set for EVERY mutant's
+        #     build+test is `PackageSelection::Explicit(vec![mutant.source_
+        #     file.package.clone()])` — a Vec of exactly ONE package, always,
+        #     even when the diff spans several packages. `--baseline skip`
+        #     also means `run_baseline`'s own multi-package
+        #     `PackageSelection::Explicit(all_mutated_packages)` (same file,
+        #     the ONE call site that ever puts >1 package in one invocation)
+        #     never runs in this job.
+        #   - `src/cargo.rs` `cargo_argv()`: `PackageSelection::Explicit`
+        #     emits one `--package=<name>@<version>` per entry in that Vec —
+        #     so with a one-package Vec every real per-mutant build/test is
+        #     `cargo test --no-run --verbose --package=<pkg>@<ver>`, never
+        #     `--package=A --package=B` together.
+        #   - Confirmed directly in run 34922651945's `debug.log` (downloaded
+        #     artifact, `mutants.out/debug.log`): every `phase=Build`/
+        #     `phase=Test` line's `quoted_argv` carries exactly one
+        #     `--package=` — e.g. `cargo test --no-run --verbose
+        #     --package=nestweaver-daemon@10.0.2` then, later,
+        #     `--package=nestweaver-mcp@10.0.2` — never both on one line,
+        #     across all 4 packages this diff touched.
+        # A single `cargo test -p A -p B -p C` invocation makes cargo unify
+        # features across A, B and C in ONE resolve — a DIFFERENT resolution
+        # than building A alone, which is what cargo-mutants actually does
+        # for A's own mutants. That mismatch re-fingerprints and rebuilds A
+        # when cargo-mutants gets to it, bringing back the exact cold-build
+        # tax this step exists to eliminate — silently, since the combined
+        # pre-warm invocation would itself report success. Looping one
+        # `--package=<pkg>` at a time reproduces the real per-mutant
+        # resolution for every package, not just the union of all of them.
+        #
+        # `--package=<pkg>` (bare name, no `@<version>`): confirmed from
+        # `src/package.rs` that `version_qualified_name()` is only
+        # `format!("{name}@{version}")`, a Cargo package-ID-spec
+        # disambiguator for a workspace with more than one same-named
+        # package from different sources — not a feature or fingerprint
+        # input. Every package name in this workspace is unique, so a bare
+        # `--package=<name>` already resolves unambiguously to the identical
+        # package cargo-mutants selects; encoding the version here would add
+        # a second, harder-to-keep-in-sync source of that number for no
+        # resolution difference.
+        #
+        # `--verbose`: added even though it has no effect on the build plan,
+        # fingerprint, or environment — purely output verbosity (confirmed:
+        # `cargo_argv()` always appends it, unconditionally, before checking
+        # `PackageSelection` at all) — kept here only so a pre-warm failure's
+        # own log is exactly as diagnosable as the mutate step's.
+        #
+        # `--locked`: cargo-mutants' own argv never adds this (absent from
+        # every `cargo_argv()` branch and from the observed `debug.log`
+        # argv). Omitting it does not change dependency resolution when
+        # Cargo.lock already satisfies Cargo.toml (it only makes Cargo
+        # refuse to silently update a lock that doesn't) — every other job
+        # in this file passes `--locked` for that safety net, and keeping it
+        # here cannot produce a different resolved graph than cargo-mutants'
+        # unlocked call would, so it stays for defense-in-depth, not parity.
+        #
+        # RUSTFLAGS parity: `src/cargo.rs` `encoded_rustflags()` only injects
+        # `CARGO_ENCODED_RUSTFLAGS` (a `--cap-lints=warn` addition) when
+        # `Options.cap_lints` is true. That field is `args.cap_lints.unwrap_
+        # or(config.cap_lints)` (`src/options.rs`); this job's `cargo mutants`
+        # invocation below passes no `--cap-lints` flag and the repo has no
+        # `mutants.toml`, so `config.cap_lints` is `bool`'s own `false`
+        # default (`src/config.rs`, `#[derive(Default)]`) and the whole
+        # branch is skipped — confirmed in the artifact: `mutants.out/debug.log`
+        # and every per-mutant log under `mutants.out/log/` contain zero
+        # occurrences of `cap-lints=warn` (`--cap-lints allow` DOES appear,
+        # but only on crates.io dependency builds like `libc`'s build script
+        # — that is Cargo's own, unconditional lint-capping for non-workspace
+        # dependencies, nothing to do with cargo-mutants or this job), and
+        # the nestweaver-daemon per-mutant build log specifically
+        # (`mutants.out/log/crates__nestweaver-daemon__src__server.rs_line_
+        # 12571_col_5.log`, the 1200.9s cold build cited throughout this
+        # step) contains 637 occurrences of `-fuse-ld=mold`, i.e. this
+        # workflow's own top-level `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_
+        # RUSTFLAGS` (line ~58) reaching every rustc invocation in that build
+        # untouched. cargo-mutants therefore
+        # sets no RUSTFLAGS-shaped env at all in this job's configuration,
+        # so this step needs none either to match it — both steps inherit
+        # the same workflow-level `env:` block, and neither overrides it.
+        # (If `--cap-lints` or a `mutants.toml` are ever added, re-verify
+        # this paragraph — the two rustflags SOURCES are mutually exclusive
+        # per Cargo's own docs, so `CARGO_ENCODED_RUSTFLAGS` appearing at
+        # all would make the mold linker flag stop applying during
+        # cargo-mutants' own builds, independent of anything pre-warm does.)
+        #
+        # cargo-mutants' other injected env (`INSTA_UPDATE=no`,
+        # `INSTA_FORCE_PASS=0`, same file) only affects `insta` at TEST
+        # RUNTIME; it cannot affect a `--no-run` build's fingerprint either
+        # way, so pre-warm does not need it.
+        #
+        # This step pays the per-package one-time cost up front, in this
+        # same checkout, OUTSIDE MUTANTS_BUDGET. Reads /tmp/pr.pkgs written
+        # by "Compute the PR diff" above — same package set, same source of
+        # truth, so this step and the mutate step below can never drift
+        # apart.
+        #
+        # BUILD ORDER: if `nestweaver-daemon` is among the touched packages,
+        # it is moved to the FRONT of the loop; every other package keeps
+        # /tmp/pr.pkgs's existing (alphabetical) order. This is the one
+        # ordering we have actual evidence and graph support for, not a
+        # general "most-dependent-first" scheduler: CLAUDE.md's own
+        # "Dependency flow" diagram shows `nestweaver-daemon` sitting at the
+        # bottom of nearly every chain in the workspace (daemon -> mcp, with
+        # the `daemon` feature also pulling in federation -> client; mcp/
+        # daemon -> engine -> parser, resolver, store, storage, algorithms ->
+        # schema) — building it FIRST means its own dependency closure, the
+        # largest in the workspace, is what pays whatever one-time cost this
+        # run incurs, and every other touched package's SMALLER closure then
+        # finds its own external/shared dependencies already Fresh. Building
+        # a shallow package first (e.g. nestweaver-store, which per the same
+        # diagram depends on schema alone) buys nothing: daemon would still
+        # have to pay its full closure's cost whenever its own turn came. We
+        # do NOT attempt a fuller dependency-depth ordering for the other
+        # packages (mcp, store, engine, ...) — CLAUDE.md's diagram gives their
+        # relative ordering too, but we have no MEASURED evidence for most of
+        # them (only daemon and mcp were actually timed in run 34922651945;
+        # store's own first `-p` build was never measured — see below), so
+        # hardcoding a full ranked list would be encoding a guess as if it
+        # were a fact. The reorder is local to this step's own copy of the
+        # array; /tmp/pr.pkgs on disk is left exactly as "Compute the PR
+        # diff" wrote it, since the mutate step's own package order has no
+        # effect on cargo-mutants' behavior (it builds one package per mutant
+        # regardless of `-p` flag order).
+        #
+        # PREWARM_BUDGET (30m) bounds the WHOLE loop, not each package.
+        # State plainly what run 34922651945 actually measured, rather than
+        # implying uniform per-package coverage: nestweaver-daemon's own
+        # first `-p` build (built FIRST in that run, same as this step's
+        # ordering) took 1200.9s (≈20.0m) cold; nestweaver-mcp, built SECOND
+        # — i.e. already benefiting from whatever daemon's build had already
+        # made Fresh — took 97.1s for its own first build and 12.4s for a
+        # same-package repeat; nestweaver-store's first `-p` build was NEVER
+        # measured, because that run was killed mid-build on store's 4th
+        # mutant before it produced a result. 30m is 1200.9s (the one number
+        # we trust as a worst case, rounded up) plus roughly 10m of headroom
+        # for whatever store, or any other untimed package, costs on top —
+        # not a sum of measured per-package figures, because we do not have
+        # enough of them to sum. The canary run (Task 0.2b Step 5, tracked by
+        # the orchestrator, not this step) is what turns "headroom" into a
+        # real measurement for store and any other package this job hasn't
+        # timed yet.
+        #
+        # Bounded and NOT swallowed on timeout: a warm build that still can't
+        # finish in 30m is the same "cross-cutting diff exhausts the runner"
+        # failure mode timeout-minutes' own comment names (PR #319, 2h04m),
+        # and hiding it behind a truncated-but-green mutation step would be
+        # nw-445 moved one step earlier. A step failure here is a normal,
+        # visible red X — including a genuine compile error, which
+        # `set -euo pipefail` inside the loop surfaces immediately instead of
+        # continuing to warm later packages.
+        #
+        # Env matches the mutate step below (NESTWEAVER_NO_DAEMON,
+        # NESTWEAVER_ALLOW_NO_DAEMON) so the two steps' cargo invocations
+        # fingerprint identically — a divergent env between the two would
+        # itself force the exact re-fingerprint-and-rebuild this step exists
+        # to front-load, defeating the point of running it first.
+        run: |
+          set -euo pipefail
+          mapfile -t pkgs < /tmp/pr.pkgs
+          # Move nestweaver-daemon to the front if present; leave every other
+          # package in /tmp/pr.pkgs's existing order. See the BUILD ORDER
+          # comment above for why only this one package is special-cased.
+          ordered=()
+          rest=()
+          has_daemon=false
+          for pkg in "${pkgs[@]}"; do
+            if [ "${pkg}" = "nestweaver-daemon" ]; then
+              has_daemon=true
+            else
+              rest+=("${pkg}")
+            fi
+          done
+          if [ "${has_daemon}" = true ]; then
+            ordered=("nestweaver-daemon" "${rest[@]}")
+          else
+            ordered=("${rest[@]}")
+          fi
+          pkgs=("${ordered[@]}")
+          echo "pre-warming, one cargo invocation per package, in this order: ${pkgs[*]}"
+          # The whole loop runs under ONE `timeout`, so the budget bounds
+          # total wall-clock across every package, not each package
+          # individually — see the PREWARM_BUDGET comment above for why. The
+          # loop body is a real script file, not an inline `bash -c '...'`
+          # string, purely so `${pkg}` is written and read as an ordinary
+          # shell variable instead of tripping shellcheck's SC2016 (which
+          # otherwise reads deliberate inner-shell interpolation as a
+          # forgotten-to-escape outer-shell one).
+          cat > /tmp/prewarm.sh <<'PREWARM_SCRIPT'
+          set -euo pipefail
+          for pkg in "$@"; do
+            echo "pre-warming: ${pkg}"
+            cargo test --locked --no-run --verbose --package="${pkg}"
+          done
+          PREWARM_SCRIPT
+          timeout --signal=INT --kill-after=60s "${PREWARM_BUDGET}" \
+            bash /tmp/prewarm.sh "${pkgs[@]}"
+        env:
+          PREWARM_BUDGET: 30m
+          NESTWEAVER_NO_DAEMON: "1"
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
       - name: Mutate only what this PR changed
         id: mutate
         # `--workspace` is load-bearing. This repo's root Cargo.toml is BOTH a
@@ -1049,7 +1345,37 @@ jobs:
         # it is exactly the scope-narrowing this job's `-p` diff-scoping (below)
         # already targets — a cross-cutting diff blowing the whole budget on
         # the BUILD is a distinct failure mode from the TEST-time ceiling this
-        # `--timeout` value addresses.
+        # `--timeout` value addresses. `--build-timeout 300` (Task 0.2b, below)
+        # is what actually bounds that phase now.
+        #
+        # Task 0.2b (mutants-build-cost.md) added `--in-place` and
+        # `--build-timeout 300`, verified against the pinned cargo-mutants
+        # v27.1.0 source (`src/options.rs`): `build_timeout` is populated ONLY
+        # from `--build-timeout`; `--timeout` above maps to `test_timeout`
+        # alone, never to the build phase. `--in-place` (`src/main.rs`: "Test
+        # mutations in the source tree, rather than in a copy") builds inside
+        # THIS checkout, the one the "Warm the -p build shape" step above just
+        # populated, instead of cargo-mutants' own scratch-dir copy — the book
+        # (mutants.rs/in-place.html) states a copied tree does not reuse
+        # `target/` build products even when they already exist, which is why
+        # PR #389's build (job 103770556730, cited above) rebuilt from near
+        # scratch and exhausted the budget before reaching a single test. With
+        # pre-warm + `--in-place`, each mutant's build now starts from a
+        # `target/` that already matches its own `-p` shape (measured
+        # same-package reuse on run 34922651945: nestweaver-mcp's 2nd mutant
+        # built in 12.4s, not the 1200.9s a first-touch package cost), and
+        # `--build-timeout 300` is defense-in-depth for whatever the pre-warm
+        # step doesn't fully cover (e.g. a diff that adds a brand-new crate) —
+        # comfortably above every *warmed* build this run measured (≤100s)
+        # and well below the 1200.9s pathological case, so hitting it is
+        # itself a signal worth investigating, not a false positive to tune
+        # away. Safe to run `--in-place` in this job specifically because the
+        # checkout is `persist-credentials: false`, nothing pushes from it, no
+        # later step reads mutated source (only `mutants.out/`), and the
+        # runner is discarded at job end — exactly the disposable-CI-checkout
+        # case the book recommends `--in-place` for, notwithstanding the
+        # book's own caveat that a killed/panicked run "might fail" to fully
+        # restore files it mutated.
         #
         # SIGINT rather than SIGKILL so cargo-mutants shuts down cleanly and
         # mutants.out/ keeps the results it had already written; --kill-after
@@ -1063,7 +1389,12 @@ jobs:
         #
         # Not using `-j`: each parallel job needs its own copy of the tree and
         # target dir, and disk (see "Free disk space") is the binding
-        # constraint on this runner, not CPU.
+        # constraint on this runner, not CPU. This is also why `--in-place`
+        # (Task 0.2b, above) has nothing to conflict with: it `conflicts_with
+        # = "jobs"` in cargo-mutants' own arg parsing (`src/main.rs`), but only
+        # bites if `-j` were ever added here — anyone tempted to add it later
+        # for more throughput cannot combine it with `--in-place` and would
+        # need to re-litigate this whole tradeoff first.
         run: |
           set +e
           # nw-272: mutate the packages this DIFF touches, not the whole
@@ -1076,24 +1407,14 @@ jobs:
           # REACHABLE — not that the workspace be rebuilt every run.
           #
           # `--in-diff` already restricts which mutants are GENERATED; `-p`
-          # restricts what gets BUILT and baselined, which is the expensive half.
-          # Derived from /tmp/pr.files, written by the same step and the same
-          # range expression that produced /tmp/pr.diff — see the comment there.
-          #
-          # `print $2` is the crate DIRECTORY name. That is only valid because
-          # every directory under crates/ is named for its package; a future
-          # crate where those differ would emit `-p <dir>` and fail loudly,
-          # which is the right way for that assumption to break.
-          #
-          # Patterns are anchored: `/^src\//` and `/^build\.rs$/`, not
-          # `/^(src|build\.rs)/`, which would also match `srcgen/` and print a
-          # package the diff never touched — a wasted baseline, which is the
-          # resource this whole change exists to conserve.
-          mapfile -t pkgs < <(awk -F/ '
-            /^crates\/[^\/]+\// { print $2 }
-            /^src\//            { print "nestweaver" }
-            /^build\.rs$/       { print "nestweaver" }
-          ' /tmp/pr.files | sort -u)
+          # restricts what gets BUILT and baselined, which is the expensive
+          # half. Task 0.2b: read from /tmp/pr.pkgs, written ONCE by "Compute
+          # the PR diff" above and already consumed by "Warm the -p build
+          # shape" — recomputing the awk block here a second time would reopen
+          # the exact same-diff-two-computations drift risk that step's own
+          # comment warns about, just between two steps instead of two
+          # artifacts.
+          mapfile -t pkgs < /tmp/pr.pkgs
           if [ "${#pkgs[@]}" -eq 0 ]; then
             echo "no Rust package in this diff; nothing to mutate"
             {
@@ -1147,6 +1468,7 @@ jobs:
           # would be silently wrong the day that default changes).
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
             cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
+              --in-place --build-timeout 300 \
               --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
             2>&1 | tee mutants-console.log
           status="${PIPESTATUS[0]}"
@@ -1181,9 +1503,13 @@ jobs:
           # wrapper's own, not cargo-mutants'.
           exit 0
         env:
-          # Deliberately shorter than the job's timeout-minutes so this wrapper,
-          # not the runner, is what stops a long run — the difference is the
-          # headroom the reporting steps need.
+          # Deliberately shorter than the job's timeout-minutes so this
+          # wrapper, not the runner, is what stops a long run. The gap between
+          # them is no longer just "reporting headroom": timeout-minutes (80)
+          # also has to cover the pre-warm step's own PREWARM_BUDGET (30m,
+          # see "Warm the -p build shape") plus setup — see the job-level
+          # `timeout-minutes` comment above for the actual margin (10m
+          # nominal, ~7m worst-case with both steps' `--kill-after` grace).
           MUTANTS_BUDGET: 35m
           NESTWEAVER_NO_DAEMON: "1"
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
