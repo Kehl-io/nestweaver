@@ -1257,7 +1257,12 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
     while let Some(m) = matches.next() {
-        let name_text = find_name_capture(m.captures(), &capture_names, source_bytes);
+        // nw-356 (A): `name_row` is the 0-based row of the `@name` capture,
+        // used below to anchor a C++ `declaration` node's start line when the
+        // node's own reported start precedes it (a tree-sitter-cpp grammar
+        // misparse).
+        let (name_text, name_row): (Option<String>, Option<u32>) =
+            find_name_capture(m.captures(), &capture_names, source_bytes).unzip();
 
         for capture in m.captures() {
             let capture_name = &capture_names[capture.index as usize];
@@ -1269,7 +1274,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
             let start_line = node.start_position().row as u32 + 1;
 
             if let Some(kind_str) = capture_name.strip_prefix("definition.") {
-                let kind = match kind_str {
+                let mut kind = match kind_str {
                     "function" => SymbolKind::Function,
                     "class" => SymbolKind::Class,
                     "method" => SymbolKind::Method,
@@ -1306,6 +1311,123 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     }
                 };
 
+                // nw-356 (B). `Type name(initializer);` — a local variable
+                // directly initialized with an anonymous/local struct type —
+                // is grammatically identical to a function declarator
+                // (`Type name(args);`): the C++ "most vexing parse".
+                // tree-sitter-cpp has no symbol table to disambiguate, so it
+                // parses this as a `function_declarator` and the
+                // `(declaration declarator: (function_declarator ...))
+                // @definition.function` rule above mints a spurious
+                // `Function` for what is really a local variable — matching
+                // the shape `cpp.scm`'s own `init_declarator
+                // @definition.variable` rule already treats as a variable.
+                // Detected syntactically: the declaration's own `type` field
+                // resolves to an INLINE struct/class definition (a `body` is
+                // present — this excludes an ordinary reference to an
+                // externally-defined type. `Foo bar(1);` is NOT such a case
+                // to worry about — with a literal argument tree-sitter-cpp
+                // parses it as an `init_declarator`, matching `cpp.scm`'s own
+                // `definition.variable` rule directly and never reaching this
+                // branch at all (verified directly). The shape that DOES
+                // reach here and must stay a `Function` is `Foo
+                // bar(GetName());` — a call-shaped argument parses as a
+                // `function_declarator` exactly like the most-vexing-parse
+                // case, but its `type` field is a plain `type_identifier`
+                // ("Foo"), not a struct/class definition, so the guard below
+                // correctly leaves it alone).
+                //
+                // Excluding an `ERROR` before the name row is required to
+                // avoid colliding with nw-356 (A)'s *different* misparse:
+                // `class LBUG_API Foo { struct Inner {...}; Foo(); ... }`
+                // produces the exact same field shape for the unrelated
+                // `Foo();` prototype (its `declaration` node's `type` field
+                // resolves to the preceding `struct Inner {...}` because the
+                // macro token desyncs statement-boundary recovery), which
+                // would misclassify a real constructor as a Variable. Reuses
+                // `has_error_before_row` (defined below, alongside
+                // `cpp_declaration_start_line`) rather than a bare
+                // `!node.has_error()`: quality-review round 2 found that a
+                // most-vexing-parse initializer can itself embed an `ERROR`
+                // AFTER the name row (e.g. a macro-shaped token inside the
+                // constructor's own argument list, `current_token(get_handle()
+                // DEPRECATED_MACRO)`) without that being nw-356 (A)'s
+                // corruption at all — a bare subtree-wide `has_error()` was
+                // wrongly excluding that case from reclassification too
+                // (verified directly:
+                // `cpp_anonymous_struct_typed_local_with_error_after_name_is_still_a_variable`).
+                // The `LBUG_API` witness's `ERROR` sits on rows 4-5, strictly
+                // before `Foo`'s name row (7), so it is still caught; an
+                // `ERROR` on or after the name row is not. This comparison is
+                // ROW-granular, not column-granular: an `ERROR` on the name's
+                // own row but before its column is not distinguished from one
+                // after it — consistent with symbol UIDs themselves being
+                // line-based (`(repo, path, name, start_line)`), and no
+                // query-matching witness has been found where the column
+                // within a shared row would change the outcome.
+                if kind == SymbolKind::Function
+                    && lang_str == "cpp"
+                    && node.kind() == "declaration"
+                    && name_row.is_some_and(|row| !has_error_before_row(&node, row))
+                    && node.child_by_field_name("type").is_some_and(|t| {
+                        matches!(t.kind(), "struct_specifier" | "class_specifier")
+                            && t.child_by_field_name("body").is_some()
+                    })
+                {
+                    kind = SymbolKind::Variable;
+                }
+
+                let kind_label = crate::entry_points::symbol_kind_label(kind);
+
+                // nw-356 (A). tree-sitter-cpp's grammar has no symbol table,
+                // so a macro token sitting where a class name is expected
+                // (e.g. `class LBUG_API Foo {`) desyncs statement-boundary
+                // recovery: the `declaration` node captured for an unrelated
+                // LATER member (a bodiless constructor `Foo();`) ends up
+                // spanning backward across the whole preceding nested type
+                // instead of starting at its own line — `Foo` was recorded as
+                // spanning `3-8` instead of just `8`. The `@name` capture's
+                // own row is always correct (it's where `signature_line` was
+                // already reading its text from), so it is preferred over the
+                // node's own start whenever the node starts earlier than its
+                // name — but ONLY when there's an `ERROR` node BEFORE the name
+                // row (see `has_error_before_row` / `cpp_declaration_start_line`
+                // for the full reasoning; both live just below this function).
+                // A subtree-wide `node.has_error()` check (an earlier version
+                // of this gate) was too broad in TWO different directions:
+                // an ordinary, error-free multi-line prototype (a specifier or
+                // attribute prefix pushing the declarator onto a later line,
+                // e.g. `static inline\nint\nfoo();`, `[[nodiscard]]\nint
+                // foo();`, `__attribute__((warn_unused_result))\nint foo();`,
+                // or `virtual\nvoid\nfoo() const override;`) has NO error at
+                // all yet was still caught by the row-preceding condition
+                // alone; and `static inline\nint\nfoo(int x
+                // DEPRECATED_MACRO);` DOES have an `ERROR` (an unexpanded
+                // macro after a parameter name), but it sits on the same row
+                // as the name — after the declarator was already correctly
+                // parsed — so `has_error()` wrongly clamped it too. Requiring
+                // the `ERROR` to be strictly BEFORE the name row excludes both
+                // false positives while still catching the `LBUG_API` witness
+                // (`ERROR` on rows 4-5, `Foo`'s name on row 7). Nor is the gap
+                // a `template_declaration` prefix either: verified directly
+                // that `template<typename T>\nT foo();`'s inner `declaration`
+                // node already starts on its own line (matching `foo`'s row
+                // exactly), so a legitimate multi-line template header must
+                // never be second-guessed by this heuristic even if some
+                // future grammar revision widens it back across the template
+                // line.
+                let start_line = if lang_str == "cpp"
+                    && node.kind() == "declaration"
+                    && kind_label == "function"
+                {
+                    match name_row {
+                        Some(row) => cpp_declaration_start_line(&node, row, start_line),
+                        None => start_line,
+                    }
+                } else {
+                    start_line
+                };
+
                 // Use the arena for the name fallback so we defer the owned-String
                 // allocation until we know this symbol passes the dedup check.
                 let name_arena: &str = match &name_text {
@@ -1338,7 +1460,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let content_hash = sha256_hex(node_text);
                 let signature = signature_line(node_text, lang_str);
 
-                let kind_label = crate::entry_points::symbol_kind_label(kind);
                 // A `definition.function` captured on a `call_expression` node is a
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
@@ -2150,16 +2271,121 @@ fn extract_types_from_tree(
     bindings
 }
 
-/// Find the value of a `@name` capture within the same query match.
+/// nw-356 (A) residual (quality-review round 2). Whether `node`'s subtree
+/// contains a tree-sitter `ERROR` node that starts strictly BEFORE
+/// `name_row` (0-based).
+///
+/// Subtree-wide `node.has_error()` (the original gate) was too broad:
+/// `static inline\nint\nfoo(int x DEPRECATED_MACRO);` ALSO has an `ERROR`
+/// node in its subtree — an unexpanded macro sitting after a parameter name
+/// parses as an unexpected second token inside `parameter_list` — but that
+/// `ERROR` is nested three levels down (`declaration` ->
+/// `function_declarator` -> `parameter_list` -> `parameter_declaration` ->
+/// `ERROR`) and sits on the SAME row as the name (row 2), i.e. AFTER the
+/// declarator was already correctly parsed, not before it. `has_error()`
+/// alone can't distinguish "corruption before the name, which invalidates
+/// this declaration's reported start" from "corruption after the name,
+/// which doesn't" — it was clamping the former AND the latter, moving this
+/// declaration's start from line 1 to line 3 for no reason. Restricting to
+/// "an ERROR strictly before the name row" keeps the `LBUG_API` witness
+/// (its `ERROR` sits on rows 4-5, `Foo`'s name on row 7) caught while
+/// excluding the `DEPRECATED_MACRO` case (verified directly via an AST dump
+/// — see `cpp_error_after_name_does_not_clamp_multiline_declaration`).
+///
+/// A bounded DESCENDANT walk, not just `node`'s direct children: nothing in
+/// tree-sitter-cpp's error-recovery documents that the corrupting `ERROR`
+/// always attaches at the immediate-child level. It happens to for the
+/// `LBUG_API` witness (its `ERROR` is a direct child of the `declaration`
+/// node), but that's an artifact of that specific misparse's recovery shape,
+/// not a grammar guarantee — a hypothetical witness with the `ERROR` nested
+/// one level deeper would be silently missed by a direct-children-only
+/// check, under-clamping a genuinely corrupted span. The walk still
+/// terminates quickly in practice without needing an explicit depth bound:
+/// once a subtree's own start row reaches `name_row`, tree-sitter child
+/// order is source order, so nothing under that subtree (or any later
+/// sibling) can start before `name_row` either — the early return below
+/// prunes those branches immediately rather than descending into them.
+///
+/// Deliberately does NOT count zero-width `MISSING` nodes (tree-sitter's
+/// other error-recovery marker, distinct from `ERROR` — e.g. `foo(int x;`
+/// recovers with a `MISSING` `)`). Quality review looked for a witness where
+/// a `MISSING` node before the name row changes an outcome and found none;
+/// widening this function to also match `is_missing()` without a measured
+/// witness would be untested behavior, which is exactly what nw-356's own
+/// "measured, not guessed" discipline (used throughout this file) argues
+/// against. If a future witness needs it, add it then, with the fixture that
+/// proves it.
+fn has_error_before_row(node: &tree_sitter::Node, name_row: u32) -> bool {
+    if node.start_position().row as u32 >= name_row {
+        return false;
+    }
+    if node.kind() == "ERROR" {
+        return true;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i)
+            && has_error_before_row(&child, name_row)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// nw-356 (A). Returns the correct 1-based start line for a C++ `declaration`
+/// capture given the (0-based) row of its `@name` capture.
+///
+/// `fallback` (the node's own reported `start_line`) is returned unchanged
+/// unless ALL of:
+/// - the node's own start row precedes the name's row (the misparse
+///   signature — see
+///   `cpp_macro_prefixed_declaration_span_starts_at_its_name_line`),
+/// - the node is not the templated child of a `template_declaration` (a
+///   legitimate multi-line template header must never be second-guessed by
+///   this heuristic — see
+///   `cpp_template_prefixed_multiline_declaration_keeps_its_start_line`, and
+///   the doc comment at the call site for why this is verified rather than
+///   assumed), and
+/// - the subtree contains an `ERROR` node strictly before the name's row
+///   (see `has_error_before_row` — this is what distinguishes a genuine
+///   grammar misparse from an ordinary, error-free multi-line prototype like
+///   `static inline\nint\nfoo();`, and from an `ERROR` that appears only
+///   AFTER the name, which does not invalidate the declaration's start).
+fn cpp_declaration_start_line(node: &tree_sitter::Node, name_row: u32, fallback: u32) -> u32 {
+    if node.start_position().row as u32 >= name_row {
+        return fallback;
+    }
+    if node
+        .parent()
+        .is_some_and(|p| p.kind() == "template_declaration")
+    {
+        return fallback;
+    }
+    if !has_error_before_row(node, name_row) {
+        return fallback;
+    }
+    name_row + 1
+}
+
+/// Find the value of a `@name` capture within the same query match, along
+/// with the capture node's own (0-based) row.
+///
+/// nw-356 (A): the row is returned alongside the text because it is the one
+/// value that is ALWAYS correct even when the enclosing capture (e.g. a C++
+/// `declaration` node, see `cpp_declaration_start_line` above) reports a
+/// misparsed, over-wide span. `end_position()` is deliberately not used as a
+/// substitute — the declarator can end many lines after its own line (a
+/// multi-line parameter list), so only the name capture's own row is safe to
+/// anchor on.
 fn find_name_capture(
     captures: &[tree_sitter::QueryCapture<'_>],
     capture_names: &[String],
     source_bytes: &[u8],
-) -> Option<String> {
+) -> Option<(String, u32)> {
     for c in captures {
         if capture_names[c.index as usize] == "name" {
             let text = c.node.utf8_text(source_bytes).unwrap_or("").to_string();
-            return Some(strip_quotes(&text));
+            return Some((strip_quotes(&text), c.node.start_position().row as u32));
         }
     }
     None
@@ -6344,6 +6570,309 @@ BOOST_AUTO_TEST_CASE(sanity) {
             .find(|s| s.name == "value")
             .unwrap_or_else(|| panic!("no value in {:#?}", parsed.symbols));
         assert_eq!(value.parent_name.as_deref(), Some("Reading"));
+    }
+
+    /// nw-356 (A). `data_chunk_state.h`'s `DataChunkState` ctor declaration
+    /// (real-corpus witness) was indexed `19-56` instead of `56-56`: a macro
+    /// token in `class LBUG_API DataChunkState {` sits where the grammar
+    /// expects the class NAME, and with no symbol table to recognize
+    /// `LBUG_API` as an unexpanded macro, tree-sitter-cpp's statement-boundary
+    /// recovery desyncs and the `declaration` node minted for a LATER,
+    /// unrelated member (a bodiless constructor) ends up spanning backward
+    /// across the whole preceding nested type. Minimized fixture, verified
+    /// directly against the real binary (not guessed) in the nw-356 spec.
+    #[test]
+    fn cpp_macro_prefixed_declaration_span_starts_at_its_name_line() {
+        let source = "\
+class LBUG_API Foo {
+public:
+    struct Inner {
+        int x;
+        void clear() { x = 0; }
+    };
+
+    Foo();
+    explicit Foo(int capacity) : y{capacity} { z = capacity; }
+
+private:
+    int y;
+    int z;
+};
+";
+        let parsed = parse_source(Path::new("nw356_macro.h"), source).unwrap();
+        // The bodiless prototype `Foo();` is captured via the `declaration`
+        // rule (queries/cpp.scm:42-44) and is the ONE misparsed by the
+        // `LBUG_API` desync; it is `SymbolKind::Function` since nothing in
+        // this change reclassifies it (see the `!has_error()` guard on
+        // nw-356 (B) below, which exists precisely so this case stays a
+        // Function rather than colliding with the most-vexing-parse fix).
+        let foo_decl = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.kind == SymbolKind::Function)
+            .unwrap_or_else(|| panic!("no bodiless Foo() declaration in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo_decl.start_line, 8,
+            "Foo() must start on its own line (8), not the preceding \
+             struct's line: {foo_decl:#?}"
+        );
+
+        // Counterweight: the nested `struct Inner` must still extract
+        // correctly at its own line — this fix must not perturb the class
+        // rule it sits next to.
+        let inner = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Inner")
+            .unwrap_or_else(|| panic!("no Inner in {:#?}", parsed.symbols));
+        assert_eq!(inner.start_line, 3);
+
+        // Counterweight: the second, REAL, body-bearing constructor is a
+        // `function_definition`, not a `declaration` — untouched by this
+        // fix — and must still extract correctly at its own line. Its kind
+        // is `Function` rather than `Method` because the `LBUG_API` desync
+        // (a pre-existing, separate defect, out of nw-356's scope) leaves the
+        // rest of the class body's declarators parsed as plain `identifier`
+        // rather than `field_identifier`; this assertion pins the MEASURED
+        // behavior so a future change to that surrounding defect notices it
+        // moved this fixture too, rather than pretending it is unaffected.
+        let defined_ctor = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.start_line == 9)
+            .unwrap_or_else(|| panic!("no defined Foo(int) ctor in {:#?}", parsed.symbols));
+        assert_eq!(defined_ctor.kind, SymbolKind::Function);
+    }
+
+    /// Counterweight to the fix above: a template's inner `declaration` node
+    /// already starts on its own line (verified directly via a diagnostic
+    /// AST dump: `template<typename T>\nT foo();`'s `declaration` child
+    /// starts at row 1, matching `foo`'s row exactly) — so the clamp's
+    /// `start_row < name_row` condition is already false here, and the
+    /// explicit `template_declaration`-parent guard exists as a second,
+    /// belt-and-suspenders line of defense so a legitimate multi-line
+    /// template header is never second-guessed even if that grammar detail
+    /// changes. `foo` must keep the template line as ITS declaration's own
+    /// start (line 2, immediately after the template header on line 1) —
+    /// not some clamped-elsewhere value.
+    #[test]
+    fn cpp_template_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "template<typename T>\nT foo();\n";
+        let parsed = parse_source(Path::new("nw356_template.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 2,
+            "a template-prefixed declaration keeps its own (already \
+             correct) line, unperturbed by the nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review counterweight (CRITICAL fix): an `[[nodiscard]]`
+    /// attribute pushes the declarator onto a later line exactly like the
+    /// `LBUG_API` misparse does — the `declaration` node's own start row (0,
+    /// the attribute's line) precedes `foo`'s name row (1) — but this is a
+    /// perfectly ordinary, ERROR-FREE parse (`node.has_error() == false`,
+    /// verified directly via an AST dump). Before the `has_error()` gate was
+    /// added, this fixture WAS wrongly clamped from line 1 to line 2, which
+    /// would have silently changed this declaration's UID for no reason.
+    #[test]
+    fn cpp_attribute_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "[[nodiscard]]\nint foo();\n";
+        let parsed = parse_source(Path::new("nw356_attr.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "an attribute-prefixed declaration is a clean parse and must \
+             keep its own (already correct) line, unperturbed by the \
+             nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review counterweight (CRITICAL fix), sibling of the attribute
+    /// case above: `static inline\nint\nfoo();` splits storage-class
+    /// specifiers and the return type across three lines before the
+    /// declarator on line 3 — also a clean, ERROR-FREE parse. Same failure
+    /// mode without the `has_error()` gate: line 1 wrongly clamped to line 3.
+    #[test]
+    fn cpp_specifier_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "static inline\nint\nfoo();\n";
+        let parsed = parse_source(Path::new("nw356_specifier.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "a specifier-prefixed multi-line declaration is a clean parse \
+             and must keep its own (already correct) line, unperturbed by \
+             the nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review round 2 residual: a subtree-wide `node.has_error()`
+    /// gate (round 1's fix for the CRITICAL false-positive) was STILL too
+    /// broad. `static inline\nint\nfoo(int x DEPRECATED_MACRO);` has an
+    /// `ERROR` in its subtree too (an unexpanded macro after a parameter
+    /// name parses as an unexpected extra token inside `parameter_list`,
+    /// nested three levels below the `declaration` node) — but that `ERROR`
+    /// sits on the SAME row as `foo`'s name (row 2), i.e. AFTER the
+    /// declarator was already correctly parsed, not before it. Verified
+    /// directly via an AST dump before writing this test. The clamp must
+    /// only fire for an `ERROR` strictly BEFORE the name row (see
+    /// `has_error_before_row`), so this declaration's own (already correct)
+    /// line 1 must survive untouched.
+    #[test]
+    fn cpp_error_after_name_does_not_clamp_multiline_declaration() {
+        let source = "static inline\nint\nfoo(int x DEPRECATED_MACRO);\n";
+        let parsed = parse_source(Path::new("nw356_error_after_name.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "an ERROR strictly AFTER the name row does not invalidate the \
+             declaration's own (already correct) start line: {foo:#?}"
+        );
+    }
+
+    /// nw-356 (B). `win_eventlog_sink.h`'s `current_process_token` (real-
+    /// corpus witness) is `struct process_token_t { ... } current_process_
+    /// token(::GetCurrentProcess());` — a LOCAL VARIABLE directly initialized
+    /// with an anonymous struct type. This is the textbook C++ "most vexing
+    /// parse": `Type name(initializer);` is syntactically identical to a
+    /// function declarator `Type name(parameter);`, and tree-sitter-cpp (no
+    /// semantic model) resolves it as one, so the `(declaration declarator:
+    /// (function_declarator ...)) @definition.function` rule mints a spurious
+    /// `Function` for what is really a variable. Minimized fixture, verified
+    /// directly against the real binary in the nw-356 spec.
+    #[test]
+    fn cpp_anonymous_struct_typed_local_is_a_variable_not_a_function() {
+        let source = "\
+void run() {
+    struct token_t {
+        int handle_;
+        ~token_t() {}
+    } current_token(get_handle());
+    use(current_token.handle_);
+}
+";
+        let parsed = parse_source(Path::new("nw356_vexing.h"), source).unwrap();
+        let current_token = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "current_token")
+            .unwrap_or_else(|| panic!("no current_token in {:#?}", parsed.symbols));
+        assert_eq!(
+            current_token.kind,
+            SymbolKind::Variable,
+            "a struct-typed local must not be misclassified as a Function: \
+             {current_token:#?}"
+        );
+
+        // Counterweight: `run` itself is a genuine function and must stay one.
+        let run = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run")
+            .unwrap_or_else(|| panic!("no run in {:#?}", parsed.symbols));
+        assert_eq!(run.kind, SymbolKind::Function);
+    }
+
+    /// Quality-review round 2: probing whether Part B's `has_error()` guard
+    /// should get the same before-the-name-row narrowing as Part A revealed a
+    /// concrete misclassification, so it was narrowed too (not "on principle"
+    /// — this test is the evidence). A most-vexing-parse initializer can
+    /// itself embed an `ERROR` node AFTER the name row — here, a macro-shaped
+    /// extra token inside the constructor call's own argument list
+    /// (`current_token(get_handle() DEPRECATED_MACRO)`) — which has nothing
+    /// to do with nw-356 (A)'s `LBUG_API`-style corruption. Verified directly
+    /// that this makes the WHOLE `declaration` node's `has_error()` true even
+    /// though the `ERROR` sits on the same row as `current_token`'s name, not
+    /// before it. A bare `!node.has_error()` guard wrongly left this
+    /// `current_token` classified `Function`; `has_error_before_row` (which
+    /// only looks for an `ERROR` strictly before the name row) correctly
+    /// reclassifies it to `Variable`.
+    #[test]
+    fn cpp_anonymous_struct_typed_local_with_error_after_name_is_still_a_variable() {
+        let source = "\
+void run() {
+    struct token_t {
+        int handle_;
+        ~token_t() {}
+    } current_token(get_handle() DEPRECATED_MACRO);
+    use(current_token.handle_);
+}
+";
+        let parsed = parse_source(Path::new("nw356_vexing_trailing_macro.h"), source).unwrap();
+        let current_token = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "current_token")
+            .unwrap_or_else(|| panic!("no current_token in {:#?}", parsed.symbols));
+        assert_eq!(
+            current_token.kind,
+            SymbolKind::Variable,
+            "an ERROR strictly AFTER the name row must not exempt a \
+             struct-typed local from reclassification: {current_token:#?}"
+        );
+    }
+
+    /// Counterweight to the fix above: an ordinary bodiless declaration whose
+    /// "type" is a plain type reference (not an inline struct/class
+    /// definition) must stay a `Function` — the reclassification is scoped
+    /// to the exact most-vexing-parse shape, not every `declaration` whose
+    /// declarator looks like a call.
+    #[test]
+    fn cpp_ordinary_bodiless_declaration_stays_a_function() {
+        let source = "int bar(int);\n";
+        let parsed = parse_source(Path::new("nw356_bar.h"), source).unwrap();
+        let bar = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "bar")
+            .unwrap_or_else(|| panic!("no bar in {:#?}", parsed.symbols));
+        assert_eq!(bar.kind, SymbolKind::Function);
+    }
+
+    /// nw-356 engine-level regression: the historical `maskMultiTable`
+    /// witness (`semi_masker.h:19-22` in the real ladybug corpus, reduced
+    /// here to a synthetic fixture) must stay correctly spanned both BEFORE
+    /// and AFTER the nw-356 (A)/(B) changes — an ordinary declaration
+    /// preceded only by comments was never the shape either fix targets, and
+    /// this pins that down as an explicit assertion rather than an assumption.
+    ///
+    /// This is intentionally a before-AND-after pin, per the plan: it is not
+    /// a red/green regression test like the others in this file — it must
+    /// pass unchanged both without and with the nw-356 (A)/(B) changes
+    /// applied, since a bodiless declaration preceded only by comments is a
+    /// clean parse (`has_error() == false`) with its own start row already
+    /// equal to its name's row, so neither fix's guard condition ever fires
+    /// for it.
+    #[test]
+    fn cpp_mask_multi_table_span_regression() {
+        let source = fixture("cpp/mask_multi_table.h");
+        let parsed = parse_source(Path::new("mask_multi_table.h"), &source).unwrap();
+        let sym = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "maskMultiTable")
+            .unwrap_or_else(|| panic!("no maskMultiTable in {:#?}", parsed.symbols));
+        assert_eq!(
+            sym.start_line, 3,
+            "two leading comment lines must not shift the declaration's own \
+             start line: {sym:#?}"
+        );
     }
 
     /// nw-364(1): tree-sitter-julia's `assignment` node has no lhs/rhs FIELDS,

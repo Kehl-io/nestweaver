@@ -105,6 +105,50 @@ use std::path::Path;
 ///     `is_entry_point: false` forever and cannot seed a reachability walk no
 ///     matter which binary asks — only re-indexing (`nestweaver index --repo
 ///     <path> --force`) writes the corrected flag.
+///
+///     nw-356 (same generation as nw-435 above, per the branch's own
+///     coordination note — one bump covers both). Two independent C++
+///     `parse.rs` fixes change what gets extracted from `.h`/`.cpp` files.
+///     BOTH are gated so an ordinary, already-correct declaration is NEVER
+///     touched — an `[[nodiscard]]`- or `static inline`-prefixed multi-line
+///     prototype, for example, also has a `declaration` node whose start row
+///     precedes its name's row, but is left completely alone. (A) only
+///     re-anchors a `declaration`-shaped capture whose reported start row
+///     precedes its own `@name` capture's row AND whose subtree contains a
+///     tree-sitter `ERROR` node that itself starts strictly BEFORE the
+///     `@name` capture's row (`has_error_before_row`) — the signature of an
+///     unexpanded macro token sitting where a class name is expected
+///     desyncing statement-boundary recovery and widening a LATER, unrelated
+///     declaration's span backward across a preceding nested type (the
+///     `LBUG_API`/`DataChunkState` witness). An `ERROR` at or after the
+///     name's row (e.g. a malformed macro token in the parameter list) does
+///     not anchor, since it does not indicate the backward span-widening
+///     corruption this fix targets. Symbol UIDs are `(repo, path, name,
+///     start_line)`, so ONLY these error-recovered, macro-prefixed
+///     declarations get a new UID — a repo indexed before this fix has the
+///     OLD (wrong) UID on disk for exactly those declarations, and every edge
+///     pointing at one (CALLS, MEMBER_OF) still points at that stale UID
+///     after upgrading the binary alone. (B) only reclassifies a directly-
+///     initialized local variable whose declaration has no `ERROR` node
+///     strictly before the name's row (`has_error_before_row`, not a
+///     subtree-wide check — this is what keeps it from colliding with (A)'s
+///     witness, whose `ERROR` sits before the name) AND whose type is an
+///     inline anonymous/local `struct`/`class` definition (the C++ "most
+///     vexing parse": `Type name(initializer);` is grammatically identical to
+///     a function declarator). An `ERROR` inside the initializer, after the
+///     name, does not block reclassification. Only that exact shape is now
+///     correctly classified `SymbolKind::Variable` instead of the spurious
+///     `SymbolKind::Function` tree-sitter-cpp's grammar produced — an
+///     ordinary function declaration, including one whose call-shaped
+///     argument also triggers the most-vexing-parse ambiguity against a
+///     plain (non-struct) type (`Foo bar(GetName());`), is unaffected. A
+///     `Variable` can never be a CALLS target — exactly generation 5's
+///     "svelte/vue/astro named exports change `SymbolKind`" shape and
+///     generation 3's `Extension`-vs-`Class` UID-changing reclassification —
+///     so this changes which edges an already-indexed repo's stale
+///     struct-typed-local symbol can participate in, invisibly to anyone not
+///     re-indexing. Same remedy as every other bump in this file: `nestweaver
+///     index --repo <path> --force`.
 pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
