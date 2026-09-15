@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.0.3](https://github.com/Kehl-io/nestweaver/compare/v10.0.2...v10.0.3) (2026-09-15)
+
+
+### Bug Fixes
+
+* honesty for status, empty search, unknown risk, tag seeds, and read_symbols root ([#394](https://github.com/Kehl-io/nestweaver/issues/394)) ([083de8f](https://github.com/Kehl-io/nestweaver/commit/083de8f9e3d49c72ae54a1eab7155a34fb2ff8d9))
+
 ## [10.0.2](https://github.com/Kehl-io/nestweaver/compare/v10.0.1...v10.0.2) (2026-09-14)
 
 
