@@ -10179,3 +10179,80 @@ fn dead_code_does_not_report_functions_run_by_a_script() {
         "unused is never invoked and must still be reported dead: {payload}"
     );
 }
+
+/// nw-490, end to end. Swift's `main.swift` executes its top-level statements
+/// directly — the same "script executed directly" class nw-435 fixed for
+/// Python/bash, extended to Swift by the `parse.rs` post-pass gated on
+/// `is_swift_top_level_entry_file` (file named `main.swift`, or a Swift file
+/// whose first line starts with `#!`). This exercises it through the real
+/// CLI index + `dead-code --json` route, not just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_swift_main_swift_top_level_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("app/Sources")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("scripts")).unwrap();
+    std::fs::write(
+        repo_dir.join("app/Sources/main.swift"),
+        "func helper() {}\n\nfunc unused() {}\n\nclass AppDelegate {}\n\nhelper()\nAppDelegate()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("scripts/tool.swift"),
+        "#!/usr/bin/env swift\n\nfunc shebang_helper() {}\n\nfunc shebang_unused() {}\n\nshebang_helper()\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"helper".to_string()),
+        "helper() is called at main.swift top level and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"AppDelegate".to_string()),
+        "AppDelegate() is a bare top-level constructor call and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"shebang_helper".to_string()),
+        "shebang_helper() is called at the top level of a #!-shebang Swift \
+         script and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: never-called siblings in the same files must still be
+    // reported dead, proving the fix is scoped to "called at top level"
+    // rather than "everything in a main.swift/shebang file is alive".
+    assert!(
+        unreachable_names.contains(&"unused".to_string()),
+        "unused is never called and must still be reported dead: {payload}"
+    );
+    assert!(
+        unreachable_names.contains(&"shebang_unused".to_string()),
+        "shebang_unused is never called and must still be reported dead: {payload}"
+    );
+}
