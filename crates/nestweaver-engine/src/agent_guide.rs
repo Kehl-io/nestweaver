@@ -604,7 +604,7 @@ pub fn generate_skill_with_tools(
     out.push_str("2. `investigate_hydrate(bundle_id)` — fills remaining bodies (may truncate long sources)\n");
     out.push_str("3. For entries where `body_complete` is `false`: call `read_symbols(uid)` to get the full untruncated source\n\n");
     out.push_str("The `body_complete` field tells you whether an inlined body is the full source (`true` or absent) or was truncated at the per-body cap (`false`). Only call `read_symbols` when the truncated tail matters for your task — skip it otherwise to save tokens.\n\n");
-    out.push_str("`investigate_expand` always returns the full untruncated body (`body_complete: true`), so no follow-up read is needed after expanding.\n\n");
+    out.push_str("`investigate_expand` fetches the full untruncated body when the source can be re-read (`body_complete` true or absent). If a previously truncated body can't be re-fetched, `body_complete` can still be `false` — check it the same way as after hydrate.\n\n");
 
     out.push_str("### Other tips\n\n");
     out.push_str("- The `summary` field on investigate entries is the first non-empty line of the body (capped at 200 chars), not an LLM-generated summary. Use it for quick scanning, not for understanding content.\n");

@@ -15447,7 +15447,7 @@ fn tool_investigate(
 fn tool_schema_investigate_expand() -> Value {
     json!({
         "name": "investigate_expand",
-        "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- Expanded entries always have body_complete: true (full untruncated body)\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
+        "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- The full untruncated body is fetched when the source can be re-read (body_complete true or absent). If a previously truncated body can't be re-fetched, body_complete can still be false — check it as you would after hydrate\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -15487,7 +15487,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
 fn tool_schema_investigate_hydrate() -> Value {
     json!({
         "name": "investigate_hydrate",
-        "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete: true means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
+        "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete true or absent means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -15521,6 +15521,73 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
     let db_path = current_db_path(store)?;
     let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
     Ok(serde_json::to_value(result)?)
+}
+
+#[cfg(test)]
+mod investigate_body_complete_schema_tests {
+    use super::*;
+
+    // nw-477: `BundleEntry::body_complete` is
+    // `#[serde(default = "default_true", skip_serializing_if = "is_true")]`
+    // (investigate.rs), so `true` is never actually written to the wire — it
+    // is OMITTED, and `false` is the only value that ever appears literally.
+    // These schema descriptions used to promise the opposite ("always have
+    // body_complete: true"), contradicting the tool's own JSON Schema
+    // contract. Pin the corrected "true or absent" phrasing — the same
+    // convention already used correctly at agent_guide.rs:606 — and guard
+    // against the sentence being silently deleted rather than fixed: a naive
+    // `str::replace` that drops the clause instead of correcting it would
+    // also make the negative assertion pass.
+    #[test]
+    fn investigate_schemas_describe_body_complete_as_true_or_absent() {
+        let expand_desc = tool_schema_investigate_expand()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !expand_desc.contains("body_complete: true"),
+            "expand schema must not claim body_complete is literally serialized as `true`: {expand_desc}"
+        );
+        assert!(
+            expand_desc.contains("body_complete"),
+            "expand schema must still document body_complete, not just drop the sentence: {expand_desc}"
+        );
+        assert!(
+            expand_desc.contains("or absent"),
+            "expand schema must use the true-or-absent phrasing: {expand_desc}"
+        );
+        // nw-477 follow-up: a previously truncated entry (body_complete=false
+        // from an earlier hydrate) that fails re-fetch inside
+        // investigate_expand (investigate.rs Err(_) if inline_body.is_some()
+        // branch, ~1288-1291) keeps expanded=true but never resets
+        // body_complete back to true. "Never false for an expanded entry"
+        // was therefore itself a false guarantee — it must not reappear.
+        assert!(
+            !expand_desc.contains("never false"),
+            "expand schema must not promise body_complete is never false for an expanded entry — a failed re-fetch on a previously truncated entry can leave it false: {expand_desc}"
+        );
+
+        let hydrate_desc = tool_schema_investigate_hydrate()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !hydrate_desc.contains("body_complete: true"),
+            "hydrate schema must not claim body_complete is literally serialized as `true`: {hydrate_desc}"
+        );
+        assert!(
+            hydrate_desc.contains("body_complete"),
+            "hydrate schema must still document body_complete, not just drop the sentence: {hydrate_desc}"
+        );
+        assert!(
+            hydrate_desc.contains("or absent"),
+            "hydrate schema must use the true-or-absent phrasing: {hydrate_desc}"
+        );
+        assert!(
+            !hydrate_desc.contains("never false"),
+            "hydrate schema must not claim body_complete is never false: {hydrate_desc}"
+        );
+    }
 }
 
 /// The nw-103 resolver-staleness disclosure, for tools whose numbers it invalidates.
