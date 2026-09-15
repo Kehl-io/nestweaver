@@ -123,6 +123,31 @@ pub struct DeadCodeResult {
     /// This is the same defect shape nw-351 closed for C++ specifically,
     /// generalised to every language rather than re-discovered one at a time.
     pub languages_without_entry_points: Vec<String>,
+    /// Repo-scope disclosure — `None` for an unfiltered call, `Some` when the
+    /// caller passed a `repos` filter (nw-479). See
+    /// [`detect_dead_code_in_repos_cancellable`] for the full semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DeadCodeScope>,
+}
+
+/// Repo-scope disclosure attached to a [`DeadCodeResult`] produced by
+/// [`detect_dead_code_in_repos_cancellable`] — nw-479.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadCodeScope {
+    /// Repo UIDs the caller filtered `unreachable_symbols` to, in the order
+    /// given.
+    pub repos: Vec<String>,
+    /// Always `"filtered"` today (the only shape this field can currently
+    /// take while `scope` is present at all). Carried as an explicit string
+    /// rather than inferred from `scope.is_some()` so a caller that only
+    /// reads this one field still learns, without cross-referencing the doc
+    /// comment, that `total_symbols`/`reachable_symbols`/`dead_percentage`
+    /// describe the SCOPED population — the repos in `repos` — and not the
+    /// whole graph, even though the reachability walk that produced them was
+    /// whole-graph. `entry_points`/`languages_without_entry_points` are the
+    /// deliberate exception: they stay whole-graph regardless of this field,
+    /// because they describe the walk's own coverage, not the output.
+    pub totals_population: &'static str,
 }
 
 impl DeadCodeResult {
@@ -367,7 +392,13 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 /// typed edges from the database (~500-700ms). This is inherent to the full-
 /// graph traversal approach and cannot be reduced without pre-computed caching.
 pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new(), None)
+    detect_dead_code_inner(
+        store,
+        DEFAULT_MIN_EDGE_CONFIDENCE,
+        &HashMap::new(),
+        None,
+        None,
+    )
 }
 
 /// Like [`detect_dead_code`], but cooperatively bails when `cancel` trips (a
@@ -381,7 +412,13 @@ pub fn detect_dead_code_cancellable(
     store: &GraphStore,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new(), cancel)
+    detect_dead_code_inner(
+        store,
+        DEFAULT_MIN_EDGE_CONFIDENCE,
+        &HashMap::new(),
+        None,
+        cancel,
+    )
 }
 
 /// Like [`detect_dead_code`] but with an explicit minimum edge confidence
@@ -392,7 +429,7 @@ pub fn detect_dead_code_with_confidence(
     store: &GraphStore,
     min_edge_confidence: f32,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), None)
+    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), None, None)
 }
 
 /// Cancellable variant of [`detect_dead_code_with_confidence`]; see
@@ -402,7 +439,7 @@ pub fn detect_dead_code_with_confidence_cancellable(
     min_edge_confidence: f32,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), cancel)
+    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), None, cancel)
 }
 
 /// Like [`detect_dead_code`] but also accepts parsed manifest data so that
@@ -412,7 +449,7 @@ pub fn detect_dead_code_with_manifests(
     store: &GraphStore,
     manifests: &HashMap<String, ManifestInfo>,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, None)
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, None, None)
 }
 
 /// Cancellable variant of [`detect_dead_code_with_manifests`]; see
@@ -422,15 +459,80 @@ pub fn detect_dead_code_with_manifests_cancellable(
     manifests: &HashMap<String, ManifestInfo>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, cancel)
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, None, cancel)
+}
+
+/// Like [`detect_dead_code_with_manifests_cancellable`] but also scopes the
+/// OUTPUT to a set of repos — nw-479, the `--repo`/`repos` filter for
+/// `dead-code`.
+///
+/// `repos = Some(uids)` — already-resolved repo UIDs, exactly like
+/// [`crate::hubs::find_hub_nodes_bounded_in_repos`]'s `repos` parameter — is
+/// intended to be built by `node_scope::resolve_repo_filter`/
+/// `resolve_repo_selector` at the call site (tools.rs / main.rs), which is
+/// also where an unknown repo name/UID surfaces as an error. This function
+/// trusts the set it is given; it does not re-validate that every UID exists.
+///
+/// **Decision (nw-479): the reachability WALK is never scoped, only the
+/// reported population is.** A symbol in a scoped repo that is called only
+/// from an *unscoped* repo is genuinely live — the caller asking about repo
+/// A does not stop repo B's code from calling into it — so narrowing the BFS
+/// itself to the scoped repos would misreport that symbol as dead. The BFS
+/// therefore always walks the WHOLE graph (identical adjacency, entry
+/// points, and `nw-489` extension-reachability propagation as the unscoped
+/// path), and `repos` is applied only once, in the final per-symbol pass
+/// that decides which rows become `unreachable_symbols` — after every
+/// suppression rule (dead-class/dead-Extension method hiding, cfg-twin
+/// dedup) has already run over the full, unscoped symbol set. This also
+/// means a dead impl block's methods stay hidden under a repo filter exactly
+/// as they do without one: `members_by_extension`/`suppressed_member_uids`
+/// never see the filter, so scoping cannot un-suppress a method the
+/// unscoped path would have hidden.
+///
+/// `total_symbols`/`reachable_symbols`/`dead_percentage` on the result ARE
+/// scoped when `repos` is `Some` — they describe the repos the caller asked
+/// about, not the whole graph, which is what a caller scoping to one repo
+/// out of a monorepo actually wants to see (`scope.totals_population` on the
+/// result discloses this). `entry_points`/`languages_without_entry_points`
+/// stay whole-graph on purpose: they are coverage/health signals about the
+/// WALK, not the output, and a scoped repo can legitimately own zero of its
+/// own entry points (e.g. a library consumed only by an app in another
+/// repo) without that being a coverage gap for THIS repo's numbers.
+///
+/// **The stale-resolver refusal (see `resolver_generation.rs`) stays
+/// whole-store, not scoped to `repos`, and is unaffected by this function**
+/// — it runs at the call site before this is ever invoked. Because the walk
+/// itself is whole-graph, a stale repo ANYWHERE (not just inside the
+/// caller's `repos`) can withhold an edge that would have made a scoped
+/// symbol reachable, so the refusal must keep consulting every repo's
+/// resolver generation, exactly as the unscoped path does today.
+///
+/// `repos = None` is byte-for-byte
+/// [`detect_dead_code_with_manifests_cancellable`]: `scope` is absent from
+/// the result (not `Some` with an empty list), and every count is computed
+/// exactly as before nw-479.
+pub fn detect_dead_code_in_repos_cancellable(
+    store: &GraphStore,
+    min_edge_confidence: f32,
+    manifests: &HashMap<String, ManifestInfo>,
+    repos: Option<&HashSet<String>>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_inner(store, min_edge_confidence, manifests, repos, cancel)
 }
 
 /// Core implementation combining confidence-aware BFS with type exclusion,
 /// manifest-driven entry points, and dead-class method deduplication.
+///
+/// `repos` is the nw-479 output-scoping filter; see
+/// [`detect_dead_code_in_repos_cancellable`] for the full contract. Every
+/// existing caller passes `None`, which keeps this function byte-for-byte
+/// its pre-nw-479 behavior.
 fn detect_dead_code_inner(
     store: &GraphStore,
     min_edge_confidence: f32,
     manifests: &HashMap<String, ManifestInfo>,
+    repos: Option<&HashSet<String>>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
     // 1. Load all symbols and partition into analysable / excluded.
@@ -459,6 +561,19 @@ fn detect_dead_code_inner(
         .filter(|s| !is_excluded_from_dead_code(s) && !function_local.contains(&s.uid))
         .collect();
 
+    // nw-479: the repo-scope disclosure, built once and cloned into every
+    // return point below. `None` (no filter) produces `scope: None`, which
+    // `#[serde(skip_serializing_if)]` drops from JSON entirely, so an
+    // unfiltered call's output is byte-for-byte its pre-nw-479 shape.
+    let scope: Option<DeadCodeScope> = repos.map(|r| {
+        let mut repos: Vec<String> = r.iter().cloned().collect();
+        repos.sort();
+        DeadCodeScope {
+            repos,
+            totals_population: "filtered",
+        }
+    });
+
     if all_symbols.is_empty() {
         return Ok(DeadCodeResult {
             unreachable_symbols: vec![],
@@ -472,6 +587,7 @@ fn detect_dead_code_inner(
             undecodable_symbols,
             entry_points: 0,
             languages_without_entry_points: vec![],
+            scope,
         });
     }
 
@@ -653,7 +769,18 @@ fn detect_dead_code_inner(
     }
 
     // 6. Collect unreachable symbols with confidence scoring.
-    let total_symbols = all_symbols.len();
+    //
+    // nw-479: `total_symbols` is scoped to `repos` when a filter is given —
+    // see `detect_dead_code_in_repos_cancellable`'s doc for why this (and
+    // `reachable_symbols`/`dead_percentage`, both derived from it below) is
+    // scoped while the reachability walk that fed it stays whole-graph.
+    let total_symbols = match repos {
+        Some(r) => all_symbols
+            .iter()
+            .filter(|s| r.contains(s.repo_uid.as_str()))
+            .count(),
+        None => all_symbols.len(),
+    };
 
     // Symbols in best_path_conf with strong path confidence are truly reachable.
     let strong_reachable: HashSet<&String> = best_path_conf
@@ -786,6 +913,20 @@ fn detect_dead_code_inner(
         if suppressed_member_uids.contains(&sym.uid) {
             continue;
         }
+        // nw-479: the repo-scope filter is applied LAST, after every
+        // reachability and suppression decision above has already run over
+        // the whole, unscoped symbol set (see
+        // `detect_dead_code_in_repos_cancellable`'s doc). A symbol outside
+        // `repos` is simply dropped from the reported rows here — it never
+        // affects reachability, cfg-twin suppression, or dead-class/dead-
+        // Extension method hiding, all of which already ran above this
+        // filter and would silently misbehave (e.g. un-suppressing a dead
+        // impl block's methods) if scoped any earlier.
+        if let Some(r) = repos
+            && !r.contains(sym.repo_uid.as_str())
+        {
+            continue;
+        }
 
         let visibility_str = sym.visibility.to_string();
 
@@ -846,6 +987,7 @@ fn detect_dead_code_inner(
         undecodable_symbols,
         entry_points: entry_point_uids.len(),
         languages_without_entry_points,
+        scope,
     })
 }
 
@@ -973,6 +1115,23 @@ mod tests {
             type_info: None,
             framework_hint: None,
             canonical_id: None,
+        }
+    }
+
+    /// Like [`make_symbol_with_kind`] but with an explicit `repo_uid` —
+    /// nw-479's repo-filter tests need symbols spread across more than the
+    /// fixed `"repo-1"` every other fixture in this file uses.
+    fn make_symbol_in_repo(
+        uid: &str,
+        name: &str,
+        kind: SymbolKind,
+        file_path: &str,
+        repo_uid: &str,
+        is_entry: bool,
+    ) -> Symbol {
+        Symbol {
+            repo_uid: repo_uid.to_string(),
+            ..make_symbol_with_kind(uid, name, kind, file_path, is_entry)
         }
     }
 
@@ -2657,8 +2816,8 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        let result = detect_dead_code_inner(&store, 0.3, &HashMap::new(), None, None)
+            .expect("detect_dead_code");
         assert!(
             result
                 .unreachable_symbols
@@ -2689,8 +2848,8 @@ mod tests {
         store.insert_symbol(&a).unwrap();
         store.insert_symbol(&b).unwrap();
 
-        let result =
-            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        let result = detect_dead_code_inner(&store, 0.3, &HashMap::new(), None, None)
+            .expect("detect_dead_code");
         assert_eq!(
             result
                 .unreachable_symbols
@@ -2742,8 +2901,8 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        let result = detect_dead_code_inner(&store, 0.3, &HashMap::new(), None, None)
+            .expect("detect_dead_code");
         assert!(
             result
                 .unreachable_symbols
@@ -2893,6 +3052,434 @@ mod tests {
         assert!(
             result.coverage_is_complete(),
             "a language with no entry-point model must not degrade coverage"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // nw-479: `--repo`/`repos` output filter for `dead-code`.
+    // ---------------------------------------------------------------------
+
+    /// The core nw-479 contract: the reachability WALK must stay whole-graph
+    /// even when the OUTPUT is scoped to one repo.
+    ///
+    /// - A symbol in the scoped repo that is called only from an UNSCOPED
+    ///   repo is genuinely live and must never appear in the scoped result
+    ///   (the counterweight that proves the walk was not narrowed).
+    /// - A genuinely unused symbol inside the scoped repo must still
+    ///   surface (proves the filter is not silently hiding real dead code).
+    /// - A genuinely dead symbol in the UNSCOPED repo must never appear
+    ///   either (proves the OUTPUT is actually filtered, not just that
+    ///   reachability was left alone).
+    #[test]
+    fn dead_code_repo_filter_keeps_global_reachability() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // repo-b: an entry point that calls into repo-a.
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:caller",
+                "caller_in_b",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                true,
+            ))
+            .unwrap();
+        // repo-b: genuinely dead, on purpose -- must never leak into a
+        // repo-a-scoped result even though it IS unreachable.
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:dead",
+                "dead_in_b",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                false,
+            ))
+            .unwrap();
+        // repo-a: called only from repo-b -- must read as LIVE when scoped
+        // to repo-a alone, because the WALK still sees repo-b's call.
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:used_by_b",
+                "used_by_b",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+        // repo-a: genuinely unused -- the counterweight to the line above.
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:truly_dead",
+                "truly_dead_in_a",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b:caller".to_string(),
+                target_uid: "a:used_by_b".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let mut repos = HashSet::new();
+        repos.insert("repo-a".to_string());
+        let result = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            Some(&repos),
+            None,
+        )
+        .unwrap();
+
+        let names: Vec<&str> = result
+            .unreachable_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"used_by_b"),
+            "a symbol in the scoped repo called only from an UNSCOPED repo \
+             must still read as live -- the walk must not have been \
+             narrowed to the scoped repo: {names:?}"
+        );
+        assert!(
+            names.contains(&"truly_dead_in_a"),
+            "a genuinely unused symbol inside the scoped repo must still \
+             surface: {names:?}"
+        );
+        assert!(
+            !names.contains(&"dead_in_b"),
+            "a genuinely dead symbol in an UNSCOPED repo must never appear \
+             in a scoped result: {names:?}"
+        );
+        assert!(
+            !names.contains(&"caller_in_b"),
+            "an unscoped repo's own (reachable) symbols must never appear \
+             in a scoped result either: {names:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT (nw-479): calling the new repo-scoped entry point with
+    /// `repos: None` must be byte-for-byte identical to the pre-nw-479
+    /// path -- same `unreachable_symbols`, same totals, and no `scope` key
+    /// on the result at all (not `Some` with an empty list).
+    #[test]
+    fn dead_code_no_repos_filter_is_byte_identical_to_before() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:main",
+                "main_b",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:dead1",
+                "dead_a1",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:dead1",
+                "dead_b1",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                false,
+            ))
+            .unwrap();
+
+        let baseline =
+            detect_dead_code_with_manifests_cancellable(&store, &HashMap::new(), None).unwrap();
+        let via_new = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            via_new.scope.is_none(),
+            "an unfiltered call must not carry a scope at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).unwrap(),
+            serde_json::to_value(&via_new).unwrap(),
+            "repos: None must be byte-identical (as serialized JSON) to the \
+             pre-nw-479 function"
+        );
+    }
+
+    /// `total_symbols`/`reachable_symbols`/`dead_percentage` describe the
+    /// SCOPED population when `repos` is given, but `entry_points` (a
+    /// coverage/health signal about the WALK, not the output) stays
+    /// whole-graph -- a scoped repo that owns zero entry points of its own
+    /// (a library called only from elsewhere) must not read as a coverage
+    /// gap just because it was scoped.
+    #[test]
+    fn dead_code_repo_filter_scopes_totals_but_not_entry_points() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:main",
+                "main_b",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                true,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:dead1",
+                "dead_a1",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:dead2",
+                "dead_a2",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+
+        let mut repos = HashSet::new();
+        repos.insert("repo-a".to_string());
+        let result = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            Some(&repos),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.total_symbols, 2,
+            "total_symbols must describe the SCOPED population (repo-a's \
+             own 2 symbols), not the whole 3-symbol graph"
+        );
+        assert_eq!(result.unreachable_symbols.len(), 2);
+        assert_eq!(result.reachable_symbols, 0);
+        assert!((result.dead_percentage - 100.0).abs() < f64::EPSILON);
+        assert_eq!(
+            result.entry_points, 1,
+            "entry_points must stay WHOLE-GRAPH -- repo-b's real entry \
+             point, even though repo-a itself owns none"
+        );
+        assert!(
+            result.coverage_is_complete(),
+            "a scoped repo with zero entry points of its own must not read \
+             as a coverage gap while the global walk had a real entry point"
+        );
+        let scope = result.scope.expect("a filtered call must carry a scope");
+        assert_eq!(scope.repos, vec!["repo-a".to_string()]);
+        assert_eq!(scope.totals_population, "filtered");
+    }
+
+    /// Coordination with nw-489: a repo filter must not defeat the dead-
+    /// Extension method suppression (`suppressed_member_uids`). The dead
+    /// impl block and its dead method are both in the scoped repo, and the
+    /// suppression must behave exactly as it does unscoped -- the block is
+    /// reported, the method is not double-reported alongside it.
+    #[test]
+    fn dead_code_repo_filter_still_hides_a_dead_impl_blocks_methods() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "entry",
+                "main",
+                SymbolKind::Function,
+                "src/main.rs",
+                "repo-a",
+                true,
+            ))
+            .unwrap();
+
+        let cls = make_symbol_in_repo(
+            "cls",
+            "Foo",
+            SymbolKind::Class,
+            "src/lib.rs",
+            "repo-a",
+            false,
+        );
+        store.insert_symbol(&cls).unwrap();
+
+        let mut method = make_symbol_in_repo(
+            "method",
+            "helper",
+            SymbolKind::Method,
+            "src/lib.rs",
+            "repo-a",
+            false,
+        );
+        method.start_line = 3;
+        method.end_line = 5;
+        store.insert_symbol(&method).unwrap();
+
+        let mut ext = make_symbol_in_repo(
+            "ext",
+            "Foo",
+            SymbolKind::Extension,
+            "src/lib.rs",
+            "repo-a",
+            false,
+        );
+        ext.start_line = 1;
+        ext.end_line = 10;
+        store.insert_symbol(&ext).unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "method".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::MemberOf,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let mut repos = HashSet::new();
+        repos.insert("repo-a".to_string());
+        let result = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            Some(&repos),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.unreachable_symbols.iter().any(|s| s.uid == "cls"),
+            "the dead struct must still be reported under a repo filter"
+        );
+        assert!(
+            result.unreachable_symbols.iter().any(|s| s.uid == "ext"),
+            "the dead impl block must still be reported under a repo filter"
+        );
+        assert!(
+            !result.unreachable_symbols.iter().any(|s| s.uid == "method"),
+            "the shared dead method must stay suppressed under a repo \
+             filter, exactly as it is unscoped"
+        );
+    }
+
+    /// The engine trusts an already-resolved `repos` set (built by
+    /// `node_scope::resolve_repo_filter` at the call site, which is also
+    /// where an unknown repo name/UID is rejected as an error). A UID with
+    /// no matching symbols in the store is therefore NOT an engine-level
+    /// error -- it is indistinguishable here from "this repo has no
+    /// analysable symbols right now", and simply produces an empty, valid
+    /// result.
+    #[test]
+    fn dead_code_repo_filter_with_no_matching_symbols_is_empty_not_an_error() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:dead",
+                "dead_a",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+
+        let mut repos = HashSet::new();
+        repos.insert("repo-does-not-exist".to_string());
+        let result = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            Some(&repos),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.total_symbols, 0);
+        assert!(result.unreachable_symbols.is_empty());
+        assert_eq!(
+            result
+                .scope
+                .expect("a filtered call must carry a scope")
+                .repos,
+            vec!["repo-does-not-exist".to_string()]
+        );
+    }
+
+    /// `scope.repos` is sorted regardless of the caller's `HashSet`
+    /// iteration order, so JSON output (and any test asserting on it) is
+    /// deterministic across runs.
+    #[test]
+    fn dead_code_repo_filter_scope_repos_are_sorted() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "a:dead",
+                "dead_a",
+                SymbolKind::Function,
+                "a/src/lib.rs",
+                "repo-a",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo(
+                "b:dead",
+                "dead_b",
+                SymbolKind::Function,
+                "b/src/lib.rs",
+                "repo-b",
+                false,
+            ))
+            .unwrap();
+
+        let mut repos = HashSet::new();
+        repos.insert("repo-b".to_string());
+        repos.insert("repo-a".to_string());
+        let result = detect_dead_code_in_repos_cancellable(
+            &store,
+            DEFAULT_MIN_EDGE_CONFIDENCE,
+            &HashMap::new(),
+            Some(&repos),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.scope.unwrap().repos,
+            vec!["repo-a".to_string(), "repo-b".to_string()]
         );
     }
 }
