@@ -3347,6 +3347,294 @@ async fn daemon_mcp_boundary_federates_two_tier() {
     );
 }
 
+// ── nw-451: CLI text rendering of the org-wide `impact` tier ──────────────
+//
+// `render_impact_tier_text` (main.rs:3030) and `brain_impact_org_tier`
+// (main.rs:3104) were unit-tested only at the JSON-shape level
+// (`brain_impact_tier_tests`, its `two_tier()` fixture) -- nothing drove the
+// actual CLI binary's TEXT stdout through a real two-tier setup. The two
+// tests below close that gap.
+//
+// SCOPE. These tests claim rendering only, not daemon-side federation
+// coordination. `brain_impact` is TwoTier-routed
+// (`nestweaver-federation/src/routing.rs`), and for the CLI that means the
+// running `nestweaver` PROCESS's own `HybridClient::query`
+// (`crates/nestweaver-client/src/hybrid.rs`) delegates to
+// `nestweaver_federation::two_tier::two_tier_query`, which discovers
+// `[[upstream]]` entries straight out of `--config` and dials the upstream
+// itself. The autostarted LOCAL daemon never acts as a federation
+// coordinator here -- that path (a raw MCP POST to a *fronting* daemon
+// configured with an upstream) is what `daemon_mcp_boundary_federates_two_tier`
+// above already proves. The envelope these two tests observe is assembled by
+// the CLI binary's own client-side two-tier merge; the CLI may build it
+// itself, and that is exactly the thing being pinned.
+
+/// Bind a TCP port and immediately release it, returning a port number that
+/// nothing is listening on. Used as a "genuinely unreachable" upstream
+/// address -- a bound-then-closed port refuses the connection immediately,
+/// unlike an unroutable IP (which can hang) or a made-up hostname (which can
+/// resolve unpredictably in some CI DNS setups).
+///
+/// Bind-then-release is inherently racy -- another process on the same host
+/// could rebind this exact port before the CLI dials it. A held listener
+/// would close that race, but then the address would refuse the connection
+/// for the WRONG reason (a live listener not accepting) rather than the one
+/// this test wants (nothing there at all); the window between release and
+/// dial is microseconds, so the trade is accepted rather than engineered
+/// around.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Point every HOME/XDG variable a spawned `nestweaver` process consults at
+/// scratch directories under `home`, strip anything that could smuggle a
+/// bypass request into the child, and shorten the autostarted daemon's
+/// ephemeral idle window so it does not linger for the production default
+/// (60s) after the test moves on.
+///
+/// Isolating `XDG_CONFIG_HOME`/`HOME` is load-bearing, not cosmetic: the
+/// CLI's upstream discovery
+/// (`nestweaver_federation::discovery::discover_upstreams_with_config`) also
+/// reads `$XDG_CONFIG_HOME/nestweaver/upstreams.toml` and honors
+/// `NESTWEAVER_UPSTREAM` -- either one, left un-isolated, could silently add
+/// to or shadow the single upstream these tests configure via `--config`.
+/// `XDG_RUNTIME_DIR`/`XDG_STATE_HOME` are isolated for the same reason on the
+/// daemon side: the autostarted daemon's socket (runtime dir) and
+/// pidfile/state live under these, and an un-isolated pair would have the
+/// test's autostarted daemon compete for the SAME socket/pidfile paths a
+/// developer's real daemon (or another parallel test) uses. The
+/// `NESTWEAVER_NO_DAEMON`/`NESTWEAVER_ALLOW_NO_DAEMON` removals follow the
+/// same `env_remove` idiom `daemon_test.rs`'s `daemon_cmd()` uses to
+/// guarantee the daemon-routed path is exercised regardless of the
+/// surrounding shell's environment.
+fn isolate_nestweaver_env(cmd: &mut StdCommand, home: &std::path::Path) {
+    cmd.env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_RUNTIME_DIR", home.join("runtime"))
+        .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "5");
+}
+
+/// Best-effort immediate shutdown of the daemon these tests autostart against
+/// `db_path`, so it does not sit around for its (shortened) idle window after
+/// the test's tempdir is gone. Errors are ignored: cleanup, not an assertion.
+fn stop_daemon_quietly(db_path: &std::path::Path, home: &std::path::Path) {
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    cmd.args(["daemon", "--db", &db_path.display().to_string(), "stop"]);
+    isolate_nestweaver_env(&mut cmd, home);
+    let _ = cmd.output();
+}
+
+/// RAII cleanup for the daemon these tests autostart against `db`. Runs the
+/// same best-effort `daemon ... stop` as [`stop_daemon_quietly`] on `Drop`,
+/// so the daemon is reaped even when an assertion panics mid-test -- the
+/// trailing statement it replaces would never run in that case. Mirrors
+/// `ServerGuard`'s own kill-on-drop convention
+/// (`tests/helpers/server_guard.rs:26-29`, "the child is killed... ensuring
+/// cleanup even on test panics").
+///
+/// `isolate_nestweaver_env`'s `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS=5`
+/// remains a backstop for the case this guard's own `Drop` never runs (a hard
+/// process abort) -- it is not the primary cleanup mechanism once this guard
+/// exists.
+struct AutostartedDaemonGuard {
+    db: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+impl AutostartedDaemonGuard {
+    /// Construct BEFORE the CLI invocation that autostarts the daemon (or
+    /// immediately after), so the guard is live for the whole call and any
+    /// assertion that follows it -- not just for a successful return.
+    fn new(db: &std::path::Path, home: &std::path::Path) -> Self {
+        Self {
+            db: db.to_path_buf(),
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for AutostartedDaemonGuard {
+    fn drop(&mut self) {
+        // Best-effort and infallible by construction: `stop_daemon_quietly`
+        // already discards its `Output`/spawn error, and `Drop` must never
+        // panic (a panic during unwind would abort the process).
+        stop_daemon_quietly(&self.db, &self.home);
+    }
+}
+
+/// Drive the real `nestweaver` binary's `impact` text output through a
+/// healthy two-tier setup: a local daemon (autostarted by the CLI itself,
+/// pointed at `--config` for upstream discovery) and a real upstream
+/// `ServerGuard`. Per the gate at main.rs ~20156
+/// (`use_daemon && repo_filter.is_none() && min_score.is_none() && confidence
+/// <= 0.0`), the invocation deliberately passes none of `--repo`,
+/// `--min-score`, `--confidence`, and never sets `NESTWEAVER_NO_DAEMON` --
+/// any one of those would fall through to the direct (non-daemon,
+/// non-federated) path and this test would prove nothing about the org-wide
+/// renderer.
+#[tokio::test]
+async fn daemon_impact_cli_renders_org_wide_tier_text() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Upstream ("org") server: carries the SAME symbol name the CLI queries
+    // (`two_tier_query` forwards `params` upstream unchanged), with a real
+    // dependent so the org-wide `impact_nodes` list is non-empty -- the
+    // dependent's name in stdout is what proves the tier actually rendered,
+    // not merely its heading.
+    let server_repo = dir.path().join("repo_upstream");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[(
+            "server/main.js",
+            "function localimpactfn(x) { return x; }\n\
+             function orgwidedependentfn(x) { return localimpactfn(x); }",
+        )],
+    );
+    index_repo(&server_repo, &db_server);
+    let upstream = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+
+    // Local db: must ALSO resolve `localimpactfn`, or the daemon route's
+    // not-found branch (main.rs ~20196) returns before the org tier is ever
+    // read.
+    let local_repo = dir.path().join("repo_local");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("local/main.js", "function localimpactfn(x) { return x; }")],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "orgserver", &upstream.grpc_addr(), HYBRID_TOKEN);
+
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Constructed BEFORE the CLI invocation so the daemon it autostarts is
+    // reaped on drop even if an assertion below panics.
+    let _daemon_guard = AutostartedDaemonGuard::new(&db_local, &home);
+
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    cmd.args([
+        "impact",
+        "localimpactfn",
+        "--db",
+        &db_local.display().to_string(),
+        "--config",
+        &cfg_path.display().to_string(),
+    ]);
+    isolate_nestweaver_env(&mut cmd, &home);
+    let output = cmd.output().expect("failed to run nestweaver impact");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "impact should succeed with a healthy upstream; stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Org-wide impact (via "),
+        "must render the org-wide tier heading; got stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("orgwidedependentfn"),
+        "the org tier's own impact node must be rendered, not just its \
+         heading; got stdout={stdout}"
+    );
+}
+
+/// COUNTERWEIGHT to the test above: an upstream that is healthy at discovery
+/// time (`UpstreamHandle::healthy` starts `true`,
+/// `nestweaver-federation/src/upstream.rs`, and its gRPC channel connects
+/// lazily) but refuses the actual dispatch -- a bound-then-released port,
+/// nothing listening -- must still render as `two_tier`, with `org_wide_impact`
+/// reported as unavailable rather than silently dropped
+/// (`nestweaver_federation::two_tier::two_tier_query`'s `server_result ==
+/// None` branch). This is the same branch
+/// `an_unavailable_upstream_is_an_org_tier_without_results` already proves at
+/// the JSON level (main.rs `brain_impact_tier_tests`); this test proves the
+/// CLI's TEXT renderer reaches it end to end, and that the local tier still
+/// renders unaffected alongside it.
+#[tokio::test]
+async fn daemon_impact_cli_renders_org_wide_tier_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let dead_port = free_port();
+    let dead_upstream_addr = format!("http://127.0.0.1:{dead_port}");
+
+    let local_repo = dir.path().join("repo_local");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[(
+            "local/main.js",
+            "function localimpactfn(x) { return x; }\n\
+             function localdependentfn(x) { return localimpactfn(x); }",
+        )],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "deadorg", &dead_upstream_addr, HYBRID_TOKEN);
+
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Constructed BEFORE the CLI invocation so the daemon it autostarts is
+    // reaped on drop even if an assertion below panics.
+    let _daemon_guard = AutostartedDaemonGuard::new(&db_local, &home);
+
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    cmd.args([
+        "impact",
+        "localimpactfn",
+        "--db",
+        &db_local.display().to_string(),
+        "--config",
+        &cfg_path.display().to_string(),
+    ]);
+    isolate_nestweaver_env(&mut cmd, &home);
+    let output = cmd.output().expect("failed to run nestweaver impact");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "impact should still succeed with an unreachable upstream (local tier \
+         found, org tier reported unavailable); stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Org-wide impact: unavailable"),
+        "an upstream that refuses the connection must render the \
+         'unavailable' branch, not silently drop the org section; got \
+         stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("Org-wide impact (via "),
+        "the healthy-tier heading must not also appear for a dead upstream; \
+         got stdout={stdout}"
+    );
+
+    // The local tier must still render, unaffected by the org tier's
+    // failure -- guards against a regression that renders the org section
+    // but silently drops the local one.
+    assert!(
+        stdout.contains("localdependentfn"),
+        "local tier must still render its own dependent; got stdout={stdout}"
+    );
+}
+
 /// A repository-restricted HTTP caller must never inherit the broader
 /// configured upstream credential. The admin request proves the upstream
 /// fixture can return its hidden canary; the restricted request must keep only
