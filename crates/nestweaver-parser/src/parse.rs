@@ -417,6 +417,88 @@ fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
     false
 }
 
+/// True if `node` is NOT lexically nested inside any function/method body —
+/// i.e. it executes when the file is loaded (Python: at import time; bash: as
+/// soon as the interpreter reaches it), rather than only when some named
+/// function is later called. See nw-435.
+///
+/// Python: any `function_definition` or `lambda` ancestor disqualifies it.
+/// This deliberately does NOT special-case `if __name__ == "__main__":` —
+/// Python executes every top-level statement (including ones nested inside a
+/// module-level `if`) at import time, so a call inside that block has no
+/// `function_definition` ancestor either. The single rule already covers both
+/// the bare-top-level case and the `__main__`-guarded case.
+///
+/// Bash: any `function_definition` ancestor disqualifies it. `if`/`for`/
+/// `while`/`{ }` wrappers at the top level do not, because bash has no
+/// separate "top-level scope" node the way Python has `module` — the absence
+/// of a `function_definition` ancestor IS top level.
+///
+/// KNOWN IMPRECISION, both low-impact and deliberately not special-cased:
+///  * False positive: a call inside `if TYPE_CHECKING:` reads as top level by
+///    this rule even though `TYPE_CHECKING` is always `False` at runtime and
+///    the block never executes. Rare in practice — that block is conventionally
+///    reserved for type-only imports/annotations, not calls.
+///  * False negative: a call in a parameter DEFAULT — `def f(x=helper()):` —
+///    sits inside the enclosing `function_definition`'s `parameters` node, so
+///    this walk finds a disqualifying `function_definition` ancestor and
+///    treats it as non-top-level, even though Python evaluates defaults once,
+///    at `def` time, not per call. `helper` is missed by this rule.
+///
+/// Unbounded walk (unlike `has_export_ancestor`'s fixed 3 hops): function
+/// nesting depth is not bounded the way export-wrapping is, and the walk is
+/// still O(depth) per call reference — negligible next to parsing itself.
+fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
+    let disqualifying: &[&str] = match lang_str {
+        "python" => &["function_definition", "lambda"],
+        "bash" => &["function_definition"],
+        _ => return false,
+    };
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if disqualifying.contains(&n.kind()) {
+            return false;
+        }
+        current = n.parent();
+    }
+    true
+}
+
+/// True if the reference's callee is a bare name, checked by the callee's OWN
+/// syntax node shape rather than by the reference's captured name.
+///
+/// nw-435 code-quality review: `top_level_called` used to key on the captured
+/// bare NAME alone, and `queries/python.scm`'s attribute-call rule —
+/// `(call function: (attribute attribute: (identifier) @name))` — captures
+/// only the trailing identifier. So a module with an unrelated, never-called
+/// `def run():` plus a top-level `obj.run()` wrongly rooted the dead `run`
+/// function: `obj.run()` can only ever invoke `C.run` (a `Method`), never a
+/// module-level function of the same name, and `mod.run()` is a cross-file
+/// call — an already-disclosed gap this rule does not attempt to close.
+///
+/// Python: a `call` node roots only when its own `function` field is a plain
+/// `identifier` (`helper()`), not an `attribute` (`obj.run()` / `mod.run()`).
+/// A bare `@decorator` (no call, no parens) is captured by a separate rule —
+/// `(decorator (identifier) @name)` — that only ever matches a plain
+/// identifier, so a `decorator` node reaching here is unconditionally bare.
+///
+/// Bash: `queries/bash.scm` has no attribute-call syntax at all — its only
+/// `@reference.call` rule is `(command name: (command_name (word) @name))` —
+/// so every `command` node reaching here is already bare by construction.
+fn callee_is_bare_identifier(node: &tree_sitter::Node, lang_str: &str) -> bool {
+    match lang_str {
+        "python" => match node.kind() {
+            "call" => node
+                .child_by_field_name("function")
+                .is_some_and(|f| f.kind() == "identifier"),
+            "decorator" => true,
+            _ => false,
+        },
+        "bash" => node.kind() == "command",
+        _ => false,
+    }
+}
+
 /// Collect the text of `attribute_item` siblings immediately preceding `node`.
 ///
 /// In tree-sitter-rust an outer attribute like `#[test]` is a *preceding sibling*
@@ -1162,6 +1244,13 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut references: Vec<RawReference> = Vec::new();
     let mut seen_symbols: std::collections::HashSet<(String, u32)> =
         std::collections::HashSet::new();
+    // nw-435: names called by a Python or bash call/command with no enclosing
+    // `function_definition` (and, for Python, no enclosing `lambda`) ancestor —
+    // see `is_top_level_reference` below. Collected during the capture loop,
+    // where the reference's own tree-sitter node is already in scope, rather
+    // than recovered afterward from `references` (which does not retain the
+    // AST node).
+    let mut top_level_called: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
@@ -1352,6 +1441,21 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
                 let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
+                // nw-435: a call/command with no enclosing function body
+                // executes as soon as the file is loaded (Python: at import
+                // time; bash: as soon as the interpreter reaches it), so its
+                // callee is a reachability ROOT rather than an ordinary call
+                // target. Collected here, not derived from `references`
+                // afterward, because `node` — the actual call/command node —
+                // is only in scope inside this capture loop.
+                if kind == ReferenceKind::Call
+                    && matches!(lang_str, "python" | "bash")
+                    && is_top_level_reference(&node, lang_str)
+                    && callee_is_bare_identifier(&node, lang_str)
+                {
+                    top_level_called.insert(name.clone());
+                }
+
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
                 // are native HTML tags (div, span, etc.), not component references.
@@ -1520,6 +1624,27 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     symbol.is_entry_point = true;
                     symbol.entry_point_kind = Some(EntryPointKind::Main);
                 }
+            }
+        }
+    }
+
+    // nw-435: promote same-file `Function` symbols called with no enclosing
+    // function body to reachability roots. `detect_python`/`detect_bash`
+    // (entry_points.rs) only recognise a function literally named `main`, so a
+    // bash script or Python module whose top level is bare statements had NO
+    // entry point at all and every function it defined was reported 100%
+    // dead. Restricted to `SymbolKind::Function` (never `Method`): a
+    // module-scope `obj.run()` captures only the bare method name `run`, and
+    // matching it against any same-named `Method` on any class in the file
+    // would root a symbol the call site never actually referenced.
+    if !top_level_called.is_empty() {
+        for symbol in &mut symbols {
+            if !symbol.is_entry_point
+                && symbol.kind == SymbolKind::Function
+                && top_level_called.contains(symbol.name.as_str())
+            {
+                symbol.is_entry_point = true;
+                symbol.entry_point_kind = Some(EntryPointKind::Main);
             }
         }
     }
@@ -7952,6 +8077,150 @@ mod reachability_recovery_tests {
         );
         let parsed = parse("benchmarks/charts.py", src);
         assert_eq!(reads(&parsed), vec!["REPO_ORDER"]);
+    }
+
+    fn find<'a>(parsed: &'a ParsedFile, name: &str) -> &'a RawSymbol {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol named {name}"))
+    }
+
+    /// nw-435. A bash script or Python module whose top level is bare
+    /// statements had no entry point at all, so every function it defined was
+    /// reported 100% dead — the dominant real-world bash idiom, and a common
+    /// Python one, being the broken case. Called-at-module-scope must root the
+    /// callee.
+    #[test]
+    fn python_function_called_at_module_scope_is_an_entry_point() {
+        let src = concat!(
+            "def helper():\n",
+            "    return 1\n",
+            "\n",
+            "def unused_helper():\n",
+            "    return 2\n",
+            "\n",
+            "helper()\n",
+        );
+        let parsed = parse("script.py", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a module-scope call roots its callee"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a function that is never called anywhere stays dead
+        // — proves the rule is scoped to "called at top level", not "every
+        // function in a directly-run file".
+        let unused = find(&parsed, "unused_helper");
+        assert!(
+            !unused.is_entry_point,
+            "a never-called function must not be swept up as an entry point"
+        );
+    }
+
+    /// The dominant real Python idiom wraps the top-level call in
+    /// `if __name__ == "__main__":`. `is_top_level_reference` does not
+    /// special-case this guard — see its doc comment — so this pins that the
+    /// no-special-case design actually covers it.
+    #[test]
+    fn python_function_called_under_dunder_main_is_an_entry_point() {
+        let src = concat!(
+            "def run_job(): pass\n",
+            "if __name__ == \"__main__\":\n",
+            "    run_job()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run_job = find(&parsed, "run_job");
+        assert!(run_job.is_entry_point);
+        assert_eq!(run_job.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// A call from inside another function's body only ever runs when that
+    /// enclosing function is invoked — it is not itself a reachability root.
+    #[test]
+    fn python_call_inside_a_function_body_does_not_root_the_callee() {
+        let parsed = parse("script.py", "def a(): b()\ndef b(): pass\n");
+        let b = find(&parsed, "b");
+        assert!(
+            !b.is_entry_point,
+            "a call from inside another function body is not top level"
+        );
+    }
+
+    /// COUNTERWEIGHT restricting the rule to `SymbolKind::Function`. A
+    /// module-scope `obj.run()` captures only the bare name `run`; matching it
+    /// against a same-named `Method` on a class in the file would root a
+    /// symbol the call site never actually referenced (and would generalize
+    /// badly to any file with multiple classes sharing a method name).
+    #[test]
+    fn python_attribute_call_at_module_scope_roots_only_same_file_functions() {
+        let src = concat!(
+            "class C:\n",
+            "    def run(self): pass\n",
+            "obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Method)
+            .expect("fixture defines the run method");
+        assert!(
+            !run.is_entry_point,
+            "the rule is restricted to Function kinds and must not root a Method"
+        );
+    }
+
+    /// COUNTERWEIGHT, false-positive found in code-quality review: matching by
+    /// bare NAME alone (rather than by the callee's own syntax shape) let an
+    /// attribute call root an UNRELATED same-named module-level `Function`.
+    /// `obj.run()` can only ever invoke `C.run`, a `Method` — it cannot invoke
+    /// a module-level `def run():`, so the module-level `run` must stay dead.
+    #[test]
+    fn python_attribute_call_does_not_root_a_same_named_module_function() {
+        let src = concat!(
+            "def run():\n",
+            "    pass\n",
+            "\n",
+            "class C:\n",
+            "    def run(self):\n",
+            "        pass\n",
+            "\n",
+            "obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run_fn = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Function)
+            .expect("fixture defines a module-level run function");
+        assert!(
+            !run_fn.is_entry_point,
+            "an attribute call (obj.run()) must never root a same-named \
+             module-level Function -- a method call cannot invoke it, and a \
+             cross-module `mod.run()` call is a disclosed gap, not this \
+             rule's job"
+        );
+    }
+
+    /// Same shape, bash: a bare top-level command invocation with no `main`
+    /// wrapper is the dominant real-world idiom this item names.
+    #[test]
+    fn bash_function_invoked_at_top_level_is_an_entry_point() {
+        let src = "greet() { echo hi; }\nunused() { :; }\ngreet\n";
+        let parsed = parse("script.sh", src);
+        let greet = find(&parsed, "greet");
+        assert!(greet.is_entry_point);
+        assert_eq!(greet.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a defined-but-never-invoked function stays dead.
+        let unused = find(&parsed, "unused");
+        assert!(!unused.is_entry_point);
     }
 }
 

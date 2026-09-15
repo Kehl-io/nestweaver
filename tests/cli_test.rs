@@ -10033,3 +10033,76 @@ fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
         "and the degrade this whole field exists to explain must clear too: {cleared}"
     );
 }
+
+/// nw-435 leg 2 (precision), end to end. `detect_python`/`detect_bash` only
+/// ever recognised a function literally named `main`, so a Python module or
+/// bash script whose top level was bare statements had NO entry point at all
+/// — every function it defined was walked as dead, even ones a bare top-level
+/// call actually runs. The fix is a `parse.rs` post-pass: a call/command with
+/// no enclosing function body roots its same-file `Function` callee. This
+/// exercises it through the real CLI index + `dead-code --json` route, not
+/// just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_functions_run_by_a_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("script.py"),
+        "def helper():\n    return 1\n\ndef unused_helper():\n    return 2\n\nhelper()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("script.sh"),
+        "greet() {\n  echo hi\n}\n\nunused() {\n  :\n}\n\ngreet\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"helper".to_string()),
+        "helper() is called at Python module scope and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"greet".to_string()),
+        "greet is invoked at bash top level and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: a genuinely never-called function in the same script must
+    // still be reported dead, proving the fix is scoped to "called at top
+    // level" rather than "everything in a directly-run script is alive".
+    assert!(
+        unreachable_names.contains(&"unused_helper".to_string()),
+        "unused_helper is never called and must still be reported dead: {payload}"
+    );
+    assert!(
+        unreachable_names.contains(&"unused".to_string()),
+        "unused is never invoked and must still be reported dead: {payload}"
+    );
+}

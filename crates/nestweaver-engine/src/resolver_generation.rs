@@ -86,7 +86,26 @@ use std::path::Path;
 ///     bump the disagreement is silent — the same shape as generation 4's own
 ///     "svelte/vue/astro named exports change `SymbolKind`" entry, which is
 ///     the precedent this follows.
-pub const RESOLVER_GENERATION: u32 = 5;
+/// 6 — nw-435: a Python or bash call/command with no enclosing
+///     `function_definition` (and, for Python, no enclosing `lambda`) ancestor
+///     now promotes its same-file `Function` callee to `is_entry_point: true`,
+///     `entry_point_kind: Some(EntryPointKind::Main)` — see the post-pass in
+///     `nestweaver-parser/src/parse.rs`. Before this, `detect_python`/
+///     `detect_bash` (entry_points.rs) recognised only fixed names and file
+///     patterns — `main`, `handler`/`lambda_handler`, `test_*`, and
+///     `views.py`/`routes.py`/`endpoints.py`/`handlers.py` for Python; only
+///     `main` for bash — none of which fire for a plain top-level script
+///     call, so a bash script or Python module whose top level was bare
+///     statements had NO entry point at all and every function it
+///     defined was reachability-walked as dead — the dominant real-world bash
+///     idiom, and a common Python one. Exactly generation 5's shape again:
+///     `is_entry_point`/`entry_point_kind` are PERSISTED per-symbol columns
+///     that `dead-code`, `process.rs` and `ranking.rs` read straight off disk
+///     rather than re-deriving, so a symbol in an already-indexed graph keeps
+///     `is_entry_point: false` forever and cannot seed a reachability walk no
+///     matter which binary asks — only re-indexing (`nestweaver index --repo
+///     <path> --force`) writes the corrected flag.
+pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

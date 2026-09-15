@@ -20,8 +20,8 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   end_line: 12
   signature: "def decorator_factory(prefix):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: Main
   visibility: Inferred
   type_info: ~
   parent_name: ~
