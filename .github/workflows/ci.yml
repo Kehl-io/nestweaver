@@ -602,6 +602,8 @@ jobs:
 
   build-and-check:
     name: Build & Tests
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    timeout-minutes: 120
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -753,6 +755,21 @@ jobs:
 
   daemon-tests:
     name: Daemon Integration Tests
+    # These jobs spawn real daemon processes and real test binaries, so a
+    # deadlocked test does not fail — it parks the binary and the job runs to
+    # GitHub's 360-minute DEFAULT. That is not hypothetical: run 35053752832
+    # sat here 03:57 -> 09:59 UTC on a single wedged test
+    # (`daemon_embed_joins_an_in_flight_auto_repair_download`), printed no
+    # `test result:` line, and was killed six hours later with an orphaned
+    # `nestweaver_daemon-*` process. Six hours of a shared runner bought one
+    # bit of information.
+    #
+    # Bounds below are ~2x the observed successful maximum over the last five
+    # green runs of each job (daemon-tests 54m, build-and-check 69m, e2e 54m,
+    # coverage 111m), so a slow runner still passes while a hang surfaces in
+    # hours rather than most of a day. Raise a bound if a job legitimately
+    # grows into it; do not remove it.
+    timeout-minutes: 120
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -846,6 +863,10 @@ jobs:
 
   coverage:
     name: Coverage
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    # Higher than the others: coverage instruments every crate and its five
+    # observed green runs averaged 105m.
+    timeout-minutes: 180
     needs: changes
     # Coverage is informational (uploads an lcov artifact; nothing gates on it)
     # and is the single slowest job — a full *instrumented* recompile that can't
@@ -1991,6 +2012,8 @@ jobs:
 
   e2e:
     name: E2E Tests
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    timeout-minutes: 120
     needs: changes
     # E2E drives the real backend API + the frontend, so run it whenever either
     # side changes.
