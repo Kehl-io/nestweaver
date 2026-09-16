@@ -16,10 +16,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::server::{
-    ConnectionGuard, DaemonState, EmbeddingRuntimeStatus, embedding_cache_dir_for_load_with,
-    embedding_load_config, unix_now_seconds,
-};
+use crate::server::{ConnectionGuard, DaemonState, EmbeddingRuntimeStatus};
+// `embedding_cache_dir_for_load_with` and `embedding_load_config` are gated on
+// the `embed` feature in `server`, and only the auto-repair loop (also gated)
+// uses them, so the import has to carry the same gate. Without it a
+// `--features metal` build with `embed` off fails to resolve the import.
+#[cfg(feature = "embed")]
+use crate::server::{embedding_cache_dir_for_load_with, embedding_load_config, unix_now_seconds};
 // Only `production_reload_loader` (`not(test)`) calls this; under a test
 // build the import would otherwise be unused.
 #[cfg(all(feature = "embed", not(test)))]

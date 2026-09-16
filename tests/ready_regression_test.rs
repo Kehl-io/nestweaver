@@ -281,6 +281,10 @@ fn ready_regression_fixture_never_touches_real_launch_agents() {
 
 /// File names directly under `path`, or an empty set if it doesn't exist.
 /// Never removes or modifies anything -- a snapshot only.
+///
+/// Only the macOS socket-fallback guard above calls this; on other platforms
+/// it would be dead code and `-D warnings` would reject it.
+#[cfg(target_os = "macos")]
 fn list_dir_names(path: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
     std::fs::read_dir(path)
         .map(|entries| {
