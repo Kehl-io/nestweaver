@@ -191,6 +191,29 @@ use std::path::Path;
 ///     cannot seed a reachability walk no matter which binary asks — only
 ///     re-indexing (`nestweaver index --repo <path> --force`) writes the
 ///     corrected flag.
+///
+/// nw-492 (same generation as nw-435/nw-356/nw-490/nw-491 above — the branch is
+/// still unreleased). `parse_manifest` read ONE `package.json`, at the repo
+/// root, and only when no other root manifest format matched first, so a
+/// monorepo's `packages/*/package.json` — or generated wasm glue declaring
+/// `"main": "nestweaver_wasm.js"` under a `Cargo.toml` root — contributed no
+/// entry point at all and every symbol it roots was reachability-walked as
+/// dead. Entry files are now unioned from EVERY `package.json` in the repo at
+/// ANY depth (root included, with or without a `name` field; `node_modules`,
+/// the shared skip-dirs and `.gitignore` already applied by the index's own
+/// file walk), each raw path is rebased onto the directory containing its own
+/// manifest rather than the repo root (an unrebased `"./index.js"` from
+/// `packages/a/package.json` names the WRONG file, which is worse than naming
+/// none), and `browser` is now an entry file when its value is a string — the
+/// object form is a bundler replacement map, not an npm/Node entry point.
+/// Same on-disk staleness shape as the rest of this generation, one artefact
+/// over: this entry set is computed at INDEX time and persisted in the
+/// `<db>.manifests.json` sidecar, and `dead_code`'s reachability walk reads it
+/// straight off disk and ORs it with each symbol's persisted `is_entry_point`
+/// column to build the same seed set. So a repo indexed before this fix keeps
+/// the old root-only, unrebased entry list forever and cannot seed the walk
+/// from it no matter which binary asks — only re-indexing (`nestweaver index
+/// --repo <path> --force`) rewrites it.
 pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must

@@ -233,6 +233,117 @@ One consequence worth expecting either way: switching a working tree between
 `-p` and `--workspace` re-resolves features, which re-fingerprints the build and
 forces a full `lbug` C++ rebuild. Pick one shape per tree and stay with it.
 
+#### Which command runs the test you just wrote
+
+`just test-crate <crate>` covers a crate's own unit and integration tests. It
+does **not** cover the workspace-root integration tests — the `tests/*.rs`
+files beside `src/main.rs` (`cli_test.rs`, `daemon_test.rs`,
+`ready_regression_test.rs`, `error_remedy_test.rs`, and the rest). Those belong
+to the root `nestweaver` package, which is one of the two packages the recipe
+exempts, so a green `just test-crate` says nothing about them. Run them by
+name:
+
+```sh
+cargo test --test cli_test                   # one root integration binary
+cargo test --test daemon_test -- --nocapture
+cargo test                                   # everything, root tests included
+```
+
+**A change to any `tests/*.rs` file must be checked against
+`every_cli_invocation_pins_its_daemon_routing` in `tests/cli_test.rs`.** It is a
+suite-wide lint: every CLI invocation in the root integration tests has to pin
+its own daemon routing explicitly, so a test cannot silently acquire (or lose)
+a daemon depending on ambient state. The failure mode to know about is that
+**pinning inside a shared helper does not satisfy it** — the guard reads call
+SITES, not what a helper does on their behalf, so extracting a helper that pins
+correctly still leaves every caller unpinned as far as the guard is concerned.
+Each call site needs its own explicit pin. This is deliberate rather than a
+limitation of the check: a helper's pin is invisible at the call site, which is
+exactly where a reader decides whether a test is hermetic.
+
+### Tests must never touch the real model cache
+
+**nw-483: no test may read from or write to the real platform embedding model
+cache.** Tests use an isolated tempdir, always.
+
+CI enforces this rather than trusting review. The `metal-smoke`,
+`build-and-check` and `daemon-tests` jobs each carry a paired **`Record real
+model cache baseline`** step before their test steps and a **`Verify no test
+reached the real model cache`** step after, and the second fails the job if the
+cache directory appeared during the run.
+
+The trap is that this is a CI-ONLY failure. **Any new test that constructs
+`EmbedConfig::default()` or `EmbeddingConfig::default()` without overriding
+`cache_dir` will turn CI red and pass on your machine**, because locally that
+directory almost always already exists — the baseline step records it as
+pre-existing and the verify step has nothing to flag. A test that reaches it is
+also not merely untidy: it makes the suite depend on a multi-gigabyte artifact
+that may or may not be present, which is how a hermetic run becomes a network
+download.
+
+Override `cache_dir` to a `TempDir` in every config a test builds, including
+ones it builds indirectly through a fixture.
+
+### Daemon embedding test seams
+
+Two seams exist so daemon embedding behaviour can be tested without a real
+model or a real download. Prefer them over inventing a third:
+
+- **`DaemonState.artifact_seeder`** — the injection point for artifact seeding.
+  Production wires `production_artifact_seeder`; `DaemonState`'s test
+  constructors default to a fake instead, so a test exercises the real RPC
+  handler, the real reload channel and the real `brain_status` wiring with
+  nothing crossing the network. It is a struct field, not a new env var,
+  deliberately: an env var would be process-global and could leak between
+  parallel tests.
+- **`write_complete_hf_cache`** — builds a hand-made cache directory that
+  satisfies the loader's artifact checks, so a test can set up the "cache is
+  present and complete" state (and, by deleting from it, the missing-artifact
+  state that auto-repair keys on) without a download.
+
+New daemon embedding tests live in `server.rs`'s test module alongside the
+existing `DaemonState` fixtures rather than in `embedding_repair.rs`, even
+though the functions moved — they exercise the full RPC/`DaemonState` wiring,
+not those functions in isolation.
+
+### Mutation testing (advisory, not in Required CI)
+
+The `mutants` job runs `cargo-mutants` over the packages **this PR's diff**
+touches. It is **not** in `Required CI` and mutation score is not a merge gate:
+a score that gates merges is optimized against rather than acted on, and what
+is actually useful is the list of individual surviving mutants on the diff
+under review.
+
+The pinned contract, so a change here is a deliberate one:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| tool version | `cargo-mutants@27.1.0` | Exit codes and `outcomes.json` shape are parsed by the reporting step; an unpinned install can change both. |
+| `--baseline skip` | — | cargo-mutants' own unmutated baseline build+test was what actually blew the budget (measured: 1715s build + a 300s test timeout, exit 4, zero mutants tested). Safe only because `build-and-check` already proves this commit green — but note that job runs `--workspace` while this one runs `-p`, so the two resolve different feature sets. |
+| `--in-place` | — | The runner's checkout is disposable, `persist-credentials: false`, nothing pushes from it, and no later step reads mutated source. Conflicts with `-j` in cargo-mutants' own arg parsing, which is a reason not to add `-j` here. |
+| `--build-timeout 300` | per build | Bounds the build phase, which `--timeout` does not reach. |
+| `--timeout 600` | per test run | Bounds ONE mutant's test run, not the job. Deliberately >1.5x the worst measured combined suite (~327s), because `--no-fail-fast` means every mutant runs the full, non-short-circuited suite. |
+| pre-warm | `PREWARM_BUDGET: 30m` | Builds each touched package's own `-p` shape BEFORE the mutation budget starts, so cargo-mutants does not spend the mutation budget on a cold build. |
+| job timeout | 80 minutes | Covers the 30m pre-warm plus the 35m `MUTANTS_BUDGET` plus setup. |
+
+**The job is no longer `continue-on-error`.** "Advisory" now means "surviving
+mutants do not fail the build", not "nothing here can fail the build". Through
+the old configuration the job reported success regardless of what any step
+found, including runs that tested ZERO mutants. The contract now:
+
+- a genuine cargo-mutants error or timeout, or a run that tested zero mutants
+  when it should have tested some, is a **real job failure**;
+- surviving mutants (exit 2) still **pass**, with a report table;
+- "no Rust package in the diff" and "the diff generated zero mutants" stay
+  green, because there was genuinely nothing to measure.
+
+**When the pre-warm cannot finish inside `PREWARM_BUDGET`** — a diff too wide
+to warm in 30 minutes — the mutation run is **SKIPPED, not failed**, with a
+loud summary. No mutation coverage is measured in that case and the summary
+says so in as many words: it is a scope limit, not a clean result. The whole
+point is that an absent signal and a clean signal must not look the same, so
+that path never prints an all-clear.
+
 ## Release gate
 
 Release Please intentionally uses the workflow's `GITHUB_TOKEN`. GitHub may

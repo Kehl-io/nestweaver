@@ -44,12 +44,12 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
 ## MCP Tools
 
-When configured as an MCP server, NestWeaver exposes **42** tools across these
+When configured as an MCP server, NestWeaver exposes **43** tools across these
 categories. The registry is `all_tool_schemas_undecorated()` in
 `crates/nestweaver-mcp/src/tools.rs`; call `tools/list` to read the live set and
 its schemas rather than trusting this table.
 
-Direct read-only mode advertises **36** (the registry minus the six mutating
+Direct read-only mode advertises **36** (the registry minus the seven mutating
 tools listed under *Admin* below). `--lite` advertises **6**.
 
 **Context & Search:**
@@ -80,7 +80,7 @@ tools listed under *Admin* below). `--lite` advertises **6**.
 - **investigate_hydrate** — Load full source for investigation targets
 
 **Vault & Notes:**
-- **note_get** — Retrieve a note with optional section filtering
+- **note_get** — Retrieve a note with optional section filtering. CLI twin: `nestweaver note get <title|uid>`
 - **backlinks** — Find notes that link to a target note
 - **brain_topic_clusters** — Topic clusters over note wikilinks (Louvain-style)
 - **brain_tag_graph** / **brain_doc_stats** — Vault structure analysis
@@ -94,16 +94,19 @@ tools listed under *Admin* below). `--lite` advertises **6**.
 
 **Admin:**
 - **brain_status** — Database and vault status
-- **brain_diff** — Show graph changes since a given SHA
-- **stale_check** — Check if the index needs refreshing. Note it compares indexed SHA against git HEAD only — it does **not** detect a resolver-generation upgrade
+- **brain_diff** — Show graph changes since a given SHA. CLI twin: `nestweaver brain diff <repo>`
+- **stale_check** — Check if the index needs refreshing. Compares each repo's indexed git SHA against HEAD **and** checks whether its edges were built by the current resolver generation. `status: "outdated_resolver"` means the repo is at HEAD and fully indexed but its edges were written by an older generation — rankings over them are wrong and edge families added since are absent, and upgrading the binary does not repair data already on disk. An independent `resolver_stale` boolean carries that fact even when `status` reports a git reason instead, alongside `resolver_stale_repos` listing the URLs. Gate on `any_needs_reindex` / `needs_reindex_repos`, the actionable union of every non-`ok` state (`stale`, `incomplete`, `missing`, `outdated_resolver`). The remedy needs `--force`: `nestweaver index --repo <path> --force`, because plain `index` is incremental and writes nothing on a repo already at HEAD — exactly the shape of an `outdated_resolver` repo
 - **query_extensions** — Read custom metadata on any node
 
-**Mutating (6)** — require the admin token when auth is configured, are never
+**Mutating (7)** — require the admin token when auth is configured, are never
 routed upstream, and are absent from direct read-only mode. Every schema carries
-MCP `annotations`, so a client can tell them apart on the wire.
+MCP `annotations`, so a client can tell them apart on the wire. Commonly
+published lists of this set omit `unset_extension`; it is mutating and gated
+exactly like the rest.
 
 - **brain_add_source** — Index new vaults or repos at runtime (additive, idempotent)
 - **set_extension** — Write one `(uid, key)` annotation (idempotent)
+- **unset_extension** — Remove one `(uid, key)` annotation (idempotent)
 - **compact_embeddings** — Reclaim vectors from deleted nodes (idempotent, non-destructive)
 - **brain_remove_source** — *destructive*, "removal is permanent"
 - **prune_stale** — *destructive*, "cannot undo — removed sources must be re-indexed"

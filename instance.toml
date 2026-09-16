@@ -34,6 +34,10 @@ summary_model = "qwen2.5-coder:7b"
 # Local semantic-search model and retrieval-fusion weights. This does not
 # configure the remote inference endpoint or its models above.
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
+# Let the daemon re-download a missing local model cache in the background,
+# bounded and only for the model this database already records. Opt-out: set
+# false to require an explicit `nestweaver embed` for every recovery.
+auto_repair_cache = true
 weight_ppr = 0.40
 weight_bm25 = 0.25
 weight_semantic = 0.35
