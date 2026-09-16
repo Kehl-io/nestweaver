@@ -104,6 +104,14 @@ pub struct IndexPublicationStatus {
     pub writer_reason: Option<String>,
     /// The marker path, so a message can name the exact file.
     pub marker_path: String,
+    /// Bounded, in-flight note paths the establishing writer recorded
+    /// (nw-475, Task 5.2) — only ever populated for a
+    /// [`nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH`]
+    /// marker. Empty for every other marker.
+    pub note_paths: Vec<String>,
+    /// True when `note_paths` was capped below the writer's actual in-flight
+    /// count.
+    pub note_paths_truncated: bool,
 }
 
 impl IndexPublicationStatus {
@@ -156,6 +164,17 @@ impl IndexPublicationStatus {
             Self::repair_command(db_path)
         }
     }
+
+    /// True when the marker's recorded reason is exactly
+    /// [`nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH`]
+    /// (nw-475, Task 5.2, owner decision Q7): a brain-watcher batch's
+    /// debounced publication window, which ranked reads may answer through
+    /// with disclosure, as opposed to a full `index` run's window, which
+    /// stays fail-closed exactly as before.
+    pub fn is_watcher_batch(&self) -> bool {
+        self.writer_reason.as_deref()
+            == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
+    }
 }
 
 /// Read the marker for `db_path` and decorate it with writer liveness.
@@ -185,6 +204,8 @@ pub fn status_from(db_path: &Path, state: MarkerState) -> IndexPublicationStatus
             marker_age_s: None,
             writer_reason: None,
             marker_path,
+            note_paths: Vec::new(),
+            note_paths_truncated: false,
         },
         MarkerState::Undeterminable(_) => IndexPublicationStatus {
             dirty: true,
@@ -196,6 +217,8 @@ pub fn status_from(db_path: &Path, state: MarkerState) -> IndexPublicationStatus
             marker_age_s: None,
             writer_reason: None,
             marker_path,
+            note_paths: Vec::new(),
+            note_paths_truncated: false,
         },
         MarkerState::Present(record) => {
             let liveness = record.writer_pid.map(process_liveness);
@@ -213,6 +236,8 @@ pub fn status_from(db_path: &Path, state: MarkerState) -> IndexPublicationStatus
                 marker_age_s: record.age().map(|age| age.as_secs()),
                 writer_reason: record.reason.clone(),
                 marker_path,
+                note_paths: record.note_paths.clone(),
+                note_paths_truncated: record.note_paths_truncated,
             }
         }
     }
@@ -254,6 +279,8 @@ mod tests {
             writer_pid: pid,
             established_unix_nanos: None,
             reason: reason.map(str::to_string),
+            note_paths: Vec::new(),
+            note_paths_truncated: false,
         })
     }
 

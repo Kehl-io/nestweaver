@@ -828,7 +828,7 @@ impl GraphStore {
         scope: &GraphScope,
         warm_start: Option<&HashMap<String, f64>>,
     ) -> Result<(), StoreError> {
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -956,7 +956,7 @@ impl GraphStore {
             }
         }
 
-        if !for_publication_owner && self.is_index_publication_dirty() {
+        if !for_publication_owner && self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -1195,7 +1195,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -1347,7 +1347,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -1664,7 +1664,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -1693,7 +1693,7 @@ impl GraphStore {
     }
 
     fn ensure_pagerank_loaded_locked(&self) -> Result<(), StoreError> {
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -1723,7 +1723,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -2168,6 +2168,58 @@ mod tests {
             store.pagerank_generation(),
             clean_pagerank_generation + 1,
             "the first clean access must perform the only retained recompute"
+        );
+    }
+
+    /// nw-475 (Task 5.2, review fix): `compute_pagerank_warm_inner`'s
+    /// MID-COMPUTE re-check (after PPR iterates, before scores are cached)
+    /// must also honour the watcher-batch exception — not just the ENTRY
+    /// gates in `symbols_by_pagerank`/`pagerank_scores`. A pre-warmed cache
+    /// (this module's other watcher-batch coverage, and every
+    /// `index_on_disk`-style fixture elsewhere) never reaches the
+    /// mid-compute check at all, because `ensure_pagerank_loaded_locked`
+    /// short-circuits on an already-loaded cache. This test starts with a
+    /// COLD cache on purpose, forcing the lazy-compute path all the way
+    /// through, so the fresh scores are not thrown away at the finish line.
+    #[test]
+    fn watcher_batch_publication_serves_a_cold_pagerank_compute_not_only_a_warm_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        assert!(
+            store
+                .pagerank_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "the cache must start cold for this test to exercise the lazy-compute path"
+        );
+
+        let _writer_authority = crate::acquire_db_write_lease(&db_path).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                Some(crate::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+
+        let scores = store.pagerank_scores().expect(
+            "a watcher-batch publication must serve a COLD pagerank compute too, \
+             not only an already-warm cache",
+        );
+        assert!(
+            scores.contains_key("A"),
+            "the lazily computed scores must actually be returned, not discarded \
+             by the mid-compute re-check: {scores:?}"
         );
     }
 

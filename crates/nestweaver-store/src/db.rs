@@ -2213,6 +2213,65 @@ impl GraphStore {
         })
     }
 
+    /// Whether the PageRank/PPR ranking gate specifically must refuse
+    /// (nw-475, Task 5.2, owner decision Q7). Same predicate as
+    /// [`is_index_publication_dirty`](Self::is_index_publication_dirty)
+    /// EXCEPT for one exception: a marker whose recorded `reason` is exactly
+    /// [`crate::index_publication::MARKER_REASON_WATCHER_BATCH`] does NOT
+    /// block ranking here, UNLESS it is also wedged (see below) — so a
+    /// brain-watcher batch's debounced publication window (many short
+    /// per-file critical sections, not one atomic run) no longer fails
+    /// every ranked read for its full wall-clock duration.
+    ///
+    /// This is deliberately NARROWER than a general "serve the old
+    /// generation" mechanism (see the nw-475 follow-up design item) — it
+    /// only recognizes the ONE reason a watcher batch stamps, and everything
+    /// else (an ordinary `index` run, an unattributed or undeterminable
+    /// marker) still fails closed exactly as before.
+    ///
+    /// **Wedged watcher-batch markers still block.** A marker left behind by
+    /// a watcher that crashed or otherwise never finalized is exactly as
+    /// stale as an abandoned `index` marker, so this cannot unconditionally
+    /// trust the reason field forever — it must also confirm a writer is
+    /// still plausibly in flight. Unlike
+    /// `nestweaver_engine::index_publication::IndexPublicationStatus::is_wedged`
+    /// (which additionally carries PID-liveness diagnostics this crate has
+    /// no `libc` dependency for), this needs only
+    /// [`write_lease_state`](crate::write_lease_state), which IS available
+    /// here: `Some(true)` (the canonical writer lease is held) means a live
+    /// writer could still legitimately finish this publication, so ranking
+    /// proceeds; `Some(false)` or `None` means no writer can complete it,
+    /// which is exactly wedged, so ranking still refuses. This mirrors
+    /// `IndexPublicationStatus::is_wedged`'s own branch on
+    /// `writer_authority_held` — the two agree in every case that matters
+    /// here, because `is_wedged` does not actually branch on PID liveness
+    /// either; that field is diagnostic-only.
+    ///
+    /// [`is_index_publication_dirty`](Self::is_index_publication_dirty)
+    /// itself is intentionally UNCHANGED: `brain_status`'s disclosure, the
+    /// response-cache bypass in `nestweaver-mcp`, and
+    /// `wait_out_index_publication`'s short-circuit all keep reporting the
+    /// raw marker-exists fact, because a watcher-batch marker genuinely IS a
+    /// dirty publication — it is just one ranked reads may now answer
+    /// through, with disclosure, rather than one that silently looks clean.
+    pub fn index_publication_blocks_ranking(&self) -> bool {
+        let Some(path) = self.db_path.as_ref() else {
+            return false;
+        };
+        match crate::index_publication::read_marker(path) {
+            crate::index_publication::MarkerState::Absent => false,
+            crate::index_publication::MarkerState::Undeterminable(_) => true,
+            crate::index_publication::MarkerState::Present(record) => {
+                if record.reason.as_deref()
+                    != Some(crate::index_publication::MARKER_REASON_WATCHER_BATCH)
+                {
+                    return true;
+                }
+                !matches!(crate::write_lease_state(path), crate::WriteLeaseState::Held)
+            }
+        }
+    }
+
     fn index_publication_marker_for(db_path: &Path) -> PathBuf {
         crate::index_publication::marker_path(db_path)
     }

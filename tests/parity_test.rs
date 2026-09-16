@@ -530,6 +530,86 @@ fn run_via_mcp(db_path: &Path, tool: &str, arguments: serde_json::Value) -> serd
     frame["result"]["structuredContent"].clone()
 }
 
+/// [`run_via_mcp`], but routed through an already-running daemon instead of
+/// `--no-daemon`. Modelled on `tests/daemon_test.rs`'s `mcp_tool_call_in_mode`
+/// (`McpMode::Daemon` arm), duplicated rather than shared per this file's own
+/// stated convention (each `tests/*.rs` is its own crate).
+///
+/// nw-475 (Task 5.2, owner decision Q7): needed because the CLI's OWN
+/// `--json` verbs (`hubs`, `bridges`, `context`, ...) decode the raw MCP
+/// response into a typed struct before printing, which silently drops any
+/// field that struct does not declare — including the new
+/// `publication_in_progress`/`marker_age_s`/`in_flight_note_paths` keys this
+/// task adds. Comparing THOSE verbs would not exercise the feature at all;
+/// going through `nestweaver mcp` (this helper, and `run_via_mcp` for the
+/// direct leg) reaches `dispatch_cancellable`'s raw `structuredContent`
+/// directly, on both routes, which is the only place both routes actually
+/// agree today. A CLI-side follow-up to carry these keys through the typed
+/// reshape (or render an equivalent text-mode note) is tracked separately.
+fn run_via_mcp_daemon(
+    db_path: &Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "parity-test", "version": "1" } }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }),
+    ];
+    let input = frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    let mut cmd = StdCommand::new(bin_path());
+    cmd.args(["mcp", "--db", &db_path.display().to_string()])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM");
+    #[cfg(not(target_os = "macos"))]
+    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp (daemon mode)");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read mcp output (daemon mode)");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let frame: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("{tool}: no tools/call frame in MCP (daemon) stdout:\n{stdout}"));
+    assert!(
+        frame["result"]["isError"] != serde_json::json!(true),
+        "{tool}: MCP (daemon) returned an error: {}",
+        frame["result"]
+    );
+    frame["result"]["structuredContent"].clone()
+}
+
 /// Run the CLI in DAEMON mode (daemon must already be running for `db_path`).
 fn run_via_daemon(db_path: &Path, args: &[&str]) -> Output {
     let mut cmd = StdCommand::new(bin_path());
@@ -4054,6 +4134,95 @@ fn stale_repos_is_the_same_list_on_every_route() {
         bridges_direct["stale_repos"], direct["stale_repos"],
         "`bridges` recomputes the same answer through the same pair of \
          functions and must not be left behind: {bridges_direct}"
+    );
+}
+
+/// nw-475 (Task 5.2), owner decision Q7: a ranked read during a
+/// brain-watcher-batch publication answers WITH DISCLOSURE
+/// (`publication_in_progress`, `marker_age_s`, `in_flight_note_paths`) on
+/// the daemon route exactly as it does on the direct route — the same
+/// marker, read by two different processes, must not silently look clean to
+/// one and disclosed to the other.
+///
+/// Goes through `nestweaver mcp` (see `run_via_mcp`/`run_via_mcp_daemon`),
+/// NOT the `hubs` CLI verb: `hubs --json` decodes the MCP response into a
+/// typed `Vec<HubNode>` before printing (`src/main.rs`), which drops any
+/// field that struct does not declare — including every key this task
+/// adds. A CLI-side follow-up to carry these keys through (or an
+/// equivalent text-mode note) is tracked separately; this test pins the
+/// layer that already agrees.
+///
+/// `db_path` is intentionally NEVER opened as a `GraphStore` by this test's
+/// own process at the same time a route under test also holds it — each
+/// leg's writer-authority holder (this test process for the direct leg, the
+/// daemon itself for the daemon leg) is exactly what makes the SAME marker
+/// file read as non-wedged for a different, legitimate reason on each route.
+#[test]
+fn daemon_ranked_read_during_watcher_publication_matches_direct() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let marker_path = nestweaver_engine::sidecar_path(db, ".index-dirty");
+    let note_paths = vec!["Alpha.md".to_string()];
+    let write_watcher_batch_marker = || {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            nestweaver_store::index_publication::format_marker_payload_with_note_paths(
+                std::process::id(),
+                nanos,
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+                &note_paths,
+            ),
+        )
+        .unwrap();
+    };
+
+    // ── DIRECT: this test process stands in for the watcher, holding the
+    // canonical write lease so the marker reads as a live, non-wedged
+    // watcher batch rather than an abandoned one. ──────────────────────────
+    let writer_authority = nestweaver_store::acquire_db_write_lease(db).unwrap();
+    write_watcher_batch_marker();
+    let direct = run_via_mcp(db, "hub_nodes", serde_json::json!({}));
+    assert_eq!(
+        direct["publication_in_progress"],
+        serde_json::json!(true),
+        "direct route must serve with disclosure during a watcher-batch \
+         publication, not fail closed: {direct}"
+    );
+    assert_eq!(
+        direct["in_flight_note_paths"],
+        serde_json::json!(note_paths)
+    );
+    drop(writer_authority);
+
+    // ── DAEMON: the daemon is the sole writer for as long as it runs, so it
+    // now holds the write lease instead — same marker file, different
+    // legitimate holder. ────────────────────────────────────────────────────
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    write_watcher_batch_marker();
+    let daemon = run_via_mcp_daemon(db, "hub_nodes", serde_json::json!({}));
+
+    assert_eq!(
+        daemon["publication_in_progress"], direct["publication_in_progress"],
+        "one marker, two answers, selected by whether a daemon happens to be \
+         running\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        daemon["marker_age_s"].is_number(),
+        direct["marker_age_s"].is_number(),
+        "both routes must disclose an age\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        daemon["in_flight_note_paths"], direct["in_flight_note_paths"],
+        "both routes must name the same in-flight note paths\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        daemon["in_flight_note_paths_truncated"], direct["in_flight_note_paths_truncated"],
+        "direct: {direct}\ndaemon: {daemon}"
     );
 }
 

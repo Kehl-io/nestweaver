@@ -2908,6 +2908,46 @@ pub fn dispatch_cancellable(
             let identity_error = store.embedding_identity_error();
             annotate_lexical_embedding_identity_degradation(identity_error.as_deref(), &mut value);
         }
+        // nw-475 (Task 5.2, owner decision Q7): a successful response served
+        // while a watcher-batch marker is still open must disclose it — this
+        // is the honesty half of the serve-with-disclosure exception in
+        // `GraphStore::index_publication_blocks_ranking`, which let the
+        // dispatch above SUCCEED instead of failing closed. `brain_status`
+        // is excluded: it already carries its own dedicated
+        // `index_publication` object (dirty/marker_age_s/etc.) and adding a
+        // second, differently-shaped disclosure at the top level would be
+        // redundant at best and conflicting at worst.
+        //
+        // KNOWN GAP (pending shared-file follow-up, main.rs is held by
+        // another task): these keys reach every MCP route (stdio and the
+        // daemon's tools/call) today, since both call this function. Several
+        // CLI `--json` verbs do NOT see them, because `src/main.rs`
+        // reshapes this same dispatch value into a typed struct before
+        // printing it — e.g. `hubs` (`Commands::Hubs`) builds `Vec<HubNode>`
+        // from `value.get("hubs")` and reprints via `print_ranking_json`,
+        // which has no field for this disclosure, so it is silently
+        // dropped. Until that CLI-side plumbing lands, an agent calling the
+        // `hub_nodes`/`brain_context`/etc. MCP tools sees the disclosure;
+        // the `nestweaver hubs --json` CLI verb (and any sibling verb with
+        // the same reshape-then-reprint shape) does not.
+        if name != "brain_status"
+            && let Some(db_path) = store.db_path()
+        {
+            let status = nestweaver_engine::index_publication::status(db_path);
+            if status.dirty
+                && status.is_watcher_batch()
+                && !status.is_wedged()
+                && let Value::Object(map) = &mut value
+            {
+                map.insert("publication_in_progress".to_string(), json!(true));
+                map.insert("marker_age_s".to_string(), json!(status.marker_age_s));
+                map.insert("in_flight_note_paths".to_string(), json!(status.note_paths));
+                map.insert(
+                    "in_flight_note_paths_truncated".to_string(),
+                    json!(status.note_paths_truncated),
+                );
+            }
+        }
         provenance_seam::stamp(Unstamped::new(value))
     });
 
@@ -2949,6 +2989,16 @@ pub fn wait_out_index_publication(
     }
     let budget = index_publication_wait();
     if budget.is_zero() {
+        return;
+    }
+    // nw-475 (Task 5.2, owner decision Q7): a watcher-batch marker that is
+    // not wedged does not block ranking at all
+    // (`GraphStore::index_publication_blocks_ranking`), so there is nothing
+    // to wait FOR — the dispatch below is going to succeed either way.
+    // Without this, every ranked call during a watcher batch burned the
+    // full configured budget before succeeding, for the batch's entire
+    // multi-minute duration, turning a latency blip into a real one.
+    if !store.index_publication_blocks_ranking() {
         return;
     }
     // Never wait on a publication that cannot complete. A wedged marker names
@@ -3062,8 +3112,10 @@ pub fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error
                  ranked queries are failing closed. {writer}; {ownership}. {preamble} A live \
                  writer can legitimately hold the lease this long for a large re-index — this is \
                  NOT necessarily stuck — but do not assume it clears immediately: check \
-                 `brain status` for progress, or raise NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to \
-                 wait longer."
+                 `brain status --json`'s `index_publication.dirty` / \
+                 `index_publication.marker_age_s` for progress (the plain-text `brain status` \
+                 does not print these field names), or raise NESTWEAVER_INDEX_PUBLICATION_WAIT_MS \
+                 to wait longer."
             )
         } else {
             anyhow!(
@@ -18270,6 +18322,256 @@ mod cache_dispatch_tests {
         // above: the identical setup with a FRESH marker (age ~0s) still reads
         // TRANSIENT and still says "retry shortly" — so this test is exercising
         // the age threshold, not some other change to the held-authority path.
+    }
+
+    /// nw-475 (Task 5.2): the "IN PROGRESS (longer than expected)" branch
+    /// used to tell the reader to "check `brain status` for progress" —
+    /// true, but not actionable, since it never named WHICH field to check.
+    /// `brain_status_json` already exposes this exact marker read as
+    /// `index_publication.dirty` / `index_publication.marker_age_s`
+    /// (tools.rs, the `brain_status_json` builder); the message must name
+    /// those real field names rather than a vague "check status".
+    #[test]
+    fn ranked_read_fail_closed_message_names_index_publication_marker() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker_aged(
+            &db_path,
+            std::process::id(),
+            None,
+            nestweaver_engine::index_publication::WEDGED_MARKER_AGE
+                + std::time::Duration::from_secs(30),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(
+                &store,
+                anyhow!("PageRank unavailable during dirty index publication"),
+            )
+        );
+        assert!(
+            message.contains("index_publication.dirty"),
+            "must name the concrete status field to check: {message}"
+        );
+        assert!(
+            message.contains("marker_age_s"),
+            "must name the concrete status field to check: {message}"
+        );
+        // The CLI-text route (`nestweaver brain status`, no flag) never
+        // prints `index_publication.dirty`/`marker_age_s` as field names —
+        // only the JSON route does. Naming the field without naming `--json`
+        // would send a reader to a command that cannot show what was named.
+        assert!(
+            message.contains("--json"),
+            "must name the JSON route, since plain-text brain status cannot \
+             show these field names: {message}"
+        );
+        // Counterweight: the env var the message already names correctly
+        // must still be present — this change points readers at status
+        // fields IN ADDITION to the existing remedy, not instead of it.
+        assert!(
+            message.contains("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS"),
+            "must still name the wait env var: {message}"
+        );
+    }
+
+    // ── nw-475 (Task 5.2), owner decision Q7: serve ranked reads with
+    // disclosure during a watcher-batch publication ──────────────────────
+
+    /// nw-475 (Task 5.2, review fix): `wait_out_index_publication` must not
+    /// burn the configured wait budget on a marker that already does not
+    /// block ranking (a non-wedged watcher-batch marker) — that would cost
+    /// EVERY ranked call the full `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` for
+    /// the batch's entire multi-minute duration, for a wait that changes
+    /// nothing (the dispatch is going to succeed either way). Every other
+    /// test in this file sets the budget to 0, which hides this defect
+    /// because a zero budget already short-circuits before the wait loop
+    /// runs for an unrelated reason — this test configures a REAL,
+    /// measurable budget so a regression shows up as a slow test, not a
+    /// silently-passing one.
+    #[test]
+    fn wait_out_index_publication_does_not_wait_during_a_watcher_batch() {
+        reset_session();
+        set_index_publication_wait_ms(5_000);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(
+            &db_path,
+            std::process::id(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let started = std::time::Instant::now();
+        wait_out_index_publication(&store, None);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "must not wait out any part of the 5000ms budget during a \
+             watcher-batch publication that does not block ranking: waited {elapsed:?}"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    /// COUNTERWEIGHT: an ordinary (non-watcher-batch) dirty marker still
+    /// waits out the configured budget exactly as before — the short-circuit
+    /// above is scoped to the ONE reason that does not block ranking.
+    #[test]
+    fn wait_out_index_publication_still_waits_for_an_ordinary_dirty_marker() {
+        reset_session();
+        set_index_publication_wait_ms(300);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let started = std::time::Instant::now();
+        wait_out_index_publication(&store, None);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "an ordinary dirty marker must still wait out (most of) the \
+             configured budget: waited {elapsed:?}"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    /// A brain-watcher batch's marker (reason ==
+    /// `MARKER_REASON_WATCHER_BATCH`, writer authority held) must let a
+    /// ranked tool answer instead of failing closed, and the response must
+    /// disclose the in-flight publication rather than silently looking
+    /// fresh. `hub_nodes` is the ranking tool `index_on_disk`'s own doc
+    /// comment names ("so hub_nodes has scores") — its PageRank is already
+    /// warm, so this proves the SERVE path, not merely a lazy recompute
+    /// that happens to succeed.
+    #[test]
+    fn ranked_read_during_watcher_publication_answers_with_disclosure() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let note_paths = vec!["Alpha.md".to_string()];
+        fs::write(
+            nestweaver_engine::sidecar_path(&db_path, ".index-dirty"),
+            nestweaver_store::index_publication::format_marker_payload_with_note_paths(
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+                &note_paths,
+            ),
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let result = dispatch(&store, None, "hub_nodes", json!({}), None).expect(
+            "a watcher-batch publication must let ranked reads answer with disclosure, \
+             not fail closed",
+        );
+
+        assert_eq!(result["publication_in_progress"], json!(true));
+        assert!(
+            result["marker_age_s"].is_number(),
+            "must disclose the marker's age: {result}"
+        );
+        assert_eq!(result["in_flight_note_paths"], json!(note_paths));
+        assert_eq!(result["in_flight_note_paths_truncated"], json!(false));
+    }
+
+    /// COUNTERWEIGHT: a marker with no reason at all (an ordinary `index`
+    /// run's shape) must still fail closed exactly as before — the
+    /// exception is scoped to the ONE reason a watcher batch stamps.
+    #[test]
+    fn ranked_read_during_index_publication_still_fails_closed() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let error = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("index publication"),
+            "an ordinary index-run marker must still fail closed: {error:#}"
+        );
+    }
+
+    /// COUNTERWEIGHT: a watcher-batch marker whose writer is NOT holding the
+    /// canonical write lease (a watcher that crashed, or otherwise never
+    /// finalized) is exactly as abandoned as a wedged `index` marker, so the
+    /// reason alone must not exempt it.
+    #[test]
+    fn ranked_read_with_wedged_watcher_marker_still_fails_closed() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        // No writer authority is acquired: the canonical write lease is free,
+        // which is exactly what makes a marker wedged.
+        write_marker(
+            &db_path,
+            reaped_child_pid() as u32,
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let error = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("WEDGED"),
+            "a watcher-batch marker with no live writer must still be WEDGED: {message}"
+        );
+    }
+
+    /// A response served with `publication_in_progress: true` disclosure
+    /// must never be written to the response cache — a later, post-batch
+    /// call must not be able to read a stale disclosure back as if it were
+    /// current. Mirrors `dirty_publication_bypasses_response_cache`, now
+    /// exercised against a tool that actually SUCCEEDS during the window.
+    #[test]
+    fn watcher_publication_disclosed_reads_are_not_cached() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(
+            &db_path,
+            std::process::id(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let first = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap();
+        let second = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap();
+        assert_eq!(first["publication_in_progress"], json!(true));
+        assert_eq!(second["publication_in_progress"], json!(true));
+        flush_response_cache();
+
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 0);
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
+        );
+        assert!(
+            cache.is_empty(),
+            "disclosed responses during a watcher publication must not be cached"
+        );
     }
 
     #[test]

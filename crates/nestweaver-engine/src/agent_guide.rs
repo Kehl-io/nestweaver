@@ -115,7 +115,9 @@ pub fn generate_guide_with_tools(
                 error.downcast_ref::<nestweaver_store::StoreError>()
             {
                 out.push_str(
-                    "Repo map temporarily unavailable — index publication in progress.\n\n",
+                    "Repo map temporarily unavailable — index publication in progress. Check \
+                     `brain_status`'s `index_publication.dirty` / `index_publication.marker_age_s` \
+                     for progress.\n\n",
                 );
             } else {
                 out.push_str("No symbols indexed yet.\n\n");
@@ -1085,6 +1087,18 @@ mod tests {
         assert!(
             !guide.contains("No symbols indexed yet."),
             "a dirty window must not claim the graph is empty: {guide}"
+        );
+        // nw-475 (Task 5.2): point the reader at the concrete `brain_status`
+        // fields that disclose this same marker (`index_publication.dirty` /
+        // `marker_age_s`, tools.rs `brain_status_json`), not just at the
+        // vague fact that status exists.
+        assert!(
+            guide.contains("index_publication.dirty"),
+            "must name the concrete status field to check: {guide}"
+        );
+        assert!(
+            guide.contains("marker_age_s"),
+            "must name the concrete status field to check: {guide}"
         );
     }
 

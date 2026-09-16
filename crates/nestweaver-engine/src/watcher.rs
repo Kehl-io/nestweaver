@@ -103,6 +103,28 @@ pub enum UpdateOutcome {
     },
 }
 
+/// Per-phase wall-clock timings for one `process_batch` call. Logged as
+/// structured `tracing` fields on the "BrainWatcher batch complete" event
+/// (nw-475, Task 5.2), mirroring the daemon-boot phase breakdown
+/// (`boot_ms`/`store_open_ms`/`extension_reconcile_ms`/... in
+/// `nestweaver-daemon/src/server.rs`, nw-119): break a composite duration
+/// into attributable phases on the SAME event, rather than leaving a reader
+/// to guess which phase of a slow batch dominated. Zero for a phase that a
+/// non-graph batch never runs.
+#[derive(Debug, Default, Clone, Copy)]
+struct BatchPhaseTimings {
+    build_symbol_index_ms: u64,
+    embedding_candidates_ms: u64,
+    refresh_watched_paths_ms: u64,
+    sidecars_ms: u64,
+    tombstones_ms: u64,
+    /// The non-graph-event loop (tag/manifest/other non-note filesystem
+    /// events in the same debounced batch). Runs regardless of
+    /// `graph_batch`, unlike the five phases above.
+    non_graph_events_ms: u64,
+    finalize_ms: u64,
+}
+
 /// Live file-watcher for a single vault. Construct via `new`, then call
 /// `run` from a dedicated thread — `run` blocks until `stop()` is
 /// signalled or the watcher's debouncer hits a fatal error.
@@ -131,6 +153,11 @@ pub struct BrainWatcher {
     ready_callback: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
+    /// Last batch's phase timings, for tests to assert on directly instead
+    /// of re-parsing `tracing` output (nw-475, Task 5.2). Interior
+    /// mutability because `process_batch` takes `&self`.
+    #[cfg(test)]
+    last_batch_phase_timings: std::sync::Mutex<Option<BatchPhaseTimings>>,
 }
 
 impl BrainWatcher {
@@ -149,16 +176,52 @@ impl BrainWatcher {
         &self,
         store: &'a GraphStore,
         io: &dyn crate::index::IndexEpilogueIo,
+        note_paths: &[String],
     ) -> Result<
         nestweaver_store::IndexPublicationLease<'a>,
         crate::index::DeletionReconciliationError,
     > {
-        crate::index::establish_index_publication_marker_with_io(
+        let lease = crate::index::establish_index_publication_marker_with_io(
             store,
             Some(&self.db_path),
-            "brain watcher batch",
+            nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH,
             io,
-        )
+        )?;
+        // nw-475 (Task 5.2, owner decision Q7): stamp the watcher-batch
+        // reason and the in-flight note paths onto the just-established
+        // marker so ranked reads can recognize this window and serve with
+        // disclosure instead of failing closed
+        // (`GraphStore::index_publication_blocks_ranking`), and so the
+        // disclosure can name the paths. `establish_marker` itself always
+        // writes a plain `{pid}:{nanos}` payload (shared by every publisher,
+        // not just the watcher), so the reason/paths are added in a second,
+        // immediately-following write — the same pattern
+        // `finalize_committed_index_for_scope_with_io` already uses to stamp
+        // `MARKER_REASON_CANCELLED` after the fact. Best-effort: a write
+        // failure here leaves the ordinary payload, which still fails closed
+        // correctly, just without the watcher exception.
+        let marker_path = crate::sidecar_path(&self.db_path, ".index-dirty");
+        let payload = nestweaver_store::index_publication::format_marker_payload_with_note_paths(
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            note_paths,
+        );
+        if let Err(error) =
+            nestweaver_store::durable_sidecar::atomic_replace_file(&marker_path, |file| {
+                std::io::Write::write_all(file, payload.as_bytes())
+            })
+        {
+            tracing::warn!(
+                "could not record the watcher-batch reason/paths in {}: {error:#}; ranked \
+                 reads will fail closed instead of serving with disclosure for this batch",
+                marker_path.display()
+            );
+        }
+        Ok(lease)
     }
 
     fn finalize_graph_publication_with_io(
@@ -169,7 +232,7 @@ impl BrainWatcher {
         crate::index::finalize_committed_index_for_scope_with_io(
             publication,
             Some(&self.db_path),
-            "brain watcher batch",
+            nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH,
             io,
             Some(&GraphScope::unified()),
             true,
@@ -205,6 +268,8 @@ impl BrainWatcher {
             ready_callback: None,
             #[cfg(test)]
             ready_signal: None,
+            #[cfg(test)]
+            last_batch_phase_timings: std::sync::Mutex::new(None),
         }
     }
 
@@ -313,6 +378,16 @@ impl BrainWatcher {
     fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
         self.ready_signal = Some(ready);
         self
+    }
+
+    /// The phase timings `process_batch` recorded on its most recent call,
+    /// for tests. `None` before any batch has run.
+    #[cfg(test)]
+    fn last_batch_phase_timings(&self) -> Option<BatchPhaseTimings> {
+        *self
+            .last_batch_phase_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Replace the ignore set with one that includes additional patterns
@@ -439,6 +514,7 @@ impl BrainWatcher {
         let initial_publication = self.establish_graph_publication_with_io(
             &store,
             &crate::index::FileSystemIndexEpilogueIo,
+            &[],
         )?;
         let ensure_result = ensure_vault(
             &store,
@@ -581,6 +657,27 @@ impl BrainWatcher {
                 .iter()
                 .any(|path| self.event_targets_manifest(path));
 
+        // Computed up front (pure filter over `unique_paths`, no side
+        // effects) so both the publication marker below (nw-475, Task 5.2:
+        // the marker records these as its in-flight note paths) and the
+        // per-file work later can use it.
+        let graph_paths: Vec<_> = unique_paths
+            .iter()
+            .filter(|path| self.event_targets_graph(path))
+            .cloned()
+            .collect();
+        // Vault-relative, for a marker payload disclosure meant for a human
+        // or agent — not the host's absolute filesystem layout.
+        let graph_note_paths: Vec<String> = graph_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&self.vault_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
         // nw-380: establishing the fail-closed publication marker is itself
         // a store write, so it gets its own freshly acquired lease rather
         // than inheriting one held since before this batch began — there is
@@ -598,19 +695,30 @@ impl BrainWatcher {
             Some(self.establish_graph_publication_with_io(
                 store,
                 &crate::index::FileSystemIndexEpilogueIo,
+                &graph_note_paths,
             )?)
         } else {
             None
         };
 
+        // nw-475 (Task 5.2): each named phase gets its own timer so a slow
+        // batch is diagnosable by WHICH phase dominated, not just that the
+        // whole batch was slow — mirrors the daemon-boot phase breakdown
+        // (`boot_ms`/`store_open_ms`/`extension_reconcile_ms`/...,
+        // server.rs, nw-119). All fields are reported together on the single
+        // "BrainWatcher batch complete" event below. A non-graph batch never
+        // runs the phases gated on `graph_batch`, so those stay at their
+        // zero default.
+        let mut phase_timings = BatchPhaseTimings::default();
+
+        let build_symbol_index_started = Instant::now();
         let symbol_index = crate::cross_domain::build_symbol_index(store).ok();
-        let graph_paths: Vec<_> = unique_paths
-            .iter()
-            .filter(|path| self.event_targets_graph(path))
-            .cloned()
-            .collect();
+        phase_timings.build_symbol_index_ms =
+            build_symbol_index_started.elapsed().as_millis() as u64;
+
         let mut batch_failures = Vec::new();
         if graph_batch {
+            let embedding_candidates_started = Instant::now();
             let mut embedding_candidates = Vec::new();
             for path in &graph_paths {
                 let relative = path.strip_prefix(&self.vault_root)?;
@@ -619,9 +727,13 @@ impl BrainWatcher {
                     &relative.to_string_lossy(),
                 ))?);
             }
+            phase_timings.embedding_candidates_ms =
+                embedding_candidates_started.elapsed().as_millis() as u64;
+
             // Planning parses changed notes and affected linking sources before
             // any deletion. A failed plan or transaction leaves the publication
             // marker dirty and never emits a successful change callback.
+            let refresh_watched_paths_started = Instant::now();
             crate::index_md::refresh_watched_paths(
                 store,
                 &self.vault_root,
@@ -631,7 +743,11 @@ impl BrainWatcher {
                 &self.ignore_set,
                 &|| self.try_acquire_batch_lease(true, "watch_vault_batch"),
             )?;
+            phase_timings.refresh_watched_paths_ms =
+                refresh_watched_paths_started.elapsed().as_millis() as u64;
+
             let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
+            let sidecars_started = Instant::now();
             for path in &graph_paths {
                 let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
                 self.refresh_prepared_note_sidecars(
@@ -643,9 +759,14 @@ impl BrainWatcher {
                     &note_tags,
                 )?;
             }
+            phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
+
+            let tombstones_started = Instant::now();
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_embeddings")?;
             tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "watched batch");
+            phase_timings.tombstones_ms = tombstones_started.elapsed().as_millis() as u64;
         }
+        let non_graph_events_started = Instant::now();
         for path in unique_paths
             .into_iter()
             .filter(|path| !self.event_targets_graph(path))
@@ -654,6 +775,7 @@ impl BrainWatcher {
             let outcome = self.handle_non_graph_event(store, path)?;
             log_outcome(&outcome);
         }
+        phase_timings.non_graph_events_ms = non_graph_events_started.elapsed().as_millis() as u64;
 
         // After a batch that touched the graph, recompute PPR over the
         // unified scope so brain_context queries see fresh ranks. This stays
@@ -665,8 +787,10 @@ impl BrainWatcher {
         // (~milliseconds)"; nw-380's own production measurement — 192,818
         // live vectors — is well past that, so treat this as a real,
         // currently-unshrunk cost rather than the stale comment's
-        // "~milliseconds".)
+        // "~milliseconds".) `finalize_ms` covers this recompute together
+        // with the publication finalize itself — one lease-held window.
         if graph_batch {
+            let finalize_started = Instant::now();
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_batch")?;
             let finalization = self.finalize_graph_publication_with_io(
                 publication.expect("graph batch established publication lease"),
@@ -690,6 +814,7 @@ impl BrainWatcher {
             if let Err(error) = finalization {
                 batch_failures.push(format!("mandatory graph publication: {error}"));
             }
+            phase_timings.finalize_ms = finalize_started.elapsed().as_millis() as u64;
         }
         // nw-380: "instrument first" — nothing previously logged batch size
         // or hold duration, so a recurrence could not distinguish "many
@@ -697,13 +822,29 @@ impl BrainWatcher {
         // the cause. `elapsed_ms` covers the WHOLE batch (all per-file lease
         // windows plus the final publish), not any single lease hold,
         // precisely because per-file holds are no longer expected to
-        // dominate it after this fix.
+        // dominate it after this fix. nw-475 (Task 5.2) adds the named phase
+        // fields alongside it so a slow batch is attributable to a specific
+        // phase without re-instrumenting later.
         tracing::info!(
             files = batch_len,
             elapsed_ms = batch_started.elapsed().as_millis() as u64,
             mutation_batch,
+            build_symbol_index_ms = phase_timings.build_symbol_index_ms,
+            embedding_candidates_ms = phase_timings.embedding_candidates_ms,
+            refresh_watched_paths_ms = phase_timings.refresh_watched_paths_ms,
+            sidecars_ms = phase_timings.sidecars_ms,
+            tombstones_ms = phase_timings.tombstones_ms,
+            non_graph_events_ms = phase_timings.non_graph_events_ms,
+            finalize_ms = phase_timings.finalize_ms,
             "BrainWatcher batch complete"
         );
+        #[cfg(test)]
+        {
+            *self
+                .last_batch_phase_timings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase_timings);
+        }
         if !batch_failures.is_empty() {
             anyhow::bail!(
                 "brain watcher batch failed after committed graph work: {}",
@@ -1185,6 +1326,92 @@ mod tests {
         assert_eq!(links[0].1, heading.uid);
     }
 
+    /// nw-475 (Task 5.2): the batch-complete event previously reported only
+    /// `files`/`elapsed_ms`/`mutation_batch` — enough to see a batch was
+    /// slow, never which of its phases was. Pins that every named phase is
+    /// measured and carried on the SAME `BrainWatcher batch complete` event
+    /// (via [`BatchPhaseTimings`]), mirroring how daemon boot broke
+    /// `boot_ms` down into `store_open_ms`/`extension_reconcile_ms`/etc.
+    /// (server.rs, nw-119) instead of leaving the reader to guess or
+    /// instrument later. Asserted against the struct `process_batch` records
+    /// for tests (`last_batch_phase_timings`) rather than by re-parsing log
+    /// output, so this test needs no tracing-capture dependency.
+    #[test]
+    fn watcher_batch_logs_per_phase_timings() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\nold\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::write(root.join("Alpha.md"), "# Alpha\n\nnew\n").unwrap();
+
+        let batch_started = Instant::now();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Alpha.md")], &None)
+            .unwrap();
+        let elapsed_ms = batch_started.elapsed().as_millis() as u64;
+
+        let timings = watcher
+            .last_batch_phase_timings()
+            .expect("a graph batch must record phase timings");
+        let accounted_ms = timings.build_symbol_index_ms
+            + timings.embedding_candidates_ms
+            + timings.refresh_watched_paths_ms
+            + timings.sidecars_ms
+            + timings.tombstones_ms
+            + timings.non_graph_events_ms
+            + timings.finalize_ms;
+        assert!(
+            accounted_ms <= elapsed_ms,
+            "the named phases are non-overlapping sub-spans of the batch, \
+             so their sum ({accounted_ms}ms) cannot exceed the batch's own \
+             wall clock ({elapsed_ms}ms, measured independently by this test)"
+        );
+        // A zeroed struct would satisfy every assertion above (0 <= anything),
+        // so that alone cannot prove the timers are wired up at all — a
+        // real graph batch (parsing, sidecar writes, a database commit) must
+        // account for SOME measurable time.
+        assert!(
+            accounted_ms > 0,
+            "a real graph batch must account for measurable time somewhere, \
+             not read as an all-zero struct: {timings:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT to `watcher_batch_logs_per_phase_timings`: a batch that
+    /// touches no graph (markdown) path at all must take NONE of the
+    /// graph-gated phases — proving those fields are actually wired to
+    /// `graph_batch`, not placeholders that happen to read as zero for an
+    /// unrelated reason.
+    #[test]
+    fn non_graph_only_batch_reports_zero_graph_phase_timings() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\nold\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::write(root.join("note.txt"), "not markdown, so not a graph path").unwrap();
+
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("note.txt")], &None)
+            .unwrap();
+
+        let timings = watcher
+            .last_batch_phase_timings()
+            .expect("even a non-graph batch records (zeroed) phase timings");
+        assert_eq!(timings.embedding_candidates_ms, 0);
+        assert_eq!(timings.refresh_watched_paths_ms, 0);
+        assert_eq!(timings.sidecars_ms, 0);
+        assert_eq!(timings.tombstones_ms, 0);
+        assert_eq!(timings.finalize_ms, 0);
+    }
+
     #[test]
     fn watched_target_creation_deletion_and_batch_links_match_full_refresh() {
         let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\n[[Beta]]\n")]);
@@ -1464,7 +1691,11 @@ mod tests {
         let watcher = BrainWatcher::new(&db_path, &root, "test", "test");
 
         let publication = watcher
-            .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
+            .establish_graph_publication_with_io(
+                &store,
+                &crate::index::FileSystemIndexEpilogueIo,
+                &[],
+            )
             .unwrap();
         ensure_vault(&store, "vault:watcher-failure", &root, "test", "test").unwrap();
         let error = watcher
