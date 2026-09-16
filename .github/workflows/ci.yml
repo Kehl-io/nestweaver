@@ -1082,6 +1082,7 @@ jobs:
           printf '%s\n' "${pkgs[@]}" > /tmp/pr.pkgs
           echo "package_count=${#pkgs[@]}" >> "$GITHUB_OUTPUT"
       - name: Warm the -p build shape before the mutation budget starts
+        id: prewarm
         if: steps.prdiff.outputs.package_count != '0'
         # Task 0.2b (mutants-build-cost.md), root causes #1 and #2. Canary run
         # 34922651945 spent 1200.9s (≈20.0m) in the BUILD phase alone for its
@@ -1257,14 +1258,25 @@ jobs:
         # real measurement for store and any other package this job hasn't
         # timed yet.
         #
-        # Bounded and NOT swallowed on timeout: a warm build that still can't
-        # finish in 30m is the same "cross-cutting diff exhausts the runner"
-        # failure mode timeout-minutes' own comment names (PR #319, 2h04m),
-        # and hiding it behind a truncated-but-green mutation step would be
-        # nw-445 moved one step earlier. A step failure here is a normal,
-        # visible red X — including a genuine compile error, which
-        # `set -euo pipefail` inside the loop surfaces immediately instead of
-        # continuing to warm later packages.
+        # Bounded, and never swallowed into a green mutation result. A build
+        # failure is still a normal, visible red X — a genuine compile error
+        # exits 101, which `set -euo pipefail` inside the loop surfaces
+        # immediately instead of continuing to warm later packages.
+        #
+        # A BUDGET expiry (exit 124, which GNU `timeout` reserves for exactly
+        # that) is treated differently, and deliberately: it means the diff is
+        # too wide to warm, which is a scope limit rather than a mutation
+        # finding. Run 35098068775 measured it — 8 packages, nestweaver-daemon
+        # alone 23.9m of the 30m, killed during package 2 of 8 — and no budget
+        # this job can afford (timeout-minutes 80, MUTANTS_BUDGET 35m) would
+        # have finished it. Running cargo-mutants anyway would burn the whole
+        # mutation budget on the build and test zero mutants. So the mutate
+        # step is SKIPPED and the summary says so in the loudest terms it has.
+        #
+        # This is not nw-445 moved one step earlier: nw-445 was an absent
+        # signal that READ LIKE a clean one. The skip path prints no all-clear,
+        # states outright that no mutation coverage was measured, and raises a
+        # `::warning::` annotation on the run.
         #
         # Env matches the mutate step below (NESTWEAVER_NO_DAEMON,
         # NESTWEAVER_ALLOW_NO_DAEMON) so the two steps' cargo invocations
@@ -1309,14 +1321,39 @@ jobs:
             cargo test --locked --no-run --verbose --package="${pkg}"
           done
           PREWARM_SCRIPT
+          # Branch on 124 SPECIFICALLY, which GNU `timeout` reserves for "the
+          # budget expired". Every other non-zero status is the command's own
+          # — a genuine compile error is 101 — and still fails this step as a
+          # red X, exactly as the "NOT swallowed" comment above requires. Only
+          # the budget case is converted into a skip, because a diff this wide
+          # cannot produce a mutation result at ANY budget this job can afford
+          # (run 35098068775: 8 packages, nestweaver-daemon alone took 23.9m of
+          # the 30m, killed during package 2 of 8), and a red X that means
+          # "the diff was too wide to warm" is not a mutation finding. The
+          # mutate step is skipped and the summary says so loudly; it never
+          # gets to print an all-clear.
+          set +e
           timeout --signal=INT --kill-after=60s "${PREWARM_BUDGET}" \
             bash /tmp/prewarm.sh "${pkgs[@]}"
+          prewarm_status=$?
+          set -e
+          if [ "${prewarm_status}" -eq 124 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Mutation testing SKIPPED: pre-warming this PR's ${#pkgs[@]} packages did not finish inside ${PREWARM_BUDGET}, so no mutation coverage was measured. This is a scope limit, not a clean result."
+            exit 0
+          fi
+          echo "timed_out=false" >> "$GITHUB_OUTPUT"
+          exit "${prewarm_status}"
         env:
           PREWARM_BUDGET: 30m
           NESTWEAVER_NO_DAEMON: "1"
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
       - name: Mutate only what this PR changed
         id: mutate
+        # Skipped when the pre-warm hit its budget: cargo-mutants would spend
+        # the whole MUTANTS_BUDGET finishing the build the pre-warm could not,
+        # and report zero tested mutants. See that step's 124 branch.
+        if: steps.prewarm.outputs.timed_out != 'true'
         # `--workspace` is load-bearing. This repo's root Cargo.toml is BOTH a
         # [workspace] and a [package], so cargo-mutants defaults to the root
         # package alone — src/main.rs and src/setup.rs. Measured: `--list`
@@ -1555,12 +1592,33 @@ jobs:
           TRUNCATED: ${{ steps.mutate.outputs.truncated }}
           NO_PACKAGES: ${{ steps.mutate.outputs.no_packages }}
           MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
+          PREWARM_TIMED_OUT: ${{ steps.prewarm.outputs.timed_out }}
+          PREWARM_BUDGET: 30m
           # Same value as the "Mutate only what this PR changed" step's env —
           # only needed here to name the budget in the failure summary.
           MUTANTS_BUDGET: 35m
         run: |
           set -uo pipefail
           summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # The pre-warm could not build this diff's packages inside its
+          # budget, so no mutation run was attempted. Reported as a SKIP, not
+          # a pass and not a finding: nothing here says anything about whether
+          # this PR's tests can kill mutants. Deliberately loud — the whole
+          # recurring defect in this job (nw-272, nw-445) is an absent signal
+          # that reads like a clean one, and "skipped" must never be mistaken
+          # for "no surviving mutants".
+          if [ "${PREWARM_TIMED_OUT:-}" = "true" ]; then
+            summary "### Mutation testing — SKIPPED (diff too wide)"
+            summary ""
+            summary "> **No mutation coverage was measured for this PR.** This is NOT a clean result."
+            summary ""
+            summary "Pre-warming the packages this diff touches did not finish inside \`${PREWARM_BUDGET}\`, so the mutation run was not started. cargo-mutants builds one package per mutant, and with a diff this wide it would have spent its entire budget building and tested zero mutants."
+            summary ""
+            summary "Nothing about this PR's mutation resistance is known. Review the diff's test coverage by hand, or split the PR so a budgeted run can complete."
+            echo "::warning::Mutation testing SKIPPED — diff too wide to pre-warm in ${PREWARM_BUDGET}. No mutation coverage measured; this is not a clean result."
+            exit 0
+          fi
 
           # nw-272: no Rust package in the diff is legitimately nothing to do —
           # distinct from "the report is missing", which the branches below
