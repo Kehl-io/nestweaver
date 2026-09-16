@@ -106,7 +106,7 @@ use std::path::Path;
 ///     matter which binary asks — only re-indexing (`nestweaver index --repo
 ///     <path> --force`) writes the corrected flag.
 ///
-///     nw-356 (same generation as nw-435 above, per the branch's own
+/// nw-356 (same generation as nw-435 above, per the branch's own
 ///     coordination note — one bump covers both). Two independent C++
 ///     `parse.rs` fixes change what gets extracted from `.h`/`.cpp` files.
 ///     BOTH are gated so an ordinary, already-correct declaration is NEVER
@@ -150,7 +150,7 @@ use std::path::Path;
 ///     re-indexing. Same remedy as every other bump in this file: `nestweaver
 ///     index --repo <path> --force`.
 ///
-///     nw-490 (same generation as nw-435/nw-356 above, per the branch's own
+/// nw-490 (same generation as nw-435/nw-356 above, per the branch's own
 ///     coordination note — one bump covers all three; the branch is
 ///     unreleased). Extends nw-435's exact mechanism (a call/command with no
 ///     enclosing function body promotes its same-file callee to
@@ -168,7 +168,7 @@ use std::path::Path;
 ///     re-indexing (`nestweaver index --repo <path> --force`) writes the
 ///     corrected flag.
 ///
-///     nw-491 (same generation as nw-435/nw-356/nw-490 above — the branch is
+/// nw-491 (same generation as nw-435/nw-356/nw-490 above — the branch is
 ///     still unreleased). `queries/bash.scm` had no capture for a command's
 ///     ARGUMENTS, only its own name, so `trap cleanup EXIT` referenced the
 ///     literal word `trap` and never `cleanup`; the handler had in-degree
