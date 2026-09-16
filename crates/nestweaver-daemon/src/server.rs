@@ -22443,20 +22443,48 @@ external_model = "external-model"
     /// counter, so it cannot extend a shutdown drain. And once shutdown has
     /// begun, a reload request is refused immediately without ever reaching
     /// the loader.
+    ///
+    /// Bounded for the same reason as
+    /// `daemon_embed_joins_an_in_flight_auto_repair_download` below — read
+    /// that test's history note first. This one did NOT hang on Linux CI, and
+    /// tracing it shows why: its fake seeder is parked on the gate long
+    /// before the test reaches its own release, and the post-shutdown reply
+    /// is deterministic. But it had the identical risky shape — a
+    /// current-thread runtime, a two-party rendezvous blocked on that one
+    /// runtime thread, and three unbounded awaits — so it was one refactor
+    /// away from the same six-hour wedge. Terminating by luck of scheduling
+    /// is not a property worth preserving, so it gets the same construction:
+    /// a polled release-flag with a deadline instead of a rendezvous, a
+    /// multi-threaded runtime, and a bound on every wait that names what it
+    /// was waiting for.
     #[cfg(feature = "embed")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn daemon_embed_seed_does_not_hold_the_write_gate_or_extend_drain() {
+        // Bounds mirror the sibling test: long enough that a healthy run
+        // never reaches them, short enough that a regression reports a named
+        // failure in seconds instead of parking the binary.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        const JOIN_BOUND: Duration = Duration::from_secs(30);
+
         let cache = tempfile::tempdir().expect("embedding cache tempdir");
         let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let release_seed = Arc::new(AtomicBool::new(false));
         let seed_calls = Arc::new(AtomicU32::new(0));
         {
-            let barrier = Arc::clone(&barrier);
+            let release_seed = Arc::clone(&release_seed);
             let seed_calls = Arc::clone(&seed_calls);
             let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
             state_mut.artifact_seeder = Arc::new(move |config, _progress| {
                 seed_calls.fetch_add(1, Ordering::Relaxed);
-                barrier.wait();
+                // Hold the download "in flight" until the test releases it.
+                // `Acquire` pairs with the test's `Release` store, and the
+                // deadline means a seeder nobody ever releases unwinds in
+                // seconds rather than pinning an OS thread for the life of
+                // the process.
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 write_complete_hf_cache(&config.cache_dir);
                 Ok(())
             });
@@ -22475,9 +22503,14 @@ external_model = "external-model"
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         let embed_task = tokio::spawn(async move { service.embed(request).await });
 
-        while seed_calls.load(Ordering::Relaxed) == 0 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_condition("the embed seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        // Settling time: the seeder has entered, but the RPC may not yet have
+        // reached whatever it does next. The assertions below are about what
+        // is NOT held, so they need a moment in which taking the gate would
+        // have shown up.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert!(
@@ -22498,7 +22531,16 @@ external_model = "external-model"
             .send(EmbeddingReloadRequest { reply: reply_tx })
             .await
             .expect("reload channel open");
-        let outcome = reply_rx.await.expect("servicer must reply");
+        let outcome = tokio::time::timeout(JOIN_BOUND, reply_rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the reload servicer to refuse a \
+                     post-shutdown reload",
+                    JOIN_BOUND.as_secs()
+                )
+            })
+            .expect("servicer must reply");
         assert!(
             matches!(outcome, EmbeddingReloadOutcome::ShuttingDown),
             "a reload requested after shutdown began must be refused"
@@ -22509,17 +22551,121 @@ external_model = "external-model"
             "no load may run once shutdown has begun"
         );
 
-        barrier.wait();
-        let _ = embed_task.await;
+        // Release the one download and let the RPC unwind. A second,
+        // unexpected seeder would read this flag rather than wait forever for
+        // a rendezvous partner that will never arrive.
+        release_seed.store(true, Ordering::Release);
+        let embed_join = tokio::time::timeout(JOIN_BOUND, embed_task)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the embed RPC to finish after its \
+                     seed was released",
+                    JOIN_BOUND.as_secs()
+                )
+            });
+        // The RPC's own `Result` is not asserted — this test is about the
+        // write gate and the drain — but a PANIC inside the task must not be
+        // swallowed the way `let _ = ..` did.
+        let _ = embed_join.expect("the embed RPC task must not panic");
         servicer.abort();
+    }
+
+    /// Poll `condition` until it holds, or FAIL naming what was awaited.
+    ///
+    /// Every wait in a test must be bounded. An unbounded one does not fail —
+    /// it parks the whole test binary until the CI job's own timeout kills
+    /// it, which costs a full job (six hours, on GitHub's default) and hides
+    /// the real cause behind the kill. That is not hypothetical here; see the
+    /// history note on `daemon_embed_joins_an_in_flight_auto_repair_download`
+    /// below.
+    #[cfg(feature = "embed")]
+    async fn wait_for_condition(what: &str, mut condition: impl FnMut() -> bool) {
+        const BOUND: Duration = Duration::from_secs(20);
+        let settled = tokio::time::timeout(BOUND, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "timed out after {}s waiting for {what}",
+            BOUND.as_secs()
+        );
     }
 
     /// The `embed` RPC joins an in-flight auto-repair download rather than
     /// racing a second one, and both routes end up loading through exactly
     /// one main-thread reload.
+    ///
+    /// ## This test has a history of HANGING — read before restructuring it
+    ///
+    /// It never returned on Linux CI (run 35053752832, job "Daemon
+    /// Integration Tests"): the job ran 03:57 → 09:59 UTC and was killed by
+    /// GitHub's default 6-hour job timeout. The daemon lib-test binary
+    /// printed `running 39 tests` and NEVER a `test result:` line — every
+    /// other binary in that job printed one — and job cleanup logged
+    /// `Terminate orphan process: pid (59418)
+    /// (nestweaver_daemon-32045b891d406fe2)`. Diffing the 38 tests that
+    /// printed `... ok` against the binary's 39 `daemon_`-matching tests left
+    /// exactly one: this one. It passed on macOS throughout (including the
+    /// Cold Metal job), because what it lost was a scheduling race that only
+    /// goes the wrong way on an oversubscribed runner.
+    ///
+    /// The production single-flight logic was NOT at fault — the old test
+    /// construction was. It ran on a CURRENT-THREAD runtime (`#[tokio::test]`
+    /// with no `flavor`), spawned the `embed` task, and then blocked that one
+    /// runtime thread on a `std::sync::Barrier::wait()`, so the `embed` task
+    /// could not be polled AT ALL until the barrier released. The seed thread
+    /// was the last party to arrive, so it returned from `wait()` immediately
+    /// while the test thread still had to be woken by the OS. Under CI load
+    /// the seed thread therefore finished `write_complete_hf_cache` (which
+    /// builds and serialises a real BERT fixture — not a quick write) and
+    /// published `SeedPhase::Done` BEFORE the `embed` task ever reached
+    /// `join_or_start_seed`. That function only joins a flight whose watch
+    /// value still reads `Running`, so `embed` correctly started a SECOND
+    /// flight — whose seeder blocked on the same 2-party barrier with no
+    /// partner left to meet it, forever. `let _ = embed_task.await;` had no
+    /// timeout (only the `repair` join did), so the binary hung instead of
+    /// failing an assertion.
+    ///
+    /// Three things keep that from recurring:
+    ///
+    /// 1. The interleaving this test exists to cover is now ESTABLISHED, not
+    ///    raced. The seed is held open until the test has positively observed
+    ///    that `embed` joined auto-repair's flight
+    ///    (`SeedProgress::joiners`, a test-only counter incremented inside
+    ///    `join_or_start_seed`'s join branch under its own lock).
+    /// 2. The seed gate is a released-flag the seed thread POLLS with a
+    ///    deadline, not a rendezvous. Releasing costs the test thread one
+    ///    atomic store it can never block on, and a second, unexpected seeder
+    ///    reads the flag rather than waiting forever for a partner — the old
+    ///    barrier's exact failure mode.
+    /// 3. EVERY await and every blocking wait is bounded, and each names what
+    ///    it was waiting for when it expires. This test can fail now; it
+    ///    cannot hang.
+    ///
+    /// `worker_threads = 2`: under `flavor = "multi_thread"` the test body
+    /// runs on the `block_on` thread and spawned tasks run on separate
+    /// workers, so a body that blocks (or busy-polls) can no longer starve
+    /// them the way the current-thread runtime did. Two workers then give the
+    /// auto-repair task and the `embed` task a thread each, so neither can be
+    /// queued behind the other's poll — `embed`'s first poll runs straight
+    /// through a store read and a `std::sync::Mutex` acquisition to
+    /// `join_or_start_seed` without yielding.
     #[cfg(feature = "embed")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn daemon_embed_joins_an_in_flight_auto_repair_download() {
+        // How long the fake seeder parks waiting to be released. Bounded, so
+        // a seeder nothing ever releases — precisely what a regression here
+        // produces — unwinds in seconds and lets the assertions below report
+        // a real failure, instead of pinning an OS thread for the life of the
+        // process.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        // Bound on each caller's completion once the one download is done.
+        const JOIN_BOUND: Duration = Duration::from_secs(30);
+
         let cache = tempfile::tempdir().expect("embedding cache tempdir");
         let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
         state
@@ -22527,15 +22673,22 @@ external_model = "external-model"
             .set_embedding_metadata("test-owner/test-model", 4)
             .unwrap();
 
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let release_seed = Arc::new(AtomicBool::new(false));
         let seed_calls = Arc::new(AtomicU32::new(0));
         {
-            let barrier = Arc::clone(&barrier);
+            let release_seed = Arc::clone(&release_seed);
             let seed_calls = Arc::clone(&seed_calls);
             let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
             state_mut.artifact_seeder = Arc::new(move |config, _progress| {
                 seed_calls.fetch_add(1, Ordering::Relaxed);
-                barrier.wait();
+                // Hold the download "in flight" until the test says
+                // otherwise. `Acquire` pairs with the `Release` store below
+                // so the flag is not merely visible but ordered after
+                // everything the test did before releasing.
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 write_complete_hf_cache(&config.cache_dir);
                 Ok(())
             });
@@ -22547,9 +22700,12 @@ external_model = "external-model"
         let repair =
             spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
 
-        while seed_calls.load(Ordering::Relaxed) == 0 {
-            tokio::task::yield_now().await;
-        }
+        // (1) Auto-repair's download is genuinely in flight: its seed thread
+        // has entered the seeder and is parked on the gate.
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
 
         let service = DaemonService::new(Arc::clone(&state));
         let mut request = Request::new(EmbedRequest {
@@ -22561,9 +22717,50 @@ external_model = "external-model"
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         let embed_task = tokio::spawn(async move { service.embed(request).await });
 
-        barrier.wait();
-        let _ = embed_task.await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), repair).await;
+        // (2) The `embed` RPC has reached `join_or_start_seed` and JOINED the
+        // flight auto-repair opened. Only now may the download finish. If
+        // `embed` ever started a second download instead of joining, this
+        // wait expires and the test FAILS by name — it can no longer wedge.
+        wait_for_condition(
+            "the embed RPC to join the in-flight auto-repair seed",
+            || {
+                state
+                    .embedding_seed_progress
+                    .joiners
+                    .load(Ordering::Acquire)
+                    == 1
+            },
+        )
+        .await;
+
+        // (3) Release the one download. Both callers wake from the same
+        // `SeedPhase::Done` and request a reload through the same channel.
+        release_seed.store(true, Ordering::Release);
+
+        let embed_join = tokio::time::timeout(JOIN_BOUND, embed_task)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the embed RPC to finish after the \
+                     in-flight seed it joined completed",
+                    JOIN_BOUND.as_secs()
+                )
+            });
+        // The RPC's own `Result` is deliberately not asserted — this test is
+        // about single-flight, not about the pass's outcome — but a PANIC
+        // inside the task must not be swallowed the way `let _ = ..` did.
+        let _ = embed_join.expect("the embed RPC task must not panic");
+
+        tokio::time::timeout(JOIN_BOUND, repair)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the auto-repair task to finish after \
+                     its download completed",
+                    JOIN_BOUND.as_secs()
+                )
+            })
+            .expect("the auto-repair task must not panic");
 
         assert_eq!(
             seed_calls.load(Ordering::Relaxed),
@@ -22654,17 +22851,25 @@ external_model = "external-model"
             .set_embedding_metadata("test-owner/test-model", 4)
             .unwrap();
 
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        // A polled release-flag with a deadline, not a rendezvous — see the
+        // history note on `daemon_embed_joins_an_in_flight_auto_repair_download`.
+        // A seeder nobody releases unwinds on its own here; a `Barrier` with
+        // no partner never does.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        let release_seed = Arc::new(AtomicBool::new(false));
         let seed_calls = Arc::new(AtomicU32::new(0));
         {
-            let barrier = Arc::clone(&barrier);
+            let release_seed = Arc::clone(&release_seed);
             let seed_calls = Arc::clone(&seed_calls);
             let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
             state_mut.artifact_seeder = Arc::new(move |config, progress| {
                 seed_calls.fetch_add(1, Ordering::Relaxed);
                 progress.bytes_total.store(2048, Ordering::Relaxed);
                 progress.bytes_done.store(1024, Ordering::Relaxed);
-                barrier.wait();
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 write_complete_hf_cache(&config.cache_dir);
                 Ok(())
             });
@@ -22678,9 +22883,10 @@ external_model = "external-model"
         let repair =
             spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
 
-        while seed_calls.load(Ordering::Relaxed) == 0 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let service = DaemonService::new(Arc::clone(&state));
@@ -22734,7 +22940,7 @@ external_model = "external-model"
         assert_eq!(seed_snapshot.origin, "auto_repair");
         assert!(seed_snapshot.bytes_done > 0);
 
-        barrier.wait();
+        release_seed.store(true, Ordering::Release);
         tokio::time::timeout(Duration::from_secs(5), repair)
             .await
             .expect("repair task must finish promptly once unblocked")
@@ -22763,15 +22969,26 @@ external_model = "external-model"
             .set_embedding_metadata("test-owner/test-model", 4)
             .unwrap();
 
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        // Deliberately never released until the assertions are done: the
+        // repair task must reach the bounded timeout below via the SHUTDOWN
+        // branch of its `tokio::select!`, never by the seed finishing. A
+        // polled flag with a deadline rather than a `Barrier` so that a
+        // seeder this test never releases still unwinds on its own instead
+        // of parking an OS thread for the rest of the binary's run — see the
+        // history note on `daemon_embed_joins_an_in_flight_auto_repair_download`.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        let release_seed = Arc::new(AtomicBool::new(false));
         let seed_calls = Arc::new(AtomicU32::new(0));
         {
-            let barrier = Arc::clone(&barrier);
+            let release_seed = Arc::clone(&release_seed);
             let seed_calls = Arc::clone(&seed_calls);
             let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
             state_mut.artifact_seeder = Arc::new(move |_config, _progress| {
                 seed_calls.fetch_add(1, Ordering::Relaxed);
-                barrier.wait();
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Ok(())
             });
         }
@@ -22782,9 +22999,10 @@ external_model = "external-model"
         let repair =
             spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
 
-        while seed_calls.load(Ordering::Relaxed) == 0 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         state
@@ -22801,9 +23019,10 @@ external_model = "external-model"
             .unwrap();
 
         // Release the blocked seed thread so it can finish and this test
-        // does not leak a permanently parked thread into the rest of the
-        // binary's test run.
-        barrier.wait();
+        // does not leak a parked thread into the rest of the binary's test
+        // run. A store, not a rendezvous: it cannot block, and it is belt to
+        // the seeder's own deadline braces.
+        release_seed.store(true, Ordering::Release);
         servicer.abort();
     }
 

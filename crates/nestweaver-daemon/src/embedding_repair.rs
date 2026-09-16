@@ -218,6 +218,25 @@ pub(crate) struct SeedProgress {
     attempt: AtomicU32,
     max_attempts: AtomicU32,
     next_retry_at: std::sync::atomic::AtomicI64,
+    /// TEST-ONLY observation seam: how many callers JOINED the flight that
+    /// `begin()` most recently opened, as opposed to starting it. Reset by
+    /// `begin()`, incremented by `join_or_start_seed`'s join branch under the
+    /// same lock that decided to join. Deliberately NOT part of
+    /// `SeedProgressSnapshot` — no status route reports it, and it is
+    /// compiled out of every non-test build.
+    ///
+    /// It exists because there is otherwise NO way to observe that a joiner
+    /// has registered: a joiner takes no `ConnectionGuard`, writes none of
+    /// the fields above (they describe the STARTER — see this struct's doc),
+    /// and only clones a `watch::Receiver`, which exposes no receiver count
+    /// (only `watch::Sender` does, and the sender is owned by the seed
+    /// thread). Without that observable a test can only GUESS when the
+    /// second caller has joined, and
+    /// `daemon_embed_joins_an_in_flight_auto_repair_download` guessed wrong
+    /// on Linux CI and hung for six hours — see the history note on that
+    /// test.
+    #[cfg(all(test, feature = "embed"))]
+    pub(crate) joiners: AtomicU32,
 }
 
 /// Immutable view of [`SeedProgress`], read under `brain_status`.
@@ -252,6 +271,11 @@ impl SeedProgress {
         self.attempt.store(attempt, Ordering::Relaxed);
         self.max_attempts.store(max_attempts, Ordering::Relaxed);
         self.next_retry_at.store(0, Ordering::Relaxed);
+        // Per-flight, like every other field here: a joiner count carried over
+        // from the previous flight would let a test conclude "someone joined"
+        // about a download that has not started yet.
+        #[cfg(test)]
+        self.joiners.store(0, Ordering::Relaxed);
         // Set active LAST: every other field must already be correct the
         // instant a concurrent reader can observe `active == true`.
         self.active.store(true, Ordering::Release);
@@ -490,6 +514,14 @@ pub(crate) fn join_or_start_seed(
         && flight.key == key
         && matches!(*flight.rx.borrow(), SeedPhase::Running)
     {
+        // Counted INSIDE the lock that decided to join, so a test observing
+        // this value knows the joiner is registered on THIS still-running
+        // flight rather than on a successor — see `SeedProgress::joiners`.
+        #[cfg(test)]
+        state
+            .embedding_seed_progress
+            .joiners
+            .fetch_add(1, Ordering::Release);
         return Ok(flight.rx.clone());
     }
 
