@@ -11,18 +11,37 @@
 //! functions in isolation, so they share that module's existing
 //! `DaemonState` test fixtures rather than duplicating them here.
 
+// `PathBuf` is only used by the embed-only `SeedPhase`/`SeedFlight` types and
+// functions below (it was ungated when `SeedFlight` itself still was).
+#[cfg(feature = "embed")]
 use std::path::PathBuf;
+// `Arc` and `Duration` are only used by the embed-only functions below
+// (seeding, the reload loaders, auto-repair's backoff schedule) — every
+// ungated item in this file (`SeedProgress`, `SeedProgressSnapshot`,
+// `EmbeddingReloadOutcome`, `EmbeddingReloadRequest`) either avoids them or
+// spells `std::sync::Arc` out fully qualified. Without the gate, a
+// `--no-default-features --features metal` build (CI's Cold Metal job, and
+// `cargo check -p nestweaver-daemon --no-default-features --features metal
+// --all-targets`) warns on both as unused.
+#[cfg(feature = "embed")]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "embed")]
 use std::time::Duration;
 
-use crate::server::{ConnectionGuard, DaemonState, EmbeddingRuntimeStatus};
-// `embedding_cache_dir_for_load_with` and `embedding_load_config` are gated on
-// the `embed` feature in `server`, and only the auto-repair loop (also gated)
-// uses them, so the import has to carry the same gate. Without it a
-// `--features metal` build with `embed` off fails to resolve the import.
+// `EmbeddingRuntimeStatus` is used by the always-compiled
+// `EmbeddingReloadOutcome`; `ConnectionGuard`/`DaemonState` are used only by
+// the embed-only functions below (`join_or_start_seed`,
+// `clear_stale_seed_flight`, `run_embedding_cache_repair`,
+// `service_embedding_reloads`), so they carry the same `embed` gate as
+// `embedding_cache_dir_for_load_with`/`embedding_load_config` right below —
+// same reasoning, same CI job.
+use crate::server::EmbeddingRuntimeStatus;
 #[cfg(feature = "embed")]
-use crate::server::{embedding_cache_dir_for_load_with, embedding_load_config, unix_now_seconds};
+use crate::server::{
+    ConnectionGuard, DaemonState, embedding_cache_dir_for_load_with, embedding_load_config,
+    unix_now_seconds,
+};
 // Only `production_reload_loader` (`not(test)`) calls this; under a test
 // build the import would otherwise be unused.
 #[cfg(all(feature = "embed", not(test)))]
@@ -42,6 +61,21 @@ use crate::server::write_complete_hf_cache;
 
 /// Outcome of one main-thread reload attempt, delivered to every request
 /// coalesced into that attempt.
+///
+/// Deliberately NOT `#[cfg(feature = "embed")]`: `EmbeddingReloadRequest`
+/// below carries it as its `reply` sender's generic parameter, and that type
+/// is part of the general-purpose `DaemonState` test-fixture surface
+/// (`test_state_with_writer_generation`, `test_state_with_authz` — used by
+/// hundreds of tests with nothing to do with embedding), which always opens
+/// a reload channel and hands the `Receiver<EmbeddingReloadRequest>` back to
+/// its caller regardless of the `embed` feature. Splitting that return type
+/// per-feature would ripple into every one of those callers for no benefit.
+/// Under `--no-default-features --features metal` only `Unavailable` is ever
+/// constructed (`run_server`'s `#[cfg(not(feature = "embed"))]` reply
+/// branch), and even that is unreachable in practice (nothing sends into the
+/// channel without `embed`) — hence the narrow, feature-scoped allow rather
+/// than a blanket one.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) enum EmbeddingReloadOutcome {
     Loaded(EmbeddingRuntimeStatus),
@@ -58,7 +92,7 @@ pub(crate) struct EmbeddingReloadRequest {
 /// Typed load failure so a caller can tell "the artifacts are missing" (the
 /// only cause auto-repair may act on) from every other failure (device,
 /// construction, probe, identity) without matching on status strings.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EmbeddingLoadFailure {
     pub(crate) missing_artifact: bool,
@@ -85,7 +119,7 @@ pub(crate) struct EmbeddingLoadFailure {
 /// thread, and downloading there would defeat the whole point of moving
 /// seeding to a dedicated thread (§4.1 of the nw-484 design) — the main
 /// thread must stay bounded by local disk and Metal shader compilation only.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 pub(crate) async fn service_embedding_reloads<F>(
     state: &Arc<DaemonState>,
     first: EmbeddingReloadRequest,
@@ -204,7 +238,13 @@ pub(crate) struct SeedProgressSnapshot {
 impl SeedProgress {
     /// `pub(crate)`: called directly by `crate::server`'s
     /// `seed_progress_sink_ordering_and_snapshot_clamp` test to arm a
-    /// `SeedProgress` before exercising `SeedProgressSink`.
+    /// `SeedProgress` before exercising `SeedProgressSink`. Every caller
+    /// (production and test) is itself `feature = "embed"`-gated, so this
+    /// carries the same gate rather than the broader `any(.., test)` it used
+    /// to — the wider gate left it "never used" (a warning, not an error)
+    /// under `--no-default-features --features metal` (CI's Cold Metal job),
+    /// which still builds the `lib test` target with `embed` off.
+    #[cfg(feature = "embed")]
     pub(crate) fn begin(&self, origin: &str, attempt: u32, max_attempts: u32) {
         self.bytes_done.store(0, Ordering::Relaxed);
         self.bytes_total.store(0, Ordering::Relaxed);
@@ -217,11 +257,12 @@ impl SeedProgress {
         self.active.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "embed")]
     fn end(&self) {
         self.active.store(false, Ordering::Release);
     }
 
-    #[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+    #[cfg(feature = "embed")]
     fn set_next_retry_at(&self, unix_secs: i64) {
         self.next_retry_at.store(unix_secs, Ordering::Relaxed);
     }
@@ -263,7 +304,12 @@ impl SeedProgress {
     }
 }
 
-/// Terminal outcome of one seed attempt, broadcast to every joiner.
+/// Terminal outcome of one seed attempt, broadcast to every joiner. Only
+/// constructed/read by the embed-only single-flight machinery
+/// (`join_or_start_seed`/`clear_stale_seed_flight`) and `DaemonState`'s
+/// `embedding_seed` field, both gated the same way — see that field's own
+/// comment for why it (unlike `embedding_reload_tx`) can be gated cleanly.
+#[cfg(feature = "embed")]
 #[derive(Clone)]
 pub(crate) enum SeedPhase {
     Running,
@@ -272,6 +318,7 @@ pub(crate) enum SeedPhase {
 
 /// The in-flight (or most recently finished) seed download, so a second
 /// caller joins instead of starting a duplicate download.
+#[cfg(feature = "embed")]
 pub(crate) struct SeedFlight {
     key: (String, PathBuf),
     rx: tokio::sync::watch::Receiver<SeedPhase>,
@@ -561,7 +608,7 @@ pub(crate) async fn unserviced_reload_loader(
 
 /// Whether a background cache repair should start for a boot-load failure,
 /// and if so, which model it should repair for.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoRepair {
     Eligible { model_id: String },
@@ -575,7 +622,7 @@ pub(crate) enum AutoRepair {
 /// boot load failed with a typed missing-artifact cause. `stored_model_id`
 /// must already be `None` unless the identity was verified — callers resolve
 /// that (a store read) before calling this pure function.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 pub(crate) fn auto_repair_eligibility(
     cfg: &nestweaver_engine::config::EmbeddingConfig,
     stored_model_id: Option<&str>,
@@ -603,10 +650,10 @@ pub(crate) fn auto_repair_eligibility(
 /// Same capped-exponential-with-jitter shape as `trigram_reconcile_backoff`,
 /// spelled out as a fixed table (rather than doubling) because the schedule
 /// itself is disclosed to the operator in `brain_status` text.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 const AUTO_REPAIR_BACKOFF_BASE_SECS: [u64; 4] = [30, 120, 480, 1800];
 
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 const AUTO_REPAIR_MAX_ATTEMPTS: u32 = 5;
 
 /// Deterministic ±20% jitter with no `rand` dependency: a fixed-round
@@ -615,7 +662,7 @@ const AUTO_REPAIR_MAX_ATTEMPTS: u32 = 5;
 /// requirement — but reproducible under a fixed seed, which is what makes
 /// `daemon_auto_repair_backs_off_after_failure_without_hot_looping` a stable
 /// assertion instead of a flake.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 fn jitter_unit_interval(seed: u64) -> f64 {
     let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -627,7 +674,7 @@ fn jitter_unit_interval(seed: u64) -> f64 {
 /// Delay before auto-repair attempt `attempt` (2-5; attempt 1 is immediate),
 /// ±20% jitter seeded by `nonce` (a value fixed for the life of one repair
 /// task, so the schedule is reproducible within a run but varies run to run).
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 fn auto_repair_delay(attempt: u32, nonce: u64) -> Duration {
     let index = (attempt.saturating_sub(2)) as usize;
     let base_secs =
@@ -643,7 +690,7 @@ fn auto_repair_delay(attempt: u32, nonce: u64) -> Duration {
 /// Conservative: anything not positively identified as permanent is treated
 /// as transient, so an unrecognized error keeps the bounded retry schedule
 /// rather than silently going quiet after one attempt.
-#[cfg(any(feature = "embed", test))]
+#[cfg(feature = "embed")]
 fn auto_repair_error_is_permanent(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("entrynotfound")

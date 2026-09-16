@@ -2047,10 +2047,24 @@ pub struct DaemonState {
     /// loop, which is the only place a local backend can reach Metal. A test
     /// state whose receiver has already been dropped makes `send` fail fast
     /// instead of hanging a caller that never wired a servicer.
+    ///
+    /// Kept ungated (not `#[cfg(feature = "embed")]`) because the
+    /// general-purpose test fixtures that build a `DaemonState`
+    /// (`test_state_with_writer_generation`, `test_state_with_authz`) always
+    /// open this channel and hand its `Receiver` back to callers unrelated to
+    /// embedding; only embed-gated code (the `embed` RPC handler) ever sends
+    /// into it, so under `--no-default-features --features metal` this field
+    /// is written but never read — see `EmbeddingReloadOutcome`'s doc for the
+    /// same tradeoff on the type it carries.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     pub(crate) embedding_reload_tx: tokio::sync::mpsc::Sender<EmbeddingReloadRequest>,
     /// Coordinates a single in-flight artifact download per process: the
     /// `embed` RPC and the background auto-repair task join the same flight
-    /// instead of racing two downloads of the same model.
+    /// instead of racing two downloads of the same model. Unlike
+    /// `embedding_reload_tx` this is never part of a general-purpose test
+    /// fixture's return type, so it can be cleanly `#[cfg(feature =
+    /// "embed")]`-gated instead of merely allowed.
+    #[cfg(feature = "embed")]
     pub(crate) embedding_seed: std::sync::Mutex<Option<SeedFlight>>,
     /// Progress of the current (or most recent) seed attempt, surfaced
     /// through `brain_status`'s JSON route.
@@ -13337,6 +13351,7 @@ pub async fn run_server(
         watcher_lifecycle: std::sync::Mutex::new(()),
         ui_server: std::sync::Mutex::new(None),
         embedding_reload_tx,
+        #[cfg(feature = "embed")]
         embedding_seed: std::sync::Mutex::new(None),
         embedding_seed_progress: Arc::new(SeedProgress::default()),
         // Mirrors the reload-loader split right below in this same function:
@@ -14848,6 +14863,11 @@ pub async fn run_server(
     // finished/failed serve always wins a simultaneous poll, and shutdown
     // still terminates the loop promptly because `uds_serve` completes on
     // the shutdown broadcast (`serve_with_incoming_shutdown`).
+    // Only the two `feature = "embed"` branches of the reload-servicer arm
+    // below borrow this; without the gate it's a `mut`-not-needed AND an
+    // unused-variable warning under `--no-default-features --features
+    // metal` (CI's Cold Metal job builds this crate with `embed` off).
+    #[cfg(feature = "embed")]
     let mut reload_shutdown = shutdown_tx.subscribe();
     let uds_result = loop {
         tokio::select! {
@@ -21124,6 +21144,7 @@ credential_method = "gh"
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
             embedding_reload_tx,
+            #[cfg(feature = "embed")]
             embedding_seed: std::sync::Mutex::new(None),
             embedding_seed_progress: Arc::new(SeedProgress::default()),
             #[cfg(feature = "embed")]
@@ -21226,6 +21247,7 @@ credential_method = "gh"
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
             embedding_reload_tx,
+            #[cfg(feature = "embed")]
             embedding_seed: std::sync::Mutex::new(None),
             embedding_seed_progress: Arc::new(SeedProgress::default()),
             #[cfg(feature = "embed")]
