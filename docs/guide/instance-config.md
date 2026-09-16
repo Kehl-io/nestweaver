@@ -250,10 +250,17 @@ the socket is bound.
 
 `--local` is the direct, daemon-free route rather than the fix for a missing
 cache. Its required form is `nestweaver embed --db <path> --local --model-id
-<id> --cache-dir <path>`, and it is what you want when choosing a model instead
-of restoring the recorded one. It receives `--cache-dir` from the shell, so
-prefer an absolute path or `$HOME/...`; the leading-tilde expansion described
-above applies to the TOML setting.
+<id> --cache-dir <path>`, and it is what you want when CHOOSING a model rather
+than restoring the recorded one.
+
+Do not omit `--local` on that path. The flag is what makes the command direct;
+without it `embed` routes to the daemon, which repairs the model this database's
+own recorded identity names — not the `--model-id` you just typed. Before
+nw-484 that detour simply failed, because the daemon was cache-only and could
+not populate anything; now it succeeds at the wrong thing, which is harder to
+notice. The direct command also receives `--cache-dir` from the shell, so prefer
+an absolute path or `$HOME/...`; the leading-tilde expansion described above
+applies to the TOML setting.
 
 ##### Watching a repair happen
 
