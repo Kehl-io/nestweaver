@@ -145,6 +145,18 @@ you want GPU-accelerated embeddings:
 cargo install --locked --path . --features metal
 ```
 
+There is no feature matrix table here because there is only one feature split
+that changes user-visible behaviour, and it is this: **the nw-484 background
+auto-repair of a missing model cache exists only in builds with the `embed`
+feature.** It is on by default there (`[embedding] auto_repair_cache = true`,
+opt-out), and it re-fetches only the model this database's own verified
+identity already names — never a first-time download. A build without `embed`
+— including `--no-default-features --features metal` — has no local cache to
+repair and the key is not present at all, so a missing cache stays an
+operator-initiated `nestweaver embed` away. The released archives and the npm
+platform packages are `embed` builds; only a hand-configured source build can
+land on the other side of this.
+
 ## macOS app
 
 The native `NestWeaver.app` is source-build-only until a release job publishes
@@ -155,6 +167,33 @@ uses the Metal feature.
 bash app/build.sh
 open target/release/NestWeaver.app
 ```
+
+## Upgrading to this release — re-index every graph
+
+**This release bumps `RESOLVER_GENERATION` to 6.** Installing the new binary
+does not repair a graph already on disk. Until each repo is re-indexed, its
+rankings, edges and `dead-code` results are computed from data the old resolver
+wrote, and `dead-code` refuses outright rather than reporting from it.
+
+What generation 6 changes is which symbols are ENTRY POINTS, and
+`is_entry_point`/`entry_point_kind` are persisted per-symbol columns read
+straight off disk rather than re-derived at query time — so a symbol indexed
+before this release keeps `is_entry_point: false` forever, no matter which
+binary asks. It covers bash and Python top-level-call rooting, Swift
+`main.swift`/shebang rooting, bash `trap` handlers, `package.json` entry points
+discovered at any depth in a monorepo, and a C++ span-anchoring and
+struct-typed-local fix that changes symbol UIDs (and therefore edge endpoints)
+in error-recovered, macro-prefixed declarations.
+
+```sh
+nestweaver index --repo <path> --force   # per repo — a full index, not incremental
+```
+
+**`--force` is required, not a suggestion.** A generation-stale repo is at HEAD
+with nothing modified, so a plain `nestweaver index --repo <path>` takes the
+incremental path, reports `0 modified`, writes nothing, and leaves both the old
+data and the old generation in place. Vaults are not repos, carry no resolver
+generation, and do not need refreshing for this.
 
 ## Upgrading from 8.x — re-index every graph
 
@@ -178,7 +217,11 @@ ladder was SHA-vs-HEAD only, so a generation-3 graph exited 0):
 ```sh
 nestweaver stale-check                 # status: outdated_resolver, exit 2
 nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
-# or read the sidecar directly — any repo below 4 needs a re-index:
+# or read the sidecar directly — any repo whose generation DIFFERS from the
+# running binary's `RESOLVER_GENERATION` (6 in this release) needs a re-index.
+# As of 9.1.0 compatibility is an exact match, not a floor: a graph written by
+# a NEWER resolver than the running binary understands is just as untrustworthy
+# as an older one, so it reads as stale too.
 cat <db>.resolver_generation.json
 ```
 

@@ -46,6 +46,33 @@ pub fn impact_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates: Val
         "candidates": candidates, "note": impact_ambiguity_remedy(repo_filter)}))
 }
 
+/// Attach bounded "did you mean" candidate names (nw-481) to a response
+/// object, or leave it untouched when there are none.
+///
+/// `candidates` comes from the shared engine builder
+/// (`nestweaver_engine::did_you_mean::did_you_mean_candidates`), which does
+/// the actual substring symbol-name search this crate cannot perform itself
+/// (zero internal deps — no store access). This half only shapes the JSON,
+/// so the CLI (`impact_json_not_found` and its text twin) and MCP
+/// (`tool_brain_impact`) cannot pick different insert timing or a different
+/// empty-vs-absent convention: an empty `candidates` slice — a genuine miss,
+/// never a fabricated placeholder — leaves `did_you_mean` OUT of the object
+/// entirely, matching this codebase's `skip_serializing_if`-style honesty
+/// convention (e.g. nw-477's `body_complete`).
+///
+/// Call this BEFORE [`impact`] / [`impact_ambiguous`] so the field is already
+/// present on the object those normalize; both leave unrecognized keys
+/// untouched.
+pub fn with_did_you_mean(mut value: Value, candidates: &[String]) -> Value {
+    if candidates.is_empty() {
+        return value;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("did_you_mean".into(), json!(candidates));
+    }
+    value
+}
+
 /// Keep published CLI (`nodes`) and MCP (`impact_nodes`) spellings as aliases
 /// of one population while clients migrate. `symbol` is the caller's query;
 /// `target` is the resolved UID, or null when resolution did not succeed.
@@ -91,6 +118,31 @@ pub fn impact(mut value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_did_you_mean_adds_the_field_only_when_candidates_exist() {
+        let base = json!({"status": "not_found", "symbol": "project_context"});
+        let with = with_did_you_mean(base.clone(), &["tool_project_context".to_string()]);
+        assert_eq!(with["did_you_mean"], json!(["tool_project_context"]));
+
+        // Counterweight: a genuine miss (empty candidates) must not add a
+        // fabricated or always-present placeholder key.
+        let without = with_did_you_mean(base.clone(), &[]);
+        assert!(without.get("did_you_mean").is_none());
+        assert_eq!(without, base);
+    }
+
+    #[test]
+    fn with_did_you_mean_survives_the_impact_envelope_normalizer() {
+        let value = with_did_you_mean(
+            json!({"status": "not_found", "symbol": "project_context"}),
+            &["tool_project_context".to_string()],
+        );
+        let normalized = impact(value);
+        assert_eq!(normalized["did_you_mean"], json!(["tool_project_context"]));
+        assert_eq!(normalized["status"], json!("not_found"));
+    }
+
     #[test]
     fn full_and_minimal_ambiguity_candidates_have_one_contract() {
         let full = json!([{"uid":"sym:one","name":"same","file_path":"a.rs","start_line":2,

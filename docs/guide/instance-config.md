@@ -158,6 +158,7 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"  # default for fresh DBs; th
 # on Windows; set cache_dir explicitly if that system location is not writable.
 # cache_dir = "~/Library/Caches/nestweaver/models"
 accelerator = "auto" # auto | metal | cpu
+auto_repair_cache = true # default; set false to require an explicit `nestweaver embed` for every recovery
 
 # Optional: use an authoritative external API instead of the local model.
 # external_endpoint = "https://api.openai.com"
@@ -177,8 +178,9 @@ semantic_search_limit = 200    # top-k semantic hits fed into fusion
 | Field | Default | Description |
 |-------|---------|-------------|
 | `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | Default local model for fresh DBs (any mean-pooled BERT-compatible HF model). The model a DB was embedded with is recorded and auto-loaded, overriding this. |
-| `cache_dir` | platform-native | Hugging Face cache root. Default: `~/Library/Caches/nestweaver/models` on macOS, `$XDG_CACHE_HOME/nestweaver/models` (or `~/.cache/nestweaver/models`) on Linux. If unavailable or non-UTF-8, a UTF-8 home supplies `~/.cache/nestweaver/models`; only then does it fall back to `/var/cache/nestweaver/models` on Unix or `C:\ProgramData\nestweaver\models` on Windows. Set `cache_dir` explicitly if the final system location is not writable. An explicit leading `~/` is expanded against the user's home directory. |
+| `cache_dir` | platform-native | Hugging Face cache root. Default: `~/Library/Caches/nestweaver/models` on macOS, `$XDG_CACHE_HOME/nestweaver/models` (or `~/.cache/nestweaver/models`) on Linux. If unavailable or non-UTF-8, a UTF-8 home supplies `~/.cache/nestweaver/models`; only then does it fall back to `/var/cache/nestweaver/models` on Unix or `C:\ProgramData\nestweaver\models` on Windows. Set `cache_dir` explicitly if the final system location is not writable. An explicit leading `~/` is expanded against the user's home directory. hf-hub may leave a resumable `.incomplete` file in the model cache if the seed thread is abandoned at process exit; that is a resume point, not corruption. |
 | `accelerator` | `"auto"` | Local device policy; exact behavior is below. Ignored for an external backend. |
+| `auto_repair_cache` | `true` | Let the daemon re-download a missing local model cache in the background. Opt-OUT: an absent `[embedding]` section still auto-repairs, and only an explicit `false` disables it — which makes every recovery require an explicit `nestweaver embed`. Conditions and bounds are below. |
 | `external_endpoint` | — | Optional authoritative external embedding API endpoint |
 | `external_model` | — | Model name for the external endpoint |
 | `weight_ppr` | `0.40` | Fusion weight for graph structure (Personalized PageRank) |
@@ -195,6 +197,17 @@ Device policies for the local backend are exact:
 | `auto` | Metal in a Metal-enabled build; CPU only when Metal is not compiled. A Metal failure is reported; `auto` does not retry on CPU. |
 | `metal` | Requires Metal to be compiled and both device creation and the full model inference probe to succeed. Failure leaves embedding state `failed`; CPU is never selected. |
 | `cpu` | Selects CPU directly and never probes Metal. Use this for an intentional CPU deployment or to opt out of Metal. |
+
+`auto_repair_cache` is narrow on purpose. Repair starts only when a boot load
+fails with a typed missing-artifact cause, the backend is local, **and** the
+database's verified persisted embedding identity already names that model. It is
+therefore **never a first-time download**: a model you have never embedded with
+is not fetched automatically, because nothing records that the database wants it.
+The work is bounded at 5 attempts, backing off 30s / 2m / 8m / 30m (each jittered
+±20%) and stopping early on a permanent error (404, 401, 403, permission denied,
+ENOSPC). It runs detached after the daemon binds its socket, so it never delays
+boot, and it exists only in builds with the `embed` feature — elsewhere a failed
+boot load stays failed until you run `nestweaver embed`.
 
 An external endpoint is authoritative. NestWeaver does not load or invoke the
 local backend after an external load, readiness, or request failure. Fix the
@@ -220,32 +233,59 @@ nestweaver daemon --db <path> restart
 ```
 
 Daemon startup is cache-only. It does not contact Hugging Face or download
-missing model files. To populate a new cache, stop the daemon (which owns the DB
-write lock) and run the direct local command. Its required form is
-`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
-The direct path downloads missing files into that cache and records the model
-used by the database:
+missing model files during boot. That no longer makes a missing cache an
+operator chore, though. When the cache lacks the model the database already
+records, `nestweaver embed --db <path>` recovers it in a single call — **no
+`daemon stop` and no restart**. It downloads the missing artifacts, loads them,
+prints one line ahead of the normal summary, and exits 0:
 
 ```sh
-CONFIG=/absolute/path/to/nestweaver-instance.toml
-DB=/absolute/path/to/brain.lbug
-MODEL=sentence-transformers/all-MiniLM-L6-v2
-CACHE="$HOME/.cache/nestweaver/models"
-nestweaver daemon --db "$DB" stop
-nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE"
-nestweaver daemon --db "$DB" start --config "$CONFIG"
+nestweaver embed --db /absolute/path/to/brain.lbug
+# Downloaded missing embedding model '<id>' into <cache-dir> and loaded it (device: <device>).
 ```
 
-Do not omit `--local`: without it, `embed` routes to the configured cache-only
-daemon and cannot populate missing model files. The direct command receives
-`--cache-dir` from the shell, so prefer an absolute path or `$HOME/...`; the
-leading-tilde expansion described above applies to the TOML setting.
+The daemon may also have fixed it without being asked: with `auto_repair_cache`
+left at its default, the same download runs as a bounded background seed once
+the socket is bound.
+
+`--local` is the direct, daemon-free route rather than the fix for a missing
+cache. Its required form is `nestweaver embed --db <path> --local --model-id
+<id> --cache-dir <path>`, and it is what you want when CHOOSING a model rather
+than restoring the recorded one.
+
+Do not omit `--local` on that path. The flag is what makes the command direct;
+without it `embed` routes to the daemon, which repairs the model this database's
+own recorded identity names — not the `--model-id` you just typed. Before
+nw-484 that detour simply failed, because the daemon was cache-only and could
+not populate anything; now it succeeds at the wrong thing, which is harder to
+notice. The direct command also receives `--cache-dir` from the shell, so prefer
+an absolute path or `$HOME/...`; the leading-tilde expansion described above
+applies to the TOML setting.
+
+##### Watching a repair happen
+
+`nestweaver brain status` is how you observe either recovery. While a seed is
+running the embedding state reads `"seeding"` — which takes precedence over every
+other state, `ready` included, and reports `degraded_components: ["semantic"]` —
+next to a `Download:` progress line naming who asked for the download and which
+attempt is in flight:
+
+```text
+Download:  <done> of <total> (automatic repair, attempt N of M)
+Download:  <done> of <total> (requested by nestweaver embed)
+Download:  retry N of M in <duration>
+```
+
+##### Switching backends on purpose
 
 Switching from an external backend to a local model requires more than removing
 `external_endpoint`: the database records the external model that produced its
 vectors, and that recorded model overrides the configured local default at
-daemon startup. Remove `external_endpoint`/`external_model`, stop the daemon,
-and replace both vectors and recorded metadata with a forced direct-local embed:
+daemon startup. **This is an intentional model switch, and the only case here
+that still needs a stop/start** — `--force` appears because you are deliberately
+discarding the recorded model and its vectors, never because a download is
+missing. Remove `external_endpoint`/`external_model`, stop the daemon, and
+replace both vectors and recorded metadata with a forced direct-local embed:
 
 ```sh
 CONFIG=/absolute/path/to/nestweaver-instance.toml

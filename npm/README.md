@@ -1,6 +1,6 @@
 # nestweaver
 
-Code knowledge graph for AI agents — 42 MCP tools, 32 languages, graph
+Code knowledge graph for AI agents — 43 MCP tools, 32 languages, graph
 visualization.
 
 This package is a thin wrapper with **no install-time (`postinstall`) script**.

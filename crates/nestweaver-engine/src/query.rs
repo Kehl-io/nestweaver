@@ -784,6 +784,52 @@ fn is_file_path(input: &str) -> bool {
         })
 }
 
+/// Above this many characters, embedding the query verbatim in a
+/// `nestweaver investigate` remedy would turn a pasteable one-liner into a
+/// wall of text; [`shell_single_quote_seeds`] falls back to a generic
+/// placeholder instead.
+const INVESTIGATE_HINT_MAX_CHARS: usize = 200;
+
+/// Build a copy-pasteable `nestweaver investigate` argument from the raw
+/// seeds a caller passed to `context` / `brain context`, so a not-found
+/// error can name the EXACT command that would have worked instead of just
+/// gesturing at "use investigate" (nw-446, owner decision Q2: no
+/// auto-routing — the not-found error names the command, it does not run
+/// it).
+///
+/// Single-quoted, POSIX style: an embedded `'` is escaped by closing the
+/// quote, emitting a literal escaped quote, and reopening it (`'` →
+/// `'\''`), so the remedy survives a shell verbatim even when the seeds
+/// contain spaces or double quotes — exactly the shape a natural-language
+/// question takes. Multiple seeds (both `context` and `brain context` can
+/// take more than one) join on a single space into ONE quoted argument,
+/// mirroring how the semantic leg already builds its query text from the
+/// same slice (`inputs.join(" ")` in
+/// `build_brain_context_hybrid_with_aliases_capped`).
+///
+/// Two more shapes a pasted remedy must survive, beyond quoting:
+/// - A query that itself starts with `-` (e.g. `-x`) would be parsed by
+///   clap as an OPTION, not the positional `query` — even single-quoted,
+///   since quoting is a shell-level concept and clap never sees the quotes.
+///   `--` (clap's end-of-options marker, already skipped by the nw-334
+///   remedy-flag sweep) is inserted before the quoted argument whenever the
+///   joined query starts with `-`.
+/// - A query longer than [`INVESTIGATE_HINT_MAX_CHARS`] is replaced with a
+///   generic `'<your question>'` placeholder rather than embedded verbatim,
+///   so the remedy stays a pasteable TEMPLATE instead of a wall of text.
+fn shell_single_quote_seeds(inputs: &[String]) -> String {
+    let joined = inputs.join(" ");
+    if joined.chars().count() > INVESTIGATE_HINT_MAX_CHARS {
+        return "'<your question>'".to_string();
+    }
+    let quoted = format!("'{}'", joined.replace('\'', r"'\''"));
+    if joined.starts_with('-') {
+        format!("-- {quoted}")
+    } else {
+        quoted
+    }
+}
+
 /// Build a task-focused context subgraph around the given seed inputs.
 ///
 /// Each entry in `inputs` is resolved to one or more symbol UIDs:
@@ -892,7 +938,13 @@ pub fn build_context_with_intent(
                 file_paths_tried.join(", ")
             );
         }
-        anyhow::bail!("No matching symbols found. Try `nestweaver search <term>` to find symbols.");
+        anyhow::bail!(
+            "No matching symbols found. Try `nestweaver search <term>` to find symbols. This \
+             command resolves a NAME (symbol name or file path) — for a natural-language \
+             question, run `nestweaver investigate {}` instead, which falls back to full-text \
+             search.",
+            shell_single_quote_seeds(inputs),
+        );
     }
 
     // Resolve the effective intent: use the caller's override if provided,
@@ -1253,6 +1305,132 @@ mod context_tests {
         assert!(
             err.contains("No matching symbols"),
             "expected 'No matching symbols' error; got: {err}"
+        );
+    }
+
+    /// nw-446 (criteria 1-3): `context`'s not-found message must name
+    /// `investigate` as the command for a natural-language question,
+    /// carrying the user's ACTUAL argument so the remedy is copy-pasteable
+    /// rather than a generic pointer (owner decision Q2, no auto-routing).
+    #[test]
+    fn build_context_not_found_names_investigate_for_questions() {
+        let (_dir, src) = make_test_repo_with_calls();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let question = "how does greet decide to say hello";
+        let err = build_context(&store, &[question.to_string()])
+            .unwrap_err()
+            .to_string();
+
+        // Counterweight: the existing disclosure (what was tried, and the
+        // `search` remedy) must survive — this must not become a message
+        // that merely mentions `investigate` while dropping the honest
+        // "here's what I tried" text.
+        assert!(
+            err.contains("No matching symbols"),
+            "expected the existing disclosure to survive; got: {err}"
+        );
+        assert!(
+            err.contains("`nestweaver search <term>`"),
+            "expected the existing search remedy to survive; got: {err}"
+        );
+        assert!(
+            err.contains("`nestweaver investigate '"),
+            "expected a backtick-quoted, copy-pasteable investigate remedy; got: {err}"
+        );
+        assert!(
+            err.contains(question),
+            "expected the remedy to embed the user's actual argument verbatim; got: {err}"
+        );
+    }
+
+    /// Counterweight to the seed-quoting shape: a seed containing a single
+    /// quote must not break the copy-pasteable remedy (nw-446, owner
+    /// decision Q2's shell-quoting requirement).
+    #[test]
+    fn build_context_not_found_remedy_escapes_embedded_single_quotes() {
+        let (_dir, src) = make_test_repo_with_calls();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let question = "what's the daemon's reindex trigger";
+        let err = build_context(&store, &[question.to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(r"what'\''s the daemon'\''s reindex trigger"),
+            "expected embedded single quotes to be POSIX-escaped ('\\''); got: {err}"
+        );
+    }
+
+    /// nw-446, review fix #1: a query that itself starts with `-` (e.g.
+    /// "-x") would be parsed by clap as an OPTION rather than the
+    /// positional `query`, even single-quoted — quoting is a shell concept,
+    /// invisible to clap once the shell hands over argv. `--` (clap's
+    /// end-of-options marker, already skipped by the nw-334 remedy sweep)
+    /// must be inserted so the printed remedy is actually pasteable.
+    #[test]
+    fn investigate_hint_for_a_leading_hyphen_query_uses_double_dash() {
+        let (_dir, src) = make_test_repo_with_calls();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let err = build_context(&store, &["-x".to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("`nestweaver investigate -- '-x'`"),
+            "a leading-hyphen query must get clap's `--` end-of-options marker; got: {err}"
+        );
+
+        // Counterweight: an ordinary query must not gain a `--` it doesn't need.
+        let ordinary_err = build_context(&store, &["zzz_no_such_symbol_xyz".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !ordinary_err.contains(" -- '"),
+            "an ordinary query must not be given `--`; got: {ordinary_err}"
+        );
+    }
+
+    /// nw-446, review fix #2: an overlong query would turn the remedy into a
+    /// wall of text instead of a pasteable one-liner; past
+    /// `INVESTIGATE_HINT_MAX_CHARS` it falls back to a generic placeholder
+    /// so the remedy stays a TEMPLATE.
+    #[test]
+    fn investigate_hint_truncates_an_overlong_query_to_a_placeholder() {
+        let (_dir, src) = make_test_repo_with_calls();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let long_query = "why does this keep happening ".repeat(10);
+        assert!(
+            long_query.chars().count() > 200,
+            "fixture must actually exceed the cap to exercise the fallback"
+        );
+        let err = build_context(&store, std::slice::from_ref(&long_query))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("`nestweaver investigate '<your question>'`"),
+            "an overlong query must fall back to the generic placeholder; got: {err}"
+        );
+        assert!(
+            !err.contains(long_query.trim()),
+            "the overlong query must not be embedded verbatim; got: {err}"
+        );
+
+        // Counterweight: a short query is still embedded verbatim.
+        let short_err = build_context(&store, &["a short question".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            short_err.contains("`nestweaver investigate 'a short question'`"),
+            "a short query must still be embedded verbatim; got: {short_err}"
         );
     }
 }
@@ -2280,7 +2458,11 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 
     if seed_uids.is_empty() {
         anyhow::bail!(
-            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol names, and semantic search. Unresolved: {:?}",
+            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol \
+             names, and semantic search. This command resolves a NAME (UID, note title, tag, or \
+             symbol name) — for a natural-language question, run `nestweaver investigate {}` \
+             instead, which falls back to full-text search. Unresolved: {:?}",
+            shell_single_quote_seeds(inputs),
             unresolved,
         );
     }
@@ -2866,17 +3048,83 @@ pub fn populate_inline_bodies(
     token_budget: Option<usize>,
     reader_resolver: Option<&InlineBodyReaderResolver>,
 ) {
+    populate_inline_bodies_with_overrides(
+        store,
+        nodes,
+        root,
+        threshold,
+        max_body_tokens,
+        token_budget,
+        &InlineBodyOverrides {
+            reader_resolver,
+            always_include: &std::collections::HashSet::new(),
+        },
+    )
+}
+
+/// nw-476 (quality review, round 3). Bundles [`populate_inline_bodies_with_overrides`]'s
+/// two less-common knobs into one value, keeping that function (and
+/// [`populate_inline_bodies`]) at 7 positional parameters instead of 8 —
+/// under clippy's `too_many_arguments` threshold without an `#[allow]`.
+#[derive(Clone, Copy)]
+pub struct InlineBodyOverrides<'a> {
+    pub reader_resolver: Option<&'a InlineBodyReaderResolver<'a>>,
+    /// UIDs that bypass the normalized-relevance threshold check entirely —
+    /// they inline (budget permitting) regardless of their `relevance`
+    /// value. See [`populate_inline_bodies_with_overrides`] for why this
+    /// exists.
+    pub always_include: &'a std::collections::HashSet<String>,
+}
+
+/// nw-476 (quality review, round 3). Like [`populate_inline_bodies`], but
+/// `overrides.always_include` names UIDs that bypass the normalized-
+/// relevance threshold check entirely — they inline (budget permitting)
+/// regardless of their `relevance` value. Additive: `populate_inline_bodies`
+/// is now a thin wrapper over this function with an empty override set, so
+/// its signature and every existing call site are unchanged.
+///
+/// Added for `investigate()`'s render-cap-injection fix (nw-476, quality
+/// review): a pinned exact match rescued from beyond `RenderCap`'s margin
+/// gets its `relevance` set to an honest display-only floor (`0.0`, since
+/// its true fused score was never computed — see the injection site in
+/// `investigate.rs`), and that floor must NOT also decide inlining
+/// eligibility for the very entry this fix exists to surface. `matched_query
+/// == Some(Exact)` entries are always in `always_include`, independent of
+/// what `relevance` says.
+pub fn populate_inline_bodies_with_overrides(
+    store: &GraphStore,
+    nodes: &mut [BrainNode],
+    root: &std::path::Path,
+    threshold: f64,
+    max_body_tokens: usize,
+    token_budget: Option<usize>,
+    overrides: &InlineBodyOverrides<'_>,
+) {
+    let InlineBodyOverrides {
+        reader_resolver,
+        always_include,
+    } = *overrides;
     let max_relevance = nodes.iter().map(|n| n.relevance).fold(0.0_f64, f64::max);
-    if max_relevance <= 0.0 {
+    if max_relevance <= 0.0 && always_include.is_empty() {
         return;
     }
     let max_body_chars = max_body_tokens.saturating_mul(4);
     let mut used_tokens = 0usize;
 
     for node in nodes.iter_mut() {
-        let normalized = node.relevance / max_relevance;
-        if normalized < threshold {
-            continue;
+        if !always_include.contains(&node.uid) {
+            // `max_relevance` can still be `<= 0.0` here (e.g. every OTHER
+            // node also has non-positive relevance while `always_include`
+            // is non-empty) — guard the division rather than let a `0.0 /
+            // 0.0` NaN silently pass or fail the threshold unpredictably.
+            let normalized = if max_relevance > 0.0 {
+                node.relevance / max_relevance
+            } else {
+                0.0
+            };
+            if normalized < threshold {
+                continue;
+            }
         }
         let Some(body) = fetch_node_body(store, &node.uid, root, reader_resolver) else {
             continue;
@@ -5031,6 +5279,84 @@ mod semantic_leg_tests {
         .expect_err("wrong-dimensional query vectors must not inject semantic seeds");
 
         assert!(format!("{err:#}").contains("No seeds resolved"));
+    }
+
+    /// nw-446 (criteria 1-3): `brain context`'s "No seeds resolved" message
+    /// must name `investigate` as the command for a natural-language
+    /// question, with the user's ACTUAL argument embedded so the remedy is
+    /// copy-pasteable (owner decision Q2, no auto-routing — this command
+    /// keeps failing closed, it only names the command that would work).
+    #[test]
+    fn no_seeds_resolved_names_investigate_for_questions() {
+        let store = store_with_symbol();
+        let config = HybridSearchConfig::default();
+
+        let question = "how does the daemon decide when to reindex a repository";
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &[question.to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("a multi-word question resolves no seeds");
+        let msg = format!("{err:#}");
+
+        // Counterweight: the existing "here's everything I tried" disclosure
+        // (including the unresolved list) must survive, and stay LAST per
+        // the verdict, not be replaced by the investigate hint.
+        assert!(
+            msg.starts_with("No seeds resolved."),
+            "the is_no_seed_resolution_error prefix contract must be preserved; got: {msg}"
+        );
+        assert!(
+            msg.contains("symbol names, and semantic search"),
+            "expected the existing enumerated strategies to survive; got: {msg}"
+        );
+        assert!(
+            msg.contains("`nestweaver investigate '"),
+            "expected a backtick-quoted, copy-pasteable investigate remedy; got: {msg}"
+        );
+        assert!(
+            msg.contains(question),
+            "expected the remedy to embed the user's actual argument verbatim; got: {msg}"
+        );
+        let investigate_pos = msg.find("nestweaver investigate").unwrap();
+        let unresolved_pos = msg.find("Unresolved:").unwrap();
+        assert!(
+            investigate_pos < unresolved_pos,
+            "the unresolved list must come last, per the verdict; got: {msg}"
+        );
+    }
+
+    /// Counterweight: a seed that DOES resolve must not pay any of this —
+    /// the happy path stays untouched (no hint text, no behavior change).
+    #[test]
+    fn a_resolvable_seed_is_unaffected_by_the_investigate_hint() {
+        let store = store_with_symbol();
+        let config = HybridSearchConfig::default();
+
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Payment".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a resolvable symbol name must still succeed");
+
+        assert!(
+            !result.seeds.is_empty(),
+            "Payment should resolve to at least one seed"
+        );
     }
 }
 

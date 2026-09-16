@@ -9,19 +9,36 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 
 1. Identify the file or symbol they're looking at
 2. Seed by the RIGHT tool for what you have. A SYMBOL NAME goes to `brain_context`, which returns a type-aware subgraph ranked by Personalized PageRank and includes vault notes. A FILE PATH goes to `code_context` instead — `brain_context` resolves seeds as UIDs, note titles, tags and symbol names only, so a path fails to resolve there. `code_context` wants the path REPO-RELATIVE (`crates/foo/src/bar.rs`); a bare basename (`bar.rs`) does not resolve either. Both replace grepping for usages.
-3. For deeper exploration, use `investigate` to build a focused investigation bundle, then `investigate_expand` to widen the scope
+3. For deeper exploration, use `investigate` to build a focused investigation bundle, then `investigate_expand` to widen the scope (see *How `investigate` orders results* below for what its ordering does and does not promise)
 4. Use `project_context` if exploring within a specific project boundary (filters to that project's repos and notes)
 5. Use `flow_trace` to follow execution from a specific entry point forward
 6. Use `hub_nodes` to find the most connected symbols in the area — replaces reading files to understand architecture. Check its `rankings_stale` field before drawing conclusions (see below)
 7. Use `bridge_nodes` to identify architectural chokepoints
 8. Use `clusters` to see which functional grouping this code belongs to
 9. Use `read_symbols` to view the source code of specific symbols — replaces reading whole files when you only need one function
-10. If vault notes appear in results, call `note_get` to read relevant notes
+10. If vault notes appear in results, call `note_get` to read relevant notes. In a subagent or for scripted/batch lookups, prefer the CLI twin `nestweaver note get <title|uid> --json` — the CLI path is 40-60% cheaper in tokens than the MCP tool for that kind of work
 11. Summarize: what this code does, what calls it, what it depends on, and any design notes from the vault
 
 **DO NOT** grep/rg/find across the repo to locate symbols — `brain_search` finds both code symbols and vault notes in one call.
 **DO NOT** read entire files to understand a function — `read_symbols` returns just the symbol body.
 **DO NOT** explore directory trees to understand architecture — `hub_nodes` and `clusters` give the structural picture.
+
+## How `investigate` orders results
+
+Under a `project:<slug>` scope, `investigate` treats name matches specially:
+
+- **Exact name matches are PINNED FIRST** — at most 5 of them, each tagged
+  `matched_query: "exact"`.
+- **Substring matches are NOT pinned.** They get a 5x boost to their fused score
+  and are tagged `matched_query: "partial"`, so they compete on rank like
+  everything else rather than jumping the queue.
+- `matched_query` is **absent outside `project:` scope** — its absence is not a
+  signal that nothing matched, only that the scope was not a project.
+
+**A pin guarantees ORDER, not token-budget survival.** A pinned exact match is
+placed first among candidates; it can still be dropped when the bundle is
+trimmed to the token budget. Do not read "it was pinned" as "it is in the
+response" — check the response.
 
 ## Before you trust a ranking
 

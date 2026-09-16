@@ -1619,6 +1619,7 @@ fn ci_metal_smoke_is_required_and_narrowly_routed_to_apple_hardware_changes() {
         ".github/workflows/ci.yml",
         ".github/workflows/release-please.yml",
         "tests/metal_smoke.rs",
+        "tests/ready_regression_test.rs",
     ] {
         assert!(
             metal_filter.contains(&format!("- '{selected_path}'")),
@@ -1803,6 +1804,78 @@ fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
         setup_position < cold_position && cold_position < direct_position,
         "CPU cache population must precede the daemon's first Metal operation, and direct Metal \
          verification must run only afterward"
+    );
+}
+
+// nw-461: extend Cold Metal to tests/ready_regression_test.rs.
+#[test]
+fn ci_metal_smoke_runs_ready_regression_between_the_real_cache_guards() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+
+    let ready_regression = workflow_step(
+        job,
+        "Ready-regression integration tests (macOS portability gate)",
+    );
+    // Same shape as the workspace/daemon steps above it: `--locked --release
+    // --features metal`, so this step links a new test binary against
+    // artifacts the job already built instead of forcing a second full
+    // compile (see CONTRIBUTING.md's `just test-crate` / `-p` re-fingerprint
+    // warning for why a differing shape is expensive here).
+    for required in [
+        "cargo test --locked --release --features metal --test ready_regression_test",
+        "--no-fail-fast",
+    ] {
+        assert!(
+            ready_regression.contains(required),
+            "ready-regression step must contain `{required}`\nstep:\n{ready_regression}"
+        );
+    }
+    // No codesign call: it must reuse the binary the daemon-integration step
+    // above already signed, not rebuild and leave a fresh unsigned one.
+    assert!(
+        !ready_regression.contains("codesign"),
+        "ready-regression step must not re-codesign; it reuses the already-signed release binary"
+    );
+
+    // Land it between the nw-483 baseline and verify guards so any real
+    // model-cache regression this suite introduces is still caught, and this
+    // is additive coverage: the daemon/workspace steps stay unchanged.
+    let baseline_position = job
+        .find("- name: Record real model cache baseline (nw-483)")
+        .unwrap();
+    let daemon_integration_position = job
+        .find("- name: Daemon integration tests (macOS portability gate)")
+        .unwrap();
+    let ready_regression_position = job
+        .find("- name: Ready-regression integration tests (macOS portability gate)")
+        .unwrap();
+    let verify_position = job
+        .find("- name: Verify no test reached the real model cache (nw-483)")
+        .unwrap();
+    assert!(
+        baseline_position < daemon_integration_position
+            && daemon_integration_position < ready_regression_position
+            && ready_regression_position < verify_position,
+        "ready-regression must run after daemon integration tests and stay between the nw-483 \
+         baseline and verify guards"
+    );
+    assert!(
+        job.contains(
+            "cargo test --locked --release --features metal --workspace --lib --no-fail-fast"
+        ),
+        "the pre-existing workspace --lib gate must stay in place unchanged"
+    );
+    assert!(
+        job.contains("cargo test --locked --release --features metal --test daemon_test"),
+        "the pre-existing daemon_test gate must stay in place unchanged"
     );
 }
 
@@ -10031,5 +10104,353 @@ fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
         cleared["coverage"],
         serde_json::json!("complete"),
         "and the degrade this whole field exists to explain must clear too: {cleared}"
+    );
+}
+
+/// nw-435 leg 2 (precision), end to end. `detect_python`/`detect_bash` only
+/// ever recognised a function literally named `main`, so a Python module or
+/// bash script whose top level was bare statements had NO entry point at all
+/// — every function it defined was walked as dead, even ones a bare top-level
+/// call actually runs. The fix is a `parse.rs` post-pass: a call/command with
+/// no enclosing function body roots its same-file `Function` callee. This
+/// exercises it through the real CLI index + `dead-code --json` route, not
+/// just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_functions_run_by_a_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("script.py"),
+        "def helper():\n    return 1\n\ndef unused_helper():\n    return 2\n\nhelper()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("script.sh"),
+        "greet() {\n  echo hi\n}\n\nunused() {\n  :\n}\n\ngreet\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"helper".to_string()),
+        "helper() is called at Python module scope and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"greet".to_string()),
+        "greet is invoked at bash top level and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: a genuinely never-called function in the same script must
+    // still be reported dead, proving the fix is scoped to "called at top
+    // level" rather than "everything in a directly-run script is alive".
+    assert!(
+        unreachable_names.contains(&"unused_helper".to_string()),
+        "unused_helper is never called and must still be reported dead: {payload}"
+    );
+    assert!(
+        unreachable_names.contains(&"unused".to_string()),
+        "unused is never invoked and must still be reported dead: {payload}"
+    );
+}
+
+/// nw-490, end to end. Swift's `main.swift` executes its top-level statements
+/// directly — the same "script executed directly" class nw-435 fixed for
+/// Python/bash, extended to Swift by the `parse.rs` post-pass gated on
+/// `is_swift_top_level_entry_file` (file named `main.swift`, or a Swift file
+/// whose first line starts with `#!`). This exercises it through the real
+/// CLI index + `dead-code --json` route, not just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_swift_main_swift_top_level_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("app/Sources")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("scripts")).unwrap();
+    std::fs::write(
+        repo_dir.join("app/Sources/main.swift"),
+        "func helper() {}\n\nfunc unused() {}\n\nclass AppDelegate {}\n\nhelper()\nAppDelegate()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("scripts/tool.swift"),
+        "#!/usr/bin/env swift\n\nfunc shebang_helper() {}\n\nfunc shebang_unused() {}\n\nshebang_helper()\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"helper".to_string()),
+        "helper() is called at main.swift top level and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"AppDelegate".to_string()),
+        "AppDelegate() is a bare top-level constructor call and must not be reported dead: {payload}"
+    );
+    assert!(
+        !unreachable_names.contains(&"shebang_helper".to_string()),
+        "shebang_helper() is called at the top level of a #!-shebang Swift \
+         script and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: never-called siblings in the same files must still be
+    // reported dead, proving the fix is scoped to "called at top level"
+    // rather than "everything in a main.swift/shebang file is alive".
+    assert!(
+        unreachable_names.contains(&"unused".to_string()),
+        "unused is never called and must still be reported dead: {payload}"
+    );
+    assert!(
+        unreachable_names.contains(&"shebang_unused".to_string()),
+        "shebang_unused is never called and must still be reported dead: {payload}"
+    );
+}
+
+/// nw-491, end to end. bash `trap NAME SIGSPEC` registers `NAME` as a
+/// signal-handler callback with the shell runtime -- `queries/bash.scm` had
+/// no capture for a command's own ARGUMENTS, only its own name, so `trap
+/// cleanup EXIT` referenced the literal word `trap` and never `cleanup`. The
+/// handler then had in-degree zero and nw-435's top-level-call rooting could
+/// not help either, since its `top_level_called` set is populated from
+/// `Call` references and `trap` produces none pointing at the handler. The
+/// fix is a registration-macro-style `parse.rs` post-pass,
+/// `collect_bash_trap_targets`, modelled on the existing Rust
+/// `criterion_group!` promotion. This exercises it through the real CLI
+/// index + `dead-code --json` route, not just the parser in isolation.
+#[test]
+fn dead_code_does_not_report_bash_trap_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("run.sh"),
+        concat!(
+            "trap cleanup EXIT\n",
+            "trap - INT\n",
+            "\n",
+            "cleanup() {\n",
+            "  echo cleaning up\n",
+            "}\n",
+            "\n",
+            "unused_helper() {\n",
+            "  :\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable_names: Vec<String> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !unreachable_names.contains(&"cleanup".to_string()),
+        "cleanup is registered by `trap cleanup EXIT` and must not be reported dead: {payload}"
+    );
+
+    // COUNTERWEIGHT: a genuinely never-called, never-trapped function in the
+    // same script must still be reported dead, proving the fix is scoped to
+    // "registered by trap" rather than "everything in a script with a trap
+    // is alive".
+    assert!(
+        unreachable_names.contains(&"unused_helper".to_string()),
+        "unused_helper is never called or trapped and must still be reported dead: {payload}"
+    );
+}
+
+/// nw-492 (Task 2.7A), end to end via the no-daemon route `nestweaver_cmd()`
+/// pins (`NESTWEAVER_NO_DAEMON=1` + `NESTWEAVER_ALLOW_NO_DAEMON=1`). Mirrors
+/// the real witness: a nested, wasm-bindgen-style glue package declares its
+/// `main` in a `package.json` that is NOT at the repo root, and the root
+/// itself has no `package.json` at all (nothing here should need one to
+/// work). Before the fix, `parse_manifest` only ever read a repo-ROOT
+/// `package.json`, so this nested manifest was never parsed, its `main` file
+/// contributed no entry point, and the file's own top-level symbols
+/// (including a list-form, aliased export) were reported dead.
+#[test]
+fn nested_package_json_main_roots_every_symbol_in_its_entry_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("crates/wasm")).unwrap();
+    std::fs::write(
+        repo_dir.join("crates/wasm/package.json"),
+        r#"{"name": "glue", "main": "nestweaver_wasm.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("crates/wasm/nestweaver_wasm.js"),
+        concat!(
+            "export class WasmGraph {\n",
+            "  helper() { return privateHelper(); }\n",
+            "}\n",
+            "function privateHelper() { return 1; }\n",
+            "function initSync() { return privateHelper(); }\n",
+            "function __wbg_init() { return privateHelper(); }\n",
+            "export { initSync, __wbg_init as default };\n",
+        ),
+    )
+    .unwrap();
+    // COUNTERWEIGHT fixture: a sibling module with no package.json entry
+    // pointing at it. Its export must still be reported dead (at Low
+    // confidence, per `infer_confidence`'s public-visibility tier) — proving
+    // this fix roots only the declared entry FILE, not "every export in the
+    // repo".
+    std::fs::write(
+        repo_dir.join("crates/wasm/other.js"),
+        "export function unusedExport() { return 1; }\n",
+    )
+    .unwrap();
+    // node_modules must be ignored by manifest discovery exactly like the
+    // main index walk already ignores it for symbols — a dependency's
+    // package.json must not root anything, and its own file must never be
+    // indexed at all.
+    std::fs::create_dir_all(repo_dir.join("node_modules/some-dep")).unwrap();
+    std::fs::write(
+        repo_dir.join("node_modules/some-dep/package.json"),
+        r#"{"name": "some-dep", "main": "index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("node_modules/some-dep/index.js"),
+        "export function shouldNeverBeIndexed() { return 1; }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let json_output = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "dead-code --json failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let unreachable: Vec<&serde_json::Value> = payload["unreachable_symbols"]
+        .as_array()
+        .expect("unreachable_symbols is an array")
+        .iter()
+        .collect();
+    let unreachable_names: Vec<String> = unreachable
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+
+    // Nested glue rooted: the manifest-declared entry file's inline export,
+    // its private callee, and both names in the trailing list-form/aliased
+    // export must all be reachable.
+    for name in ["WasmGraph", "privateHelper", "initSync", "__wbg_init"] {
+        assert!(
+            !unreachable_names.contains(&name.to_string()),
+            "{name} is rooted by crates/wasm/package.json's \"main\" and must \
+             not be reported dead: {payload}"
+        );
+    }
+
+    // Non-entry export still reported, at Low confidence specifically (not
+    // just present) — pins that this fix does not become "every export is a
+    // root", which is the exact defect nw-492's original spec was rejected
+    // for.
+    let unused_export = unreachable
+        .iter()
+        .find(|s| s["name"].as_str() == Some("unusedExport"))
+        .unwrap_or_else(|| panic!("unusedExport must still be reported dead: {payload}"));
+    assert_eq!(
+        unused_export["confidence"].as_str(),
+        Some("low"),
+        "a public export outside any manifest entry file stays at Low \
+         confidence, never excluded: {payload}"
+    );
+
+    // node_modules ignored, end to end: a dependency's declared entry never
+    // roots anything, and its file's own export is never even indexed.
+    assert!(
+        !unreachable_names.contains(&"shouldNeverBeIndexed".to_string()),
+        "node_modules must be skipped entirely, so this symbol should not \
+         exist in the graph at all: {payload}"
     );
 }

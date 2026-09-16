@@ -34,6 +34,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// `index --force`" guidance is not silently lost.
 pub const MARKER_REASON_CANCELLED: &str = "cancelled";
 
+/// Marker payload reason recorded by a brain-watcher batch (nw-475, Task
+/// 5.2, owner decision Q7), as opposed to a full `index` run.
+///
+/// A watcher batch's publication window covers a debounced set of short
+/// per-file critical sections, not one atomic run — the graph is still
+/// genuinely being published, but ranked reads may answer through it WITH
+/// DISCLOSURE (`publication_in_progress`, `marker_age_s`, the in-flight note
+/// paths) instead of failing closed, unlike a full `index` window. See
+/// `GraphStore::index_publication_blocks_ranking` (nestweaver-store) and
+/// `nestweaver_mcp::tools::dispatch_cancellable`.
+pub const MARKER_REASON_WATCHER_BATCH: &str = "brain watcher batch";
+
 /// Path of the durable publication marker for `db_path`.
 ///
 /// Kept as a free function so callers that only have a path (the `repair`
@@ -60,6 +72,17 @@ pub struct MarkerRecord {
     /// Optional reason field (see [`MARKER_REASON_CANCELLED`]). Absent on the
     /// ordinary `{pid}:{nanos}` payload every writer has always written.
     pub reason: Option<String>,
+    /// Bounded, in-flight note paths the establishing writer recorded
+    /// (nw-475, Task 5.2) — only ever populated for a
+    /// [`MARKER_REASON_WATCHER_BATCH`] marker today. Empty for every marker
+    /// written before this field existed, and for any marker whose
+    /// establisher never recorded paths (a plain `{pid}:{nanos}[:{reason}]`
+    /// payload still parses; this is additive, not required).
+    pub note_paths: Vec<String>,
+    /// True when the establishing writer had more in-flight paths than
+    /// [`MAX_MARKER_NOTE_PATHS`], so `note_paths` is a prefix, not the full
+    /// list.
+    pub note_paths_truncated: bool,
 }
 
 impl MarkerRecord {
@@ -127,6 +150,44 @@ pub fn format_marker_payload(pid: u32, unix_nanos: u128, reason: Option<&str>) -
     }
 }
 
+/// Cap on the number of in-flight note paths recorded in a marker payload
+/// (nw-475, Task 5.2): a diagnostic list, not a durability record, so
+/// bounded rather than growing with an arbitrarily large watcher batch.
+pub const MAX_MARKER_NOTE_PATHS: usize = 20;
+
+/// [`format_marker_payload`], plus a bounded, comma-joined list of in-flight
+/// note paths as a FOURTH `:`-delimited field (nw-475, Task 5.2): a leading
+/// `1`/`0` truncation flag followed by up to [`MAX_MARKER_NOTE_PATHS`]
+/// comma-separated paths, e.g. `1,a.md,b.md` means "more paths were in
+/// flight than fit; a.md and b.md are the first two." Falls back to
+/// [`format_marker_payload`]'s exact byte shape when `note_paths` is empty,
+/// so a caller with nothing in flight to report never grows a field it has
+/// nothing to say. Note paths are assumed not to contain a literal `,` or
+/// `:` — an unusual path violating that assumption degrades the DIAGNOSTIC
+/// list only; the marker's safety-critical fields (pid/timestamp/reason),
+/// parsed first and independently, are unaffected.
+pub fn format_marker_payload_with_note_paths(
+    pid: u32,
+    unix_nanos: u128,
+    reason: Option<&str>,
+    note_paths: &[String],
+) -> String {
+    if note_paths.is_empty() {
+        return format_marker_payload(pid, unix_nanos, reason);
+    }
+    let truncated = note_paths.len() > MAX_MARKER_NOTE_PATHS;
+    let capped = &note_paths[..note_paths.len().min(MAX_MARKER_NOTE_PATHS)];
+    let mut paths_field = String::from(if truncated { "1" } else { "0" });
+    for path in capped {
+        paths_field.push(',');
+        paths_field.push_str(path);
+    }
+    format!(
+        "{pid}:{unix_nanos}:{}:{paths_field}\n",
+        reason.unwrap_or("")
+    )
+}
+
 /// Parse a marker payload. Never fails: an unrecognised payload yields a
 /// [`MarkerRecord`] with no attribution, which callers treat as
 /// "present but unattributable" — dirty, but not abandoned.
@@ -142,11 +203,38 @@ pub fn parse_marker_payload(contents: &str) -> MarkerRecord {
         .next()
         .map(|f| f.trim().to_string())
         .filter(|r| !r.is_empty());
+    let (note_paths, note_paths_truncated) = fields
+        .next()
+        .map(|field| parse_note_paths_field(field.trim()))
+        .unwrap_or_default();
     MarkerRecord {
         writer_pid,
         established_unix_nanos,
         reason,
+        note_paths,
+        note_paths_truncated,
     }
+}
+
+/// Parse the fourth `:`-delimited field written by
+/// [`format_marker_payload_with_note_paths`]. Never fails: an empty or
+/// unrecognised field yields no paths, the same "present but has nothing
+/// useful to say" posture the rest of this parser takes toward every other
+/// field, and — critically — a marker written before this field existed
+/// (no fourth field at all, so `fields.next()` returns `None` upstream)
+/// never reaches this function.
+fn parse_note_paths_field(field: &str) -> (Vec<String>, bool) {
+    if field.is_empty() {
+        return (Vec::new(), false);
+    }
+    let truncated = field.starts_with('1');
+    let rest = field.get(1..).unwrap_or("");
+    let paths = rest
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (paths, truncated)
 }
 
 /// Read the marker for `db_path`.
@@ -173,6 +261,8 @@ pub fn read_marker_at(path: &Path) -> MarkerState {
                     writer_pid: None,
                     established_unix_nanos: None,
                     reason: None,
+                    note_paths: Vec::new(),
+                    note_paths_truncated: false,
                 }),
                 Err(error) => MarkerState::Undeterminable(error.to_string()),
             }
@@ -206,6 +296,86 @@ mod tests {
         ));
         assert_eq!(record.writer_pid, Some(7));
         assert!(record.is_deliberately_dirty());
+    }
+
+    /// nw-475 (Task 5.2): the note-paths field round-trips, including the
+    /// truncation flag once the list exceeds the cap.
+    #[test]
+    fn note_paths_round_trip_through_the_marker_payload() {
+        let paths = vec!["a.md".to_string(), "sub/b.md".to_string()];
+        let payload = format_marker_payload_with_note_paths(
+            9,
+            1_755_000_000_000_000_000,
+            Some(MARKER_REASON_WATCHER_BATCH),
+            &paths,
+        );
+        let record = parse_marker_payload(&payload);
+        assert_eq!(record.writer_pid, Some(9));
+        assert_eq!(record.reason.as_deref(), Some(MARKER_REASON_WATCHER_BATCH));
+        assert_eq!(record.note_paths, paths);
+        assert!(!record.note_paths_truncated);
+    }
+
+    /// COUNTERWEIGHT: more paths than the cap are truncated, and the flag
+    /// says so.
+    #[test]
+    fn note_paths_beyond_the_cap_are_truncated_with_the_flag_set() {
+        let paths: Vec<String> = (0..(MAX_MARKER_NOTE_PATHS + 5))
+            .map(|i| format!("note-{i}.md"))
+            .collect();
+        let payload = format_marker_payload_with_note_paths(
+            9,
+            1_755_000_000_000_000_000,
+            Some(MARKER_REASON_WATCHER_BATCH),
+            &paths,
+        );
+        let record = parse_marker_payload(&payload);
+        assert_eq!(record.note_paths.len(), MAX_MARKER_NOTE_PATHS);
+        assert_eq!(record.note_paths, paths[..MAX_MARKER_NOTE_PATHS]);
+        assert!(record.note_paths_truncated);
+    }
+
+    /// nw-475: an empty `note_paths` slice must not grow the payload at all
+    /// — proves the with-note-paths writer is a pure superset of the
+    /// original, not a shape a legacy reader might mishandle when nothing
+    /// was in flight.
+    #[test]
+    fn empty_note_paths_falls_back_to_the_plain_payload_shape() {
+        let with_empty = format_marker_payload_with_note_paths(
+            9,
+            1_755_000_000_000_000_000,
+            Some(MARKER_REASON_WATCHER_BATCH),
+            &[],
+        );
+        let plain = format_marker_payload(
+            9,
+            1_755_000_000_000_000_000,
+            Some(MARKER_REASON_WATCHER_BATCH),
+        );
+        assert_eq!(with_empty, plain);
+    }
+
+    /// nw-475: backward compatibility — a marker written by a binary before
+    /// this field existed (plain `{pid}:{nanos}:{reason}`, no fourth field)
+    /// must still parse cleanly, with empty/false note-path values rather
+    /// than a parse failure.
+    #[test]
+    fn a_marker_without_the_note_paths_field_still_parses() {
+        let legacy = format_marker_payload(9, 1_755_000_000_000_000_000, Some("cancelled"));
+        let record = parse_marker_payload(&legacy);
+        assert_eq!(record.writer_pid, Some(9));
+        assert_eq!(record.reason.as_deref(), Some("cancelled"));
+        assert!(record.note_paths.is_empty());
+        assert!(!record.note_paths_truncated);
+    }
+
+    /// COUNTERWEIGHT: a legacy TWO-field marker (no reason at all) also
+    /// still parses cleanly through the note-paths reader.
+    #[test]
+    fn a_two_field_legacy_marker_still_parses_with_no_note_paths() {
+        let record = parse_marker_payload("4242:1755000000000000000\n");
+        assert!(record.note_paths.is_empty());
+        assert!(!record.note_paths_truncated);
     }
 
     #[test]

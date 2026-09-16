@@ -157,6 +157,10 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release-please.yml'
               - 'tests/metal_smoke.rs'
+              # nw-461: metal-smoke now also runs this file's process-level
+              # regression tests (see the "Ready-regression integration
+              # tests" step below), so a change to it must re-run the job.
+              - 'tests/ready_regression_test.rs'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
 
@@ -212,6 +216,23 @@ jobs:
           brew install protobuf
       - name: Build Metal-enabled CLI
         run: cargo build --locked --release --features metal
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: distinct from this job's own $MODEL_CACHE (set up below by
+        # "Configure isolated smoke paths" and deliberately exercised by the
+        # Metal smoke steps) — this is the REAL platform default a test can
+        # still reach via EmbedConfig::default() / EmbeddingConfig::default()
+        # if it forgets to override cache_dir. Runners are ephemeral, so this
+        # only has to prove the directory did not exist before this job's
+        # tests ran and does after — not survive across jobs/runs.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/Library/Caches/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       # `--features metal`, NOT `--features embed`. `metal` is additive on top
       # of `default = ["embed"]`, so this step was verifying the daemon's
       # cache-only contract under a DIFFERENT feature set than the binary the
@@ -252,6 +273,35 @@ jobs:
           codesign --verify --strict --verbose=2 target/release/nestweaver
           codesign --display --verbose=2 target/release/nestweaver
           cargo test --locked --release --features metal --test daemon_test
+      # nw-461: THE THREE macOS-divergent regressions in this repo's history
+      # (nw-450 GNU-vs-BSD `tar | grep -q` under `pipefail`, nw-440 GNU-only
+      # `find -printf`/`mapfile` in both release verifiers, and an
+      # uncanonicalised `/var` vs `/private/var` path comparison from PR
+      # #373) were each invisible to CI until a human hit them locally on
+      # macOS, because `tests/ready_regression_test.rs` sits outside both the
+      # `--lib` gate above and `--test daemon_test`. This step closes that
+      # gap. Same `--locked --release --features metal` shape as the two test
+      # steps above it, so it links a new test binary against artifacts this
+      # job already built instead of forcing a second full compile, and its
+      # fixtures spawn the SAME already-codesigned `target/release/nestweaver`
+      # (via `assert_cmd::Command::cargo_bin`), so no extra codesign step is
+      # needed. 17 of the file's 18 tests compile and run here; the 18th
+      # (`selected_pull_rejects_unknown_instance_and_uses_registered_workspace`)
+      # is `#[cfg(target_os = "linux")]`, since it depends on XDG registry
+      # paths this platform does not use, so it does not add to this job's
+      # time. CI time: on the order of single-digit minutes -- each test
+      # spawns a real CLI subprocess against a temp git repo and a temp
+      # database, comparable in shape to the daemon_test step above, well
+      # inside this job's 90-minute budget (which already assumes a cold
+      # 36-minute build). Deliberately placed BETWEEN the nw-483 real-model-
+      # cache baseline step above and its verify step below, so a regression
+      # this suite might introduce there is still caught by that guard, and
+      # BEFORE "Collect macOS crash reports" so a SIGSEGV in these fixtures
+      # (nw-222, a ~15% flake on this job) still produces a diagnostic
+      # report. `--no-fail-fast` for the same reason nw-205 added it to the
+      # step above: one failing test must not hide the other 15.
+      - name: Ready-regression integration tests (macOS portability gate)
+        run: cargo test --locked --release --features metal --test ready_regression_test --no-fail-fast
       # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
       #
       # A test binary has died with `signal: 11` on ~15% of runs of this job,
@@ -454,6 +504,28 @@ jobs:
             sort -z |
             xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-after.sha256"
           diff -u "$SETUP_ROOT/cache-before.sha256" "$SETUP_ROOT/cache-after.sha256"
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would extend this
+        # already 90-minute-budgeted job) — it only inspects the filesystem
+        # side effect the cargo test steps above may have left in the REAL
+        # cache, as opposed to this job's own isolated $MODEL_CACHE (checked
+        # separately by the before/after sha256 diff above). `if: always()`
+        # so a failure above still gets this check; only a cancelled job
+        # skips it.
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/Library/Caches/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
       - name: Collect Metal smoke evidence
         if: failure()
         shell: bash
@@ -530,6 +602,8 @@ jobs:
 
   build-and-check:
     name: Build & Tests
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    timeout-minutes: 120
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -590,6 +664,20 @@ jobs:
         # unnoticed. `check --benches` catches a bench that stops compiling
         # without paying for a full release-profile `bench --no-run`.
         run: cargo check --locked --benches
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: a test can still reach EmbedConfig::default() /
+        # EmbeddingConfig::default() and download into the REAL platform
+        # cache instead of a test-owned tempdir. Runners are ephemeral, so
+        # this only has to prove the directory did not exist before this
+        # job's tests ran and does after — not survive across jobs/runs.
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's
@@ -603,6 +691,24 @@ jobs:
           # the escape hatch now says so.
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would double this job's
+        # duration) — it only inspects the filesystem side effect the tests
+        # above may have left. `if: always()` so a test FAILURE above still
+        # gets this check; only a cancelled job skips it.
+        if: always()
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
 
   clippy:
     name: Clippy
@@ -649,6 +755,21 @@ jobs:
 
   daemon-tests:
     name: Daemon Integration Tests
+    # These jobs spawn real daemon processes and real test binaries, so a
+    # deadlocked test does not fail — it parks the binary and the job runs to
+    # GitHub's 360-minute DEFAULT. That is not hypothetical: run 35053752832
+    # sat here 03:57 -> 09:59 UTC on a single wedged test
+    # (`daemon_embed_joins_an_in_flight_auto_repair_download`), printed no
+    # `test result:` line, and was killed six hours later with an orphaned
+    # `nestweaver_daemon-*` process. Six hours of a shared runner bought one
+    # bit of information.
+    #
+    # Bounds below are ~2x the observed successful maximum over the last five
+    # green runs of each job (daemon-tests 54m, build-and-check 69m, e2e 54m,
+    # coverage 111m), so a slow runner still passes while a hang surfaces in
+    # hours rather than most of a day. Raise a bound if a job legitimately
+    # grows into it; do not remove it.
+    timeout-minutes: 120
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -697,6 +818,20 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
+      - name: Record real model cache baseline (nw-483)
+        # nw-483: a test can still reach EmbedConfig::default() /
+        # EmbeddingConfig::default() and download into the REAL platform
+        # cache instead of a test-owned tempdir. Runners are ephemeral, so
+        # this only has to prove the directory did not exist before this
+        # job's tests ran and does after — not survive across jobs/runs.
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ -d "$cache_dir" ]; then
+            echo "NW_MODEL_CACHE_PREEXISTED=true" >> "$GITHUB_ENV"
+          else
+            echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
+          fi
       - name: Daemon-named tests (skipped in the main job)
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
@@ -707,9 +842,31 @@ jobs:
         # Check the standalone daemon-feature configuration separately from
         # workspace feature unification (which also enables embedding support).
         run: cargo test --locked -p nestweaver-mcp --features daemon --no-fail-fast
+      - name: Verify no test reached the real model cache (nw-483)
+        # Deliberately does not re-run any tests (that would double this job's
+        # duration) — it only inspects the filesystem side effect the tests
+        # above may have left. `if: always()` so a test FAILURE above still
+        # gets this check; only a cancelled job skips it.
+        if: always()
+        run: |
+          set -euo pipefail
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nestweaver/models"
+          if [ ! -d "$cache_dir" ]; then
+            exit 0
+          fi
+          if [ "${NW_MODEL_CACHE_PREEXISTED:-false}" = "true" ]; then
+            echo "::warning::$cache_dir exists, but it already existed before this job's tests ran, so this run cannot attribute it to a test (nw-483)."
+            exit 0
+          fi
+          echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
+          exit 1
 
   coverage:
     name: Coverage
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    # Higher than the others: coverage instruments every crate and its five
+    # observed green runs averaged 105m.
+    timeout-minutes: 180
     needs: changes
     # Coverage is informational (uploads an lcov artifact; nothing gates on it)
     # and is the single slowest job — a full *instrumented* recompile that can't
@@ -784,13 +941,30 @@ jobs:
   mutants:
     name: Mutation testing (advisory)
     needs: changes
-    # ADVISORY ONLY — nothing gates on this, and there is deliberately no
-    # mutation-score threshold.
+    # ADVISORY, NOT ABSENT: this job is not in `required-ci`'s `needs` (nw-282),
+    # so it can never block a merge, and there is deliberately no
+    # mutation-score threshold — a score target invites tests written to kill
+    # mutants rather than to check behaviour (Goodhart). Google's deployment
+    # reports surface individual SURVIVING mutants on the diff under review and
+    # never show developers a score; that is the model here.
     #
-    # A score target invites tests written to kill mutants rather than to check
-    # behaviour (Goodhart). Google's deployment reports surface individual
-    # SURVIVING mutants on the diff under review and never show developers a
-    # score; that is the model here.
+    # But "advisory" no longer means `continue-on-error: true`. Through
+    # 2026-09 that flag forced this job's own conclusion to `success`
+    # regardless of what any step reported, and cargo-mutants' `--timeout 300`
+    # baseline (see below) truncated on every cross-cutting diff (nw-445:
+    # PR #389 jobs 103681801425/103757379892/103770556730, PR #392 job
+    # 103841693321 — three truncations in a row, each rendered green with
+    # ZERO mutants tested). The contract as of this change:
+    #   - a genuine cargo-mutants error/timeout, or a run that tested zero
+    #     mutants when it should have tested some, is now a real job
+    #     `failure` (red X on the PR, `::error::` annotation, step summary
+    #     line) — see the "Surviving mutants" step;
+    #   - "no Rust package in the diff" and "diff generated zero mutants" stay
+    #     `success` with an explicit summary line, because both are legitimate
+    #     nothing-to-do outcomes, not missing signal;
+    #   - surviving mutants (status 2) stay `success` with a report table —
+    #     mutation SCORE is still not a merge gate, only mutation ABSENCE-OF-
+    #     SIGNAL is.
     #
     # Why it exists: the post-7.0.0 review found ~20 tests that pass with the
     # fix they guard reverted — several guarding named tickets, so they read as
@@ -802,20 +976,53 @@ jobs:
     # runtime tolerable — a full baseline is a separate, occasional run.
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
-    # Backstop only. The mutation run bounds itself with `timeout` (see the
-    # "Mutate only what this PR changed" step) so that the reporting steps
-    # still run and can DISCLOSE a truncated run. This job-level limit exists
-    # for everything the wrapper can't cover — a wedged apt/cargo install, a
-    # hung cache restore. Cancelling the job here skips the disclosure, so it
-    # is set well above the mutation budget and should never be what fires.
+    # Backstop only. Both budgeted steps bound themselves with their own
+    # `timeout` wrapper (see "Warm the -p build shape" and "Mutate only what
+    # this PR changed") so that the reporting steps still run and can DISCLOSE
+    # a truncated run. This job-level limit exists for everything those
+    # wrappers can't cover — a wedged apt/cargo install, a hung cache restore.
+    # Cancelling the job here skips the disclosure, so it is set well above
+    # the sum of both budgets and should never be what fires.
     #
-    # Nothing bounded total runtime before: `--timeout` is PER CARGO COMMAND,
-    # not per job. On PR #319 this job ran 2h04m without finishing (~5m was
-    # the norm) and was still holding a runner. With one shared runner pool
-    # that is head-of-line blocking for every other PR — see the `concurrency`
-    # note at the top of this file.
-    timeout-minutes: 55
+    # Task 0.2b (mutants-build-cost.md): raised from 55 after adding the
+    # pre-warm step. Budget: PREWARM_BUDGET (30m — one cargo invocation PER
+    # PACKAGE, looped, not one combined invocation; see the pre-warm step's
+    # own comment for what is and is not measured — this is NOT "cold cost
+    # plus a covered second/third package," it is one number sized to what we
+    # actually know: run 34922651945 measured nestweaver-daemon's own
+    # first-package cold build at 1200.9s (≈20.0m) and nestweaver-mcp's,
+    # built second (i.e. already benefiting from daemon's dependency build),
+    # at 97.1s first + 12.4s repeat; nestweaver-store's first `-p` build was
+    # never measured — that run was killed mid-build on store's 4th mutant.
+    # 30m is 1200.9s plus roughly 10m of unmeasured headroom, not a value
+    # derived from summing per-package figures) + MUTANTS_BUDGET (35m,
+    # unchanged) + setup/checkout/toolchain/cache-restore/report steps (~5m
+    # observed) = 70m.
+    #
+    # Margin above that 70m sum is 10m (80−70), stated plainly rather than as
+    # "the same margin as before" — it is NOT the same: applying the
+    # identical timeout-minus-budget-minus-setup accounting to the PRE-Task-
+    # 0.2b job (55 − 35 MUTANTS_BUDGET − ~5m setup) gives 15m, so this change
+    # nets a SMALLER margin (10m), not an equal one, because PREWARM_BUDGET
+    # is new spend this backstop must also clear.
+    #
+    # Worst case is larger than 70m: both budgeted steps' `timeout` wrappers
+    # use `--kill-after` (pre-warm 60s, mutate 120s — see each step's own
+    # `run:`), so a step that ignores SIGINT can run 60s/120s past its stated
+    # budget before SIGKILL. Worst-case total is therefore 30m + 60s + 35m +
+    # 120s + ~5m setup ≈ 73m, leaving a worst-case margin of ~7m under this
+    # 80m backstop — still comfortably positive, and still well short of the
+    # PR #319 2h04m failure mode this backstop exists to catch.
+    #
+    # See "Alternatives considered" in the design doc for why raising a
+    # budget instead of this backstop was rejected.
+    #
+    # Nothing bounded total runtime before either budget existed: `--timeout`
+    # is PER CARGO COMMAND, not per job. On PR #319 this job ran 2h04m without
+    # finishing (~5m was the norm) and was still holding a runner. With one
+    # shared runner pool that is head-of-line blocking for every other PR —
+    # see the `concurrency` note at the top of this file.
+    timeout-minutes: 80
     steps:
       - name: Free disk space
         run: |
@@ -843,19 +1050,331 @@ jobs:
       - name: Install cargo-mutants
         uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2
         with:
-          tool: cargo-mutants
+          # Pinned to the exact version the exit-code and outcomes.json
+          # field-name comments below were verified against (`src/outcome.rs`
+          # and `src/exit_code.rs` at the `v27.1.0` tag in
+          # sourcefrog/cargo-mutants, byte-identical to that repo's `main` at
+          # verification time). `tool: cargo-mutants` alone would still be a
+          # PARTIAL pin — taiki-e/install-action's own README states an
+          # unversioned tool name resolves to "upstream releases with a delay
+          # of one to a few days" tied to the action's own version, not a
+          # specific tool version — so an unpinned tool name could silently
+          # install a newer cargo-mutants whose exit codes or JSON shape have
+          # moved out from under these comments without this file changing at
+          # all. Bump this deliberately, alongside re-verifying the cited
+          # source files, not by drift.
+          tool: cargo-mutants@27.1.0
       - name: Compute the PR diff
-        # ONE range expression, two artifacts. nw-272: the package list and the
-        # mutant list must come from the SAME diff — computing the range twice
-        # lets them drift silently, so `--in-diff` could generate a mutant in a
+        id: prdiff
+        # ONE range expression, TWO artifacts (the diff and the file list) and
+        # ONE package computation. nw-272: the package list and the mutant
+        # list must come from the SAME diff — computing the range twice lets
+        # them drift silently, so `--in-diff` could generate a mutant in a
         # package `-p` never built (skipped, invisible) or `-p` could baseline
         # packages with no mutants (the exact cost this scoping removes). Both
         # failure modes look like a normal run.
+        #
+        # Task 0.2b: the touched-package list is now ALSO consumed by the new
+        # "Warm the -p build shape" step below, so it is computed here — once
+        # — and written to /tmp/pr.pkgs, instead of being recomputed by each
+        # consumer. Recomputing it twice would reopen exactly the
+        # same-diff-two-computations drift risk described above, just between
+        # two steps instead of two artifacts. `package_count` is exposed as a
+        # step output so the pre-warm step can skip cleanly (`if:`) rather
+        # than starting and immediately no-op'ing.
+        #
+        # `print $2` is the crate DIRECTORY name. That is only valid because
+        # every directory under crates/ is named for its package; a future
+        # crate where those differ would emit `-p <dir>` and fail loudly,
+        # which is the right way for that assumption to break.
+        #
+        # Patterns are anchored: `/^src\//` and `/^build\.rs$/`, not
+        # `/^(src|build\.rs)/`, which would also match `srcgen/` and print a
+        # package the diff never touched — a wasted baseline/pre-warm, which
+        # is the resource this whole change exists to conserve.
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
           git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.files
+          mapfile -t pkgs < <(awk -F/ '
+            /^crates\/[^\/]+\// { print $2 }
+            /^src\//            { print "nestweaver" }
+            /^build\.rs$/       { print "nestweaver" }
+          ' /tmp/pr.files | sort -u)
+          printf '%s\n' "${pkgs[@]}" > /tmp/pr.pkgs
+          echo "package_count=${#pkgs[@]}" >> "$GITHUB_OUTPUT"
+      - name: Warm the -p build shape before the mutation budget starts
+        id: prewarm
+        if: steps.prdiff.outputs.package_count != '0'
+        # Task 0.2b (mutants-build-cost.md), root causes #1 and #2. Canary run
+        # 34922651945 spent 1200.9s (≈20.0m) in the BUILD phase alone for its
+        # first mutant (nestweaver-daemon), inside the 35m MUTANTS_BUDGET,
+        # before a single mutant's TEST phase ran — verified in that run's
+        # `mutants.out/outcomes.json` `phase_results`. Two compounding causes,
+        # both verified against the pinned cargo-mutants v27.1.0 source/book:
+        #
+        # 1. cargo-mutants copies the source tree — including `target/` — into
+        #    a scratch dir by default (`Options::copy_target`, src/options.rs).
+        #    The book (mutants.rs/in-place.html) says plainly: "the Rust
+        #    toolchain currently doesn't reuse build products after
+        #    cargo-mutants copies the tree, but it will reuse them with
+        #    --in-place." `--in-place`, added to the mutate step below, builds
+        #    in THIS checkout — the same one this step just warmed — so none
+        #    of the absolute build paths cargo's fingerprints depend on move.
+        # 2. Switching `-p` target (daemon → mcp → store, CLAUDE.md's `-p` vs
+        #    `--workspace` feature-resolution table) re-resolves features,
+        #    which re-fingerprints and rebuilds whatever differs from the
+        #    `--workspace`-shaped `build`-keyed Swatinem/rust-cache restored
+        #    above. That run showed this is a ONE-TIME-PER-PACKAGE cost within
+        #    a run, not a per-mutant one (nestweaver-mcp's build: 97.1s then
+        #    12.4s on its 2nd mutant) — the defect was paying it lazily,
+        #    serially, inside the budget, so the first package hit ate most of
+        #    it before a single mutant's test even ran.
+        #
+        # ONE INVOCATION PER PACKAGE, LOOPED — not one invocation with every
+        # `-p`/`--package` flag together. Verified against the pinned
+        # cargo-mutants v27.1.0 source AND this run's own debug.log, because a
+        # combined-flags pre-warm would defeat itself:
+        #   - `src/lab.rs` `Worker::run_queue`: for the default
+        #     `TestPackages::Mutated` (`TestsForMutant::Mutated` — this job
+        #     does not set `--test-workspace`/configure `test_package`, so
+        #     this is the arm taken), the package set for EVERY mutant's
+        #     build+test is `PackageSelection::Explicit(vec![mutant.source_
+        #     file.package.clone()])` — a Vec of exactly ONE package, always,
+        #     even when the diff spans several packages. `--baseline skip`
+        #     also means `run_baseline`'s own multi-package
+        #     `PackageSelection::Explicit(all_mutated_packages)` (same file,
+        #     the ONE call site that ever puts >1 package in one invocation)
+        #     never runs in this job.
+        #   - `src/cargo.rs` `cargo_argv()`: `PackageSelection::Explicit`
+        #     emits one `--package=<name>@<version>` per entry in that Vec —
+        #     so with a one-package Vec every real per-mutant build/test is
+        #     `cargo test --no-run --verbose --package=<pkg>@<ver>`, never
+        #     `--package=A --package=B` together.
+        #   - Confirmed directly in run 34922651945's `debug.log` (downloaded
+        #     artifact, `mutants.out/debug.log`): every `phase=Build`/
+        #     `phase=Test` line's `quoted_argv` carries exactly one
+        #     `--package=` — e.g. `cargo test --no-run --verbose
+        #     --package=nestweaver-daemon@10.0.2` then, later,
+        #     `--package=nestweaver-mcp@10.0.2` — never both on one line,
+        #     across all 4 packages this diff touched.
+        # A single `cargo test -p A -p B -p C` invocation makes cargo unify
+        # features across A, B and C in ONE resolve — a DIFFERENT resolution
+        # than building A alone, which is what cargo-mutants actually does
+        # for A's own mutants. That mismatch re-fingerprints and rebuilds A
+        # when cargo-mutants gets to it, bringing back the exact cold-build
+        # tax this step exists to eliminate — silently, since the combined
+        # pre-warm invocation would itself report success. Looping one
+        # `--package=<pkg>` at a time reproduces the real per-mutant
+        # resolution for every package, not just the union of all of them.
+        #
+        # `--package=<pkg>` (bare name, no `@<version>`): confirmed from
+        # `src/package.rs` that `version_qualified_name()` is only
+        # `format!("{name}@{version}")`, a Cargo package-ID-spec
+        # disambiguator for a workspace with more than one same-named
+        # package from different sources — not a feature or fingerprint
+        # input. Every package name in this workspace is unique, so a bare
+        # `--package=<name>` already resolves unambiguously to the identical
+        # package cargo-mutants selects; encoding the version here would add
+        # a second, harder-to-keep-in-sync source of that number for no
+        # resolution difference.
+        #
+        # `--verbose`: added even though it has no effect on the build plan,
+        # fingerprint, or environment — purely output verbosity (confirmed:
+        # `cargo_argv()` always appends it, unconditionally, before checking
+        # `PackageSelection` at all) — kept here only so a pre-warm failure's
+        # own log is exactly as diagnosable as the mutate step's.
+        #
+        # `--locked`: cargo-mutants' own argv never adds this (absent from
+        # every `cargo_argv()` branch and from the observed `debug.log`
+        # argv). Omitting it does not change dependency resolution when
+        # Cargo.lock already satisfies Cargo.toml (it only makes Cargo
+        # refuse to silently update a lock that doesn't) — every other job
+        # in this file passes `--locked` for that safety net, and keeping it
+        # here cannot produce a different resolved graph than cargo-mutants'
+        # unlocked call would, so it stays for defense-in-depth, not parity.
+        #
+        # RUSTFLAGS parity: `src/cargo.rs` `encoded_rustflags()` only injects
+        # `CARGO_ENCODED_RUSTFLAGS` (a `--cap-lints=warn` addition) when
+        # `Options.cap_lints` is true. That field is `args.cap_lints.unwrap_
+        # or(config.cap_lints)` (`src/options.rs`); this job's `cargo mutants`
+        # invocation below passes no `--cap-lints` flag and the repo has no
+        # `mutants.toml`, so `config.cap_lints` is `bool`'s own `false`
+        # default (`src/config.rs`, `#[derive(Default)]`) and the whole
+        # branch is skipped — confirmed in the artifact: `mutants.out/debug.log`
+        # and every per-mutant log under `mutants.out/log/` contain zero
+        # occurrences of `cap-lints=warn` (`--cap-lints allow` DOES appear,
+        # but only on crates.io dependency builds like `libc`'s build script
+        # — that is Cargo's own, unconditional lint-capping for non-workspace
+        # dependencies, nothing to do with cargo-mutants or this job), and
+        # the nestweaver-daemon per-mutant build log specifically
+        # (`mutants.out/log/crates__nestweaver-daemon__src__server.rs_line_
+        # 12571_col_5.log`, the 1200.9s cold build cited throughout this
+        # step) contains 637 occurrences of `-fuse-ld=mold`, i.e. this
+        # workflow's own top-level `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_
+        # RUSTFLAGS` (line ~58) reaching every rustc invocation in that build
+        # untouched. cargo-mutants therefore
+        # sets no RUSTFLAGS-shaped env at all in this job's configuration,
+        # so this step needs none either to match it — both steps inherit
+        # the same workflow-level `env:` block, and neither overrides it.
+        # (If `--cap-lints` or a `mutants.toml` are ever added, re-verify
+        # this paragraph — the two rustflags SOURCES are mutually exclusive
+        # per Cargo's own docs, so `CARGO_ENCODED_RUSTFLAGS` appearing at
+        # all would make the mold linker flag stop applying during
+        # cargo-mutants' own builds, independent of anything pre-warm does.)
+        #
+        # cargo-mutants' other injected env (`INSTA_UPDATE=no`,
+        # `INSTA_FORCE_PASS=0`, same file) only affects `insta` at TEST
+        # RUNTIME; it cannot affect a `--no-run` build's fingerprint either
+        # way, so pre-warm does not need it.
+        #
+        # This step pays the per-package one-time cost up front, in this
+        # same checkout, OUTSIDE MUTANTS_BUDGET. Reads /tmp/pr.pkgs written
+        # by "Compute the PR diff" above — same package set, same source of
+        # truth, so this step and the mutate step below can never drift
+        # apart.
+        #
+        # BUILD ORDER: if `nestweaver-daemon` is among the touched packages,
+        # it is moved to the FRONT of the loop; every other package keeps
+        # /tmp/pr.pkgs's existing (alphabetical) order. This is the one
+        # ordering we have actual evidence and graph support for, not a
+        # general "most-dependent-first" scheduler: CLAUDE.md's own
+        # "Dependency flow" diagram shows `nestweaver-daemon` sitting at the
+        # bottom of nearly every chain in the workspace (daemon -> mcp, with
+        # the `daemon` feature also pulling in federation -> client; mcp/
+        # daemon -> engine -> parser, resolver, store, storage, algorithms ->
+        # schema) — building it FIRST means its own dependency closure, the
+        # largest in the workspace, is what pays whatever one-time cost this
+        # run incurs, and every other touched package's SMALLER closure then
+        # finds its own external/shared dependencies already Fresh. Building
+        # a shallow package first (e.g. nestweaver-store, which per the same
+        # diagram depends on schema alone) buys nothing: daemon would still
+        # have to pay its full closure's cost whenever its own turn came. We
+        # do NOT attempt a fuller dependency-depth ordering for the other
+        # packages (mcp, store, engine, ...) — CLAUDE.md's diagram gives their
+        # relative ordering too, but we have no MEASURED evidence for most of
+        # them (only daemon and mcp were actually timed in run 34922651945;
+        # store's own first `-p` build was never measured — see below), so
+        # hardcoding a full ranked list would be encoding a guess as if it
+        # were a fact. The reorder is local to this step's own copy of the
+        # array; /tmp/pr.pkgs on disk is left exactly as "Compute the PR
+        # diff" wrote it, since the mutate step's own package order has no
+        # effect on cargo-mutants' behavior (it builds one package per mutant
+        # regardless of `-p` flag order).
+        #
+        # PREWARM_BUDGET (30m) bounds the WHOLE loop, not each package.
+        # State plainly what run 34922651945 actually measured, rather than
+        # implying uniform per-package coverage: nestweaver-daemon's own
+        # first `-p` build (built FIRST in that run, same as this step's
+        # ordering) took 1200.9s (≈20.0m) cold; nestweaver-mcp, built SECOND
+        # — i.e. already benefiting from whatever daemon's build had already
+        # made Fresh — took 97.1s for its own first build and 12.4s for a
+        # same-package repeat; nestweaver-store's first `-p` build was NEVER
+        # measured, because that run was killed mid-build on store's 4th
+        # mutant before it produced a result. 30m is 1200.9s (the one number
+        # we trust as a worst case, rounded up) plus roughly 10m of headroom
+        # for whatever store, or any other untimed package, costs on top —
+        # not a sum of measured per-package figures, because we do not have
+        # enough of them to sum. The canary run (Task 0.2b Step 5, tracked by
+        # the orchestrator, not this step) is what turns "headroom" into a
+        # real measurement for store and any other package this job hasn't
+        # timed yet.
+        #
+        # Bounded, and never swallowed into a green mutation result. A build
+        # failure is still a normal, visible red X — a genuine compile error
+        # exits 101, which `set -euo pipefail` inside the loop surfaces
+        # immediately instead of continuing to warm later packages.
+        #
+        # A BUDGET expiry (exit 124, which GNU `timeout` reserves for exactly
+        # that) is treated differently, and deliberately: it means the diff is
+        # too wide to warm, which is a scope limit rather than a mutation
+        # finding. Run 35098068775 measured it — 8 packages, nestweaver-daemon
+        # alone 23.9m of the 30m, killed during package 2 of 8 — and no budget
+        # this job can afford (timeout-minutes 80, MUTANTS_BUDGET 35m) would
+        # have finished it. Running cargo-mutants anyway would burn the whole
+        # mutation budget on the build and test zero mutants. So the mutate
+        # step is SKIPPED and the summary says so in the loudest terms it has.
+        #
+        # This is not nw-445 moved one step earlier: nw-445 was an absent
+        # signal that READ LIKE a clean one. The skip path prints no all-clear,
+        # states outright that no mutation coverage was measured, and raises a
+        # `::warning::` annotation on the run.
+        #
+        # Env matches the mutate step below (NESTWEAVER_NO_DAEMON,
+        # NESTWEAVER_ALLOW_NO_DAEMON) so the two steps' cargo invocations
+        # fingerprint identically — a divergent env between the two would
+        # itself force the exact re-fingerprint-and-rebuild this step exists
+        # to front-load, defeating the point of running it first.
+        run: |
+          set -euo pipefail
+          mapfile -t pkgs < /tmp/pr.pkgs
+          # Move nestweaver-daemon to the front if present; leave every other
+          # package in /tmp/pr.pkgs's existing order. See the BUILD ORDER
+          # comment above for why only this one package is special-cased.
+          ordered=()
+          rest=()
+          has_daemon=false
+          for pkg in "${pkgs[@]}"; do
+            if [ "${pkg}" = "nestweaver-daemon" ]; then
+              has_daemon=true
+            else
+              rest+=("${pkg}")
+            fi
+          done
+          if [ "${has_daemon}" = true ]; then
+            ordered=("nestweaver-daemon" "${rest[@]}")
+          else
+            ordered=("${rest[@]}")
+          fi
+          pkgs=("${ordered[@]}")
+          echo "pre-warming, one cargo invocation per package, in this order: ${pkgs[*]}"
+          # The whole loop runs under ONE `timeout`, so the budget bounds
+          # total wall-clock across every package, not each package
+          # individually — see the PREWARM_BUDGET comment above for why. The
+          # loop body is a real script file, not an inline `bash -c '...'`
+          # string, purely so `${pkg}` is written and read as an ordinary
+          # shell variable instead of tripping shellcheck's SC2016 (which
+          # otherwise reads deliberate inner-shell interpolation as a
+          # forgotten-to-escape outer-shell one).
+          cat > /tmp/prewarm.sh <<'PREWARM_SCRIPT'
+          set -euo pipefail
+          for pkg in "$@"; do
+            echo "pre-warming: ${pkg}"
+            cargo test --locked --no-run --verbose --package="${pkg}"
+          done
+          PREWARM_SCRIPT
+          # Branch on 124 SPECIFICALLY, which GNU `timeout` reserves for "the
+          # budget expired". Every other non-zero status is the command's own
+          # — a genuine compile error is 101 — and still fails this step as a
+          # red X, exactly as the "NOT swallowed" comment above requires. Only
+          # the budget case is converted into a skip, because a diff this wide
+          # cannot produce a mutation result at ANY budget this job can afford
+          # (run 35098068775: 8 packages, nestweaver-daemon alone took 23.9m of
+          # the 30m, killed during package 2 of 8), and a red X that means
+          # "the diff was too wide to warm" is not a mutation finding. The
+          # mutate step is skipped and the summary says so loudly; it never
+          # gets to print an all-clear.
+          set +e
+          timeout --signal=INT --kill-after=60s "${PREWARM_BUDGET}" \
+            bash /tmp/prewarm.sh "${pkgs[@]}"
+          prewarm_status=$?
+          set -e
+          if [ "${prewarm_status}" -eq 124 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Mutation testing SKIPPED: pre-warming this PR's ${#pkgs[@]} packages did not finish inside ${PREWARM_BUDGET}, so no mutation coverage was measured. This is a scope limit, not a clean result."
+            exit 0
+          fi
+          echo "timed_out=false" >> "$GITHUB_OUTPUT"
+          exit "${prewarm_status}"
+        env:
+          PREWARM_BUDGET: 30m
+          NESTWEAVER_NO_DAEMON: "1"
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
       - name: Mutate only what this PR changed
         id: mutate
+        # Skipped when the pre-warm hit its budget: cargo-mutants would spend
+        # the whole MUTANTS_BUDGET finishing the build the pre-warm could not,
+        # and report zero tested mutants. See that step's 124 branch.
+        if: steps.prewarm.outputs.timed_out != 'true'
         # `--workspace` is load-bearing. This repo's root Cargo.toml is BOTH a
         # [workspace] and a [package], so cargo-mutants defaults to the root
         # package alone — src/main.rs and src/setup.rs. Measured: `--list`
@@ -866,15 +1385,88 @@ jobs:
         # in this diff" this job printed was therefore uninformative — the same
         # manifest shape the Coverage job already works around with --workspace.
         #
-        # `--timeout 300` bounds ONE cargo command, not the job: an unkilled
-        # mutant can hang a test that would otherwise exit, and without it one
-        # pathological mutant stalls everything. It says nothing about total
-        # runtime, and cargo-mutants (27.x) has no total-time flag — `--help`
-        # offers only per-command `--timeout`/`--build-timeout` and `--shard`.
-        # So the budget is enforced here with `timeout`, chosen over sharding
-        # (a shard matrix multiplies runners and cold builds for an advisory
-        # job) and over a mutant cap (which would silently drop mutants with no
-        # wall-clock guarantee anyway).
+        # `--timeout 600` bounds ONE cargo command (one mutant's test run, or
+        # the baseline), not the job: an unkilled mutant can hang a test that
+        # would otherwise exit, and without it one pathological mutant stalls
+        # everything. It says nothing about total runtime, and cargo-mutants
+        # (pinned to 27.1.0 — see "Install cargo-mutants" above) has no
+        # total-time flag — `--help` offers only per-command
+        # `--timeout`/`--build-timeout` and `--shard`. So the budget is
+        # enforced here with `timeout`, chosen over sharding (a shard matrix
+        # multiplies runners and cold builds for an advisory job) and over a
+        # mutant cap (which would silently drop mutants with no wall-clock
+        # guarantee anyway).
+        #
+        # `--baseline skip` (nw-282/445): cargo-mutants' own unmutated-baseline
+        # build+test run was the thing actually blowing the budget — measured
+        # on PR #392 job 103841693321 (packages nestweaver-daemon,
+        # nestweaver-engine, nestweaver-store): "TIMEOUT Unmutated baseline in
+        # 1715s build + 300s test" (MUTANTS_STATUS 4). The build (1715s) was
+        # NOT the problem — cargo-mutants pays that cost again for the first
+        # mutant anyway, baseline or not. The TEST phase was: it hit the old
+        # `--timeout 300` ceiling mid-suite (nestweaver-daemon's 358 tests in
+        # 26.22s + nestweaver-engine's 1543 lib tests in 214.72s + 5 small
+        # nestweaver-engine integration binaries in 12.23s = 253.17s, then
+        # nestweaver-store's own ~74s lib-test binary started and was still
+        # running when the ceiling hit). `--baseline skip` removes that
+        # redundant pre-mutation run entirely — see the "relies on the main
+        # job" note below for why this is safe. `--minimum-test-timeout` is
+        # deliberately NOT set: per the cargo-mutants book, it only raises the
+        # floor on the timeout cargo-mutants AUTO-CALCULATES from the baseline
+        # test's own measured duration (5x baseline, min 20s); with
+        # `--baseline skip` there is no baseline measurement to calibrate
+        # from, and an explicit `--timeout` is used instead, so the flag would
+        # be silently ignored dead weight, per https://mutants.rs/baseline.html.
+        #
+        # 600s is deliberately more than 1.5x the worst combined figure above
+        # (253.17s measured + ~74s for the interrupted nestweaver-store lib
+        # suite, taken from a same-day `--workspace`-shaped main-CI run,
+        # ≈327s total): CI-runner jitter alone moved nestweaver-engine's suite
+        # from 172.60s (`--workspace` shape, job 103902930743) to 214.72s
+        # (`-p` shape, job 103841693321) on the same day, and `--no-fail-fast`
+        # (below) means EVERY scenario — caught or missed — runs the full,
+        # non-short-circuited suite, so `--timeout` must clear the whole
+        # suite's duration on every single mutant, not just the baseline.
+        # PR #389 (job 103770556730, 8 packages: nestweaver, nestweaver-client,
+        # nestweaver-daemon, nestweaver-engine, nestweaver-mcp,
+        # nestweaver-proto, nestweaver-schema, nestweaver-store) never reached
+        # the test phase at all — the BUILD alone exhausted the whole 35m
+        # MUTANTS_BUDGET and was killed mid `Lab::run_baseline` (exit 124).
+        # `--timeout` cannot fix that; it is scoped to the test phase only, and
+        # it is exactly the scope-narrowing this job's `-p` diff-scoping (below)
+        # already targets — a cross-cutting diff blowing the whole budget on
+        # the BUILD is a distinct failure mode from the TEST-time ceiling this
+        # `--timeout` value addresses. `--build-timeout 300` (Task 0.2b, below)
+        # is what actually bounds that phase now.
+        #
+        # Task 0.2b (mutants-build-cost.md) added `--in-place` and
+        # `--build-timeout 300`, verified against the pinned cargo-mutants
+        # v27.1.0 source (`src/options.rs`): `build_timeout` is populated ONLY
+        # from `--build-timeout`; `--timeout` above maps to `test_timeout`
+        # alone, never to the build phase. `--in-place` (`src/main.rs`: "Test
+        # mutations in the source tree, rather than in a copy") builds inside
+        # THIS checkout, the one the "Warm the -p build shape" step above just
+        # populated, instead of cargo-mutants' own scratch-dir copy — the book
+        # (mutants.rs/in-place.html) states a copied tree does not reuse
+        # `target/` build products even when they already exist, which is why
+        # PR #389's build (job 103770556730, cited above) rebuilt from near
+        # scratch and exhausted the budget before reaching a single test. With
+        # pre-warm + `--in-place`, each mutant's build now starts from a
+        # `target/` that already matches its own `-p` shape (measured
+        # same-package reuse on run 34922651945: nestweaver-mcp's 2nd mutant
+        # built in 12.4s, not the 1200.9s a first-touch package cost), and
+        # `--build-timeout 300` is defense-in-depth for whatever the pre-warm
+        # step doesn't fully cover (e.g. a diff that adds a brand-new crate) —
+        # comfortably above every *warmed* build this run measured (≤100s)
+        # and well below the 1200.9s pathological case, so hitting it is
+        # itself a signal worth investigating, not a false positive to tune
+        # away. Safe to run `--in-place` in this job specifically because the
+        # checkout is `persist-credentials: false`, nothing pushes from it, no
+        # later step reads mutated source (only `mutants.out/`), and the
+        # runner is discarded at job end — exactly the disposable-CI-checkout
+        # case the book recommends `--in-place` for, notwithstanding the
+        # book's own caveat that a killed/panicked run "might fail" to fully
+        # restore files it mutated.
         #
         # SIGINT rather than SIGKILL so cargo-mutants shuts down cleanly and
         # mutants.out/ keeps the results it had already written; --kill-after
@@ -888,7 +1480,12 @@ jobs:
         #
         # Not using `-j`: each parallel job needs its own copy of the tree and
         # target dir, and disk (see "Free disk space") is the binding
-        # constraint on this runner, not CPU.
+        # constraint on this runner, not CPU. This is also why `--in-place`
+        # (Task 0.2b, above) has nothing to conflict with: it `conflicts_with
+        # = "jobs"` in cargo-mutants' own arg parsing (`src/main.rs`), but only
+        # bites if `-j` were ever added here — anyone tempted to add it later
+        # for more throughput cannot combine it with `--in-place` and would
+        # need to re-litigate this whole tradeoff first.
         run: |
           set +e
           # nw-272: mutate the packages this DIFF touches, not the whole
@@ -901,24 +1498,14 @@ jobs:
           # REACHABLE — not that the workspace be rebuilt every run.
           #
           # `--in-diff` already restricts which mutants are GENERATED; `-p`
-          # restricts what gets BUILT and baselined, which is the expensive half.
-          # Derived from /tmp/pr.files, written by the same step and the same
-          # range expression that produced /tmp/pr.diff — see the comment there.
-          #
-          # `print $2` is the crate DIRECTORY name. That is only valid because
-          # every directory under crates/ is named for its package; a future
-          # crate where those differ would emit `-p <dir>` and fail loudly,
-          # which is the right way for that assumption to break.
-          #
-          # Patterns are anchored: `/^src\//` and `/^build\.rs$/`, not
-          # `/^(src|build\.rs)/`, which would also match `srcgen/` and print a
-          # package the diff never touched — a wasted baseline, which is the
-          # resource this whole change exists to conserve.
-          mapfile -t pkgs < <(awk -F/ '
-            /^crates\/[^\/]+\// { print $2 }
-            /^src\//            { print "nestweaver" }
-            /^build\.rs$/       { print "nestweaver" }
-          ' /tmp/pr.files | sort -u)
+          # restricts what gets BUILT and baselined, which is the expensive
+          # half. Task 0.2b: read from /tmp/pr.pkgs, written ONCE by "Compute
+          # the PR diff" above and already consumed by "Warm the -p build
+          # shape" — recomputing the awk block here a second time would reopen
+          # the exact same-diff-two-computations drift risk that step's own
+          # comment warns about, just between two steps instead of two
+          # artifacts.
+          mapfile -t pkgs < /tmp/pr.pkgs
           if [ "${#pkgs[@]}" -eq 0 ]; then
             echo "no Rust package in this diff; nothing to mutate"
             {
@@ -931,10 +1518,51 @@ jobs:
           pkg_args=()
           for pkg in "${pkgs[@]}"; do pkg_args+=(-p "${pkg}"); done
           echo "mutating packages: ${pkgs[*]}"
+          # `--baseline skip` relies on THIS PR's commit already being GREEN in
+          # the `build-and-check` job before this job's result means anything
+          # (per the cargo-mutants book: "If you use --baseline=skip, you must
+          # make sure that the tests are actually passing, otherwise the
+          # results of cargo-mutants will be meaningless" —
+          # https://mutants.rs/baseline.html). That green run is NOT the same
+          # shape as this one, though: `build-and-check` runs
+          # `cargo test --workspace` (unified feature resolution across every
+          # crate) while this job runs `cargo test -p <touched-crate>` per
+          # package (see the nw-272 comment above for why). CLAUDE.md's "Build
+          # & Test" section documents concretely that `-p` and `--workspace`
+          # can resolve to DIFFERENT feature sets and therefore run different
+          # test counts for the same crate (nestweaver-daemon: 238 vs 264;
+          # nestweaver-mcp: 154 vs 180). Both shapes also set
+          # NESTWEAVER_NO_DAEMON=1 (this job further sets
+          # NESTWEAVER_ALLOW_NO_DAEMON=1, since CI/GITHUB_ACTIONS confer
+          # nothing per CLAUDE.md's daemon-architecture section), so daemon
+          # bypass itself is not the divergence — feature unification is. THE
+          # RISK: a test that is genuinely red only under the `-p` feature
+          # shape (never exercised, or exercised differently, under
+          # `--workspace`) would be invisible to `build-and-check`'s green
+          # checkmark, and with `--baseline skip` this job has no baseline run
+          # of its own left to catch it — every mutant's test run would then
+          # fail for a reason that has NOTHING to do with the mutation, and
+          # every one would misreport as "caught" (a false all-clear, not a
+          # false alarm — the dangerous direction, since it hides real
+          # coverage gaps behind an apparently-clean mutation report).
+          # Combined stdout+stderr is captured to mutants-console.log for the
+          # next step, WITHOUT losing the real exit status: `tee` is the last
+          # command in the pipeline, so a bare `$?` here would be `tee`'s own
+          # status (always 0 on a healthy write), not `timeout`'s/
+          # cargo-mutants'. `${PIPESTATUS[0]}` is bash's array of each
+          # pipeline stage's own exit code, taken BEFORE anything else can
+          # overwrite `$?` — index 0 is the `timeout ... cargo mutants ...`
+          # stage, i.e. exactly what `status=$?` captured before this was a
+          # pipeline. This is deliberately independent of whether `pipefail`
+          # is set (GitHub's default bash invocation already sets it, but
+          # relying on that default rather than reading it off the array
+          # would be silently wrong the day that default changes).
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
             cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
-              --timeout 300 --no-shuffle -- --no-fail-fast
-          status=$?
+              --in-place --build-timeout 300 \
+              --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
+            2>&1 | tee mutants-console.log
+          status="${PIPESTATUS[0]}"
           set -e
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           # GNU timeout reports 124 when it had to interrupt, 137 when the
@@ -948,13 +1576,31 @@ jobs:
           else
             echo "truncated=false" >> "$GITHUB_OUTPUT"
           fi
-          # Advisory job: surviving mutants (2), timeouts (3) and unviable
-          # mutants (4) are findings to report, not build failures.
+          # Exit status is a REPORT for the next step to classify, not a
+          # verdict on its own — the wrapper always exits 0 so `if: always()`
+          # below runs unconditionally. cargo-mutants' own exit codes
+          # (https://mutants.rs/exit-codes.html, confirmed against
+          # `src/exit_code.rs` in sourcefrog/cargo-mutants): 0 all caught,
+          # 1 usage error, 2 some mutants survived (a finding to report, not a
+          # build failure — mutation SCORE is not a merge gate), 3 some tests
+          # timed out, 4 the BASELINE failed or hung before any mutant ran
+          # (NOT "unviable mutants" — unviable mutants have no exit code of
+          # their own; they land in outcomes.json's `unviable` count but do
+          # not change `exit_code()`, whose only inputs are a non-mutant
+          # scenario failing, `timeout > 0`, or `missed > 0`), 5/6 the
+          # `--in-diff` diff didn't match the tree / couldn't be parsed,
+          # 70 an internal cargo-mutants error (`sysexit`'s EX_SOFTWARE). GNU
+          # `timeout`'s 124/137 below are a distinct, OUTER signal — this
+          # wrapper's own, not cargo-mutants'.
           exit 0
         env:
-          # Deliberately shorter than the job's timeout-minutes so this wrapper,
-          # not the runner, is what stops a long run — the difference is the
-          # headroom the reporting steps need.
+          # Deliberately shorter than the job's timeout-minutes so this
+          # wrapper, not the runner, is what stops a long run. The gap between
+          # them is no longer just "reporting headroom": timeout-minutes (80)
+          # also has to cover the pre-warm step's own PREWARM_BUDGET (30m,
+          # see "Warm the -p build shape") plus setup — see the job-level
+          # `timeout-minutes` comment above for the actual margin (10m
+          # nominal, ~7m worst-case with both steps' `--kill-after` grace).
           MUTANTS_BUDGET: 35m
           NESTWEAVER_NO_DAEMON: "1"
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
@@ -967,60 +1613,192 @@ jobs:
           TRUNCATED: ${{ steps.mutate.outputs.truncated }}
           NO_PACKAGES: ${{ steps.mutate.outputs.no_packages }}
           MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
+          PREWARM_TIMED_OUT: ${{ steps.prewarm.outputs.timed_out }}
+          PREWARM_BUDGET: 30m
+          # Same value as the "Mutate only what this PR changed" step's env —
+          # only needed here to name the budget in the failure summary.
+          MUTANTS_BUDGET: 35m
         run: |
+          set -uo pipefail
           summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
 
+          # The pre-warm could not build this diff's packages inside its
+          # budget, so no mutation run was attempted. Reported as a SKIP, not
+          # a pass and not a finding: nothing here says anything about whether
+          # this PR's tests can kill mutants. Deliberately loud — the whole
+          # recurring defect in this job (nw-272, nw-445) is an absent signal
+          # that reads like a clean one, and "skipped" must never be mistaken
+          # for "no surviving mutants".
+          if [ "${PREWARM_TIMED_OUT:-}" = "true" ]; then
+            summary "### Mutation testing — SKIPPED (diff too wide)"
+            summary ""
+            summary "> **No mutation coverage was measured for this PR.** This is NOT a clean result."
+            summary ""
+            summary "Pre-warming the packages this diff touches did not finish inside \`${PREWARM_BUDGET}\`, so the mutation run was not started. cargo-mutants builds one package per mutant, and with a diff this wide it would have spent its entire budget building and tested zero mutants."
+            summary ""
+            summary "Nothing about this PR's mutation resistance is known. Review the diff's test coverage by hand, or split the PR so a budgeted run can complete."
+            echo "::warning::Mutation testing SKIPPED — diff too wide to pre-warm in ${PREWARM_BUDGET}. No mutation coverage measured; this is not a clean result."
+            exit 0
+          fi
+
           # nw-272: no Rust package in the diff is legitimately nothing to do —
-          # distinct from "the report is missing", which the branch below treats
-          # as a non-result. Saying the wrong one of those is the whole defect
-          # this job keeps re-learning.
+          # distinct from "the report is missing", which the branches below
+          # treat as a non-result. Saying the wrong one of those is the whole
+          # defect this job keeps re-learning.
           if [ "${NO_PACKAGES}" = "true" ]; then
             summary "### Mutation testing"
             summary "No Rust package in this diff, so no mutants were generated. Nothing to report."
             exit 0
           fi
 
-          # How far did it actually get? Every mutant that produced a verdict
-          # lands in exactly one of these files; mutants.json is the full list
-          # generated up front.
-          tested=0
-          for f in caught missed timeout unviable; do
-            if [ -f "mutants.out/${f}.txt" ]; then
-              tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
-            fi
-          done
+          # cargo-mutants itself (not just this job's own NO_PACKAGES check
+          # above) has a second, legitimate "nothing to mutate" outcome: an
+          # empty `--in-diff` diff, a diff touching no Rust source files, or
+          # a diff that resolves to zero mutants after filtering. Verified in
+          # the pinned source (cargo-mutants v27.1.0, `src/in_diff.rs`):
+          # `DiffFilterError::{EmptyDiff, NoSourceFiles, NoMutants}` all map
+          # to `ExitCode::Success` (0) and are logged via `info!("{err}")`
+          # BEFORE any lab/output is written — so `mutants.out/` is genuinely
+          # absent, not missing-because-something-broke. RE-VERIFY these
+          # three strings (`grep -n Display -A6 src/in_diff.rs` at the pinned
+          # tag) if the `cargo-mutants@` version in the "Install cargo-mutants"
+          # step above ever changes — they are Display-impl text, not a
+          # stable machine-readable contract.
+          CARGO_MUTANTS_NO_MUTANTS_MESSAGES=(
+            "Diff file is empty"
+            "Diff changes no Rust source files"
+            "No mutants to filter"
+          )
+          if [ "${MUTANTS_STATUS}" = "0" ] && [ ! -d mutants.out ] && [ -f mutants-console.log ]; then
+            for msg in "${CARGO_MUTANTS_NO_MUTANTS_MESSAGES[@]}"; do
+              if grep -qF -- "${msg}" mutants-console.log; then
+                summary "### Mutation testing"
+                summary "cargo-mutants reported \"${msg}\" — nothing to mutate in this diff. Nothing to report."
+                exit 0
+              fi
+            done
+          fi
+
+          # `total` MUST come from mutants.out/mutants.json, unconditionally,
+          # whenever that file exists — never from outcomes.json's
+          # `total_mutants`. cargo-mutants writes mutants.json UP FRONT,
+          # before any build or test (`cargo_mutants::lab`, src/lab.rs ~44),
+          # so its length is the PLANNED mutant count regardless of how many
+          # have actually been processed. `total_mutants` in outcomes.json is
+          # NOT that: `LabOutcome::add()` (src/outcome.rs) increments
+          # `total_mutants` in the SAME call that increments a
+          # caught/missed/timeout/unviable counter, so on outcomes.json alone
+          # `total_mutants` always equals the already-processed count — a run
+          # that planned N mutants and was killed (or crashed) before testing
+          # any of them would read `total_mutants=0`, `tested=0`, and fall
+          # into the "diff generated no mutants" branch below: the exact
+          # nw-445 false all-clear this job exists to catch, just moved one
+          # layer down. If mutants.json is itself missing, `total` stays
+          # unknown (""). That case is NOT left to the "status not in
+          # {0,2,3}" rule to catch incidentally — an unknown total is
+          # EXPLICITLY failed below (`[ -z "${total}" ] && fail=true`),
+          # because outcomes.json can exist and parse cleanly with
+          # MUTANTS_STATUS=0 even when mutants.json is gone (e.g. it was
+          # deleted between steps, or a future cargo-mutants version moves
+          # where it's written), and that combination must not silently pass
+          # just because no other rule happened to fire.
           total=""
           if [ -f mutants.out/mutants.json ]; then
             total=$(jq 'length' mutants.out/mutants.json 2>/dev/null || echo "")
           fi
+
+          # `tested` (the caught/missed/timeout/unviable breakdown) still
+          # prefers mutants.out/outcomes.json — cargo-mutants' own summary;
+          # field names confirmed against `LabOutcome` in
+          # sourcefrog/cargo-mutants `src/outcome.rs`, since the mutants.rs
+          # book documents the file's existence but not its exact fields.
+          # `write_lab_outcome()` runs "multiple times as the lab runs, and
+          # once at the end" per that source, so even a run cut short by the
+          # outer `timeout` (SIGINT) below should leave a last-written, if
+          # incomplete, outcomes.json. Fall back to the historical
+          # *.txt-line-count method (every mutant that produced a verdict
+          # lands in exactly one of caught/missed/timeout/unviable.txt) both
+          # for a run killed before outcomes.json's first write, AND for a
+          # SIGINT that lands mid-write and leaves a half-flushed,
+          # unparseable outcomes.json — `jq -e .` below rejects that case
+          # rather than trusting a torn read.
+          report_present=false
+          tested=""
+          if [ -f mutants.out/outcomes.json ] && jq -e . mutants.out/outcomes.json >/dev/null 2>&1; then
+            report_present=true
+            caught=$(jq -r '.caught // 0' mutants.out/outcomes.json)
+            missed_n=$(jq -r '.missed // 0' mutants.out/outcomes.json)
+            timeout_n=$(jq -r '.timeout // 0' mutants.out/outcomes.json)
+            unviable=$(jq -r '.unviable // 0' mutants.out/outcomes.json)
+            tested=$(( caught + missed_n + timeout_n + unviable ))
+          elif [ -d mutants.out ]; then
+            report_present=true
+            tested=0
+            for f in caught missed timeout unviable; do
+              if [ -f "mutants.out/${f}.txt" ]; then
+                tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
+              fi
+            done
+          fi
+          tested="${tested:-0}"
+
           progress="${tested} mutants"
           if [ -n "${total}" ]; then
             progress="${tested} of ${total} mutants"
           fi
 
+          # FAIL — a real job failure, not a hidden warning — whenever
+          # cargo-mutants' own exit code isn't one that leaves a trustworthy
+          # report (0 all caught, 2 some survived, 3 some timed out; see the
+          # exit-code comment on the step above, confirmed against
+          # `src/exit_code.rs`), OR the planned mutant count can't be
+          # verified at all (mutants.json missing), OR mutants were planned
+          # but NONE were actually tested. Succeed — with an explicit summary
+          # line, never a silent no-op — only for the two legitimate
+          # all-clears: nothing to mutate (handled above) or a complete run
+          # that planned zero mutants. Surviving mutants (status 2) alone are
+          # NOT a failure: mutation testing is a report, not a merge gate.
+          fail=false
+          if [ "${MUTANTS_STATUS}" != "0" ] && [ "${MUTANTS_STATUS}" != "2" ] && [ "${MUTANTS_STATUS}" != "3" ]; then
+            fail=true
+          fi
+          if [ "${report_present}" = "false" ]; then
+            fail=true
+          fi
+          # An unverifiable total is ALWAYS a failure, independent of status —
+          # this must not depend on MUTANTS_STATUS happening to also be bad.
+          # Without this line, a parseable outcomes.json plus MUTANTS_STATUS=0
+          # and a missing mutants.json passed every other check above and
+          # fell through to the "diff generated no mutants" success message,
+          # which is a false all-clear (nw-445) hiding behind a status the
+          # other two conditions treat as trustworthy.
+          if [ -z "${total}" ]; then
+            fail=true
+          fi
+          if [ -n "${total}" ] && [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
+            fail=true
+          fi
+
           summary "## Mutation testing (advisory)"
           summary ""
 
-          incomplete=false
-          if [ "${TRUNCATED}" = "true" ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **TRUNCATED — this run hit its time budget and did not finish.**"
-            summary "> It got through **${progress}** before being stopped."
-            summary "> The list below is PARTIAL. A mutant missing from it was not"
-            summary "> killed — it was never reached. Do not read this as an all-clear."
-            summary ""
-          elif [ ! -d mutants.out ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **cargo-mutants produced no report** (exit status \`${MUTANTS_STATUS:-unknown}\`)."
-            summary "> Nothing was mutated. This is a missing result, not a passing one."
-            summary ""
-          elif [ "${MUTANTS_STATUS}" = "1" ]; then
-            incomplete=true
-            summary "> [!WARNING]"
-            summary "> **cargo-mutants exited with an error** (status 1) — the run did not"
-            summary "> complete normally. Treat any list below as partial."
+          if [ "${fail}" = "true" ]; then
+            if [ "${report_present}" = "false" ]; then
+              reason="cargo-mutants produced no report at all (exit status \`${MUTANTS_STATUS:-unknown}\`) — mutants.out/ is missing."
+            elif [ "${TRUNCATED}" = "true" ]; then
+              reason="the run hit its \`${MUTANTS_BUDGET}\` budget and was cut short (exit status \`${MUTANTS_STATUS}\`), reaching only ${progress} before being stopped."
+            elif [ -z "${total}" ]; then
+              reason="mutants.out/mutants.json (the planned mutant list, written before any build or test) is missing, so the planned mutant count cannot be verified (exit status \`${MUTANTS_STATUS}\`)."
+            elif [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
+              reason="${total} mutants were planned but zero were tested (exit status \`${MUTANTS_STATUS}\`)."
+            else
+              reason="cargo-mutants exited with status \`${MUTANTS_STATUS}\`, which is not one of the trustworthy codes (0, 2, 3)."
+            fi
+            echo "::error::Mutation testing produced no usable signal: ${reason}"
+            summary "> [!CAUTION]"
+            summary "> **FAILED — no usable mutation signal.**"
+            summary "> ${reason}"
+            summary "> An absent signal must not read as an all-clear — see this job's own header comment for the full pass/fail contract."
             summary ""
           fi
 
@@ -1034,25 +1812,40 @@ jobs:
             summary '```'
             cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
             summary '```'
-          elif [ "${incomplete}" = "true" ]; then
-            if [ "${tested}" -eq 0 ]; then
-              summary "**No mutants were tested at all.** There is no result here to read."
-            else
-              summary "No surviving mutants among the ones this run did reach (${progress})."
-              summary "The rest were not tested."
-            fi
+          elif [ "${fail}" = "true" ]; then
+            summary "No mutants were tested (or the report was missing) — see the failure above."
           elif [ "${tested}" -eq 0 ]; then
             # Not a pass and not a failure: the diff touched nothing mutable.
             summary "This PR's diff generated no mutants — nothing in it was mutable."
           else
             summary "No surviving mutants in this diff (${progress} tested)."
           fi
+
+          if [ "${fail}" = "true" ]; then
+            exit 1
+          fi
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-report
-          path: mutants.out/
+          # Multiple paths, one per line (actions/upload-artifact's own
+          # README at this pinned SHA, "Upload using Multiple Paths and
+          # Exclusions") — mutants-console.log is the raw stdout+stderr
+          # capture the mutate step now writes (`tee`) for the "legitimate
+          # zero mutants" evaluation branch, and is useful on its own for
+          # diagnosing a genuine failure too.
+          path: |
+            mutants.out/
+            mutants-console.log
+          # `if-no-files-found` only fires when NONE of the paths above
+          # match anything — per the same README ("If a path (or paths),
+          # result in no files being found for the artifact..."). So
+          # mutants.out/ being absent (the legitimate no-mutants case, or
+          # any other run that never produced a report) does not trigger
+          # this on its own as long as mutants-console.log exists; `ignore`
+          # only matters for the true no-packages-in-diff case, where
+          # neither path has anything to upload.
           if-no-files-found: ignore
 
   audit:
@@ -1219,6 +2012,8 @@ jobs:
 
   e2e:
     name: E2E Tests
+    # See the daemon-tests timeout-minutes comment for why these bounds exist.
+    timeout-minutes: 120
     needs: changes
     # E2E drives the real backend API + the frontend, so run it whenever either
     # side changes.

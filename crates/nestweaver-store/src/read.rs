@@ -306,7 +306,10 @@ impl ScanIntegrity {
         }
         Some(format!(
             "coverage DEGRADED: {} corrupt row(s) skipped, {} kept; first: {}. \
-             Counts are a floor. Re-index to repair (`nestweaver brain add --force`).",
+             Counts are a floor. Repair by re-writing the affected source: \
+             `nestweaver index --repo <path> --force` for code, `nestweaver brain refresh \
+             <vault>` for notes, or restore a backup with `nestweaver backup restore <archive> \
+             --data-dir <dir>`.",
             self.skipped_corrupt,
             self.returned,
             self.first_reason.as_deref().unwrap_or("unknown")
@@ -3120,10 +3123,44 @@ impl GraphStore {
     /// many repos fans out across tens of thousands of
     /// `PROJECT_INCLUDES_SYMBOL` edges, leaving each individual symbol below
     /// threshold when only the project node is seeded.
+    ///
+    /// `path_prefix`/`repos` restrict the candidate set BEFORE `ORDER BY`
+    /// and `LIMIT` apply (nw-470) — filtering after the cut starves a
+    /// restrictive `path_prefix`/`repos` of candidates it never saw, because
+    /// on a project the size of `nestweaver` almost none of a given
+    /// subdirectory's symbols land in the *global* top-`limit`-by-PageRank
+    /// set. `s.file_path STARTS WITH $path_prefix` mirrors
+    /// `node_scope::retain_nodes_under_path_prefix`'s
+    /// `location.starts_with(prefix)` semantics: a symbol's rendered
+    /// `location` is `format!("{file_path}:{start_line}")`
+    /// (`query::render_brain_node`), not bare `file_path`, but the two are
+    /// interchangeable for a `STARTS WITH` prefix test as long as the prefix
+    /// itself never runs past the `file_path` portion into the `:line`
+    /// suffix — true for every real caller, which only ever passes a
+    /// directory/file-path fragment. `path_prefix: None` means "no path
+    /// restriction", matching the pre-nw-470 unfiltered behavior exactly.
+    ///
+    /// `repos` has TWO distinct empty states that must not be confused:
+    /// `repos: None` means "no repo restriction" (every repo is a
+    /// candidate, same as omitting the argument). `repos: Some(&[])` means
+    /// "zero repos selected", which matches NO symbols — this mirrors the
+    /// existing MCP-layer contract for an explicit `"repos": []` argument:
+    /// `resolve_repo_filter` (`crates/nestweaver-engine/src/node_scope.rs`)
+    /// resolves an empty selector list to `Ok(HashSet::new())` (not an
+    /// error, not "unrestricted"), and the post-hoc
+    /// `retain_nodes_in_repos` then keeps nothing because no UID is ever a
+    /// member of the empty set. `Some(&[])` here reaches the database as a
+    /// genuine `s.repo_uid IN $repos` predicate bound to an empty LIST
+    /// value (confirmed executable, not silently caught by this function's
+    /// generic query-error fallback) — it is not special-cased in Rust
+    /// because the underlying query engine already returns zero rows for
+    /// an empty-list `IN`, which is the correct answer on its own.
     pub fn list_project_symbol_uids_by_pagerank(
         &self,
         project_uid: &str,
         limit: usize,
+        path_prefix: Option<&str>,
+        repos: Option<&[String]>,
     ) -> Result<Vec<String>, StoreError> {
         let _flight = self
             .pagerank_compute_lock
@@ -3137,11 +3174,26 @@ impl GraphStore {
             return Ok(vec![]);
         }
         let conn = self.conn()?;
-        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
-                 RETURN s.uid, s.pagerank_score \
-                 ORDER BY s.pagerank_score DESC \
-                 LIMIT $limit";
-        let mut stmt = match conn.prepare(q) {
+        let mut predicates: Vec<&str> = Vec::new();
+        if path_prefix.is_some() {
+            predicates.push("s.file_path STARTS WITH $path_prefix");
+        }
+        if repos.is_some() {
+            predicates.push("s.repo_uid IN $repos");
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {} ", predicates.join(" AND "))
+        };
+        let q = format!(
+            "MATCH (p:Project {{uid: $uid}})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
+             {where_clause} \
+             RETURN s.uid, s.pagerank_score \
+             ORDER BY s.pagerank_score DESC \
+             LIMIT $limit"
+        );
+        let mut stmt = match conn.prepare(&q) {
             Ok(s) => s,
             Err(e) => {
                 tracing::trace!(
@@ -3151,13 +3203,23 @@ impl GraphStore {
                 return Ok(vec![]);
             }
         };
-        let result = match conn.execute(
-            &mut stmt,
-            vec![
-                ("uid", Value::String(project_uid.to_string())),
-                ("limit", Value::Int64(limit as i64)),
-            ],
-        ) {
+        let mut params = vec![
+            ("uid", Value::String(project_uid.to_string())),
+            ("limit", Value::Int64(limit as i64)),
+        ];
+        if let Some(prefix) = path_prefix {
+            params.push(("path_prefix", Value::String(prefix.to_string())));
+        }
+        if let Some(repo_uids) = repos {
+            params.push((
+                "repos",
+                Value::List(
+                    lbug::LogicalType::String,
+                    repo_uids.iter().map(|r| Value::String(r.clone())).collect(),
+                ),
+            ));
+        }
+        let result = match conn.execute(&mut stmt, params) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!(
@@ -4282,5 +4344,217 @@ mod frontmatter_backfill_tests {
             let error = store.note_tag_sets().unwrap_err().to_string();
             assert!(error.contains("tag sets"), "{relationship}: {error}");
         }
+    }
+}
+
+/// nw-470: `path_prefix`/`repos` on `list_project_symbol_uids_by_pagerank`
+/// must restrict the candidate set BEFORE `ORDER BY ... LIMIT`, not after —
+/// otherwise a restrictive scope on a large project is starved of candidates
+/// it never saw (the seed-selection analogue of nw-378's render-cap fix).
+#[cfg(test)]
+mod project_symbol_pagerank_scope_tests {
+    use super::*;
+
+    fn scoped_symbol(uid: &str, repo_uid: &str, file_path: &str, pagerank: f64) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {uid}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: Some(pagerank),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// Fixture: a project with 120 high-PageRank symbols under `crates/a/`
+    /// (repo A) and 30 low-PageRank symbols under `crates/b/src/` (repo B).
+    /// Every "a" symbol outranks every "b" symbol, so the pre-nw-470
+    /// unfiltered top-100 query returns 100 "a" UIDs and ZERO "b" UIDs —
+    /// exactly the starvation this fix addresses.
+    fn build_fixture() -> (GraphStore, Project, Vec<String>, Vec<String>) {
+        let store = GraphStore::in_memory().unwrap();
+        let project = Project {
+            uid: "proj:test:fixture".to_string(),
+            name: "Fixture".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&project).unwrap();
+
+        let a_symbols: Vec<Symbol> = (0..120)
+            .map(|i| {
+                scoped_symbol(
+                    &format!("sym:repo-a:{i:04}"),
+                    "repo:a",
+                    &format!("crates/a/file_{i}.rs"),
+                    // Descending, all well above every "b" score below.
+                    10_000.0 - i as f64,
+                )
+            })
+            .collect();
+        let b_symbols: Vec<Symbol> = (0..30)
+            .map(|i| {
+                scoped_symbol(
+                    &format!("sym:repo-b:{i:04}"),
+                    "repo:b",
+                    &format!("crates/b/src/file_{i}.rs"),
+                    1.0 + i as f64,
+                )
+            })
+            .collect();
+
+        let mut all_symbols = a_symbols.clone();
+        all_symbols.extend(b_symbols.clone());
+        store.batch_insert_symbols(&all_symbols).unwrap();
+
+        let all_uids: Vec<String> = all_symbols.iter().map(|s| s.uid.clone()).collect();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, &all_uids, 1.0)
+            .unwrap();
+
+        let a_uids: Vec<String> = a_symbols.iter().map(|s| s.uid.clone()).collect();
+        let b_uids: Vec<String> = b_symbols.iter().map(|s| s.uid.clone()).collect();
+        (store, project, a_uids, b_uids)
+    }
+
+    #[test]
+    fn project_symbol_uids_by_pagerank_honours_path_prefix_and_repos() {
+        let (store, project, a_uids, b_uids) = build_fixture();
+
+        // 1. A path_prefix matching only the low-PageRank "b" group must
+        //    still return ALL of it, even though every one of those UIDs
+        //    would have been cut by an unfiltered top-100 (they're globally
+        //    outranked by all 120 "a" symbols).
+        let prefixed = store
+            .list_project_symbol_uids_by_pagerank(&project.uid, 100, Some("crates/b/src/"), None)
+            .unwrap();
+        let prefixed_set: HashSet<String> = prefixed.into_iter().collect();
+        let expected_b: HashSet<String> = b_uids.iter().cloned().collect();
+        assert_eq!(
+            prefixed_set, expected_b,
+            "path_prefix must restrict the candidate set BEFORE the PageRank \
+             LIMIT cut, not after — otherwise the low-PageRank prefix group \
+             is starved of a candidate pool it never saw"
+        );
+
+        // Counterweight: None returns the same UIDs as the pre-nw-470
+        // unfiltered query on this fixture (top 100 by PageRank, which is
+        // exactly the 100 highest-scoring "a" symbols since every "a" score
+        // outranks every "b" score). Compared as a SET, not an ordered Vec,
+        // because floating PageRank ties are not part of this function's
+        // contract.
+        let unfiltered = store
+            .list_project_symbol_uids_by_pagerank(&project.uid, 100, None, None)
+            .unwrap();
+        let unfiltered_set: HashSet<String> = unfiltered.into_iter().collect();
+        let expected_top_100: HashSet<String> = a_uids.iter().take(100).cloned().collect();
+        assert_eq!(
+            unfiltered_set, expected_top_100,
+            "the None path must return the same top-100-by-PageRank UIDs as \
+             the pre-nw-470 unfiltered query on the same fixture"
+        );
+
+        // A prefix matching nothing returns empty, not an error and not a
+        // fallback to the unfiltered set.
+        let empty = store
+            .list_project_symbol_uids_by_pagerank(
+                &project.uid,
+                100,
+                Some("crates/nonexistent/"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            empty.is_empty(),
+            "a path_prefix matching zero symbols must return an empty list"
+        );
+
+        // 2. repos: symbols live in two repos; repos=[B] returns only B's,
+        //    none of A's, even though A's are all higher-PageRank.
+        let repo_b_only = store
+            .list_project_symbol_uids_by_pagerank(
+                &project.uid,
+                100,
+                None,
+                Some(&["repo:b".to_string()]),
+            )
+            .unwrap();
+        let repo_b_set: HashSet<String> = repo_b_only.into_iter().collect();
+        assert_eq!(
+            repo_b_set, expected_b,
+            "repos=[B] must return exactly B's members, restricted before \
+             the PageRank LIMIT cut"
+        );
+        assert!(
+            repo_b_set.is_disjoint(&a_uids.iter().cloned().collect()),
+            "repos=[B] must never leak repo A's symbols"
+        );
+
+        // 3. repos: Some(&[]) — the "zero repos selected" contract, which
+        //    is DISTINCT from `None` ("no repo restriction"). This mirrors
+        //    the existing MCP-layer behavior for an explicit `"repos": []`
+        //    argument: `resolve_repo_filter` resolves it to an empty
+        //    `HashSet`, and `retain_nodes_in_repos` then keeps nothing
+        //    against that empty set. It must match nothing here too, even
+        //    though every symbol in the fixture technically has *some*
+        //    `repo_uid` — an empty repos list selects zero of them, by
+        //    construction, not by accident.
+        let repo_scope_empty = store
+            .list_project_symbol_uids_by_pagerank(&project.uid, 100, None, Some(&[]))
+            .unwrap();
+        assert!(
+            repo_scope_empty.is_empty(),
+            "repos: Some(&[]) must match NOTHING (mirrors the MCP-layer \
+             'zero repos selected' contract), not fall back to 'unrestricted'; \
+             got {repo_scope_empty:?}"
+        );
+    }
+
+    /// nw-470 follow-up (code-quality review). `repos: Some(&[])` reaches
+    /// the database as a real `s.repo_uid IN $repos` predicate bound to an
+    /// empty `Value::List`. This function's `conn.execute` failure arm
+    /// swallows ANY query error into `Ok(vec![])` (treating it as "table
+    /// may not exist yet"), which means a naive test asserting only
+    /// `list_project_symbol_uids_by_pagerank(..., Some(&[])) == Ok(vec![])`
+    /// cannot distinguish "correctly matched zero rows" from "the empty-list
+    /// bind was rejected by the engine and the error was silently eaten."
+    /// This test calls the exact same query/param shape directly against a
+    /// connection, bypassing that fallback, to prove the bind genuinely
+    /// executes and returns real (empty) results rather than erroring.
+    #[test]
+    fn repos_empty_list_bind_genuinely_executes_rather_than_erroring() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let q = "MATCH (s:Symbol) WHERE s.repo_uid IN $repos RETURN s.uid";
+        let mut stmt = conn
+            .prepare(q)
+            .expect("prepare must succeed for this schema");
+        let params = vec![("repos", Value::List(lbug::LogicalType::String, vec![]))];
+        let result = conn.execute(&mut stmt, params);
+        assert!(
+            result.is_ok(),
+            "binding an empty Value::List to `IN $repos` must execute, not \
+             error — if this ever fails, list_project_symbol_uids_by_pagerank \
+             must special-case Some(&[]) in Rust before building the query \
+             instead of relying on the engine to accept an empty LIST bind: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap().collect::<Vec<_>>().len(),
+            0,
+            "an empty IN list must match zero rows, not error out to an \
+             empty result via a different path"
+        );
     }
 }

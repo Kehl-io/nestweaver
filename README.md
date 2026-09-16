@@ -61,7 +61,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 </td>
 <td width="50%" valign="top">
 
-**42-Tool MCP Server**<br>
+**43-Tool MCP Server**<br>
 Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
@@ -121,10 +121,16 @@ nestweaver setup --force   # regenerate skill/guide files even if customized
 
 Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
 
-## Upgrading to 9.0.0 — re-index before you trust a ranking
+## Upgrading — re-index before you trust a ranking
 
-**9.0.0 bumps `RESOLVER_GENERATION` from 3 to 4. Every graph indexed by an
-earlier release must be re-indexed.** Until you do:
+**`RESOLVER_GENERATION` is 6. Every graph indexed by an earlier release must be
+re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
+by any other generation — older or newer — is treated as untrustworthy.
+
+9.0.0 took it from 3 to 4, and generations 5 and 6 followed. The 9.0.0 bump
+changed edge SHAPE; 5 and 6 changed which symbols are persisted as ENTRY
+POINTS, which is what `dead-code` walks from. Both kinds of staleness have the
+same remedy and the same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
   PageRank-ordered result are computed over edges the old resolver wrote.
@@ -159,11 +165,20 @@ no edit:
 ```sh
 nestweaver stale-check                    # [OLD-RESOLVER] rows + the remedy, exit 2
 nestweaver stale-check --json             # "resolver_stale_repos": [...], per-repo "resolver_stale"
-cat <db>.resolver_generation.json         # per-repo generation; anything below 4 is stale
+cat <db>.resolver_generation.json         # per-repo generation; anything that is not the current one is stale
 ```
 
 In 8.x it did not: the status ladder was `missing`/`incomplete`/SHA-behind-HEAD
 only, so a generation-3 graph reported `ok` and exited 0.
+
+Generations 5 and 6 turned on PERSISTED PER-SYMBOL COLUMNS rather than edge
+shape: `is_entry_point` and `entry_point_kind` are read straight off disk, so a
+symbol indexed as `false` stays `false` no matter which binary asks. Generation
+6 roots bash and Python top-level calls, Swift `main.swift`/shebang files, bash
+`trap` handlers, and `package.json` entry points at any depth in a monorepo.
+Those additions can only ADD reachability roots, so they can only REMOVE
+symbols from a `dead-code` list — an un-re-indexed graph over-reports dead
+code.
 
 `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
 disclose it (`rankings_stale` / `stale_repos` on `--json`, a warning on stderr
@@ -390,6 +405,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
 | `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. `any_stale` / `is_stale` mean *behind HEAD* specifically |
+| `brain diff <repo>` | Show what changed in the graph since a commit (`--since-sha <sha>`, `--limit` 1–1000 default 50, `--json`, `--db`, `--config`). Local repos only; the CLI twin of the MCP `brain_diff` tool |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
 | `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
 | `brain orphans` | List notes with zero inbound and zero outbound wikilinks |
@@ -397,6 +413,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain tag-graph` | Show a tag's note count and co-occurring tags (or dump the full tag graph) |
 | `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
 | `backlinks` | Resolve a note by UID or title and list the notes that link to it |
+| `note get <target>` | Read one note by `note:` UID or by title (`--json`, `--db`, `--config`). Read-only; the CLI twin of the MCP `note_get` tool. **Exits 2** when the title or UID resolves to nothing |
 | `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
 | `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files) |
 | `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.) |
@@ -413,11 +430,29 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `publication cancel` | Request cooperative cancellation at an exact observed journal revision |
 | `publication discard` | Remove failed staging at an exact revision, or safely discard only an invalid journal |
 | `publication rollback` | Switch back one step to the retained predecessor while the daemon is stopped |
-| `repair` | Reconcile an index publication abandoned by a crashed indexer. While `<db>.index-dirty` exists every ranked query fails closed; this removes the stale PageRank sidecar, advances the generation, clears the marker and recomputes. Refuses a marker it cannot prove abandoned unless `--force`, and never overrides a live writer |
+| `repair` | Reconcile an index publication abandoned by a crashed indexer. While `<db>.index-dirty` exists for a full `index` publication — or a watcher marker is wedged — every ranked query fails closed; this removes the stale PageRank sidecar, advances the generation, clears the marker and recomputes. Refuses a marker it cannot prove abandoned unless `--force`, and never overrides a live writer |
 | `publication prune` | Reclaim slots nothing can still reach. Keeps the slot `CURRENT` selects, its retained predecessor (the one-step rollback target), and any slot an in-flight operation targets; `--dry-run` previews. Takes the publication-root lock, so it serializes against rebuild/rollback/discard |
 
 The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 [publication rebuild and recovery guide](docs/guide/publication-rebuild.md).
+
+**Ranked reads during a publication.** Not every publication fails a ranked read
+closed any more. A `brain watcher batch` publication now lets ranked reads
+**succeed**, returning results plus a disclosure of what was in flight. A full
+`index` publication still fails closed, and so does a wedged watcher marker —
+those two are unchanged. MCP responses computed during a live publication carry
+four disclosure keys:
+
+| Key | Meaning |
+|-----|---------|
+| `publication_in_progress` | a publication was in flight while this answer was computed |
+| `marker_age_s` | age of the publication marker, in seconds |
+| `in_flight_note_paths` | the note paths being published, capped at 20 |
+| `in_flight_note_paths_truncated` | `true` when more than 20 paths were in flight |
+
+Known gap: CLI `--json` verbs that reshape the response into a typed struct —
+`nestweaver hubs --json` among them — drop these keys. Their absence from a CLI
+JSON payload is therefore not evidence that no publication was running.
 
 </details>
 
@@ -431,7 +466,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High, or Unknown when a changed file could not be assessed); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | **A review aid, not a deletion list**, and it **refuses to produce one at all on a resolver-generation-stale graph** — exit `2`, `refused: true` with `reason: "outdated_resolver"` and a runnable `remedies[].command` on `--json`, on every route including MCP. A missing edge can only fail to *reach* a live symbol, so an under-resolved graph moves live code onto a deletion list; re-index with `nestweaver index --repo <path> --force` and re-run. Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk proved nothing — no entry point (`entry_points == 0`), undecodable symbols in the store, or a language that contributed analysed symbols but zero entry points of its own (named in `languages_without_entry_points`) — so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
+| `dead-code` | **A review aid, not a deletion list**, and it **refuses to produce one at all on a resolver-generation-stale graph** — exit `2`, `refused: true` with `reason: "outdated_resolver"` and a runnable `remedies[].command` on `--json`, on every route including MCP. A missing edge can only fail to *reach* a live symbol, so an under-resolved graph moves live code onto a deletion list; re-index with `nestweaver index --repo <path> --force` and re-run. Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk proved nothing — no entry point (`entry_points == 0`), undecodable symbols in the store, or a language that contributed analysed symbols but zero entry points of its own (named in `languages_without_entry_points`) — so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged. A Rust `impl` block is reachable when ANY of its members is, and a dead one now suppresses its own `Method` members instead of listing the block and every method separately (associated `Constant`s still surface). Rows are deterministically ordered with a uid tie-break, so which of them survive `--limit` no longer varies run to run |
 | `rerank` | Lightweight result reranker (off-by-default heuristic) |
 | `info` | Show hardware and configuration information |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
@@ -440,6 +475,16 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `ranking` | Inspect ranking priors |
 | `eval` | Offline retrieval-quality evaluation |
 | `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format (cypher/graphml/mermaid carry real PageRank scores; mermaid `--top N` ranks by PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout). An invalid `--format` or `--scope` value now exits **64** (`EX_USAGE`), not 1 — an unsupported but valid *combination*, such as `--format cypher --scope vault`, still exits 1 |
+
+**What counts as an entry point.** Reachability is a forward walk from entry
+points, so what the parser accepts as one decides what `dead-code` reads as
+dead:
+
+- **bash** — `trap` handlers are entry points, including quoted flags and traps nested inside functions. Any command with no enclosing function also roots its same-file callee, so a script with a bare top level now has entry points at all; it used to have none, and every function in such a script read as 100% dead. **Trap handler resolution is SAME-FILE ONLY** — a handler defined in a `source`d file (`source lib.sh; trap cleanup EXIT`) is not resolved and shows as unreachable.
+- **Swift** — a top-level call in `main.swift`, or in a shebang-led file, roots its callee. Known gap: `swiftc foo.swift` on a file that is neither `main.swift` nor shebang-led is missed.
+- **Python** — a module-scope call roots a same-file function, which covers `if __name__ == "__main__":` with no special case for it. Restricted to bare identifiers (`obj.run()` roots nothing) and to functions, never methods.
+- **C++** — an error-recovered, macro-prefixed declaration is re-anchored to its name's line, which CHANGES that symbol's UID. A local whose type is an inline anonymous struct or class is reclassified `Function` → `Variable` (the most-vexing-parse fix).
+- **Manifests** — `package.json` entry points are discovered at ANY depth, so a monorepo's `packages/*/package.json` counts. Paths are rebased against the manifest's own directory, and the `browser` field is now an entry file.
 
 </details>
 
@@ -466,7 +511,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (42 tools; 36 in direct read-only mode; 6 with `--lite`; auto-starts daemon) |
+| `mcp` | Start the MCP server (43 tools; 36 in direct read-only mode; 6 with `--lite`; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
 | `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
 | `server` | Server management utilities (`init-tls`, `backup`, `status`) |
@@ -595,20 +640,38 @@ startup is cache-only: it never downloads model files or contacts Hugging Face.
 The configured `cache_dir` expands a leading `~/` against the daemon user's home
 directory.
 
-If the model is absent, stop the daemon and use the direct local path, which may
-download missing artifacts. The required form is
-`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
-Use the same model ID and expanded cache directory configured for the daemon:
+**A missing model cache repairs itself.** If the recorded model is absent from
+the cache, `nestweaver embed` recovers it in one call — no `daemon stop`, no
+restart. It downloads the missing artifacts, loads them, prints one line ahead
+of the normal summary, and exits 0:
 
 ```sh
-CONFIG=/absolute/path/to/nestweaver-instance.toml
-DB=/absolute/path/to/brain.lbug
-MODEL=sentence-transformers/all-MiniLM-L6-v2
-CACHE="$HOME/.cache/nestweaver/models"
-nestweaver daemon --db "$DB" stop
-nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE"
-nestweaver daemon --db "$DB" start --config "$CONFIG"
+nestweaver embed --db /absolute/path/to/brain.lbug
+# Downloaded missing embedding model '<id>' into <cache-dir> and loaded it (device: <device>).
 ```
+
+The daemon repairs itself too, in a bounded background seed. When a boot load
+fails because the artifacts are missing, the backend is local, and the database
+already carries a verified embedding identity naming that model, the daemon
+downloads it in the background **after** the socket is bound — so boot stays
+cache-only and the download never delays it. It is never a first-time download:
+with no recorded identity there is nothing to repair and nothing is fetched. At
+most 5 attempts, backing off 30s / 2m / 8m / 30m (each jittered ±20%), stopping
+early on a permanent error (404, 401, 403, permission denied, ENOSPC). Opt out
+with `[embedding] auto_repair_cache = false` — it defaults to `true`.
+
+`brain status` grows a `Download:` line while a seed is running, naming who
+asked for it and which attempt is in flight:
+
+```text
+Download:  <done> of <total> (automatic repair, attempt N of M)
+Download:  <done> of <total> (requested by nestweaver embed)
+Download:  retry N of M in <duration>
+```
+
+While a seed is active the embedding state is `"seeding"`. It takes precedence
+over every other state, `ready` included, and reports
+`degraded_components: ["semantic"]`.
 
 **External embedding endpoints.** Instead of a local model you can embed via an
 OpenAI-compatible endpoint:
@@ -619,7 +682,13 @@ to config, the graph, or a snapshot. An external endpoint is authoritative: a
 load or request failure is reported and does not load a local model. Switching
 backends requires both an explicit configuration change and re-embedding:
 remove `external_endpoint`, stop the daemon, and replace the recorded external
-model metadata/vectors with the chosen local model:
+model metadata/vectors with the chosen local model.
+
+**The stop/start recipe below is for an intentional model SWITCH only** — it is
+the one case that still needs one. It is not the repair for a missing cache:
+that is a single `nestweaver embed` call with the daemon left running, described
+above. `--force` appears here because you are deliberately discarding the
+recorded model and its vectors, never because a download is missing:
 
 ```sh
 CONFIG=/absolute/path/to/nestweaver-instance.toml
@@ -776,7 +845,7 @@ CLI commands (`search`, `brain search`, `brain context`) also respect this setti
 
 ## MCP Server
 
-NestWeaver exposes **42 tools** via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes **43 tools** via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 > **Where that number comes from.** The registry is
 > `all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs`, and
@@ -796,11 +865,12 @@ nestweaver mcp --tools brain_context,brain_search,read_symbols --db ./nestweaver
 NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug
 ```
 
-Direct read-only mode advertises **36** tools — the registry minus the six names
-in `MUTATING_TOOLS` (`crates/nestweaver-mcp/src/http.rs`): `brain_add_source`,
-`brain_remove_source`, `brain_memory_consolidate`, `set_extension`,
-`prune_stale`, `compact_embeddings` — and rejects mutations before dispatch.
-Daemon-backed stdio exposes all 42. `--lite` exposes 6. `--tools` names are
+Direct read-only mode advertises **36** tools — the registry minus the seven
+names in `MUTATING_TOOLS` (`crates/nestweaver-mcp/src/http.rs`):
+`brain_add_source`, `brain_remove_source`, `brain_memory_consolidate`,
+`set_extension`, `unset_extension`, `prune_stale`, `compact_embeddings` — and
+rejects mutations before dispatch. Daemon-backed stdio exposes all 43.
+`--lite` exposes 6. `--tools` names are
 exact, case-sensitive registry names; unknown, duplicate, empty, or transport-
 unavailable names fail at startup instead of silently producing an empty tool
 surface.
@@ -824,7 +894,7 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 pgrep -af "nestweaver daemon"                     # find running daemons (Linux)
 ```
 
-42 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.
+43 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.
 
 ### Key capabilities
 

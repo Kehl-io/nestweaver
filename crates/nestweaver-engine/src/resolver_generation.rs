@@ -86,7 +86,135 @@ use std::path::Path;
 ///     bump the disagreement is silent — the same shape as generation 4's own
 ///     "svelte/vue/astro named exports change `SymbolKind`" entry, which is
 ///     the precedent this follows.
-pub const RESOLVER_GENERATION: u32 = 5;
+/// 6 — nw-435: a Python or bash call/command with no enclosing
+///     `function_definition` (and, for Python, no enclosing `lambda`) ancestor
+///     now promotes its same-file `Function` callee to `is_entry_point: true`,
+///     `entry_point_kind: Some(EntryPointKind::Main)` — see the post-pass in
+///     `nestweaver-parser/src/parse.rs`. Before this, `detect_python`/
+///     `detect_bash` (entry_points.rs) recognised only fixed names and file
+///     patterns — `main`, `handler`/`lambda_handler`, `test_*`, and
+///     `views.py`/`routes.py`/`endpoints.py`/`handlers.py` for Python; only
+///     `main` for bash — none of which fire for a plain top-level script
+///     call, so a bash script or Python module whose top level was bare
+///     statements had NO entry point at all and every function it
+///     defined was reachability-walked as dead — the dominant real-world bash
+///     idiom, and a common Python one. Exactly generation 5's shape again:
+///     `is_entry_point`/`entry_point_kind` are PERSISTED per-symbol columns
+///     that `dead-code`, `process.rs` and `ranking.rs` read straight off disk
+///     rather than re-deriving, so a symbol in an already-indexed graph keeps
+///     `is_entry_point: false` forever and cannot seed a reachability walk no
+///     matter which binary asks — only re-indexing (`nestweaver index --repo
+///     <path> --force`) writes the corrected flag.
+///
+/// nw-356 (same generation as nw-435 above, per the branch's own
+///     coordination note — one bump covers both). Two independent C++
+///     `parse.rs` fixes change what gets extracted from `.h`/`.cpp` files.
+///     BOTH are gated so an ordinary, already-correct declaration is NEVER
+///     touched — an `[[nodiscard]]`- or `static inline`-prefixed multi-line
+///     prototype, for example, also has a `declaration` node whose start row
+///     precedes its name's row, but is left completely alone. (A) only
+///     re-anchors a `declaration`-shaped capture whose reported start row
+///     precedes its own `@name` capture's row AND whose subtree contains a
+///     tree-sitter `ERROR` node that itself starts strictly BEFORE the
+///     `@name` capture's row (`has_error_before_row`) — the signature of an
+///     unexpanded macro token sitting where a class name is expected
+///     desyncing statement-boundary recovery and widening a LATER, unrelated
+///     declaration's span backward across a preceding nested type (the
+///     `LBUG_API`/`DataChunkState` witness). An `ERROR` at or after the
+///     name's row (e.g. a malformed macro token in the parameter list) does
+///     not anchor, since it does not indicate the backward span-widening
+///     corruption this fix targets. Symbol UIDs are `(repo, path, name,
+///     start_line)`, so ONLY these error-recovered, macro-prefixed
+///     declarations get a new UID — a repo indexed before this fix has the
+///     OLD (wrong) UID on disk for exactly those declarations, and every edge
+///     pointing at one (CALLS, MEMBER_OF) still points at that stale UID
+///     after upgrading the binary alone. (B) only reclassifies a directly-
+///     initialized local variable whose declaration has no `ERROR` node
+///     strictly before the name's row (`has_error_before_row`, not a
+///     subtree-wide check — this is what keeps it from colliding with (A)'s
+///     witness, whose `ERROR` sits before the name) AND whose type is an
+///     inline anonymous/local `struct`/`class` definition (the C++ "most
+///     vexing parse": `Type name(initializer);` is grammatically identical to
+///     a function declarator). An `ERROR` inside the initializer, after the
+///     name, does not block reclassification. Only that exact shape is now
+///     correctly classified `SymbolKind::Variable` instead of the spurious
+///     `SymbolKind::Function` tree-sitter-cpp's grammar produced — an
+///     ordinary function declaration, including one whose call-shaped
+///     argument also triggers the most-vexing-parse ambiguity against a
+///     plain (non-struct) type (`Foo bar(GetName());`), is unaffected. A
+///     `Variable` can never be a CALLS target — exactly generation 5's
+///     "svelte/vue/astro named exports change `SymbolKind`" shape and
+///     generation 3's `Extension`-vs-`Class` UID-changing reclassification —
+///     so this changes which edges an already-indexed repo's stale
+///     struct-typed-local symbol can participate in, invisibly to anyone not
+///     re-indexing. Same remedy as every other bump in this file: `nestweaver
+///     index --repo <path> --force`.
+///
+/// nw-490 (same generation as nw-435/nw-356 above, per the branch's own
+///     coordination note — one bump covers all three; the branch is
+///     unreleased). Extends nw-435's exact mechanism (a call/command with no
+///     enclosing function body promotes its same-file callee to
+///     `is_entry_point: true`, `entry_point_kind: Some(EntryPointKind::Main)`)
+///     to Swift, gated to files `main.swift` or a shebang first line — the
+///     only Swift files whose top-level statements the compiler executes
+///     directly (`@main`-attributed types were already handled by
+///     `detect_swift`'s signature check and are untouched). Also widens the
+///     promoted-kind gate to `SymbolKind::Class` for Swift only, since a bare
+///     top-level call can be an implicit constructor call (`AppDelegate()`),
+///     and Swift mints classes/structs/enums/extensions/actors all as
+///     `SymbolKind::Class`. Same persisted-column shape as nw-435: a symbol in
+///     an already-indexed graph keeps `is_entry_point: false` forever and
+///     cannot seed a reachability walk no matter which binary asks — only
+///     re-indexing (`nestweaver index --repo <path> --force`) writes the
+///     corrected flag.
+///
+/// nw-491 (same generation as nw-435/nw-356/nw-490 above — the branch is
+///     still unreleased). `queries/bash.scm` had no capture for a command's
+///     ARGUMENTS, only its own name, so `trap cleanup EXIT` referenced the
+///     literal word `trap` and never `cleanup`; the handler had in-degree
+///     zero and nw-435's rooting had nothing to promote (its
+///     `top_level_called` set comes from `Call` references, and `trap`
+///     produced none pointing at the handler). A registration-macro-style
+///     post-pass, `collect_bash_trap_targets` in `nestweaver-parser/src/
+///     parse.rs`, now parses a bash `trap`'s operands per the GNU Bash
+///     manual grammar (`-l`/`-p`/`-P` print or list and register nothing; a
+///     leading `--` is consumed; the first remaining operand is the action
+///     only when a sigspec also remains; an action of `-` or empty text is a
+///     reset/ignore) and promotes the first word of the action text to
+///     `is_entry_point: true`, `entry_point_kind:
+///     Some(EntryPointKind::EventListener)` on any same-file `Function` of
+///     that name — `EventListener`, not `Main`, because a trap handler is
+///     triggered by an external OS signal rather than being the script's own
+///     entry point, keeping it out of `process.rs`'s `{dir}::main` bucket.
+///     Same persisted-column shape as nw-435/nw-490: a symbol in an
+///     already-indexed graph keeps `is_entry_point: false` forever and
+///     cannot seed a reachability walk no matter which binary asks — only
+///     re-indexing (`nestweaver index --repo <path> --force`) writes the
+///     corrected flag.
+///
+/// nw-492 (same generation as nw-435/nw-356/nw-490/nw-491 above — the branch is
+/// still unreleased). `parse_manifest` read ONE `package.json`, at the repo
+/// root, and only when no other root manifest format matched first, so a
+/// monorepo's `packages/*/package.json` — or generated wasm glue declaring
+/// `"main": "nestweaver_wasm.js"` under a `Cargo.toml` root — contributed no
+/// entry point at all and every symbol it roots was reachability-walked as
+/// dead. Entry files are now unioned from EVERY `package.json` in the repo at
+/// ANY depth (root included, with or without a `name` field; `node_modules`,
+/// the shared skip-dirs and `.gitignore` already applied by the index's own
+/// file walk), each raw path is rebased onto the directory containing its own
+/// manifest rather than the repo root (an unrebased `"./index.js"` from
+/// `packages/a/package.json` names the WRONG file, which is worse than naming
+/// none), and `browser` is now an entry file when its value is a string — the
+/// object form is a bundler replacement map, not an npm/Node entry point.
+/// Same on-disk staleness shape as the rest of this generation, one artefact
+/// over: this entry set is computed at INDEX time and persisted in the
+/// `<db>.manifests.json` sidecar, and `dead_code`'s reachability walk reads it
+/// straight off disk and ORs it with each symbol's persisted `is_entry_point`
+/// column to build the same seed set. So a repo indexed before this fix keeps
+/// the old root-only, unrebased entry list forever and cannot seed the walk
+/// from it no matter which binary asks — only re-indexing (`nestweaver index
+/// --repo <path> --force`) rewrites it.
+pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

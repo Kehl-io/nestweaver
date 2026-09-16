@@ -80,10 +80,23 @@ has three exact policies:
 | `cpu` | Selects CPU directly and never probes Metal. |
 
 An `external_endpoint` is authoritative and never switches to a local model
-after a failure. Daemon startup is cache-only: it does not contact Hugging Face
-or download missing local model files. Populate the configured cache while the
-daemon is stopped with
-`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
+after a failure. Daemon startup is still cache-only: boot does not contact
+Hugging Face or download missing local model files, so a cold cache produces a
+boot load that *fails* rather than a boot that blocks on a download.
+
+Recovering from that no longer needs a stop/start. Run `nestweaver embed --db
+<path>` against the **running** daemon: it seeds the configured cache in place
+and reloads the backend without restarting the process. While the seed runs,
+`state` reports `seeding` and `nestweaver brain status` renders a `Download:`
+progress line. The daemon may also repair the cache on its own — see
+[Bounded background auto-repair](#bounded-background-auto-repair).
+
+The older
+`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>` form
+still pre-populates a cache while the daemon is stopped, and is still what an
+explicit model or backend *switch* needs — that is a different operation from
+filling a gap in the cache, and it is covered under
+[Troubleshooting](#embedding-or-semantic-retrieval-unavailable).
 
 On macOS, `daemon start` and client autostart register a launchd agent that owns
 the foreground daemon process. An explicit `daemon run --server` remains in the
@@ -108,7 +121,10 @@ For a ready local backend, `selected_device` is `metal` or `cpu` and
 `fallback_used` remains `false`. A ready external backend has an empty
 `selected_device` because it has no local device.
 
-`state` is one of `disabled`, `loading`, `ready`, `failed`, or `embedding`.
+`state` is one of `disabled`, `loading`, `ready`, `failed`, `seeding`, or
+`embedding`. `seeding` **takes precedence over every other state, including
+`ready`**, for as long as `seed_active` is true, and a seeding daemon reports
+`degraded_components: ["semantic"]`.
 
 ### Embedding pass progress
 
@@ -135,6 +151,104 @@ running" instead of failing.
 `nestweaver brain status` renders the same numbers as a `Progress:` line, and
 `nestweaver embed` polls this status to print a live counter on the daemon
 route.
+
+### Model seed progress
+
+A seed is a model download into the configured cache — started either by an
+operator's `nestweaver embed` or by the daemon's own background repair (see
+[Bounded background auto-repair](#bounded-background-auto-repair)). While one
+is in flight, `state` reports `seeding` and `embedding_status` carries seven
+more keys, on both the `--json` route and the typed proto:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `seed_active` | bool | A seed is in flight. This is the unambiguous machine signal, exactly as `pass_active` is for an embedding pass; do not match on the state string. |
+| `seed_bytes_done` | int | Bytes fetched so far. |
+| `seed_bytes_total` | int | A **growing lower bound**, not a fixed target. `0` means "not yet known". |
+| `seed_origin` | string | `"auto_repair"`, `"embed"`, or `""` when nothing is in flight. |
+| `seed_attempt` | int | Attempt number of the flight in progress. |
+| `seed_max_attempts` | int | Attempt ceiling for that flight. |
+| `seed_next_retry_at` | int | Unix seconds at which the next attempt is due. |
+
+**`seed_bytes_total` is a lower bound that grows — this is the trap.** It
+totals only the artifacts whose sizes are already known, so it can increase
+while the download proceeds, and a percentage derived from it can go *down*
+while the seed is making real progress. Render it as "N of at least M", and
+treat `0` as "total not yet known" rather than as an empty or finished
+download. It is the same convention `pass_total` uses, for the same reason.
+
+**`seed_origin`, `seed_attempt` and `seed_max_attempts` describe whoever
+STARTED the flight, not a joiner.** Downloads are single-flight, so an `embed`
+call that joins an in-flight auto-repair still reports `seed_origin:
+"auto_repair"` along with that repair's attempt counters. A client must not
+read `seed_origin` as "what I asked for".
+
+On the wire these are additions only — nothing was removed or renamed.
+`EmbeddingStatus` gains fields 20-26 for the seven keys above, and
+`EmbedResponse` gains fields 10-13: `model_seeded` (bool), `seeded_cache_dir`
+(string), `loaded_device` (`"metal"`, `"cpu"`, or `""`), and `seeded_model_id`
+(string). All are proto3 scalars, so an older daemon or client decodes them as
+"no seed in flight" and "nothing seeded" rather than failing.
+
+#### `embed` RPC status codes
+
+The missing-model branch used to end in `FAILED_PRECONDITION` unconditionally.
+Now that the same call can *recover* the model, it distinguishes recovery from
+the ways recovery fails:
+
+| Code | When |
+|---|---|
+| `OK` | The model was seeded — or an in-flight seed was joined — and the backend loaded. |
+| `FAILED_PRECONDITION` | An external backend is configured; the cache directory could not be resolved; the download failed; or the download succeeded and the model still failed to load. |
+| `UNAVAILABLE` | The daemon shut down during the seed, or the reload channel or the seed watch channel was closed. |
+| `INTERNAL` | The seed thread could not be spawned, or the backend reported ready without publishing a model. |
+
+`UNAVAILABLE` and `INTERNAL` are new. A client that treated every missing-model
+failure as `FAILED_PRECONDITION` will now see a shutdown or a closed channel as
+`UNAVAILABLE` — retryable against the next daemon — instead of as a
+configuration error it can never fix by retrying.
+
+### Bounded background auto-repair
+
+A daemon whose boot load fails can repair its own model cache in the
+background, within strict bounds. It is not a general download path, and it is
+**never a first-time download**.
+
+It starts only when all of the following hold:
+
+- the boot load failed with a **typed missing-artifact cause** — not a generic
+  load error, a device failure, or a failed inference probe;
+- the backend is **local**. An `external_endpoint` is authoritative and is
+  never repaired into a local model;
+- `[embedding] auto_repair_cache` is not `false` in the instance config;
+- the DB's **verified persisted embedding identity already names a model**.
+  That is what makes this a repair of a cache that was populated before, rather
+  than a first download of a model nothing has embedded with.
+
+The repair thread is spawned **detached, after the socket is bound**, so it
+cannot delay boot. Readiness is unchanged — still a real inference probe — and
+non-semantic requests stay available throughout.
+
+Its bounds:
+
+- at most **5 attempts**;
+- backoff **30s / 2m / 8m / 30m**, each jittered ±20%;
+- it **stops early on permanent errors** — 404, 401, 403, permission denied,
+  `ENOSPC` — instead of spending the remaining attempts on a failure that
+  cannot resolve itself.
+
+An operator `nestweaver embed` is always the override: it **joins** an
+in-flight download rather than starting a second one, and when the repair is
+merely waiting out its backoff it overrides that wait immediately. Downloads
+are **single-flight keyed on `(model_id, cache_dir)`**, so a background attempt
+and an operator attempt against the same model and cache converge on one
+download — which is also why `seed_origin` reports the starter, not the joiner.
+
+Two operational notes. hf-hub may leave a resumable `.incomplete` file in the
+model cache when the seed thread is abandoned at process exit; that is a resume
+point, not corruption, and the next attempt picks it up. And auto-repair
+**only exists in builds with the `embed` feature** — elsewhere a failed boot
+load stays failed until an operator acts.
 
 ### Write-path visibility
 
@@ -225,7 +339,7 @@ before that response is returned. Cancellation notifications themselves never
 produce a JSON-RPC response. Stdio bounds pending tool dispatches to 128 while
 continuing to accept ping and cancellation controls.
 
-NestWeaver's registry holds **42** tools. The number is derivable, not typed:
+NestWeaver's registry holds **43** tools. The number is derivable, not typed:
 `all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs` is the
 registry, and `tools::tool_doc_tests::all_tools_have_doc_categories` asserts the
 documented table covers exactly `tool_list(false)["tools"].len()`. Read it back
@@ -233,15 +347,16 @@ with a `tools/list` call rather than trusting this paragraph.
 
 | Transport | Tools advertised |
 |---|---|
-| Daemon-backed stdio, daemon proxy, hybrid, MCP-over-HTTP | 42 |
-| Direct read-only mode | 36 — the registry minus the six `MUTATING_TOOLS` |
+| Daemon-backed stdio, daemon proxy, hybrid, MCP-over-HTTP | 43 |
+| Direct read-only mode | 36 — the registry minus the seven `MUTATING_TOOLS` |
 | `--lite` | 6 — `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, `detect_changes` |
 
 **Validation** *is* identical on every transport: all of them enforce the
 `--tools`/`--lite` allowlists, and tool schemas reject unknown argument names and
 out-of-range numeric values (e.g. `token_budget` outside 1–16000, `depth` outside
 1–15) instead of silently ignoring them. **Tool exposure is not** — direct
-read-only mode drops the six mutating tools from both `tools/list` and dispatch.
+read-only mode drops the seven mutating tools from both `tools/list` and
+dispatch.
 
 Every tool schema carries MCP `annotations` — `readOnlyHint`,
 `destructiveHint`, `idempotentHint`, `openWorldHint` — derived from the same
@@ -281,13 +396,13 @@ Admin API endpoints require a separate `admin_token`. This token grants access t
 - Job queue management (drain, resume, clear dead-letter)
 - Backup operations
 - Server configuration
-- **Six MCP tools.** A query token may only invoke read-only tools. The six
+- **Seven MCP tools.** A query token may only invoke read-only tools. The seven
   entries of `MUTATING_TOOLS` (`crates/nestweaver-mcp/src/http.rs` — the single
   canonical list, which both the HTTP gate and the daemon's gRPC gate consult)
   require the admin token: `brain_add_source`, `brain_remove_source`,
-  `brain_memory_consolidate`, `set_extension`, `prune_stale`,
-  `compact_embeddings`. If an agent gets a 403 from `prune_stale` over
-  MCP-over-HTTP while every other tool works, this is why.
+  `brain_memory_consolidate`, `set_extension`, `unset_extension`,
+  `prune_stale`, `compact_embeddings`. If an agent gets a 403 from
+  `prune_stale` over MCP-over-HTTP while every other tool works, this is why.
 
 ```bash
 curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
@@ -405,6 +520,8 @@ Once indexed, vault notes are queryable from any connected client just like loca
 - `backlinks` finds what links to a note
 
 In server mode these tools route to the server (merge or fallback), so a developer with no local copy of the vault still gets its notes in results, tagged `"server"` in `_meta.sources`.
+
+`note_get` now has a CLI twin — `nestweaver note get <title|uid>` — so a note can be read from a shell without going through an MCP client. (`brain_diff` likewise has `nestweaver brain diff <repo>`.)
 
 ### Git credentials
 
@@ -826,13 +943,15 @@ immediately in normal operation.
 
 > **This section is about *latency*, not *correctness*.** Everything below
 > describes how fast ranks are served, and assumes the underlying edges are the
-> ones the current resolver would write. **9.0.0 bumps `RESOLVER_GENERATION`
-> from 3 to 4** (`crates/nestweaver-engine/src/resolver_generation.rs`), so a
-> graph indexed by an earlier release serves ranks *quickly* and *wrongly*: they
-> are computed over edges written before `.h` files were dispatched to the C++
-> grammar, before C/C++ `MEMBER_OF` edges existed at all, and before C++
-> `#include` resolved to `IMPORTS`. Re-index every repo — `nestweaver index
-> --repo <path> --force` — before trusting any ranking on this server.
+> ones the current resolver would write. **`RESOLVER_GENERATION` is 6**
+> (`crates/nestweaver-engine/src/resolver_generation.rs`), and compatibility is
+> an exact match rather than a floor, so a graph indexed by any other release
+> serves ranks *quickly* and *wrongly*. Through generation 4 that meant edges
+> written before `.h` files were dispatched to the C++ grammar, before C/C++
+> `MEMBER_OF` edges existed at all, and before C++ `#include` resolved to
+> `IMPORTS`; generations 5 and 6 additionally changed which symbols are
+> persisted as entry points. Re-index every repo — `nestweaver index --repo
+> <path> --force` — before trusting any ranking on this server.
 >
 > **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports
 > `status: "outdated_resolver"` with `resolver_stale: true` and
@@ -1086,6 +1205,17 @@ RUST_LOG=nestweaver_daemon=debug nestweaver daemon --db ./brain.lbug run --serve
 > and no webhook secret. A *missing* config file is non-fatal (built-in defaults).
 > If the server exits immediately after "failed to parse --config", fix the TOML.
 
+A boot that is refused because another process holds the store's **write lease**
+now names the one case where waiting, not intervening, is correct:
+
+> Stop it before starting a daemon — two writers against this store risk
+> corruption — unless a `nestweaver backup restore` is in progress against this
+> database, in which case wait for it to finish.
+
+A restore legitimately holds the lease for its whole duration. Killing the
+holder in that case is the corruption the message is warning about, not the fix
+for it.
+
 ### Client can't connect
 
 ```bash
@@ -1122,9 +1252,19 @@ First inspect `nestweaver diagnostics capabilities --json` and
 |-------------|---------|-------------------|
 | `metal_compiled = false` | This binary does not contain the Metal backend. With `auto`, CPU is selected; explicit `metal` fails. | Install a Metal-enabled macOS release archive or rebuild with `cargo install --locked --path . --features metal`. |
 | `selected_device = ""` | Expected for an external backend. For a local backend it means state is not ready. | Check `backend`, `state`, and `error`; do not infer a device until local state is `ready`. |
-| Error reports a missing model cache artifact | The cache-only daemon found no required model file in the configured cache. | Stop the daemon, run `nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>` with the same model/cache, then restart with `--config <path>` and recheck status. |
+| Error reports a missing model cache artifact | The cache-only boot found no required model file in the configured cache. Background auto-repair may already be fetching it. | Run `nestweaver embed --db <path>` against the **running** daemon — no stop, no restart. It seeds the configured cache in place (or joins a download already running) and reloads the backend. Watch it with `nestweaver brain status --db <path>`: `state` reports `seeding` and a `Download:` line tracks `seed_bytes_done` against the growing `seed_bytes_total`. |
+| `error` reads "automatic model download failed (attempt N of 5): {error}; retrying in Ns; run `nestweaver embed` to retry now" | Auto-repair hit a transient failure and is waiting out its jittered backoff. | Nothing is required — it retries on its own, up to 5 attempts. To skip the wait, run `nestweaver embed --db <path>`; it overrides the backoff immediately. |
+| `error` reads "automatic model download stopped after N attempt(s): {error}; run `nestweaver embed` to retry" | Auto-repair gave up: it either exhausted its 5 attempts or hit a permanent error (404/401/403/permission denied/`ENOSPC`). | Nothing retries from here. Fix the named cause — model ID, credentials, cache-directory permissions, disk space — then run `nestweaver embed --db <path>`. |
+| `error` reads "automatic model download could not start: failed to resolve the configured embedding cache directory: {error}; run `nestweaver embed` to retry" | Auto-repair never began, because the configured `[embedding]` cache directory could not be resolved. | Point `cache_dir` (or the environment it derives from) at a resolvable, writable directory, then run `nestweaver embed --db <path>`. |
 | External endpoint readiness or request failure | The configured external backend is unavailable; no local model is attempted. | Restore the endpoint/credentials. To switch local, remove the external config, stop the daemon, direct-local re-embed with `--force`, then restart with the same `--config`. |
-| Response contains `"semantic"` in `degraded_components` | Semantic retrieval was requested but the model was not ready, inference failed, or the DB has no embeddings. | Inspect embedding status and populate/fix the model or embeddings. Graph, PPR, and BM25 results remain available; `semantic_applied` is `false`. |
+| Response contains `"semantic"` in `degraded_components` | Semantic retrieval was requested but the model was not ready, a seed is in flight, inference failed, or the DB has no embeddings. | Inspect embedding status and populate/fix the model or embeddings. Graph, PPR, and BM25 results remain available; `semantic_applied` is `false`. |
+
+**Switching models or backends is a different operation, and still needs a
+stop/start.** The recipe below is *not* the fix for a missing cache — that one
+is `nestweaver embed` against the running daemon, in the table above. Use this
+only when deliberately changing which model or backend the DB is embedded with:
+`--force` re-embeds, rewriting the DB's embedding identity, rather than filling
+a gap in the cache for the model that identity already names.
 
 For an explicit external-to-local switch:
 
@@ -1139,6 +1279,52 @@ nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE" --f
 nestweaver daemon --db "$DB" start --config "$CONFIG"
 nestweaver brain status --db "$DB" --json
 ```
+
+### Ranked reads during an index publication
+
+Publication is the window in which a finished index swaps its results in. What
+a ranked read does in that window depends on *which* publication is open:
+
+- **`brain watcher batch` publication — ranked reads SUCCEED.** They return
+  results with disclosure rather than erroring. This is the common case on a
+  server running a vault watcher, and it used to fail.
+- **Full `index` publication — ranked reads still fail closed.** After
+  `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` (default 3000) the read errors instead
+  of serving a half-published graph.
+- **A wedged watcher marker still blocks.** A marker left behind by a watcher
+  that died mid-publication is not mistaken for a live batch.
+
+The fail-closed message names where progress is readable:
+
+> check `brain status --json`'s `index_publication.dirty` /
+> `index_publication.marker_age_s` for progress (the plain-text `brain status`
+> does not print these field names)
+
+While a watcher-batch publication is open, **every MCP tool except
+`brain_status`** stamps four keys on its response:
+
+| Key | Meaning |
+|---|---|
+| `publication_in_progress` | A watcher-batch publication was open when this response was produced |
+| `marker_age_s` | How long the marker has been held |
+| `in_flight_note_paths` | The note paths being published, **at most 20** |
+| `in_flight_note_paths_truncated` | True when more than 20 were in flight |
+
+**Known gap:** CLI `--json` verbs that reshape the daemon response into a typed
+struct — `nestweaver hubs --json` is the clear example — drop all four keys
+silently. A read through one of those can be served mid-publication with no
+disclosure whatsoever. Read the MCP response, or `brain status --json`, when
+the disclosure matters.
+
+#### The `.index-dirty` marker payload
+
+The `.index-dirty` marker written alongside the database gained an **optional
+fourth `:`-delimited field**: a `1`/`0` truncation flag followed by up to 20
+comma-separated in-flight note paths. That field is the source of
+`in_flight_note_paths` / `in_flight_note_paths_truncated` above. It is
+backward compatible — a legacy 2- or 3-field marker still parses and simply
+yields no in-flight paths — and `"brain watcher batch"` is a new reason
+constant carried in the same marker.
 
 ### High query latency
 

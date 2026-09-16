@@ -115,7 +115,9 @@ pub fn generate_guide_with_tools(
                 error.downcast_ref::<nestweaver_store::StoreError>()
             {
                 out.push_str(
-                    "Repo map temporarily unavailable — index publication in progress.\n\n",
+                    "Repo map temporarily unavailable — index publication in progress. Check \
+                     `brain_status`'s `index_publication.dirty` / `index_publication.marker_age_s` \
+                     for progress.\n\n",
                 );
             } else {
                 out.push_str("No symbols indexed yet.\n\n");
@@ -378,12 +380,15 @@ pub fn generate_guide_with_tools(
     out.push_str(
         "| \"Orient on unfamiliar topic\" | MCP `investigate` | One-call map with summaries |\n",
     );
+    out.push_str("| Ask a QUESTION, not a name | MCP `investigate` | `context` / `brain context` resolve a NAME (symbol name, UID, note title, tag, or file path); a natural-language question resolves to nothing there. `investigate` falls back to full-text search. Both not-found errors now say this and print a pasteable `nestweaver investigate <q>` |\n");
     out.push_str("| \"Find text by regex\" | MCP `regex_search` | Searches indexed text — NOT `grep`/`rg` |\n");
     out.push_str(
         "| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA-vs-HEAD **and** resolver generation |\n",
     );
-    out.push_str("| Batch/scripted queries | CLI `nestweaver context/search/impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
+    out.push_str("| Batch/scripted queries | CLI `nestweaver context --json`, `nestweaver search --json`, `nestweaver impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
     out.push_str("| Subagent code exploration | CLI `nestweaver context <seed> --json` | CLI is cheaper for focused lookups |\n");
+    out.push_str("| Read a note from a script/subagent | CLI `nestweaver note get <title\\|uid>` | Read-only CLI twin of MCP `note_get`; takes a title or a `note:` UID and exits 2 on a miss, so a script branches on the miss instead of parsing output |\n");
+    out.push_str("| Diff a repo from a script/subagent | CLI `nestweaver brain diff <repo>` | Read-only CLI twin of MCP `brain_diff`; same 1-1000 `--limit` bound the tool schema declares. LOCAL REPOS ONLY — no remote fetch |\n");
     out.push_str("| Known-path file read | `Read` tool | Graph can't beat a direct file read |\n");
     out.push('\n');
     out.push_str("**Token economy:** MCP tools cost ~200-500 tokens per call in schema overhead. CLI via Bash costs ~50 tokens. For single targeted queries, the difference is noise. For 5+ queries in a session, CLI saves 1000+ tokens.\n\n");
@@ -553,7 +558,7 @@ pub fn generate_skill_with_tools(
         "- **Don't skip the graph** — always query NestWeaver before reading source files\n",
     );
     out.push_str("- **Don't use broad seeds** — `brain_context \"auth\"` returns noise; use `brain_context \"AuthService.validate\"` instead\n");
-    out.push_str("- **In subagents:** use the CLI (`nestweaver search --json`) not MCP — 40-60% fewer tokens\n\n");
+    out.push_str("- **In subagents:** use the CLI (`nestweaver search --json`) not MCP — 40-60% fewer tokens. Two more MCP tools now have read-only CLI twins for exactly this: `note_get` → `nestweaver note get <title|uid>` (exits 2 on a miss, so a script branches instead of parsing), and `brain_diff` → `nestweaver brain diff <repo>` (same 1-1000 `--limit` bound the tool schema declares; local repos only, no remote fetch)\n\n");
 
     // ── Workflows ────────────────────────────────────────────────────────
     out.push_str("## Common workflows\n\n");
@@ -594,7 +599,8 @@ pub fn generate_skill_with_tools(
     out.push_str("### Choosing the right retrieval tool\n\n");
     out.push_str("- **`brain_search`** for locating named symbols or notes by keyword — direct BM25/substring lookup, cheaper than a full PPR walk. Returns both notes and code symbols in one call (per-kind cap, not cross-kind), so you never need separate queries.\n");
     out.push_str("- **`brain_context`** for structural exploration — when you need to understand what's *connected* to something, not just find it by name.\n");
-    out.push_str("- **`get_summary`** for token-efficient overviews of files or clusters — much cheaper than reading entire source files.\n\n");
+    out.push_str("- **`get_summary`** for token-efficient overviews of files or clusters — much cheaper than reading entire source files.\n");
+    out.push_str("- **Name vs. question.** `context` / `brain context` (and their MCP tools) resolve a NAME: a UID, symbol name, note title, tag, or repo-relative file path. A natural-language question is not a name and resolves to nothing there — no partial credit. Send a QUESTION to `investigate`, which falls back to full-text search. Both not-found errors state this and emit a copy-pasteable `nestweaver investigate <q>` you can run directly.\n\n");
 
     out.push_str("### Progressive disclosure with investigate\n\n");
     out.push_str("Use the investigate chain to go from broad orientation to precise source without reading every file upfront:\n\n");
@@ -604,7 +610,7 @@ pub fn generate_skill_with_tools(
     out.push_str("2. `investigate_hydrate(bundle_id)` — fills remaining bodies (may truncate long sources)\n");
     out.push_str("3. For entries where `body_complete` is `false`: call `read_symbols(uid)` to get the full untruncated source\n\n");
     out.push_str("The `body_complete` field tells you whether an inlined body is the full source (`true` or absent) or was truncated at the per-body cap (`false`). Only call `read_symbols` when the truncated tail matters for your task — skip it otherwise to save tokens.\n\n");
-    out.push_str("`investigate_expand` always returns the full untruncated body (`body_complete: true`), so no follow-up read is needed after expanding.\n\n");
+    out.push_str("`investigate_expand` fetches the full untruncated body when the source can be re-read (`body_complete` true or absent). If a previously truncated body can't be re-fetched, `body_complete` can still be `false` — check it the same way as after hydrate.\n\n");
 
     out.push_str("### Other tips\n\n");
     out.push_str("- The `summary` field on investigate entries is the first non-empty line of the body (capped at 200 chars), not an LLM-generated summary. Use it for quick scanning, not for understanding content.\n");
@@ -660,6 +666,22 @@ pub fn generate_skill_with_tools(
     out.push_str("- **Depth 1**: Direct callers/dependents — these will definitely be affected\n");
     out.push_str("- **Depth 2**: Callers of callers — likely affected, review recommended\n");
     out.push_str("- **Depth 3+**: Transitive dependents — possibly affected, check if the change propagates\n\n");
+
+    out.push_str("### investigate ordering under `project:<slug>` scope\n\n");
+    out.push_str("Ordering changes under `project:<slug>` scope ONLY, because that scope seeds every project member unconditionally — a query naming one specific member symbol would otherwise lose to a flood of stronger-scoring member notes and never appear at all.\n\n");
+    out.push_str("- `matched_query: \"exact\"` — the query text (or one of its tokens) is a case-sensitive full match on the symbol's name. These are PINNED first, at most 5, ahead of everything else regardless of fused score.\n");
+    out.push_str("- `matched_query: \"partial\"` — a substring match. NOT pinned: it gets a 5x fused-score boost and keeps whatever ranked position that earns it.\n");
+    out.push_str("- `matched_query` is absent entirely outside `project:` scope (`vault`, `repo:<name>`, `all`), and absent under `project:` scope too when neither exact nor partial applies — which is most entries.\n\n");
+    out.push_str("**A pin guarantees ORDER, not survival.** Only the first entry is admitted unconditionally; pinned entries at positions 2-5 are ordinary candidates for the token-budget cut and can be dropped like any other entry. If a pin matters, raise `token_budget` rather than assuming it is there. One further gap: a match living at a path the ranker deboosts (a test-mirror path, for example) can fall outside the name resolver's own top-5 candidates and go unpinned even when it is an exact match.\n\n");
+
+    out.push_str("### Ranked reads during an index publication\n\n");
+    out.push_str("A ranked read no longer fails closed during a `brain watcher batch` publication — it SUCCEEDS and discloses the open window on the response: `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (capped at 20) and `in_flight_note_paths_truncated`. Treat those results as answered against a graph that is still being written to: the named notes are mid-publication.\n\n");
+    out.push_str("Two cases still fail closed rather than disclosing: a full `index` publication, and a WEDGED watcher marker (which needs human recovery — there is no MCP tool for it). `brain_status` is excluded from the disclosure keys because it already carries its own `index_publication` object.\n\n");
+    out.push_str("**Known gap:** the disclosure reaches every MCP route, but CLI `--json` verbs that reshape the response into a typed struct before printing (e.g. `nestweaver hubs --json`) drop these keys silently. If you need the disclosure, call the MCP tool rather than the reshaping CLI verb.\n\n");
+
+    out.push_str("### brain_status: embedding seed progress\n\n");
+    out.push_str("Inside `embedding_status`, seven keys describe an in-flight (or most recently attempted) model-artifact download: `seed_active`, `seed_bytes_done`, `seed_bytes_total`, `seed_origin`, `seed_attempt`, `seed_max_attempts`, `seed_next_retry_at`. While one is in flight, `state` reads `\"seeding\"` — a new state that takes precedence over `ready`/`embedding`, and semantic retrieval genuinely is unavailable for that window.\n\n");
+    out.push_str("`seed_bytes_total` is a growing LOWER BOUND, not a fixed target: the artifact set is resolved file by file, so the total climbs as each new file starts. `0` means \"not yet known\", not \"nothing to download\". A percentage derived from these two numbers can therefore go DOWN — do not report it as progress toward a known end. Prefer the boolean `seed_active`, and read `seed_next_retry_at` (nonzero with `seed_active: false`) to tell \"retry scheduled\" from \"gave up\".\n\n");
 
     // ── Indexed codebase ─────────────────────────────────────────────────
     out.push_str("## Indexed codebase\n\n");
@@ -981,6 +1003,17 @@ pub fn generate_claude_md_with_rules(
          when empty; the other two always emit it.\n",
     );
     out.push_str(
+        "- `publication_in_progress` — a ranked read now SUCCEEDS during a `brain \
+         watcher batch` publication instead of failing closed, and says so with \
+         `marker_age_s`, `in_flight_note_paths` (max 20) and \
+         `in_flight_note_paths_truncated`. The answer came from a graph still \
+         being written to; the named notes are mid-publication. A full `index` \
+         publication still fails closed, and a WEDGED marker still blocks and \
+         needs human recovery. Known gap: CLI `--json` verbs that reshape the \
+         response into a typed struct (e.g. `nestweaver hubs --json`) drop these \
+         keys — call the MCP tool if you need the disclosure.\n",
+    );
+    out.push_str(
         "- `notifications` / `note` — read them. A caveat like `cochange-no-coverage` \
          means an empty list is unmined history, not evidence of no coupling.\n",
     );
@@ -1085,6 +1118,18 @@ mod tests {
         assert!(
             !guide.contains("No symbols indexed yet."),
             "a dirty window must not claim the graph is empty: {guide}"
+        );
+        // nw-475 (Task 5.2): point the reader at the concrete `brain_status`
+        // fields that disclose this same marker (`index_publication.dirty` /
+        // `marker_age_s`, tools.rs `brain_status_json`), not just at the
+        // vague fact that status exists.
+        assert!(
+            guide.contains("index_publication.dirty"),
+            "must name the concrete status field to check: {guide}"
+        );
+        assert!(
+            guide.contains("marker_age_s"),
+            "must name the concrete status field to check: {guide}"
         );
     }
 

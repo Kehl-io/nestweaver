@@ -1416,6 +1416,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_ENGINE_CACHE_DIR_ISOLATION_ROOT",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_GIT_CLONE_TIMEOUT_SECS",
         role: EnvRole::Configures,
     },
@@ -4275,6 +4279,42 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
             ));
         }
     }
+    // nw-484: a missing local model cache is repaired in place (an
+    // operator-initiated `embed`, or the daemon's own bounded background
+    // auto-repair). `state` already reads "seeding" for the whole window —
+    // this line adds the byte-level detail behind it. Shown even when a
+    // retry is merely SCHEDULED (not yet active), so an operator watching
+    // `brain status` between attempts still sees why semantic search is
+    // degraded and when the next attempt fires, not just a bare "failed".
+    if status.seed_active {
+        let done = format_bytes(status.seed_bytes_done);
+        let amount = if status.seed_bytes_total > 0 {
+            format!("{done} of {}", format_bytes(status.seed_bytes_total))
+        } else {
+            format!("{done} (size not yet known)")
+        };
+        let origin = match status.seed_origin.as_str() {
+            "auto_repair" => format!(
+                " (automatic repair, attempt {} of {})",
+                status.seed_attempt, status.seed_max_attempts
+            ),
+            "embed" => " (requested by nestweaver embed)".to_string(),
+            _ => String::new(),
+        };
+        lines.push(format!("  Download:         {amount}{origin}"));
+    } else if status.seed_next_retry_at > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let remaining = (status.seed_next_retry_at - now).max(0) as u64;
+        lines.push(format!(
+            "  Download:         retry {} of {} in {}",
+            status.seed_attempt,
+            status.seed_max_attempts,
+            nestweaver_client::progress::format_duration_secs(remaining)
+        ));
+    }
     if !status.identity_state.is_empty() {
         lines.push(format!("  Identity:         {}", status.identity_state));
     }
@@ -4319,6 +4359,15 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
             .as_str()
             .unwrap_or("")
             .to_string(),
+        // nw-484. Absent on an older daemon; proto3 defaults read as "no
+        // seed in flight", the honest answer when the daemon cannot tell us.
+        seed_active: value["seed_active"].as_bool().unwrap_or(false),
+        seed_bytes_done: value["seed_bytes_done"].as_u64().unwrap_or(0),
+        seed_bytes_total: value["seed_bytes_total"].as_u64().unwrap_or(0),
+        seed_origin: value["seed_origin"].as_str().unwrap_or("").to_string(),
+        seed_attempt: value["seed_attempt"].as_u64().unwrap_or(0) as u32,
+        seed_max_attempts: value["seed_max_attempts"].as_u64().unwrap_or(0) as u32,
+        seed_next_retry_at: value["seed_next_retry_at"].as_i64().unwrap_or(0),
     }
 }
 
@@ -4780,6 +4829,77 @@ mod daemon_status_renderer_tests {
         assert!(text.contains("Pass scope:       all"), "{text}");
         // The pre-existing fields must survive the insertion.
         assert!(text.contains("Model:            test-model"), "{text}");
+    }
+
+    /// nw-484 seed fields are a user-visible contract across three layers —
+    /// daemon JSON, the typed proto struct, and the rendered text — and
+    /// nothing had pinned the round trip end to end. Proves
+    /// `embedding_status_from_json` actually reads all 7 new keys (not just
+    /// a subset), and that `format_embedding_status` renders their values on
+    /// the "Download:" line. The counterweight proves the opposite direction
+    /// matters just as much: an OLDER daemon's JSON, with none of the
+    /// `seed_*` keys at all, must default every field honestly (false/0/
+    /// empty) and must render no Download line — and, above all, must never
+    /// panic on the absent keys.
+    #[test]
+    fn embedding_status_seed_fields_round_trip_from_json_to_text() {
+        let json = serde_json::json!({
+            "state": "seeding",
+            "backend": "local",
+            "requested_device": "auto",
+            "selected_device": "",
+            "model_id": "test-owner/test-model",
+            "error": "",
+            "metal_compiled": false,
+            "fallback_used": false,
+            "seed_active": true,
+            "seed_bytes_done": 1_048_576u64,
+            "seed_bytes_total": 4_194_304u64,
+            "seed_origin": "auto_repair",
+            "seed_attempt": 2u64,
+            "seed_max_attempts": 5u64,
+            "seed_next_retry_at": 0i64,
+        });
+
+        let status = embedding_status_from_json(&json);
+        assert!(status.seed_active);
+        assert_eq!(status.seed_bytes_done, 1_048_576);
+        assert_eq!(status.seed_bytes_total, 4_194_304);
+        assert_eq!(status.seed_origin, "auto_repair");
+        assert_eq!(status.seed_attempt, 2);
+        assert_eq!(status.seed_max_attempts, 5);
+        assert_eq!(status.seed_next_retry_at, 0);
+
+        let text = format_embedding_status(&status);
+        assert!(
+            text.contains("Download:         1.0 MB of 4.0 MB (automatic repair, attempt 2 of 5)"),
+            "{text}"
+        );
+
+        let legacy_json = serde_json::json!({
+            "state": "ready",
+            "backend": "local",
+            "requested_device": "auto",
+            "selected_device": "cpu",
+            "model_id": "test-owner/test-model",
+            "error": "",
+            "metal_compiled": false,
+            "fallback_used": false,
+        });
+        let legacy_status = embedding_status_from_json(&legacy_json);
+        assert!(!legacy_status.seed_active);
+        assert_eq!(legacy_status.seed_bytes_done, 0);
+        assert_eq!(legacy_status.seed_bytes_total, 0);
+        assert_eq!(legacy_status.seed_origin, "");
+        assert_eq!(legacy_status.seed_attempt, 0);
+        assert_eq!(legacy_status.seed_max_attempts, 0);
+        assert_eq!(legacy_status.seed_next_retry_at, 0);
+
+        let legacy_text = format_embedding_status(&legacy_status);
+        assert!(
+            !legacy_text.contains("Download:"),
+            "an older daemon's status must never grow a Download line: {legacy_text}"
+        );
     }
 
     #[test]
@@ -5619,6 +5739,19 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to an instance config file")]
         config: Option<PathBuf>,
+    },
+
+    /// Read a vault note's content and metadata — the read-only CLI twin of
+    /// the `note_get` MCP tool an agent already has.
+    //
+    // nw-215(a). `note_get` was MCP-only: an agent could read a note's full
+    // body, but an operator debugging the same graph from a terminal had no
+    // command to reproduce what the agent saw. Nested under its own `note`
+    // group, mirroring `brain`/`extensions`/`contracts`, so a future related
+    // verb has somewhere to land without a breaking rename.
+    Note {
+        #[command(subcommand)]
+        command: NoteCommands,
     },
 
     /// Show cross-repo references for a symbol (legacy command)
@@ -7522,6 +7655,30 @@ enum RtsEvalCommands {
 }
 
 #[derive(Subcommand)]
+enum NoteCommands {
+    /// Fetch a vault note's full markdown body plus structural metadata
+    /// (frontmatter, heading outline, section count) — the read-only CLI
+    /// twin of the `note_get` MCP tool.
+    #[command(
+        name = "get",
+        after_help = "Examples:\n  nestweaver note get 'Architecture Overview'\n  nestweaver note get note:vault:Notes:abc123 --json"
+    )]
+    Get {
+        /// Target note UID (`note:...`) or title
+        target: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExtensionCommands {
     /// List annotations. With no filter, every annotated node.
     List {
@@ -8189,6 +8346,37 @@ enum BrainCommands {
             help = "Max entries in top_tags (1-1000; default 10; matches the MCP brain_doc_stats schema)"
         )]
         top_tags_limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Show what changed in a repo since it was last indexed: files added,
+    /// modified or deleted, plus the symbols they affect — the read-only
+    /// CLI twin of the `brain_diff` MCP tool. Local repos only.
+    #[command(
+        name = "diff",
+        after_help = "Examples:\n  nestweaver brain diff my-service\n  nestweaver brain diff my-service --since-sha abc123 --json"
+    )]
+    Diff {
+        /// Repo name or substring of its URL, matched against indexed repos.
+        repo: String,
+        #[arg(
+            long,
+            help = "Git SHA to compare against (default: the repo's indexed SHA)"
+        )]
+        since_sha: Option<String>,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max affected symbols to return (1-1000; default 50; matches the MCP brain_diff schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -12048,11 +12236,15 @@ async fn restart_verified_live_under_lock(
                     };
                     Err(commit_error.context(format!(
                         "restart failed after the incumbent daemon was stopped; {restoration}. \
-                         Resolve the cause above, then retry `nestweaver daemon --db {} restart{}`",
-                        db_path.display(),
-                        explicit_config
-                            .map(|config| format!(" --config {}", config.display()))
-                            .unwrap_or_default(),
+                         Resolve the cause above, then retry `{retry_command}`",
+                        retry_command = {
+                            let mut cmd =
+                                format!("nestweaver daemon --db {} restart", db_path.display());
+                            if let Some(config) = explicit_config {
+                                cmd.push_str(&format!(" --config {}", config.display()));
+                            }
+                            cmd
+                        },
                     )))
                 }
                 // Bare `daemon start` fails closed on unreadable persisted
@@ -15119,6 +15311,101 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             backlink["confidence"].as_f64().unwrap_or(0.0)
                         );
                     }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Note {
+            command:
+                NoteCommands::Get {
+                    target,
+                    json,
+                    db,
+                    config,
+                },
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let args = if target.starts_with("note:") {
+                serde_json::json!({ "uid": target })
+            } else {
+                serde_json::json!({ "title": target })
+            };
+            // Mirrors `backlinks`: daemon route first via the shared JSON-RPC
+            // dispatch, falling back to the same `nestweaver_mcp::tools::dispatch`
+            // the daemon and MCP routes call, so all three surfaces answer from
+            // one implementation.
+            let routed = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "note_get",
+                args.clone(),
+            ) {
+                Ok(Some(value)) => Ok(Some(value)),
+                Ok(None) => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::dispatch(&store, None, "note_get", args, None).map(Some)
+                }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `tool_note_get` reports a title miss as "no note found with
+                // title '<t>'" and a uid miss as a context-wrapped
+                // `StoreError::NotFound` ("failed to look up note with uid
+                // '<uid>': not found") — both are classified as not-found
+                // here rather than a hard error, matching `backlinks`.
+                Err(error)
+                    if {
+                        let message = format!("{error:#}");
+                        message.contains("no note found with title")
+                            || message.contains("failed to look up note with uid")
+                    } =>
+                {
+                    if json {
+                        print_json_not_found("target", &target);
+                    }
+                    eprintln!("Note '{target}' not found.");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
+            };
+            if json {
+                print_json_payload(&payload)?;
+            } else {
+                if out.verbose {
+                    println!(
+                        "Note: {} [{}]",
+                        payload["title"].as_str().unwrap_or("?"),
+                        payload["uid"].as_str().unwrap_or("?")
+                    );
+                } else {
+                    println!("Note: {}", payload["title"].as_str().unwrap_or("?"));
+                }
+                println!("Path: {}", payload["path"].as_str().unwrap_or("?"));
+                println!("Kind: {}", payload["note_kind"].as_str().unwrap_or("?"));
+                println!("Words: {}", payload["word_count"].as_u64().unwrap_or(0));
+                if let Some(outline) = payload["outline"].as_array()
+                    && !outline.is_empty()
+                {
+                    println!(
+                        "\nOutline ({} section(s)):",
+                        payload["section_count"].as_u64().unwrap_or(0)
+                    );
+                    for heading in outline {
+                        let level = heading["level"].as_u64().unwrap_or(1) as usize;
+                        println!(
+                            "  {} {}",
+                            "#".repeat(level.max(1)),
+                            heading["text"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                if let Some(body) = payload["body"].as_str() {
+                    println!("\n{body}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -28448,6 +28735,77 @@ fn run_brain(
             }
             Ok((EXIT_SUCCESS, None))
         }
+
+        BrainCommands::Diff {
+            repo,
+            since_sha,
+            limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let mut args = serde_json::json!({ "repo": repo });
+            if let Some(sha) = since_sha.as_deref() {
+                args["since_sha"] = serde_json::json!(sha);
+            }
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
+            }
+            // Mirrors `backlinks`/`note get`: daemon route first via the
+            // shared JSON-RPC dispatch, falling back to the same
+            // `nestweaver_mcp::tools::dispatch` the daemon and MCP routes
+            // call, so all three surfaces answer from one implementation.
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_diff",
+                args.clone(),
+            )? {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None)?
+                }
+            };
+            if json {
+                print_json_payload(&payload)?;
+            } else {
+                println!(
+                    "Diff for {}: {} -> {}",
+                    payload["repo"].as_str().unwrap_or(&repo),
+                    payload["base_sha"].as_str().unwrap_or("?"),
+                    payload["head_sha"].as_str().unwrap_or("?")
+                );
+                if let Some(message) = payload["message"].as_str() {
+                    println!("{message}");
+                } else {
+                    println!(
+                        "  {} added, {} modified, {} deleted",
+                        payload["files_added"].as_u64().unwrap_or(0),
+                        payload["files_modified"].as_u64().unwrap_or(0),
+                        payload["files_deleted"].as_u64().unwrap_or(0),
+                    );
+                    if let Some(symbols) = payload["affected_symbols"].as_array()
+                        && !symbols.is_empty()
+                    {
+                        println!("Affected symbols ({}):", symbols.len());
+                        for sym in symbols {
+                            println!(
+                                "  {} [{}] {}:{}",
+                                sym["name"].as_str().unwrap_or("?"),
+                                sym["kind"].as_str().unwrap_or("?"),
+                                sym["file_path"].as_str().unwrap_or("?"),
+                                sym["start_line"].as_u64().unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
     }
 }
 
@@ -29658,6 +30016,7 @@ mod cli_help_contract_tests {
     /// compile-time completeness from an enum match; a clap tree is not an
     /// enum, so this gets the same guarantee at test time instead -- an
     /// undeclared path is a test FAILURE, not a `continue`.
+    #[derive(Debug, PartialEq)]
     enum CliMcpTwin {
         /// This CLI command's MCP counterpart, by registry name.
         Tool(&'static str),
@@ -29692,6 +30051,9 @@ mod cli_help_contract_tests {
             "brain add" => Tool("brain_add_source"),
             "brain broken-links" => Tool("brain_broken_links"),
             "brain context" => Tool("brain_context"),
+            // nw-215(a): `brain diff` is the CLI twin added alongside `note
+            // get` to close the two read-only MCP-only gaps this item found.
+            "brain diff" => Tool("brain_diff"),
             "brain doc-stats" => Tool("brain_doc_stats"),
             // nw-217b hole: mechanical guess was "brain_orphans"; the real
             // tool is `brain_orphan_documents`. `brain orphans --limit` was
@@ -29725,7 +30087,11 @@ mod cli_help_contract_tests {
             // `extensions list`/`extensions unset` rather than exposing a
             // literal `extensions_list`/`extensions_unset` tool pair.
             "extensions list" => Tool("query_extensions"),
-            "extensions unset" => Tool("set_extension"),
+            // nw-215(a) fix: this used to read `Tool("set_extension")`, a
+            // stale mapping predating `unset_extension`'s existence (nw-281).
+            // `extensions unset` (`ExtensionCommands::Unset`) calls
+            // `client.unset_extension(&uid, &key)` -- the real twin.
+            "extensions unset" => Tool("unset_extension"),
             "flow-trace" => Tool("flow_trace"),
             // nw-217b hole: `brain_guide`'s own description names this exact
             // CLI command as its local-path equivalent.
@@ -29747,6 +30113,8 @@ mod cli_help_contract_tests {
             "memory consolidate" => Tool("brain_memory_consolidate"),
             "memory lint" => Tool("brain_memory_lint"),
             "memory related" => Tool("brain_memory_related"),
+            // nw-215(a): `note_get` was MCP-only; `note get` is its CLI twin.
+            "note get" => Tool("note_get"),
             "project-context" => Tool("project_context"),
             "prune-stale" => Tool("prune_stale"),
             "read-symbols" => Tool("read_symbols"),
@@ -29843,6 +30211,9 @@ mod cli_help_contract_tests {
             | "materialize-projects"
             | "mcp"
             | "memory"
+            // The bare group has no operation of its own; its only member,
+            // `note get`, is declared separately above as `Tool("note_get")`.
+            | "note"
             | "pr-impact"
             | "pre-push-impact"
             | "publication"
@@ -29996,6 +30367,23 @@ mod cli_help_contract_tests {
              classify each as `Tool(\"...\")` or `NoTwin(\"...\")`:\n{}",
             undeclared.len(),
             undeclared.join("\n")
+        );
+    }
+
+    /// nw-215(a). `declared_cli_mcp_twin("extensions unset")` used to read
+    /// `Tool("set_extension")`, a mapping that predates `unset_extension`'s
+    /// existence (nw-281) and was never updated once the CLI's `extensions
+    /// unset` (`ExtensionCommands::Unset`, handler calls
+    /// `client.unset_extension`) got its own gated RPC. This pins the fix
+    /// directly rather than relying on the completeness walk above, which
+    /// only checks that SOME arm exists for the path, not that it names the
+    /// right tool.
+    #[test]
+    fn extensions_unset_twin_mapping_names_the_real_tool() {
+        assert_eq!(
+            declared_cli_mcp_twin("extensions unset"),
+            Some(CliMcpTwin::Tool("unset_extension")),
+            "`extensions unset` calls `client.unset_extension`, not `set_extension`"
         );
     }
 
@@ -30206,6 +30594,11 @@ mod cli_help_contract_tests {
             "nestweaver brain add",
             "nestweaver brain broken-links",
             "nestweaver brain context",
+            // nw-215(a): added deliberately, alongside `note get`. Both are
+            // new read-only CLI twins of MCP-only tools (`brain_diff`,
+            // `note_get`) and resolve through the same `resolve_db_with_config`
+            // every read command in this inventory uses.
+            "nestweaver brain diff",
             "nestweaver brain doc-stats",
             // nw-280: added deliberately. The upgrade runbook's step 4
             // ("verify one convention everywhere") tells a config-driven user
@@ -30277,6 +30670,7 @@ mod cli_help_contract_tests {
             "nestweaver memory consolidate",
             "nestweaver memory lint",
             "nestweaver memory related",
+            "nestweaver note get",
             "nestweaver project-context",
             "nestweaver publication rebuild",
             "nestweaver publication rollback",
@@ -31336,17 +31730,21 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
 
     /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
     ///
-    /// It answers "does this subcommand still exist?", which catches a future
-    /// rename and catches NONE of nw-310/318/328/329. Scoped to backtick-
-    /// quoted commands because that is the convention this codebase already
-    /// uses for pasteable text, which keeps prose out of the sweep.
+    /// It answers "does this subcommand PATH still exist?", which catches a
+    /// future rename and catches NONE of nw-310/318/328/329. Scoped to
+    /// backtick-quoted commands because that is the convention this codebase
+    /// already uses for pasteable text, which keeps prose out of the sweep.
+    /// Shares `nestweaver_spans_in_file` (join-then-extract, so a remedy
+    /// split by a Rust `\` line-continuation is not invisible to this sweep)
+    /// and `check_remedy_subcommand_path` (the same nested-path walk
+    /// `check_remedy_flags` below uses) with the flag check, so a bad SECOND
+    /// word (`daemon bogus`) is caught here too, not only a bad first one.
     #[test]
     fn backtick_quoted_remedies_still_name_a_real_subcommand() {
-        let subcommands = on_big_stack(|| {
-            let root = Cli::command();
-            root.get_subcommands()
-                .map(|sub| sub.get_name().to_string())
-                .collect::<std::collections::HashSet<String>>()
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
         });
 
         // Deliberate exceptions, in the explicit-inventory idiom this module
@@ -31361,25 +31759,16 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
 
         let mut unknown: Vec<String> = Vec::new();
         for (file, body) in sweep_sources() {
-            for (index, line) in body.lines().enumerate() {
-                if is_comment(line) {
+            for (line, span) in nestweaver_spans_in_file(&body) {
+                let first_word: String = span
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if NOT_A_SUBCOMMAND.contains(&first_word.as_str()) {
                     continue;
                 }
-                let mut at = 0usize;
-                while let Some(found) = line[at..].find("`nestweaver ") {
-                    let start = at + found + "`nestweaver ".len();
-                    let rest = &line[start..];
-                    let word: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                        .collect();
-                    at = start.max(at + 1);
-                    if word.is_empty() {
-                        continue;
-                    }
-                    if !subcommands.contains(&word) && !NOT_A_SUBCOMMAND.contains(&word.as_str()) {
-                        unknown.push(format!("{file}:{}: `nestweaver {word}`", index + 1));
-                    }
+                if let Err(reason) = check_remedy_subcommand_path(&root, &span) {
+                    unknown.push(format!("{file}:{line}: `nestweaver {span}` — {reason}"));
                 }
             }
         }
@@ -31387,9 +31776,446 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
         unknown.dedup();
         assert!(
             unknown.is_empty(),
-            "these backtick-quoted remedies name a subcommand the CLI does not \
-             have, so a user who pastes them gets a clap parse error instead of \
-             a fix: {unknown:#?}"
+            "these backtick-quoted remedies name a subcommand path the CLI \
+             does not have, so a user who pastes them gets a clap parse \
+             error instead of a fix: {unknown:#?}"
+        );
+
+        // Counterweight: a REAL positional following a real command must not
+        // be mistaken for a mistyped subcommand.
+        assert!(
+            check_remedy_subcommand_path(&root, "impact <symbol>").is_ok(),
+            "a placeholder positional after a real subcommand must pass"
+        );
+        assert!(
+            check_remedy_subcommand_path(&root, "impact formatNumber").is_ok(),
+            "`impact` declares its own positional (`name_or_uid`) and has no \
+             subcommands of its own, so a literal value that doesn't match \
+             any subcommand name must not be reported"
+        );
+        assert!(
+            check_remedy_subcommand_path(&root, "brain refresh <vault>").is_ok(),
+            "a real nested path ending in a placeholder positional must pass"
+        );
+
+        // FAIL: `brain` HAS subcommands (Add/Refresh/Search/…) and declares
+        // NO positional of its own, so an unmatched second word must be
+        // reported as a bad subcommand rather than silently accepted as a
+        // value nobody asked for.
+        assert!(
+            check_remedy_subcommand_path(&root, "brain seach").is_err(),
+            "a command with subcommands and no positional of its own must \
+             report an unmatched second word as a bad subcommand, not \
+             silently accept it as a positional value"
+        );
+    }
+
+    /// Runs the `\`-continuation join ONCE per file, then finds every
+    /// `` `nestweaver ...` `` span, pairing each with the 1-based PHYSICAL
+    /// line its OPENING backtick came from — not merely the join's first
+    /// line, so a span deep inside a long continued message still reports
+    /// precisely. A plain `body.lines()` scan silently drops a span whose
+    /// opening backtick has no closing backtick on the SAME physical line —
+    /// exactly the shape of a real remedy in this codebase,
+    /// `` `nestweaver brain\n add <vault>` `` (rustc folds the two SOURCE
+    /// lines into one string at compile time inside a `\`-continued string
+    /// literal; a line-at-a-time sweep sees an unclosed backtick on the
+    /// first line and an unopened one on the second, and reports NEITHER —
+    /// silently checking nothing rather than failing loudly). Shared by both
+    /// S1/T1 checks (subcommand-path and flag validation) so that blind spot
+    /// is closed for both at once, not patched into only one.
+    fn nestweaver_spans_in_file(body: &str) -> Vec<(usize, String)> {
+        let physical: Vec<&str> = body.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < physical.len() {
+            if is_comment(physical[i]) {
+                i += 1;
+                continue;
+            }
+            // Accumulate one `\`-continued run into a joined string,
+            // recording the byte offset in `joined` at which each
+            // contributing physical line's own text begins — the same
+            // dropped-backslash, stripped-leading-whitespace join rustc
+            // performs on a `\`-continued string literal.
+            let mut joined = String::new();
+            let mut offsets: Vec<(usize, usize)> = Vec::new();
+            loop {
+                let line_no = i + 1;
+                let raw = physical[i];
+                // A trailing backslash continues the line ONLY when its
+                // count is ODD. Inside a string literal, `\\` is an escaped
+                // backslash followed by a real newline — it does NOT
+                // continue the line — while `\` (one) or `\\\` (three) do,
+                // because the last backslash in an odd run has no partner
+                // and is rustc's line-continuation escape. Counting and
+                // parity-checking (rather than a single `strip_suffix`)
+                // is what tells these apart.
+                let trailing_backslashes = raw.len() - raw.trim_end_matches('\\').len();
+                let continues = trailing_backslashes % 2 == 1;
+                let text = if continues {
+                    &raw[..raw.len() - 1]
+                } else {
+                    raw
+                };
+                let piece = if offsets.is_empty() {
+                    text
+                } else {
+                    text.trim_start()
+                };
+                offsets.push((joined.len(), line_no));
+                joined.push_str(piece);
+                i += 1;
+                if !continues || i >= physical.len() {
+                    break;
+                }
+            }
+            let mut at = 0usize;
+            while let Some(found) = joined[at..].find("`nestweaver ") {
+                let backtick_offset = at + found;
+                let start = backtick_offset + "`nestweaver ".len();
+                let rest = &joined[start..];
+                let Some(end) = rest.find('`') else {
+                    break;
+                };
+                let line = offsets
+                    .iter()
+                    .rev()
+                    .find(|(off, _)| *off <= backtick_offset)
+                    .map(|(_, l)| *l)
+                    .unwrap_or(offsets[0].1);
+                out.push((line, rest[..end].to_string()));
+                at = start + end + 1;
+            }
+        }
+        out
+    }
+
+    /// Walks a span's leading non-flag tokens against the live command tree,
+    /// following nested subcommand names (`daemon stop`, `brain context`) as
+    /// far as they go. Flag tokens (`-`-led) are entirely out of scope here
+    /// — that is `check_remedy_flags`'s job — so they are skipped, not
+    /// evaluated. A non-flag token that matches NEITHER a subcommand name
+    /// NOR is explainable as a positional (the CURRENT command has
+    /// subcommands of its own AND declares no positional of its own) is
+    /// reported: that shape is a typo a pasting user cannot recover from
+    /// (`` `nestweaver brain seach` ``), not a legitimate value. A command
+    /// that DOES take a positional (`impact <symbol>`) or has no
+    /// subcommands left to mismatch against is left alone from that token on
+    /// — everything after is a value, out of scope for a subcommand-path
+    /// check.
+    fn check_remedy_subcommand_path(root: &clap::Command, span: &str) -> Result<(), String> {
+        let mut current = root;
+        let mut path = current.get_name().to_string();
+        for token in span.split_whitespace() {
+            if token == "--" || token.starts_with('-') {
+                continue;
+            }
+            if token.starts_with('{') || token.starts_with('<') {
+                continue;
+            }
+            if let Some(sub) = current.find_subcommand(token) {
+                current = sub;
+                path.push(' ');
+                path.push_str(token);
+                continue;
+            }
+            if current.has_subcommands() && current.get_positionals().next().is_none() {
+                return Err(format!("`{token}` is not a subcommand of `{path}`"));
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// Every `--long` (plus its aliases) and `-s` a command accepts. Called
+    /// only on a command reached from a root that has already had
+    /// `.build()` run on it, so this already includes every arg clap itself
+    /// copied in — a `global = true` arg propagated down from an ancestor,
+    /// and the injected `--help`/`-h` (and, on this tree, `--version`/`-V`
+    /// per command — see `check_remedy_flags`'s doc comment) — not only the
+    /// args declared directly on this command's own `Commands`/`*Action`
+    /// variant.
+    fn command_flag_names(cmd: &clap::Command) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        for arg in cmd.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                names.insert(format!("--{long}"));
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                for alias in aliases {
+                    names.insert(format!("--{alias}"));
+                }
+            }
+            if let Some(short) = arg.get_short() {
+                names.insert(format!("-{short}"));
+            }
+            if let Some(shorts) = arg.get_all_short_aliases() {
+                for short in shorts {
+                    names.insert(format!("-{short}"));
+                }
+            }
+        }
+        names
+    }
+
+    /// Walks one backtick span's tokens against a BUILT `Cli::command()`
+    /// tree (`root.build()` already run — see the two test functions):
+    /// descends into nested subcommands by name (`daemon stop`, `brain
+    /// context`) while consecutive leading tokens keep matching one, and
+    /// checks every `-`/`--` token against ONLY the CURRENT command's own
+    /// `command_flag_names`. There is no separate global-flag tracking here
+    /// on purpose: `build()` is clap's OWN propagation pass, and it already
+    /// copies a `global = true` arg into every descendant's own
+    /// `get_arguments()` — root's globals AND any declared on an
+    /// intermediate command, e.g. `Commands::Daemon`'s `--db`
+    /// (src/main.rs ~6978-6982) — recursively, all the way down, so
+    /// `daemon stop --db <path>` is valid even though `DaemonAction::Stop`
+    /// declares no `--db` of its own. That propagation runs one direction —
+    /// `daemon --force` (a flag `Stop` declares on itself, not `daemon`) is
+    /// still refused, since a CHILD's own flag never propagates back to its
+    /// parent. The same `build()` pass injects `--help`/`-h` onto every
+    /// command, so no manual allow-list is needed for it either — but NOT
+    /// `--version`/`-V` the way one might expect: this CLI's root
+    /// `#[command(version)]` has no `propagate_version`, and clap only
+    /// copies the VERSION STRING via that setting, not the `--version` ARG
+    /// itself onto every command regardless — empirically (see the
+    /// `impact --version` counterweight below) it stays root-only on this
+    /// tree, so it is validated the same as any other flag rather than
+    /// hand-listed as always-on. `{…}`/`<…>` placeholders and a bare `--`
+    /// (clap's end-of-flags marker) are not flags and are skipped; so is any
+    /// `-`-led token that is not letter-led (e.g. a negative number `-5`),
+    /// since only true flag tokens are in scope here — not the values that
+    /// follow them. Combined short flags (`-vq`) are NOT split apart — no
+    /// remedy in this codebase currently uses that shorthand, so it stays
+    /// unhandled rather than guessed at.
+    fn check_remedy_flags(root: &clap::Command, span: &str) -> Result<(), String> {
+        let mut current = root;
+        let mut path = current.get_name().to_string();
+        let mut still_descending = true;
+        for token in span.split_whitespace() {
+            if token == "--" {
+                continue;
+            }
+            if token.starts_with('{') || token.starts_with('<') {
+                continue;
+            }
+            let flagish = token.starts_with('-')
+                && token
+                    .trim_start_matches('-')
+                    .starts_with(|c: char| c.is_ascii_alphabetic());
+            if flagish {
+                let name = token.split('=').next().unwrap_or(token);
+                if !command_flag_names(current).contains(name) {
+                    return Err(format!("`{name}` is not a flag on `{path}`"));
+                }
+                continue;
+            }
+            if token.starts_with('-') {
+                // Not letter-led after the dash(es) — a value like `-5`, not
+                // a flag token. Nothing to validate.
+                continue;
+            }
+            if still_descending {
+                if let Some(sub) = current.find_subcommand(token) {
+                    current = sub;
+                    path.push(' ');
+                    path.push_str(token);
+                    continue;
+                }
+                still_descending = false;
+            }
+            // A positional argument value (symbol name, path, timestamp,
+            // …) — out of scope for this check; subcommand-path shape is
+            // `check_remedy_subcommand_path`'s job.
+        }
+        Ok(())
+    }
+
+    /// S1/T1's companion for the other half of a pasted remedy: the flag
+    /// tokens after the subcommand. `backtick_quoted_remedies_still_name_a_
+    /// real_subcommand` (above) proves the SUBCOMMAND PATH exists; it says
+    /// nothing about what follows, so `` `nestweaver impact --bogus-flag` ``
+    /// already passes it and still hands a pasting user a clap parse error.
+    /// This walks the full nested path (`daemon stop`, `brain context`, …)
+    /// against a BUILT `Cli::command()` tree (shared `nestweaver_spans_in_file`
+    /// extraction, so a `\`-continued span is not invisible here either) and
+    /// checks every flag token against that command's own, post-`build()`
+    /// arguments — see `check_remedy_flags`'s doc comment for exactly what
+    /// `build()` buys over hand-tracking global/help/version flags.
+    ///
+    /// Deliberately scoped, same as the subcommand check above: a remedy
+    /// assembled at runtime via `format!` (no literal backtick span in
+    /// source) is invisible to this sweep, and a flag that is valid on the
+    /// named command in general but wrong given what THIS specific
+    /// invocation already passed (nw-328/nw-329's actual shape) cannot be
+    /// expressed as a static per-string check. Both stay covered only by the
+    /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    #[test]
+    fn backtick_quoted_remedies_name_real_flags_on_real_command_paths() {
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
+        });
+
+        // Counterweight for a clap-introspection regression: if this were
+        // empty, the sweep below would pass by finding nothing to check on a
+        // multi-flag subcommand, not because every remedy is honest.
+        let impact = root
+            .find_subcommand("impact")
+            .expect("`impact` must exist for this counterweight to mean anything");
+        let impact_flags = command_flag_names(impact);
+        assert!(
+            impact_flags.len() > 1,
+            "expected `impact` to expose multiple flags via clap introspection \
+             (get_arguments()/get_long()); got {impact_flags:#?} — a clap API \
+             change here would make the whole check below pass by checking \
+             nothing"
+        );
+
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (line, span) in nestweaver_spans_in_file(&body) {
+                if let Err(reason) = check_remedy_flags(&root, &span) {
+                    unknown.push(format!("{file}:{line}: `nestweaver {span}` — {reason}"));
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these remedies name a flag the named command path does not \
+             accept, so pasting them is a clap parse error: {unknown:#?}"
+        );
+
+        // Step 2, the counterweight: run the same checker on synthetic
+        // inputs so the assertion above is proven to discriminate, not just
+        // to pass vacuously. `--json` is per-subcommand on this CLI (every
+        // `Commands` variant that supports it declares its own `json: bool`
+        // field), not one of the six `global = true` root args, so the
+        // "global flag written before the subcommand" case below uses
+        // `--quiet` — a real global flag — rather than the hypothetical
+        // `--json` the spec sketch used.
+        assert!(
+            check_remedy_flags(&root, "impact --not-a-flag").is_err(),
+            "the checker must catch an invented flag on a real subcommand"
+        );
+        assert!(
+            check_remedy_flags(&root, "daemon stop --force").is_ok(),
+            "`daemon stop --force` is a real nested path + flag and must pass"
+        );
+        assert!(
+            check_remedy_flags(&root, "brain context --since").is_ok(),
+            "`brain context --since` is a real nested path + flag and must pass"
+        );
+        assert!(
+            check_remedy_flags(&root, "--quiet search").is_ok(),
+            "a global flag written before the subcommand must still be \
+             recognised, order-independent of where the subcommand token \
+             falls"
+        );
+        // PASS: `--db` is `global = true` declared on `Commands::Daemon`
+        // ITSELF (src/main.rs ~6978-6982), not the root, and
+        // `DaemonAction::Stop` declares no `--db` of its own — reachable
+        // only via clap's OWN global-arg propagation on a built command
+        // tree (no hand-rolled ancestor tracking left to get this wrong).
+        assert!(
+            check_remedy_flags(&root, "daemon stop --db <path>").is_ok(),
+            "`--db` is `global = true` on `Commands::Daemon` itself (src/main.rs \
+             ~6978-6982), and `DaemonAction::Stop` declares no `--db` of its \
+             own, so this is only reachable via clap's OWN `build()` \
+             propagation, not just the root's own args"
+        );
+        // FAIL counterweight: `--force` is declared only on the CHILD
+        // `DaemonAction::Stop` (src/main.rs ~7239-7240), not on `daemon`
+        // itself (which has only `action` and the global `--db`). clap's
+        // propagation runs one direction — ancestor to descendant — so a
+        // child's own flag must NOT be usable on its parent, proving the fix
+        // didn't overcorrect into accepting everything everywhere.
+        assert!(
+            check_remedy_flags(&root, "daemon --force").is_err(),
+            "`--force` is declared only on `DaemonAction::Stop`, a CHILD of \
+             `daemon` — it must not be usable on the parent `daemon` command \
+             itself"
+        );
+        // FAIL counterweight: this CLI's root `#[command(version)]` has no
+        // `propagate_version`, so `--version`/`-V` must stay ROOT-only,
+        // unlike `--help`/`-h` which clap injects onto every command
+        // regardless. Removing the old hand-rolled `--version` allow-list
+        // is exactly what makes this checkable at all.
+        assert!(
+            check_remedy_flags(&root, "impact --version").is_err(),
+            "`--version` must not be accepted on a subcommand: only the root \
+             carries a version flag on a tree with no `propagate_version`"
+        );
+
+        // Documented skips: neither a bare `--` (clap's end-of-flags marker)
+        // nor a non-letter-led dash token (a negative number, not a flag)
+        // should be treated as an unknown flag.
+        assert!(
+            check_remedy_flags(&root, "impact -- -5").is_ok(),
+            "a bare `--` and a non-letter-led dash token like `-5` must be \
+             skipped, not reported as unknown flags"
+        );
+
+        // Multi-line blind spot: a span split by a Rust `\` line-
+        // continuation must still be found and checked, not silently
+        // dropped by a line-at-a-time scan. The literal below has a REAL
+        // backslash followed by a REAL newline and leading whitespace —
+        // i.e. it simulates raw FILE TEXT, not a Rust-source continuation
+        // (which the compiler would already have folded before this test
+        // ever ran).
+        // Built via a `backtick` variable, not a literal `` `nestweaver ``
+        // substring, so this FIXTURE does not trip the outer sweep on
+        // itself when it scans main.rs's own source text (the risk
+        // `sweep_sources`'s own doc comment names).
+        let backtick = '`';
+        let split_body = format!("{backtick}nestweaver impact --not-\\\n    a-flag{backtick}\n");
+        let spans = nestweaver_spans_in_file(&split_body);
+        assert_eq!(
+            spans,
+            vec![(1, "impact --not-a-flag".to_string())],
+            "a `\\`-continued span must be joined before extraction — \
+             body.lines() alone would see an unclosed backtick on line 1 \
+             and an unopened one on line 2, and silently check neither: \
+             {spans:#?}"
+        );
+        assert!(
+            check_remedy_flags(&root, &spans[0].1).is_err(),
+            "the (now-joined) split span must still be checked and caught \
+             as bogus, proving the join feeds real validation rather than \
+             just concatenating text nobody looks at"
+        );
+
+        // Counterweight: an EVEN number of trailing backslashes is an
+        // escaped backslash plus a real newline — NOT a continuation. This
+        // has to be observed through an UNCLOSED opener, not two
+        // independently self-closed spans: this function tracks each
+        // physical line's own byte offset regardless of where a chunk
+        // boundary falls, so two already-complete spans report the same
+        // `(line, span)` pairs whether or not an inert prose line between
+        // them gets wrongly merged in — merging alone doesn't corrupt
+        // anything by itself. The bug only becomes OBSERVABLE when a wrong
+        // merge lets one line's unclosed backtick adopt a CLOSING backtick
+        // that belongs to an unrelated next line, fabricating a span that
+        // spans two physical lines and never existed. That is exactly what
+        // a real multi-line `bail!`/`format!` message risks if one of its
+        // continuation lines happens to end in an escaped backslash (e.g. a
+        // literal Windows path).
+        let unclosed_before_even_backslashes =
+            format!("{backtick}nestweaver impact --flag \\\\\nunrelated text{backtick}\n");
+        let spans = nestweaver_spans_in_file(&unclosed_before_even_backslashes);
+        assert_eq!(
+            spans,
+            Vec::<(usize, String)>::new(),
+            "a line ending in an EVEN number of `\\` must NOT continue: \
+             this line's own unclosed backtick must find no span at all \
+             (matching the documented 'unclosed backtick contributes \
+             nothing further' behavior), not wrongly adopt the NEXT, \
+             unrelated line's closing backtick and fabricate a span that \
+             never existed: {spans:#?}"
         );
     }
 
@@ -32273,6 +33099,216 @@ mod context_json_renderer_tests {
     }
 }
 
+/// Pure rendering for the daemon `embed` route's terminal outcome (nw-484):
+/// the lines to print and the exit code, with no I/O of its own, so tests
+/// can assert on exact strings instead of capturing stderr through a live
+/// daemon (which the design explicitly calls out as untestable here — an
+/// e2e run against a real Hugging Face endpoint is out of scope for a gate).
+///
+/// Mirrors `run_embed_with_cancel`'s existing
+/// `restart_required`/`rejected`/`stats` branches exactly; the only new
+/// behavior is the `model_seeded` line. `repair_identity` +
+/// `!resp.identity_repaired` is still the CALLER's job to check first (it is
+/// an error, not a line+exit-code pair) — this function assumes that check
+/// already passed.
+fn render_daemon_embed_outcome(
+    resp: &nestweaver_proto::EmbedResponse,
+    elapsed: std::time::Duration,
+    stats: bool,
+) -> (Vec<String>, i32) {
+    let mut lines = Vec::new();
+    if resp.identity_repaired {
+        lines.push(format!(
+            "Discarded {} embedding(s) and removed the unreadable semantic identity.",
+            resp.discarded_embeddings
+        ));
+    }
+    if resp.restart_required {
+        lines.push(
+            "Restart the daemon to load the configured embedding model, then run \
+             `nestweaver embed --force`."
+                .to_string(),
+        );
+        return (lines, EXIT_SUCCESS);
+    }
+    if resp.rejected > 0 {
+        lines.push(format!(
+            "Error: {} embedding(s) rejected by the embedding guards \
+             (model or dimension mismatch). Use --force to switch models \
+             (clears existing embeddings).",
+            resp.rejected
+        ));
+    }
+    // nw-484: this call itself downloaded a missing local model cache and
+    // loaded it — no restart. Named once, before the pass summary, because
+    // nothing else in this function's output says a download happened.
+    // Neither the stale "missing … run `nestweaver embed`" remediation nor
+    // any restart advice may appear here: the daemon's own error text is
+    // already free of both on every seeding path (server.rs's `embed` RPC),
+    // and this function must not reintroduce either on the success path.
+    if resp.model_seeded {
+        let device = if resp.loaded_device.is_empty() {
+            "unknown"
+        } else {
+            &resp.loaded_device
+        };
+        lines.push(format!(
+            "Downloaded missing embedding model '{}' into {} and loaded it (device: {device}).",
+            resp.seeded_model_id, resp.seeded_cache_dir
+        ));
+    }
+    if stats {
+        lines.push(format!(
+            "Embed stats: {} succeeded, {} failed, \
+             {} rejected (model/dim mismatch), {} eligible, \
+             {} already embedded, {} scoped node(s), {:.2}s elapsed",
+            resp.succeeded,
+            resp.failed,
+            resp.rejected,
+            resp.eligible,
+            resp.skipped,
+            resp.scoped,
+            elapsed.as_secs_f64()
+        ));
+    } else {
+        lines.push(format!(
+            "Done: {} embedding(s) generated, {} error(s); \
+             {} already embedded out of {} scoped node(s).",
+            resp.succeeded, resp.failed, resp.skipped, resp.scoped
+        ));
+    }
+    let exit = if resp.failed > 0 || resp.rejected > 0 {
+        EXIT_ERROR
+    } else {
+        EXIT_SUCCESS
+    };
+    (lines, exit)
+}
+
+#[cfg(test)]
+mod render_daemon_embed_outcome_tests {
+    use super::*;
+
+    fn response(succeeded: u32, failed: u32) -> nestweaver_proto::EmbedResponse {
+        nestweaver_proto::EmbedResponse {
+            succeeded,
+            failed,
+            scoped: succeeded as u64 + failed as u64,
+            eligible: succeeded as u64 + failed as u64,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of nw-484: a seeded, successful recovery prints the
+    /// "Downloaded …" line exactly ONCE, before the usual `Done:` summary,
+    /// and exits 0 — no restart line, no stale "missing" remediation
+    /// anywhere in the output.
+    #[test]
+    fn daemon_embed_cli_reports_a_seeded_model_once_and_exits_zero() {
+        let resp = nestweaver_proto::EmbedResponse {
+            model_seeded: true,
+            seeded_model_id: "BAAI/bge-base-en-v1.5".to_string(),
+            seeded_cache_dir: "/Users/kory/Library/Caches/nestweaver/models".to_string(),
+            loaded_device: "metal".to_string(),
+            ..response(3, 0)
+        };
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+
+        assert_eq!(exit, EXIT_SUCCESS);
+        let seeded_lines: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("Downloaded missing embedding model"))
+            .collect();
+        assert_eq!(
+            seeded_lines.len(),
+            1,
+            "the seeded-model line must appear exactly once: {lines:?}"
+        );
+        assert_eq!(
+            seeded_lines[0],
+            "Downloaded missing embedding model 'BAAI/bge-base-en-v1.5' into \
+             /Users/kory/Library/Caches/nestweaver/models and loaded it (device: metal)."
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("Done:")),
+            "the usual pass summary must still print: {lines:?}"
+        );
+        let joined = lines.join("\n").to_ascii_lowercase();
+        assert!(
+            !joined.contains("restart"),
+            "a successful seeded recovery must never mention restarting: {lines:?}"
+        );
+        assert!(
+            !joined.contains("run `nestweaver embed`"),
+            "the stale pre-recovery remediation must not leak into a success line: {lines:?}"
+        );
+    }
+
+    /// Counterweight: when nothing was seeded, the line must not appear at
+    /// all — a fresh `EmbedResponse` default (`model_seeded: false`) must
+    /// render exactly like the pre-nw-484 output.
+    #[test]
+    fn unseeded_response_prints_no_download_line() {
+        let resp = response(2, 0);
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_SUCCESS);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("Downloaded missing")),
+            "an unseeded response must never print the seeded-model line: {lines:?}"
+        );
+    }
+
+    /// A seed/load failure never reaches this function (the daemon returns
+    /// an `Err` `Status`, handled by the caller's `Err(e) => return
+    /// Err(e).context(..)` branch) — so the "no restart or stale missing
+    /// text" guarantee for a FAILURE is pinned directly on the daemon's
+    /// error text, not here. This test pins the other half: this function
+    /// itself never manufactures restart/stale-missing text on any input,
+    /// including a failed-but-not-seeded pass (`failed > 0`, exit non-zero).
+    #[test]
+    fn daemon_embed_cli_seed_error_has_no_restart_or_stale_missing_text() {
+        let resp = response(1, 2);
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_ERROR);
+        let joined = lines.join("\n").to_ascii_lowercase();
+        assert!(!joined.contains("restart"), "{lines:?}");
+        assert!(!joined.contains("run `nestweaver embed`"), "{lines:?}");
+    }
+
+    /// `restart_required` (the SEPARATE identity-repair path, nw-488 follow-up,
+    /// out of scope for nw-484) is the one case that legitimately still
+    /// prints restart text — pinned so the nw-484 "no restart" guarantees
+    /// above are known not to have silently swallowed this real, unrelated
+    /// case.
+    #[test]
+    fn restart_required_still_prints_its_own_restart_line() {
+        let resp = nestweaver_proto::EmbedResponse {
+            restart_required: true,
+            identity_repaired: true,
+            discarded_embeddings: 5,
+            ..Default::default()
+        };
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_SUCCESS);
+        assert!(lines.iter().any(|line| line.contains("Restart the daemon")));
+    }
+
+    #[test]
+    fn stats_mode_prints_the_stats_line_instead_of_done() {
+        let resp = response(4, 1);
+        let (lines, _exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(2), true);
+        assert!(lines.iter().any(|line| line.starts_with("Embed stats:")));
+        assert!(!lines.iter().any(|line| line.starts_with("Done:")));
+    }
+}
+
 /// Generate embeddings for symbols, notes, and/or headings.
 #[allow(clippy::too_many_arguments)]
 fn run_embed<Load>(
@@ -32479,51 +33515,11 @@ where
                                  restart it and retry --repair-identity"
                             );
                         }
-                        if resp.identity_repaired {
-                            eprintln!(
-                                "Discarded {} embedding(s) and removed the unreadable semantic identity.",
-                                resp.discarded_embeddings
-                            );
+                        let (lines, exit_code) = render_daemon_embed_outcome(&resp, elapsed, stats);
+                        for line in lines {
+                            eprintln!("{line}");
                         }
-                        if resp.restart_required {
-                            eprintln!(
-                                "Restart the daemon to load the configured embedding model, then run `nestweaver embed --force`."
-                            );
-                            return Ok(EXIT_SUCCESS);
-                        }
-                        if resp.rejected > 0 {
-                            eprintln!(
-                                "Error: {} embedding(s) rejected by the embedding guards \
-                                 (model or dimension mismatch). Use --force to switch models \
-                                 (clears existing embeddings).",
-                                resp.rejected
-                            );
-                        }
-                        if stats {
-                            eprintln!(
-                                "Embed stats: {} succeeded, {} failed, \
-                                 {} rejected (model/dim mismatch), {} eligible, \
-                                 {} already embedded, {} scoped node(s), {:.2}s elapsed",
-                                resp.succeeded,
-                                resp.failed,
-                                resp.rejected,
-                                resp.eligible,
-                                resp.skipped,
-                                resp.scoped,
-                                elapsed.as_secs_f64()
-                            );
-                        } else {
-                            eprintln!(
-                                "Done: {} embedding(s) generated, {} error(s); \
-                                 {} already embedded out of {} scoped node(s).",
-                                resp.succeeded, resp.failed, resp.skipped, resp.scoped
-                            );
-                        }
-                        return if resp.failed > 0 || resp.rejected > 0 {
-                            Ok(EXIT_ERROR)
-                        } else {
-                            Ok(EXIT_SUCCESS)
-                        };
+                        return Ok(exit_code);
                     }
                     Err(e) => {
                         return Err(e).context("daemon embed failed");
@@ -34499,8 +35495,8 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
         // restore is destructive → fail closed.
         Err(e) => anyhow::bail!(
             "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
-             ({e}) — refusing a destructive restore. Stop the daemon (`nestweaver daemon stop` \
-             / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+             ({e}) — refusing a destructive restore. Stop the daemon \
+             (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
         // Present but EMPTY → claims no PID at all, which is the same fact as
@@ -34513,16 +35509,16 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
                 "a pidfile exists at {} but could not be parsed to confirm the daemon is \
-                 stopped — refusing a destructive restore. Stop the daemon (`nestweaver daemon \
-                 stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+                 stopped — refusing a destructive restore. Stop the daemon \
+                 (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
                 pidfile.display(),
             ),
             // Live pid → daemon is running → refuse.
             Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
                 "a daemon (pid {pid}) is running on the target data directory {} — restoring \
                  would rename its live files aside and delete them while it keeps writing to the \
-                 unlinked inodes, silently diverging the restored state. Stop it with `nestweaver \
-                 daemon stop` (or `nestweaver server stop`) and retry.",
+                 unlinked inodes, silently diverging the restored state. Stop it with \
+                 `nestweaver daemon stop` and retry.",
                 data_dir.display(),
             ),
             // Dead/stale pid → daemon is gone → permit.
@@ -34553,8 +35549,8 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
         // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
         Err(e) => anyhow::bail!(
             "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
-             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon (`nestweaver \
-             daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon \
+             (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
         // Present but EMPTY → no PID is claimed → quiesced, exactly as an
@@ -34566,8 +35562,7 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
             Err(_) => anyhow::bail!(
                 "a pidfile exists at {} but could not be parsed to confirm the daemon is \
                  stopped — refusing to build a possibly-torn snapshot. Stop the daemon \
-                 (`nestweaver daemon stop` / `nestweaver server stop`) or remove the stale \
-                 pidfile, then retry.",
+                 (`nestweaver daemon stop`) or remove the stale pidfile, then retry.",
                 pidfile.display(),
             ),
             // Live pid → daemon is writing this DB → refuse.

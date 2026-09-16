@@ -417,6 +417,169 @@ fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
     false
 }
 
+/// True if `node` is NOT lexically nested inside any function/method body —
+/// i.e. it executes when the file is loaded (Python: at import time; bash: as
+/// soon as the interpreter reaches it), rather than only when some named
+/// function is later called. See nw-435.
+///
+/// Python: any `function_definition` or `lambda` ancestor disqualifies it.
+/// This deliberately does NOT special-case `if __name__ == "__main__":` —
+/// Python executes every top-level statement (including ones nested inside a
+/// module-level `if`) at import time, so a call inside that block has no
+/// `function_definition` ancestor either. The single rule already covers both
+/// the bare-top-level case and the `__main__`-guarded case.
+///
+/// Bash: any `function_definition` ancestor disqualifies it. `if`/`for`/
+/// `while`/`{ }` wrappers at the top level do not, because bash has no
+/// separate "top-level scope" node the way Python has `module` — the absence
+/// of a `function_definition` ancestor IS top level.
+///
+/// KNOWN IMPRECISION, both low-impact and deliberately not special-cased:
+///  * False positive: a call inside `if TYPE_CHECKING:` reads as top level by
+///    this rule even though `TYPE_CHECKING` is always `False` at runtime and
+///    the block never executes. Rare in practice — that block is conventionally
+///    reserved for type-only imports/annotations, not calls.
+///  * False negative: a call in a parameter DEFAULT — `def f(x=helper()):` —
+///    sits inside the enclosing `function_definition`'s `parameters` node, so
+///    this walk finds a disqualifying `function_definition` ancestor and
+///    treats it as non-top-level, even though Python evaluates defaults once,
+///    at `def` time, not per call. `helper` is missed by this rule.
+///
+/// Unbounded walk (unlike `has_export_ancestor`'s fixed 3 hops): function
+/// nesting depth is not bounded the way export-wrapping is, and the walk is
+/// still O(depth) per call reference — negligible next to parsing itself.
+///
+/// Swift (nw-490, gated further at the call site to files
+/// `is_swift_top_level_entry_file` recognises): a call is top level when none
+/// of its ancestors is a `function_declaration` (an ordinary function/method
+/// body), `init_declaration` / `deinit_declaration` / `subscript_declaration`
+/// (bodies that run once per instance, not at load time), a
+/// `computed_property` (evaluated on access, not at load), or a
+/// `class_declaration` / `protocol_declaration` (a stored-property
+/// initializer inside a type body runs per instance, not at load — struct/
+/// enum/extension/actor declarations share the `class_declaration` node per
+/// `swift.scm`'s own comment). Node kinds confirmed against a tree-sitter-
+/// swift 0.7.3 grammar dump, not guessed.
+///
+/// Deliberately does NOT disqualify `lambda_literal`: `Task { await run() }`
+/// and `DispatchQueue.main.async { ... }` are the standard Swift concurrency
+/// idioms for top-level async work, and excluding closures would recreate
+/// the exact false positive this item fixes.
+///
+/// KNOWN GAP, deliberate: `willSet`/`didSet` observer blocks on a top-level
+/// stored var are not disqualified either, so a callee reached only from one
+/// reads as top level and gets rooted even though the observer runs on
+/// assignment, not at load time. Over-rooting is the safe direction for a
+/// deletion list — the callee is live code either way — so this is left
+/// alone rather than adding another disqualifying node kind.
+fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
+    let disqualifying: &[&str] = match lang_str {
+        "python" => &["function_definition", "lambda"],
+        "bash" => &["function_definition"],
+        "swift" => &[
+            "function_declaration",
+            "init_declaration",
+            "deinit_declaration",
+            "subscript_declaration",
+            "computed_property",
+            "class_declaration",
+            "protocol_declaration",
+        ],
+        _ => return false,
+    };
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if disqualifying.contains(&n.kind()) {
+            return false;
+        }
+        current = n.parent();
+    }
+    true
+}
+
+/// True if the reference's callee is a bare name, checked by the callee's OWN
+/// syntax node shape rather than by the reference's captured name.
+///
+/// nw-435 code-quality review: `top_level_called` used to key on the captured
+/// bare NAME alone, and `queries/python.scm`'s attribute-call rule —
+/// `(call function: (attribute attribute: (identifier) @name))` — captures
+/// only the trailing identifier. So a module with an unrelated, never-called
+/// `def run():` plus a top-level `obj.run()` wrongly rooted the dead `run`
+/// function: `obj.run()` can only ever invoke `C.run` (a `Method`), never a
+/// module-level function of the same name, and `mod.run()` is a cross-file
+/// call — an already-disclosed gap this rule does not attempt to close.
+///
+/// Python: a `call` node roots only when its own `function` field is a plain
+/// `identifier` (`helper()`), not an `attribute` (`obj.run()` / `mod.run()`).
+/// A bare `@decorator` (no call, no parens) is captured by a separate rule —
+/// `(decorator (identifier) @name)` — that only ever matches a plain
+/// identifier, so a `decorator` node reaching here is unconditionally bare.
+///
+/// Bash: `queries/bash.scm` has no attribute-call syntax at all — its only
+/// `@reference.call` rule is `(command name: (command_name (word) @name))` —
+/// so every `command` node reaching here is already bare by construction.
+///
+/// Swift (nw-490): unlike Python/bash, `call_expression` has NO fields in
+/// tree-sitter-swift 0.7.3 (confirmed with a grammar dump, not guessed), so
+/// `child_by_field_name` cannot be used the way the Python arm uses it. A
+/// bare call (`helper()`, `AppDelegate()`) has a `simple_identifier` as its
+/// first named child; an attribute/method call (`obj.run()`) has a
+/// `navigation_expression` there instead — checking the first named child's
+/// kind distinguishes the two shapes. `Foo<T>()` and `[Int]()` parse as
+/// `constructor_expression`, a different node kind not reached here at all —
+/// `swift.scm`'s own `@reference.call` rule cannot see them either, a
+/// pre-existing, disclosed gap this rule does not attempt to close.
+fn callee_is_bare_identifier(node: &tree_sitter::Node, lang_str: &str) -> bool {
+    match lang_str {
+        "python" => match node.kind() {
+            "call" => node
+                .child_by_field_name("function")
+                .is_some_and(|f| f.kind() == "identifier"),
+            "decorator" => true,
+            _ => false,
+        },
+        "bash" => node.kind() == "command",
+        "swift" => {
+            node.kind() == "call_expression"
+                && node
+                    .named_child(0)
+                    .is_some_and(|c| c.kind() == "simple_identifier")
+        }
+        _ => false,
+    }
+}
+
+/// True for a Swift file whose top-level statements the compiler actually
+/// executes: a file literally named `main.swift` (the SwiftPM
+/// executable-target convention, `Sources/<target>/main.swift`), or a script
+/// invoked directly with a shebang first line (`#!/usr/bin/env swift`, run as
+/// `swift file.swift`). See nw-490.
+///
+/// The Swift book describes several mutually exclusive ways a module
+/// designates its entry point: a file that contains top-level executable
+/// code (which, outside a shebang script, means `main.swift`), the `main`
+/// attribute, or the `NSApplicationMain`/`UIApplicationMain` attributes. The
+/// `@main` case is unrelated to this gate — it is already handled by
+/// `detect_swift`'s own signature check (`entry_points.rs` ~814-817), because
+/// an `@main`-attributed type's static `main()` is an ordinary function-body
+/// call site, not bare top-level code.
+///
+/// The gate is necessary, not just descriptive: an ordinary (non-`main.swift`,
+/// non-script) Swift file can hold a global `let x = f()`, and that
+/// initializer is LAZY — evaluated on first access, not at load time.
+/// Treating every Swift file as "top level executes on load" would wrongly
+/// root `f` for a global that may never be touched.
+///
+/// KNOWN GAP: a single-file build with neither a `main.swift` name nor a
+/// shebang (`swiftc foo.swift`) is missed — not attempted here.
+fn is_swift_top_level_entry_file(file_path_str: &str, source: &str) -> bool {
+    file_path_str.rsplit('/').next() == Some("main.swift")
+        || source
+            .strip_prefix('\u{feff}')
+            .unwrap_or(source)
+            .starts_with("#!")
+}
+
 /// Collect the text of `attribute_item` siblings immediately preceding `node`.
 ///
 /// In tree-sitter-rust an outer attribute like `#[test]` is a *preceding sibling*
@@ -1157,18 +1320,34 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     };
     let file_path_str = path.to_string_lossy();
+    // nw-490: computed once per file, not per call reference, since it reads
+    // the whole source's first bytes (the shebang check) and the file name.
+    let swift_top_level_entry_file =
+        lang_str == "swift" && is_swift_top_level_entry_file(&file_path_str, source);
 
     let mut symbols: Vec<RawSymbol> = Vec::new();
     let mut references: Vec<RawReference> = Vec::new();
     let mut seen_symbols: std::collections::HashSet<(String, u32)> =
         std::collections::HashSet::new();
+    // nw-435: names called by a Python or bash call/command with no enclosing
+    // `function_definition` (and, for Python, no enclosing `lambda`) ancestor —
+    // see `is_top_level_reference` below. Collected during the capture loop,
+    // where the reference's own tree-sitter node is already in scope, rather
+    // than recovered afterward from `references` (which does not retain the
+    // AST node).
+    let mut top_level_called: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
     let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
     while let Some(m) = matches.next() {
-        let name_text = find_name_capture(m.captures(), &capture_names, source_bytes);
+        // nw-356 (A): `name_row` is the 0-based row of the `@name` capture,
+        // used below to anchor a C++ `declaration` node's start line when the
+        // node's own reported start precedes it (a tree-sitter-cpp grammar
+        // misparse).
+        let (name_text, name_row): (Option<String>, Option<u32>) =
+            find_name_capture(m.captures(), &capture_names, source_bytes).unzip();
 
         for capture in m.captures() {
             let capture_name = &capture_names[capture.index as usize];
@@ -1180,7 +1359,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
             let start_line = node.start_position().row as u32 + 1;
 
             if let Some(kind_str) = capture_name.strip_prefix("definition.") {
-                let kind = match kind_str {
+                let mut kind = match kind_str {
                     "function" => SymbolKind::Function,
                     "class" => SymbolKind::Class,
                     "method" => SymbolKind::Method,
@@ -1217,6 +1396,123 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     }
                 };
 
+                // nw-356 (B). `Type name(initializer);` — a local variable
+                // directly initialized with an anonymous/local struct type —
+                // is grammatically identical to a function declarator
+                // (`Type name(args);`): the C++ "most vexing parse".
+                // tree-sitter-cpp has no symbol table to disambiguate, so it
+                // parses this as a `function_declarator` and the
+                // `(declaration declarator: (function_declarator ...))
+                // @definition.function` rule above mints a spurious
+                // `Function` for what is really a local variable — matching
+                // the shape `cpp.scm`'s own `init_declarator
+                // @definition.variable` rule already treats as a variable.
+                // Detected syntactically: the declaration's own `type` field
+                // resolves to an INLINE struct/class definition (a `body` is
+                // present — this excludes an ordinary reference to an
+                // externally-defined type. `Foo bar(1);` is NOT such a case
+                // to worry about — with a literal argument tree-sitter-cpp
+                // parses it as an `init_declarator`, matching `cpp.scm`'s own
+                // `definition.variable` rule directly and never reaching this
+                // branch at all (verified directly). The shape that DOES
+                // reach here and must stay a `Function` is `Foo
+                // bar(GetName());` — a call-shaped argument parses as a
+                // `function_declarator` exactly like the most-vexing-parse
+                // case, but its `type` field is a plain `type_identifier`
+                // ("Foo"), not a struct/class definition, so the guard below
+                // correctly leaves it alone).
+                //
+                // Excluding an `ERROR` before the name row is required to
+                // avoid colliding with nw-356 (A)'s *different* misparse:
+                // `class LBUG_API Foo { struct Inner {...}; Foo(); ... }`
+                // produces the exact same field shape for the unrelated
+                // `Foo();` prototype (its `declaration` node's `type` field
+                // resolves to the preceding `struct Inner {...}` because the
+                // macro token desyncs statement-boundary recovery), which
+                // would misclassify a real constructor as a Variable. Reuses
+                // `has_error_before_row` (defined below, alongside
+                // `cpp_declaration_start_line`) rather than a bare
+                // `!node.has_error()`: quality-review round 2 found that a
+                // most-vexing-parse initializer can itself embed an `ERROR`
+                // AFTER the name row (e.g. a macro-shaped token inside the
+                // constructor's own argument list, `current_token(get_handle()
+                // DEPRECATED_MACRO)`) without that being nw-356 (A)'s
+                // corruption at all — a bare subtree-wide `has_error()` was
+                // wrongly excluding that case from reclassification too
+                // (verified directly:
+                // `cpp_anonymous_struct_typed_local_with_error_after_name_is_still_a_variable`).
+                // The `LBUG_API` witness's `ERROR` sits on rows 4-5, strictly
+                // before `Foo`'s name row (7), so it is still caught; an
+                // `ERROR` on or after the name row is not. This comparison is
+                // ROW-granular, not column-granular: an `ERROR` on the name's
+                // own row but before its column is not distinguished from one
+                // after it — consistent with symbol UIDs themselves being
+                // line-based (`(repo, path, name, start_line)`), and no
+                // query-matching witness has been found where the column
+                // within a shared row would change the outcome.
+                if kind == SymbolKind::Function
+                    && lang_str == "cpp"
+                    && node.kind() == "declaration"
+                    && name_row.is_some_and(|row| !has_error_before_row(&node, row))
+                    && node.child_by_field_name("type").is_some_and(|t| {
+                        matches!(t.kind(), "struct_specifier" | "class_specifier")
+                            && t.child_by_field_name("body").is_some()
+                    })
+                {
+                    kind = SymbolKind::Variable;
+                }
+
+                let kind_label = crate::entry_points::symbol_kind_label(kind);
+
+                // nw-356 (A). tree-sitter-cpp's grammar has no symbol table,
+                // so a macro token sitting where a class name is expected
+                // (e.g. `class LBUG_API Foo {`) desyncs statement-boundary
+                // recovery: the `declaration` node captured for an unrelated
+                // LATER member (a bodiless constructor `Foo();`) ends up
+                // spanning backward across the whole preceding nested type
+                // instead of starting at its own line — `Foo` was recorded as
+                // spanning `3-8` instead of just `8`. The `@name` capture's
+                // own row is always correct (it's where `signature_line` was
+                // already reading its text from), so it is preferred over the
+                // node's own start whenever the node starts earlier than its
+                // name — but ONLY when there's an `ERROR` node BEFORE the name
+                // row (see `has_error_before_row` / `cpp_declaration_start_line`
+                // for the full reasoning; both live just below this function).
+                // A subtree-wide `node.has_error()` check (an earlier version
+                // of this gate) was too broad in TWO different directions:
+                // an ordinary, error-free multi-line prototype (a specifier or
+                // attribute prefix pushing the declarator onto a later line,
+                // e.g. `static inline\nint\nfoo();`, `[[nodiscard]]\nint
+                // foo();`, `__attribute__((warn_unused_result))\nint foo();`,
+                // or `virtual\nvoid\nfoo() const override;`) has NO error at
+                // all yet was still caught by the row-preceding condition
+                // alone; and `static inline\nint\nfoo(int x
+                // DEPRECATED_MACRO);` DOES have an `ERROR` (an unexpanded
+                // macro after a parameter name), but it sits on the same row
+                // as the name — after the declarator was already correctly
+                // parsed — so `has_error()` wrongly clamped it too. Requiring
+                // the `ERROR` to be strictly BEFORE the name row excludes both
+                // false positives while still catching the `LBUG_API` witness
+                // (`ERROR` on rows 4-5, `Foo`'s name on row 7). Nor is the gap
+                // a `template_declaration` prefix either: verified directly
+                // that `template<typename T>\nT foo();`'s inner `declaration`
+                // node already starts on its own line (matching `foo`'s row
+                // exactly), so a legitimate multi-line template header must
+                // never be second-guessed by this heuristic even if some
+                // future grammar revision widens it back across the template
+                // line.
+                let start_line = if lang_str == "cpp"
+                    && node.kind() == "declaration"
+                    && kind_label == "function"
+                {
+                    match name_row {
+                        Some(row) => cpp_declaration_start_line(&node, row, start_line),
+                        None => start_line,
+                    }
+                } else {
+                    start_line
+                };
+
                 // Use the arena for the name fallback so we defer the owned-String
                 // allocation until we know this symbol passes the dedup check.
                 let name_arena: &str = match &name_text {
@@ -1249,7 +1545,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let content_hash = sha256_hex(node_text);
                 let signature = signature_line(node_text, lang_str);
 
-                let kind_label = crate::entry_points::symbol_kind_label(kind);
                 // A `definition.function` captured on a `call_expression` node is a
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
@@ -1351,6 +1646,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let context = first_line(context_node.utf8_text(source_bytes).unwrap_or(""));
 
                 let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
+
+                // nw-435 / nw-490: a call/command with no enclosing function
+                // body executes as soon as the file is loaded (Python: at
+                // import time; bash: as soon as the interpreter reaches it;
+                // Swift: only in `main.swift` or a shebang script — see
+                // `is_swift_top_level_entry_file`), so its callee is a
+                // reachability ROOT rather than an ordinary call target.
+                // Collected here, not derived from `references` afterward,
+                // because `node` — the actual call/command node — is only in
+                // scope inside this capture loop.
+                if kind == ReferenceKind::Call
+                    && (matches!(lang_str, "python" | "bash") || swift_top_level_entry_file)
+                    && is_top_level_reference(&node, lang_str)
+                    && callee_is_bare_identifier(&node, lang_str)
+                {
+                    top_level_called.insert(name.clone());
+                }
 
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
@@ -1524,6 +1836,61 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // nw-491: promote same-file `Function` symbols registered by a bash
+    // `trap NAME SIGSPEC` command to reachability roots. See
+    // `collect_bash_trap_targets` for the grammar this parses and why the
+    // whole tree is scanned rather than gating on an enclosing function body.
+    // `EntryPointKind::EventListener`, not `Main`: a trap handler is
+    // triggered by an external OS signal — the same relationship
+    // `EventListener` already models for JS/TS hooks/contexts/providers —
+    // not "the" program entry point the way `main`/a directly-run script is,
+    // and reusing `Main` would conflate trap-registered callbacks with
+    // top-level-called functions in `process.rs`'s `{dir}::main` bucket.
+    if lang == Language::Bash {
+        let trapped = collect_bash_trap_targets(tree.root_node(), source_bytes);
+        if !trapped.is_empty() {
+            for symbol in &mut symbols {
+                if !symbol.is_entry_point
+                    && symbol.kind == SymbolKind::Function
+                    && trapped.contains(symbol.name.as_str())
+                {
+                    symbol.is_entry_point = true;
+                    symbol.entry_point_kind = Some(EntryPointKind::EventListener);
+                }
+            }
+        }
+    }
+
+    // nw-435: promote same-file `Function` symbols called with no enclosing
+    // function body to reachability roots. `detect_python`/`detect_bash`
+    // (entry_points.rs) only recognise a function literally named `main`, so a
+    // bash script or Python module whose top level is bare statements had NO
+    // entry point at all and every function it defined was reported 100%
+    // dead. Restricted to `SymbolKind::Function` (never `Method`): a
+    // module-scope `obj.run()` captures only the bare method name `run`, and
+    // matching it against any same-named `Method` on any class in the file
+    // would root a symbol the call site never actually referenced.
+    //
+    // nw-490: Swift additionally widens the kind gate to `SymbolKind::Class`
+    // — a bare top-level call can also be an implicit constructor call (the
+    // `AppDelegate()` witness), and Swift classes/structs/enums/extensions/
+    // actors are all minted as `SymbolKind::Class` (`swift.scm`'s own
+    // comment). This widening is Swift-only and does not touch Python/bash's
+    // existing, already-shipped `Function`-only behaviour.
+    if !top_level_called.is_empty() {
+        for symbol in &mut symbols {
+            let kind_ok = match lang_str {
+                "swift" => matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class),
+                _ => symbol.kind == SymbolKind::Function,
+            };
+            if !symbol.is_entry_point && kind_ok && top_level_called.contains(symbol.name.as_str())
+            {
+                symbol.is_entry_point = true;
+                symbol.entry_point_kind = Some(EntryPointKind::Main);
+            }
+        }
+    }
+
     // nw-155: promote symbols named in an `export { .. }` clause to Public.
     //
     // has_export_ancestor only recognises the INLINE form, where the declaration
@@ -1663,6 +2030,156 @@ fn collect_identifiers_in_token_tree<'a>(
         for child in current.children(&mut cursor) {
             stack.push(child);
         }
+    }
+}
+
+/// Every candidate callback name registered by a bash `trap NAME SIGSPEC`
+/// command — nw-491. `queries/bash.scm` has exactly one `@reference.call`
+/// rule, which captures a command's own NAME (`"trap"`), never its
+/// arguments, so `trap cleanup EXIT` produced a `Call` reference to `trap`
+/// and none at all to `cleanup`. The handler then had in-degree zero and
+/// nw-435's top-level-call rooting could not help either, because its
+/// `top_level_called` set is populated from `Call` references and `cleanup`
+/// has none.
+///
+/// This is a REGISTRATION, not an ordinary call — the shell runtime invokes
+/// the handler on receipt of a signal, not any call site in the script — the
+/// same relationship `collect_rust_registered_entry_points` already models
+/// for `criterion_group!`. Follow that precedent exactly: walk the whole
+/// tree for `trap` commands (unlike `is_top_level_reference`, this does NOT
+/// check for an enclosing function body — see
+/// `bash_trap_inside_a_function_body_still_roots_the_handler`'s doc comment
+/// for why: a `setup_traps() { trap cleanup EXIT; }` helper still really
+/// registers the handler once it runs), collect candidate names, and let the
+/// caller intersect them against the file's own `Function` definitions —
+/// which is what keeps `trap - EXIT` (reset) or `trap '' EXIT` (ignore) from
+/// inventing an entry point out of nothing.
+///
+/// Operand parsing follows the GNU Bash manual's `trap` grammar exactly
+/// (JUDGE-VERDICT-2b nw-491; confirmed against a tree-sitter-bash 0.25.1
+/// grammar dump, not guessed):
+///  * `-l`, `-p` and `-P` are print/list forms and register nothing.
+///  * A leading `--` ends option parsing and is consumed.
+///  * Among the remaining operands, the first is the ACTION only when at
+///    least one sigspec also remains — a single remaining operand is itself
+///    a sigspec, and the action is implicitly `-` (reset).
+///  * An action of literal `-`, or empty text, is a reset/ignore and
+///    registers nothing.
+///
+/// The action text comes from three possible argument node shapes: a bare
+/// `word`, a single-quoted `raw_string` (unquoted via the existing
+/// `strip_quotes`), or a double-quoted `string` built only from
+/// `string_content` children — a `string` containing any `expansion`,
+/// `simple_expansion` or `command_substitution` child (`trap "$HANDLER"
+/// EXIT`) is rejected outright, since its real value is not knowable
+/// statically. Any other argument node shape (`concatenation`,
+/// `simple_expansion` used directly, `command_substitution`, ...) is
+/// likewise rejected.
+///
+/// The manual's action is "a command that is read and executed" — it can be
+/// an entire shell command line, not just a function name (`trap 'rm -f x'
+/// EXIT`). Only the FIRST WORD of the (quote-stripped) action text is taken
+/// as the candidate, so `trap 'cleanup $?' EXIT` roots `cleanup` (a real
+/// call the trap actually makes) while `trap 'rm -f x' EXIT` only ever
+/// candidates `rm` — which the caller's intersection step then correctly
+/// rejects unless the file genuinely defines a function named `rm`.
+///
+/// KNOWN GAP, same shape as nw-435/nw-490's disclosed cross-file gaps: only
+/// SAME-FILE `Function` definitions are matched, so a handler defined in a
+/// `source`d file (`source lib.sh; trap cleanup EXIT`) is not resolved.
+fn collect_bash_trap_targets<'a>(
+    root: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "command"
+            && let Some(cmd_name) = current
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source_bytes).ok())
+            && cmd_name == "trap"
+        {
+            collect_one_bash_trap_target(current, source_bytes, &mut names);
+            continue;
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    names
+}
+
+/// Parse one `trap` command's operands per the grammar described on
+/// [`collect_bash_trap_targets`], inserting its candidate action name (if
+/// any) into `names`.
+fn collect_one_bash_trap_target(
+    command: tree_sitter::Node,
+    source_bytes: &[u8],
+    names: &mut std::collections::HashSet<String>,
+) {
+    let mut cursor = command.walk();
+    let args: Vec<tree_sitter::Node> = command
+        .children_by_field_name("argument", &mut cursor)
+        .collect();
+    if args.is_empty() {
+        return;
+    }
+    // `-l` (list), `-p`/`-P` (print) register nothing regardless of what
+    // follows them. Quote-stripped via `bash_trap_action_text`, not raw
+    // `utf8_text`, so `trap '-p' EXIT` and `trap "--" cleanup EXIT` are
+    // recognised the same as their unquoted spellings — the shell strips
+    // quotes before `trap` ever sees the argument, so bash treats them
+    // identically.
+    let first_text = bash_trap_action_text(args[0], source_bytes).unwrap_or_default();
+    if matches!(first_text.as_str(), "-l" | "-p" | "-P") {
+        return;
+    }
+    let mut idx = 0;
+    if first_text == "--" {
+        idx += 1;
+    }
+    let operands = &args[idx..];
+    // The action is present only when at least one sigspec also remains; a
+    // lone remaining operand is the sigspec of an implicit reset (`trap
+    // INT`), never a candidate name.
+    if operands.len() < 2 {
+        return;
+    }
+    let Some(text) = bash_trap_action_text(operands[0], source_bytes) else {
+        return;
+    };
+    if text == "-" || text.trim().is_empty() {
+        return;
+    }
+    if let Some(first_word) = text.split_whitespace().next() {
+        names.insert(first_word.to_string());
+    }
+}
+
+/// The unquoted text of a `trap` action argument, or `None` when its shape
+/// cannot be statically resolved to literal text (an unquoted expansion, a
+/// concatenation, a `string` containing any expansion/substitution, ...).
+fn bash_trap_action_text(action: tree_sitter::Node, source_bytes: &[u8]) -> Option<String> {
+    match action.kind() {
+        "word" => action.utf8_text(source_bytes).ok().map(str::to_string),
+        "raw_string" => action.utf8_text(source_bytes).ok().map(strip_quotes),
+        "string" => {
+            let mut cursor = action.walk();
+            let mut text = String::new();
+            for child in action.children(&mut cursor) {
+                match child.kind() {
+                    "string_content" => {
+                        text.push_str(child.utf8_text(source_bytes).ok()?);
+                    }
+                    "\"" => continue,
+                    _ => return None, // expansion / simple_expansion / command_substitution
+                }
+            }
+            Some(text)
+        }
+        _ => None,
     }
 }
 
@@ -2025,16 +2542,121 @@ fn extract_types_from_tree(
     bindings
 }
 
-/// Find the value of a `@name` capture within the same query match.
+/// nw-356 (A) residual (quality-review round 2). Whether `node`'s subtree
+/// contains a tree-sitter `ERROR` node that starts strictly BEFORE
+/// `name_row` (0-based).
+///
+/// Subtree-wide `node.has_error()` (the original gate) was too broad:
+/// `static inline\nint\nfoo(int x DEPRECATED_MACRO);` ALSO has an `ERROR`
+/// node in its subtree — an unexpanded macro sitting after a parameter name
+/// parses as an unexpected second token inside `parameter_list` — but that
+/// `ERROR` is nested three levels down (`declaration` ->
+/// `function_declarator` -> `parameter_list` -> `parameter_declaration` ->
+/// `ERROR`) and sits on the SAME row as the name (row 2), i.e. AFTER the
+/// declarator was already correctly parsed, not before it. `has_error()`
+/// alone can't distinguish "corruption before the name, which invalidates
+/// this declaration's reported start" from "corruption after the name,
+/// which doesn't" — it was clamping the former AND the latter, moving this
+/// declaration's start from line 1 to line 3 for no reason. Restricting to
+/// "an ERROR strictly before the name row" keeps the `LBUG_API` witness
+/// (its `ERROR` sits on rows 4-5, `Foo`'s name on row 7) caught while
+/// excluding the `DEPRECATED_MACRO` case (verified directly via an AST dump
+/// — see `cpp_error_after_name_does_not_clamp_multiline_declaration`).
+///
+/// A bounded DESCENDANT walk, not just `node`'s direct children: nothing in
+/// tree-sitter-cpp's error-recovery documents that the corrupting `ERROR`
+/// always attaches at the immediate-child level. It happens to for the
+/// `LBUG_API` witness (its `ERROR` is a direct child of the `declaration`
+/// node), but that's an artifact of that specific misparse's recovery shape,
+/// not a grammar guarantee — a hypothetical witness with the `ERROR` nested
+/// one level deeper would be silently missed by a direct-children-only
+/// check, under-clamping a genuinely corrupted span. The walk still
+/// terminates quickly in practice without needing an explicit depth bound:
+/// once a subtree's own start row reaches `name_row`, tree-sitter child
+/// order is source order, so nothing under that subtree (or any later
+/// sibling) can start before `name_row` either — the early return below
+/// prunes those branches immediately rather than descending into them.
+///
+/// Deliberately does NOT count zero-width `MISSING` nodes (tree-sitter's
+/// other error-recovery marker, distinct from `ERROR` — e.g. `foo(int x;`
+/// recovers with a `MISSING` `)`). Quality review looked for a witness where
+/// a `MISSING` node before the name row changes an outcome and found none;
+/// widening this function to also match `is_missing()` without a measured
+/// witness would be untested behavior, which is exactly what nw-356's own
+/// "measured, not guessed" discipline (used throughout this file) argues
+/// against. If a future witness needs it, add it then, with the fixture that
+/// proves it.
+fn has_error_before_row(node: &tree_sitter::Node, name_row: u32) -> bool {
+    if node.start_position().row as u32 >= name_row {
+        return false;
+    }
+    if node.kind() == "ERROR" {
+        return true;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i)
+            && has_error_before_row(&child, name_row)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// nw-356 (A). Returns the correct 1-based start line for a C++ `declaration`
+/// capture given the (0-based) row of its `@name` capture.
+///
+/// `fallback` (the node's own reported `start_line`) is returned unchanged
+/// unless ALL of:
+/// - the node's own start row precedes the name's row (the misparse
+///   signature — see
+///   `cpp_macro_prefixed_declaration_span_starts_at_its_name_line`),
+/// - the node is not the templated child of a `template_declaration` (a
+///   legitimate multi-line template header must never be second-guessed by
+///   this heuristic — see
+///   `cpp_template_prefixed_multiline_declaration_keeps_its_start_line`, and
+///   the doc comment at the call site for why this is verified rather than
+///   assumed), and
+/// - the subtree contains an `ERROR` node strictly before the name's row
+///   (see `has_error_before_row` — this is what distinguishes a genuine
+///   grammar misparse from an ordinary, error-free multi-line prototype like
+///   `static inline\nint\nfoo();`, and from an `ERROR` that appears only
+///   AFTER the name, which does not invalidate the declaration's start).
+fn cpp_declaration_start_line(node: &tree_sitter::Node, name_row: u32, fallback: u32) -> u32 {
+    if node.start_position().row as u32 >= name_row {
+        return fallback;
+    }
+    if node
+        .parent()
+        .is_some_and(|p| p.kind() == "template_declaration")
+    {
+        return fallback;
+    }
+    if !has_error_before_row(node, name_row) {
+        return fallback;
+    }
+    name_row + 1
+}
+
+/// Find the value of a `@name` capture within the same query match, along
+/// with the capture node's own (0-based) row.
+///
+/// nw-356 (A): the row is returned alongside the text because it is the one
+/// value that is ALWAYS correct even when the enclosing capture (e.g. a C++
+/// `declaration` node, see `cpp_declaration_start_line` above) reports a
+/// misparsed, over-wide span. `end_position()` is deliberately not used as a
+/// substitute — the declarator can end many lines after its own line (a
+/// multi-line parameter list), so only the name capture's own row is safe to
+/// anchor on.
 fn find_name_capture(
     captures: &[tree_sitter::QueryCapture<'_>],
     capture_names: &[String],
     source_bytes: &[u8],
-) -> Option<String> {
+) -> Option<(String, u32)> {
     for c in captures {
         if capture_names[c.index as usize] == "name" {
             let text = c.node.utf8_text(source_bytes).unwrap_or("").to_string();
-            return Some(strip_quotes(&text));
+            return Some((strip_quotes(&text), c.node.start_position().row as u32));
         }
     }
     None
@@ -6221,6 +6843,309 @@ BOOST_AUTO_TEST_CASE(sanity) {
         assert_eq!(value.parent_name.as_deref(), Some("Reading"));
     }
 
+    /// nw-356 (A). `data_chunk_state.h`'s `DataChunkState` ctor declaration
+    /// (real-corpus witness) was indexed `19-56` instead of `56-56`: a macro
+    /// token in `class LBUG_API DataChunkState {` sits where the grammar
+    /// expects the class NAME, and with no symbol table to recognize
+    /// `LBUG_API` as an unexpanded macro, tree-sitter-cpp's statement-boundary
+    /// recovery desyncs and the `declaration` node minted for a LATER,
+    /// unrelated member (a bodiless constructor) ends up spanning backward
+    /// across the whole preceding nested type. Minimized fixture, verified
+    /// directly against the real binary (not guessed) in the nw-356 spec.
+    #[test]
+    fn cpp_macro_prefixed_declaration_span_starts_at_its_name_line() {
+        let source = "\
+class LBUG_API Foo {
+public:
+    struct Inner {
+        int x;
+        void clear() { x = 0; }
+    };
+
+    Foo();
+    explicit Foo(int capacity) : y{capacity} { z = capacity; }
+
+private:
+    int y;
+    int z;
+};
+";
+        let parsed = parse_source(Path::new("nw356_macro.h"), source).unwrap();
+        // The bodiless prototype `Foo();` is captured via the `declaration`
+        // rule (queries/cpp.scm:42-44) and is the ONE misparsed by the
+        // `LBUG_API` desync; it is `SymbolKind::Function` since nothing in
+        // this change reclassifies it (see the `!has_error()` guard on
+        // nw-356 (B) below, which exists precisely so this case stays a
+        // Function rather than colliding with the most-vexing-parse fix).
+        let foo_decl = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.kind == SymbolKind::Function)
+            .unwrap_or_else(|| panic!("no bodiless Foo() declaration in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo_decl.start_line, 8,
+            "Foo() must start on its own line (8), not the preceding \
+             struct's line: {foo_decl:#?}"
+        );
+
+        // Counterweight: the nested `struct Inner` must still extract
+        // correctly at its own line — this fix must not perturb the class
+        // rule it sits next to.
+        let inner = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Inner")
+            .unwrap_or_else(|| panic!("no Inner in {:#?}", parsed.symbols));
+        assert_eq!(inner.start_line, 3);
+
+        // Counterweight: the second, REAL, body-bearing constructor is a
+        // `function_definition`, not a `declaration` — untouched by this
+        // fix — and must still extract correctly at its own line. Its kind
+        // is `Function` rather than `Method` because the `LBUG_API` desync
+        // (a pre-existing, separate defect, out of nw-356's scope) leaves the
+        // rest of the class body's declarators parsed as plain `identifier`
+        // rather than `field_identifier`; this assertion pins the MEASURED
+        // behavior so a future change to that surrounding defect notices it
+        // moved this fixture too, rather than pretending it is unaffected.
+        let defined_ctor = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.start_line == 9)
+            .unwrap_or_else(|| panic!("no defined Foo(int) ctor in {:#?}", parsed.symbols));
+        assert_eq!(defined_ctor.kind, SymbolKind::Function);
+    }
+
+    /// Counterweight to the fix above: a template's inner `declaration` node
+    /// already starts on its own line (verified directly via a diagnostic
+    /// AST dump: `template<typename T>\nT foo();`'s `declaration` child
+    /// starts at row 1, matching `foo`'s row exactly) — so the clamp's
+    /// `start_row < name_row` condition is already false here, and the
+    /// explicit `template_declaration`-parent guard exists as a second,
+    /// belt-and-suspenders line of defense so a legitimate multi-line
+    /// template header is never second-guessed even if that grammar detail
+    /// changes. `foo` must keep the template line as ITS declaration's own
+    /// start (line 2, immediately after the template header on line 1) —
+    /// not some clamped-elsewhere value.
+    #[test]
+    fn cpp_template_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "template<typename T>\nT foo();\n";
+        let parsed = parse_source(Path::new("nw356_template.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 2,
+            "a template-prefixed declaration keeps its own (already \
+             correct) line, unperturbed by the nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review counterweight (CRITICAL fix): an `[[nodiscard]]`
+    /// attribute pushes the declarator onto a later line exactly like the
+    /// `LBUG_API` misparse does — the `declaration` node's own start row (0,
+    /// the attribute's line) precedes `foo`'s name row (1) — but this is a
+    /// perfectly ordinary, ERROR-FREE parse (`node.has_error() == false`,
+    /// verified directly via an AST dump). Before the `has_error()` gate was
+    /// added, this fixture WAS wrongly clamped from line 1 to line 2, which
+    /// would have silently changed this declaration's UID for no reason.
+    #[test]
+    fn cpp_attribute_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "[[nodiscard]]\nint foo();\n";
+        let parsed = parse_source(Path::new("nw356_attr.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "an attribute-prefixed declaration is a clean parse and must \
+             keep its own (already correct) line, unperturbed by the \
+             nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review counterweight (CRITICAL fix), sibling of the attribute
+    /// case above: `static inline\nint\nfoo();` splits storage-class
+    /// specifiers and the return type across three lines before the
+    /// declarator on line 3 — also a clean, ERROR-FREE parse. Same failure
+    /// mode without the `has_error()` gate: line 1 wrongly clamped to line 3.
+    #[test]
+    fn cpp_specifier_prefixed_multiline_declaration_keeps_its_start_line() {
+        let source = "static inline\nint\nfoo();\n";
+        let parsed = parse_source(Path::new("nw356_specifier.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "a specifier-prefixed multi-line declaration is a clean parse \
+             and must keep its own (already correct) line, unperturbed by \
+             the nw-356 (A) clamp: {foo:#?}"
+        );
+    }
+
+    /// Quality-review round 2 residual: a subtree-wide `node.has_error()`
+    /// gate (round 1's fix for the CRITICAL false-positive) was STILL too
+    /// broad. `static inline\nint\nfoo(int x DEPRECATED_MACRO);` has an
+    /// `ERROR` in its subtree too (an unexpanded macro after a parameter
+    /// name parses as an unexpected extra token inside `parameter_list`,
+    /// nested three levels below the `declaration` node) — but that `ERROR`
+    /// sits on the SAME row as `foo`'s name (row 2), i.e. AFTER the
+    /// declarator was already correctly parsed, not before it. Verified
+    /// directly via an AST dump before writing this test. The clamp must
+    /// only fire for an `ERROR` strictly BEFORE the name row (see
+    /// `has_error_before_row`), so this declaration's own (already correct)
+    /// line 1 must survive untouched.
+    #[test]
+    fn cpp_error_after_name_does_not_clamp_multiline_declaration() {
+        let source = "static inline\nint\nfoo(int x DEPRECATED_MACRO);\n";
+        let parsed = parse_source(Path::new("nw356_error_after_name.h"), source).unwrap();
+        let foo = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap_or_else(|| panic!("no foo in {:#?}", parsed.symbols));
+        assert_eq!(
+            foo.start_line, 1,
+            "an ERROR strictly AFTER the name row does not invalidate the \
+             declaration's own (already correct) start line: {foo:#?}"
+        );
+    }
+
+    /// nw-356 (B). `win_eventlog_sink.h`'s `current_process_token` (real-
+    /// corpus witness) is `struct process_token_t { ... } current_process_
+    /// token(::GetCurrentProcess());` — a LOCAL VARIABLE directly initialized
+    /// with an anonymous struct type. This is the textbook C++ "most vexing
+    /// parse": `Type name(initializer);` is syntactically identical to a
+    /// function declarator `Type name(parameter);`, and tree-sitter-cpp (no
+    /// semantic model) resolves it as one, so the `(declaration declarator:
+    /// (function_declarator ...)) @definition.function` rule mints a spurious
+    /// `Function` for what is really a variable. Minimized fixture, verified
+    /// directly against the real binary in the nw-356 spec.
+    #[test]
+    fn cpp_anonymous_struct_typed_local_is_a_variable_not_a_function() {
+        let source = "\
+void run() {
+    struct token_t {
+        int handle_;
+        ~token_t() {}
+    } current_token(get_handle());
+    use(current_token.handle_);
+}
+";
+        let parsed = parse_source(Path::new("nw356_vexing.h"), source).unwrap();
+        let current_token = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "current_token")
+            .unwrap_or_else(|| panic!("no current_token in {:#?}", parsed.symbols));
+        assert_eq!(
+            current_token.kind,
+            SymbolKind::Variable,
+            "a struct-typed local must not be misclassified as a Function: \
+             {current_token:#?}"
+        );
+
+        // Counterweight: `run` itself is a genuine function and must stay one.
+        let run = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run")
+            .unwrap_or_else(|| panic!("no run in {:#?}", parsed.symbols));
+        assert_eq!(run.kind, SymbolKind::Function);
+    }
+
+    /// Quality-review round 2: probing whether Part B's `has_error()` guard
+    /// should get the same before-the-name-row narrowing as Part A revealed a
+    /// concrete misclassification, so it was narrowed too (not "on principle"
+    /// — this test is the evidence). A most-vexing-parse initializer can
+    /// itself embed an `ERROR` node AFTER the name row — here, a macro-shaped
+    /// extra token inside the constructor call's own argument list
+    /// (`current_token(get_handle() DEPRECATED_MACRO)`) — which has nothing
+    /// to do with nw-356 (A)'s `LBUG_API`-style corruption. Verified directly
+    /// that this makes the WHOLE `declaration` node's `has_error()` true even
+    /// though the `ERROR` sits on the same row as `current_token`'s name, not
+    /// before it. A bare `!node.has_error()` guard wrongly left this
+    /// `current_token` classified `Function`; `has_error_before_row` (which
+    /// only looks for an `ERROR` strictly before the name row) correctly
+    /// reclassifies it to `Variable`.
+    #[test]
+    fn cpp_anonymous_struct_typed_local_with_error_after_name_is_still_a_variable() {
+        let source = "\
+void run() {
+    struct token_t {
+        int handle_;
+        ~token_t() {}
+    } current_token(get_handle() DEPRECATED_MACRO);
+    use(current_token.handle_);
+}
+";
+        let parsed = parse_source(Path::new("nw356_vexing_trailing_macro.h"), source).unwrap();
+        let current_token = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "current_token")
+            .unwrap_or_else(|| panic!("no current_token in {:#?}", parsed.symbols));
+        assert_eq!(
+            current_token.kind,
+            SymbolKind::Variable,
+            "an ERROR strictly AFTER the name row must not exempt a \
+             struct-typed local from reclassification: {current_token:#?}"
+        );
+    }
+
+    /// Counterweight to the fix above: an ordinary bodiless declaration whose
+    /// "type" is a plain type reference (not an inline struct/class
+    /// definition) must stay a `Function` — the reclassification is scoped
+    /// to the exact most-vexing-parse shape, not every `declaration` whose
+    /// declarator looks like a call.
+    #[test]
+    fn cpp_ordinary_bodiless_declaration_stays_a_function() {
+        let source = "int bar(int);\n";
+        let parsed = parse_source(Path::new("nw356_bar.h"), source).unwrap();
+        let bar = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "bar")
+            .unwrap_or_else(|| panic!("no bar in {:#?}", parsed.symbols));
+        assert_eq!(bar.kind, SymbolKind::Function);
+    }
+
+    /// nw-356 engine-level regression: the historical `maskMultiTable`
+    /// witness (`semi_masker.h:19-22` in the real ladybug corpus, reduced
+    /// here to a synthetic fixture) must stay correctly spanned both BEFORE
+    /// and AFTER the nw-356 (A)/(B) changes — an ordinary declaration
+    /// preceded only by comments was never the shape either fix targets, and
+    /// this pins that down as an explicit assertion rather than an assumption.
+    ///
+    /// This is intentionally a before-AND-after pin, per the plan: it is not
+    /// a red/green regression test like the others in this file — it must
+    /// pass unchanged both without and with the nw-356 (A)/(B) changes
+    /// applied, since a bodiless declaration preceded only by comments is a
+    /// clean parse (`has_error() == false`) with its own start row already
+    /// equal to its name's row, so neither fix's guard condition ever fires
+    /// for it.
+    #[test]
+    fn cpp_mask_multi_table_span_regression() {
+        let source = fixture("cpp/mask_multi_table.h");
+        let parsed = parse_source(Path::new("mask_multi_table.h"), &source).unwrap();
+        let sym = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "maskMultiTable")
+            .unwrap_or_else(|| panic!("no maskMultiTable in {:#?}", parsed.symbols));
+        assert_eq!(
+            sym.start_line, 3,
+            "two leading comment lines must not shift the declaration's own \
+             start line: {sym:#?}"
+        );
+    }
+
     /// nw-364(1): tree-sitter-julia's `assignment` node has no lhs/rhs FIELDS,
     /// so the short-form pattern's unanchored `(call_expression …)` matched the
     /// RIGHT side too. `greeting = greet(animal.name)` minted `greet` as a
@@ -7952,6 +8877,732 @@ mod reachability_recovery_tests {
         );
         let parsed = parse("benchmarks/charts.py", src);
         assert_eq!(reads(&parsed), vec!["REPO_ORDER"]);
+    }
+
+    fn find<'a>(parsed: &'a ParsedFile, name: &str) -> &'a RawSymbol {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol named {name}"))
+    }
+
+    /// nw-435. A bash script or Python module whose top level is bare
+    /// statements had no entry point at all, so every function it defined was
+    /// reported 100% dead — the dominant real-world bash idiom, and a common
+    /// Python one, being the broken case. Called-at-module-scope must root the
+    /// callee.
+    #[test]
+    fn python_function_called_at_module_scope_is_an_entry_point() {
+        let src = concat!(
+            "def helper():\n",
+            "    return 1\n",
+            "\n",
+            "def unused_helper():\n",
+            "    return 2\n",
+            "\n",
+            "helper()\n",
+        );
+        let parsed = parse("script.py", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a module-scope call roots its callee"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a function that is never called anywhere stays dead
+        // — proves the rule is scoped to "called at top level", not "every
+        // function in a directly-run file".
+        let unused = find(&parsed, "unused_helper");
+        assert!(
+            !unused.is_entry_point,
+            "a never-called function must not be swept up as an entry point"
+        );
+    }
+
+    /// The dominant real Python idiom wraps the top-level call in
+    /// `if __name__ == "__main__":`. `is_top_level_reference` does not
+    /// special-case this guard — see its doc comment — so this pins that the
+    /// no-special-case design actually covers it.
+    #[test]
+    fn python_function_called_under_dunder_main_is_an_entry_point() {
+        let src = concat!(
+            "def run_job(): pass\n",
+            "if __name__ == \"__main__\":\n",
+            "    run_job()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run_job = find(&parsed, "run_job");
+        assert!(run_job.is_entry_point);
+        assert_eq!(run_job.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// A call from inside another function's body only ever runs when that
+    /// enclosing function is invoked — it is not itself a reachability root.
+    #[test]
+    fn python_call_inside_a_function_body_does_not_root_the_callee() {
+        let parsed = parse("script.py", "def a(): b()\ndef b(): pass\n");
+        let b = find(&parsed, "b");
+        assert!(
+            !b.is_entry_point,
+            "a call from inside another function body is not top level"
+        );
+    }
+
+    /// COUNTERWEIGHT restricting the rule to `SymbolKind::Function`. A
+    /// module-scope `obj.run()` captures only the bare name `run`; matching it
+    /// against a same-named `Method` on a class in the file would root a
+    /// symbol the call site never actually referenced (and would generalize
+    /// badly to any file with multiple classes sharing a method name).
+    #[test]
+    fn python_attribute_call_at_module_scope_roots_only_same_file_functions() {
+        let src = concat!(
+            "class C:\n",
+            "    def run(self): pass\n",
+            "obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Method)
+            .expect("fixture defines the run method");
+        assert!(
+            !run.is_entry_point,
+            "the rule is restricted to Function kinds and must not root a Method"
+        );
+    }
+
+    /// COUNTERWEIGHT, false-positive found in code-quality review: matching by
+    /// bare NAME alone (rather than by the callee's own syntax shape) let an
+    /// attribute call root an UNRELATED same-named module-level `Function`.
+    /// `obj.run()` can only ever invoke `C.run`, a `Method` — it cannot invoke
+    /// a module-level `def run():`, so the module-level `run` must stay dead.
+    #[test]
+    fn python_attribute_call_does_not_root_a_same_named_module_function() {
+        let src = concat!(
+            "def run():\n",
+            "    pass\n",
+            "\n",
+            "class C:\n",
+            "    def run(self):\n",
+            "        pass\n",
+            "\n",
+            "obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("script.py", src);
+        let run_fn = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Function)
+            .expect("fixture defines a module-level run function");
+        assert!(
+            !run_fn.is_entry_point,
+            "an attribute call (obj.run()) must never root a same-named \
+             module-level Function -- a method call cannot invoke it, and a \
+             cross-module `mod.run()` call is a disclosed gap, not this \
+             rule's job"
+        );
+    }
+
+    /// Same shape, bash: a bare top-level command invocation with no `main`
+    /// wrapper is the dominant real-world idiom this item names.
+    #[test]
+    fn bash_function_invoked_at_top_level_is_an_entry_point() {
+        let src = "greet() { echo hi; }\nunused() { :; }\ngreet\n";
+        let parsed = parse("script.sh", src);
+        let greet = find(&parsed, "greet");
+        assert!(greet.is_entry_point);
+        assert_eq!(greet.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a defined-but-never-invoked function stays dead.
+        let unused = find(&parsed, "unused");
+        assert!(!unused.is_entry_point);
+    }
+
+    /// nw-490. `main.swift`'s top-level statements execute directly, the same
+    /// "script executed directly" class nw-435 fixed for Python/bash, just
+    /// outside its scope. A bare top-level call must root its callee.
+    #[test]
+    fn swift_function_called_at_top_level_of_main_swift_is_an_entry_point() {
+        let src = concat!(
+            "func helper() {}\n",
+            "func unused_helper() {}\n",
+            "helper()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a top-level call in main.swift roots its callee"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+
+        // Counterweight: a never-called function stays dead.
+        let unused = find(&parsed, "unused_helper");
+        assert!(!unused.is_entry_point);
+    }
+
+    /// The `AppDelegate()` witness: a bare top-level call can also be an
+    /// implicit constructor call, whose callee resolves to `SymbolKind::Class`
+    /// rather than `SymbolKind::Function`. nw-435's Python/bash promotion is
+    /// deliberately `Function`-only to avoid rooting through an attribute
+    /// call; that reasoning does not apply to a bare constructor call, which
+    /// Swift's grammar already distinguishes from an attribute call at the
+    /// node-shape level.
+    #[test]
+    fn swift_bare_constructor_call_at_top_level_of_main_swift_roots_the_class() {
+        let src = concat!(
+            "class AppDelegate {\n",
+            "    func launch() {}\n",
+            "}\n",
+            "AppDelegate()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let app_delegate = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "AppDelegate" && s.kind == SymbolKind::Class)
+            .expect("fixture defines the AppDelegate class");
+        assert!(
+            app_delegate.is_entry_point,
+            "a bare top-level constructor call roots the Class"
+        );
+        assert_eq!(app_delegate.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// Struct-constructor variant: `swift.scm` mints struct declarations as
+    /// `SymbolKind::Class` too (comment: "Class, struct, enum, extension,
+    /// actor declarations all use class_declaration node"), so the same
+    /// widening must cover a bare struct constructor call, not only classes.
+    #[test]
+    fn swift_bare_constructor_call_at_top_level_of_main_swift_roots_the_struct() {
+        let src = concat!(
+            "struct Config {\n",
+            "    var value: Int = 0\n",
+            "}\n",
+            "Config()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let config = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .expect("fixture defines the Config struct, minted as SymbolKind::Class");
+        assert!(
+            config.is_entry_point,
+            "structs are minted as SymbolKind::Class too, so the constructor widening covers them"
+        );
+        assert_eq!(config.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// COUNTERWEIGHT: Swift only executes top-level code in `main.swift` (or a
+    /// shebang script) — a bare top-level call in any other Swift file must
+    /// not root anything.
+    #[test]
+    fn swift_top_level_call_outside_main_swift_does_not_root_anything() {
+        let src = concat!("func helper() {}\n", "helper()\n",);
+        let parsed = parse("Sources/Helper.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "only main.swift (or a shebang script) executes top-level statements directly"
+        );
+    }
+
+    /// COUNTERWEIGHT mirroring `python_attribute_call_does_not_root_a_same_named_module_function`:
+    /// `obj.run()` is an attribute call (first named child is a
+    /// `navigation_expression`, not a `simple_identifier`) and must never root
+    /// an unrelated, same-named top-level `Function` — it can only ever invoke
+    /// `C.run`, a `Method`.
+    #[test]
+    fn swift_attribute_call_at_top_level_does_not_root_a_same_named_function() {
+        let src = concat!(
+            "func run() {}\n",
+            "\n",
+            "class C {\n",
+            "    func run() {}\n",
+            "}\n",
+            "let obj = C()\n",
+            "obj.run()\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let run_fn = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Function)
+            .expect("fixture defines a top-level run function");
+        assert!(
+            !run_fn.is_entry_point,
+            "obj.run() is an attribute call and must never root a same-named top-level Function"
+        );
+    }
+
+    /// A script run with `swift file.swift` (or `#!/usr/bin/env swift`) also
+    /// executes its top-level statements directly, outside the `main.swift`
+    /// naming convention.
+    #[test]
+    fn swift_shebang_script_top_level_call_is_an_entry_point() {
+        let src = concat!("#!/usr/bin/env swift\n", "func helper() {}\n", "helper()\n",);
+        let parsed = parse("scripts/tool.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a shebang-first Swift script executes its top-level statements directly, same as main.swift"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// A UTF-8 BOM before the shebang line is common from Windows editors and
+    /// must not defeat the shebang check — mirrors the existing
+    /// `strip_prefix('\u{feff}')` precedent in `markdown.rs`.
+    #[test]
+    fn swift_bom_prefixed_shebang_script_top_level_call_is_an_entry_point() {
+        let src = concat!(
+            "\u{feff}#!/usr/bin/env swift\n",
+            "func helper() {}\n",
+            "helper()\n",
+        );
+        let parsed = parse("scripts/tool.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            helper.is_entry_point,
+            "a leading UTF-8 BOM must not defeat the shebang check"
+        );
+        assert_eq!(helper.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// COUNTERWEIGHT for the ancestor list: a call inside `init()` runs once
+    /// per instance construction, not when the file loads, even inside
+    /// `main.swift`.
+    #[test]
+    fn swift_call_inside_init_in_main_swift_does_not_root() {
+        let src = concat!(
+            "func helper() {}\n",
+            "class Foo {\n",
+            "    init() {\n",
+            "        helper()\n",
+            "    }\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "a call inside init() runs once per instance construction, not at file-load time"
+        );
+    }
+
+    /// COUNTERWEIGHT for the ancestor list: a class stored-property
+    /// initializer runs per instance, not at load time, even inside
+    /// `main.swift`.
+    #[test]
+    fn swift_class_property_initializer_in_main_swift_does_not_root() {
+        let src = concat!(
+            "func helper() -> Int { 1 }\n",
+            "class Foo {\n",
+            "    var x = helper()\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let helper = find(&parsed, "helper");
+        assert!(
+            !helper.is_entry_point,
+            "a stored-property initializer runs per instance, not at load time"
+        );
+    }
+
+    /// `Task { await run() }` is the standard Swift concurrency idiom for
+    /// top-level async work. Closures must NOT be disqualifying ancestors —
+    /// excluding them would recreate the false positive this item fixes.
+    #[test]
+    fn swift_task_closure_at_top_level_of_main_swift_roots_its_callee() {
+        let src = concat!(
+            "func run() {}\n",
+            "func unused() {}\n",
+            "Task {\n",
+            "    await run()\n",
+            "}\n",
+        );
+        let parsed = parse("app/Sources/main.swift", src);
+        let run_fn = find(&parsed, "run");
+        assert!(
+            run_fn.is_entry_point,
+            "Task {{ await run() }} is the standard top-level async idiom and must root its callee"
+        );
+        assert_eq!(run_fn.entry_point_kind, Some(EntryPointKind::Main));
+
+        let unused = find(&parsed, "unused");
+        assert!(!unused.is_entry_point);
+    }
+
+    /// The reason the file-name/shebang gate is necessary, not just
+    /// descriptive: a global `let` initializer in an ordinary Swift file is
+    /// LAZY (evaluated on first access), not executed at load time, so it
+    /// must not be treated as a top-level root just because it sits outside
+    /// any function body.
+    #[test]
+    fn swift_global_initializer_call_outside_main_swift_does_not_root() {
+        let src = concat!("func f() -> Int { 1 }\n", "let x = f()\n",);
+        let parsed = parse("Sources/Globals.swift", src);
+        let f = find(&parsed, "f");
+        assert!(
+            !f.is_entry_point,
+            "a global let initializer in a non-main.swift file is lazy, not executed at load time -- the file-name/shebang gate must still apply"
+        );
+    }
+
+    // nw-491: bash `trap NAME SIGSPEC` registers `NAME` as a signal-handler
+    // callback with the shell runtime, not with any call site in the script,
+    // so it needs the same registration-macro-shaped rooting
+    // `collect_rust_registered_entry_points` already gives `criterion_group!`.
+    // Parsed strictly per the GNU Bash manual's `trap` grammar (JUDGE-VERDICT-2b
+    // nw-491): `-l`/`-p`/`-P` print or list and register nothing; a leading
+    // `--` is consumed; the first remaining operand is the action only when at
+    // least one sigspec also remains; an action of `-` or empty text is a
+    // reset/ignore and registers nothing.
+
+    /// The dominant real bash idiom: `trap cleanup EXIT` with a bare,
+    /// unquoted handler name.
+    #[test]
+    fn bash_trap_with_bare_name_roots_the_handler() {
+        let src = "trap cleanup EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a bare trap action roots its handler"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap 'cleanup' INT TERM` — a single-quoted action whose unquoted text
+    /// is exactly one word still names one function, just spelled with
+    /// quotes. The literal DONE WHEN case from the backlog item.
+    #[test]
+    fn bash_trap_with_quoted_single_name_roots_the_handler() {
+        let src = "trap 'cleanup' INT TERM\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap -- cleanup EXIT` — a leading `--` ends option parsing per the
+    /// manual; the action still follows and must still root.
+    #[test]
+    fn bash_trap_double_dash_then_name_roots_the_handler() {
+        let src = "trap -- cleanup EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a `--` before the action must not be mistaken for the action itself"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap cleanup INT TERM EXIT` — several sigspecs after one action; only
+    /// the action (the first operand) is ever a candidate name.
+    #[test]
+    fn bash_trap_multiple_sigspecs_roots_the_handler() {
+        let src = "trap cleanup INT TERM EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// `trap 'cleanup $?' EXIT` — the action is a real shell command line,
+    /// not a bare function name, but its FIRST WORD is `cleanup`. The manual
+    /// says the action is "a command that is read and executed", so rooting
+    /// the first word is what a user calling this a callback would expect.
+    #[test]
+    fn bash_trap_with_dollar_question_calls_its_first_word_function() {
+        let src = "trap 'cleanup $?' EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "the action's first word is a real call the trap actually makes"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT (backlog item's own DONE WHEN counterweight, corrected by
+    /// the judge to intersect on the first word rather than reject the whole
+    /// string): `trap 'rm -f x' EXIT`'s first word is `rm`, and no function
+    /// named `rm` is defined anywhere in the file — only an unrelated,
+    /// differently-named `rm_f_x` is. Nothing must root.
+    #[test]
+    fn bash_trap_command_string_with_no_matching_function_roots_nothing() {
+        let src = "trap 'rm -f x' EXIT\nrm_f_x() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let rm_f_x = find(&parsed, "rm_f_x");
+        assert!(
+            !rm_f_x.is_entry_point,
+            "the trap's first word is `rm`, which does not match `rm_f_x` -- \
+             a multi-word action must never invent a match against an \
+             unrelated same-file function"
+        );
+    }
+
+    /// The other half of the same case: when the file genuinely DOES define a
+    /// function named after the action's first word, the trap really does
+    /// call it, so rooting is correct.
+    #[test]
+    fn bash_trap_command_string_roots_its_first_word_function() {
+        let src = "trap 'rm -f x' EXIT\nrm() { echo would-remove; }\n";
+        let parsed = parse("script.sh", src);
+        let rm = find(&parsed, "rm");
+        assert!(
+            rm.is_entry_point,
+            "trap really does invoke `rm` as its first word, so a same-named \
+             function in the file is a real callee"
+        );
+        assert_eq!(rm.entry_point_kind, Some(EntryPointKind::EventListener));
+    }
+
+    /// COUNTERWEIGHT named explicitly in the task: a quoted action naming a
+    /// function that does not exist anywhere in the file roots nothing. This
+    /// exercises the intersection-with-real-definitions step, not just
+    /// candidate collection.
+    #[test]
+    fn bash_trap_quoted_action_naming_a_non_existent_function_roots_nothing() {
+        let src = "trap 'ghost' EXIT\nother() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let other = find(&parsed, "other");
+        assert!(!other.is_entry_point);
+        assert!(
+            parsed.symbols.iter().all(|s| s.name != "ghost"),
+            "the fixture defines no `ghost` function, so nothing can be found rooted under that name"
+        );
+    }
+
+    /// COUNTERWEIGHT, unquoted variant: `trap ghost EXIT` with no `ghost`
+    /// function anywhere in the file.
+    #[test]
+    fn bash_trap_naming_an_undefined_function_roots_nothing() {
+        let src = "trap ghost EXIT\nother() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let other = find(&parsed, "other");
+        assert!(!other.is_entry_point);
+    }
+
+    /// COUNTERWEIGHT: `trap - EXIT` (explicit reset) and `trap '' EXIT`
+    /// (ignore) must both register nothing. The same file defines a function
+    /// literally named `EXIT` (legal in bash) so this test can only pass for
+    /// the right reason -- the sketch's naive "skip every `-`-prefixed
+    /// argument" bug would otherwise treat `EXIT` itself as the candidate
+    /// name and this test would pass by accident.
+    #[test]
+    fn bash_trap_reset_and_ignore_forms_root_nothing() {
+        let reset = parse("reset.sh", "trap - EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&reset, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap - EXIT` is an explicit reset; `-` is the action, not a name, \
+             and EXIT is a sigspec, never a candidate"
+        );
+
+        let ignore = parse("ignore.sh", "trap '' EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&ignore, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap '' EXIT` ignores the signal; an empty action registers nothing"
+        );
+    }
+
+    /// COUNTERWEIGHT: `-l`, `-p` and `-P` are print/list forms per the manual
+    /// and register nothing, even though their next operand looks exactly
+    /// like a bare trap action. Each fixture defines a function named after
+    /// the sigspec that follows the flag, so the naive "skip every
+    /// `-`-prefixed argument" bug (which would treat the sigspec text as the
+    /// candidate) has something real to wrongly root.
+    #[test]
+    fn bash_trap_print_and_list_options_root_nothing() {
+        let printed = parse("printed.sh", "trap -p EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&printed, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "`trap -p EXIT` prints; it does not register"
+        );
+
+        let printed_upper = parse("printed_upper.sh", "trap -P INT\nINT() { :; }\n");
+        let int_fn = find(&printed_upper, "INT");
+        assert!(
+            !int_fn.is_entry_point,
+            "`trap -P INT` prints; it does not register"
+        );
+
+        let listed = parse("listed.sh", "trap -l\nl() { :; }\n");
+        let l_fn = find(&listed, "l");
+        assert!(
+            !l_fn.is_entry_point,
+            "`trap -l` lists signal names; it does not register"
+        );
+    }
+
+    /// COUNTERWEIGHT: `trap INT` (a single remaining operand) is a reset per
+    /// the manual -- the action is ABSENT, and the lone operand is the
+    /// sigspec, never a candidate name. The sketch's naive "skip every
+    /// `-`-prefixed argument, take the next" bug would otherwise treat `INT`
+    /// itself as the action.
+    #[test]
+    fn bash_trap_single_operand_is_a_sigspec_not_an_action() {
+        let src = "trap INT\nINT() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let int_fn = find(&parsed, "INT");
+        assert!(
+            !int_fn.is_entry_point,
+            "a single operand after `trap` is the sigspec of a reset, not an action"
+        );
+    }
+
+    /// COUNTERWEIGHT: `trap "$HANDLER" EXIT` -- a double-quoted action that is
+    /// entirely a variable expansion. Its unquoted text is not literal source
+    /// naming a function; it is resolved at RUN time to whatever `$HANDLER`
+    /// holds, which this static analysis cannot know. Must not be guessed at
+    /// by, say, treating the literal text `$HANDLER` as a candidate.
+    #[test]
+    fn bash_trap_double_quoted_variable_expansion_roots_nothing() {
+        let src = "trap \"$HANDLER\" EXIT\nHANDLER() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let handler_fn = find(&parsed, "HANDLER");
+        assert!(
+            !handler_fn.is_entry_point,
+            "a trap action that is a variable expansion is not statically knowable and must not be guessed at"
+        );
+    }
+
+    /// DECISION: a `trap` command inside a function body still roots its
+    /// target, the same way `collect_rust_registered_entry_points` scans the
+    /// whole file for `criterion_group!` without checking whether the macro
+    /// invocation itself is lexically top level. Unlike nw-435/nw-490's
+    /// ordinary-call rooting (which asks "does this call run merely by
+    /// loading the file"), a `trap` line is a REGISTRATION action: bash
+    /// scripts commonly wrap trap setup in a helper such as
+    /// `setup_traps() { trap cleanup EXIT; }`, and as long as that helper
+    /// itself ever runs, the trap line still executes and really does
+    /// register the handler. Gating this on "no enclosing function_definition
+    /// ancestor" would silently miss that whole common pattern, so
+    /// `collect_bash_trap_targets` intentionally does not check
+    /// `is_top_level_reference` at all -- it walks the entire tree, exactly
+    /// like the Rust registration-macro precedent it is modelled on.
+    #[test]
+    fn bash_trap_inside_a_function_body_still_roots_the_handler() {
+        let src = concat!(
+            "setup_traps() {\n",
+            "    trap cleanup EXIT\n",
+            "}\n",
+            "cleanup() { :; }\n",
+        );
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a trap registered from inside a function body still really registers when that function runs"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP counterweight: `-l`/`-p`/`-P` and `--` must be recognised
+    /// even quoted. Bash strips quotes before `trap` ever sees its own
+    /// argument text, so `trap '-p' EXIT` is indistinguishable from `trap -p
+    /// EXIT` at the shell level, and `trap "--" cleanup EXIT` still ends
+    /// option parsing the same as an unquoted `--`.
+    #[test]
+    fn bash_trap_quoted_flags_are_recognised() {
+        let printed = parse("printed.sh", "trap '-p' EXIT\nEXIT() { :; }\n");
+        let exit_fn = find(&printed, "EXIT");
+        assert!(
+            !exit_fn.is_entry_point,
+            "a quoted `-p` still prints; it does not register"
+        );
+
+        let parsed = parse("script.sh", "trap \"--\" cleanup EXIT\ncleanup() { :; }\n");
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "a quoted `--` still ends option parsing; the action still follows and must still root"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: a double-quoted action with no expansion is just as much a
+    /// bare name as an unquoted or single-quoted one.
+    #[test]
+    fn bash_trap_double_quoted_bare_name_roots_the_handler() {
+        let src = "trap \"cleanup\" EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(cleanup.is_entry_point);
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: leading whitespace inside a quoted action must not defeat
+    /// `split_whitespace().next()`'s first-word extraction.
+    #[test]
+    fn bash_trap_quoted_action_with_leading_whitespace_roots_its_first_word() {
+        let src = "trap ' cleanup' EXIT\ncleanup() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let cleanup = find(&parsed, "cleanup");
+        assert!(
+            cleanup.is_entry_point,
+            "leading whitespace in the quoted action must not defeat first-word extraction"
+        );
+        assert_eq!(
+            cleanup.entry_point_kind,
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// FOLLOW-UP: two independent `trap` commands in one file must both
+    /// root, proving `collect_bash_trap_targets`'s whole-tree walk visits
+    /// every `trap` command rather than stopping at the first.
+    #[test]
+    fn bash_trap_multiple_trap_commands_in_one_file_all_root() {
+        let src = "trap a EXIT\ntrap b INT\na() { :; }\nb() { :; }\n";
+        let parsed = parse("script.sh", src);
+        let a = find(&parsed, "a");
+        let b = find(&parsed, "b");
+        assert!(
+            a.is_entry_point,
+            "the first trap command must root its handler"
+        );
+        assert!(
+            b.is_entry_point,
+            "the second trap command must also root its handler"
+        );
+        assert_eq!(a.entry_point_kind, Some(EntryPointKind::EventListener));
+        assert_eq!(b.entry_point_kind, Some(EntryPointKind::EventListener));
     }
 }
 

@@ -385,10 +385,12 @@ pub mod cochange;
 pub mod config;
 pub mod content_reader;
 pub mod contract_change;
+pub mod contract_ref_source;
 pub mod contracts;
 pub mod cpu_throttle;
 pub mod cross_domain;
 pub mod dead_code;
+pub mod did_you_mean;
 pub mod diff_impact;
 pub mod drain;
 pub mod embedding;
@@ -485,10 +487,11 @@ pub use brain_memory::{
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
-    ClusterMember, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
-    LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, compute_clusters,
-    default_cluster_resolution, load_clusters, load_clusters_for_resolution, save_clusters,
-    sidecar_path_for_resolution,
+    ClusterMember, ClusterScope, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
+    LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, ScopedClusteringOutput,
+    compute_clusters, compute_clusters_scoped, default_cluster_resolution,
+    default_cluster_resolution_for_symbol_count, load_clusters, load_clusters_for_resolution,
+    save_clusters, sidecar_path_for_resolution,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{

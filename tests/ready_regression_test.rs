@@ -73,8 +73,46 @@ impl Fixture {
             .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
             .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
             .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "60")
+            // nw-461: every database this fixture creates lives under
+            // `tempfile::tempdir()`, i.e. under `$TMPDIR`, so
+            // `nestweaver_daemon::lifecycle::is_temp_db_path` is true for it
+            // and the `daemon start` call site in `main.rs` (`let use_launchd
+            // = !is_temp_db_path(&db_path)`) already skips launchd entirely
+            // for every test in this file -- verified by
+            // `ready_regression_fixture_never_touches_real_launch_agents`
+            // below, which failed on a plist-location assertion before this
+            // was understood, not on a real-home write. HOME is still
+            // isolated here as defense in depth: `runtime_dir()` (pidfile,
+            // socket, `daemon.log`) falls back to `dirs::home_dir() +
+            // ".local/state"` on macOS whenever `XDG_RUNTIME_DIR` and
+            // `dirs::state_dir()` are both unset (the latter is always unset
+            // on macOS), so without this override every daemon this fixture
+            // starts would still write its runtime state into the invoking
+            // process's real `~/.local/state/nestweaver/<hash>`.
+            .env("HOME", self.dir.path().join("home"))
+            // `runtime_dir()` consults `XDG_RUNTIME_DIR` BEFORE the HOME
+            // fallback above, so an ambient value (systemd session, a
+            // developer's shell, or this fixture's own outer test-runner
+            // environment) would silently win over the HOME isolation just
+            // added. Remove it rather than override it: there is no isolated
+            // value worth setting here that `HOME` doesn't already provide.
+            .env_remove("XDG_RUNTIME_DIR")
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .env("XDG_DATA_HOME", self.dir.path().join("data"));
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            // The Unix socket path is `<runtime_dir>/<instance_id>.sock`
+            // (under the now-isolated HOME), and `sockaddr_un::sun_path` is
+            // capped at 104 bytes on macOS/BSD. A path built from a fixture
+            // tempdir plus `home/.local/state/nestweaver/<hash>/...` can
+            // exceed that, and `socket_fallback_root()` (lifecycle.rs) then
+            // falls back to the REAL `/tmp/nw-sock-<uid>` tree when this var
+            // is unset -- outside every isolation above, and outside this
+            // fixture's cleanup. Point it at a fixture-scoped fallback root
+            // so a long path degrades into another isolated location instead
+            // of the operator's real one.
+            .env(
+                "NESTWEAVER_SOCK_FALLBACK_DIR",
+                self.dir.path().join("sock-fallback"),
+            );
         #[cfg(not(target_os = "macos"))]
         cmd.env("NESTWEAVER_DAEMON_FORK", "1");
         cmd
@@ -147,6 +185,114 @@ fn payload(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+// nw-461 safety check (plan step 1). Only macOS ever considers the launchd
+// path (the fixture forks on every other platform instead), so this only
+// needs to run there.
+//
+// This test's FIRST version asserted the plist would appear under the
+// fixture's isolated `HOME`, on the assumption that `daemon start` always
+// goes through launchd on macOS. Running it caught that assumption as false:
+// `main.rs`'s `daemon start` handler gates launchd on
+// `!nestweaver_daemon::lifecycle::is_temp_db_path(&db_path)`, and every
+// database this fixture creates lives under `tempfile::tempdir()` (under
+// `$TMPDIR`), so `daemon start` here never calls `launchd::install_and_start`
+// at all -- there is no plist to find, isolated or not. The real property
+// worth pinning is therefore narrower and stronger: this fixture's databases
+// are always recognized as ephemeral, and no run of this file's `daemon
+// start` calls -- now or after a future change to `is_temp_db_path` or to
+// how this fixture sources its tempdir -- writes into the developer's or
+// CI runner's REAL `~/Library/LaunchAgents`. `real_plist` is computed by
+// calling the exact production function `launchd_plist_path` from THIS test
+// process, whose own `HOME` the fixture never touches, so it names the exact
+// file that must never appear.
+#[cfg(target_os = "macos")]
+#[test]
+fn ready_regression_fixture_never_touches_real_launch_agents() {
+    let f = Fixture::new();
+    assert!(
+        nestweaver_daemon::lifecycle::is_temp_db_path(&f.db),
+        "fixture database must be recognized as ephemeral so `daemon start` skips launchd: {}",
+        f.db.display()
+    );
+
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&f.db);
+    let real_plist = nestweaver_daemon::lifecycle::launchd_plist_path(&instance_id);
+    assert!(
+        !real_plist.exists(),
+        "precondition: this instance's real launch agent must not already exist: {}",
+        real_plist.display()
+    );
+
+    // `socket_fallback_root()` reads `NESTWEAVER_SOCK_FALLBACK_DIR` from THIS
+    // process's own environment, which `Fixture::cmd()` never touches, so
+    // this names the REAL `/tmp/nw-sock-<uid>` tree the daemon would fall
+    // back to if the isolated `HOME`-derived socket path were too long.
+    // Snapshot rather than assert-empty: the real tree may legitimately hold
+    // entries from other daemons on this machine, and this test must never
+    // delete them -- it only asserts no NEW entry appears.
+    let real_fallback_root = nestweaver_daemon::lifecycle::socket_fallback_root();
+    let before = list_dir_names(&real_fallback_root);
+
+    f.cmd()
+        .args(["daemon", "start", "--db"])
+        .arg(&f.db)
+        .arg("--config")
+        .arg(&f.config)
+        .assert()
+        .success();
+
+    assert!(
+        !real_plist.exists(),
+        "daemon start wrote a plist into the real ~/Library/LaunchAgents even though the \
+         database is a temp path: {}",
+        real_plist.display()
+    );
+    assert!(
+        !f.dir.path().join("home/Library/LaunchAgents").exists(),
+        "no launchd artifact should exist anywhere -- daemon start on a temp-path database \
+         never reaches launchd, isolated HOME or not"
+    );
+    let during = list_dir_names(&real_fallback_root);
+    assert_eq!(
+        during,
+        before,
+        "daemon start left new entries in the REAL {} instead of the fixture's isolated \
+         NESTWEAVER_SOCK_FALLBACK_DIR",
+        real_fallback_root.display()
+    );
+
+    f.stop();
+    assert!(
+        !real_plist.exists(),
+        "the real ~/Library/LaunchAgents must still be untouched after stop: {}",
+        real_plist.display()
+    );
+    let after = list_dir_names(&real_fallback_root);
+    assert_eq!(
+        after,
+        before,
+        "daemon stop left new entries in the REAL {} instead of the fixture's isolated \
+         NESTWEAVER_SOCK_FALLBACK_DIR",
+        real_fallback_root.display()
+    );
+}
+
+/// File names directly under `path`, or an empty set if it doesn't exist.
+/// Never removes or modifies anything -- a snapshot only.
+///
+/// Only the macOS socket-fallback guard above calls this; on other platforms
+/// it would be dead code and `-D warnings` would reject it.
+#[cfg(target_os = "macos")]
+fn list_dir_names(path: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]

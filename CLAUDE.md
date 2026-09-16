@@ -169,13 +169,45 @@ by an error message the tool can print, so they belong somewhere findable.
 | `NESTWEAVER_LBUG_AUTO_CHECKPOINT` | on | `0`/`false` defers auto-checkpoints; reduces the #678 corruption trigger during bulk load. |
 | `NESTWEAVER_LBUG_MAX_DB_SIZE` | engine default | Max database size in bytes. Also bounds the VIRTUAL ADDRESS RESERVATION each open takes, so a smaller value allows more concurrent opens — lbug's own test config bounds it for exactly that reason. `.cargo/config.toml` pins 16 GiB for anything cargo runs, because the suite opens dozens of stores at default parallelism and exhausted address space, failing unrelated tests with an mmap error (nw-137). Raise it for a brain approaching the bound. |
 | `NESTWEAVER_RPC_TIMEOUT_SECS` | 300 | Client-side ceiling on a daemon RPC; `0` disables. `--max-millis` is enforced SERVER-side and does not bound the client's wall clock, so without this a daemon that accepted the connection and then stopped answering parked the CLI indefinitely (nw-162). With `--max-millis` the ceiling is that budget plus a transport margin. |
-| `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` | 3000 | How long a ranked query waits out an in-flight index publication before failing closed. Named in the error message itself, so it must be discoverable here. |
+| `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` | 3000 | How long a ranked query waits out an in-flight index publication before failing closed. Named in the error message itself, so it must be discoverable here. Scoped to the publications that still fail closed — a full `index` window, and any marker that cannot be attributed to a live writer. A live `"brain watcher batch"` publication no longer makes a ranked query wait at all: it answers immediately, with disclosure. See the `<db>.index-dirty` sidecar bullet. |
 | `NESTWEAVER_CRASH_REPORT_DIRS` | platform | Extra directories scanned by `diagnostics capabilities` for nw-073 crash recurrence. |
 | `NESTWEAVER_GIT_CLONE_TIMEOUT_SECS` / `NESTWEAVER_GIT_NET_TIMEOUT_SECS` | — | Bounds on git clone / network operations during pull. |
 
 Server mode additionally reads `NESTWEAVER_BIND`, `NESTWEAVER_TOKEN`,
 `NESTWEAVER_ADMIN_TOKEN`, `NESTWEAVER_UPSTREAM`, and
 `NESTWEAVER_WEBHOOK_SECRET` / `NESTWEAVER_WEBHOOK_SECRET_OLD` (rotation).
+
+### Instance-config keys in the same class
+
+One TOML key belongs in the same place, for the same reason — the daemon
+discloses it by name in `brain_status` text, so an operator who reads that
+message needs somewhere to look it up.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `[embedding] auto_repair_cache` | `true` | Bounded background repair of a MISSING local model cache (nw-484). Opt-OUT, not opt-in, and the scope is what makes that safe: it only ever re-fetches the model the DB's own VERIFIED persisted identity already names, and only when the boot load failed with a typed missing-artifact cause. It is never a first-time download — those stay operator-initiated — and it is skipped outright when an external embedding backend is configured, since there is no local cache to repair. Bounded: at most 5 attempts, the first immediate and the rest after 30s / 2m / 8m / 30m, each independently jittered ±20%, stopping early on a permanently-failing error (404/401, repo or entry not found). Anything not positively identified as permanent is treated as transient, so an unrecognised error keeps the bounded schedule rather than going quiet after one try. Present only in builds with the `embed` feature. |
+
+**nw-484 changed the recovery story for a missing model cache; older guidance
+to restart the daemon after `nestweaver embed` is wrong for that case.**
+`nestweaver embed` now recovers a missing local model cache in ONE call — it
+seeds the artifacts off the write gate on a dedicated thread, then hands the
+load to `run_server`'s main `block_on` loop over a channel and awaits the
+reply, because candle's Metal path needs the process main thread and an RPC
+handler runs on a tokio worker. No stop, no restart, no second invocation.
+What has NOT changed: **daemon startup remains cache-only.** The boot load and
+the main-thread reload loop never download; only `embed`/`plan_embed` and the
+bounded auto-repair above may fetch bytes, which is precisely what keeps a
+cold boot from blocking on the network.
+
+While a seed is in flight the embedding state reads `"seeding"`, which takes
+precedence over EVERY other state including `ready`. That precedence is the
+point: during the production incident `ready` was the truth about the model
+and not about the daemon, and a stale `EmbeddingRuntimeStatus` may still read
+`failed` from a previous attempt or `loading` on a first-boot repair — bytes
+moving is the ground truth, not the snapshot. `"seeding"` is neither `ready`
+nor `embedding`, so it already falls into `disclose_semantic_degradation`'s
+degraded branch and yields `degraded_components: ["semantic"]` with no new
+state added to that function.
 
 ## macOS App (preferred on Mac)
 
@@ -230,6 +262,33 @@ nestweaver rts-eval record-truth --sha X --failed-test-files a.test.ts  # CI rep
 nestweaver rts-eval report               # measured recall/breadth of past selections (nw-037 loop)
 nestweaver dead-code                     # REVIEW AID, not a deletion list — measured 0/15 top-15 precision on Rust, poor on C++
 #                                        REFUSES (exit 2) on a resolver-generation-stale graph — see the sidecar bullet
+#   That 0/15 figure predates the generation-6 entry-point work (bash/Python/
+#   Swift rooting, bash `trap` handlers, monorepo package.json entries). Those
+#   add reachability ROOTS, which can only remove symbols from the unreachable
+#   set, so the measured precision is stale and should be RE-MEASURED before
+#   anyone quotes it — it is not a number to assume got worse, or better.
+#   Three behaviours worth knowing before reading the output (nw-489/nw-444):
+#   - A Rust `impl` block (`SymbolKind::Extension`) is reachable when ANY of
+#     its members is. It has no `MEMBER_OF` edge to reach it by — `index.rs`'s
+#     `container_kinds` excludes `Extension` deliberately, since an impl
+#     block's symbol name is only the type's name and several impl blocks of
+#     one type cannot be told apart by it — so reachability propagates by SPAN
+#     CONTAINMENT over the container's own line range instead, which IS unique
+#     per block. A sibling impl block of the same type, with a disjoint span,
+#     stays dead on its own merits.
+#   - A dead impl block now SUPPRESSES ITS OWN `Method` members rather than
+#     listing them again beside it. Associated `Constant`s still surface: the
+#     suppression is gated on `Method`, and a dead constant is a genuine,
+#     separately-actionable finding. The suppression is computed before any
+#     `--repo` scoping, so a filter can never un-suppress a method.
+#   - Results are ordered deterministically with `uid` as the FINAL tie-break
+#     (after rank, file path, name). `Vec::sort_by` is stable, so without it
+#     two symbols tied on every visible field ordered by store iteration —
+#     which decides WHICH ROWS SURVIVE `--limit`, and made the truncated list
+#     non-reproducible across runs.
+#   One honest limit: bash `trap` resolution is SAME-FILE ONLY. A handler
+#   defined in a `source`d file and registered by a `trap` in the sourcing
+#   script is not promoted, and shows as unreachable.
 
 # Export
 nestweaver export --format cypher        # graph export (cypher, graphml, mermaid)
@@ -244,6 +303,18 @@ nestweaver brain status                  # vault counts, per-vault staleness
 nestweaver brain stale-check             # compare indexed SHAs against git HEAD
 nestweaver brain stale-check --json      # JSON output
 nestweaver brain watch ~/notes --refresh-wiki-hours 6 --config ./instance.toml  # periodic wiki refresh
+nestweaver brain diff my-service         # files added/modified/deleted since the repo's indexed SHA, plus affected symbols
+nestweaver brain diff my-service --since-sha abc123 --limit 200 --json
+#   --limit is 1-1000, default 50 — the same bound the MCP brain_diff schema
+#   declares, because this is its read-only CLI twin, not a second
+#   implementation. LOCAL REPOS ONLY: there is no remote fetch behind it.
+
+# Vault notes
+nestweaver note get "Architecture Overview"          # full markdown body + frontmatter, heading outline, section count
+nestweaver note get note:vault:Notes:abc123 --json   # a `note:` UID resolves as well as a title
+#   Read-only CLI twin of the MCP `note_get` tool. Accepts either a `note:` UID
+#   or a note title, and exits 2 (not found) on a miss rather than printing an
+#   empty note — so a script can branch on the miss instead of parsing output.
 
 # Projects
 nestweaver list-projects --config ./nestweaver-instance.toml
@@ -286,12 +357,21 @@ nestweaver interactions forget <uid> --db ./nestweaver.lbug    # drop one node's
 nestweaver extensions list --db ./nestweaver.lbug              # read back what agents wrote via set_extension
 nestweaver extensions unset <uid> <key>                         # remove one extension property from one node
 
-# MCP server (42 tools; 36 in direct read-only mode; 6 with --lite, e.g. for Cursor).
+# MCP server (43 tools; 36 in direct read-only mode; 6 with --lite, e.g. for Cursor).
 # The count is derivable, not typed: `all_tool_schemas_undecorated()` in
 # crates/nestweaver-mcp/src/tools.rs is the registry, and
 # tools::tool_doc_tests::all_tools_have_doc_categories asserts the doc table
 # covers exactly tool_list(false)["tools"].len(). Read it back with tools/list
 # rather than restating it.
+# The 43 - 36 gap is the 7 MUTATING tools, which direct read-only mode
+# withholds. That list is derivable too, and for the same reason: the
+# `mutating_tools!` invocation in crates/nestweaver-mcp/src/http.rs projects
+# BOTH `MUTATING_TOOLS` (the single canonical gate, referenced by the HTTP/MCP
+# surface and the daemon's gRPC surface alike) and `MUTATING_TOOL_HINTS`, so
+# `readOnlyHint`/`destructiveHint` are derived from membership rather than
+# hand-written beside it. `unset_extension` is one of the 7 — a count of six
+# predates it. Read the annotations back off tools/list rather than trusting
+# either number here.
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 # --tools takes exact, case-sensitive REGISTRY names, not CLI verb names.
@@ -340,7 +420,8 @@ Sidecar files written alongside the database:
 - `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read). Every entry also records the response-SHAPE version of the binary that wrote it (derived by `nestweaver-mcp/build.rs` from the shape-relevant crate sources). Foreign-shape entries are dropped at open and refused on lookup, so a release that adds a response field cannot serve the old shape from cache across an upgrade. The digest is deliberately over-broad: a comment-only edit in a hashed crate also invalidates the cache, costing one recompute
 - `<db>.parsed_cache.bin` — Cached parse results (symbols, references, type bindings) keyed by content hash, for skipping re-parsing unchanged files
 - `<db>.resolution_deps.bin` — Per-file resolution dependency tracker for incremental cross-file resolution
-- `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and reads as generation 0. A repo below `RESOLVER_GENERATION` is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE cannot repair edges already written — only re-indexing can. **COMPATIBILITY IS AN EXACT MATCH AS OF 9.1.0, NOT A FLOOR.** Through 9.0.5 a repo was stale only when its generation was BELOW `RESOLVER_GENERATION`; it is stale whenever it DIFFERS. Deliberate — a graph written by a NEWER resolver than the running binary understands is exactly as untrustworthy as an older one, and the old comparison silently trusted it. Missing and unreadable generation metadata fail closed the same way (both read as generation 0). TWO CONSEQUENCES TO PLAN FOR. Mixed-version fleets: a developer who upgrades and re-indexes a shared graph makes every repo read as incompatible to colleagues and CI still on the older binary, degrading `affected-tests` to `run-full-suite` and failing `stale-check` with exit 2 until they upgrade too. And one stale repo degrades EVERY edge-dependent call, not only the calls touching it — the preflight is `list_repos(None)` over the whole store, so a changed file in a freshly-indexed repo still yields `run-full-suite`. **`RESOLVER_GENERATION` is 4 as of 9.0.0** (`crates/nestweaver-engine/src/resolver_generation.rs`, which carries the per-generation rationale); every graph built by an earlier release must be re-indexed before rankings, `MEMBER_OF` edges and C++ `IMPORTS` edges are correct. **`stale-check` consults this sidecar as of 9.0.0** — a repo below `RESOLVER_GENERATION` reports `status: "outdated_resolver"`, `resolver_stale: true`, `needs_reindex: true`, and the command exits 2 (through 8.x its ladder was SHA-vs-HEAD only and a generation-3 graph exited 0). The remedy needs `--force`: a generation-stale repo is at HEAD with nothing modified, so plain `nestweaver index --repo <path>` takes the incremental path and writes nothing. `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` disclose it too (`rankings_stale` / `stale_repos`). **`dead-code` REFUSES as of 9.0.0** on every route (CLI direct, CLI daemon, `--json`, MCP `dead_code`): it returns `refused: true` with `reason: "outdated_resolver"`, a `remedies` array of ready-to-run `nestweaver index --repo <path> --force` commands, and NO `unreachable_symbols` key, and the CLI exits 2. It refuses rather than disclosing because its output is a list of symbols to DELETE computed by a forward reachability walk, so a missing edge can only move a LIVE symbol onto it — the error is one-directional and the deletion is not recoverable. The response cache is salted with this sidecar (`resolver_generation_cache_salt`) so a pre-bump list cannot be replayed past the bump. `clusters`, `blast-radius`, `affected-tests`, `generate-guide`, PPR-backed `context` and the web UI still do not disclose. Vaults are not `Repo` nodes and carry no generation
+- `<db>.index-dirty` — durable publication marker. Written by the indexing writer with `sync_all` and a fsynced parent directory PRECISELY so it survives process death: while it exists, the canonical `.generation` and `.pagerank.json` sidecars may predate the committed graph. The payload is `{pid}:{nanos}[:{reason}[:{note_paths}]]`. The optional FOURTH `:`-delimited field (nw-475) is a `1`/`0` truncation flag followed by up to `MAX_MARKER_NOTE_PATHS` (20) comma-separated in-flight note paths — `1,a.md,b.md` means "more were in flight than fit; these are the first two". It is additive and BACKWARD COMPATIBLE: the legacy 2-field `{pid}:{nanos}` and 3-field `{pid}:{nanos}:{reason}` payloads still parse, a writer with nothing in flight emits the 2- or 3-field shape byte-for-byte unchanged, and a path containing a literal `,` or `:` degrades only that DIAGNOSTIC list — pid, timestamp and reason are parsed first and independently, so the marker's safety-critical fields are unaffected. Two reason constants: `"cancelled"` (`MARKER_REASON_CANCELLED`, a run that committed after cancellation was requested and left its publication dirty deliberately) and `"brain watcher batch"` (`MARKER_REASON_WATCHER_BATCH`). **Reads are not uniformly failed closed any more.** `GraphStore::index_publication_blocks_ranking` treats a `"brain watcher batch"` marker as non-blocking WHILE THE WRITE LEASE IS STILL HELD, so a ranked read answers through it with disclosure — `publication_in_progress`, `marker_age_s`, `in_flight_note_paths`, `in_flight_note_paths_truncated` — because a watcher batch's window is a debounced set of short per-file critical sections rather than one atomic run, and failing an entire vault's ranked reads closed for the duration of ordinary note editing is not a proportionate answer. A full `index` publication still FAILS CLOSED, and a WEDGED watcher marker still blocks: with no live lease the same marker is indistinguishable from an abandoned publication, so it falls back to blocking. Parsing is three-state by design — absent / present / undeterminable — and an `EACCES`/`EIO` on the sidecar directory reads as permanently dirty (`try_exists().unwrap_or(true)`), because "cannot tell" is not "abandoned" and recovery must never clear a marker it could not read
+- `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and reads as generation 0. A repo below `RESOLVER_GENERATION` is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE cannot repair edges already written — only re-indexing can. **COMPATIBILITY IS AN EXACT MATCH AS OF 9.1.0, NOT A FLOOR.** Through 9.0.5 a repo was stale only when its generation was BELOW `RESOLVER_GENERATION`; it is stale whenever it DIFFERS. Deliberate — a graph written by a NEWER resolver than the running binary understands is exactly as untrustworthy as an older one, and the old comparison silently trusted it. Missing and unreadable generation metadata fail closed the same way (both read as generation 0). TWO CONSEQUENCES TO PLAN FOR. Mixed-version fleets: a developer who upgrades and re-indexes a shared graph makes every repo read as incompatible to colleagues and CI still on the older binary, degrading `affected-tests` to `run-full-suite` and failing `stale-check` with exit 2 until they upgrade too. And one stale repo degrades EVERY edge-dependent call, not only the calls touching it — the preflight is `list_repos(None)` over the whole store, so a changed file in a freshly-indexed repo still yields `run-full-suite`. **`RESOLVER_GENERATION` is 6** (`crates/nestweaver-engine/src/resolver_generation.rs`, which carries the per-generation rationale); every graph built by an earlier release must be re-indexed before rankings, `MEMBER_OF` edges and C++ `IMPORTS` edges are correct. Generations 1-4 changed EDGE shape (nw-103 import fan-out; nw-308/327 and nw-323/324 receiver-gate and TS/JS specifier resolution; nw-349/330/340 degenerate function spans and the `Class`→`Extension` reclassification; nw-352/356/351/349/364 `.h` dispatched to the C++ grammar, C-family `MEMBER_OF`, C++ `#include` and Rust attribute references). Generation 5 (nw-441) was the first to turn on PERSISTED PER-SYMBOL COLUMNS instead: `vue.rs`/`svelte.rs`/`astro.rs` hardcoded `is_entry_point: false` and never called `detect_entry_point`. Generation 6 is the same persisted-column shape, five times over — `is_entry_point`/`entry_point_kind` are read straight off disk by `dead-code`, `process.rs` and `ranking.rs` rather than re-derived, so a symbol in an already-indexed graph keeps `false` forever no matter which binary asks: **nw-435** roots bash and Python top-level calls (a call with no enclosing `function_definition` — and for Python no enclosing `lambda` — promotes its same-file `Function` callee to `Main`), which is the dominant real-world bash idiom and previously left every function in a bare-statement script walked as dead; **nw-356** re-anchors error-recovered, macro-prefixed C++ `declaration` spans (changing their `(repo, path, name, start_line)` UIDs, and therefore every CALLS/`MEMBER_OF` edge endpoint pointing at one) and reclassifies the C++ most-vexing-parse struct-typed local from a spurious `Function` to `Variable`, which can never be a CALLS target; **nw-490** extends nw-435's mechanism to Swift, gated to `main.swift` or a shebang first line — the only Swift files whose top-level statements execute directly — and widens the promoted-kind gate to `SymbolKind::Class` there, because Swift mints classes/structs/enums/actors alike as `Class` and a bare top-level call can be an implicit constructor call; **nw-491** teaches `queries/bash.scm` to capture a command's ARGUMENTS, so `trap cleanup EXIT` finally references `cleanup` rather than the literal word `trap`, promoting the handler to `EventListener` (not `Main` — a trap fires on an external OS signal, so it must stay out of `process.rs`'s `{dir}::main` bucket). Folded into the same bump: `package.json` entry-point discovery now runs at ANY DEPTH rather than the repo root alone, so a monorepo's `packages/*/package.json` contributes its own entry points, each rebased against the manifest's own directory, and `browser` joins `main`/`bin`/`exports` as an entry file when its value is a string (the object form is still ignored). That has the same on-disk staleness shape as the other four, one artefact over: this entry set is not the per-symbol `is_entry_point` column but the `<db>.manifests.json` sidecar, which `dead-code` reads at query time and ORs with each symbol's persisted column to build its seed set. Either way a repo indexed before the fix keeps the old root-only, unrebased list forever and only `--force` rewrites it — which is why one bump covers all five rather than each taking its own. **`stale-check` consults this sidecar as of 9.0.0** — a repo below `RESOLVER_GENERATION` reports `status: "outdated_resolver"`, `resolver_stale: true`, `needs_reindex: true`, and the command exits 2 (through 8.x its ladder was SHA-vs-HEAD only and a generation-3 graph exited 0). The remedy needs `--force`: a generation-stale repo is at HEAD with nothing modified, so plain `nestweaver index --repo <path>` takes the incremental path and writes nothing. `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` disclose it too (`rankings_stale` / `stale_repos`). **`dead-code` REFUSES as of 9.0.0** on every route (CLI direct, CLI daemon, `--json`, MCP `dead_code`): it returns `refused: true` with `reason: "outdated_resolver"`, a `remedies` array of ready-to-run `nestweaver index --repo <path> --force` commands, and NO `unreachable_symbols` key, and the CLI exits 2. It refuses rather than disclosing because its output is a list of symbols to DELETE computed by a forward reachability walk, so a missing edge can only move a LIVE symbol onto it — the error is one-directional and the deletion is not recoverable. The response cache is salted with this sidecar (`resolver_generation_cache_salt`) so a pre-bump list cannot be replayed past the bump. `clusters`, `blast-radius`, `affected-tests`, `generate-guide`, PPR-backed `context` and the web UI still do not disclose. Vaults are not `Repo` nodes and carry no generation
 
 ## Architecture
 
@@ -406,6 +487,15 @@ federation          (leaf: schema + proto only)
 
 - `ci.yml` — cargo fmt, clippy, test, coverage (`cargo-llvm-cov`), security audit (`cargo-audit`) (on every PR and push to main)
 - `release-please.yml` — automated releases, binary builds for x86_64/aarch64 x linux/darwin
+
+The **Cold Metal daemon smoke** job (`metal-smoke`, macOS-only, in `Required
+CI`) now runs `tests/ready_regression_test.rs` as well as `--workspace --lib`
+and `tests/daemon_test.rs` (nw-461). That file sat outside BOTH of the other
+two gates, which is why all three of this repo's macOS-divergent regressions
+— GNU-vs-BSD `tar | grep -q` under `pipefail`, GNU-only `find -printf`, and an
+uncanonicalised `/var` vs `/private/var` comparison — reached a human on a Mac
+before they reached CI. The project is developed on macOS and released from
+Linux runners, so platform divergence is real in both directions.
 
 ## Exit codes
 

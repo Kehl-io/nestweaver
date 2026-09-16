@@ -2,7 +2,7 @@
 
 ## Why this exists
 
-Five open backlog items are blocked on the same missing artefact, and none of
+Four open backlog items are blocked on the same missing artefact, and none of
 them owned building it — so it could never be scheduled:
 
 | Item | What it needs the corpus for |
@@ -11,7 +11,14 @@ them owned building it — so it could never be scheduled:
 | nw-308 | hub/bridge name-collision rate across many repos |
 | nw-322 | `investigate --scope project:` latency on a large multi-repo graph |
 | nw-351 | C++ entry-point discovery, re-measured |
-| nw-358 | `stale_repos` ordering across routes, needs tens of repos |
+
+**nw-358** (`stale_repos` ordering differing by route) previously sat here too,
+citing a need for "tens of repos." That premise was wrong: the divergence was
+never a scale effect, only a lexicographic-vs-insertion-order accident that a
+TWO-repo fixture reproduces as long as the second repo does not sort after the
+first. It shipped fixed and covered by
+`stale_repos_is_the_same_list_on_every_route` (`tests/parity_test.rs`,
+commit `0dd98b08`) using exactly that two-repo fixture — no corpus needed.
 
 Every one of those measurements had previously been taken against Kory's
 personal brain DB. That DB is not reproducible by anyone else, so no result
@@ -71,6 +78,6 @@ themselves: `DEFAULT_RETRIEVAL_BREADTH` 30, `HUB_COUNT` 30,
 
 ## Definition of done
 
-nw-413 is closed when **one of the five dependent items has been re-measured
+nw-413 is closed when **one of the four dependent items has been re-measured
 with this corpus and closed or updated on the result** — not when the script
 exists. A fixture nobody has used is the same dead end as no fixture.

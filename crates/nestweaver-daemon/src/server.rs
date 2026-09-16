@@ -18,6 +18,7 @@ use tonic::codegen::http;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
+use crate::embedding_repair::*;
 use crate::lifecycle;
 use crate::safeguards::{
     ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard_cancellable,
@@ -306,7 +307,10 @@ mod list_contracts_tests {
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
 /// the async task is cancelled, the counter is still decremented.
-struct ConnectionGuard {
+///
+/// `pub(crate)`: `crate::embedding_repair` holds a read guard for the life
+/// of an artifact download (nw-484).
+pub(crate) struct ConnectionGuard {
     counter: Arc<AtomicU32>,
 }
 
@@ -329,7 +333,7 @@ where
 }
 
 impl ConnectionGuard {
-    fn read(state: &DaemonState) -> Self {
+    pub(crate) fn read(state: &DaemonState) -> Self {
         state.active_reads.fetch_add(1, Ordering::Relaxed);
         state.idle_notify.notify_one();
         Self {
@@ -546,7 +550,9 @@ fn persist_embed_output(
     Ok(())
 }
 
-fn unix_now_seconds() -> i64 {
+/// `pub(crate)`: used by `crate::embedding_repair` (nw-484)'s auto-repair
+/// backoff scheduling.
+pub(crate) fn unix_now_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1210,14 +1216,18 @@ pub struct UiServerRegistration {
     watcher: Option<UiWatcherBinding>,
 }
 
+/// `pub(crate)` (the type itself, plus `state`/`error` only — everything
+/// else stays module-private): `crate::embedding_repair` (nw-484) carries
+/// this by value in `EmbeddingReloadOutcome` and directly sets
+/// `state`/`error` when a seed or reload attempt fails.
 #[derive(Debug, Clone, Default)]
-struct EmbeddingRuntimeStatus {
-    state: String,
+pub(crate) struct EmbeddingRuntimeStatus {
+    pub(crate) state: String,
     backend: String,
     requested_device: String,
     selected_device: String,
     model_id: String,
-    error: String,
+    pub(crate) error: String,
     metal_compiled: bool,
     fallback_used: bool,
 }
@@ -1416,7 +1426,9 @@ impl EmbeddingRuntimeSnapshot {
     }
 }
 
-struct EmbeddingRuntime {
+/// `pub(crate)`: named by `DaemonState::embedding_runtime`'s type, which
+/// `crate::embedding_repair` (nw-484) reads/writes through.
+pub(crate) struct EmbeddingRuntime {
     snapshot: std::sync::RwLock<EmbeddingRuntimeSnapshot>,
 }
 
@@ -1439,7 +1451,9 @@ impl EmbeddingRuntime {
         (snapshot.status().clone(), snapshot.model())
     }
 
-    fn status(&self) -> EmbeddingRuntimeStatus {
+    /// `pub(crate)`: read by `crate::embedding_repair` (nw-484)'s reload
+    /// servicer and auto-repair loop.
+    pub(crate) fn status(&self) -> EmbeddingRuntimeStatus {
         self.snapshot
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -1454,7 +1468,9 @@ impl EmbeddingRuntime {
             .model()
     }
 
-    fn publish_unavailable(&self, status: EmbeddingRuntimeStatus) {
+    /// `pub(crate)`: called by `crate::embedding_repair` (nw-484)'s
+    /// auto-repair loop to publish a failed status between attempts.
+    pub(crate) fn publish_unavailable(&self, status: EmbeddingRuntimeStatus) {
         assert_ne!(status.state, "ready");
         *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) =
             EmbeddingRuntimeSnapshot::Unavailable { status };
@@ -1574,11 +1590,24 @@ fn finalize_embedding_status(
 /// said `ready`, so nothing in status distinguished "idle and healthy" from
 /// "busy and healthy". While a pass is in flight the state narrows to
 /// `embedding`, which still implies the model is loaded and usable.
+///
+/// `seeding` (nw-484) takes precedence over everything else: while an
+/// artifact download is in flight, semantic retrieval really is unavailable
+/// regardless of what the last published `EmbeddingRuntimeStatus` says (it
+/// may still read `failed` from a previous attempt, or `loading` on the very
+/// first boot repair) — bytes moving is the ground truth, not the stale
+/// snapshot. This is the same overlay shape as `embedding`, just with higher
+/// precedence, and it deliberately adds no NEW state to
+/// `disclose_semantic_degradation`: `seeding` is neither `ready` nor
+/// `embedding`, so it already falls into that function's degraded branch.
 fn effective_embedding_state(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
+    seed_active: bool,
 ) -> String {
-    if progress.active && status.state == "ready" {
+    if seed_active {
+        "seeding".to_string()
+    } else if progress.active && status.state == "ready" {
         "embedding".to_string()
     } else {
         status.state.clone()
@@ -1590,11 +1619,12 @@ fn embedding_status_proto(
     progress: &EmbedProgressSnapshot,
     occupancy: nestweaver_store::EmbeddingIndexOccupancy,
     store: &GraphStore,
+    seed: &SeedProgressSnapshot,
 ) -> nestweaver_proto::EmbeddingStatus {
     let (identity_state, identity_error, identity_remediation) =
         embedding_identity_fields(store, status);
     nestweaver_proto::EmbeddingStatus {
-        state: effective_embedding_state(status, progress),
+        state: effective_embedding_state(status, progress, seed.active),
         backend: status.backend.clone(),
         requested_device: status.requested_device.clone(),
         selected_device: status.selected_device.clone(),
@@ -1613,6 +1643,13 @@ fn embedding_status_proto(
         identity_state: identity_state.to_string(),
         identity_error,
         identity_remediation: identity_remediation.to_string(),
+        seed_active: seed.active,
+        seed_bytes_done: seed.bytes_done,
+        seed_bytes_total: seed.bytes_total,
+        seed_origin: seed.origin.clone(),
+        seed_attempt: seed.attempt,
+        seed_max_attempts: seed.max_attempts,
+        seed_next_retry_at: seed.next_retry_at,
     }
 }
 
@@ -1645,11 +1682,12 @@ fn embedding_status_json(
     progress: &EmbedProgressSnapshot,
     occupancy: nestweaver_store::EmbeddingIndexOccupancy,
     store: &GraphStore,
+    seed: &SeedProgressSnapshot,
 ) -> serde_json::Value {
     let (identity_state, identity_error, identity_remediation) =
         embedding_identity_fields(store, status);
     serde_json::json!({
-        "state": effective_embedding_state(status, progress),
+        "state": effective_embedding_state(status, progress, seed.active),
         "backend": status.backend,
         "requested_device": status.requested_device,
         "selected_device": status.selected_device,
@@ -1668,6 +1706,18 @@ fn embedding_status_json(
         "identity_state": identity_state,
         "identity_error": identity_error,
         "identity_remediation": identity_remediation,
+        // ── Seed progress (nw-484). The typed gRPC `EmbeddingStatus` proto
+        // message carries the same 7 fields (see `embedding_status_proto`
+        // below); this is the JSON route's copy of the same values, kept in
+        // lockstep with it. `state` above already reports "seeding" on BOTH
+        // routes; this block adds the numeric detail.
+        "seed_active": seed.active,
+        "seed_bytes_done": seed.bytes_done,
+        "seed_bytes_total": seed.bytes_total,
+        "seed_origin": seed.origin,
+        "seed_attempt": seed.attempt,
+        "seed_max_attempts": seed.max_attempts,
+        "seed_next_retry_at": seed.next_retry_at,
     })
 }
 
@@ -1888,7 +1938,8 @@ pub struct DaemonState {
     pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     /// Embedding readiness and the exact usable model as one immutable
     /// snapshot. A handler can never observe `ready` without that model.
-    embedding_runtime: Arc<EmbeddingRuntime>,
+    /// `pub(crate)`: read/written by `crate::embedding_repair` (nw-484).
+    pub(crate) embedding_runtime: Arc<EmbeddingRuntime>,
     /// Serializes writes so only one runs at a time (KùzuDB allows a single
     /// write transaction), and accounts for who holds it and who is waiting.
     /// Every writer in the process acquires through it — RPC handlers via
@@ -1991,6 +2042,38 @@ pub struct DaemonState {
     /// optional canonical watcher registration. `stop_ui` aborts the server
     /// and stops/drains only the watcher this UI session owns.
     pub ui_server: std::sync::Mutex<Option<UiServerRegistration>>,
+    /// Sender half of the main-thread reload channel (nw-484). `run_server`
+    /// keeps the receiver locally and services it from its own `block_on`
+    /// loop, which is the only place a local backend can reach Metal. A test
+    /// state whose receiver has already been dropped makes `send` fail fast
+    /// instead of hanging a caller that never wired a servicer.
+    ///
+    /// Kept ungated (not `#[cfg(feature = "embed")]`) because the
+    /// general-purpose test fixtures that build a `DaemonState`
+    /// (`test_state_with_writer_generation`, `test_state_with_authz`) always
+    /// open this channel and hand its `Receiver` back to callers unrelated to
+    /// embedding; only embed-gated code (the `embed` RPC handler) ever sends
+    /// into it, so under `--no-default-features --features metal` this field
+    /// is written but never read — see `EmbeddingReloadOutcome`'s doc for the
+    /// same tradeoff on the type it carries.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    pub(crate) embedding_reload_tx: tokio::sync::mpsc::Sender<EmbeddingReloadRequest>,
+    /// Coordinates a single in-flight artifact download per process: the
+    /// `embed` RPC and the background auto-repair task join the same flight
+    /// instead of racing two downloads of the same model. Unlike
+    /// `embedding_reload_tx` this is never part of a general-purpose test
+    /// fixture's return type, so it can be cleanly `#[cfg(feature =
+    /// "embed")]`-gated instead of merely allowed.
+    #[cfg(feature = "embed")]
+    pub(crate) embedding_seed: std::sync::Mutex<Option<SeedFlight>>,
+    /// Progress of the current (or most recent) seed attempt, surfaced
+    /// through `brain_status`'s JSON route.
+    pub(crate) embedding_seed_progress: Arc<SeedProgress>,
+    /// Injected artifact seeder (nw-483/nw-484 test seam). Production
+    /// downloads for real; tests substitute a fake so no test ever reaches
+    /// the network or the developer's real platform model cache.
+    #[cfg(feature = "embed")]
+    pub(crate) artifact_seeder: ArtifactSeeder,
 }
 
 impl DaemonState {
@@ -8469,6 +8552,7 @@ impl NestWeaverDaemon for DaemonService {
             &self.state.embed_progress.snapshot(),
             self.state.store.embedding_index_occupancy(),
             &self.state.store,
+            &self.state.embedding_seed_progress.snapshot(),
         );
         let search_status = search_capability_status(&self.state);
         let write_queue_depth = self.state.write_gate.waiting() as i32;
@@ -8616,6 +8700,7 @@ impl NestWeaverDaemon for DaemonService {
                 &self.state.embed_progress.snapshot(),
                 self.state.store.embedding_index_occupancy(),
                 &self.state.store,
+                &self.state.embedding_seed_progress.snapshot(),
             );
             let embedding_state = value["embedding_status"]["state"]
                 .as_str()
@@ -9827,86 +9912,191 @@ impl NestWeaverDaemon for DaemonService {
             let do_headings = scopes.headings;
 
             let (status, model) = self.state.embedding_runtime.snapshot();
-            let model = match model {
-                Some(model) => model,
-                None if repair_identity => {
-                    let store = self.state.store.clone();
-                    let discarded = self
-                        .run_unary_mutation("repair_embedding_identity", move || {
-                            store
-                                .reset_embedding_space_for_identity_repair()
-                                .map(|count| count as u64)
-                                .map_err(|error| {
-                                    Status::internal(format!(
-                                        "reset unreadable embedding identity: {error}"
-                                    ))
-                                })
-                        })
-                        .await?;
-                    return Ok(Response::new(EmbedResponse {
-                        identity_repaired: true,
-                        restart_required: true,
-                        discarded_embeddings: discarded,
-                        ..EmbedResponse::default()
-                    }));
-                }
-                None => {
-                    // nw-139: the daemon is the single writer, and since 6.3.0
-                    // the CLI refuses `embed --local` while the daemon holds
-                    // the write lock. So telling the operator to run it — which
-                    // is what the cache-only startup failure did — asked them
-                    // to stop the single writer and hand the lock to a second
-                    // process, the one thing the policy forbids. There was no
-                    // in-policy path to a working embedder on a cold cache.
-                    //
-                    // Seed it here instead. This is safe precisely because it
-                    // is NOT the startup path: the request is operator-
-                    // initiated, already admin-authenticated, and the cache
-                    // seed below runs inside the same exact-worker write lease,
-                    // so no lock ever changes hands.
-                    // Startup stays CacheOnly, so booting never depends on
-                    // network reachability.
-                    //
-                    // A complete cache makes DownloadMissing a no-op, so a
-                    // failure for any other reason simply reproduces itself
-                    // below and reports the original diagnosis.
-                    let detail = if status.error.is_empty() {
-                        format!("embedding is not ready (state: {})", status.state)
-                    } else {
-                        format!(
-                            "embedding is not ready (state: {}): {}",
-                            status.state, status.error
+            let (model, model_seeded, seeded_cache_dir, loaded_device, seeded_model_id) =
+                match model {
+                    Some(model) => (model, false, String::new(), String::new(), String::new()),
+                    None if repair_identity => {
+                        let store = self.state.store.clone();
+                        let discarded = self
+                            .run_unary_mutation("repair_embedding_identity", move || {
+                                store
+                                    .reset_embedding_space_for_identity_repair()
+                                    .map(|count| count as u64)
+                                    .map_err(|error| {
+                                        Status::internal(format!(
+                                            "reset unreadable embedding identity: {error}"
+                                        ))
+                                    })
+                            })
+                            .await?;
+                        return Ok(Response::new(EmbedResponse {
+                            identity_repaired: true,
+                            restart_required: true,
+                            discarded_embeddings: discarded,
+                            ..EmbedResponse::default()
+                        }));
+                    }
+                    None => {
+                        // nw-484: recover in ONE command. `nestweaver embed`
+                        // against a missing local cache now (1) seeds the
+                        // missing artifacts on a dedicated thread, off the write
+                        // gate, (2) hands the load to the daemon's main
+                        // `block_on` thread through the reload channel — the
+                        // only place a local backend can reach Metal — then (3)
+                        // falls into the same pass every other call takes below.
+                        // No restart, and the RPC does not return until the pass
+                        // has actually run (or a real failure explains why not).
+                        //
+                        // nw-139 still holds: this is reachable only from an
+                        // operator-initiated, already admin-authenticated `embed`
+                        // RPC — never from daemon startup, which stays CacheOnly.
+                        let cfg = self
+                            .state
+                            .instance_cfg
+                            .as_ref()
+                            .map(|c| c.embedding.clone())
+                            .unwrap_or_default();
+                        if cfg.external_endpoint.is_some() {
+                            let detail = if status.error.is_empty() {
+                                format!("embedding is not ready (state: {})", status.state)
+                            } else {
+                                format!(
+                                    "embedding is not ready (state: {}): {}",
+                                    status.state, status.error
+                                )
+                            };
+                            return Err(Status::failed_precondition(format!(
+                                "{detail}. An external embedding backend has no local artifact cache \
+                             to seed; check the external endpoint and model configuration."
+                            )));
+                        }
+                        // Admit-then-drop mirrors `run_unary_mutation`'s ordering
+                        // (admission before work), so a drain in progress refuses
+                        // immediately rather than starting a download it would
+                        // then have to abandon.
+                        drop(ConnectionGuard::write(&self.state)?);
+
+                        let cache_dir = embedding_cache_dir_for_load_with(
+                            &cfg,
+                            nestweaver_engine::resolve_user_path,
                         )
-                    };
-                    let state = self.state.clone();
-                    return self
-                        .run_unary_mutation("embed", move || {
-                            tracing::info!(
-                                state = %status.state,
-                                "embedding model unavailable; seeding the configured artifact cache"
-                            );
-                            // Cache writes are part of this unary mutation too:
-                            // a disconnect must not make shutdown claim the
-                            // daemon is idle while downloads are still being
-                            // published.
-                            let outcome = seed_embedding_artifact_cache(&state);
-                            Err::<EmbedResponse, _>(Status::failed_precondition(match outcome {
-                                Ok(cache_dir) => format!(
-                                    "{detail}. The missing model artifacts have now been downloaded \
-                                     into {} by the daemon itself, so the write lock never changed \
-                                     hands. Restart the daemon to load them \
-                                     (`nestweaver daemon restart`), then re-run this command.",
-                                    cache_dir.display()
-                                ),
-                                Err(error) => {
-                                    format!("{detail}. Seeding the cache failed: {error:#}")
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "resolve embedding cache directory: {error}"
+                            ))
+                        })?;
+                        let stored_model_id = self
+                            .state
+                            .store
+                            .get_embedding_metadata()
+                            .ok()
+                            .flatten()
+                            .map(|(id, _)| id);
+                        let config =
+                            embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
+
+                        let mut shutdown_sub = self.state.shutdown_tx.subscribe();
+                        const SHUTDOWN_UNAVAILABLE: &str = "daemon is shutting down and is not accepting new writes; it is \
+                         finishing the writes already in flight and still serving reads. \
+                         Retry against the daemon that starts next.";
+
+                        let seed_key = (config.model_id.clone(), config.cache_dir.clone());
+                        let mut seed_rx = join_or_start_seed(&self.state, &config, "embed", 1, 1)
+                            .map_err(|error| {
+                            Status::internal(format!(
+                                "failed to start embedding artifact download: {error}"
+                            ))
+                        })?;
+                        let seeded_cache_dir = tokio::select! {
+                            changed = seed_rx.wait_for(|phase| matches!(phase, SeedPhase::Done(_))) => {
+                                match changed {
+                                    Ok(phase_ref) => match &*phase_ref {
+                                        SeedPhase::Done(Ok(dir)) => dir.clone(),
+                                        SeedPhase::Done(Err(error)) => {
+                                            return Err(Status::failed_precondition(format!(
+                                                "could not download embedding model '{}' into {}: {error}",
+                                                config.model_id,
+                                                config.cache_dir.display()
+                                            )));
+                                        }
+                                        SeedPhase::Running => unreachable!("wait_for only resolves on Done"),
+                                    },
+                                    Err(_) => {
+                                        // The sender closed without ever reporting
+                                        // Done. `join_or_start_seed`'s RAII guard
+                                        // makes this unreachable in practice (see
+                                        // its doc comment), but clear the stale
+                                        // flight defensively so a retry never joins
+                                        // a channel that will never complete.
+                                        tracing::warn!(
+                                            model_id = %config.model_id,
+                                            "embedding seed watch channel closed without a Done outcome; \
+                                             clearing the flight so a retry starts fresh"
+                                        );
+                                        clear_stale_seed_flight(&self.state, &seed_key);
+                                        return Err(Status::unavailable(
+                                            "embedding seed watch channel closed unexpectedly; retry",
+                                        ));
+                                    }
                                 }
-                            }))
-                        })
-                        .await
-                        .map(Response::new);
-                }
-            };
+                            }
+                            _ = shutdown_sub.changed() => {
+                                return Err(Status::unavailable(SHUTDOWN_UNAVAILABLE));
+                            }
+                        };
+
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if self
+                            .state
+                            .embedding_reload_tx
+                            .send(EmbeddingReloadRequest { reply: reply_tx })
+                            .await
+                            .is_err()
+                        {
+                            return Err(Status::unavailable(
+                                "daemon reload channel is closed; the daemon is shutting down",
+                            ));
+                        }
+                        let reload_outcome = tokio::select! {
+                            result = reply_rx => result,
+                            _ = shutdown_sub.changed() => {
+                                return Err(Status::unavailable(SHUTDOWN_UNAVAILABLE));
+                            }
+                        };
+                        match reload_outcome {
+                            Ok(EmbeddingReloadOutcome::Loaded(loaded_status)) => {
+                                let loaded_device = loaded_status.selected_device.clone();
+                                let seeded_model_id = config.model_id.clone();
+                                match self.state.embedding_runtime.snapshot().1 {
+                                    Some(model) => (
+                                        model,
+                                        true,
+                                        seeded_cache_dir.display().to_string(),
+                                        loaded_device,
+                                        seeded_model_id,
+                                    ),
+                                    None => {
+                                        return Err(Status::internal(
+                                            "embedding reported ready after a reload but no model \
+                                         is published",
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(EmbeddingReloadOutcome::Unavailable(reload_status)) => {
+                                return Err(Status::failed_precondition(format!(
+                                    "downloaded embedding model '{}' into {}, but loading it failed: {}",
+                                    config.model_id,
+                                    seeded_cache_dir.display(),
+                                    reload_status.error
+                                )));
+                            }
+                            Ok(EmbeddingReloadOutcome::ShuttingDown) | Err(_) => {
+                                return Err(Status::unavailable(SHUTDOWN_UNAVAILABLE));
+                            }
+                        }
+                    }
+                };
             // The model the daemon actually loaded (startup preference: the
             // DB-recorded id wins, else the configured external/local model).
             // Used to stamp embedding metadata after a productive run.
@@ -10238,6 +10428,10 @@ impl NestWeaverDaemon for DaemonService {
                     identity_repaired: repair_identity,
                     restart_required: false,
                     discarded_embeddings,
+                    model_seeded,
+                    seeded_cache_dir,
+                    loaded_device,
+                    seeded_model_id,
                 })
             })
             .await
@@ -11393,19 +11587,41 @@ mod embedding_status_tests {
     }
 }
 
+/// Shared HF-cache fixture writer for daemon embedding tests. A module-level
+/// item (rather than `pub(super)` inside a single test module) so both
+/// `embedding_load_config_tests` and `startup_helper_tests` can build a
+/// complete, offline-resolvable cache — nw-483: a test config that reaches
+/// `ArtifactMode::CacheOnly` (`local_files_only`) with an incomplete/absent
+/// cache hits the real network AND the developer's real platform model
+/// cache. A complete cache makes `CacheOnly` resolve every artifact locally,
+/// which is what lets `embedding_load_config_tests` exercise that path
+/// hermetically.
+///
+/// nw-484 correction: `ArtifactMode::DownloadMissing` (`local_files_only:
+/// false`) is NOT made a no-op by a complete fixture cache — measured
+/// empirically, hf-hub's ref/commit resolution still reaches the network
+/// even when every artifact this fixture writes is already present, because
+/// this fixture does not replicate the blob/symlink layout and `.no_exist`
+/// markers a real `HFCache` populates. Nothing in `startup_helper_tests`
+/// exercises `DownloadMissing` through the REAL seeder: every `DaemonState`
+/// built for tests gets `fake_default_test_seeder` (which calls this
+/// function directly and never touches `resolve_model_artifacts`), and only
+/// `run_server`'s production path uses `production_artifact_seeder` /
+/// `DownloadMissing`.
+/// `pub(crate)`: `crate::embedding_repair::fake_default_test_seeder`
+/// (nw-484) calls this too.
 #[cfg(all(test, feature = "embed"))]
-mod embedding_load_config_tests {
-    use super::*;
+pub(crate) fn write_complete_hf_cache(
+    cache_dir: &std::path::Path,
+) -> nestweaver_embed::ModelArtifacts {
     use candle_core::{DType, Device};
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-    use std::path::Path;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
-    fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
-        const CONFIG_JSON: &str = r#"{
+    const CONFIG_JSON: &str = r#"{
             "vocab_size": 3,
             "hidden_size": 4,
             "num_hidden_layers": 1,
@@ -11423,27 +11639,25 @@ mod embedding_load_config_tests {
             "classifier_dropout": null,
             "model_type": "bert"
         }"#;
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let repo_dir = cache_dir.join("models--test-owner--test-model");
-        let snapshot_dir = repo_dir.join("snapshots").join(commit);
-        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
-        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
-        std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
-        let artifacts = nestweaver_embed::ModelArtifacts {
-            config: snapshot_dir.join("config.json"),
-            tokenizer: snapshot_dir.join("tokenizer.json"),
-            weights: snapshot_dir.join("model.safetensors"),
-            modules: snapshot_dir.join("modules.json"),
-            sentence_transformer_config: Some(
-                snapshot_dir.join("config_sentence_transformers.json"),
-            ),
-            transformer_config: snapshot_dir.join("sentence_bert_config.json"),
-            pooling_config: snapshot_dir.join("1_Pooling/config.json"),
-            dense_modules: Vec::new(),
-        };
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let repo_dir = cache_dir.join("models--test-owner--test-model");
+    let snapshot_dir = repo_dir.join("snapshots").join(commit);
+    std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+    std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
+    let artifacts = nestweaver_embed::ModelArtifacts {
+        config: snapshot_dir.join("config.json"),
+        tokenizer: snapshot_dir.join("tokenizer.json"),
+        weights: snapshot_dir.join("model.safetensors"),
+        modules: snapshot_dir.join("modules.json"),
+        sentence_transformer_config: Some(snapshot_dir.join("config_sentence_transformers.json")),
+        transformer_config: snapshot_dir.join("sentence_bert_config.json"),
+        pooling_config: snapshot_dir.join("1_Pooling/config.json"),
+        dense_modules: Vec::new(),
+    };
 
-        std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
-        std::fs::write(
+    std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
+    std::fs::write(
             &artifacts.modules,
             r#"[
                 {"idx":0,"name":"0","path":"","type":"sentence_transformers.models.Transformer"},
@@ -11452,51 +11666,55 @@ mod embedding_load_config_tests {
             ]"#,
         )
         .expect("write modules fixture");
-        std::fs::write(
-            artifacts
-                .sentence_transformer_config
-                .as_ref()
-                .expect("fixture publishes a sentence-transformer config"),
-            r#"{"similarity_fn_name":"cosine"}"#,
-        )
-        .expect("write sentence-transformer fixture");
-        std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
-            .expect("write transformer fixture");
-        std::fs::write(
-            &artifacts.pooling_config,
-            r#"{"pooling_mode_mean_tokens":true,"include_prompt":true}"#,
-        )
-        .expect("write pooling fixture");
-
-        std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
-        let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
-        let varmap = VarMap::new();
-        let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-        BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
-        varmap
-            .save(&artifacts.weights)
-            .expect("write model weights");
-
-        let vocab = [
-            ("[PAD]".to_string(), 0_u32),
-            ("[UNK]".to_string(), 1_u32),
-            ("test".to_string(), 2_u32),
-        ]
-        .into_iter()
-        .collect();
-        let tokenizer_model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("[UNK]".to_string())
-            .build()
-            .expect("build tokenizer model");
-        let mut tokenizer = Tokenizer::new(tokenizer_model);
-        tokenizer.with_pre_tokenizer(Some(Whitespace));
-        tokenizer
-            .save(&artifacts.tokenizer, false)
-            .expect("write tokenizer");
-
+    std::fs::write(
         artifacts
-    }
+            .sentence_transformer_config
+            .as_ref()
+            .expect("fixture publishes a sentence-transformer config"),
+        r#"{"similarity_fn_name":"cosine"}"#,
+    )
+    .expect("write sentence-transformer fixture");
+    std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
+        .expect("write transformer fixture");
+    std::fs::write(
+        &artifacts.pooling_config,
+        r#"{"pooling_mode_mean_tokens":true,"include_prompt":true}"#,
+    )
+    .expect("write pooling fixture");
+
+    std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
+    let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
+    let varmap = VarMap::new();
+    let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+    BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
+    varmap
+        .save(&artifacts.weights)
+        .expect("write model weights");
+
+    let vocab = [
+        ("[PAD]".to_string(), 0_u32),
+        ("[UNK]".to_string(), 1_u32),
+        ("test".to_string(), 2_u32),
+    ]
+    .into_iter()
+    .collect();
+    let tokenizer_model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .expect("build tokenizer model");
+    let mut tokenizer = Tokenizer::new(tokenizer_model);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer
+        .save(&artifacts.tokenizer, false)
+        .expect("write tokenizer");
+
+    artifacts
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod embedding_load_config_tests {
+    use super::*;
 
     #[test]
     fn daemon_accelerator_maps_each_policy() {
@@ -11571,11 +11789,12 @@ mod embedding_load_config_tests {
         );
 
         // The operator-initiated path seeds through DownloadMissing, but does
-        // so by resolving ARTIFACTS ONLY (seed_embedding_artifact_cache) —
-        // never by constructing the model, which must stay on the main
-        // block_on thread or a local backend loses Metal. This pins that the
-        // mode is reachable; the thread contract is enforced by the
-        // debug_assert in load_embedding_model itself.
+        // so by resolving ARTIFACTS ONLY (production_artifact_seeder /
+        // join_or_start_seed) — never by constructing the model, which must
+        // stay on the main block_on thread or a local backend loses Metal.
+        // This pins that the mode is reachable; the thread contract is
+        // enforced by the debug_assert in load_embedding_model_with_mode
+        // itself.
         load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
@@ -11927,46 +12146,12 @@ pub fn daemon_embedding_device_policy(
     }
 }
 
-/// Download any missing local model artifacts into the configured cache.
-///
-/// nw-139: the daemon is the single writer, and since 6.3.0 the CLI refuses
-/// `embed --local` while the daemon holds the write lock — so the cache-only
-/// startup failure told operators to do the one thing the policy forbids.
-/// Seeding here removes that dead end without any lock changing hands.
-///
-/// Deliberately resolves ARTIFACTS ONLY and never constructs the model: this
-/// runs on a tokio worker, and a local backend loaded off the main block_on
-/// thread loses Metal. The caller therefore reports success as "restart to
-/// load", not as readiness.
-#[cfg(feature = "embed")]
-fn seed_embedding_artifact_cache(
-    state: &std::sync::Arc<DaemonState>,
-) -> anyhow::Result<std::path::PathBuf> {
-    let cfg = state
-        .instance_cfg
-        .as_ref()
-        .map(|c| c.embedding.clone())
-        .unwrap_or_default();
-    anyhow::ensure!(
-        cfg.external_endpoint.is_none(),
-        "an external embedding backend does not use the local artifact cache"
-    );
-    let cache_dir =
-        embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path)
-            .map_err(|error| anyhow::anyhow!("resolve embedding cache directory: {error}"))?;
-    let stored_model_id = state
-        .store
-        .get_embedding_metadata()
-        .ok()
-        .flatten()
-        .map(|(id, _)| id);
-    let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
-    nestweaver_embed::resolve_model_artifacts(
-        &config,
-        nestweaver_embed::ArtifactMode::DownloadMissing,
-    )?;
-    Ok(cache_dir)
-}
+// `seed_embedding_artifact_cache` (the pre-nw-484 synchronous, in-write-gate
+// seeder) is gone: seeding now runs on a dedicated thread off the write gate
+// via `join_or_start_seed`/`production_artifact_seeder` above, and the
+// `embed` RPC hands the resulting load to the main-thread reload channel
+// instead of asking the operator to restart. See the design note at
+// `join_or_start_seed` for why the write gate must never cover a download.
 
 /// Resolve whether an IndexRepo request should refresh the trigram pre-filter.
 ///
@@ -12271,21 +12456,41 @@ fn log_embedding_ready(
 /// load, non-semantic RPCs are served normally and semantic search returns "model not loaded"
 /// until it completes.
 ///
-/// The production call site is gated `not(test)`. The function remains testable so the external
-/// path can be exercised under Tokio; only the local backend has the main-thread requirement.
-#[cfg(feature = "embed")]
+/// Test-only convenience wrapper: `run_server`'s production boot site calls
+/// `load_embedding_model_with_mode` directly (it needs the typed outcome to
+/// decide on auto-repair), so this thin `()`-returning form now exists only
+/// for tests that do not care about that outcome. The function it wraps
+/// remains testable so the external path can be exercised under Tokio; only
+/// the local backend has the main-thread requirement.
+#[cfg(all(feature = "embed", test))]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
-    load_embedding_model_with_mode(state, daemon_startup_artifact_mode()).await
+    let _ = load_embedding_model_with_mode(state, daemon_startup_artifact_mode()).await;
 }
 
 /// Resolve, load and publish the embedding backend under an explicit artifact
 /// mode. See [`load_daemon_embedding_backend_with_mode`] for why only the
 /// operator-initiated path may pass `DownloadMissing`.
+///
+/// Returns a typed outcome — `Ok(())` once `state.embedding_runtime` is
+/// published `ready`, `Err(EmbeddingLoadFailure)` for every other outcome —
+/// so a caller (the boot site, deciding whether to start auto-repair) can
+/// tell "the configured cache is missing an artifact" from every other
+/// failure (device, construction, probe, unreadable identity) without
+/// matching on status strings. The function still publishes
+/// ready/unavailable onto `state.embedding_runtime` itself in every case;
+/// the return value is additional, not a replacement for that.
+///
+/// Callers: the boot load and `service_embedding_reloads` only — this must
+/// never be called from a tokio worker for a local backend (see the
+/// main-thread constraint below).
+///
+/// `pub(crate)`: `crate::embedding_repair::production_reload_loader`
+/// (nw-484) is the `service_embedding_reloads` caller referenced above.
 #[cfg(feature = "embed")]
-async fn load_embedding_model_with_mode(
+pub(crate) async fn load_embedding_model_with_mode(
     state: &std::sync::Arc<DaemonState>,
     mode: nestweaver_embed::ArtifactMode,
-) {
+) -> Result<(), EmbeddingLoadFailure> {
     if let Err(error) = state.store.require_verified_embedding_identity() {
         let status = embedding_identity_unreadable_status(
             state.embedding_runtime.status(),
@@ -12297,7 +12502,7 @@ async fn load_embedding_model_with_mode(
             remediation = EMBEDDING_IDENTITY_REMEDIATION,
             "embedding model load skipped because persisted identity is unreadable; graph and lexical service remain available"
         );
-        return;
+        return Err(EmbeddingLoadFailure::default());
     }
     let cfg = state
         .instance_cfg
@@ -12338,7 +12543,7 @@ async fn load_embedding_model_with_mode(
                 remediation = EMBEDDING_IDENTITY_REMEDIATION,
                 "embedding metadata became unreadable during model load; semantic service remains disabled"
             );
-            return;
+            return Err(EmbeddingLoadFailure::default());
         }
     };
     if let Some(stored_model_id) = stored_model_id.as_deref() {
@@ -12372,7 +12577,7 @@ async fn load_embedding_model_with_mode(
                 let message = status.error.clone();
                 state.embedding_runtime.publish_unavailable(status);
                 tracing::warn!("Failed to resolve embedding cache directory: {message}");
-                return;
+                return Err(EmbeddingLoadFailure::default());
             }
         };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
@@ -12409,10 +12614,12 @@ async fn load_embedding_model_with_mode(
                         .is_none()
                         .then_some(cache_dir.as_path());
                     log_embedding_ready(&backend, &selected_device, &model_id, cache_dir);
+                    Ok(())
                 } else {
                     let error = status.error.clone();
                     state.embedding_runtime.publish_unavailable(status);
                     tracing::warn!("Embedding model failed readiness: {error}");
+                    Err(EmbeddingLoadFailure::default())
                 }
             }
             Err(error) => {
@@ -12424,9 +12631,13 @@ async fn load_embedding_model_with_mode(
                 let error = status.error.clone();
                 state.embedding_runtime.publish_unavailable(status);
                 tracing::warn!("Embedding model failed readiness: {error}");
+                Err(EmbeddingLoadFailure::default())
             }
         },
         Err(e) => {
+            let missing_artifact = e
+                .chain()
+                .any(|cause| cause.is::<nestweaver_embed::MissingModelArtifactError>());
             let (status, hint) = embedding_load_failure_status(
                 state.embedding_runtime.status(),
                 state.store.embedding_index_dimension(),
@@ -12439,6 +12650,7 @@ async fn load_embedding_model_with_mode(
                 Some(hint) => tracing::warn!("Failed to load embedding model: {e}; {hint}"),
                 None => tracing::warn!("Failed to load embedding model: {e}"),
             }
+            Err(EmbeddingLoadFailure { missing_artifact })
         }
     }
 }
@@ -12685,7 +12897,9 @@ pub async fn run_server(
             Err(lifecycle::WriteLeaseError::Held) => {
                 anyhow::bail!(
                     "another process holds the write lease for {}. Stop it before starting a \
-                     daemon — two writers against this store risk corruption.",
+                     daemon — two writers against this store risk corruption — unless a \
+                     `nestweaver backup restore` is in progress against this database, in \
+                     which case wait for it to finish.",
                     db_path.display()
                 );
             }
@@ -13085,6 +13299,11 @@ pub async fn run_server(
         );
     }
     let embedding_probe_ms = embedding_probe_started.elapsed().as_millis() as u64;
+    // Created before `DaemonState` so the sender can be stored on it; the
+    // receiver is kept locally and serviced by this function's own tail loop
+    // (the daemon's main `block_on` thread — see `service_embedding_reloads`).
+    let (embedding_reload_tx, mut embedding_reload_rx) =
+        tokio::sync::mpsc::channel::<EmbeddingReloadRequest>(8);
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -13131,6 +13350,19 @@ pub async fn run_server(
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
         watcher_lifecycle: std::sync::Mutex::new(()),
         ui_server: std::sync::Mutex::new(None),
+        embedding_reload_tx,
+        #[cfg(feature = "embed")]
+        embedding_seed: std::sync::Mutex::new(None),
+        embedding_seed_progress: Arc::new(SeedProgress::default()),
+        // Mirrors the reload-loader split right below in this same function:
+        // an in-process `run_server` under libtest (three in-crate tests
+        // spawn it) must never reach the real Hugging Face endpoint, so the
+        // seeder is swapped for the network-free fake under `cfg(test)`,
+        // exactly like `production_reload_loader`/`unserviced_reload_loader`.
+        #[cfg(all(feature = "embed", not(test)))]
+        artifact_seeder: Arc::new(production_artifact_seeder),
+        #[cfg(all(feature = "embed", test))]
+        artifact_seeder: Arc::new(fake_default_test_seeder),
     });
     state.search.attach_recovery_context(&state);
 
@@ -14559,7 +14791,7 @@ pub async fn run_server(
             )
         })?;
     }
-    let uds_serve = tokio::spawn(
+    let mut uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)
             .serve_with_incoming_shutdown(uds_stream, async move {
@@ -14582,16 +14814,106 @@ pub async fn run_server(
     #[cfg(all(feature = "embed", not(test)))]
     {
         let mut load_shutdown = shutdown_tx.subscribe();
-        tokio::select! {
-            _ = load_embedding_model(&state) => {}
+        let boot_outcome = tokio::select! {
+            outcome = load_embedding_model_with_mode(&state, daemon_startup_artifact_mode()) => Some(outcome),
             _ = load_shutdown.changed() => {
                 tracing::info!("shutdown requested during embedding model load — abandoning load");
+                None
+            }
+        };
+        // nw-484 (D11): a boot load that failed for a TYPED missing-artifact
+        // reason, on a database whose persisted embedding identity already
+        // names a model, starts a bounded background repair — never a
+        // first-time download, and never anything that could delay this
+        // point (the socket above is already bound and serving). Spawned
+        // detached: it selects on the shutdown broadcast itself and is
+        // deliberately not part of the exit-sequence awaits below, since it
+        // performs no DB write.
+        if let Some(Err(failure)) = boot_outcome {
+            let cfg = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.embedding.clone())
+                .unwrap_or_default();
+            let stored_model_id = state
+                .store
+                .require_verified_embedding_identity()
+                .is_ok()
+                .then(|| state.store.get_embedding_metadata().ok().flatten())
+                .flatten()
+                .map(|(model_id, _)| model_id);
+            match auto_repair_eligibility(&cfg, stored_model_id.as_deref(), &failure) {
+                AutoRepair::Eligible { model_id } => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        "starting background embedding cache repair after a missing-artifact boot failure"
+                    );
+                    spawn_embedding_cache_repair(Arc::clone(&state), model_id);
+                }
+                AutoRepair::Skip(reason) => {
+                    tracing::debug!(reason, "embedding cache auto-repair not eligible");
+                }
             }
         }
     }
 
-    let uds_result = uds_serve
-        .await
+    // The bare `uds_serve.await` this replaced parked the main thread until
+    // shutdown with no way to service anything else on it. The main-thread
+    // reload channel (nw-484) needs exactly that thread — biased so a
+    // finished/failed serve always wins a simultaneous poll, and shutdown
+    // still terminates the loop promptly because `uds_serve` completes on
+    // the shutdown broadcast (`serve_with_incoming_shutdown`).
+    // Only the two `feature = "embed"` branches of the reload-servicer arm
+    // below borrow this; without the gate it's a `mut`-not-needed AND an
+    // unused-variable warning under `--no-default-features --features
+    // metal` (CI's Cold Metal job builds this crate with `embed` off).
+    #[cfg(feature = "embed")]
+    let mut reload_shutdown = shutdown_tx.subscribe();
+    let uds_result = loop {
+        tokio::select! {
+            biased;
+            result = &mut uds_serve => break result,
+            Some(first) = embedding_reload_rx.recv() => {
+                // `cfg(test)`: an in-process `run_server` under libtest never
+                // runs on the real process main thread, so servicing a
+                // reload with the real loader here would trip the same
+                // main-thread assert the boot load is gated off for. Publish
+                // an honest failure through the SAME servicer (coalescing
+                // and shutdown-refusal still apply) rather than hanging or
+                // silently skipping every queued reply.
+                #[cfg(all(feature = "embed", not(test)))]
+                service_embedding_reloads(
+                    &state,
+                    first,
+                    &mut embedding_reload_rx,
+                    &mut reload_shutdown,
+                    production_reload_loader(&state),
+                )
+                .await;
+                #[cfg(all(feature = "embed", test))]
+                service_embedding_reloads(
+                    &state,
+                    first,
+                    &mut embedding_reload_rx,
+                    &mut reload_shutdown,
+                    unserviced_reload_loader(&state),
+                )
+                .await;
+                // No `embed` feature at all: the embedding runtime can never
+                // become ready, so there is nothing to load. Reply directly
+                // rather than pulling in `service_embedding_reloads`, which
+                // does not exist in this build (it needs
+                // `EmbeddingLoadFailure`, gated the same way).
+                #[cfg(not(feature = "embed"))]
+                {
+                    let _ = first
+                        .reply
+                        .send(EmbeddingReloadOutcome::Unavailable(state.embedding_runtime.status()));
+                }
+            }
+        }
+    };
+    let uds_result = uds_result
         .context("UDS serve task panicked")
         .and_then(|result| result.context("gRPC server error"));
 
@@ -18159,7 +18481,7 @@ credential_method = "gh"
 
     #[test]
     fn node_deletion_generation_exhaustion_is_reported_while_pagerank_is_invalidated() {
-        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let state = test_state_with_writer_generation(Some(u64::MAX)).0;
         let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
         let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let pagerank_generation = state.store.pagerank_generation();
@@ -18504,7 +18826,7 @@ credential_method = "gh"
 
     #[test]
     fn remove_project_surfaces_generation_exhaustion_after_committed_delete() {
-        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let state = test_state_with_writer_generation(Some(u64::MAX)).0;
         let project_uid = "proj:test:exhausted-remove";
         seed_project(&state, project_uid, "Exhausted remove");
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
@@ -20738,11 +21060,22 @@ credential_method = "gh"
 
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
     /// exercising admin mutation RPCs in isolation.
+    ///
+    /// Drops the reload-channel receiver half: a caller that hits the
+    /// main-thread reload path without wiring a servicer (most tests) gets a
+    /// fast, clear "channel closed" failure instead of hanging forever.
+    /// Tests that need a live reload path call
+    /// `test_state_with_writer_generation` directly and keep the receiver.
     fn test_state_with_writer() -> Arc<DaemonState> {
-        test_state_with_writer_generation(None)
+        test_state_with_writer_generation(None).0
     }
 
-    fn test_state_with_writer_generation(generation: Option<u64>) -> Arc<DaemonState> {
+    fn test_state_with_writer_generation(
+        generation: Option<u64>,
+    ) -> (
+        Arc<DaemonState>,
+        tokio::sync::mpsc::Receiver<EmbeddingReloadRequest>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
         if let Some(generation) = generation {
@@ -20755,7 +21088,9 @@ credential_method = "gh"
         // Keep the temp dir alive for the duration of the test process.
         std::mem::forget(dir);
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
-        Arc::new(DaemonState {
+        let (embedding_reload_tx, embedding_reload_rx) =
+            tokio::sync::mpsc::channel::<EmbeddingReloadRequest>(8);
+        let state = Arc::new(DaemonState {
             store,
             search: Arc::new(SearchRuntime::from_parts(
                 dir_path.join("tantivy"),
@@ -20808,7 +21143,14 @@ credential_method = "gh"
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
-        })
+            embedding_reload_tx,
+            #[cfg(feature = "embed")]
+            embedding_seed: std::sync::Mutex::new(None),
+            embedding_seed_progress: Arc::new(SeedProgress::default()),
+            #[cfg(feature = "embed")]
+            artifact_seeder: Arc::new(fake_default_test_seeder),
+        });
+        (state, embedding_reload_rx)
     }
 
     fn write_provenance_test_config(path: &Path, root: &Path) {
@@ -20849,6 +21191,8 @@ credential_method = "gh"
         permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     ) -> Arc<DaemonState> {
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let (embedding_reload_tx, _embedding_reload_rx) =
+            tokio::sync::mpsc::channel::<EmbeddingReloadRequest>(8);
         Arc::new(DaemonState {
             store,
             search: Arc::new(SearchRuntime::from_parts(
@@ -20902,6 +21246,12 @@ credential_method = "gh"
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
+            embedding_reload_tx,
+            #[cfg(feature = "embed")]
+            embedding_seed: std::sync::Mutex::new(None),
+            embedding_seed_progress: Arc::new(SeedProgress::default()),
+            #[cfg(feature = "embed")]
+            artifact_seeder: Arc::new(fake_default_test_seeder),
         })
     }
 
@@ -20945,6 +21295,17 @@ credential_method = "gh"
         assert_eq!(
             ready["degraded_components"],
             serde_json::json!(["semantic"])
+        );
+
+        // nw-484: `seeding` adds no NEW component — it degrades exactly like
+        // `loading`, never a third population beyond `["semantic"]`.
+        let mut seeding = serde_json::json!({ "degraded_components": [] });
+        disclose_semantic_degradation(&mut seeding, "seeding");
+        assert_eq!(
+            seeding["degraded_components"],
+            serde_json::json!(["semantic"]),
+            "a download in flight cannot serve semantic retrieval yet, and must \
+             not introduce any component beyond the existing `semantic` one"
         );
     }
 
@@ -21156,14 +21517,53 @@ credential_method = "gh"
             active: true,
             ..EmbedProgressSnapshot::default()
         };
-        assert_eq!(effective_embedding_state(&ready, &idle), "ready");
-        assert_eq!(effective_embedding_state(&ready, &running), "embedding");
+        assert_eq!(effective_embedding_state(&ready, &idle, false), "ready");
+        assert_eq!(
+            effective_embedding_state(&ready, &running, false),
+            "embedding"
+        );
 
         let failed = EmbeddingRuntimeStatus {
             state: "failed".to_string(),
             ..EmbeddingRuntimeStatus::default()
         };
-        assert_eq!(effective_embedding_state(&failed, &running), "failed");
+        assert_eq!(
+            effective_embedding_state(&failed, &running, false),
+            "failed"
+        );
+    }
+
+    /// nw-484: a seed in flight takes precedence over EVERY other signal —
+    /// `ready`/`embedding` included — because bytes moving means semantic
+    /// retrieval really is unavailable right now, regardless of what the
+    /// last published status or embed-pass snapshot says.
+    #[test]
+    fn seed_active_overrides_every_other_embedding_state() {
+        let idle = EmbedProgressSnapshot::default();
+        let running = EmbedProgressSnapshot {
+            active: true,
+            ..EmbedProgressSnapshot::default()
+        };
+        for status in [
+            EmbeddingRuntimeStatus {
+                state: "ready".to_string(),
+                ..EmbeddingRuntimeStatus::default()
+            },
+            EmbeddingRuntimeStatus {
+                state: "failed".to_string(),
+                ..EmbeddingRuntimeStatus::default()
+            },
+            EmbeddingRuntimeStatus {
+                state: "loading".to_string(),
+                ..EmbeddingRuntimeStatus::default()
+            },
+        ] {
+            assert_eq!(effective_embedding_state(&status, &idle, true), "seeding");
+            assert_eq!(
+                effective_embedding_state(&status, &running, true),
+                "seeding"
+            );
+        }
     }
 
     #[test]
@@ -21607,10 +22007,371 @@ credential_method = "gh"
         );
     }
 
+    /// nw-483: build a `test_state_with_writer()` state whose `instance_cfg`
+    /// points the embedding cache at `cache_dir` (pre-filled with a complete,
+    /// offline-resolvable fixture via `write_complete_hf_cache`) instead of
+    /// leaving `instance_cfg: None`, which falls back to
+    /// `EmbeddingConfig::default()` — the real, non-test platform cache dir.
+    ///
+    /// Drops the reload-channel receiver (see `test_state_with_writer`): a
+    /// caller that hits the `embed` RPC's seed-then-reload path against this
+    /// state gets a fast "channel closed" failure rather than hanging. Use
+    /// `state_with_isolated_embedding_cache_and_reload` for a test that needs
+    /// the reload to actually complete.
+    #[cfg(feature = "embed")]
+    fn embed_rpc_not_ready_test_config(
+        cache_dir: &std::path::Path,
+    ) -> nestweaver_engine::InstanceConfig {
+        nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "embed-rpc-not-ready-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+model_id = "test-owner/test-model"
+cache_dir = {:?}
+accelerator = "cpu"
+"#,
+            cache_dir.display().to_string()
+        ))
+        .expect("valid embedding fixture config")
+    }
+
+    #[cfg(feature = "embed")]
+    fn state_with_isolated_embedding_cache(cache_dir: &std::path::Path) -> Arc<DaemonState> {
+        write_complete_hf_cache(cache_dir);
+        let config = embed_rpc_not_ready_test_config(cache_dir);
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config));
+        state
+    }
+
+    /// Same fixture, but keeps the reload-channel receiver alive so a test
+    /// can drive `service_embedding_reloads` (directly, or via
+    /// `spawn_fake_reload_servicer`) and observe the `embed` RPC's
+    /// seed-then-reload path actually complete.
+    #[cfg(feature = "embed")]
+    fn state_with_isolated_embedding_cache_and_reload(
+        cache_dir: &std::path::Path,
+    ) -> (
+        Arc<DaemonState>,
+        tokio::sync::mpsc::Receiver<EmbeddingReloadRequest>,
+    ) {
+        write_complete_hf_cache(cache_dir);
+        let config = embed_rpc_not_ready_test_config(cache_dir);
+        let (mut state, rx) = test_state_with_writer_generation(None);
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config));
+        (state, rx)
+    }
+
+    /// An `EmbedQueryFn` that counts calls and returns a fixed vector — reuse
+    /// of `CountingEmbed`'s shape, wired directly into a fake `ready` load so
+    /// a reload servicer test never touches candle or the real HF client.
+    #[cfg(feature = "embed")]
+    async fn fake_ready_reload(
+        state: Arc<DaemonState>,
+        loader_calls: Arc<AtomicU32>,
+    ) -> Result<(), EmbeddingLoadFailure> {
+        loader_calls.fetch_add(1, Ordering::Relaxed);
+        let mut status = state.embedding_runtime.status();
+        status.state = "ready".to_string();
+        status.selected_device = "cpu".to_string();
+        status.error.clear();
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        state.embedding_runtime.publish_ready(status, model);
+        Ok(())
+    }
+
+    /// Drive the main-thread reload channel from a background task with a
+    /// fake `ready` loader, standing in for `run_server`'s tail loop. Tests
+    /// use this instead of the real `production_reload_loader` because the
+    /// real one asserts it runs on the process main thread (Metal), which no
+    /// libtest task ever is.
+    #[cfg(feature = "embed")]
+    fn spawn_fake_reload_servicer(
+        state: Arc<DaemonState>,
+        mut rx: tokio::sync::mpsc::Receiver<EmbeddingReloadRequest>,
+        loader_calls: Arc<AtomicU32>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut shutdown = state.shutdown_tx.subscribe();
+            while let Some(first) = rx.recv().await {
+                let load = fake_ready_reload(Arc::clone(&state), Arc::clone(&loader_calls));
+                service_embedding_reloads(&state, first, &mut rx, &mut shutdown, load).await;
+            }
+        })
+    }
+
+    /// nw-484: the whole point of the fix. A cache-missing `embed` RPC no
+    /// longer permanently fails after seeding — it seeds (via the injected
+    /// `artifact_seeder`, never the network in this test), hands the load to
+    /// the main-thread reload channel (serviced here by a fake loader, never
+    /// the real candle path), and completes the pass in the SAME call: no
+    /// restart, `model_seeded == true`, and the response is not
+    /// `failed_precondition`.
+    #[cfg(feature = "embed")]
     #[tokio::test]
-    async fn embedding_status_blocks_embed_rpc_until_ready() {
-        let state = test_state_with_writer();
-        let expected_state = state.embedding_runtime.status().state;
+    async fn daemon_embed_seeding_requests_reload_through_main_loop_channel() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        insert_unembedded_symbol(&state.store, "sym-seed-recovery");
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let response = service
+            .embed(request)
+            .await
+            .expect("a missing cache must self-heal in one embed call")
+            .into_inner();
+
+        assert!(response.model_seeded, "the RPC must report that it seeded");
+        assert!(
+            !response.seeded_cache_dir.is_empty(),
+            "the RPC must name the cache dir it seeded into"
+        );
+        assert_eq!(response.loaded_device, "cpu");
+        assert!(response.succeeded > 0, "the pass must actually run");
+        assert_eq!(
+            loader_calls.load(Ordering::Relaxed),
+            1,
+            "the model must be constructed exactly once, and only by the reload servicer"
+        );
+        assert_eq!(state.embedding_runtime.status().state, "ready");
+
+        servicer.abort();
+    }
+
+    /// Server-review IMPORTANT item 3: the `embed` RPC's missing-model
+    /// branch must refuse immediately for an EXTERNAL backend rather than
+    /// attempting to seed a local HF artifact cache that will never exist
+    /// for it. Pins the `cfg.external_endpoint.is_some()` early return in
+    /// the RPC handler, right above `join_or_start_seed` — no seed thread
+    /// is spawned, no reload is requested, and the failure is
+    /// `FAILED_PRECONDITION` (a config problem, not a transient one) naming
+    /// the reason so an operator knows to fix the endpoint/model instead of
+    /// retrying.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_embed_refuses_to_seed_a_local_cache_for_an_external_backend() {
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(
+            r#"
+instance_id = "embed-rpc-external-missing-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+model_id = "test-owner/test-model"
+external_endpoint = "http://127.0.0.1:11434/v1"
+external_model = "external-model"
+"#,
+        )
+        .expect("valid external-embedding fixture config");
+
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config));
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(request)
+            .await
+            .expect_err("an external backend must never attempt local-cache seeding");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("no local artifact cache"),
+            "error should explain why an external backend was not seeded: {error}"
+        );
+        assert!(
+            !state.embedding_seed_progress.snapshot().active,
+            "refusing an external backend must never start a seed flight"
+        );
+    }
+
+    /// `SeedProgressSink::on_bytes` stores `bytes_total` before `bytes_done`
+    /// (see its doc comment), and `SeedProgress::snapshot()` clamps
+    /// defensively on top of that — this pins the clamp specifically: an
+    /// out-of-order `on_bytes` call (done above the total it was paired
+    /// with) must never leave `snapshot().bytes_done > bytes_total`, since
+    /// both the JSON and typed status routes print these numbers as-is.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn seed_progress_sink_ordering_and_snapshot_clamp() {
+        let progress = Arc::new(SeedProgress::default());
+        progress.begin("embed", 1, 1);
+        let sink = SeedProgressSink(Arc::clone(&progress));
+
+        nestweaver_embed::ArtifactProgressSink::on_bytes(&sink, 50, 100);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.bytes_done, 50);
+        assert_eq!(snapshot.bytes_total, 100);
+
+        // Pathological/out-of-order call: `done` above the `total` it was
+        // reported with. The real adapter never does this (it clamps
+        // itself), but `snapshot()` must not trust that.
+        nestweaver_embed::ArtifactProgressSink::on_bytes(&sink, 500, 100);
+        let snapshot = progress.snapshot();
+        assert_eq!(
+            snapshot.bytes_done, 100,
+            "snapshot must clamp done to total, never report done > total"
+        );
+        assert_eq!(snapshot.bytes_total, 100);
+    }
+
+    /// The critical fix: a seeder that PANICS must still report a failure —
+    /// never wedge `seed_active` true forever with every later joiner
+    /// blocked on a channel nothing will complete. First call panics; the
+    /// SAME fake seeder succeeds on its second invocation, so this also
+    /// proves the daemon recovers on the very next `embed` call, with no
+    /// restart needed.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_embed_recovers_after_a_seeder_panic() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        insert_unembedded_symbol(&state.store, "sym-panic-recovery");
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |config, _progress| {
+                let call_number = seed_calls.fetch_add(1, Ordering::Relaxed);
+                if call_number == 0 {
+                    panic!("simulated seeder panic");
+                }
+                write_complete_hf_cache(&config.cache_dir);
+                Ok(())
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut first_request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        first_request
+            .extensions_mut()
+            .insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(first_request)
+            .await
+            .expect_err("a panicking seeder must fail the RPC, not hang forever");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("simulated seeder panic"),
+            "the panic message must reach the caller: {error}"
+        );
+        assert_eq!(seed_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            !state.embedding_seed_progress.snapshot().active,
+            "seed_active must clear after a panicking seed, not stay stuck true"
+        );
+
+        // Recovery: a second `embed` call, same daemon, no restart. The fake
+        // seeder now succeeds (call_number == 1), proving the panic did not
+        // wedge the single-flight coordinator for this model.
+        let mut second_request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        second_request
+            .extensions_mut()
+            .insert(crate::auth::IsAdmin(true));
+        let response = service
+            .embed(second_request)
+            .await
+            .expect("the second call must succeed with no restart")
+            .into_inner();
+        assert!(response.model_seeded);
+        assert!(response.succeeded > 0);
+        assert_eq!(seed_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(state.embedding_runtime.status().state, "ready");
+
+        servicer.abort();
+    }
+
+    /// Counterweight: a seed that genuinely cannot download must surface the
+    /// real error and exit non-zero (`FAILED_PRECONDITION`), with neither the
+    /// stale "missing … run `nestweaver embed`" remediation nor any restart
+    /// advice — those both leaked exactly this text in the pre-nw-484 code.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_embed_seeding_failure_reports_the_download_error_without_restart_advice() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        // Cache is deliberately left EMPTY: the fake seeder below fails before
+        // ever touching it, so completeness here is irrelevant, and an empty
+        // dir keeps this test from depending on `write_complete_hf_cache`.
+        let config = embed_rpc_not_ready_test_config(cache.path());
+        let (mut state, _rx) = test_state_with_writer_generation(None);
+        {
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.instance_cfg = Some(Arc::new(config));
+            state_mut.artifact_seeder = Arc::new(|_config, _progress| {
+                Err(anyhow::anyhow!("simulated offline: connection refused"))
+            });
+        }
+
         let service = DaemonService::new(state);
         let mut request = Request::new(EmbedRequest {
             scope: "all".to_string(),
@@ -21623,13 +22384,831 @@ credential_method = "gh"
         let error = service
             .embed(request)
             .await
-            .expect_err("an unavailable embedding model must block embedding");
+            .expect_err("an offline seed must fail the RPC");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(
-            error.message().contains(&expected_state)
-                || error.message().contains("without the `embed` feature"),
+            error.message().contains("simulated offline"),
+            "the real download error must be reported: {error}"
+        );
+        assert!(
+            !error.message().to_ascii_lowercase().contains("restart"),
+            "no restart advice may leak into a seed failure: {error}"
+        );
+        assert!(
+            !error.message().contains("run `nestweaver embed`"),
+            "the stale pre-recovery remediation must not leak into a seed failure: {error}"
+        );
+    }
+
+    /// Queue three reload requests before anything services the channel,
+    /// exactly as concurrent RPCs would. One coalesced batch must load
+    /// exactly once and answer all three.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embedding_reload_requests_coalesce_into_one_load() {
+        let (state, mut rx) = test_state_with_writer_generation(None);
+        let mut shutdown = state.shutdown_tx.subscribe();
+        let loader_calls = Arc::new(AtomicU32::new(0));
+
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx2) = tokio::sync::oneshot::channel();
+            state
+                .embedding_reload_tx
+                .send(EmbeddingReloadRequest { reply: tx })
+                .await
+                .expect("reload channel open");
+            receivers.push(rx2);
+        }
+
+        let first = rx.recv().await.expect("first queued request");
+        let load = fake_ready_reload(Arc::clone(&state), Arc::clone(&loader_calls));
+        service_embedding_reloads(&state, first, &mut rx, &mut shutdown, load).await;
+
+        for receiver in receivers {
+            let outcome = receiver
+                .await
+                .expect("servicer must reply to every coalesced request");
+            assert!(matches!(outcome, EmbeddingReloadOutcome::Loaded(_)));
+        }
+        assert_eq!(
+            loader_calls.load(Ordering::Relaxed),
+            1,
+            "one coalesced batch must load exactly once"
+        );
+    }
+
+    /// A seed download must never hold the write gate or the write-admission
+    /// counter, so it cannot extend a shutdown drain. And once shutdown has
+    /// begun, a reload request is refused immediately without ever reaching
+    /// the loader.
+    ///
+    /// Bounded for the same reason as
+    /// `daemon_embed_joins_an_in_flight_auto_repair_download` below — read
+    /// that test's history note first. This one did NOT hang on Linux CI, and
+    /// tracing it shows why: its fake seeder is parked on the gate long
+    /// before the test reaches its own release, and the post-shutdown reply
+    /// is deterministic. But it had the identical risky shape — a
+    /// current-thread runtime, a two-party rendezvous blocked on that one
+    /// runtime thread, and three unbounded awaits — so it was one refactor
+    /// away from the same six-hour wedge. Terminating by luck of scheduling
+    /// is not a property worth preserving, so it gets the same construction:
+    /// a polled release-flag with a deadline instead of a rendezvous, a
+    /// multi-threaded runtime, and a bound on every wait that names what it
+    /// was waiting for.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_embed_seed_does_not_hold_the_write_gate_or_extend_drain() {
+        // Bounds mirror the sibling test: long enough that a healthy run
+        // never reaches them, short enough that a regression reports a named
+        // failure in seconds instead of parking the binary.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        const JOIN_BOUND: Duration = Duration::from_secs(30);
+
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        let release_seed = Arc::new(AtomicBool::new(false));
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let release_seed = Arc::clone(&release_seed);
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |config, _progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                // Hold the download "in flight" until the test releases it.
+                // `Acquire` pairs with the test's `Release` store, and the
+                // deadline means a seeder nobody ever releases unwinds in
+                // seconds rather than pinning an OS thread for the life of
+                // the process.
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                write_complete_hf_cache(&config.cache_dir);
+                Ok(())
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let embed_task = tokio::spawn(async move { service.embed(request).await });
+
+        wait_for_condition("the embed seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        // Settling time: the seeder has entered, but the RPC may not yet have
+        // reached whatever it does next. The assertions below are about what
+        // is NOT held, so they need a moment in which taking the gate would
+        // have shown up.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            state.write_gate.holder_snapshot().is_none(),
+            "a seed download must never hold the write gate"
+        );
+        assert_eq!(
+            state.active_writes.load(Ordering::Relaxed),
+            0,
+            "a seed download must not extend a shutdown drain"
+        );
+
+        // Shutdown begins WHILE the seed is still blocked.
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        state
+            .embedding_reload_tx
+            .send(EmbeddingReloadRequest { reply: reply_tx })
+            .await
+            .expect("reload channel open");
+        let outcome = tokio::time::timeout(JOIN_BOUND, reply_rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the reload servicer to refuse a \
+                     post-shutdown reload",
+                    JOIN_BOUND.as_secs()
+                )
+            })
+            .expect("servicer must reply");
+        assert!(
+            matches!(outcome, EmbeddingReloadOutcome::ShuttingDown),
+            "a reload requested after shutdown began must be refused"
+        );
+        assert_eq!(
+            loader_calls.load(Ordering::Relaxed),
+            0,
+            "no load may run once shutdown has begun"
+        );
+
+        // Release the one download and let the RPC unwind. A second,
+        // unexpected seeder would read this flag rather than wait forever for
+        // a rendezvous partner that will never arrive.
+        release_seed.store(true, Ordering::Release);
+        let embed_join = tokio::time::timeout(JOIN_BOUND, embed_task)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the embed RPC to finish after its \
+                     seed was released",
+                    JOIN_BOUND.as_secs()
+                )
+            });
+        // The RPC's own `Result` is not asserted — this test is about the
+        // write gate and the drain — but a PANIC inside the task must not be
+        // swallowed the way `let _ = ..` did.
+        let _ = embed_join.expect("the embed RPC task must not panic");
+        servicer.abort();
+    }
+
+    /// Poll `condition` until it holds, or FAIL naming what was awaited.
+    ///
+    /// Every wait in a test must be bounded. An unbounded one does not fail —
+    /// it parks the whole test binary until the CI job's own timeout kills
+    /// it, which costs a full job (six hours, on GitHub's default) and hides
+    /// the real cause behind the kill. That is not hypothetical here; see the
+    /// history note on `daemon_embed_joins_an_in_flight_auto_repair_download`
+    /// below.
+    #[cfg(feature = "embed")]
+    async fn wait_for_condition(what: &str, mut condition: impl FnMut() -> bool) {
+        const BOUND: Duration = Duration::from_secs(20);
+        let settled = tokio::time::timeout(BOUND, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "timed out after {}s waiting for {what}",
+            BOUND.as_secs()
+        );
+    }
+
+    /// The `embed` RPC joins an in-flight auto-repair download rather than
+    /// racing a second one, and both routes end up loading through exactly
+    /// one main-thread reload.
+    ///
+    /// ## This test has a history of HANGING — read before restructuring it
+    ///
+    /// It never returned on Linux CI (run 35053752832, job "Daemon
+    /// Integration Tests"): the job ran 03:57 → 09:59 UTC and was killed by
+    /// GitHub's default 6-hour job timeout. The daemon lib-test binary
+    /// printed `running 39 tests` and NEVER a `test result:` line — every
+    /// other binary in that job printed one — and job cleanup logged
+    /// `Terminate orphan process: pid (59418)
+    /// (nestweaver_daemon-32045b891d406fe2)`. Diffing the 38 tests that
+    /// printed `... ok` against the binary's 39 `daemon_`-matching tests left
+    /// exactly one: this one. It passed on macOS throughout (including the
+    /// Cold Metal job), because what it lost was a scheduling race that only
+    /// goes the wrong way on an oversubscribed runner.
+    ///
+    /// The production single-flight logic was NOT at fault — the old test
+    /// construction was. It ran on a CURRENT-THREAD runtime (`#[tokio::test]`
+    /// with no `flavor`), spawned the `embed` task, and then blocked that one
+    /// runtime thread on a `std::sync::Barrier::wait()`, so the `embed` task
+    /// could not be polled AT ALL until the barrier released. The seed thread
+    /// was the last party to arrive, so it returned from `wait()` immediately
+    /// while the test thread still had to be woken by the OS. Under CI load
+    /// the seed thread therefore finished `write_complete_hf_cache` (which
+    /// builds and serialises a real BERT fixture — not a quick write) and
+    /// published `SeedPhase::Done` BEFORE the `embed` task ever reached
+    /// `join_or_start_seed`. That function only joins a flight whose watch
+    /// value still reads `Running`, so `embed` correctly started a SECOND
+    /// flight — whose seeder blocked on the same 2-party barrier with no
+    /// partner left to meet it, forever. `let _ = embed_task.await;` had no
+    /// timeout (only the `repair` join did), so the binary hung instead of
+    /// failing an assertion.
+    ///
+    /// Three things keep that from recurring:
+    ///
+    /// 1. The interleaving this test exists to cover is now ESTABLISHED, not
+    ///    raced. The seed is held open until the test has positively observed
+    ///    that `embed` joined auto-repair's flight
+    ///    (`SeedProgress::joiners`, a test-only counter incremented inside
+    ///    `join_or_start_seed`'s join branch under its own lock).
+    /// 2. The seed gate is a released-flag the seed thread POLLS with a
+    ///    deadline, not a rendezvous. Releasing costs the test thread one
+    ///    atomic store it can never block on, and a second, unexpected seeder
+    ///    reads the flag rather than waiting forever for a partner — the old
+    ///    barrier's exact failure mode.
+    /// 3. EVERY await and every blocking wait is bounded, and each names what
+    ///    it was waiting for when it expires. This test can fail now; it
+    ///    cannot hang.
+    ///
+    /// `worker_threads = 2`: under `flavor = "multi_thread"` the test body
+    /// runs on the `block_on` thread and spawned tasks run on separate
+    /// workers, so a body that blocks (or busy-polls) can no longer starve
+    /// them the way the current-thread runtime did. Two workers then give the
+    /// auto-repair task and the `embed` task a thread each, so neither can be
+    /// queued behind the other's poll — `embed`'s first poll runs straight
+    /// through a store read and a `std::sync::Mutex` acquisition to
+    /// `join_or_start_seed` without yielding.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_embed_joins_an_in_flight_auto_repair_download() {
+        // How long the fake seeder parks waiting to be released. Bounded, so
+        // a seeder nothing ever releases — precisely what a regression here
+        // produces — unwinds in seconds and lets the assertions below report
+        // a real failure, instead of pinning an OS thread for the life of the
+        // process.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        // Bound on each caller's completion once the one download is done.
+        const JOIN_BOUND: Duration = Duration::from_secs(30);
+
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 4)
+            .unwrap();
+
+        let release_seed = Arc::new(AtomicBool::new(false));
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let release_seed = Arc::clone(&release_seed);
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |config, _progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                // Hold the download "in flight" until the test says
+                // otherwise. `Acquire` pairs with the `Release` store below
+                // so the flag is not merely visible but ordered after
+                // everything the test did before releasing.
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                write_complete_hf_cache(&config.cache_dir);
+                Ok(())
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let repair =
+            spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
+
+        // (1) Auto-repair's download is genuinely in flight: its seed thread
+        // has entered the seeder and is parked on the gate.
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let embed_task = tokio::spawn(async move { service.embed(request).await });
+
+        // (2) The `embed` RPC has reached `join_or_start_seed` and JOINED the
+        // flight auto-repair opened. Only now may the download finish. If
+        // `embed` ever started a second download instead of joining, this
+        // wait expires and the test FAILS by name — it can no longer wedge.
+        wait_for_condition(
+            "the embed RPC to join the in-flight auto-repair seed",
+            || {
+                state
+                    .embedding_seed_progress
+                    .joiners
+                    .load(Ordering::Acquire)
+                    == 1
+            },
+        )
+        .await;
+
+        // (3) Release the one download. Both callers wake from the same
+        // `SeedPhase::Done` and request a reload through the same channel.
+        release_seed.store(true, Ordering::Release);
+
+        let embed_join = tokio::time::timeout(JOIN_BOUND, embed_task)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the embed RPC to finish after the \
+                     in-flight seed it joined completed",
+                    JOIN_BOUND.as_secs()
+                )
+            });
+        // The RPC's own `Result` is deliberately not asserted — this test is
+        // about single-flight, not about the pass's outcome — but a PANIC
+        // inside the task must not be swallowed the way `let _ = ..` did.
+        let _ = embed_join.expect("the embed RPC task must not panic");
+
+        tokio::time::timeout(JOIN_BOUND, repair)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {}s waiting for the auto-repair task to finish after \
+                     its download completed",
+                    JOIN_BOUND.as_secs()
+                )
+            })
+            .expect("the auto-repair task must not panic");
+
+        assert_eq!(
+            seed_calls.load(Ordering::Relaxed),
+            1,
+            "both callers must join ONE download, never race two"
+        );
+        assert_eq!(
+            loader_calls.load(Ordering::Relaxed),
+            1,
+            "the model must be constructed exactly once"
+        );
+        servicer.abort();
+    }
+
+    /// Pure decision function, tested without any async machinery. No
+    /// recorded identity, an external backend, and a non-missing-artifact
+    /// failure must all skip — auto-repair only ever repairs a model this
+    /// database's VERIFIED identity already names, for a genuinely missing
+    /// artifact.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn daemon_does_not_auto_download_a_model_the_db_never_used() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig::default();
+        let missing = EmbeddingLoadFailure {
+            missing_artifact: true,
+        };
+
+        assert!(matches!(
+            auto_repair_eligibility(&cfg, None, &missing),
+            AutoRepair::Skip(_)
+        ));
+
+        let external_cfg = nestweaver_engine::config::EmbeddingConfig {
+            external_endpoint: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            auto_repair_eligibility(&external_cfg, Some("some-model"), &missing),
+            AutoRepair::Skip(_)
+        ));
+
+        let non_missing = EmbeddingLoadFailure {
+            missing_artifact: false,
+        };
+        assert!(matches!(
+            auto_repair_eligibility(&cfg, Some("some-model"), &non_missing),
+            AutoRepair::Skip(_)
+        ));
+
+        assert_eq!(
+            auto_repair_eligibility(&cfg, Some("some-model"), &missing),
+            AutoRepair::Eligible {
+                model_id: "some-model".to_string()
+            }
+        );
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn daemon_auto_repair_cache_false_disables_background_download() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            auto_repair_cache: false,
+            ..Default::default()
+        };
+        let missing = EmbeddingLoadFailure {
+            missing_artifact: true,
+        };
+        assert!(matches!(
+            auto_repair_eligibility(&cfg, Some("some-model"), &missing),
+            AutoRepair::Skip(_)
+        ));
+    }
+
+    /// Design's replacement for "boot did not wait": drive
+    /// `spawn_embedding_cache_repair` directly with a Barrier-blocked seeder.
+    /// It returns a handle without the caller awaiting it, and while the
+    /// download is blocked, non-semantic RPCs (`health_check`,
+    /// `brain_status`) stay answerable and report `state == "seeding"` with
+    /// live progress. Releasing the barrier lets the repair finish and reach
+    /// `ready` through the same main-thread reload channel.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_auto_repairs_missing_cache_for_a_model_with_recorded_identity() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 4)
+            .unwrap();
+
+        // A polled release-flag with a deadline, not a rendezvous — see the
+        // history note on `daemon_embed_joins_an_in_flight_auto_repair_download`.
+        // A seeder nobody releases unwinds on its own here; a `Barrier` with
+        // no partner never does.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        let release_seed = Arc::new(AtomicBool::new(false));
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let release_seed = Arc::clone(&release_seed);
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |config, progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                progress.bytes_total.store(2048, Ordering::Relaxed);
+                progress.bytes_done.store(1024, Ordering::Relaxed);
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                write_complete_hf_cache(&config.cache_dir);
+                Ok(())
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        // "Boot did not wait": the caller gets a handle back immediately and
+        // never awaits it before continuing.
+        let repair =
+            spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
+
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let service = DaemonService::new(Arc::clone(&state));
+        service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("a non-semantic RPC must remain usable while a repair is downloading");
+        let status = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("status RPC must remain usable while a repair is downloading")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(status.state, "seeding");
+        // Wire-format coverage (server review item 2): assert the actual
+        // VALUES the typed gRPC `EmbeddingStatus` copies from `SeedProgress`,
+        // not just that `state == "seeding"`. `embedding_status_proto` and
+        // `embedding_status_json` are two independent struct/map literals
+        // built from the same `SeedProgressSnapshot`; a swapped done/total,
+        // or a field dropped from one of the two, would still pass a test
+        // that only checks `state`.
+        assert!(status.seed_active);
+        assert_eq!(status.seed_bytes_done, 1024);
+        assert_eq!(status.seed_bytes_total, 2048);
+        assert_eq!(status.seed_origin, "auto_repair");
+        assert_eq!(status.seed_attempt, 1);
+        assert_eq!(status.seed_max_attempts, 5);
+
+        // Same values, JSON route: `embedding_status_json` is the second,
+        // independent literal built off the same `SeedProgressSnapshot` as
+        // `embedding_status_proto` above — mirrors the exact call the
+        // `brain_status` JSON path makes, so both wire formats are pinned in
+        // one test rather than only the one this RPC happens to use.
+        let json_status = embedding_status_json(
+            &embedding_status_with_store_identity(state.embedding_runtime.status(), &state.store),
+            &state.embed_progress.snapshot(),
+            state.store.embedding_index_occupancy(),
+            &state.store,
+            &state.embedding_seed_progress.snapshot(),
+        );
+        assert_eq!(json_status["seed_active"], true);
+        assert_eq!(json_status["seed_bytes_done"], 1024);
+        assert_eq!(json_status["seed_bytes_total"], 2048);
+        assert_eq!(json_status["seed_origin"], "auto_repair");
+        assert_eq!(json_status["seed_attempt"], 1);
+        assert_eq!(json_status["seed_max_attempts"], 5);
+
+        let seed_snapshot = state.embedding_seed_progress.snapshot();
+        assert!(seed_snapshot.active);
+        assert_eq!(seed_snapshot.origin, "auto_repair");
+        assert!(seed_snapshot.bytes_done > 0);
+
+        release_seed.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), repair)
+            .await
+            .expect("repair task must finish promptly once unblocked")
+            .unwrap();
+
+        assert_eq!(state.embedding_runtime.status().state, "ready");
+        servicer.abort();
+    }
+
+    /// Server review item 4 (MINOR): `run_embedding_cache_repair` is
+    /// deliberately never awaited in `run_server`'s exit sequence (see its
+    /// own doc comment) — it must return promptly on shutdown instead,
+    /// racing every wait point against `shutdown_sub.changed()`. Already
+    /// correct by code reading; this pins it. Blocks the fake seeder on a
+    /// `Barrier` that shutdown fires WITHOUT ever releasing, so the repair
+    /// task can only reach the bounded `tokio::time::timeout` below by
+    /// taking the shutdown branch of the `tokio::select!` at the seed-watch
+    /// wait point, never by the seed actually finishing.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_auto_repair_returns_promptly_on_shutdown_without_finishing_the_seed() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 4)
+            .unwrap();
+
+        // Deliberately never released until the assertions are done: the
+        // repair task must reach the bounded timeout below via the SHUTDOWN
+        // branch of its `tokio::select!`, never by the seed finishing. A
+        // polled flag with a deadline rather than a `Barrier` so that a
+        // seeder this test never releases still unwinds on its own instead
+        // of parking an OS thread for the rest of the binary's run — see the
+        // history note on `daemon_embed_joins_an_in_flight_auto_repair_download`.
+        const SEED_GATE_BOUND: Duration = Duration::from_secs(30);
+        let release_seed = Arc::new(AtomicBool::new(false));
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let release_seed = Arc::clone(&release_seed);
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |_config, _progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                let deadline = Instant::now() + SEED_GATE_BOUND;
+                while !release_seed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let repair =
+            spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
+
+        wait_for_condition("the auto-repair seed thread to start downloading", || {
+            seed_calls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        state
+            .shutdown_tx
+            .send(true)
+            .expect("shutdown_tx must still have a receiver");
+
+        tokio::time::timeout(Duration::from_secs(5), repair)
+            .await
+            .expect(
+                "the auto-repair loop must return promptly on shutdown, \
+                 not wait out an in-flight seed",
+            )
+            .unwrap();
+
+        // Release the blocked seed thread so it can finish and this test
+        // does not leak a parked thread into the rest of the binary's test
+        // run. A store, not a rendezvous: it cannot block, and it is belt to
+        // the seeder's own deadline braces.
+        release_seed.store(true, Ordering::Release);
+        servicer.abort();
+    }
+
+    /// Bounded backoff, disclosed. A seeder that always fails transiently is
+    /// retried on the fixed schedule (30s/2m/8m/30m ±20% jitter) up to
+    /// `AUTO_REPAIR_MAX_ATTEMPTS`, never hot-looping, and the final status
+    /// names the attempt count.
+    #[cfg(feature = "embed")]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_auto_repair_backs_off_after_failure_without_hot_looping() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 4)
+            .unwrap();
+
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |_config, _progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::anyhow!("simulated transient network error"))
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let repair =
+            spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
+        // `start_paused = true` auto-advances the virtual clock whenever the
+        // runtime has nothing runnable and at least one pending timer, so a
+        // bare await on the handle resolves once the bounded retry loop's
+        // own backoff sleeps have all (virtually) elapsed. Deliberately NO
+        // competing `tokio::time::timeout` here: the seed itself runs on a
+        // REAL `std::thread` (see `join_or_start_seed`), so between attempts
+        // the repair task is briefly blocked on real cross-thread
+        // synchronization rather than a timer. If a competing virtual
+        // timeout is the ONLY other registered timer during that window,
+        // auto-advance can jump straight to ITS deadline before the repair
+        // task ever gets to register its own nearer backoff sleep — firing
+        // early and flaking regardless of how large the bound is. Any
+        // genuine hang is still caught at the CI job level.
+        repair.await.expect("repair task must not panic");
+
+        assert_eq!(
+            seed_calls.load(Ordering::Relaxed),
+            5,
+            "must attempt exactly AUTO_REPAIR_MAX_ATTEMPTS times, never hot-loop"
+        );
+        assert_eq!(
+            loader_calls.load(Ordering::Relaxed),
+            0,
+            "a seed that always fails must never reach the reload loader"
+        );
+        let status = state.embedding_runtime.status();
+        assert_eq!(status.state, "failed");
+        assert!(
+            status.error.contains("stopped after 5 attempt(s)"),
+            "{}",
+            status.error
+        );
+        servicer.abort();
+    }
+
+    /// Counterweight: a permanent error (not-found-shaped) stops after ONE
+    /// attempt rather than exhausting the bounded schedule.
+    #[cfg(feature = "embed")]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_auto_repair_stops_early_on_a_permanent_error() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (mut state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 4)
+            .unwrap();
+
+        let seed_calls = Arc::new(AtomicU32::new(0));
+        {
+            let seed_calls = Arc::clone(&seed_calls);
+            let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+            state_mut.artifact_seeder = Arc::new(move |_config, _progress| {
+                seed_calls.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::anyhow!(
+                    "EntryNotFound: model repository does not exist"
+                ))
+            });
+        }
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+
+        let repair =
+            spawn_embedding_cache_repair(Arc::clone(&state), "test-owner/test-model".to_string());
+        // No competing `tokio::time::timeout` — see the note in
+        // `daemon_auto_repair_backs_off_after_failure_without_hot_looping`
+        // on why that races with paused time and a real seed thread.
+        repair.await.expect("repair task must not panic");
+
+        assert_eq!(
+            seed_calls.load(Ordering::Relaxed),
+            1,
+            "a permanent error must stop after exactly one attempt"
+        );
+        let status = state.embedding_runtime.status();
+        assert_eq!(status.state, "failed");
+        assert!(
+            status.error.contains("stopped after 1 attempt(s)"),
+            "{}",
+            status.error
+        );
+        servicer.abort();
+    }
+
+    /// This variant only compiles with the `embed` feature OFF, and nothing
+    /// sanctioned builds that: the root crate's `default = ["embed"]` means
+    /// every `--workspace` build — every CI job in this repo included — unifies
+    /// `embed` ON for `nestweaver-daemon` too. So this branch is UNVERIFIED;
+    /// no test run anyone here does compiles or executes it. It is kept
+    /// anyway as executable documentation of the RPC's own
+    /// `#[cfg(not(feature = "embed"))]` refusal branch above — the one place
+    /// that behavior is pinned at all — for the sole build shape that would
+    /// exercise it (`--no-default-features`), should one ever get added.
+    #[cfg(not(feature = "embed"))]
+    #[tokio::test]
+    async fn embedding_status_blocks_embed_rpc_until_ready() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+            repair_identity: false,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(request)
+            .await
+            .expect_err("a daemon built without the embed feature must refuse the embed RPC");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("without the `embed` feature"),
             "error should identify the structured readiness failure: {error}"
+        );
+    }
+
+    /// nw-483 guard. Proves `state_with_isolated_embedding_cache`'s own
+    /// contract: the state it builds resolves the embed RPC's artifact-seed
+    /// path (`embedding_cache_dir_for_load_with`, the same resolution the
+    /// `embed` RPC's `None` branch performs before calling
+    /// `join_or_start_seed`) inside the tempdir it was given. Fails against a
+    /// bare `test_state_with_writer()`
+    /// (`instance_cfg: None` falls back to `EmbeddingConfig::default()`'s
+    /// real, non-test platform cache dir); passes once built through the
+    /// helper.
+    ///
+    /// It does NOT prove that `embedding_status_blocks_embed_rpc_until_ready`
+    /// or `embed_handler_never_observes_ready_without_exact_model` still call
+    /// this helper — either could silently revert to a bare
+    /// `test_state_with_writer()` and this test would keep passing, since it
+    /// exercises the helper directly rather than those tests. The backstop
+    /// for that regression is ci.yml's "Verify no test reached the real model
+    /// cache (nw-483)" step, which inspects the real cache directory after
+    /// the daemon test job runs regardless of which test path wrote to it.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn embed_rpc_test_state_never_resolves_the_platform_model_cache() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let state = state_with_isolated_embedding_cache(cache.path());
+        let cfg = state
+            .instance_cfg
+            .as_ref()
+            .map(|c| c.embedding.clone())
+            .unwrap_or_default();
+        let resolved =
+            embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path)
+                .expect("embedding cache dir must resolve");
+        assert!(
+            resolved.starts_with(cache.path()),
+            "the embed RPC's artifact-seed path must resolve inside this test's \
+             tempdir, not the real platform model cache — got {}",
+            resolved.display()
         );
     }
 
@@ -21969,10 +23548,27 @@ external_model = "unavailable-test-model"
         assert!(!typed.fallback_used);
     }
 
+    /// nw-483: before the model is ever published, the loop below races real
+    /// `embed` RPCs against `state.embedding_runtime`'s initial `model: None`
+    /// snapshot — that race is the whole point of this test (it pins that the
+    /// handler never reports "ready" without an exact model, even mid-race).
+    /// `model: None` + `repair_identity: false` is exactly the branch that
+    /// now seeds (via `join_or_start_seed`) then requests a main-thread
+    /// reload. `state_with_isolated_embedding_cache` drops the reload-channel
+    /// receiver (see its doc comment), so every one of these iterations gets
+    /// a fast "channel closed" failure instead of hanging on a reload nobody
+    /// services — this test intentionally does not wire a servicer, since
+    /// its whole point is the race BEFORE any model is ready, not recovery.
+    /// nw-483 originally landed here because a bare `test_state_with_writer()`
+    /// resolves `EmbeddingConfig::default()`'s real, non-test platform cache
+    /// dir; `state_with_isolated_embedding_cache` and the default test
+    /// artifact seeder together keep every iteration off the real network and
+    /// the real cache.
     #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embed_handler_never_observes_ready_without_exact_model() {
-        let state = test_state_with_writer();
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let state = state_with_isolated_embedding_cache(cache.path());
         insert_unembedded_symbol(&state.store, "sym-atomic-handler");
         let calls = Arc::new(AtomicU32::new(0));
         let model = Arc::new(CountingEmbed {

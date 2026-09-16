@@ -2908,6 +2908,46 @@ pub fn dispatch_cancellable(
             let identity_error = store.embedding_identity_error();
             annotate_lexical_embedding_identity_degradation(identity_error.as_deref(), &mut value);
         }
+        // nw-475 (Task 5.2, owner decision Q7): a successful response served
+        // while a watcher-batch marker is still open must disclose it — this
+        // is the honesty half of the serve-with-disclosure exception in
+        // `GraphStore::index_publication_blocks_ranking`, which let the
+        // dispatch above SUCCEED instead of failing closed. `brain_status`
+        // is excluded: it already carries its own dedicated
+        // `index_publication` object (dirty/marker_age_s/etc.) and adding a
+        // second, differently-shaped disclosure at the top level would be
+        // redundant at best and conflicting at worst.
+        //
+        // KNOWN GAP (pending shared-file follow-up, main.rs is held by
+        // another task): these keys reach every MCP route (stdio and the
+        // daemon's tools/call) today, since both call this function. Several
+        // CLI `--json` verbs do NOT see them, because `src/main.rs`
+        // reshapes this same dispatch value into a typed struct before
+        // printing it — e.g. `hubs` (`Commands::Hubs`) builds `Vec<HubNode>`
+        // from `value.get("hubs")` and reprints via `print_ranking_json`,
+        // which has no field for this disclosure, so it is silently
+        // dropped. Until that CLI-side plumbing lands, an agent calling the
+        // `hub_nodes`/`brain_context`/etc. MCP tools sees the disclosure;
+        // the `nestweaver hubs --json` CLI verb (and any sibling verb with
+        // the same reshape-then-reprint shape) does not.
+        if name != "brain_status"
+            && let Some(db_path) = store.db_path()
+        {
+            let status = nestweaver_engine::index_publication::status(db_path);
+            if status.dirty
+                && status.is_watcher_batch()
+                && !status.is_wedged()
+                && let Value::Object(map) = &mut value
+            {
+                map.insert("publication_in_progress".to_string(), json!(true));
+                map.insert("marker_age_s".to_string(), json!(status.marker_age_s));
+                map.insert("in_flight_note_paths".to_string(), json!(status.note_paths));
+                map.insert(
+                    "in_flight_note_paths_truncated".to_string(),
+                    json!(status.note_paths_truncated),
+                );
+            }
+        }
         provenance_seam::stamp(Unstamped::new(value))
     });
 
@@ -2949,6 +2989,16 @@ pub fn wait_out_index_publication(
     }
     let budget = index_publication_wait();
     if budget.is_zero() {
+        return;
+    }
+    // nw-475 (Task 5.2, owner decision Q7): a watcher-batch marker that is
+    // not wedged does not block ranking at all
+    // (`GraphStore::index_publication_blocks_ranking`), so there is nothing
+    // to wait FOR — the dispatch below is going to succeed either way.
+    // Without this, every ranked call during a watcher batch burned the
+    // full configured budget before succeeding, for the batch's entire
+    // multi-minute duration, turning a latency blip into a real one.
+    if !store.index_publication_blocks_ranking() {
         return;
     }
     // Never wait on a publication that cannot complete. A wedged marker names
@@ -3062,8 +3112,10 @@ pub fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error
                  ranked queries are failing closed. {writer}; {ownership}. {preamble} A live \
                  writer can legitimately hold the lease this long for a large re-index — this is \
                  NOT necessarily stuck — but do not assume it clears immediately: check \
-                 `brain status` for progress, or raise NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to \
-                 wait longer."
+                 `brain status --json`'s `index_publication.dirty` / \
+                 `index_publication.marker_age_s` for progress (the plain-text `brain status` \
+                 does not print these field names), or raise NESTWEAVER_INDEX_PUBLICATION_WAIT_MS \
+                 to wait longer."
             )
         } else {
             anyhow!(
@@ -5048,7 +5100,7 @@ fn tool_schema_code_context() -> Value {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -7942,7 +7994,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content — but a count of `null` means it could NOT BE READ, which is NOT zero and is not a reason to re-index. Check `unavailable` (and `counts_complete`) before acting on any count\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status, search_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content — but a count of `null` means it could NOT BE READ, which is NOT zero and is not a reason to re-index. Check `unavailable` (and `counts_complete`) before acting on any count\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status, search_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Seven further keys — `seed_active`, `seed_bytes_done`, `seed_bytes_total`, `seed_origin`, `seed_attempt`, `seed_max_attempts`, `seed_next_retry_at` — describe an in-flight (or most recently attempted) model-artifact download. While one is in flight `state` reads `seeding`, which takes precedence over `ready`/`embedding`: semantic retrieval really is unavailable for that window, so `seeding` is NOT a narrower `ready` the way `embedding` is. Prefer the boolean `seed_active`. `seed_bytes_total` is a growing LOWER BOUND, not a fixed target — the artifact set is resolved file by file, so the total climbs as each new file starts and `0` means \"not yet known\", not \"nothing to download\"; a percentage derived from these two keys can go DOWN, so do not report it as progress toward a known end. `seed_next_retry_at` nonzero with `seed_active: false` means an attempt is SCHEDULED, not abandoned. `seed_origin`/`seed_attempt`/`seed_max_attempts` describe whoever STARTED the download, not every caller waiting on it. Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11761,7 +11813,7 @@ fn tool_brain_diff(
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within strict project membership, bounded by token budget. Each result reports in_project, source_project, and membership_basis; linked foreign content is excluded.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within strict project membership, bounded by token budget. Each result reports in_project, source_project, and membership_basis; linked foreign content is excluded.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -11816,11 +11868,11 @@ fn tool_schema_project_context() -> Value {
                 "repos": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Use on a returning session to skip the broad load."
+                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load."
                 },
                 "path_prefix": {
                     "type": "string",
-                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\"). Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded."
+                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\"). Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a prefix-scoped call can surface symbols that an unscoped call would never reach, because they were never in the unscoped call's top-ranked seed set."
                 },
                 "tags": {
                     "type": "array",
@@ -12104,6 +12156,22 @@ fn tool_project_context(
         return Ok(response);
     }
 
+    // nw-470: resolve the `repos` selector scope BEFORE the PageRank
+    // seed-selection cut below, not just before the post-hoc `.retain()` at
+    // 5b. A restrictive `path_prefix`/`repos` applied only after
+    // `list_project_symbol_uids_by_pagerank`'s global top-K-by-PageRank cut
+    // has nothing left to select from on a project this size — the same
+    // "filter before you truncate, not after" defect nw-378 already fixed
+    // one call frame later (`RenderCap::admit`). `resolve_repo_filter` needs
+    // only `store`/`filter_repos`/`visible`, all already in scope.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
+    };
+    let seed_repo_uids: Option<Vec<String>> = repo_scope
+        .as_ref()
+        .map(|uids| uids.iter().cloned().collect());
+
     // 4. Seed PPR from the project node, its components, and — critically —
     //    the project's member notes (Bug #12). Seeding the notes guarantees
     //    they survive the `min_score` filter in PPR: when a project declares
@@ -12117,16 +12185,30 @@ fn tool_project_context(
     //    that declares any repo returns notes-only context even after
     //    `materialize-projects` writes hundreds of thousands of
     //    PROJECT_INCLUDES_SYMBOL edges.
+    //
+    //    `path_prefix`/`repos` are pushed into the seed query itself (nw-470)
+    //    so a narrow scope still has a candidate pool to rank within, instead
+    //    of narrowing an already-truncated global top-100.
     const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
     let mut member_symbol_uids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let top_symbols = store
-        .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+        .list_project_symbol_uids_by_pagerank(
+            &project.uid,
+            PROJECT_SYMBOL_SEED_LIMIT,
+            path_prefix.as_deref(),
+            seed_repo_uids.as_deref(),
+        )
         .map_err(|e| anyhow!("list_project_symbol_uids_by_pagerank: {e}"))?;
     member_symbol_uids.extend(top_symbols);
     for comp_uid in &component_uids {
         let comp_top = store
-            .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+            .list_project_symbol_uids_by_pagerank(
+                comp_uid,
+                PROJECT_SYMBOL_SEED_LIMIT,
+                path_prefix.as_deref(),
+                seed_repo_uids.as_deref(),
+            )
             .unwrap_or_default();
         member_symbol_uids.extend(comp_top);
     }
@@ -12246,10 +12328,10 @@ fn tool_project_context(
     //     predicate, which is why one grooming pass had to fix the same defect
     //     in two places. Both now route through the shared resolver and the
     //     shared retain helpers, so the next correction lands once.
-    let repo_scope = match filter_repos {
-        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
-        None => None,
-    };
+    //     `repo_scope` was already resolved above (nw-470) so the seed-cut
+    //     query could use it; kept here too as defence-in-depth for nodes
+    //     that arrive via PPR graph-proximity rather than direct seeding
+    //     (e.g. a non-member neighbor that happens to satisfy path_prefix).
     let apply_scope = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
         if let Some(ref repo_uids) = repo_scope {
             retain_nodes_in_repos(nodes, repo_uids);
@@ -12520,7 +12602,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos` and a `remedies` array, and NO `unreachable_symbols` key at all — a missing edge can only fail to reach a LIVE symbol, so an under-resolved graph moves live code onto a deletion list. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required) and call again.\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding. A polyglot repo can degrade even with entry_points > 0 and undecodable_symbols == 0: `languages_without_entry_points` names each language that contributed analysed symbols but no entry point of its own — its reachability numbers are exactly as vacuous as the whole-corpus case, just scoped to that language",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos` and a `remedies` array, and NO `unreachable_symbols` key at all — a missing edge can only fail to reach a LIVE symbol, so an under-resolved graph moves live code onto a deletion list. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required) and call again.\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- Rust `impl` blocks: a block is REACHABLE when ANY of its members is, and a DEAD block suppresses its own unreachable `Method` members from the list — you get the block once, not the block plus every method it defines. Associated `Constant`s still surface individually, matching how a dead class's already did\n- Row order is deterministic and total: confidence, then PageRank importance, then file path, then name, then `uid` as the final tie-break. That last key matters because `limit` keeps a PREFIX — without it, two same-named dead siblings in one file (duplicate overloads, `impl`-block twins) could swap position between runs on an unchanged graph and change which rows survive the cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- bash `trap` handler resolution is SAME-FILE ONLY. `trap cleanup EXIT` roots `cleanup` only when the same file also defines it; a handler defined in a `source`d file (`source lib.sh; trap cleanup EXIT`) is NOT resolved and the handler will appear unreachable\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding. A polyglot repo can degrade even with entry_points > 0 and undecodable_symbols == 0: `languages_without_entry_points` names each language that contributed analysed symbols but no entry point of its own — its reachability numbers are exactly as vacuous as the whole-corpus case, just scoped to that language",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -15335,7 +15417,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it); the one case it can still miss is a match living at a path the ranker deboosts (e.g. a test-mirror path), which can fall outside the name resolver's own top-5 candidates and go unpinned. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -15417,7 +15499,7 @@ fn tool_investigate(
 fn tool_schema_investigate_expand() -> Value {
     json!({
         "name": "investigate_expand",
-        "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- Expanded entries always have body_complete: true (full untruncated body)\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
+        "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- The full untruncated body is fetched when the source can be re-read (body_complete true or absent). If a previously truncated body can't be re-fetched, body_complete can still be false — check it as you would after hydrate\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -15457,7 +15539,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
 fn tool_schema_investigate_hydrate() -> Value {
     json!({
         "name": "investigate_hydrate",
-        "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete: true means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
+        "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete true or absent means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -15491,6 +15573,73 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
     let db_path = current_db_path(store)?;
     let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
     Ok(serde_json::to_value(result)?)
+}
+
+#[cfg(test)]
+mod investigate_body_complete_schema_tests {
+    use super::*;
+
+    // nw-477: `BundleEntry::body_complete` is
+    // `#[serde(default = "default_true", skip_serializing_if = "is_true")]`
+    // (investigate.rs), so `true` is never actually written to the wire — it
+    // is OMITTED, and `false` is the only value that ever appears literally.
+    // These schema descriptions used to promise the opposite ("always have
+    // body_complete: true"), contradicting the tool's own JSON Schema
+    // contract. Pin the corrected "true or absent" phrasing — the same
+    // convention already used correctly at agent_guide.rs:606 — and guard
+    // against the sentence being silently deleted rather than fixed: a naive
+    // `str::replace` that drops the clause instead of correcting it would
+    // also make the negative assertion pass.
+    #[test]
+    fn investigate_schemas_describe_body_complete_as_true_or_absent() {
+        let expand_desc = tool_schema_investigate_expand()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !expand_desc.contains("body_complete: true"),
+            "expand schema must not claim body_complete is literally serialized as `true`: {expand_desc}"
+        );
+        assert!(
+            expand_desc.contains("body_complete"),
+            "expand schema must still document body_complete, not just drop the sentence: {expand_desc}"
+        );
+        assert!(
+            expand_desc.contains("or absent"),
+            "expand schema must use the true-or-absent phrasing: {expand_desc}"
+        );
+        // nw-477 follow-up: a previously truncated entry (body_complete=false
+        // from an earlier hydrate) that fails re-fetch inside
+        // investigate_expand (investigate.rs Err(_) if inline_body.is_some()
+        // branch, ~1288-1291) keeps expanded=true but never resets
+        // body_complete back to true. "Never false for an expanded entry"
+        // was therefore itself a false guarantee — it must not reappear.
+        assert!(
+            !expand_desc.contains("never false"),
+            "expand schema must not promise body_complete is never false for an expanded entry — a failed re-fetch on a previously truncated entry can leave it false: {expand_desc}"
+        );
+
+        let hydrate_desc = tool_schema_investigate_hydrate()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !hydrate_desc.contains("body_complete: true"),
+            "hydrate schema must not claim body_complete is literally serialized as `true`: {hydrate_desc}"
+        );
+        assert!(
+            hydrate_desc.contains("body_complete"),
+            "hydrate schema must still document body_complete, not just drop the sentence: {hydrate_desc}"
+        );
+        assert!(
+            hydrate_desc.contains("or absent"),
+            "hydrate schema must use the true-or-absent phrasing: {hydrate_desc}"
+        );
+        assert!(
+            !hydrate_desc.contains("never false"),
+            "hydrate schema must not claim body_complete is never false: {hydrate_desc}"
+        );
+    }
 }
 
 /// The nw-103 resolver-staleness disclosure, for tools whose numbers it invalidates.
@@ -16653,6 +16802,214 @@ mod project_context_bug12_tests {
         assert!(
             bodied.iter().any(|b| b.contains("function")),
             "opted-in path should embed at least one symbol body; got connected={connected:?}"
+        );
+    }
+
+    /// nw-470. `path_prefix`/`kinds:["Symbol"]` used to collapse to (at most)
+    /// one generic result, because `list_project_symbol_uids_by_pagerank`'s
+    /// top-`PROJECT_SYMBOL_SEED_LIMIT`-by-PageRank seed cut ran BEFORE
+    /// `path_prefix` was ever consulted: on a project with a large noisy
+    /// symbol mass elsewhere, a handful of low-PageRank symbols under one
+    /// specific prefix never made the global top-100 cut and so were never
+    /// even PPR seeds, regardless of how well they matched the requested
+    /// scope. Fixed by pushing `path_prefix`/`repos` into the seed query
+    /// itself (read.rs `list_project_symbol_uids_by_pagerank`).
+    #[test]
+    fn project_context_path_prefix_kinds_symbol_returns_symbols_under_prefix() {
+        fn mk_ranked_symbol(uid: &str, file_path: &str, pagerank: f64) -> Symbol {
+            Symbol {
+                uid: uid.to_string(),
+                name: uid.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:noisy".to_string(),
+                file_path: file_path.to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {uid}()"),
+                summary: None,
+                content_hash: format!("hash-{uid}"),
+                embedding: None,
+                pagerank_score: Some(pagerank),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            }
+        }
+
+        let store = GraphStore::in_memory().unwrap();
+        let proj = Project {
+            uid: "proj:nw470".into(),
+            name: "NW470".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        // 150 unrelated, high-PageRank "noise" symbols elsewhere in the repo
+        // — enough to fill PROJECT_SYMBOL_SEED_LIMIT (100) on their own, so
+        // an unfiltered top-K seed cut leaves zero room for the target-prefix
+        // symbols below.
+        let mut all_uids: Vec<String> = Vec::new();
+        for i in 0..150 {
+            let uid = format!("sym:noise{i}");
+            store
+                .insert_symbol(&mk_ranked_symbol(
+                    &uid,
+                    &format!("src/elsewhere/file{i}.rs"),
+                    10_000.0 - i as f64,
+                ))
+                .unwrap();
+            all_uids.push(uid);
+        }
+
+        // 5 low-PageRank symbols under the prefix under test.
+        let mut target_uids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let uid = format!("sym:target{i}");
+            store
+                .insert_symbol(&mk_ranked_symbol(
+                    &uid,
+                    &format!("src/target/file{i}.rs"),
+                    1.0 + i as f64,
+                ))
+                .unwrap();
+            all_uids.push(uid.clone());
+            target_uids.push(uid);
+        }
+
+        store
+            .batch_insert_project_symbol_edges("proj:nw470", &all_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "NW470",
+                "token_budget": 8000,
+                "response_format": "detailed",
+                "path_prefix": "src/target/",
+                "kinds": ["Symbol"],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        let symbol_nodes: Vec<&Value> = connected
+            .iter()
+            .filter(|n| n["kind"].as_str().is_some_and(|k| k.starts_with("Symbol")))
+            .collect();
+        assert!(
+            symbol_nodes.len() > 1,
+            "expected more than one Symbol under the prefix; got {connected:?}"
+        );
+        for node in &symbol_nodes {
+            let location = node["location"].as_str().unwrap_or_default();
+            assert!(
+                location.starts_with("src/target/"),
+                "every returned Symbol must be under the requested prefix; got {location}"
+            );
+        }
+        let returned_uids: std::collections::HashSet<&str> = symbol_nodes
+            .iter()
+            .filter_map(|n| n["uid"].as_str())
+            .collect();
+        for target in &target_uids {
+            assert!(
+                returned_uids.contains(target.as_str()),
+                "target-prefix symbol {target} must survive the seed cut; got {connected:?}"
+            );
+        }
+    }
+
+    /// nw-470 follow-up (code-quality review). `"repos": []` (an explicit
+    /// empty array, distinct from omitting `repos` entirely) must keep
+    /// meaning "zero repos selected, so nothing matches" — the SAME
+    /// contract this tool already had before nw-470 pushed `repos` into the
+    /// PageRank seed-selection query. Before nw-470, `repos: []` resolved
+    /// to an empty `HashSet` via `resolve_repo_filter` and was applied only
+    /// by the post-hoc `retain_nodes_in_repos` at step 5b, which keeps
+    /// nothing against an empty set (and drops vault content unconditionally
+    /// whenever `repos` is set at all, per the tool's schema). nw-470 must
+    /// not change this: seeding now also passes the same empty set into
+    /// `list_project_symbol_uids_by_pagerank`, which must independently
+    /// match nothing rather than falling back to "unrestricted".
+    #[test]
+    fn project_context_repos_empty_array_matches_nothing_same_as_before_nw470() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:nw470b".into(),
+                name: "nw470b".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        let proj = Project {
+            uid: "proj:nw470b".into(),
+            name: "NW470B".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        store
+            .insert_note(&mk_note(
+                "note:nw470b",
+                "vlt:nw470b",
+                "Projects/nw470b/doc.md",
+                "note:nw470b",
+            ))
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:nw470b", "note:nw470b")])
+            .unwrap();
+
+        let sym_uids: Vec<String> = (0..10)
+            .map(|i| {
+                let uid = format!("sym:nw470b{i}");
+                store
+                    .insert_symbol(&mk_symbol(
+                        &uid,
+                        "repo:nw470b",
+                        &format!("src/f{i}.rs"),
+                        &uid,
+                    ))
+                    .unwrap();
+                uid
+            })
+            .collect();
+        store
+            .batch_insert_project_symbol_edges("proj:nw470b", &sym_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "NW470B",
+                "token_budget": 5000,
+                "response_format": "detailed",
+                "repos": [],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        assert!(
+            connected.is_empty(),
+            "\"repos\": [] must match NOTHING (same pre-nw-470 contract as \
+             resolve_repo_filter + retain_nodes_in_repos on an empty set), \
+             not fall back to unrestricted; got {connected:?}"
         );
     }
 }
@@ -17965,6 +18322,256 @@ mod cache_dispatch_tests {
         // above: the identical setup with a FRESH marker (age ~0s) still reads
         // TRANSIENT and still says "retry shortly" — so this test is exercising
         // the age threshold, not some other change to the held-authority path.
+    }
+
+    /// nw-475 (Task 5.2): the "IN PROGRESS (longer than expected)" branch
+    /// used to tell the reader to "check `brain status` for progress" —
+    /// true, but not actionable, since it never named WHICH field to check.
+    /// `brain_status_json` already exposes this exact marker read as
+    /// `index_publication.dirty` / `index_publication.marker_age_s`
+    /// (tools.rs, the `brain_status_json` builder); the message must name
+    /// those real field names rather than a vague "check status".
+    #[test]
+    fn ranked_read_fail_closed_message_names_index_publication_marker() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker_aged(
+            &db_path,
+            std::process::id(),
+            None,
+            nestweaver_engine::index_publication::WEDGED_MARKER_AGE
+                + std::time::Duration::from_secs(30),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(
+                &store,
+                anyhow!("PageRank unavailable during dirty index publication"),
+            )
+        );
+        assert!(
+            message.contains("index_publication.dirty"),
+            "must name the concrete status field to check: {message}"
+        );
+        assert!(
+            message.contains("marker_age_s"),
+            "must name the concrete status field to check: {message}"
+        );
+        // The CLI-text route (`nestweaver brain status`, no flag) never
+        // prints `index_publication.dirty`/`marker_age_s` as field names —
+        // only the JSON route does. Naming the field without naming `--json`
+        // would send a reader to a command that cannot show what was named.
+        assert!(
+            message.contains("--json"),
+            "must name the JSON route, since plain-text brain status cannot \
+             show these field names: {message}"
+        );
+        // Counterweight: the env var the message already names correctly
+        // must still be present — this change points readers at status
+        // fields IN ADDITION to the existing remedy, not instead of it.
+        assert!(
+            message.contains("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS"),
+            "must still name the wait env var: {message}"
+        );
+    }
+
+    // ── nw-475 (Task 5.2), owner decision Q7: serve ranked reads with
+    // disclosure during a watcher-batch publication ──────────────────────
+
+    /// nw-475 (Task 5.2, review fix): `wait_out_index_publication` must not
+    /// burn the configured wait budget on a marker that already does not
+    /// block ranking (a non-wedged watcher-batch marker) — that would cost
+    /// EVERY ranked call the full `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` for
+    /// the batch's entire multi-minute duration, for a wait that changes
+    /// nothing (the dispatch is going to succeed either way). Every other
+    /// test in this file sets the budget to 0, which hides this defect
+    /// because a zero budget already short-circuits before the wait loop
+    /// runs for an unrelated reason — this test configures a REAL,
+    /// measurable budget so a regression shows up as a slow test, not a
+    /// silently-passing one.
+    #[test]
+    fn wait_out_index_publication_does_not_wait_during_a_watcher_batch() {
+        reset_session();
+        set_index_publication_wait_ms(5_000);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(
+            &db_path,
+            std::process::id(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let started = std::time::Instant::now();
+        wait_out_index_publication(&store, None);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "must not wait out any part of the 5000ms budget during a \
+             watcher-batch publication that does not block ranking: waited {elapsed:?}"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    /// COUNTERWEIGHT: an ordinary (non-watcher-batch) dirty marker still
+    /// waits out the configured budget exactly as before — the short-circuit
+    /// above is scoped to the ONE reason that does not block ranking.
+    #[test]
+    fn wait_out_index_publication_still_waits_for_an_ordinary_dirty_marker() {
+        reset_session();
+        set_index_publication_wait_ms(300);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let started = std::time::Instant::now();
+        wait_out_index_publication(&store, None);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "an ordinary dirty marker must still wait out (most of) the \
+             configured budget: waited {elapsed:?}"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    /// A brain-watcher batch's marker (reason ==
+    /// `MARKER_REASON_WATCHER_BATCH`, writer authority held) must let a
+    /// ranked tool answer instead of failing closed, and the response must
+    /// disclose the in-flight publication rather than silently looking
+    /// fresh. `hub_nodes` is the ranking tool `index_on_disk`'s own doc
+    /// comment names ("so hub_nodes has scores") — its PageRank is already
+    /// warm, so this proves the SERVE path, not merely a lazy recompute
+    /// that happens to succeed.
+    #[test]
+    fn ranked_read_during_watcher_publication_answers_with_disclosure() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let note_paths = vec!["Alpha.md".to_string()];
+        fs::write(
+            nestweaver_engine::sidecar_path(&db_path, ".index-dirty"),
+            nestweaver_store::index_publication::format_marker_payload_with_note_paths(
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+                &note_paths,
+            ),
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let result = dispatch(&store, None, "hub_nodes", json!({}), None).expect(
+            "a watcher-batch publication must let ranked reads answer with disclosure, \
+             not fail closed",
+        );
+
+        assert_eq!(result["publication_in_progress"], json!(true));
+        assert!(
+            result["marker_age_s"].is_number(),
+            "must disclose the marker's age: {result}"
+        );
+        assert_eq!(result["in_flight_note_paths"], json!(note_paths));
+        assert_eq!(result["in_flight_note_paths_truncated"], json!(false));
+    }
+
+    /// COUNTERWEIGHT: a marker with no reason at all (an ordinary `index`
+    /// run's shape) must still fail closed exactly as before — the
+    /// exception is scoped to the ONE reason a watcher batch stamps.
+    #[test]
+    fn ranked_read_during_index_publication_still_fails_closed() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let error = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("index publication"),
+            "an ordinary index-run marker must still fail closed: {error:#}"
+        );
+    }
+
+    /// COUNTERWEIGHT: a watcher-batch marker whose writer is NOT holding the
+    /// canonical write lease (a watcher that crashed, or otherwise never
+    /// finalized) is exactly as abandoned as a wedged `index` marker, so the
+    /// reason alone must not exempt it.
+    #[test]
+    fn ranked_read_with_wedged_watcher_marker_still_fails_closed() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        // No writer authority is acquired: the canonical write lease is free,
+        // which is exactly what makes a marker wedged.
+        write_marker(
+            &db_path,
+            reaped_child_pid() as u32,
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let error = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("WEDGED"),
+            "a watcher-batch marker with no live writer must still be WEDGED: {message}"
+        );
+    }
+
+    /// A response served with `publication_in_progress: true` disclosure
+    /// must never be written to the response cache — a later, post-batch
+    /// call must not be able to read a stale disclosure back as if it were
+    /// current. Mirrors `dirty_publication_bypasses_response_cache`, now
+    /// exercised against a tool that actually SUCCEEDS during the window.
+    #[test]
+    fn watcher_publication_disclosed_reads_are_not_cached() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        write_marker(
+            &db_path,
+            std::process::id(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let first = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap();
+        let second = dispatch(&store, None, "hub_nodes", json!({}), None).unwrap();
+        assert_eq!(first["publication_in_progress"], json!(true));
+        assert_eq!(second["publication_in_progress"], json!(true));
+        flush_response_cache();
+
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 0);
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
+        );
+        assert!(
+            cache.is_empty(),
+            "disclosed responses during a watcher publication must not be cached"
+        );
     }
 
     #[test]

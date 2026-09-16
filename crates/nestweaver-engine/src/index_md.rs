@@ -2467,8 +2467,11 @@ where
                 "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
                  note files, and the indexed note count could not be read in full, so \
                  \"nothing is indexed\" is NOT established -- {disclosure} Committing this \
-                 could delete notes this process was unable to see. Repair the graph \
-                 (`nestweaver brain add --force`) before reindexing."
+                 could delete notes this process was unable to see. Check that the vault \
+                 directory is readable and mounted. If its notes really are gone, drop and \
+                 re-add the vault (`nestweaver brain remove <vault>`, then `nestweaver brain \
+                 add <vault>`), or restore a backup with `nestweaver backup restore <archive> \
+                 --data-dir <dir>`."
             );
         }
     }

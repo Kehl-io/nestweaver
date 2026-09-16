@@ -7,7 +7,8 @@
 //! Composition over reinvention: this module reuses
 //! - [`crate::query::build_brain_context_hybrid_with_aliases`] for hybrid
 //!   PPR + BM25 retrieval (PRF enabled),
-//! - [`crate::query::populate_inline_bodies`] (F8) for inline source bodies,
+//! - [`crate::query::populate_inline_bodies_with_overrides`] (F8) for inline
+//!   source bodies,
 //! - project-scope member-UID logic (mirrors `tool_project_context`).
 //!
 //! Bundles are persisted to a JSON sidecar `<db>.bundles.json` using the same
@@ -21,8 +22,9 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    BrainNode, EmbedQueryFn, HybridSearchConfig, RenderCap,
-    build_brain_context_hybrid_with_aliases_capped, populate_inline_bodies,
+    BrainNode, EmbedQueryFn, HybridSearchConfig, InlineBodyOverrides, RenderCap,
+    SEED_NAME_MATCH_LIMIT, build_brain_context_hybrid_with_aliases_capped,
+    populate_inline_bodies_with_overrides,
 };
 
 /// Bundle time-to-live: entries older than this are dropped when the sidecar
@@ -118,7 +120,32 @@ pub struct BundleEntry {
     /// output.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_seed: bool,
+    /// nw-476. Under `project:` scope `resolve_scope` seeds every project
+    /// member (notes AND symbols), so a query naming one specific member
+    /// symbol can lose to stronger-scoring member notes on plain fused score
+    /// and never surface. Set ONLY under `project:` scope (owner decision
+    /// Q1, revised — `vault`/`repo:`/`all` scope never sets this field, see
+    /// `investigate_vault_scope_exact_symbol_match_is_not_pinned`), when
+    /// this entry's UID was independently resolved from `[query] + its
+    /// tokens` (not from the bulk membership seeding) via the same name
+    /// resolver/limit as ordinary seed resolution: `Exact` for a
+    /// case-sensitive name match against the query text or one of its
+    /// whitespace tokens (pinned to the front of the map, capped at
+    /// `SEED_NAME_MATCH_LIMIT`), `Partial` for a substring match (not
+    /// pinned; its fused score is boosted instead). Absent when the entry
+    /// matched no better than any other retrieval result. Skipped from JSON
+    /// when absent so existing consumers see unchanged output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_query: Option<MatchedQuery>,
     pub relevance: f64,
+}
+
+/// See [`BundleEntry::matched_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchedQuery {
+    Exact,
+    Partial,
 }
 
 fn default_true() -> bool {
@@ -838,6 +865,14 @@ pub fn investigate(
         serde_json::json!({"component":"semantic", "stage":"seed_resolution", "reason":"seed_resolution_fallback", "remediation":"use a resolvable seed or verify semantic availability"}),
     );
     let mut degraded_components = vec!["semantic".to_string()];
+    // nw-476. Populated from the `Ok(ctx)` arm below; used after the match to
+    // tag each surviving `BundleEntry` with `matched_query`. Empty (so every
+    // entry's `matched_query` is `None`) on the `bm25_fallback` path — that
+    // path has no project-scope member flood to be starved by, so there is
+    // nothing to pin or boost.
+    let mut exact_match_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut partial_match_uids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => {
             semantic_applied = ctx.semantic_applied;
@@ -845,13 +880,112 @@ pub fn investigate(
             degraded_components = ctx.degraded_components;
             admitted_before_cap = ctx.admitted_before_cap;
             seed_uids = ctx.seeds.iter().map(|n| n.uid.clone()).collect();
-            let mut nodes = ctx.seeds;
-            nodes.extend(
-                ctx.connected
-                    .into_iter()
-                    .filter(|n| !seed_uids.contains(&n.uid)),
-            );
-            nodes
+
+            // nw-476 (owner decision Q1, revised): the pin/boost behavior
+            // below is authorized ONLY "under `project:` scope" — the
+            // owner's own example is `investigate --scope project:nestweaver`,
+            // and the plan's counterweight
+            // (`investigate_vault_scope_exact_symbol_match_is_not_pinned`)
+            // requires `vault`/`repo:` ordering to stay exactly what it was.
+            // Gated on the SCOPE PARSER'S OWN classification (`ScopeFilter`,
+            // returned by `resolve_scope` above) rather than re-deriving it
+            // from the raw `scope` string, so this can never drift from
+            // what `resolve_scope` itself decided `scope` meant.
+            let is_project_scope =
+                matches!(scope_filter.as_ref(), Some(ScopeFilter::Project { .. }));
+
+            if is_project_scope {
+                // Resolve `[query] + tokens` on their own, separately from
+                // the bulk `project:`-membership seeding baked into
+                // `seed_inputs`/`ctx.seeds`, so we know which UIDs the query
+                // itself named. Scope-filter immediately: a same-named
+                // symbol outside the current project must not be pinned OR
+                // boosted, only the ordinary `uid_in_scope` filter below
+                // decides whether it appears at all.
+                let in_scope = |uid: &String| {
+                    scope_filter
+                        .as_ref()
+                        .is_none_or(|filter| uid_in_scope(uid, filter))
+                };
+                let (exact_uids, partial_uids) =
+                    resolve_query_symbol_matches(store, query, &config.seed_resolution);
+                let exact_uids: Vec<String> = exact_uids.into_iter().filter(in_scope).collect();
+                let partial_uids: std::collections::HashSet<String> =
+                    partial_uids.into_iter().filter(in_scope).collect();
+                exact_match_uids = exact_uids.iter().cloned().collect();
+                partial_match_uids = partial_uids.clone();
+
+                // nw-476 (quality review). `RenderCap` (query.rs) hydrates
+                // at most `RETRIEVAL_RENDER_MARGIN` (120) candidates PER
+                // PARTITION, by descending fused score, BEFORE this function
+                // ever runs — so on a project with more than 120 members, a
+                // confirmed in-scope exact match can be entirely absent from
+                // both `ctx.seeds` and `ctx.connected`. That is the original
+                // nw-476 bug at a higher threshold: silently dropping the
+                // one entry the query named exactly. Build its `BrainNode`
+                // directly, via the SAME store/engine helper the pipeline
+                // itself uses to turn a uid into a `BrainNode`
+                // (`render_brain_node`, also used by `bm25_fallback` below
+                // and by `build_brain_context_hybrid_with_aliases_capped`
+                // itself), so `pin_and_boost` can inject it instead of
+                // silently skipping the pin.
+                //
+                // Relevance `0.0`: `RenderCap` hydrates in descending
+                // fused-score order, so a candidate that did NOT make the
+                // cut is, by construction, below every candidate that did —
+                // `0.0` is a true (if imprecise) lower bound, never an
+                // overstatement. This function has no access to the
+                // candidate's real fused score: `weighted_score_fuse`
+                // computes one, but `RenderCap` only returns hydrated
+                // `BrainNode`s, not the scores of what it declined to
+                // hydrate. Harmless here regardless, since an exact match's
+                // PIN POSITION is resolver order, never relevance — `0.0`
+                // only affects `entry_token_cost` accounting and the value
+                // surfaced in the JSON response.
+                let present: std::collections::HashSet<&str> = ctx
+                    .seeds
+                    .iter()
+                    .chain(ctx.connected.iter())
+                    .map(|n| n.uid.as_str())
+                    .collect();
+                let mut injected: std::collections::HashMap<String, BrainNode> =
+                    std::collections::HashMap::new();
+                for uid in &exact_uids {
+                    if !present.contains(uid.as_str())
+                        && let Ok(Some(node)) = crate::query::render_brain_node(store, uid, 0.0)
+                    {
+                        // Always a seed: it is resolved from the query text
+                        // itself, which `resolve_scope` always seeds — see
+                        // the "is_seed`-first contract" note in
+                        // `pin_and_boost`'s doc comment.
+                        seed_uids.insert(uid.clone());
+                        injected.insert(uid.clone(), node);
+                    }
+                }
+
+                pin_and_boost(
+                    ctx.seeds,
+                    ctx.connected,
+                    &seed_uids,
+                    &exact_uids,
+                    &partial_uids,
+                    &injected,
+                )
+            } else {
+                // `vault` / `repo:` / `all`: unchanged from before nw-476.
+                // The seed partition here is small (a handful of
+                // exact-name/title/UID resolutions), so the merge-then-
+                // truncate bug this fix addresses never manifests, and the
+                // owner decision does not authorize touching this path's
+                // ordering. See `investigate_vault_scope_exact_symbol_match_is_not_pinned`.
+                let mut nodes = ctx.seeds;
+                nodes.extend(
+                    ctx.connected
+                        .into_iter()
+                        .filter(|n| !seed_uids.contains(&n.uid)),
+                );
+                nodes
+            }
         }
         Err(e) => {
             // nw-384. A publication that BEGAN after the step-0 check is the
@@ -915,14 +1049,23 @@ pub fn investigate(
     let bundle_id = generate_bundle_id(query, scope);
 
     // 4. Inline at most MAX_INLINE_BODIES high-confidence bodies.
-    populate_inline_bodies(
+    // nw-476 (quality review, round 3): a pinned exact match always
+    // qualifies, regardless of its `relevance` — an injected one (rescued
+    // from beyond `RenderCap`'s margin) carries an honest display-only
+    // `0.0` floor that must not ALSO gate the very inline body this fix
+    // exists to surface. `exact_match_uids` is empty outside `project:`
+    // scope (nw-476's own gate), so this is a no-op there.
+    populate_inline_bodies_with_overrides(
         store,
         &mut connected,
         root,
         INLINE_THRESHOLD,
         INLINE_MAX_BODY_TOKENS,
         Some(budget),
-        None,
+        &InlineBodyOverrides {
+            reader_resolver: None,
+            always_include: &exact_match_uids,
+        },
     );
     // Cap the number of inlined bodies (populate_inline_bodies has no count cap).
     let mut inlined = 0usize;
@@ -962,11 +1105,23 @@ pub fn investigate(
             expanded: false,
             unavailable_reason: None,
             is_seed: seed_uids.contains(&node.uid),
+            matched_query: if exact_match_uids.contains(&node.uid) {
+                Some(MatchedQuery::Exact)
+            } else if partial_match_uids.contains(&node.uid) {
+                Some(MatchedQuery::Partial)
+            } else {
+                None
+            },
             relevance: node.relevance,
         };
         let cost = entry_token_cost(&entry);
         // Always admit the first entry so a single oversized node never starves
         // the whole map (mirrors populate_inline_bodies / read_symbols).
+        // nw-476 (quality review, round 3, left as-is/non-blocking): only
+        // entries[0] is guaranteed by this. A pin (`matched_query:
+        // Some(Exact)`) guarantees ORDER — pinned entries at positions 1-4
+        // are still ordinary candidates for this token-budget cut and can
+        // be dropped like any other entry past the first.
         if !entries.is_empty() && used_tokens + cost > budget {
             more_available += 1;
             continue;
@@ -1396,6 +1551,219 @@ fn resolve_scope(
     )
 }
 
+/// nw-476 (quality review). How many of a multi-word query's UNIQUE
+/// whitespace tokens `resolve_query_symbol_matches` resolves, beyond the
+/// query text itself. Each unique term costs one
+/// `search_symbols_by_name_page` call — cache-backed after the first DB
+/// scan for a given store generation, but still an in-memory scan of the
+/// cached symbol list per call — and this resolution runs IN ADDITION to
+/// the identical per-term resolution the hybrid retrieval pipeline already
+/// performs for `seed_inputs` (query.rs:2054), so an uncapped multi-hundred-
+/// token query would double an already-uncapped cost. 16 is generous for
+/// the natural-language queries this tool documents as its use case
+/// ("device pairing", "how does indexing work") while bounding a
+/// pathological or adversarial query to a fixed number of extra resolver
+/// calls.
+const MAX_EXTRA_QUERY_TERMS: usize = 16;
+
+/// Pure helper behind `resolve_query_symbol_matches`'s term list, pulled out
+/// so the `MAX_EXTRA_QUERY_TERMS` cap is unit-testable without a store:
+/// `[query] + its first MAX_EXTRA_QUERY_TERMS UNIQUE whitespace tokens`,
+/// first-occurrence-wins, in query order. A single-token query's one token
+/// already equals the query text, so nothing is appended in that case
+/// (matches the pre-cap behavior exactly).
+fn capped_query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = vec![query.trim().to_string()];
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.len() > 1 {
+        let mut seen_tokens: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for token in &tokens {
+            if seen_tokens.len() >= MAX_EXTRA_QUERY_TERMS {
+                break;
+            }
+            if seen_tokens.insert(token) {
+                terms.push(token.to_string());
+            }
+        }
+    }
+    terms
+}
+
+/// nw-476. Resolve `[query] + its whitespace tokens` to symbol UIDs using
+/// the SAME name resolver and limit (`SEED_NAME_MATCH_LIMIT`) that
+/// `build_brain_context_hybrid_with_aliases_capped` uses internally
+/// (query.rs's `search_symbols_by_name_page` call), but kept separate from
+/// `resolve_scope`'s bulk `project:` membership seeding. That separation is
+/// the whole point: once query-origin and membership-origin seeds are
+/// merged into one `Vec<String>` (as `resolve_scope` does for retrieval),
+/// nothing downstream can tell which UIDs the query itself named, which is
+/// exactly what made every project member equally "the query's seed" and
+/// let member notes crowd out the one member symbol the query actually
+/// named.
+///
+/// Returns `(exact, partial)`:
+/// - `exact` — UIDs whose symbol name is a CASE-SENSITIVE full match against
+///   the query text or one of its tokens, in resolver order (query first,
+///   then tokens left-to-right; within a term, the resolver's own ranked
+///   order), capped at `SEED_NAME_MATCH_LIMIT` *total* across all terms —
+///   the per-term resolver call is already bounded by the same limit, but a
+///   multi-token query can otherwise contribute up to `limit` matches PER
+///   token.
+/// - `partial` — every other (case-insensitive substring) hit the resolver
+///   returned, i.e. every symbol `search_symbols_by_name_page` matched that
+///   isn't an exact hit. Not capped here: the resolver's own per-term limit
+///   already bounds how many can exist, and a partial match is boosted
+///   rather than pinned, so a larger set is harmless.
+///
+/// Callers MUST still run every returned UID through `uid_in_scope`: this
+/// resolver searches the whole store, so an exact-named symbol in a
+/// different project is legitimately returned here and must not be pinned
+/// (or even surfaced) once scope is applied.
+///
+/// This function is scope-agnostic; the OWNER DECISION (nw-476, Q1 revised)
+/// only authorizes pinning/boosting "under `project:` scope" — the caller in
+/// `investigate()` gates the call on `ScopeFilter::Project`, not this
+/// function. `vault`/`repo:`/`all` scope must see the unchanged fused-score
+/// order, per `investigate_vault_scope_exact_symbol_match_is_not_pinned`.
+///
+/// CAVEAT: `search_symbols_by_name_page` ranks candidates by name quality
+/// THEN a multiplicative path-deboost factor
+/// (`[seed_resolution].path_deboost`, e.g. test/mirror paths like
+/// `__tests__/`, `*.test.ts`) before kind priority and a file-path
+/// tiebreak — see its doc comment in `nestweaver-store/src/traverse.rs`.
+/// An exact-name match living at a deboosted path can therefore rank below
+/// `SEED_NAME_MATCH_LIMIT` other same-name (exact or partial) candidates and
+/// fall outside this function's own top-`SEED_NAME_MATCH_LIMIT` page. It is
+/// then simply not in `exact`/`partial` at all — not pinned, not boosted —
+/// same as any other name this resolver never saw. This is a real,
+/// unresolved limitation, not a bug this function tries to paper over: the
+/// render-cap-injection fix in `investigate()` (nw-476, quality review)
+/// rescues a CONFIRMED exact match that this function already found but
+/// `RenderCap` later dropped; it cannot rescue a match this function never
+/// found in the first place.
+fn resolve_query_symbol_matches(
+    store: &GraphStore,
+    query: &str,
+    seed_resolution: &nestweaver_store::SeedResolutionConfig,
+) -> (Vec<String>, std::collections::HashSet<String>) {
+    let terms = capped_query_terms(query);
+
+    let mut exact: Vec<String> = Vec::new();
+    let mut exact_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut partial: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for term in &terms {
+        if term.is_empty() {
+            continue;
+        }
+        let Ok(page) =
+            store.search_symbols_by_name_page(term, SEED_NAME_MATCH_LIMIT, seed_resolution)
+        else {
+            continue;
+        };
+        for sym in page.symbols {
+            let is_exact = terms.iter().any(|t| t == &sym.name);
+            if is_exact {
+                if exact.len() < SEED_NAME_MATCH_LIMIT && exact_seen.insert(sym.uid.clone()) {
+                    exact.push(sym.uid);
+                }
+            } else {
+                partial.insert(sym.uid);
+            }
+        }
+    }
+    // A symbol matched exactly by one term can also come back as a
+    // (redundant) substring hit for another term in the same loop; exact
+    // wins, and it must not ALSO carry the x5 partial boost on top of being
+    // pinned.
+    for uid in &exact {
+        partial.remove(uid);
+    }
+    (exact, partial)
+}
+
+/// nw-476. Multiplier applied to a `partial`-matched node's fused score
+/// before `pin_and_boost` re-sorts its partition. Zoekt's `index/score.go`
+/// defines `importantTermBoost = 5` and uses it to scale TERM FREQUENCY for
+/// a symbol/filename match before that feeds its own BM25-family scoring —
+/// a different mechanism operating on a different signal than the single
+/// fused PPR+BM25(+semantic) score this function scales directly. It is
+/// cited here as PRECEDENT for the factor (a mature code-search engine
+/// judged a 5x weight the right order of magnitude for "this hit named a
+/// symbol"), not as a claim that this function reimplements Zoekt's scoring
+/// — it does not.
+const PARTIAL_MATCH_BOOST: f64 = 5.0;
+
+/// nw-476 (quality review, minor #3). The pin/boost/merge step, extracted
+/// into a pure function so it is unit-testable directly against synthetic
+/// nodes — independent of the real PPR/BM25/tanh-normalization pipeline
+/// that is otherwise the only way to produce a `BrainNode` with a
+/// particular `relevance`.
+///
+/// Boosts every `partial_uids` node's fused score by `PARTIAL_MATCH_BOOST`,
+/// re-sorts each partition by the (possibly boosted) score, then pins
+/// `exact_uids` to the very front in the order given (the caller is
+/// responsible for capping and ordering `exact_uids` — this function trusts
+/// it, and does not re-derive `SEED_NAME_MATCH_LIMIT` itself).
+///
+/// Preserves the existing "seeds partition precedes connected partition"
+/// contract (`investigate_includes_resolved_seeds_first`): pinning only
+/// reorders WITHIN the combined list, and every exact match is already a
+/// seed (or is injected as one — see `injected` below), so pulling it to
+/// the front never promotes a connected node ahead of a genuine seed.
+///
+/// `injected` supplies a pre-built `BrainNode` for any `exact_uids` entry
+/// that is present in NEITHER `seeds` NOR `connected` — on a project with
+/// more members than `RETRIEVAL_RENDER_MARGIN`, `RenderCap`'s per-partition
+/// hydration cap can trim a confirmed in-scope exact match out of both
+/// lists before this function ever runs. This function stays pure (no
+/// `store`, no I/O): the caller owns `store` and builds `injected` via
+/// `render_brain_node` before calling in. A UID absent from `seeds`,
+/// `connected`, AND `injected` is simply not pinned — nothing to pin.
+///
+/// Does not truncate to any breadth cap; the caller does that afterward.
+fn pin_and_boost(
+    seeds: Vec<BrainNode>,
+    connected: Vec<BrainNode>,
+    seed_uids: &std::collections::HashSet<String>,
+    exact_uids: &[String],
+    partial_uids: &std::collections::HashSet<String>,
+    injected: &std::collections::HashMap<String, BrainNode>,
+) -> Vec<BrainNode> {
+    let rerank = |mut nodes: Vec<BrainNode>| -> Vec<BrainNode> {
+        for node in nodes.iter_mut() {
+            if partial_uids.contains(&node.uid) {
+                node.relevance *= PARTIAL_MATCH_BOOST;
+            }
+        }
+        nodes.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        nodes
+    };
+
+    let mut nodes = rerank(seeds);
+    nodes.extend(rerank(
+        connected
+            .into_iter()
+            .filter(|n| !seed_uids.contains(&n.uid))
+            .collect(),
+    ));
+
+    let mut pinned: Vec<BrainNode> = Vec::with_capacity(exact_uids.len());
+    for uid in exact_uids {
+        if let Some(pos) = nodes.iter().position(|n| &n.uid == uid) {
+            pinned.push(nodes.remove(pos));
+        } else if let Some(node) = injected.get(uid) {
+            pinned.push(node.clone());
+        }
+    }
+    pinned.extend(nodes);
+    pinned
+}
+
 /// BM25-only retrieval against the vault index when graph-seed resolution
 /// fails. Returns up to `limit` `BrainNode`s ranked by BM25 score, normalized
 /// so the top hit has relevance 1.0 (matching the hybrid pipeline's score
@@ -1576,13 +1944,17 @@ fn group_into_domains(_store: &GraphStore, entries: &[BundleEntry]) -> Vec<Domai
     let mut domains: Vec<Domain> = groups
         .into_iter()
         .map(|(label, mut idxs)| {
-            // Rank members by relevance (descending); entry point is the top.
-            idxs.sort_by(|&a, &b| {
-                entries[b]
-                    .relevance
-                    .partial_cmp(&entries[a].relevance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Rank members by relevance (descending); entry point is the
+            // top. nw-476 (quality review, round 3): a pinned exact match
+            // (`matched_query: Some(Exact)`) always wins the entry-point
+            // slot first, ahead of relevance — a rescued/injected exact
+            // match (RenderCap-trimmed on a large project) carries an
+            // honest display-only `0.0` floor (see
+            // `populate_inline_bodies_with_overrides`'s doc comment) that
+            // must not ALSO cost it the entry-point slot for the domain
+            // containing the one entry `investigate()` already pinned to
+            // `entries[0]`.
+            idxs.sort_by(|&a, &b| is_exact_first(&entries[a], &entries[b]));
             let members: Vec<String> = idxs.iter().map(|&i| entries[i].asset_id.clone()).collect();
             let entry_point = members.first().cloned().unwrap_or_default();
             Domain {
@@ -1592,21 +1964,39 @@ fn group_into_domains(_store: &GraphStore, entries: &[BundleEntry]) -> Vec<Domai
             }
         })
         .collect();
-    // Order domains by their entry point's relevance (most relevant first).
+    // Order domains by their entry point's relevance (most relevant first),
+    // EXCEPT a domain whose entry point is itself a pinned exact match
+    // always sorts first — same rationale as the member sort above; a
+    // domain built around the query's own pinned hit must not report last
+    // just because the rest of its relevance is an honest but low `0.0`.
     domains.sort_by(|a, b| {
-        let ra = entries
-            .iter()
-            .find(|e| e.asset_id == a.entry_point)
-            .map(|e| e.relevance)
-            .unwrap_or(0.0);
-        let rb = entries
-            .iter()
-            .find(|e| e.asset_id == b.entry_point)
-            .map(|e| e.relevance)
-            .unwrap_or(0.0);
-        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+        let a_entry = entries.iter().find(|e| e.asset_id == a.entry_point);
+        let b_entry = entries.iter().find(|e| e.asset_id == b.entry_point);
+        match (a_entry, b_entry) {
+            (Some(ae), Some(be)) => is_exact_first(ae, be),
+            _ => {
+                let ra = a_entry.map(|e| e.relevance).unwrap_or(0.0);
+                let rb = b_entry.map(|e| e.relevance).unwrap_or(0.0);
+                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
     });
     domains
+}
+
+/// Ordering used by both the within-domain member sort and the domain sort
+/// in `group_into_domains`: a pinned exact match (`matched_query:
+/// Some(Exact)`) always compares "less" (sorts first), regardless of
+/// relevance; otherwise, higher relevance sorts first. See
+/// `group_into_domains` for why relevance alone is not trustworthy here.
+fn is_exact_first(a: &BundleEntry, b: &BundleEntry) -> std::cmp::Ordering {
+    let a_exact = a.matched_query == Some(MatchedQuery::Exact);
+    let b_exact = b.matched_query == Some(MatchedQuery::Exact);
+    b_exact.cmp(&a_exact).then_with(|| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 /// Compute a domain label for an entry: directory of a symbol's file, or a
@@ -2121,6 +2511,271 @@ mod tests {
                 )),
             "the fail-closed store error must remain typed through context"
         );
+    }
+
+    // ── nw-476 (quality review): pure-function unit tests ───────────────
+
+    #[test]
+    fn capped_query_terms_single_token_query_appends_nothing() {
+        // A single-token query's own token already equals the query text --
+        // appending it would be a pointless duplicate, not a second term.
+        assert_eq!(capped_query_terms("hello"), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn capped_query_terms_caps_at_max_extra_query_terms_unique_tokens() {
+        // 20 distinct tokens, only MAX_EXTRA_QUERY_TERMS (16) of which may
+        // be appended, in order, after the query text itself.
+        let query = (0..20)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let terms = capped_query_terms(&query);
+        assert_eq!(
+            terms.len(),
+            1 + MAX_EXTRA_QUERY_TERMS,
+            "must be the query text plus exactly {MAX_EXTRA_QUERY_TERMS} tokens: {terms:?}"
+        );
+        assert_eq!(terms[0], query, "the query text itself is always terms[0]");
+        for i in 0..MAX_EXTRA_QUERY_TERMS {
+            assert_eq!(
+                terms[1 + i],
+                format!("tok{i}"),
+                "tokens must be kept in QUERY ORDER, first {MAX_EXTRA_QUERY_TERMS} only: {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_query_terms_dedupes_repeated_tokens_before_capping() {
+        // 3 unique tokens repeated many times must cost only 3 extra terms,
+        // not "however many repeats happened to fit under the cap" -- a
+        // repeated token must not consume a cap slot twice.
+        let query = "brain_context brain_context brain_context vault vault code";
+        let terms = capped_query_terms(query);
+        assert_eq!(
+            terms,
+            vec![
+                query.to_string(),
+                "brain_context".to_string(),
+                "vault".to_string(),
+                "code".to_string(),
+            ],
+            "duplicate tokens must be deduped, first-occurrence-wins, before the cap applies"
+        );
+    }
+
+    fn brain_node(uid: &str, relevance: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol/Function".to_string(),
+            title: uid.to_string(),
+            location: "f.rs:1".to_string(),
+            relevance,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    #[test]
+    fn pin_and_boost_pins_exact_matches_in_resolver_order_ahead_of_higher_score() {
+        let seeds = vec![
+            brain_node("sym:a", 10.0), // far outscores the exact match
+            brain_node("sym:exact2", 1.0),
+            brain_node("sym:exact1", 0.5), // lower score, but resolver-first
+        ];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let exact_uids = vec!["sym:exact1".to_string(), "sym:exact2".to_string()];
+        let out = pin_and_boost(
+            seeds,
+            Vec::new(),
+            &seed_uids,
+            &exact_uids,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            out.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:exact1", "sym:exact2", "sym:a"],
+            "exact matches must be pinned in RESOLVER order (as given in `exact_uids`), \
+             not fused-score order, ahead of every non-pinned entry"
+        );
+    }
+
+    #[test]
+    fn pin_and_boost_pins_up_to_five_and_leaves_the_rest_in_fused_order() {
+        // Mirrors `SEED_NAME_MATCH_LIMIT` (5): the caller is responsible for
+        // the cap, but this proves `pin_and_boost` pins exactly what it is
+        // given, in order, without dropping or reordering any of the 5.
+        let seeds: Vec<BrainNode> = (0..7)
+            .map(|i| brain_node(&format!("sym:dup{i}"), 1.0))
+            .collect();
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let exact_uids: Vec<String> = (0..5).map(|i| format!("sym:dup{i}")).collect();
+        let out = pin_and_boost(
+            seeds,
+            Vec::new(),
+            &seed_uids,
+            &exact_uids,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            out.iter()
+                .take(5)
+                .map(|n| n.uid.clone())
+                .collect::<Vec<_>>(),
+            exact_uids,
+            "the first 5 entries must be exactly the given exact_uids, in order"
+        );
+        assert_eq!(
+            out[5..]
+                .iter()
+                .map(|n| n.uid.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["sym:dup5", "sym:dup6"]),
+            "the un-pinned remainder must be exactly the members outside the cap"
+        );
+    }
+
+    #[test]
+    fn pin_and_boost_boosts_and_re_sorts_partial_matches_within_a_partition() {
+        let seeds = vec![
+            brain_node("sym:strong", 1.0),  // stays ahead even after boost
+            brain_node("sym:partial", 0.3), // 0.3 * 5.0 = 1.5, overtakes strong
+            brain_node("sym:untouched", 0.5),
+        ];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let partial_uids: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["sym:partial".to_string()]);
+        let out = pin_and_boost(
+            seeds,
+            Vec::new(),
+            &seed_uids,
+            &[],
+            &partial_uids,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            out.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:partial", "sym:strong", "sym:untouched"],
+            "boosted (0.3*5=1.5) must re-sort ahead of the unboosted 1.0 and 0.5 entries"
+        );
+        let boosted = out.iter().find(|n| n.uid == "sym:partial").unwrap();
+        assert!(
+            (boosted.relevance - 1.5).abs() < 1e-9,
+            "the boost must be exactly PARTIAL_MATCH_BOOST (5.0) x the original relevance: \
+             got {}",
+            boosted.relevance
+        );
+    }
+
+    #[test]
+    fn pin_and_boost_keeps_seeds_before_connected_and_drops_no_nodes() {
+        let seeds = vec![brain_node("sym:seed_low", 0.1)];
+        let connected = vec![
+            brain_node("sec:conn_high", 9.0), // far outscores every seed
+            brain_node("sec:conn_low", 0.05),
+        ];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let out = pin_and_boost(
+            seeds,
+            connected,
+            &seed_uids,
+            &[],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            out.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:seed_low", "sec:conn_high", "sec:conn_low"],
+            "the LOW-scoring seed must still precede BOTH connected entries, even the one \
+             that far outscores it on fused score -- seeds-before-connected is a hard \
+             partition, not a score comparison"
+        );
+    }
+
+    #[test]
+    fn pin_and_boost_deduplicates_a_uid_present_in_both_seeds_and_connected() {
+        // `resolve_scope`/hybrid retrieval can, in principle, resolve the
+        // same uid into both partitions; `pin_and_boost`'s own dedup
+        // (filtering `connected` by `seed_uids`) must keep exactly one copy.
+        let seeds = vec![brain_node("sym:dup", 1.0)];
+        let connected = vec![
+            brain_node("sym:dup", 1.0), // same uid, must be dropped
+            brain_node("sec:other", 0.5),
+        ];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let out = pin_and_boost(
+            seeds,
+            connected,
+            &seed_uids,
+            &[],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        let dup_count = out.iter().filter(|n| n.uid == "sym:dup").count();
+        assert_eq!(
+            dup_count, 1,
+            "a uid present in both partitions must appear exactly once"
+        );
+        assert_eq!(out.len(), 2, "no other node may be dropped: {out:?}");
+    }
+
+    #[test]
+    fn pin_and_boost_injects_an_exact_match_missing_from_both_partitions() {
+        // The nw-476 (quality review, IMPORTANT #1) fix: a `RenderCap`-
+        // trimmed exact match, supplied by the caller as a pre-built node.
+        let seeds = vec![brain_node("sym:other_seed", 5.0)];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let exact_uids = vec!["sym:trimmed".to_string()];
+        let injected = std::collections::HashMap::from([(
+            "sym:trimmed".to_string(),
+            brain_node("sym:trimmed", 0.0),
+        )]);
+        let out = pin_and_boost(
+            seeds,
+            Vec::new(),
+            &seed_uids,
+            &exact_uids,
+            &std::collections::HashSet::new(),
+            &injected,
+        );
+        assert_eq!(
+            out.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:trimmed", "sym:other_seed"],
+            "an injected exact match must be pinned at entry 0, exactly like an organically \
+             present one"
+        );
+    }
+
+    #[test]
+    fn pin_and_boost_drops_an_exact_uid_present_in_neither_nodes_nor_injected() {
+        // Nothing to pin: not an error, just nothing to add.
+        let seeds = vec![brain_node("sym:only", 1.0)];
+        let seed_uids: std::collections::HashSet<String> =
+            seeds.iter().map(|n| n.uid.clone()).collect();
+        let exact_uids = vec!["sym:nowhere".to_string()];
+        let out = pin_and_boost(
+            seeds,
+            Vec::new(),
+            &seed_uids,
+            &exact_uids,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "an unresolvable exact_uid must be silently dropped: {out:?}"
+        );
+        assert_eq!(out[0].uid, "sym:only");
     }
 
     fn make_store() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
@@ -2732,6 +3387,7 @@ mod tests {
             expanded: false,
             unavailable_reason: None,
             is_seed: false,
+            matched_query: None,
             relevance: 1.0,
         }
     }
@@ -3405,6 +4061,1019 @@ mod tests {
              out-of-scope competitors -- if this fails, RenderCap's admit predicate is not \
              running before the per-partition cap; entries: {uids:?}"
         );
+    }
+
+    /// Fixture shared by the nw-476 exact/partial-match tests: one project
+    /// with a single member symbol (name supplied by the caller, so both the
+    /// "exact" and "partial" tests can reuse this) plus one member note per
+    /// `notes` entry, each with its title (and therefore Tantivy body, since
+    /// nothing backs it on disk) set to `heading_term` repeated `repeats`
+    /// times so its BM25 score can be tuned per note. `link_notes` controls
+    /// whether every note also gets a fan-out wikilink to every other note
+    /// (see the comment at its call site) — skip it when the caller only
+    /// needs many notes to out-rank a pinned entry positionally, since it is
+    /// the most expensive part of this fixture. Returns
+    /// `(TempDir, db_path, store, tantivy, symbol_uid)`.
+    fn make_project_with_symbol_and_noise_notes(
+        project_slug: &str,
+        symbol_name: &str,
+        notes: &[(&str, &str, usize)], // (slug, heading_term, repeats)
+        link_notes: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        GraphStore,
+        nestweaver_store::TantivyIndex,
+        String,
+    ) {
+        use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Vault, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        let vault_uid = format!("vlt:test:{project_slug}");
+        store
+            .upsert_vault(&Vault {
+                uid: vault_uid.clone(),
+                name: project_slug.to_string(),
+                root_path: format!("/{project_slug}"),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+
+        let project = nestweaver_schema::Project {
+            uid: format!("proj:test:{project_slug}"),
+            name: project_slug.to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+
+        let symbol_uid = format!("sym:{project_slug}:target");
+        let symbol = Symbol {
+            uid: symbol_uid.clone(),
+            name: symbol_name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: format!("repo:{project_slug}"),
+            file_path: "target.js".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("function {symbol_name}()"),
+            summary: None,
+            content_hash: "h-target".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&symbol).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&symbol_uid), 1.0)
+            .unwrap();
+
+        // nw-476 test support: the note's own title becomes its Tantivy
+        // "body" too (no on-disk file backs it, so `write_full_corpus`
+        // falls back to `note.title` -- see the doc comment above). A
+        // note is ALWAYS a seed under `project:` scope (`resolve_scope`
+        // seeds every member note unconditionally), so putting the
+        // repeated term directly in the TITLE lets a note carry a real
+        // BM25 signal on its OWN (seed-partition) uid. A Heading would
+        // carry the same text, but a Heading is graph-CONNECTED, not a
+        // seed -- on a project with more members than
+        // `DEFAULT_RETRIEVAL_BREADTH` it would be starved out entirely
+        // by the seed-partition-first truncate before its score is even
+        // considered, useless as a "stronger competitor" fixture for a
+        // boost/pin test. No Heading is created here at all (unlike
+        // earlier revisions of this helper): a Heading's own raw PPR
+        // score sits well BELOW any seed's, and with equal heading/seed
+        // counts it anchors `tanh_normalize`'s median exactly at a lone
+        // seed's own score, making every isolated seed's normalized PPR
+        // contribution converge to the same ~tanh(1) value regardless of
+        // scale -- see `investigate_project_scope_boosts_partial_symbol_match_without_pinning`'s
+        // ring-link comment for why that mattered.
+        //
+        // Batched, not per-note: nw-476's quality review flagged a
+        // 130-member fixture (`investigate_project_scope_pins_exact_symbol_match_beyond_the_render_cap`)
+        // as slow. Building the full `Vec` and issuing one
+        // `batch_insert_notes` / `batch_insert_vault_note_edges` /
+        // `batch_insert_project_note_edges` call each, instead of 3 round
+        // trips PER note, is a test-fixture-only change (this helper is
+        // `#[cfg(test)]`-scoped) -- not the "test-only knob in production"
+        // the review asked NOT to add; `RETRIEVAL_RENDER_MARGIN` itself is
+        // untouched.
+        let note_uids: Vec<String> = notes
+            .iter()
+            .map(|(slug, _, _)| format!("note:{vault_uid}:{slug}"))
+            .collect();
+        let note_rows: Vec<Note> = notes
+            .iter()
+            .zip(&note_uids)
+            .map(|((slug, heading_term, repeats), note_uid)| Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.clone(),
+                file_path: format!("{slug}.md"),
+                title: format!("{heading_term} ").repeat(*repeats),
+                note_kind: NoteKind::General,
+                word_count: *repeats as u32,
+                content_hash: format!("h-{slug}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .collect();
+        store.batch_insert_notes(&note_rows).unwrap();
+        let vault_note_edges: Vec<(&str, &str)> = note_uids
+            .iter()
+            .map(|uid| (vault_uid.as_str(), uid.as_str()))
+            .collect();
+        store
+            .batch_insert_vault_note_edges(&vault_note_edges)
+            .unwrap();
+        let project_note_edges: Vec<(&str, &str)> = note_uids
+            .iter()
+            .map(|uid| (project.uid.as_str(), uid.as_str()))
+            .collect();
+        store
+            .batch_insert_project_note_edges(&project_note_edges)
+            .unwrap();
+
+        // nw-476 test support, only when `link_notes` is set (the exact-pin
+        // test doesn't need it -- pinning overrides fused score regardless
+        // of magnitude, so it can skip this entirely and stay fast). A bare
+        // project-member note and a bare project-member symbol are
+        // STRUCTURALLY IDENTICAL to `personalized_pagerank` (both isolated
+        // seeds with personalization `1/seed_count` and no incoming edges),
+        // so without this they'd converge to the exact same raw score --
+        // no fixture built only from bare seeds can demonstrate one
+        // out-scoring the other. Giving every note ONE section that fans
+        // out to every OTHER note (multiple WIKILINK_TO_NOTE edges from the
+        // same section row) gives each one real incoming PPR credit an
+        // isolated member symbol never gets, matching the real-world
+        // asymmetry the bug report is about (a vault genuinely has
+        // inter-note links; a newly-added function usually doesn't yet have
+        // callers). Deliberately ONE section per note, not one per edge: an
+        // earlier revision of this fixture created a Section per (note,
+        // target) pair, and that N^2 population of low-scoring Section
+        // nodes RAISED the isolated symbol's relative score instead of
+        // lowering it, because it anchored `tanh_normalize`'s PPR median
+        // right back down near a lone seed's own score.
+        if link_notes {
+            let fan_out = note_uids.len() - 1;
+            for (i, note_uid) in note_uids.iter().enumerate() {
+                let sec_uid =
+                    nestweaver_schema::uid::section_uid(note_uid, 1, &format!("fan{i:04}"));
+                store
+                    .insert_section(&Section {
+                        uid: sec_uid.clone(),
+                        note_uid: note_uid.clone(),
+                        heading_uid: None,
+                        start_line: 1,
+                        end_line: 1,
+                        text_hash: format!("fan-h{i}"),
+                        text_content: "see also".to_string(),
+                        word_count: 2,
+                        pagerank_score: None,
+                    })
+                    .unwrap();
+                store
+                    .batch_insert_note_section_edges(&[(note_uid.as_str(), sec_uid.as_str())])
+                    .unwrap();
+                let targets: Vec<(&str, &str, f32, &str, &str)> = (1..=fan_out)
+                    .map(|k| {
+                        let target_uid = &note_uids[(i + k) % note_uids.len()];
+                        (sec_uid.as_str(), target_uid.as_str(), 1.0, "fan", "fan")
+                    })
+                    .collect();
+                store.batch_insert_wikilink_to_note_edges(&targets).unwrap();
+            }
+        }
+
+        let tantivy_dir = tempfile::tempdir().unwrap();
+        // Leaked deliberately: the TempDir must outlive this function, and
+        // the test fixtures below only need the TantivyIndex, not the dir
+        // handle itself (the OS reclaims it at process exit either way in a
+        // `cargo test` run).
+        let tantivy_dir = Box::leak(Box::new(tantivy_dir));
+        let tantivy = nestweaver_store::TantivyIndex::open_or_create(tantivy_dir.path()).unwrap();
+        tantivy.reindex_from_store(&store).unwrap();
+
+        (dir, db_path, store, tantivy, symbol_uid)
+    }
+
+    /// nw-476 (owner decision, refined). Under `project:` scope,
+    /// `resolve_scope` seeds every project member (notes AND symbols)
+    /// unconditionally, so a query that names one specific member symbol can
+    /// still lose to a flood of stronger-scoring member notes on plain fused
+    /// score and never surface in the map at all (the original bug report:
+    /// `investigate brain_context --scope project:nestweaver` returned 8
+    /// notes and zero symbols even though `build_brain_context_hybrid_with_aliases`
+    /// is a real member). The fix pins a CASE-SENSITIVE exact name match
+    /// against the query text to the very front, regardless of fused score.
+    #[test]
+    fn investigate_project_scope_pins_exact_symbol_match_first() {
+        const SYMBOL_NAME: &str = "build_brain_context_hybrid_with_aliases";
+        // Strictly more than DEFAULT_RETRIEVAL_BREADTH (30) notes, each
+        // repeating the exact query text in its heading so BM25 ranks every
+        // one of them far above the symbol (which carries no BM25 signal at
+        // all -- Tantivy indexes notes/headings/sections only, never
+        // symbols, so the symbol's sole score component is its PPR seed
+        // share).
+        let notes: Vec<(String, &str, usize)> = (0..35)
+            .map(|i| (format!("noise{i:03}"), SYMBOL_NAME, 30))
+            .collect();
+        let notes_ref: Vec<(&str, &str, usize)> = notes
+            .iter()
+            .map(|(slug, term, n)| (slug.as_str(), *term, *n))
+            .collect();
+        let (dir, db_path, store, tantivy, symbol_uid) =
+            make_project_with_symbol_and_noise_notes("pinexact", SYMBOL_NAME, &notes_ref, false);
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            SYMBOL_NAME,
+            "project:pinexact",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.entries.is_empty(),
+            "the exact-match symbol must survive even outranked by 35 member notes"
+        );
+        assert_eq!(
+            result.entries[0].uid,
+            symbol_uid,
+            "the exact-name match must be pinned to entry 0, ahead of every \
+             stronger-scoring member note; entries: {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.uid, &e.title, e.relevance))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.entries[0].matched_query,
+            Some(MatchedQuery::Exact),
+            "a pinned entry must be flagged matched_query: exact"
+        );
+    }
+
+    /// nw-476 (quality review, IMPORTANT #1). `RenderCap.seeds` (query.rs)
+    /// hydrates at most `RETRIEVAL_RENDER_MARGIN` (120) candidates in the
+    /// seed partition, by descending fused score, BEFORE `pin_and_boost`
+    /// ever runs. On a project with more than 120 members, a confirmed
+    /// in-scope exact match can therefore be entirely absent from BOTH
+    /// `ctx.seeds` and `ctx.connected` -- it is a seed (every project member
+    /// is), not a graph-proximity hit, so it can never turn up in
+    /// `connected` either. This is the ORIGINAL nw-476 bug at a higher
+    /// threshold: a user who names a symbol exactly still expects to see
+    /// it, and the fix must rescue it via direct injection rather than
+    /// silently skip the pin.
+    #[test]
+    fn investigate_project_scope_pins_exact_symbol_match_beyond_the_render_cap() {
+        const SYMBOL_NAME: &str = "render_cap_exact_target";
+        // Strictly more than RETRIEVAL_RENDER_MARGIN (120) member notes.
+        // Each repeats the exact query text in its own title (and thus
+        // Tantivy body -- see `make_project_with_symbol_and_noise_notes`'s
+        // doc comment), giving it real BM25 signal on its OWN seed-
+        // partition uid; the isolated member symbol has NONE (Tantivy never
+        // indexes symbols), and empirically (the other nw-476 tests in this
+        // file) that alone is enough to reliably outrank a bare member
+        // symbol without needing the wikilink fan-out -- so `link_notes:
+        // false` keeps this fixture's setup cost to plain note/project
+        // inserts, not an O(n^2) mesh. 130 is "more than 120" with a small
+        // safety margin, not a stress test.
+        const NOISE_COUNT: usize = 130;
+        let notes: Vec<(String, &str, usize)> = (0..NOISE_COUNT)
+            .map(|i| (format!("noise{i:04}"), SYMBOL_NAME, 20))
+            .collect();
+        let notes_ref: Vec<(&str, &str, usize)> = notes
+            .iter()
+            .map(|(slug, term, n)| (slug.as_str(), *term, *n))
+            .collect();
+        let (dir, db_path, store, tantivy, symbol_uid) = make_project_with_symbol_and_noise_notes(
+            "rendercapexact",
+            SYMBOL_NAME,
+            &notes_ref,
+            false,
+        );
+        // nw-476 (quality review, round 3): a real on-disk file backing the
+        // target symbol's declared span (start_line 1, end_line 2 in
+        // `make_project_with_symbol_and_noise_notes`), so
+        // `populate_inline_bodies_with_overrides` has an actual body to
+        // read -- the fixture otherwise only creates DB rows, no files.
+        fs::write(
+            dir.path().join("target.js"),
+            format!("function {SYMBOL_NAME}() {{\n  return 1;\n}}\n"),
+        )
+        .unwrap();
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            SYMBOL_NAME,
+            "project:rendercapexact",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.entries.is_empty(),
+            "the exact-match symbol must survive even beyond the {RETRIEVAL_RENDER_MARGIN}-\
+             candidate render cap, outranked by {NOISE_COUNT} member notes"
+        );
+        assert_eq!(
+            result.entries[0].uid,
+            symbol_uid,
+            "an exact-name match trimmed out of both ctx.seeds and ctx.connected by \
+             RenderCap's margin ({RETRIEVAL_RENDER_MARGIN}) must still be injected and \
+             pinned to entry 0; entries: {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.uid, &e.title, e.relevance))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.entries[0].matched_query,
+            Some(MatchedQuery::Exact),
+            "an injected pin must still be flagged matched_query: exact"
+        );
+        assert!(
+            result.entries[0].is_seed,
+            "an injected exact match must be flagged is_seed: true (it IS a project \
+             member, hence a seed, even though RenderCap never hydrated it)"
+        );
+        // nw-476 (quality review, round 3): the injected node's relevance is
+        // an honest display-only `0.0` floor (its true fused score was
+        // never computed -- RenderCap dropped it before that mattered), and
+        // that floor must NOT ALSO gate inlining -- the entry this fix
+        // exists to surface must actually get a body, not just a pin.
+        assert_eq!(
+            result.entries[0].relevance, 0.0,
+            "sanity: the injected node's relevance is the documented 0.0 floor"
+        );
+        assert!(
+            result.entries[0]
+                .inline_body
+                .as_deref()
+                .is_some_and(|b| b.contains("return 1")),
+            "an injected exact match must have its inline_body populated despite its \
+             relevance being 0.0 -- eligibility must not depend on the display-only floor; \
+             got {:?}",
+            result.entries[0].inline_body
+        );
+    }
+
+    /// nw-476 (quality review, round 3). An injected exact match's domain
+    /// must still win the entry-point slot and sort its domain first, even
+    /// though its relevance is the honest display-only `0.0` floor and
+    /// another (organically-surviving) member symbol shares its directory
+    /// domain with a REAL, nonzero fused score.
+    ///
+    /// Fixture: `NOISE_COUNT` (119, deliberately < `RETRIEVAL_RENDER_MARGIN`
+    /// so exactly one bare symbol -- the target -- gets trimmed) member
+    /// notes outrank the isolated target symbol on BM25 alone (as in the
+    /// sibling render-cap test above). The "sibling" symbol shares the
+    /// target's directory (both are bare filenames, so both map to the
+    /// `code:.` domain) and gets a semantic-leg embedding matching the
+    /// query's, giving it real fused-score credit (`weight_semantic = 0.35`)
+    /// the totally isolated, non-embedded target never gets -- the same
+    /// lever `investigate_project_scope_boosts_partial_symbol_match_without_pinning`
+    /// uses to reliably beat BM25-heavy notes, and the only reliable one:
+    /// PPR alone (e.g. a single incoming CALLS edge) was tried first and
+    /// measured NOT enough separation to survive the same 119 notes.
+    #[test]
+    fn investigate_project_scope_pins_injected_exact_match_as_domain_entry_point() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        const SYMBOL_NAME: &str = "domain_render_cap_exact_target";
+        const NOISE_COUNT: usize = 119;
+        let notes: Vec<(String, &str, usize)> = (0..NOISE_COUNT)
+            .map(|i| (format!("noise{i:04}"), SYMBOL_NAME, 20))
+            .collect();
+        let notes_ref: Vec<(&str, &str, usize)> = notes
+            .iter()
+            .map(|(slug, term, n)| (slug.as_str(), *term, *n))
+            .collect();
+        let (dir, db_path, store, tantivy, symbol_uid) = make_project_with_symbol_and_noise_notes(
+            "domainrendercap",
+            SYMBOL_NAME,
+            &notes_ref,
+            false,
+        );
+        let project_uid = "proj:test:domainrendercap".to_string();
+
+        // The target symbol's file is `target.js` (set by the shared
+        // helper) at the fixture's root, i.e. domain ".". The sibling lives
+        // in the SAME directory ("." — both at fixture root, since neither
+        // file_path has a directory component) so they land in the same
+        // `code:.` domain.
+        let sibling_uid = "sym:domainrendercap:sibling".to_string();
+        let sibling = Symbol {
+            uid: sibling_uid.clone(),
+            name: "sibling_symbol".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:domainrendercap".to_string(),
+            file_path: "sibling.js".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: "function sibling_symbol()".to_string(),
+            summary: None,
+            content_hash: "h-sibling".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.batch_insert_symbols(&[sibling]).unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                &project_uid,
+                std::slice::from_ref(&sibling_uid),
+                1.0,
+            )
+            .unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        store
+            .update_symbol_embedding(&sibling_uid, &[1.0_f32, 0.0])
+            .unwrap();
+
+        struct FixedEmbed;
+        impl EmbedQueryFn for FixedEmbed {
+            fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+        }
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            SYMBOL_NAME,
+            "project:domainrendercap",
+            Some(4000),
+            Some(&FixedEmbed),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.entries[0].uid,
+            symbol_uid,
+            "the target must still be injected and pinned to entry 0; entries: {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.uid, e.relevance, &e.matched_query))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.entries.iter().any(|e| e.uid == sibling_uid),
+            "the sibling symbol must survive into the map on its own (real, nonzero) \
+             fused score -- this test needs an ordinary, non-injected domain-mate; \
+             entries: {:?}",
+            result.entries.iter().map(|e| &e.uid).collect::<Vec<_>>()
+        );
+
+        let target_asset_id = result.entries[0].asset_id.clone();
+        let domain = result
+            .domains
+            .iter()
+            .find(|d| d.members.contains(&target_asset_id))
+            .expect("the injected target must belong to some domain");
+        assert_eq!(
+            domain.entry_point, target_asset_id,
+            "the injected exact match must be its domain's entry_point even though its \
+             relevance (0.0) is lower than the sibling's real, nonzero score -- domain: \
+             {domain:?}"
+        );
+        let sibling_asset_id = result
+            .entries
+            .iter()
+            .find(|e| e.uid == sibling_uid)
+            .map(|e| e.asset_id.clone())
+            .expect("sibling entry must exist");
+        assert!(
+            domain.members.contains(&sibling_asset_id),
+            "the sibling must share the target's domain (same directory), proving this \
+             is a REAL shared-domain scenario, not a domain of one: {domain:?}"
+        );
+        assert_eq!(
+            result.domains.first().map(|d| d.label.clone()),
+            Some(domain.label.clone()),
+            "the domain containing the pinned exact match must sort first, even though \
+             its entry point's relevance (0.0) is the lowest of any entry in the map: \
+             {:?}",
+            result.domains.iter().map(|d| &d.label).collect::<Vec<_>>()
+        );
+    }
+
+    /// nw-476 counterweight (owner decision, refined). A SUBSTRING match is
+    /// deliberately NOT pinned -- it only gets its fused score boosted (x5,
+    /// Zoekt's `importantTermBoost` precedent), so a note that is genuinely
+    /// far stronger on fused score still outranks it. This is the test that
+    /// distinguishes "pin" from "boost": if the implementation pinned every
+    /// resolved match the same way, the strong note below would never be
+    /// able to outrank the symbol regardless of its own score.
+    #[test]
+    fn investigate_project_scope_boosts_partial_symbol_match_without_pinning() {
+        const SYMBOL_NAME: &str = "build_brain_context_hybrid_with_aliases";
+        const QUERY_TERM: &str = "brain_context"; // substring, not equal -> "partial"
+
+        let mut notes: Vec<(String, &str, usize)> = Vec::new();
+        // WEAK notes: a single low-frequency mention of the query term in
+        // the note's own title/body (per
+        // `make_project_with_symbol_and_noise_notes`), so each gets a
+        // modest BM25 bump on its OWN (seed-partition) uid. `link_notes:
+        // true` below also fans every note's section out to every other
+        // note, giving each one real incoming PPR credit an isolated member
+        // symbol never gets.
+        const WEAK_COUNT: usize = 18;
+        for i in 0..WEAK_COUNT {
+            notes.push((format!("weak{i:03}"), QUERY_TERM, 1));
+        }
+        // STRONG note: the query term repeated heavily, so its OWN
+        // (seed-partition) BM25 score is far above anything a x5 boost of a
+        // lone member symbol's PPR-only seed share can reach.
+        notes.push(("strong".to_string(), QUERY_TERM, 400));
+        let notes_ref: Vec<(&str, &str, usize)> = notes
+            .iter()
+            .map(|(slug, term, n)| (slug.as_str(), *term, *n))
+            .collect();
+        let (dir, db_path, store, tantivy, symbol_uid) =
+            make_project_with_symbol_and_noise_notes("pinpartial", SYMBOL_NAME, &notes_ref, true);
+
+        // Semantic leg (weight_semantic = 0.35, the largest of the three):
+        // give ONLY the "strong" note an embedding aligned with the query's,
+        // so it collects the full semantic contribution on top of its BM25
+        // and PPR legs. A lone member symbol with no embedding of its own
+        // gets none.
+        struct FixedEmbed;
+        impl EmbedQueryFn for FixedEmbed {
+            fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+        }
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        store
+            .update_note_embedding("note:vlt:test:pinpartial:strong", &[1.0_f32, 0.0])
+            .unwrap();
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            QUERY_TERM,
+            "project:pinpartial",
+            Some(4000),
+            Some(&FixedEmbed),
+        )
+        .unwrap();
+
+        let symbol_entry = result
+            .entries
+            .iter()
+            .find(|e| e.uid == symbol_uid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the partially-matched symbol must still appear in the map; entries: {:?}",
+                    result
+                        .entries
+                        .iter()
+                        .map(|e| (&e.uid, &e.title))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            symbol_entry.matched_query,
+            Some(MatchedQuery::Partial),
+            "a substring (non-exact) match must be flagged matched_query: partial"
+        );
+
+        // The boost is an exact x5 multiplier applied to the node's own
+        // fused score, so the pre-boost value is recoverable directly rather
+        // than needing a second "boost disabled" run of the pipeline.
+        let symbol_relevance = symbol_entry.relevance;
+        let symbol_unboosted = symbol_relevance / 5.0;
+
+        let strong_note_uid = "note:vlt:test:pinpartial:strong".to_string();
+        let strong_entry = result
+            .entries
+            .iter()
+            .find(|e| e.uid == strong_note_uid)
+            .expect("the strong note must survive retrieval");
+        assert!(
+            strong_entry.relevance > symbol_relevance,
+            "a note whose fused score exceeds 5x the symbol's ({symbol_unboosted} x5 = \
+             {symbol_relevance}) must still outrank the boosted (not pinned) symbol: \
+             strong note relevance {}",
+            strong_entry.relevance
+        );
+
+        // At least one weak (single-mention) note must sit STRICTLY BETWEEN
+        // the symbol's unboosted and boosted relevance -- i.e. it would have
+        // outranked the bare symbol, but the x5 boost now moves the symbol
+        // back above it. This is the numeric form of "ranks above its
+        // unboosted position."
+        let weak_relevances: Vec<f64> = result
+            .entries
+            .iter()
+            .filter(|e| e.uid.contains(":weak"))
+            .map(|e| e.relevance)
+            .collect();
+        assert!(
+            weak_relevances
+                .iter()
+                .any(|r| *r > symbol_unboosted && *r < symbol_relevance),
+            "at least one weak note must rank between the symbol's unboosted \
+             ({symbol_unboosted}) and boosted ({symbol_relevance}) relevance, proving the \
+             boost (not a pin) is what moved the symbol above it: weak note relevances \
+             {weak_relevances:?}"
+        );
+    }
+
+    /// nw-476. `SEED_NAME_MATCH_LIMIT` (5) bounds how many exact matches can
+    /// be pinned, even when more than 5 project members share the exact
+    /// query name -- the resolver call behind the pin (same one seed
+    /// resolution always used, same limit) only ever returns its own
+    /// top-`SEED_NAME_MATCH_LIMIT` page, so the rest are never candidates
+    /// for pinning at all (they still appear, unpinned, in ordinary fused
+    /// order).
+    #[test]
+    fn investigate_exact_matches_are_capped_at_the_seed_name_limit() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        const DUP_COUNT: usize = 7;
+        const NAME: &str = "dup_fn";
+        let symbols: Vec<Symbol> = (0..DUP_COUNT)
+            .map(|i| Symbol {
+                uid: format!("sym:dup{i}"),
+                name: NAME.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:dup".to_string(),
+                // Lexicographic file_path is the resolver's final tiebreak
+                // for otherwise-identical candidates, so this also fixes
+                // resolver order deterministically.
+                file_path: format!("src/f{i}.js"),
+                start_line: 1,
+                end_line: 2,
+                signature: format!("function {NAME}()"),
+                summary: None,
+                content_hash: format!("h{i}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+        let member_uids: Vec<String> = symbols.iter().map(|s| s.uid.clone()).collect();
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:dupproj".to_string(),
+            name: "dupproj".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, &member_uids, 1.0)
+            .unwrap();
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            dir.path(),
+            NAME,
+            "project:dupproj",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        let exact_count = result
+            .entries
+            .iter()
+            .filter(|e| e.matched_query == Some(MatchedQuery::Exact))
+            .count();
+        assert_eq!(
+            exact_count,
+            SEED_NAME_MATCH_LIMIT,
+            "exactly SEED_NAME_MATCH_LIMIT ({SEED_NAME_MATCH_LIMIT}) of the {DUP_COUNT} \
+             identically-named members may be pinned; entries: {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.uid, &e.matched_query))
+                .collect::<Vec<_>>()
+        );
+        for i in 0..SEED_NAME_MATCH_LIMIT {
+            assert_eq!(
+                result.entries[i].matched_query,
+                Some(MatchedQuery::Exact),
+                "entries 0..{SEED_NAME_MATCH_LIMIT} must all be pinned exact matches"
+            );
+        }
+        // The dup_fn members beyond the pinned cap must still be present
+        // (project membership always seeds them), just unpinned.
+        let dup_uids: std::collections::HashSet<&String> = member_uids.iter().collect();
+        let present_dup_count = result
+            .entries
+            .iter()
+            .filter(|e| dup_uids.contains(&e.uid))
+            .count();
+        assert_eq!(
+            present_dup_count, DUP_COUNT,
+            "all {DUP_COUNT} identically-named members must still appear in the map, \
+             pinned or not"
+        );
+    }
+
+    /// nw-476 counterweight. `resolve_query_symbol_matches` searches the
+    /// WHOLE store, so a same-named symbol belonging to a DIFFERENT project
+    /// is a legitimate hit from the resolver's point of view -- it must be
+    /// filtered by `uid_in_scope` exactly like any other out-of-scope
+    /// candidate, both for pinning AND for ordinary inclusion in the map.
+    #[test]
+    fn investigate_project_scope_does_not_pin_exact_match_outside_the_project() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        const NAME: &str = "sharedname";
+
+        // The scoped project has ONE unrelated member, so it is a
+        // well-formed, non-empty project scope -- not the degenerate
+        // "empty project" case.
+        let scoped_uid = "sym:scoped_member".to_string();
+        let unrelated = nestweaver_schema::Symbol {
+            uid: scoped_uid.clone(),
+            name: "unrelated_member".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:scoped".to_string(),
+            file_path: "scoped.js".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: "function unrelated_member()".to_string(),
+            summary: None,
+            content_hash: "h-scoped".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&unrelated).unwrap();
+        let scoped_project = nestweaver_schema::Project {
+            uid: "proj:test:scoped".to_string(),
+            name: "scoped".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&scoped_project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                &scoped_project.uid,
+                std::slice::from_ref(&scoped_uid),
+                1.0,
+            )
+            .unwrap();
+
+        // A DIFFERENT project owns the exact-named symbol.
+        let foreign_uid = "sym:foreign_shared".to_string();
+        let foreign = Symbol {
+            uid: foreign_uid.clone(),
+            name: NAME.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:foreign".to_string(),
+            file_path: "foreign.js".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("function {NAME}()"),
+            summary: None,
+            content_hash: "h-foreign".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&foreign).unwrap();
+        let foreign_project = nestweaver_schema::Project {
+            uid: "proj:test:foreign".to_string(),
+            name: "foreign".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&foreign_project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                &foreign_project.uid,
+                std::slice::from_ref(&foreign_uid),
+                1.0,
+            )
+            .unwrap();
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            dir.path(),
+            NAME,
+            "project:scoped",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.entries.iter().any(|e| e.uid == foreign_uid),
+            "an exact-named symbol belonging to a DIFFERENT project must not appear in \
+             the map at all, pinned or not; entries: {:?}",
+            result.entries.iter().map(|e| &e.uid).collect::<Vec<_>>()
+        );
+    }
+
+    /// nw-476 counterweight. Outside `project:` scope the seed partition is
+    /// small (a handful of exact-name/title/UID resolutions), so the merge
+    /// step was never the site of the bug -- and it must not become one now.
+    /// With no scope filter and a query that resolves via a NOTE TITLE (not
+    /// any symbol name), `resolve_query_symbol_matches` finds nothing, so
+    /// the new pin/boost logic is fully inert and each partition's order
+    /// must be exactly what it always was: non-increasing fused score,
+    /// seeds before connected.
+    #[test]
+    fn investigate_unscoped_ordering_unchanged() {
+        let (dir, store) = make_wide_vault_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            dir.path(),
+            "Hub",
+            "vault",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.entries.is_empty(),
+            "the hub note itself must appear in the map"
+        );
+        assert!(
+            result.entries.iter().all(|e| e.matched_query.is_none()),
+            "a query with no symbol-name match at all must never tag matched_query"
+        );
+
+        let last_seed = result.entries.iter().rposition(|e| e.is_seed);
+        let first_non_seed = result.entries.iter().position(|e| !e.is_seed);
+        if let (Some(l), Some(f)) = (last_seed, first_non_seed) {
+            assert!(l < f, "all seed entries must precede non-seed entries");
+        }
+        let seed_relevances: Vec<f64> = result
+            .entries
+            .iter()
+            .filter(|e| e.is_seed)
+            .map(|e| e.relevance)
+            .collect();
+        assert!(
+            seed_relevances.windows(2).all(|w| w[0] >= w[1]),
+            "seed entries must stay in non-increasing fused-score order: {seed_relevances:?}"
+        );
+        let connected_relevances: Vec<f64> = result
+            .entries
+            .iter()
+            .filter(|e| !e.is_seed)
+            .map(|e| e.relevance)
+            .collect();
+        assert!(
+            connected_relevances.windows(2).all(|w| w[0] >= w[1]),
+            "connected entries must stay in non-increasing fused-score order: \
+             {connected_relevances:?}"
+        );
+    }
+
+    /// nw-476 counterweight (owner decision Q1, revised — orchestrator
+    /// review). Q1 and its revision both authorize the pin/boost/
+    /// `matched_query` behavior ONLY "under `project:` scope"; the plan's
+    /// own counterweight row names this exact test. Unlike
+    /// `investigate_unscoped_ordering_unchanged` above (whose query matches
+    /// a NOTE title, never touching `resolve_query_symbol_matches` at all),
+    /// this test's query is a dead-on CASE-SENSITIVE exact match against a
+    /// real SYMBOL name -- the one case that, before the scope gate, WOULD
+    /// have been pinned and flagged `matched_query: "exact"` regardless of
+    /// scope. `vault` and `repo:` scope must see it treated exactly as
+    /// before nw-476: an ordinary (if often top-ranked, via the pre-existing
+    /// `is_seed`-first / `investigate_isolated_symbol_exact_match_is_not_empty`
+    /// contract) entry, never pinned past that and never flagged.
+    #[test]
+    fn investigate_vault_scope_exact_symbol_match_is_not_pinned() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        for scope in ["vault", "repo:test"] {
+            let result = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "hello", // exact-matches the real `hello` symbol in make_store()
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap();
+
+            assert!(
+                !result.entries.is_empty(),
+                "{scope}: the exact-match symbol must still appear in the map"
+            );
+            assert!(
+                result.entries.iter().all(|e| e.matched_query.is_none()),
+                "{scope}: nw-476's pin/boost is authorized ONLY under 'project:' scope \
+                 (owner decision Q1, revised) -- matched_query must never be set here: {:?}",
+                result
+                    .entries
+                    .iter()
+                    .map(|e| (&e.uid, &e.matched_query))
+                    .collect::<Vec<_>>()
+            );
+
+            // Pre-nw-476 fused order: seeds precede connected (the
+            // `is_seed`-first contract predates and is untouched by
+            // nw-476), and NEITHER partition is boosted or re-sorted beyond
+            // its own natural fused-score order.
+            let last_seed = result.entries.iter().rposition(|e| e.is_seed);
+            let first_non_seed = result.entries.iter().position(|e| !e.is_seed);
+            if let (Some(l), Some(f)) = (last_seed, first_non_seed) {
+                assert!(
+                    l < f,
+                    "{scope}: seed entries must precede connected entries"
+                );
+            }
+            let seed_relevances: Vec<f64> = result
+                .entries
+                .iter()
+                .filter(|e| e.is_seed)
+                .map(|e| e.relevance)
+                .collect();
+            assert!(
+                seed_relevances.windows(2).all(|w| w[0] >= w[1]),
+                "{scope}: seed entries must stay in the pre-existing non-increasing \
+                 fused-score order, never re-sorted by a boost: {seed_relevances:?}"
+            );
+            let connected_relevances: Vec<f64> = result
+                .entries
+                .iter()
+                .filter(|e| !e.is_seed)
+                .map(|e| e.relevance)
+                .collect();
+            assert!(
+                connected_relevances.windows(2).all(|w| w[0] >= w[1]),
+                "{scope}: connected entries must stay in the pre-existing non-increasing \
+                 fused-score order, never re-sorted by a boost: {connected_relevances:?}"
+            );
+        }
     }
 
     #[test]
@@ -4300,6 +5969,7 @@ mod tests {
                     expanded: false,
                     unavailable_reason: None,
                     is_seed: false,
+                    matched_query: None,
                     relevance: 1.0,
                 }],
             },
@@ -4378,6 +6048,7 @@ mod tests {
             expanded: false,
             unavailable_reason: None,
             is_seed: false,
+            matched_query: None,
             relevance: 1.0,
         };
         let mut bundle_store = BundleStore::default();
