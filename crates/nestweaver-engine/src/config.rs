@@ -467,6 +467,14 @@ pub struct EmbeddingConfig {
     /// Candidate pool size for the semantic ANN search. Default 200.
     #[serde(default = "default_semantic_search_limit")]
     pub semantic_search_limit: usize,
+    /// Whether the daemon may repair a missing local model cache in the
+    /// background, for a model this database's persisted embedding identity
+    /// already names. Default `true`. Downloads a background repair may start
+    /// still never hold the write gate and never delay boot (nw-484); this
+    /// flag only controls whether the daemon starts them at all. Set `false`
+    /// to require an explicit `nestweaver embed` for every recovery.
+    #[serde(default = "default_true")]
+    pub auto_repair_cache: bool,
 }
 
 /// Device-selection policy for the local embedding backend.
@@ -555,6 +563,7 @@ impl Default for EmbeddingConfig {
             always_blend_semantic: true,
             semantic_seed_limit: default_semantic_seed_limit(),
             semantic_search_limit: default_semantic_search_limit(),
+            auto_repair_cache: true,
         }
     }
 }
@@ -2799,6 +2808,29 @@ url = "https://github.com/example/keep-me"
         assert_eq!(cfg.workers, 8);
         assert_eq!(cfg.min_poll, "45s");
         assert_eq!(cfg.max_poll, "8h");
+    }
+
+    /// nw-484 (D11): auto-repair of a missing embedding cache is opt-OUT, not
+    /// opt-in — an absent `[embedding]` section, or one that never mentions
+    /// this key, must still repair. Only an explicit `false` disables it.
+    #[test]
+    fn embedding_auto_repair_cache_defaults_to_true() {
+        assert!(EmbeddingConfig::default().auto_repair_cache);
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(
+            cfg.embedding.auto_repair_cache,
+            "an instance config with no [embedding] section must still default to true"
+        );
+    }
+
+    #[test]
+    fn embedding_auto_repair_cache_false_is_honoured() {
+        let toml = format!("{MINIMAL_TOML}\n\n[embedding]\nauto_repair_cache = false\n");
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert!(
+            !cfg.embedding.auto_repair_cache,
+            "an explicit false must disable background auto-repair"
+        );
     }
 
     /// nw-483 counterweight. The bug was tests reaching a real model

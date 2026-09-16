@@ -372,13 +372,30 @@ pub fn resolve_model_artifacts(
     config: &crate::EmbedConfig,
     mode: ArtifactMode,
 ) -> Result<ModelArtifacts> {
-    resolve_model_artifacts_with_builder(config, mode, HFClient::builder())
+    resolve_model_artifacts_with_progress(config, mode, None)
+}
+
+/// Same as [`resolve_model_artifacts`], with an optional cumulative
+/// byte-progress sink (nw-484). The sink receives `(done, total)` calls as
+/// each artifact file resolves — see [`crate::ArtifactProgressSink`].
+///
+/// Only attached under `ArtifactMode::DownloadMissing`. `CacheOnly` resolves
+/// everything from local disk with no byte transfer to report on, and this
+/// keeps the daemon's cache-only boot and main-thread reload paths — which
+/// always pass `CacheOnly` — byte-for-byte identical to before this existed.
+pub fn resolve_model_artifacts_with_progress(
+    config: &crate::EmbedConfig,
+    mode: ArtifactMode,
+    progress: Option<std::sync::Arc<dyn crate::ArtifactProgressSink>>,
+) -> Result<ModelArtifacts> {
+    resolve_model_artifacts_with_builder(config, mode, HFClient::builder(), progress)
 }
 
 fn resolve_model_artifacts_with_builder(
     config: &crate::EmbedConfig,
     mode: ArtifactMode,
     builder: HFClientBuilder,
+    progress: Option<std::sync::Arc<dyn crate::ArtifactProgressSink>>,
 ) -> Result<ModelArtifacts> {
     let async_client = builder
         .cache_dir(config.cache_dir.clone())
@@ -389,10 +406,24 @@ fn resolve_model_artifacts_with_builder(
     let (owner, name) = split_id(&config.model_id);
     let repo = client.model(owner, name);
 
+    // hf-hub's own progress plumbing is a documented no-op with no handler
+    // attached ("When no handler is set, the library emits nothing — there
+    // is no runtime cost"), so this is safe to leave `None` for `CacheOnly`
+    // without any conditional-cost concern; it is gated anyway per the doc
+    // comment above.
+    let hf_progress: Option<hf_hub::progress::Progress> = if mode == ArtifactMode::DownloadMissing {
+        progress.map(|sink| {
+            hf_hub::progress::Progress::new(crate::progress::HfProgressAdapter::new(sink))
+        })
+    } else {
+        None
+    };
+
     let resolve = |filename: &str| -> Result<PathBuf> {
         repo.download_file()
             .filename(filename)
             .local_files_only(mode == ArtifactMode::CacheOnly)
+            .maybe_progress(hf_progress.clone())
             .send()
             .map_err(|source| {
                 if mode == ArtifactMode::CacheOnly
@@ -423,6 +454,7 @@ fn resolve_model_artifacts_with_builder(
             .download_file()
             .filename(filename)
             .local_files_only(mode == ArtifactMode::CacheOnly)
+            .maybe_progress(hf_progress.clone())
             .send()
         {
             Ok(path) => Ok(Some(path)),
@@ -1101,6 +1133,7 @@ mod tests {
             &test_config(cache.path()),
             ArtifactMode::CacheOnly,
             HFClient::builder().endpoint("http://127.0.0.1:9"),
+            None,
         )
         .expect("a complete configured cache must resolve with an unreachable endpoint");
 
@@ -1121,6 +1154,7 @@ mod tests {
             &test_config(cache.path()),
             ArtifactMode::CacheOnly,
             HFClient::builder().endpoint("http://127.0.0.1:9"),
+            None,
         )
         .expect("a model that publishes no sentence-transformers config must still resolve");
 
@@ -1161,6 +1195,7 @@ mod tests {
             &test_config(cache.path()),
             ArtifactMode::CacheOnly,
             HFClient::builder().endpoint("http://127.0.0.1:9"),
+            None,
         )
         .expect_err("a missing required artifact must fail without contacting the endpoint");
         let missing = err

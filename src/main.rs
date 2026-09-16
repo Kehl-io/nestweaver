@@ -4279,6 +4279,42 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
             ));
         }
     }
+    // nw-484: a missing local model cache is repaired in place (an
+    // operator-initiated `embed`, or the daemon's own bounded background
+    // auto-repair). `state` already reads "seeding" for the whole window —
+    // this line adds the byte-level detail behind it. Shown even when a
+    // retry is merely SCHEDULED (not yet active), so an operator watching
+    // `brain status` between attempts still sees why semantic search is
+    // degraded and when the next attempt fires, not just a bare "failed".
+    if status.seed_active {
+        let done = format_bytes(status.seed_bytes_done);
+        let amount = if status.seed_bytes_total > 0 {
+            format!("{done} of {}", format_bytes(status.seed_bytes_total))
+        } else {
+            format!("{done} (size not yet known)")
+        };
+        let origin = match status.seed_origin.as_str() {
+            "auto_repair" => format!(
+                " (automatic repair, attempt {} of {})",
+                status.seed_attempt, status.seed_max_attempts
+            ),
+            "embed" => " (requested by nestweaver embed)".to_string(),
+            _ => String::new(),
+        };
+        lines.push(format!("  Download:         {amount}{origin}"));
+    } else if status.seed_next_retry_at > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let remaining = (status.seed_next_retry_at - now).max(0) as u64;
+        lines.push(format!(
+            "  Download:         retry {} of {} in {}",
+            status.seed_attempt,
+            status.seed_max_attempts,
+            nestweaver_client::progress::format_duration_secs(remaining)
+        ));
+    }
     if !status.identity_state.is_empty() {
         lines.push(format!("  Identity:         {}", status.identity_state));
     }
@@ -4323,6 +4359,15 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
             .as_str()
             .unwrap_or("")
             .to_string(),
+        // nw-484. Absent on an older daemon; proto3 defaults read as "no
+        // seed in flight", the honest answer when the daemon cannot tell us.
+        seed_active: value["seed_active"].as_bool().unwrap_or(false),
+        seed_bytes_done: value["seed_bytes_done"].as_u64().unwrap_or(0),
+        seed_bytes_total: value["seed_bytes_total"].as_u64().unwrap_or(0),
+        seed_origin: value["seed_origin"].as_str().unwrap_or("").to_string(),
+        seed_attempt: value["seed_attempt"].as_u64().unwrap_or(0) as u32,
+        seed_max_attempts: value["seed_max_attempts"].as_u64().unwrap_or(0) as u32,
+        seed_next_retry_at: value["seed_next_retry_at"].as_i64().unwrap_or(0),
     }
 }
 
@@ -4784,6 +4829,77 @@ mod daemon_status_renderer_tests {
         assert!(text.contains("Pass scope:       all"), "{text}");
         // The pre-existing fields must survive the insertion.
         assert!(text.contains("Model:            test-model"), "{text}");
+    }
+
+    /// nw-484 seed fields are a user-visible contract across three layers —
+    /// daemon JSON, the typed proto struct, and the rendered text — and
+    /// nothing had pinned the round trip end to end. Proves
+    /// `embedding_status_from_json` actually reads all 7 new keys (not just
+    /// a subset), and that `format_embedding_status` renders their values on
+    /// the "Download:" line. The counterweight proves the opposite direction
+    /// matters just as much: an OLDER daemon's JSON, with none of the
+    /// `seed_*` keys at all, must default every field honestly (false/0/
+    /// empty) and must render no Download line — and, above all, must never
+    /// panic on the absent keys.
+    #[test]
+    fn embedding_status_seed_fields_round_trip_from_json_to_text() {
+        let json = serde_json::json!({
+            "state": "seeding",
+            "backend": "local",
+            "requested_device": "auto",
+            "selected_device": "",
+            "model_id": "test-owner/test-model",
+            "error": "",
+            "metal_compiled": false,
+            "fallback_used": false,
+            "seed_active": true,
+            "seed_bytes_done": 1_048_576u64,
+            "seed_bytes_total": 4_194_304u64,
+            "seed_origin": "auto_repair",
+            "seed_attempt": 2u64,
+            "seed_max_attempts": 5u64,
+            "seed_next_retry_at": 0i64,
+        });
+
+        let status = embedding_status_from_json(&json);
+        assert!(status.seed_active);
+        assert_eq!(status.seed_bytes_done, 1_048_576);
+        assert_eq!(status.seed_bytes_total, 4_194_304);
+        assert_eq!(status.seed_origin, "auto_repair");
+        assert_eq!(status.seed_attempt, 2);
+        assert_eq!(status.seed_max_attempts, 5);
+        assert_eq!(status.seed_next_retry_at, 0);
+
+        let text = format_embedding_status(&status);
+        assert!(
+            text.contains("Download:         1.0 MB of 4.0 MB (automatic repair, attempt 2 of 5)"),
+            "{text}"
+        );
+
+        let legacy_json = serde_json::json!({
+            "state": "ready",
+            "backend": "local",
+            "requested_device": "auto",
+            "selected_device": "cpu",
+            "model_id": "test-owner/test-model",
+            "error": "",
+            "metal_compiled": false,
+            "fallback_used": false,
+        });
+        let legacy_status = embedding_status_from_json(&legacy_json);
+        assert!(!legacy_status.seed_active);
+        assert_eq!(legacy_status.seed_bytes_done, 0);
+        assert_eq!(legacy_status.seed_bytes_total, 0);
+        assert_eq!(legacy_status.seed_origin, "");
+        assert_eq!(legacy_status.seed_attempt, 0);
+        assert_eq!(legacy_status.seed_max_attempts, 0);
+        assert_eq!(legacy_status.seed_next_retry_at, 0);
+
+        let legacy_text = format_embedding_status(&legacy_status);
+        assert!(
+            !legacy_text.contains("Download:"),
+            "an older daemon's status must never grow a Download line: {legacy_text}"
+        );
     }
 
     #[test]
@@ -32983,6 +33099,216 @@ mod context_json_renderer_tests {
     }
 }
 
+/// Pure rendering for the daemon `embed` route's terminal outcome (nw-484):
+/// the lines to print and the exit code, with no I/O of its own, so tests
+/// can assert on exact strings instead of capturing stderr through a live
+/// daemon (which the design explicitly calls out as untestable here — an
+/// e2e run against a real Hugging Face endpoint is out of scope for a gate).
+///
+/// Mirrors `run_embed_with_cancel`'s existing
+/// `restart_required`/`rejected`/`stats` branches exactly; the only new
+/// behavior is the `model_seeded` line. `repair_identity` +
+/// `!resp.identity_repaired` is still the CALLER's job to check first (it is
+/// an error, not a line+exit-code pair) — this function assumes that check
+/// already passed.
+fn render_daemon_embed_outcome(
+    resp: &nestweaver_proto::EmbedResponse,
+    elapsed: std::time::Duration,
+    stats: bool,
+) -> (Vec<String>, i32) {
+    let mut lines = Vec::new();
+    if resp.identity_repaired {
+        lines.push(format!(
+            "Discarded {} embedding(s) and removed the unreadable semantic identity.",
+            resp.discarded_embeddings
+        ));
+    }
+    if resp.restart_required {
+        lines.push(
+            "Restart the daemon to load the configured embedding model, then run \
+             `nestweaver embed --force`."
+                .to_string(),
+        );
+        return (lines, EXIT_SUCCESS);
+    }
+    if resp.rejected > 0 {
+        lines.push(format!(
+            "Error: {} embedding(s) rejected by the embedding guards \
+             (model or dimension mismatch). Use --force to switch models \
+             (clears existing embeddings).",
+            resp.rejected
+        ));
+    }
+    // nw-484: this call itself downloaded a missing local model cache and
+    // loaded it — no restart. Named once, before the pass summary, because
+    // nothing else in this function's output says a download happened.
+    // Neither the stale "missing … run `nestweaver embed`" remediation nor
+    // any restart advice may appear here: the daemon's own error text is
+    // already free of both on every seeding path (server.rs's `embed` RPC),
+    // and this function must not reintroduce either on the success path.
+    if resp.model_seeded {
+        let device = if resp.loaded_device.is_empty() {
+            "unknown"
+        } else {
+            &resp.loaded_device
+        };
+        lines.push(format!(
+            "Downloaded missing embedding model '{}' into {} and loaded it (device: {device}).",
+            resp.seeded_model_id, resp.seeded_cache_dir
+        ));
+    }
+    if stats {
+        lines.push(format!(
+            "Embed stats: {} succeeded, {} failed, \
+             {} rejected (model/dim mismatch), {} eligible, \
+             {} already embedded, {} scoped node(s), {:.2}s elapsed",
+            resp.succeeded,
+            resp.failed,
+            resp.rejected,
+            resp.eligible,
+            resp.skipped,
+            resp.scoped,
+            elapsed.as_secs_f64()
+        ));
+    } else {
+        lines.push(format!(
+            "Done: {} embedding(s) generated, {} error(s); \
+             {} already embedded out of {} scoped node(s).",
+            resp.succeeded, resp.failed, resp.skipped, resp.scoped
+        ));
+    }
+    let exit = if resp.failed > 0 || resp.rejected > 0 {
+        EXIT_ERROR
+    } else {
+        EXIT_SUCCESS
+    };
+    (lines, exit)
+}
+
+#[cfg(test)]
+mod render_daemon_embed_outcome_tests {
+    use super::*;
+
+    fn response(succeeded: u32, failed: u32) -> nestweaver_proto::EmbedResponse {
+        nestweaver_proto::EmbedResponse {
+            succeeded,
+            failed,
+            scoped: succeeded as u64 + failed as u64,
+            eligible: succeeded as u64 + failed as u64,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of nw-484: a seeded, successful recovery prints the
+    /// "Downloaded …" line exactly ONCE, before the usual `Done:` summary,
+    /// and exits 0 — no restart line, no stale "missing" remediation
+    /// anywhere in the output.
+    #[test]
+    fn daemon_embed_cli_reports_a_seeded_model_once_and_exits_zero() {
+        let resp = nestweaver_proto::EmbedResponse {
+            model_seeded: true,
+            seeded_model_id: "BAAI/bge-base-en-v1.5".to_string(),
+            seeded_cache_dir: "/Users/kory/Library/Caches/nestweaver/models".to_string(),
+            loaded_device: "metal".to_string(),
+            ..response(3, 0)
+        };
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+
+        assert_eq!(exit, EXIT_SUCCESS);
+        let seeded_lines: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("Downloaded missing embedding model"))
+            .collect();
+        assert_eq!(
+            seeded_lines.len(),
+            1,
+            "the seeded-model line must appear exactly once: {lines:?}"
+        );
+        assert_eq!(
+            seeded_lines[0],
+            "Downloaded missing embedding model 'BAAI/bge-base-en-v1.5' into \
+             /Users/kory/Library/Caches/nestweaver/models and loaded it (device: metal)."
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("Done:")),
+            "the usual pass summary must still print: {lines:?}"
+        );
+        let joined = lines.join("\n").to_ascii_lowercase();
+        assert!(
+            !joined.contains("restart"),
+            "a successful seeded recovery must never mention restarting: {lines:?}"
+        );
+        assert!(
+            !joined.contains("run `nestweaver embed`"),
+            "the stale pre-recovery remediation must not leak into a success line: {lines:?}"
+        );
+    }
+
+    /// Counterweight: when nothing was seeded, the line must not appear at
+    /// all — a fresh `EmbedResponse` default (`model_seeded: false`) must
+    /// render exactly like the pre-nw-484 output.
+    #[test]
+    fn unseeded_response_prints_no_download_line() {
+        let resp = response(2, 0);
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_SUCCESS);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("Downloaded missing")),
+            "an unseeded response must never print the seeded-model line: {lines:?}"
+        );
+    }
+
+    /// A seed/load failure never reaches this function (the daemon returns
+    /// an `Err` `Status`, handled by the caller's `Err(e) => return
+    /// Err(e).context(..)` branch) — so the "no restart or stale missing
+    /// text" guarantee for a FAILURE is pinned directly on the daemon's
+    /// error text, not here. This test pins the other half: this function
+    /// itself never manufactures restart/stale-missing text on any input,
+    /// including a failed-but-not-seeded pass (`failed > 0`, exit non-zero).
+    #[test]
+    fn daemon_embed_cli_seed_error_has_no_restart_or_stale_missing_text() {
+        let resp = response(1, 2);
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_ERROR);
+        let joined = lines.join("\n").to_ascii_lowercase();
+        assert!(!joined.contains("restart"), "{lines:?}");
+        assert!(!joined.contains("run `nestweaver embed`"), "{lines:?}");
+    }
+
+    /// `restart_required` (the SEPARATE identity-repair path, nw-488 follow-up,
+    /// out of scope for nw-484) is the one case that legitimately still
+    /// prints restart text — pinned so the nw-484 "no restart" guarantees
+    /// above are known not to have silently swallowed this real, unrelated
+    /// case.
+    #[test]
+    fn restart_required_still_prints_its_own_restart_line() {
+        let resp = nestweaver_proto::EmbedResponse {
+            restart_required: true,
+            identity_repaired: true,
+            discarded_embeddings: 5,
+            ..Default::default()
+        };
+        let (lines, exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(1), false);
+        assert_eq!(exit, EXIT_SUCCESS);
+        assert!(lines.iter().any(|line| line.contains("Restart the daemon")));
+    }
+
+    #[test]
+    fn stats_mode_prints_the_stats_line_instead_of_done() {
+        let resp = response(4, 1);
+        let (lines, _exit) =
+            render_daemon_embed_outcome(&resp, std::time::Duration::from_secs(2), true);
+        assert!(lines.iter().any(|line| line.starts_with("Embed stats:")));
+        assert!(!lines.iter().any(|line| line.starts_with("Done:")));
+    }
+}
+
 /// Generate embeddings for symbols, notes, and/or headings.
 #[allow(clippy::too_many_arguments)]
 fn run_embed<Load>(
@@ -33189,51 +33515,11 @@ where
                                  restart it and retry --repair-identity"
                             );
                         }
-                        if resp.identity_repaired {
-                            eprintln!(
-                                "Discarded {} embedding(s) and removed the unreadable semantic identity.",
-                                resp.discarded_embeddings
-                            );
+                        let (lines, exit_code) = render_daemon_embed_outcome(&resp, elapsed, stats);
+                        for line in lines {
+                            eprintln!("{line}");
                         }
-                        if resp.restart_required {
-                            eprintln!(
-                                "Restart the daemon to load the configured embedding model, then run `nestweaver embed --force`."
-                            );
-                            return Ok(EXIT_SUCCESS);
-                        }
-                        if resp.rejected > 0 {
-                            eprintln!(
-                                "Error: {} embedding(s) rejected by the embedding guards \
-                                 (model or dimension mismatch). Use --force to switch models \
-                                 (clears existing embeddings).",
-                                resp.rejected
-                            );
-                        }
-                        if stats {
-                            eprintln!(
-                                "Embed stats: {} succeeded, {} failed, \
-                                 {} rejected (model/dim mismatch), {} eligible, \
-                                 {} already embedded, {} scoped node(s), {:.2}s elapsed",
-                                resp.succeeded,
-                                resp.failed,
-                                resp.rejected,
-                                resp.eligible,
-                                resp.skipped,
-                                resp.scoped,
-                                elapsed.as_secs_f64()
-                            );
-                        } else {
-                            eprintln!(
-                                "Done: {} embedding(s) generated, {} error(s); \
-                                 {} already embedded out of {} scoped node(s).",
-                                resp.succeeded, resp.failed, resp.skipped, resp.scoped
-                            );
-                        }
-                        return if resp.failed > 0 || resp.rejected > 0 {
-                            Ok(EXIT_ERROR)
-                        } else {
-                            Ok(EXIT_SUCCESS)
-                        };
+                        return Ok(exit_code);
                     }
                     Err(e) => {
                         return Err(e).context("daemon embed failed");

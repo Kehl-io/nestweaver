@@ -459,6 +459,42 @@ message EmbeddingStatus {
   string identity_error = 18;
   // Safe operator action. `--force` is explicitly not an identity override.
   string identity_remediation = 19;
+
+  // ── Seed progress (added 10.1, nw-484) ───────────────────────────
+  // A missing local model cache is repaired in place — either by an
+  // operator-initiated `embed` RPC or by the daemon's own bounded
+  // background auto-repair — and these fields disclose that download
+  // while it is happening. `state` above already reads "seeding" for the
+  // whole time any of this is active (it takes precedence over every
+  // other state string), so a client that only reads `state` already
+  // gets an honest answer; these are the numeric detail behind it.
+  // Proto3 scalars, so a daemon that predates them decodes as "no seed in
+  // flight" rather than as an error.
+
+  // True while an artifact download is in flight (auto-repair or an
+  // operator-initiated `embed`).
+  bool seed_active = 20;
+  // Cumulative bytes resolved so far across every artifact file in this
+  // seed attempt. 0 while `seed_active` is true means "not yet reported by
+  // the transfer layer", not "zero bytes moved".
+  uint64 seed_bytes_done = 21;
+  // Cumulative bytes known so far. Grows as additional artifact files are
+  // discovered — the full artifact set's total size is not known upfront —
+  // so treat this as a lower bound while `seed_active` is true, not a fixed
+  // target. 0 means "not yet known".
+  uint64 seed_bytes_total = 22;
+  // Who started the in-flight (or most recently finished) seed attempt:
+  // "auto_repair" | "embed" | "" (no seed has run this process).
+  string seed_origin = 23;
+  // 1-based attempt number of the current/most recent seed try.
+  uint32 seed_attempt = 24;
+  // Bound on `seed_attempt` for this seed's retry schedule. Always 1 for an
+  // operator-initiated `embed` (which retries immediately on the next
+  // explicit call, never on its own schedule); up to 5 for auto-repair.
+  uint32 seed_max_attempts = 25;
+  // Unix seconds of the next scheduled auto-repair retry; 0 means none
+  // scheduled (a seed is active right now, or the schedule is exhausted).
+  int64 seed_next_retry_at = 26;
 }
 
 message SearchStatus {
@@ -738,6 +774,28 @@ message EmbedResponse {
   bool identity_repaired = 7;
   bool restart_required = 8;
   uint64 discarded_embeddings = 9;
+
+  // ── One-command recovery (nw-484, added 10.1) ────────────────────
+  // Proto3 scalars: an older daemon/client decodes these as
+  // false/""/"", the honest "nothing was seeded" reading.
+
+  // True when THIS call downloaded missing local model artifacts before
+  // running the pass (operator-initiated seeding, never a background
+  // auto-repair — auto-repair runs off a reload request this RPC did not
+  // send). Startup itself never seeds; see `EmbeddingStatus.state`.
+  bool model_seeded = 10;
+  // The local artifact cache directory seeded, when `model_seeded` is true.
+  // Empty otherwise, and always empty for an external backend (which has no
+  // local cache to seed).
+  string seeded_cache_dir = 11;
+  // The device the reloaded model actually ran on ("metal" | "cpu" | ""),
+  // when this call triggered a main-thread reload. Empty when the model was
+  // already loaded and no reload was needed.
+  string loaded_device = 12;
+  // The model id downloaded and loaded, when `model_seeded` is true. Empty
+  // otherwise. Lets the CLI name the model in its one-line recovery message
+  // without a second round trip.
+  string seeded_model_id = 13;
 }
 
 // ─── Impact Analysis (Phase 4) ──────────────────────────────────────

@@ -1,15 +1,17 @@
 mod external;
 pub mod local;
 pub mod preprocess;
+mod progress;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 pub use local::{
     ArtifactMode, DenseArtifacts, MissingModelArtifactError, ModelArtifacts,
-    resolve_model_artifacts,
+    resolve_model_artifacts, resolve_model_artifacts_with_progress,
 };
 use nestweaver_schema::EmbeddingPipelineV2;
+pub use progress::ArtifactProgressSink;
 
 /// Requested device-selection policy for the local embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
