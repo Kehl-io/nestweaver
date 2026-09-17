@@ -15292,6 +15292,9 @@ fn dispatch_add_source_via_daemon(
                 vault_name: vault_name.unwrap_or_default(),
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
+                max_note_bytes: current_instance_config()
+                    .map(|config| config.indexing.note_limits().max_note_bytes())
+                    .unwrap_or(0),
             });
             let stream = client
                 .index_vault(req)

@@ -68,6 +68,10 @@ message IndexVaultRequest {
   string vault_name = 2;
   repeated string extra_ignore_patterns = 3;
   string instance_id = 4;
+  // Zero inherits the daemon's `[indexing].max_note_bytes` (or the 1 MiB
+  // compiled default). Non-zero must remain within the daemon's hard safety
+  // bounds — same contract as `IndexRepoRequest.max_source_file_bytes`.
+  uint64 max_note_bytes = 5;
 }
 
 // Incremental vault refresh is a distinct method so an older daemon cannot
@@ -78,6 +82,9 @@ message RefreshVaultSinceRequest {
   repeated string extra_ignore_patterns = 3;
   string instance_id = 4;
   uint64 since_unix_seconds = 5;
+  // Zero inherits the daemon's `[indexing].max_note_bytes`. See
+  // `IndexVaultRequest.max_note_bytes`.
+  uint64 max_note_bytes = 6;
 }
 
 message RefreshBrainRequest {}
@@ -109,6 +116,9 @@ message WatchVaultRequest {
   // here — a self-reported pid could be forged, and asking the kernel covers
   // clients built before this change.
   bool force = 5;
+  // Zero inherits the daemon's `[indexing].max_note_bytes`. See
+  // `IndexVaultRequest.max_note_bytes`.
+  uint64 max_note_bytes = 6;
 }
 
 message WatchVaultResponse {
@@ -576,6 +586,30 @@ message BrainStatusResponse {
   SearchStatus search_status = 18;
   WatcherStatus watcher = 19;
   string supervision = 20;
+  // Notes skipped for exceeding `[indexing].max_note_bytes`. Absence means an
+  // older daemon that cannot report the sidecar; a live daemon always sets
+  // this, including `count: 0`.
+  SkippedNotesStatus skipped_notes = 21;
+  // Indexed notes above 50% of the configured note-size limit. Absence vs
+  // `count: 0` follows `skipped_notes`.
+  NotesNearSizeLimit notes_near_size_limit = 22;
+}
+
+message SkippedNotesStatus {
+  uint32 count = 1;
+  repeated string paths = 2;
+  bool truncated = 3;
+}
+
+message NearLimitNote {
+  string path = 1;
+  uint64 bytes = 2;
+}
+
+message NotesNearSizeLimit {
+  uint32 count = 1;
+  repeated NearLimitNote notes = 2;
+  bool truncated = 3;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
