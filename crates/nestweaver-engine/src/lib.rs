@@ -576,11 +576,11 @@ pub use investigate::{
     load_bundle, load_bundle_store, save_bundle_store,
 };
 pub use manifest::{
-    GraphMutationPublicationDisposition, GraphMutationPublicationGuard,
+    DeadCodeManifests, GraphMutationPublicationDisposition, GraphMutationPublicationGuard,
     GraphMutationPublicationOutcome, GraphMutationPublicationWarning, ManifestInfo,
     begin_graph_mutation_publication, finalize_committed_graph_mutation, load_manifest_cache,
-    load_manifest_cache_for_db, manifest_cache_path, parse_manifest, save_manifest_cache,
-    save_manifest_cache_for_db,
+    load_manifest_cache_for_db, load_manifests_for_dead_code, manifest_cache_path, parse_manifest,
+    save_manifest_cache, save_manifest_cache_for_db,
 };
 pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,

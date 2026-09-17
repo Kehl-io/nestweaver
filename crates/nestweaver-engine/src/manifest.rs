@@ -100,6 +100,76 @@ pub fn load_manifest_cache_for_db(
     .unwrap_or_default())
 }
 
+/// The manifest sidecar as a dead-code run must see it: the payload, plus
+/// whether loading it FAILED.
+///
+/// nw-500. Every dead-code call site loaded manifests with
+/// `load_manifest_cache_for_db(..).unwrap_or_default()`, which collapses two
+/// materially different states into one empty map. Entry files are
+/// reachability ROOTS, so losing them can only move LIVE code onto a list of
+/// symbols to delete — the caller has to be told when that happened.
+///
+/// ABSENT AND CORRUPT ARE DIFFERENT, and the distinction needs no new
+/// plumbing: [`crate::artifact_sidecar::load_json`] already returns `Ok(None)`
+/// for a sidecar that is not there and `Err` for one that is there and cannot
+/// be decoded (wrong envelope, foreign identity, stale generation, unreadable
+/// bytes). `load_manifest_cache_for_db` maps the first to an empty map and
+/// propagates the second. An absent sidecar is the NORMAL state for a graph
+/// with no code repos indexed yet, so it must not raise a disclosure; only a
+/// genuine load failure may.
+#[derive(Debug, Default, Clone)]
+pub struct DeadCodeManifests {
+    /// Parsed manifests keyed by repo UID. Empty when the sidecar is absent
+    /// OR when loading it failed — read `load_error` to tell which.
+    pub manifests: HashMap<String, ManifestInfo>,
+    /// `Some(message)` only when the sidecar EXISTS and could not be loaded.
+    /// `None` covers both a successful load and a legitimately absent
+    /// sidecar, so a healthy graph adds no disclosure at all.
+    pub load_error: Option<String>,
+}
+
+impl DeadCodeManifests {
+    /// The disclosure a caller should attach to its dead-code response, if any.
+    pub fn disclosure(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+}
+
+/// Load the manifest sidecar for a dead-code run on ANY route.
+///
+/// nw-512. The direct CLI path loaded manifests and the MCP `dead_code` tool
+/// did not, so the daemon CLI, MCP-direct and MCP-via-daemon all walked with
+/// an EMPTY manifest map while `nestweaver dead-code --no-daemon` walked with
+/// a populated one — four routes, two answers, same database. This is the one
+/// loader all of them call, so they cannot drift again.
+///
+/// Never returns `Err`: a dead-code run over a graph whose manifest sidecar
+/// cannot be read is still a legitimate (if degraded) answer, and refusing it
+/// outright would be a bigger behaviour change than the silent degradation
+/// this replaces. The failure travels in `load_error` instead — see
+/// [`DeadCodeManifests`].
+pub fn load_manifests_for_dead_code(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> DeadCodeManifests {
+    match load_manifest_cache_for_db(store, db_path) {
+        Ok(manifests) => DeadCodeManifests {
+            manifests,
+            load_error: None,
+        },
+        Err(error) => DeadCodeManifests {
+            manifests: HashMap::new(),
+            load_error: Some(format!(
+                "manifest sidecar {} could not be read ({error:#}); manifest-declared entry \
+                 files did NOT seed the reachability walk, so code reachable only from a \
+                 package entry point is reported as unreachable. Re-index to repair \
+                 (`nestweaver index --force`).",
+                manifest_cache_path(db_path).display()
+            )),
+        },
+    }
+}
+
 /// Publication status for a graph mutation that has already committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphMutationPublicationDisposition {
@@ -1344,6 +1414,80 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             b"previous-valid-sidecar"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// nw-500. `dead-code` loaded manifests with
+    /// `load_manifest_cache_for_db(..).unwrap_or_default()`, which collapses
+    /// two materially different states into one empty map: "no manifests
+    /// indexed yet" and "the manifests are right there and unreadable". The
+    /// second silently drops every manifest-declared entry file from the
+    /// reachability seed, and because entry files are ROOTS the error runs in
+    /// only one direction — live code lands on a list of symbols to delete.
+    ///
+    /// The distinction needed no new mechanism. `artifact_sidecar::load_json`
+    /// already returns `Ok(None)` for an absent sidecar and `Err` for a
+    /// present-but-undecodable one; the caller was throwing that away.
+    #[test]
+    fn a_corrupt_manifest_sidecar_is_disclosed_and_an_absent_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+
+        // ABSENT — the normal state for a graph with no code repos indexed
+        // yet. It must not raise an alarm, or the disclosure cries wolf on
+        // every fresh database and stops being read.
+        let absent = load_manifests_for_dead_code(&store, &db_path);
+        assert!(
+            absent.disclosure().is_none(),
+            "an absent sidecar is normal and must not be disclosed, got {:?}",
+            absent.disclosure()
+        );
+        assert!(absent.manifests.is_empty());
+
+        // PRESENT AND VALID — also no disclosure. This is the counterweight:
+        // a healthy load must add nothing at all.
+        let manifests = HashMap::from([(
+            "repo:canonical".to_string(),
+            ManifestInfo {
+                package_name: Some("pkg".to_string()),
+                dependencies: vec![],
+                entry_files: vec!["index.js".to_string()],
+            },
+        )]);
+        save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
+        let healthy = load_manifests_for_dead_code(&store, &db_path);
+        assert!(
+            healthy.disclosure().is_none(),
+            "a successful load must add no disclosure, got {:?}",
+            healthy.disclosure()
+        );
+        assert_eq!(
+            healthy.manifests["repo:canonical"].entry_files,
+            vec!["index.js".to_string()],
+            "and it must actually carry the payload, or the assertion above \
+             is vacuous"
+        );
+
+        // PRESENT AND CORRUPT — disclosed, with the failure and the path in
+        // the message so the reader can act on it.
+        std::fs::write(manifest_cache_path(&db_path), b"{ not an envelope").unwrap();
+        let corrupt = load_manifests_for_dead_code(&store, &db_path);
+        let disclosure = corrupt
+            .disclosure()
+            .expect("a sidecar that exists and cannot be read must be disclosed");
+        assert!(
+            disclosure.contains(&manifest_cache_path(&db_path).display().to_string()),
+            "the disclosure must name the file that failed: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("entry"),
+            "and must say what was lost — entry files — not merely that \
+             something failed: {disclosure}"
+        );
+        assert!(
+            corrupt.manifests.is_empty(),
+            "the walk still runs, degraded, rather than refusing"
+        );
     }
 
     #[test]

@@ -17,13 +17,13 @@ use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
     SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
     broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
-    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
-    generate_guide_with_tools, generate_skill_with_tools, generate_summaries, get_all_properties,
-    get_last_indexed_at, investigate, investigate_expand, investigate_hydrate, load_alias_sidecar,
-    load_clusters, load_extensions, memory_consolidate, memory_lint, memory_related,
-    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
-    render_text, tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
+    doc_stats, expand_query_with_aliases, filter_by_target, generate_agents_md_with_rules,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
+    generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
+    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
+    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
+    tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
@@ -3477,7 +3477,64 @@ fn response_cache_key(
     // input, so a hit would serve a pre-bump deletion list past the bump.
     // Measured on a build without this salt: `refused` absent and
     // `unreachable_count: 5` on a downgraded database, straight from cache.
-    mix_visibility_cache_key(key, resolver_generation_cache_salt(db_path))
+    let key = mix_visibility_cache_key(key, resolver_generation_cache_salt(db_path));
+    // nw-512/nw-500: the manifest sidecar is an INPUT to `dead_code`'s answer
+    // (its entry files seed the reachability walk) and appeared in no part of
+    // this key. `graph_generation` covers the graph and
+    // `whole_db_scope_digest` covers parsed FILES — a `package.json` is
+    // neither, so it sits in no filemeta slice and moves no counter.
+    //
+    // Measured while building
+    // `daemon_dead_code_discloses_a_failed_manifest_load_on_every_route`:
+    // with the sidecar corrupted under a live daemon, the default route
+    // served the pre-corruption answer straight from cache — `coverage:
+    // "complete"`, no `manifest_load_error` — so the nw-500 disclosure was
+    // computed correctly and then never reached the caller.
+    //
+    // NOT the same gap as nw-498. That one is the watcher advancing the
+    // generation on a manifest edit, which invalidates everything at once;
+    // this is the narrower guarantee that a manifest change nothing bumped
+    // for — an external edit, a restore, a half-written file — still cannot
+    // be served past.
+    mix_visibility_cache_key(key, manifest_sidecar_cache_salt(db_path))
+}
+
+/// Salt folded into every cacheable tool's key so a response cannot outlive
+/// the manifest sidecar it was computed under.
+///
+/// Hashes the sidecar's BYTES rather than its mtime: an atomic replace can
+/// land inside one mtime tick, and the payload is small (one entry per repo)
+/// — `whole_db_scope_digest` already reads and hashes a larger sidecar on
+/// every cacheable call.
+///
+/// An absent sidecar contributes 0, which is the value the key already had
+/// before this salt existed, so entries written for a graph with no manifests
+/// still hit and nothing regresses for the common case. An UNREADABLE sidecar
+/// is deliberately NOT folded in as 0: that is the nw-500 degradation, and
+/// giving it the same salt as "absent" would let a healthy pre-corruption
+/// answer be served past the corruption — the exact defect this closes.
+fn manifest_sidecar_cache_salt(db_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let path = nestweaver_engine::manifest_cache_path(db_path);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            "manifest_sidecar".hash(&mut hasher);
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            // Cannot tell what the inputs were. Fall back to a salt derived
+            // from the error kind, which is stable for a stable condition
+            // (so caching still works while a permission problem persists)
+            // and differs from both "absent" and any successful read.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            "manifest_sidecar_unreadable".hash(&mut hasher);
+            format!("{:?}", error.kind()).hash(&mut hasher);
+            hasher.finish()
+        }
+    }
 }
 
 /// Salt folded into every cacheable tool's key so a response cannot outlive
@@ -12677,7 +12734,38 @@ fn tool_dead_code(
         RESULT_LIMIT_MAX,
     )?;
 
-    let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
+    // nw-512: load the manifest sidecar so the reachability walk is seeded
+    // from manifest-declared entry files, through the ONE loader
+    // `src/main.rs`'s `Commands::DeadCode` also calls.
+    //
+    // THE MANIFEST SIDECAR NEVER REACHED THIS TOOL. It ran
+    // `detect_dead_code_cancellable`, which hard-codes an empty manifest map,
+    // so every route that ends up here — the default CLI (the daemon prints
+    // what this tool returns), MCP direct and MCP-via-daemon — walked with NO
+    // manifest-declared entry files at all. `main`/`bin`/`exports`/`browser`
+    // entries are reachability ROOTS, so their absence does not merely change
+    // the answer, it makes it WRONG in one direction: code reachable only
+    // from a package entry point was reported as dead.
+    //
+    // Reproduced on 10.0.3 against a fixture whose
+    // `packages/glue/package.json` declares `"main": "glue_entry.js"`: the
+    // default route reported `glueInit` unreachable, over a database whose
+    // sidecar named that file as an entry point.
+    //
+    // `current_db_path` failing is not a manifest failure: it is the
+    // in-process test configuration where no server ever set a path. There is
+    // no sidecar to read and nothing to disclose, so it degrades to the empty
+    // map silently — the same non-event as an absent sidecar (nw-500).
+    let manifests = match current_db_path(store) {
+        Ok(db_path) => nestweaver_engine::load_manifests_for_dead_code(store, &db_path),
+        Err(_) => nestweaver_engine::DeadCodeManifests::default(),
+    };
+    let result = nestweaver_engine::detect_dead_code_with_manifests_cancellable(
+        store,
+        &manifests.manifests,
+        cancel,
+    )
+    .context("detect_dead_code")?;
 
     let total_unreachable = result.unreachable_symbols.len();
     let all_matching: Vec<_> = result
@@ -12708,7 +12796,7 @@ fn tool_dead_code(
         })
         .collect();
 
-    Ok(json!({
+    let mut payload = json!({
         "total_symbols": result.total_symbols,
         "reachable_symbols": result.reachable_symbols,
         "unreachable_count": total_unreachable,
@@ -12722,7 +12810,22 @@ fn tool_dead_code(
         // cannot decode (nw-335) rather than losing the corpus, so `coverage`
         // says whether it actually saw everything — without it, "N of M" over a
         // silently-shortened corpus reads as exact.
-        "coverage": if result.coverage_is_complete() { "complete" } else { "degraded" },
+        //
+        // nw-500 folds a failed manifest load into the SAME field rather than
+        // inventing a parallel one. It is the same class of defect this field
+        // already exists for: the walk did not see everything it needed, and
+        // here what it lost is SEED points, so the error runs in the one
+        // direction that puts live code on a list of symbols to delete. Every
+        // consumer already branching on `coverage` therefore catches it with
+        // no new key to learn — and `manifest_load_error` below names WHICH
+        // degradation occurred, exactly as nw-435 added
+        // `languages_without_entry_points` beside `undecodable_symbols`
+        // because `coverage` alone cannot distinguish them.
+        "coverage": if result.coverage_is_complete() && manifests.load_error.is_none() {
+            "complete"
+        } else {
+            "degraded"
+        },
         "undecodable_symbols": result.undecodable_symbols,
         // nw-351: a reachability BFS with no seed visits nothing, so every
         // symbol falls out unreachable and `dead_percentage` reads 100. That
@@ -12739,7 +12842,18 @@ fn tool_dead_code(
         "languages_without_entry_points": result.languages_without_entry_points,
         "min_confidence": min_conf_str,
         "unreachable_symbols": filtered,
-    }))
+    });
+    // nw-500: a manifest sidecar that EXISTS and cannot be read is a silent
+    // downgrade of this answer — entry files are reachability roots, so
+    // losing them moves live code onto a list of symbols to delete. Disclose
+    // it, and ONLY it: an absent sidecar (the normal state for a graph with
+    // no code repos) and a clean load both leave `load_error` at `None`, so
+    // this key never appears and a healthy response is byte-for-byte its
+    // pre-nw-500 shape.
+    if let Some(disclosure) = manifests.disclosure() {
+        payload["manifest_load_error"] = json!(disclosure);
+    }
+    Ok(payload)
 }
 
 // ── 19. hub_nodes ─────────────────────────────────────────────────────────
@@ -25418,5 +25532,70 @@ mod deadline_cache_tests {
             "detect_changes",
             &json!({"deadline_exceeded":false,"status":"complete"})
         ));
+    }
+}
+
+#[cfg(test)]
+mod manifest_sidecar_cache_salt_tests {
+    use super::*;
+
+    /// nw-512/nw-500. The manifest sidecar seeds `dead_code`'s reachability
+    /// walk and was in no part of the response-cache key: `graph_generation`
+    /// covers the graph and `whole_db_scope_digest` covers parsed FILES, and
+    /// a `package.json` is neither. So an edited or corrupted sidecar could
+    /// be served straight past — measured on a live daemon while building
+    /// `daemon_dead_code_discloses_a_failed_manifest_load_on_every_route`,
+    /// which got `coverage: "complete"` and no disclosure from cache over an
+    /// already-corrupted sidecar.
+    #[test]
+    fn a_changed_manifest_sidecar_changes_the_salt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let sidecar = nestweaver_engine::manifest_cache_path(&db_path);
+
+        // ABSENT contributes 0 — the value the key already had before this
+        // salt existed, so entries written for a graph with no manifests
+        // still hit and nothing regresses for the common case.
+        assert_eq!(
+            manifest_sidecar_cache_salt(&db_path),
+            0,
+            "an absent sidecar must contribute nothing, or every pre-existing \
+             cache entry misses once on upgrade for no reason"
+        );
+
+        std::fs::write(&sidecar, br#"{"repo:a":{"entry_files":["index.js"]}}"#).unwrap();
+        let first = manifest_sidecar_cache_salt(&db_path);
+        assert_ne!(
+            first, 0,
+            "a present sidecar must be distinguishable from an absent one"
+        );
+
+        // COUNTERWEIGHT: an UNCHANGED sidecar keeps the same salt. This salt
+        // must not become a cache-buster — re-reading it on every cacheable
+        // call is only affordable because identical bytes keep hitting.
+        assert_eq!(
+            manifest_sidecar_cache_salt(&db_path),
+            first,
+            "an unchanged sidecar must keep its salt, or this salt silently \
+             disables the response cache"
+        );
+
+        // A changed entry-file set changes the answer, so it must change the
+        // key.
+        std::fs::write(&sidecar, br#"{"repo:a":{"entry_files":["other.js"]}}"#).unwrap();
+        assert_ne!(
+            manifest_sidecar_cache_salt(&db_path),
+            first,
+            "editing the entry files changes which symbols are reachable; a \
+             hit here serves a pre-edit deletion list"
+        );
+
+        // And an unreadable sidecar is NOT folded in as 0: that is the nw-500
+        // degradation, and sharing "absent"'s salt would let the healthy
+        // pre-corruption answer be served past the corruption.
+        std::fs::write(&sidecar, b"{ not an envelope").unwrap();
+        let corrupt = manifest_sidecar_cache_salt(&db_path);
+        assert_ne!(corrupt, 0);
+        assert_ne!(corrupt, first);
     }
 }
