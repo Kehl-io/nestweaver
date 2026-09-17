@@ -11244,7 +11244,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff\n- `stale_repos` on THIS tool is behind-HEAD git URLs (matching `any_stale`/`is_stale`) — a different population from the SAME-NAMED `stale_repos` on `hub_nodes`/`bridge_nodes` (generation-mismatch repo UIDs) or `blast_radius`'s `_meta.stale_repos` (federation lag). This tool's OWN generation-stale set is the differently-named `resolver_stale_repos` above, precisely to avoid deepening that collision (nw-371)",
+        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `no_indexable_content` — the index finished successfully and nothing was eligible (does not set `needs_reindex`)\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff\n- `stale_repos` on THIS tool is behind-HEAD git URLs (matching `any_stale`/`is_stale`) — a different population from the SAME-NAMED `stale_repos` on `hub_nodes`/`bridge_nodes` (generation-mismatch repo UIDs) or `blast_radius`'s `_meta.stale_repos` (federation lag). This tool's OWN generation-stale set is the differently-named `resolver_stale_repos` above, precisely to avoid deepening that collision (nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11350,9 +11350,15 @@ fn tool_stale_check(
         // (interrupted index) compares equal to HEAD yet serves an empty graph.
         // That is NOT staleness — it is incompleteness — but it needs the same
         // remedy, which is what `needs_reindex` expresses.
+        //
+        // A finished index with zero eligible files records the eligibility
+        // policy; that is `no_indexable_content`, not incomplete.
         let content_missing = store
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
+        let empty_complete = store
+            .repo_index_empty_complete(repo)
+            .map_err(|e| anyhow!("repo_index_empty_complete: {e}"))?;
 
         // nw-370: `outdated_resolver` sits BELOW the three git-derived states
         // deliberately. A repo that is `missing`, `incomplete` or behind HEAD
@@ -11365,6 +11371,8 @@ fn tool_stale_check(
             "missing"
         } else if content_missing {
             "incomplete"
+        } else if empty_complete {
+            "no_indexable_content"
         } else if is_stale {
             "stale"
         } else if repo_resolver_stale {
@@ -11373,12 +11381,13 @@ fn tool_stale_check(
             "ok"
         };
         // The ACTIONABLE union, and the only thing a CI gate should key on:
-        // every non-`ok` status is fixed by re-indexing. nw-370: this line is
-        // unchanged and now covers the fourth rung too, which is the point of
-        // adding the rung to `status` rather than beside it — an existing CI
-        // gate on `any_needs_reindex` (or on exit 2) catches the 9.0.0
-        // migration with no edit.
-        let needs_reindex = status != "ok";
+        // every non-`ok` status is fixed by re-indexing — except
+        // `no_indexable_content`, which already finished successfully with
+        // nothing eligible. nw-370: this line covers the fourth rung too,
+        // which is the point of adding the rung to `status` rather than
+        // beside it — an existing CI gate on `any_needs_reindex` (or on exit
+        // 2) catches the 9.0.0 migration with no edit.
+        let needs_reindex = status != "ok" && status != "no_indexable_content";
 
         if is_stale {
             any_stale = true;
@@ -22364,6 +22373,42 @@ mod stale_check_tool_tests {
         assert_eq!(healed["any_stale"], false, "{healed}");
         assert_eq!(healed["any_needs_reindex"], false, "{healed}");
         assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
+    }
+
+    /// A finished index with zero eligible files records SHA plus eligibility
+    /// policy. That must not pin `stale-check` at exit 2 forever.
+    #[test]
+    fn stale_check_finished_empty_index_is_not_incomplete() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:static-site".to_string(),
+                url: format!("file://{root}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.clone()),
+            })
+            .expect("insert repo");
+        store
+            .set_repo_index_policy("repo:static-site", "eligibility-v1:no-source")
+            .expect("record finished-empty eligibility");
+
+        let result = tool_stale_check(&store, None).expect("stale check");
+        let repo = &result["repos"][0];
+        assert_eq!(repo["status"], "no_indexable_content", "{result}");
+        assert_eq!(repo["needs_reindex"], false, "{result}");
+        assert_eq!(result["any_needs_reindex"], false, "{result}");
+        assert_eq!(result["any_stale"], false, "{result}");
+        assert!(
+            result["needs_reindex_repos"]
+                .as_array()
+                .is_some_and(|urls| urls.is_empty()),
+            "empty-complete must not appear in the gate list: {result}"
+        );
     }
 
     /// A server-mode vault Repo row carries the SHA while its content lives in
