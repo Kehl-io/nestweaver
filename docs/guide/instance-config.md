@@ -641,17 +641,21 @@ compile, write seconds into a valid v3 cache, and silently keep the bug.
 ### `[indexing]` (optional)
 
 Source code and Markdown notes have independent size policies. Source files
-default to 2 MiB and can be raised for repositories with unusually large,
-legitimate files:
+default to 2 MiB; notes default to 1 MiB. Either ceiling can be raised for
+unusually large, legitimate files:
 
 ```toml
 [indexing]
 max_source_file_bytes = 8388608 # 8 MiB
+max_note_bytes = 2097152        # 2 MiB
 ```
 
-The accepted range is 1 KiB through a fixed 64 MiB safety ceiling; invalid
-values fail config loading rather than being clamped. Markdown notes retain
-their separate 1 MiB policy. Every policy skip is reported by `nestweaver
+The accepted range for both keys is 1 KiB through a fixed 64 MiB safety
+ceiling; invalid values fail config loading rather than being clamped.
+Notes above **50%** of `max_note_bytes` are listed on `brain status` and
+`brain refresh` (`notes_near_size_limit`) so a growing note is visible
+before it drops out of the graph. Notes above the limit are skipped and
+disclosed as `skipped_notes`. Every policy skip is reported by `nestweaver
 index`; use `--json` for a typed terminal result or `--fail-on-skip` when CI
 must reject degraded coverage.
 

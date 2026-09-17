@@ -290,6 +290,8 @@ pub struct InstanceConfig {
 pub struct SourceIndexingConfig {
     #[serde(default = "default_max_source_file_bytes")]
     pub max_source_file_bytes: u64,
+    #[serde(default = "default_max_note_bytes")]
+    pub max_note_bytes: u64,
     /// Keep the regex trigram pre-filter fresh as part of indexing.
     ///
     /// `regex-search` uses a trigram posting table when one exists and falls
@@ -355,10 +357,15 @@ fn default_max_source_file_bytes() -> u64 {
     crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES
 }
 
+fn default_max_note_bytes() -> u64 {
+    crate::index_limits::DEFAULT_MAX_NOTE_BYTES
+}
+
 impl Default for SourceIndexingConfig {
     fn default() -> Self {
         Self {
             max_source_file_bytes: default_max_source_file_bytes(),
+            max_note_bytes: default_max_note_bytes(),
             with_trigrams: false,
             trigram_reconcile_interval: default_trigram_reconcile_interval(),
         }
@@ -379,10 +386,13 @@ impl SourceIndexingConfig {
     }
 
     pub fn limits(&self) -> crate::index_limits::IndexLimits {
-        // InstanceConfig validates this during construction, so downstream
-        // code never has to handle an invalid value.
         crate::index_limits::IndexLimits::new(self.max_source_file_bytes)
             .expect("validated source indexing limit")
+    }
+
+    pub fn note_limits(&self) -> crate::index_limits::NoteLimits {
+        crate::index_limits::NoteLimits::new(self.max_note_bytes)
+            .expect("validated note indexing limit")
     }
 }
 
@@ -1177,6 +1187,7 @@ impl InstanceConfig {
             config.expected_brain_uuid = Some(parsed.to_string());
         }
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
+        crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
         if let Some(limit) = config.limits.default_result_limit
             && !(1..=1000).contains(&limit)
         {
@@ -1727,6 +1738,29 @@ url = "https://github.com/example/repo"
             ))
             .unwrap_err();
             assert!(error.to_string().contains("max_source_file_bytes"));
+        }
+    }
+
+    #[test]
+    fn max_note_bytes_config_is_validated_like_source_bytes() {
+        let default = InstanceConfig::from_toml_str(MINIMAL_TOML).unwrap();
+        assert_eq!(
+            default.indexing.max_note_bytes,
+            crate::index_limits::DEFAULT_MAX_NOTE_BYTES
+        );
+
+        let configured = InstanceConfig::from_toml_str(&format!(
+            "{MINIMAL_TOML}\n[indexing]\nmax_note_bytes = 4096\n"
+        ))
+        .unwrap();
+        assert_eq!(configured.indexing.max_note_bytes, 4096);
+
+        for invalid in [0, 512, crate::index_limits::HARD_MAX_NOTE_BYTES + 1] {
+            let error = InstanceConfig::from_toml_str(&format!(
+                "{MINIMAL_TOML}\n[indexing]\nmax_note_bytes = {invalid}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("max_note_bytes"));
         }
     }
 
