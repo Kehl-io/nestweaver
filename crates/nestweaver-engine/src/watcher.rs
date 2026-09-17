@@ -146,6 +146,9 @@ pub struct BrainWatcher {
     /// Compiled `.brainignore` glob patterns. Loaded once at construction
     /// from the vault root's `.brainignore` file (or built-in defaults).
     ignore_set: GlobSet,
+    /// `[indexing].max_note_bytes`. Defaults to 1 MiB so tests and unconfigured
+    /// watchers match the markdown indexer.
+    note_limits: crate::index_limits::NoteLimits,
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
@@ -263,6 +266,7 @@ impl BrainWatcher {
             manifests_path: None,
             debounce_ms: 200,
             ignore_set,
+            note_limits: crate::index_limits::NoteLimits::default(),
             external_tantivy: None,
             mutation_lease_factory: None,
             ready_callback: None,
@@ -279,6 +283,12 @@ impl BrainWatcher {
     /// behind until `brain reindex-search`).
     pub fn with_tantivy_index(mut self, path: impl Into<PathBuf>) -> Self {
         self.tantivy_path = Some(path.into());
+        self
+    }
+
+    /// Apply the configured markdown-note size limit to watched vault reads.
+    pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
+        self.note_limits = limits;
         self
     }
 
@@ -741,6 +751,7 @@ impl BrainWatcher {
                 &self.vault_name,
                 &graph_paths,
                 &self.ignore_set,
+                self.note_limits,
                 &|| self.try_acquire_batch_lease(true, "watch_vault_batch"),
             )?;
             phase_timings.refresh_watched_paths_ms =

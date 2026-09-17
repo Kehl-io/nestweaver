@@ -6202,7 +6202,14 @@ impl NestWeaverDaemon for DaemonService {
         let mut watcher =
             nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
                 .with_manifests_path(&manifests_path)
-                .with_extra_ignore_patterns(&extra_patterns);
+                .with_extra_ignore_patterns(&extra_patterns)
+                .with_note_limits(
+                    self.state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|config| config.indexing.note_limits())
+                        .unwrap_or_default(),
+                );
 
         // Share the daemon's writer-mode Tantivy handle with the watcher
         // so live edits update BM25 in place. Opening a separate handle
@@ -7392,13 +7399,18 @@ impl NestWeaverDaemon for DaemonService {
             };
 
             let index_result =
-                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count(
+                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count_and_note_limits(
                     &state.store,
                     &vault_path,
                     &state.db_path,
                     &instance_id,
                     &vault_name,
                     &extra_patterns,
+                    state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|config| config.indexing.note_limits())
+                        .unwrap_or_default(),
                 );
 
             match index_result {
@@ -7574,13 +7586,18 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore(
+            match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
                 &state.store,
                 &vault_path,
                 &instance_id,
                 &vault_name,
                 since,
                 &extra_patterns,
+                state
+                    .instance_cfg
+                    .as_ref()
+                    .map(|config| config.indexing.note_limits())
+                    .unwrap_or_default(),
             ) {
                 Ok(result) => {
                     let mutation = indexed_search_mutation(

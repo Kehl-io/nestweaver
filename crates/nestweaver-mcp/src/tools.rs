@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source and set_extension write directly using
 // these primitives; in daemon builds those writes route through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_markdown_directory, save_extensions, set_property};
+use nestweaver_engine::{index_markdown_directory_with_note_limits, save_extensions, set_property};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -8974,8 +8974,17 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             // server's open handle and the indexer's open handle are two
             // connections to the same DB.
             let db_path = current_db_path(store)?;
-            let result = index_markdown_directory(path, &db_path, "default", &name)
-                .context("index vault")?;
+            let note_limits = current_instance_config()
+                .map(|config| config.indexing.note_limits())
+                .unwrap_or_default();
+            let result = index_markdown_directory_with_note_limits(
+                path,
+                &db_path,
+                "default",
+                &name,
+                note_limits,
+            )
+            .context("index vault")?;
             // Record the indexer run timestamp for this vault.
             if let Err(e) = nestweaver_engine::record_last_indexed_at(&db_path, &result.vault_uid) {
                 tracing::warn!("failed to record last_indexed_at: {e}");

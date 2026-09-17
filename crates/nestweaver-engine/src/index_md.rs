@@ -234,6 +234,7 @@ fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
 /// `[indexing].max_note_bytes` can raise or lower it. Multi-MB markdown
 /// is almost always machine-generated (pasted logs, exported data dumps)
 /// and parsing them takes seconds while tanking ranking quality.
+#[allow(dead_code)] // default policy; tests and watcher fixtures still pin to it
 pub(crate) const MAX_NOTE_SIZE_BYTES: u64 = crate::index_limits::DEFAULT_MAX_NOTE_BYTES;
 
 /// Versioned sidecar written next to the graph: `<db>.skipped_notes.json`.
@@ -274,10 +275,16 @@ impl Default for SkippedNotesSidecar {
     }
 }
 
-fn note_reader_limits() -> crate::index_limits::IndexLimits {
-    crate::index_limits::NoteLimits::new(MAX_NOTE_SIZE_BYTES)
-        .expect("default note size policy is within bounds")
-        .as_index_limits()
+fn note_reader_limits(limits: crate::index_limits::NoteLimits) -> crate::index_limits::IndexLimits {
+    limits.as_index_limits()
+}
+
+fn filesystem_note_reader(
+    root: &Path,
+    limits: crate::index_limits::NoteLimits,
+) -> crate::content_reader::FilesystemReader {
+    crate::content_reader::FilesystemReader::with_limits(root, note_reader_limits(limits))
+        .with_skip_dirs(SKIP_DIRS)
 }
 
 fn cap_sidecar_list<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
@@ -425,7 +432,31 @@ pub fn index_markdown_directory(
     instance_id: &str,
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    index_markdown_directory_with_ignore(vault_root, db_path, instance_id, vault_name, &[])
+    index_markdown_directory_with_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        crate::index_limits::NoteLimits::default(),
+    )
+}
+
+/// Like [`index_markdown_directory`] with a caller-supplied note-size policy.
+pub fn index_markdown_directory_with_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        &[],
+        note_limits,
+    )
 }
 
 /// Like [`index_markdown_directory`] but with additional ignore patterns from
@@ -437,12 +468,33 @@ pub fn index_markdown_directory_with_ignore(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    index_markdown_directory_with_ignore_and_deletion_count(
+    index_markdown_directory_with_ignore_and_note_limits(
         vault_root,
         db_path,
         instance_id,
         vault_name,
         extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+    )
+}
+
+/// Like [`index_markdown_directory_with_ignore`] with a caller-supplied
+/// note-size policy (`[indexing].max_note_bytes`).
+pub fn index_markdown_directory_with_ignore_and_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        note_limits,
     )
     .map(|result| result.index)
 }
@@ -457,12 +509,35 @@ pub fn index_markdown_directory_with_ignore_and_write_lease(
     extra_ignore_patterns: &[String],
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+    index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
         vault_root,
         db_path,
         instance_id,
         vault_name,
         extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+        authority,
+    )
+}
+
+/// Like [`index_markdown_directory_with_ignore_and_write_lease`] with a
+/// caller-supplied note-size policy.
+pub fn index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        note_limits,
         authority,
     )
     .map(|result| result.index)
@@ -477,18 +552,39 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+    )
+}
+
+/// Like [`index_markdown_directory_with_ignore_and_deletion_count`] with a
+/// caller-supplied note-size policy.
+pub fn index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
         anyhow::anyhow!(
             "cannot index markdown database {}: {error:?}",
             db_path.display()
         )
     })?;
-    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
         vault_root,
         db_path,
         instance_id,
         vault_name,
         extra_ignore_patterns,
+        note_limits,
         &authority,
     )
 }
@@ -503,15 +599,38 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
     extra_ignore_patterns: &[String],
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+        authority,
+    )
+}
+
+/// Full markdown indexing under an exact writer authority with a
+/// caller-supplied note-size policy.
+pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    index_markdown_directory_with_store_and_deletion_count(
+    index_markdown_directory_with_store_and_deletion_count_and_note_limits(
         &store,
         vault_root,
         db_path,
         instance_id,
         vault_name,
         extra_ignore_patterns,
+        note_limits,
     )
 }
 
@@ -545,15 +664,35 @@ pub fn index_markdown_directory_with_store_and_deletion_count(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    index_markdown_directory_with_store_and_deletion_count_and_note_limits(
+        store,
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+    )
+}
+
+/// Like [`index_markdown_directory_with_store_and_deletion_count`] with a
+/// caller-supplied note-size policy.
+pub fn index_markdown_directory_with_store_and_deletion_count_and_note_limits(
+    store: &GraphStore,
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     // nw-436: this reader's prune list is the VAULT one, not the code default
     // `FilesystemReader::with_limits` used to leave in place — see
     // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
-    let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
-            .with_skip_dirs(SKIP_DIRS);
+    let reader = filesystem_note_reader(&canonical, note_limits);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
@@ -606,9 +745,7 @@ pub fn index_markdown_directory_in_memory(
     // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
-    let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
-            .with_skip_dirs(SKIP_DIRS);
+    let reader = filesystem_note_reader(&canonical, crate::index_limits::NoteLimits::default());
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
     let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result.index, store))
@@ -801,15 +938,40 @@ pub fn index_markdown_directory_since_with_ignore_and_write_lease(
     extra_ignore_patterns: &[String],
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
+    index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        since,
+        extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+        authority,
+    )
+}
+
+/// Incremental markdown indexing under an exact writer authority with a
+/// caller-supplied note-size policy.
+pub fn index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
     let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    index_markdown_directory_since_with_store_and_ignore(
+    index_markdown_directory_since_with_store_and_ignore_and_note_limits(
         &store,
         vault_root,
         instance_id,
         vault_name,
         since,
         extra_ignore_patterns,
+        note_limits,
     )
 }
 
@@ -824,15 +986,34 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     since: std::time::SystemTime,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
+    index_markdown_directory_since_with_store_and_ignore_and_note_limits(
+        store,
+        vault_root,
+        instance_id,
+        vault_name,
+        since,
+        extra_ignore_patterns,
+        crate::index_limits::NoteLimits::default(),
+    )
+}
+
+/// Daemon-owned incremental refresh with a caller-supplied note-size policy.
+pub fn index_markdown_directory_since_with_store_and_ignore_and_note_limits(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     // nw-436: this reader's prune list is the VAULT one, not the code default
     // `FilesystemReader::with_limits` used to leave in place — see
     // `Self::with_skip_dirs`'s doc comment. Without this, `.claude/skills/*.md`
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
-    let reader =
-        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits())
-            .with_skip_dirs(SKIP_DIRS);
+    let reader = filesystem_note_reader(&canonical, note_limits);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
@@ -882,6 +1063,7 @@ pub(crate) fn refresh_watched_paths(
     vault_name: &str,
     paths: &[PathBuf],
     ignore_set: &GlobSet,
+    note_limits: crate::index_limits::NoteLimits,
     lease: &WatchLeaseAcquirer<'_>,
 ) -> Result<(), anyhow::Error> {
     let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
@@ -915,11 +1097,7 @@ pub(crate) fn refresh_watched_paths(
         }
     }
     let reader = WatchedNoteReader {
-        filesystem: crate::content_reader::FilesystemReader::with_limits(
-            vault_root,
-            note_reader_limits(),
-        )
-        .with_skip_dirs(SKIP_DIRS),
+        filesystem: filesystem_note_reader(vault_root, note_limits),
         files: files.into_iter().collect(),
         changed,
     };
@@ -4950,6 +5128,35 @@ sub b body
             Some(MAX_NOTE_SIZE_BYTES + 1)
         );
         assert_eq!(result.skipped[0].limit_bytes, Some(MAX_NOTE_SIZE_BYTES));
+    }
+
+    #[test]
+    fn filesystem_index_honors_configured_note_size_limit() {
+        let limit = 4096u64;
+        let note_limits = crate::index_limits::NoteLimits::new(limit).unwrap();
+        let keep = "# Keep\n\nsmall\n";
+        let too_big = format!("# Big\n\n{}", "x".repeat(limit as usize));
+        let (_dir, root) = make_vault(&[("keep.md", keep), ("big.md", too_big.as_str())]);
+        let db_path = root.join("scratch.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count_and_note_limits(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+            note_limits,
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 1);
+        assert_eq!(result.index.skipped.len(), 1);
+        assert_eq!(result.index.skipped[0].path, "big.md");
+        assert_eq!(result.index.skipped[0].limit_bytes, Some(limit));
+        assert_eq!(
+            result.index.skipped[0].reason_code,
+            SkipReasonCode::Oversized
+        );
     }
 
     #[test]

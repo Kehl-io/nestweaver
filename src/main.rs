@@ -101,13 +101,14 @@ use nestweaver_engine::{
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
     filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_summaries,
-    get_last_indexed_at, index_markdown_directory_since_with_ignore_and_write_lease,
-    index_markdown_directory_with_ignore,
-    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease,
-    index_markdown_directory_with_ignore_and_write_lease, list_repos, list_services,
-    load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at, render_text,
-    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
-    truncate_to_budget,
+    get_last_indexed_at,
+    index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
+    index_markdown_directory_with_ignore_and_note_limits,
+    index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
+    list_services, load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at,
+    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
+    suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -9474,6 +9475,18 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
             None
         }
     }
+}
+
+fn note_limits_from_config(
+    config: Option<&Path>,
+) -> anyhow::Result<nestweaver_engine::index_limits::NoteLimits> {
+    Ok(match config {
+        Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
+            .with_context(|| format!("failed to load config from {}", path.display()))?
+            .indexing
+            .note_limits(),
+        None => nestweaver_engine::index_limits::NoteLimits::default(),
+    })
 }
 
 /// Resolve the instance id for a command using the nw-019 precedence:
@@ -25734,6 +25747,7 @@ fn run_brain(
             ));
 
             let extra_patterns = parse_ignore_flag(&ignore);
+            let note_limits = note_limits_from_config(config.as_deref())?;
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
@@ -25798,12 +25812,13 @@ fn run_brain(
             // the Tantivy index; neither checked for a live daemon holding the
             // same database.
             let write_lease = require_exclusive_store_access(&db_path, "add a vault")?;
-            let result = index_markdown_directory_with_ignore_and_write_lease(
+            let result = index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
                 &path,
                 &db_path,
                 instance_id,
                 &vault_name,
                 &extra_patterns,
+                note_limits,
                 &write_lease,
             )
             .context("index_markdown_directory")?;
@@ -26061,6 +26076,47 @@ fn run_brain(
                     println!("  Tags:      {}", count("tags"));
                     println!("  Wikilinks: {}", count("wikilinks"));
                     println!("  Repos:     {}", count("repo_count"));
+                    if let Some(skipped) = value.get("skipped_notes") {
+                        let skipped_count =
+                            skipped.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if skipped_count > 0 {
+                            println!("  Skipped notes: {skipped_count}");
+                            if let Some(paths) = skipped.get("paths").and_then(|v| v.as_array()) {
+                                for path in paths.iter().filter_map(|p| p.as_str()) {
+                                    println!("    - {path}");
+                                }
+                            }
+                            if skipped
+                                .get("truncated")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                println!("    (list truncated)");
+                            }
+                        }
+                    }
+                    if let Some(near) = value.get("notes_near_size_limit") {
+                        let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if near_count > 0 {
+                            println!("  Notes approaching size limit: {near_count}");
+                            if let Some(notes) = near.get("notes").and_then(|v| v.as_array()) {
+                                for note in notes {
+                                    let path =
+                                        note.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let bytes =
+                                        note.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    println!("    - {path} ({bytes} bytes)");
+                                }
+                            }
+                            if near
+                                .get("truncated")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                println!("    (list truncated)");
+                            }
+                        }
+                    }
                     // And name what failed, so the reader is not left to infer
                     // it from which rows say "unavailable".
                     if let Some(unavailable) = value.get("unavailable").and_then(|v| v.as_array())
@@ -26793,6 +26849,10 @@ fn run_brain(
             // brain refresh, top-level index, and top-level watch.
             let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_cfg = load_instance_config_opt(config.as_deref());
+            let note_limits = instance_cfg
+                .as_ref()
+                .map(|c| c.indexing.note_limits())
+                .unwrap_or_default();
 
             // nw-273: same refusal as `watch` — see the comment there for why
             // this is refused rather than restored in-process.
@@ -26881,6 +26941,7 @@ fn run_brain(
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
+                .with_note_limits(note_limits)
                 .with_debounce_ms(watch_cfg.debounce_ms);
             let stop = watcher.shutdown_handle();
 
@@ -27020,6 +27081,7 @@ fn run_brain(
             });
             let extra_patterns = parse_ignore_flag(&ignore);
             let canonical = abs_for_daemon(&path);
+            let note_limits = note_limits_from_config(config.as_deref())?;
             // Parse before registration discovery: an invalid timestamp must
             // not autostart a daemon or touch graph/runtime state.
             let since_time = since
@@ -27188,16 +27250,18 @@ fn run_brain(
                 // Incremental refresh: only re-index files modified since the
                 // given timestamp.
                 let since_time = since_time.expect("parsed above when --since is present");
-                let result = index_markdown_directory_since_with_ignore_and_write_lease(
-                    &path,
-                    &db_path,
-                    &instance_id,
-                    &vault_name,
-                    since_time,
-                    &extra_patterns,
-                    &write_lease,
-                )
-                .context("index_markdown_directory_since")?;
+                let result =
+                    index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits(
+                        &path,
+                        &db_path,
+                        &instance_id,
+                        &vault_name,
+                        since_time,
+                        &extra_patterns,
+                        note_limits,
+                        &write_lease,
+                    )
+                    .context("index_markdown_directory_since")?;
                 require_complete_graph_publication(
                     "incremental vault refresh",
                     &result.publication,
@@ -27230,12 +27294,13 @@ fn run_brain(
                 // failed cascade/write propagates and cannot be reported as a
                 // successful dropped note.
                 let result =
-                    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+                    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
                         &path,
                         &db_path,
                         &instance_id,
                         &vault_name,
                         &extra_patterns,
+                        note_limits,
                         &write_lease,
                     )
                     .context("index_markdown_directory")?;
@@ -36522,12 +36587,13 @@ fn run_publication_rebuild(
                             total,
                             format!("indexing vault {}", vault.name),
                         )?;
-                        index_markdown_directory_with_ignore(
+                        index_markdown_directory_with_ignore_and_note_limits(
                             Path::new(&vault.root_path),
                             &target_db,
                             &vault.instance_id,
                             &vault.name,
                             &[],
+                            config.indexing.note_limits(),
                         )?;
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
