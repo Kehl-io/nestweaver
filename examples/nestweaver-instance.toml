@@ -164,10 +164,11 @@ components = ["device-onboarding", "user-auth"]
 stoplist_extend = ["Platform", "Service", "Manager"]
 min_symbol_name_length = 4
 
-# Source-code parser safety limit. Markdown notes keep their independent 1 MiB
-# policy. Values must be between 1 KiB and the fixed 64 MiB hard ceiling.
+# Source-code parser safety limit (2 MiB default) and markdown note ceiling
+# (1 MiB default). Values must be between 1 KiB and the fixed 64 MiB hard ceiling.
 [indexing]
 max_source_file_bytes = 2097152
+# max_note_bytes = 1048576
 
 # ── MCP servers (for wiki source ingestion) ──────────────────────────────
 #

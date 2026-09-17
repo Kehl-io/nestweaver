@@ -1604,22 +1604,75 @@ mod tests {
         assert_eq!(store.count_wikilink_edges().unwrap(), 1);
         assert_eq!(callbacks.load(Ordering::SeqCst), 0);
         assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
-        // Restore the affected source and make the indexed target oversized.
-        // The same fail-before-delete contract applies to policy refusals.
+        // Restore the affected source so a later batch can succeed. Policy
+        // skips for oversized notes are covered by
+        // `watcher_discloses_note_grown_past_limit_without_failing_the_batch`.
         fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta]]\n").unwrap();
+    }
+
+    #[test]
+    fn watcher_records_new_oversized_note_as_skipped() {
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let huge = root.join("huge.md");
+        fs::write(
+            &huge,
+            vec![b'x'; crate::index_md::MAX_NOTE_SIZE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![huge], &None)
+            .unwrap();
+        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        assert!(
+            sidecar.skipped.iter().any(|file| file.path == "huge.md"),
+            "new oversized note must land in the sidecar: {sidecar:?}"
+        );
+        let notes = store.list_notes(Some(&v_uid)).unwrap();
+        assert!(
+            notes.iter().all(|note| note.file_path != "huge.md"),
+            "oversized note must not be indexed: {notes:?}"
+        );
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "publication marker must stay clean after a disclosed skip"
+        );
+    }
+
+    #[test]
+    fn watcher_discloses_note_grown_past_limit_without_failing_the_batch() {
+        let (_dir, root) = make_vault(&[("Beta.md", "# Beta\n\nold\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let beta = note_uid(&v_uid, "Beta.md");
+        let before = store.lookup_note(&beta).unwrap().content_hash;
         fs::write(
             root.join("Beta.md"),
             vec![b'x'; crate::index_md::MAX_NOTE_SIZE_BYTES as usize + 1],
         )
         .unwrap();
-        assert!(
-            watcher
-                .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &callback)
-                .is_err()
-        );
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .unwrap();
         assert_eq!(store.lookup_note(&beta).unwrap().content_hash, before);
-        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
-        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        assert!(
+            sidecar.skipped.iter().any(|file| file.path == "Beta.md"),
+            "grown-past-limit note must be disclosed: {sidecar:?}"
+        );
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "publication marker must stay clean"
+        );
     }
 
     #[test]

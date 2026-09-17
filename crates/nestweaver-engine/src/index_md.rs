@@ -75,6 +75,7 @@ pub struct MarkdownRefreshResult {
     pub index: MarkdownIndexResult,
     pub notes_deleted: usize,
     pub publication: crate::manifest::GraphMutationPublicationOutcome,
+    pub notes_near_size_limit: Vec<NearLimitNote>,
 }
 
 /// Canonical full-refresh summary shared by direct CLI and daemon progress.
@@ -128,6 +129,15 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
         }
         for sf in &result.index.skipped {
             summary.push_str(&format!("\n  {} - {}", sf.path, sf.reason));
+        }
+    }
+    if !result.notes_near_size_limit.is_empty() {
+        summary.push_str(&format!(
+            "\nNotes approaching the size limit ({}):",
+            result.notes_near_size_limit.len()
+        ));
+        for note in &result.notes_near_size_limit {
+            summary.push_str(&format!("\n  {} - {} bytes", note.path, note.bytes));
         }
     }
     summary
@@ -220,14 +230,185 @@ fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
 /// pasted into a note). Files above this size are skipped with a warning.
 /// Per-file cap on note size. Files larger than this are skipped with a
-/// logged warning. Architecture doc §9.7 specifies 1 MB; multi-MB markdown
+/// logged warning. Architecture doc §9.7 specifies 1 MB as the default;
+/// `[indexing].max_note_bytes` can raise or lower it. Multi-MB markdown
 /// is almost always machine-generated (pasted logs, exported data dumps)
 /// and parsing them takes seconds while tanking ranking quality.
-pub(crate) const MAX_NOTE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MiB
+pub(crate) const MAX_NOTE_SIZE_BYTES: u64 = crate::index_limits::DEFAULT_MAX_NOTE_BYTES;
+
+/// Versioned sidecar written next to the graph: `<db>.skipped_notes.json`.
+pub const SKIPPED_NOTES_SIDECAR_SUFFIX: &str = ".skipped_notes.json";
+const SKIPPED_NOTES_SIDECAR_VERSION: u32 = 1;
+const NOTES_NEAR_SIZE_LIMIT_RATIO: f64 = 0.5;
+const SKIPPED_NOTES_LIST_CAP: usize = 50;
+
+/// A note whose size exceeds 50% of the configured limit but is still indexed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NearLimitNote {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkippedNotesSidecar {
+    pub version: u32,
+    #[serde(default)]
+    pub skipped: Vec<SkippedFile>,
+    #[serde(default)]
+    pub notes_near_size_limit: Vec<NearLimitNote>,
+    #[serde(default)]
+    pub skipped_truncated: bool,
+    #[serde(default)]
+    pub near_limit_truncated: bool,
+}
+
+impl Default for SkippedNotesSidecar {
+    fn default() -> Self {
+        Self {
+            version: SKIPPED_NOTES_SIDECAR_VERSION,
+            skipped: Vec::new(),
+            notes_near_size_limit: Vec::new(),
+            skipped_truncated: false,
+            near_limit_truncated: false,
+        }
+    }
+}
 
 fn note_reader_limits() -> crate::index_limits::IndexLimits {
-    crate::index_limits::IndexLimits::new(MAX_NOTE_SIZE_BYTES)
-        .expect("note size policy is within source-reader safety bounds")
+    crate::index_limits::NoteLimits::new(MAX_NOTE_SIZE_BYTES)
+        .expect("default note size policy is within bounds")
+        .as_index_limits()
+}
+
+fn cap_sidecar_list<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
+    let truncated = items.len() > SKIPPED_NOTES_LIST_CAP;
+    items.truncate(SKIPPED_NOTES_LIST_CAP);
+    (items, truncated)
+}
+
+fn near_limit_threshold(limit_bytes: u64) -> u64 {
+    ((limit_bytes as f64) * NOTES_NEAR_SIZE_LIMIT_RATIO).ceil() as u64
+}
+
+fn oversized_skip(path: String, observed_bytes: u64, limit_bytes: u64) -> SkippedFile {
+    SkippedFile {
+        path,
+        reason: format!("file exceeds {limit_bytes} bytes"),
+        reason_code: SkipReasonCode::Oversized,
+        observed_bytes: Some(observed_bytes),
+        limit_bytes: Some(limit_bytes),
+    }
+}
+
+fn maybe_near_limit(path: &str, size: u64, limit_bytes: u64) -> Option<NearLimitNote> {
+    let threshold = near_limit_threshold(limit_bytes);
+    if size > threshold && size <= limit_bytes {
+        Some(NearLimitNote {
+            path: path.to_string(),
+            bytes: size,
+        })
+    } else {
+        None
+    }
+}
+
+fn build_skipped_notes_sidecar(
+    skipped: &[SkippedFile],
+    near: &[NearLimitNote],
+) -> SkippedNotesSidecar {
+    let (skipped, skipped_truncated) = cap_sidecar_list(skipped.to_vec());
+    let (notes_near_size_limit, near_limit_truncated) = cap_sidecar_list(near.to_vec());
+    SkippedNotesSidecar {
+        version: SKIPPED_NOTES_SIDECAR_VERSION,
+        skipped,
+        notes_near_size_limit,
+        skipped_truncated,
+        near_limit_truncated,
+    }
+}
+
+fn persist_skipped_notes_sidecar(db_path: &Path, sidecar: &SkippedNotesSidecar) {
+    let path = crate::sidecar_path(db_path, SKIPPED_NOTES_SIDECAR_SUFFIX);
+    match serde_json::to_string_pretty(sidecar) {
+        Ok(json) => {
+            if let Err(error) = std::fs::write(&path, json) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to write skipped-notes sidecar"
+                );
+            }
+        }
+        Err(error) => tracing::warn!("failed to serialize skipped-notes sidecar: {error}"),
+    }
+}
+
+fn persist_skipped_notes_replace(
+    db_path: Option<&Path>,
+    skipped: &[SkippedFile],
+    near: &[NearLimitNote],
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    persist_skipped_notes_sidecar(db_path, &build_skipped_notes_sidecar(skipped, near));
+}
+
+fn persist_skipped_notes_merge(
+    db_path: Option<&Path>,
+    touched_paths: &[String],
+    skipped: &[SkippedFile],
+    near: &[NearLimitNote],
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let mut sidecar = load_skipped_notes_sidecar(db_path);
+    let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
+    sidecar
+        .skipped
+        .retain(|file| !touched.contains(file.path.as_str()));
+    sidecar
+        .notes_near_size_limit
+        .retain(|note| !touched.contains(note.path.as_str()));
+    sidecar.skipped.extend(skipped.iter().cloned());
+    sidecar.notes_near_size_limit.extend(near.iter().cloned());
+    sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    sidecar.skipped.dedup_by(|a, b| a.path == b.path);
+    sidecar
+        .notes_near_size_limit
+        .sort_by(|a, b| a.path.cmp(&b.path));
+    sidecar
+        .notes_near_size_limit
+        .dedup_by(|a, b| a.path == b.path);
+    let rebuilt = build_skipped_notes_sidecar(&sidecar.skipped, &sidecar.notes_near_size_limit);
+    persist_skipped_notes_sidecar(db_path, &rebuilt);
+}
+
+/// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty
+/// disclosure, not an error — status must not walk the vault as a fallback.
+pub fn load_skipped_notes_sidecar(db_path: &Path) -> SkippedNotesSidecar {
+    let path = crate::sidecar_path(db_path, SKIPPED_NOTES_SIDECAR_SUFFIX);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return SkippedNotesSidecar::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Shape consumed by `brain_status` / `brain_status_json`. Never walks the vault.
+pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, serde_json::Value) {
+    let sidecar = db_path.map(load_skipped_notes_sidecar).unwrap_or_default();
+    let skipped = serde_json::json!({
+        "count": sidecar.skipped.len(),
+        "paths": sidecar.skipped.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "truncated": sidecar.skipped_truncated,
+    });
+    let near = serde_json::json!({
+        "count": sidecar.notes_near_size_limit.len(),
+        "notes": sidecar.notes_near_size_limit,
+        "truncated": sidecar.near_limit_truncated,
+    });
+    (skipped, near)
 }
 
 /// Index a markdown vault into a persistent `GraphStore` at `db_path`.
@@ -555,6 +736,8 @@ pub struct MarkdownSinceResult {
     /// not comparable with a full index's `resolved_link_edges`.
     pub changed_note_link_edges: usize,
     pub publication: crate::manifest::GraphMutationPublicationOutcome,
+    pub skipped: Vec<SkippedFile>,
+    pub notes_near_size_limit: Vec<NearLimitNote>,
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
@@ -685,6 +868,9 @@ impl ContentReader for WatchedNoteReader {
         } else {
             Ok(Some((0, 0)))
         }
+    }
+    fn max_source_file_bytes(&self) -> u64 {
+        self.filesystem.max_source_file_bytes()
     }
 }
 
@@ -819,11 +1005,15 @@ fn index_markdown_since_with_reader_mode(
         .saturating_mul(1_000_000_000);
 
     let all_files = reader.list_files()?;
+    let note_limit_bytes = reader.max_source_file_bytes();
 
     let mut files_checked = 0usize;
     let mut candidates = Vec::new();
     let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
     let mut eligible_note_uids = HashSet::new();
+    let mut skipped: Vec<SkippedFile> = Vec::new();
+    let mut notes_near_size_limit: Vec<NearLimitNote> = Vec::new();
+    let mut touched_paths: Vec<String> = Vec::new();
 
     for rel_path in all_files {
         if !is_markdown(&rel_path) {
@@ -849,12 +1039,22 @@ fn index_markdown_since_with_reader_mode(
         // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta_nanos(&rel_path) {
             Ok(Some((mtime_nanos, file_size))) => {
-                if file_size > MAX_NOTE_SIZE_BYTES {
-                    if existing_note_uids.contains(&n_uid) {
-                        return Err(anyhow::anyhow!(
-                            "cannot safely rebuild wikilinks for oversized indexed note {rel_path_str}"
-                        ));
+                if mtime_nanos >= since_nanos {
+                    touched_paths.push(rel_path_str.clone());
+                    if let Some(near) = maybe_near_limit(&rel_path_str, file_size, note_limit_bytes)
+                    {
+                        notes_near_size_limit.push(near);
                     }
+                }
+                if file_size > note_limit_bytes {
+                    // nw-469: skip and disclose. Keep any already-indexed
+                    // body so wikilinks are not rebuilt from a truncated
+                    // read, and do not fail the watcher batch.
+                    skipped.push(oversized_skip(
+                        rel_path_str.clone(),
+                        file_size,
+                        note_limit_bytes,
+                    ));
                     tracing::warn!("skipping oversized file: {}", rel_path_str);
                     continue;
                 }
@@ -953,6 +1153,12 @@ fn index_markdown_since_with_reader_mode(
         .filter(|candidate| candidate.changed)
         .count();
     let notes_deleted = delete_note_uids.len();
+    persist_skipped_notes_merge(
+        store.db_path(),
+        &touched_paths,
+        &skipped,
+        &notes_near_size_limit,
+    );
     if notes_updated == 0 && notes_deleted == 0 && vault_existed {
         return Ok(MarkdownSinceResult {
             vault_name: vault_name.to_string(),
@@ -964,6 +1170,8 @@ fn index_markdown_since_with_reader_mode(
             tags_count: 0,
             changed_note_link_edges: 0,
             publication: crate::manifest::finalize_committed_graph_mutation(store, false),
+            skipped,
+            notes_near_size_limit,
         });
     }
 
@@ -1377,6 +1585,8 @@ fn index_markdown_since_with_reader_mode(
         tags_count: total_tags,
         changed_note_link_edges: changed_wikilinks,
         publication,
+        skipped,
+        notes_near_size_limit,
     })
 }
 
@@ -1998,6 +2208,8 @@ where
 
     let mut scanned_notes: Vec<ScannedNote> = Vec::new();
     let mut skipped: Vec<SkippedFile> = Vec::new();
+    let mut notes_near_size_limit: Vec<NearLimitNote> = Vec::new();
+    let note_limit_bytes = reader.max_source_file_bytes();
 
     // SECURITY: FilesystemReader::list_files() uses follow_links(false)
     // and only returns entries where file_type().is_file() == true,
@@ -2048,17 +2260,14 @@ where
         }
 
         // Size guard.
-        if let Ok(Some((_, size))) = reader.file_meta_nanos(&rel_path)
-            && size > MAX_NOTE_SIZE_BYTES
-        {
-            skipped.push(SkippedFile {
-                path: rel_str.into_owned(),
-                reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
-                reason_code: SkipReasonCode::Oversized,
-                observed_bytes: Some(size),
-                limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
-            });
-            continue;
+        if let Ok(Some((_, size))) = reader.file_meta_nanos(&rel_path) {
+            if size > note_limit_bytes {
+                skipped.push(oversized_skip(rel_str.into_owned(), size, note_limit_bytes));
+                continue;
+            }
+            if let Some(near) = maybe_near_limit(&rel_str, size, note_limit_bytes) {
+                notes_near_size_limit.push(near);
+            }
         }
 
         scanned_notes.push(ScannedNote { rel_path });
@@ -2121,13 +2330,11 @@ where
                 parse_pb.inc(1);
                 if let Some(oversized) = err.downcast_ref::<crate::content_reader::SourceTooLarge>()
                 {
-                    return NoteOutcome::Skipped(SkippedFile {
-                        path: rel_path,
-                        reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
-                        reason_code: SkipReasonCode::Oversized,
-                        observed_bytes: Some(oversized.observed_bytes),
-                        limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
-                    });
+                    return NoteOutcome::Skipped(oversized_skip(
+                        rel_path,
+                        oversized.observed_bytes,
+                        note_limit_bytes,
+                    ));
                 }
                 return NoteOutcome::Skipped(SkippedFile::new(
                     rel_path,
@@ -2139,15 +2346,13 @@ where
         // `file_meta_nanos` is unavailable for bare Git readers. Enforce the note
         // policy again on the returned content so any reader implementation
         // remains policy-correct even when it cannot preflight metadata.
-        if source.len() as u64 > MAX_NOTE_SIZE_BYTES {
+        if source.len() as u64 > note_limit_bytes {
             parse_pb.inc(1);
-            return NoteOutcome::Skipped(SkippedFile {
-                path: rel_path,
-                reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
-                reason_code: SkipReasonCode::Oversized,
-                observed_bytes: Some(source.len() as u64),
-                limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
-            });
+            return NoteOutcome::Skipped(oversized_skip(
+                rel_path,
+                source.len() as u64,
+                note_limit_bytes,
+            ));
         }
 
         let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
@@ -2718,6 +2923,8 @@ where
         elapsed.as_secs_f64(),
     );
 
+    persist_skipped_notes_replace(store.db_path(), &skipped, &notes_near_size_limit);
+
     Ok(MarkdownRefreshResult {
         index: MarkdownIndexResult {
             vault_uid: v_uid,
@@ -2734,6 +2941,7 @@ where
         },
         notes_deleted,
         publication,
+        notes_near_size_limit,
     })
 }
 
@@ -4742,6 +4950,73 @@ sub b body
             Some(MAX_NOTE_SIZE_BYTES + 1)
         );
         assert_eq!(result.skipped[0].limit_bytes, Some(MAX_NOTE_SIZE_BYTES));
+    }
+
+    #[test]
+    fn refresh_persists_skipped_files_sidecar() {
+        let note = |title: &str, size: usize| {
+            let prefix = format!("# {title}\n\n");
+            format!("{prefix}{}", "x".repeat(size - prefix.len()))
+        };
+        let above = note("Above", MAX_NOTE_SIZE_BYTES as usize + 1);
+        let half_plus = note("Near", (MAX_NOTE_SIZE_BYTES as f64 * 0.55).ceil() as usize);
+        let half_minus = note("Safe", (MAX_NOTE_SIZE_BYTES as f64 * 0.45).floor() as usize);
+        let (_dir, root) = make_vault(&[
+            ("keep.md", "# Keep\n"),
+            ("near.md", half_plus.as_str()),
+            ("safe.md", half_minus.as_str()),
+            ("big.md", above.as_str()),
+        ]);
+        let db_path = root.join("scratch.lbug");
+        let result = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 3);
+        assert_eq!(result.index.skipped.len(), 1);
+        assert_eq!(result.index.skipped[0].path, "big.md");
+        assert_eq!(result.notes_near_size_limit.len(), 1);
+        assert_eq!(result.notes_near_size_limit[0].path, "near.md");
+
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        assert_eq!(sidecar.version, 1);
+        assert_eq!(sidecar.skipped.len(), 1);
+        assert_eq!(sidecar.skipped[0].path, "big.md");
+        assert_eq!(sidecar.skipped[0].reason_code, SkipReasonCode::Oversized);
+        assert_eq!(sidecar.notes_near_size_limit.len(), 1);
+        assert_eq!(sidecar.notes_near_size_limit[0].path, "near.md");
+    }
+
+    #[test]
+    fn brain_refresh_lists_notes_near_the_size_limit() {
+        let note = |title: &str, size: usize| {
+            let prefix = format!("# {title}\n\n");
+            format!("{prefix}{}", "x".repeat(size - prefix.len()))
+        };
+        let near = note("Near", (MAX_NOTE_SIZE_BYTES as f64 * 0.55).ceil() as usize);
+        let (_dir, root) = make_vault(&[("near.md", near.as_str())]);
+        let db_path = root.join("scratch.lbug");
+        let result = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        let summary = format_markdown_refresh_summary(&result);
+        assert!(
+            summary.contains("near.md") && summary.contains("approaching the size limit"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("Coverage DEGRADED"),
+            "near-limit notes must not degrade coverage: {summary}"
+        );
     }
 
     #[test]

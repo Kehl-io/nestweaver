@@ -8551,6 +8551,8 @@ pub fn brain_status_json(
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
     let (unavailable, counts_complete) = counts_disclosure(unavailable, vault_count_failures);
+    let (skipped_notes, notes_near_size_limit) =
+        nestweaver_engine::index_md::skipped_notes_status_json(db_path.as_deref());
 
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
@@ -8622,6 +8624,10 @@ pub fn brain_status_json(
         "write_holder": Value::Null,
         "write_holder_seconds": Value::Null,
         "search_status": Value::Null,
+        // nw-469: skipped / near-limit notes, read from `<db>.skipped_notes.json`
+        // (no vault walk). Always present so callers can key on `count: 0`.
+        "skipped_notes": skipped_notes,
+        "notes_near_size_limit": notes_near_size_limit,
         // The `brain_search` precedent: always present, empty unless a
         // component was bypassed. The direct fallback sets
         // ["daemon_runtime"] via `mark_brain_status_daemon_bypassed`.
@@ -11351,8 +11357,8 @@ fn tool_stale_check(
         // That is NOT staleness — it is incompleteness — but it needs the same
         // remedy, which is what `needs_reindex` expresses.
         //
-        // A finished index with zero eligible files records the eligibility
-        // policy; that is `no_indexable_content`, not incomplete.
+        // nw-523: a finished index with zero eligible files records the
+        // eligibility policy; that is `no_indexable_content`, not incomplete.
         let content_missing = store
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
@@ -11383,8 +11389,8 @@ fn tool_stale_check(
         // The ACTIONABLE union, and the only thing a CI gate should key on:
         // every non-`ok` status is fixed by re-indexing — except
         // `no_indexable_content`, which already finished successfully with
-        // nothing eligible. nw-370: this line covers the fourth rung too,
-        // which is the point of adding the rung to `status` rather than
+        // nothing eligible (nw-523). nw-370: this line covers the fourth rung
+        // too, which is the point of adding the rung to `status` rather than
         // beside it — an existing CI gate on `any_needs_reindex` (or on exit
         // 2) catches the 9.0.0 migration with no edit.
         let needs_reindex = status != "ok" && status != "no_indexable_content";
@@ -18857,10 +18863,65 @@ mod cache_dispatch_tests {
         assert_eq!(status["tantivy_available"], json!(false));
         assert_eq!(status["tantivy_doc_count"], json!(0));
         assert_eq!(status["degraded_components"], json!([]));
+        assert_eq!(status["skipped_notes"]["count"], json!(0));
+        assert_eq!(status["skipped_notes"]["paths"], json!([]));
+        assert_eq!(status["notes_near_size_limit"]["count"], json!(0));
         assert!(
             status.get("_meta").is_none(),
             "provenance is added by the serving layer, not the builder: {status}"
         );
+    }
+
+    #[test]
+    fn brain_status_reports_skipped_notes_from_sidecar() {
+        reset_session();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("keep.md"), "# Keep\n").unwrap();
+        let oversized =
+            "x".repeat(nestweaver_engine::index_limits::DEFAULT_MAX_NOTE_BYTES as usize + 1);
+        fs::write(vault.join("big.md"), oversized).unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        nestweaver_engine::index_markdown_directory(&vault, &db_path, "default", "v").unwrap();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let status = brain_status_json(&store, None).unwrap();
+        assert_eq!(status["skipped_notes"]["count"], json!(1), "{status}");
+        assert_eq!(status["skipped_notes"]["paths"], json!(["big.md"]));
+        assert_eq!(status["degraded_components"], json!([]));
+    }
+
+    #[test]
+    fn brain_status_lists_notes_over_half_the_note_limit() {
+        reset_session();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let limit = nestweaver_engine::index_limits::DEFAULT_MAX_NOTE_BYTES as f64;
+        let over = "x".repeat((limit * 0.55).ceil() as usize);
+        let under = "x".repeat((limit * 0.45).floor() as usize);
+        fs::write(vault.join("hot.md"), format!("# Hot\n\n{over}")).unwrap();
+        fs::write(vault.join("cool.md"), format!("# Cool\n\n{under}")).unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        nestweaver_engine::index_markdown_directory(&vault, &db_path, "default", "v").unwrap();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let status = brain_status_json(&store, None).unwrap();
+        let notes = status["notes_near_size_limit"]["notes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            notes.iter().any(|n| n["path"] == "hot.md"),
+            "55% of the limit must be listed: {status}"
+        );
+        assert!(
+            notes.iter().all(|n| n["path"] != "cool.md"),
+            "45% of the limit must not be listed: {status}"
+        );
+        assert_eq!(status["degraded_components"], json!([]));
+        assert_eq!(status["skipped_notes"]["count"], json!(0));
     }
 
     /// The direct-path marker: every daemon-runtime field becomes an explicit
@@ -22375,8 +22436,8 @@ mod stale_check_tool_tests {
         assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
     }
 
-    /// A finished index with zero eligible files records SHA plus eligibility
-    /// policy. That must not pin `stale-check` at exit 2 forever.
+    /// nw-523: a finished index with zero eligible files records SHA plus
+    /// eligibility policy. That must not pin `stale-check` at exit 2 forever.
     #[test]
     fn stale_check_finished_empty_index_is_not_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");

@@ -106,6 +106,7 @@ pub struct WorkerPool {
     /// an unconfigured pool indexes everything as code (the prior behaviour).
     repo_types: Arc<HashMap<String, RepoType>>,
     index_limits: crate::index_limits::IndexLimits,
+    note_limits: crate::index_limits::NoteLimits,
     /// Tracks successful incremental code updates so server mode can
     /// periodically force a full refresh and bound graph drift.
     reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
@@ -118,6 +119,7 @@ impl WorkerPool {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             repo_types: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
+            note_limits: crate::index_limits::NoteLimits::default(),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
     }
@@ -135,6 +137,12 @@ impl WorkerPool {
     /// Apply the configured source-file safety limit to bare-repository reads.
     pub fn with_index_limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
         self.index_limits = limits;
+        self
+    }
+
+    /// Apply the configured markdown-note size limit to vault-repo reads.
+    pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
+        self.note_limits = limits;
         self
     }
 
@@ -197,6 +205,7 @@ impl WorkerPool {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
         let index_limits = self.index_limits;
+        let note_limits = self.note_limits;
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -377,6 +386,7 @@ impl WorkerPool {
                                 &instance_id,
                                 force_full_reindex,
                                 index_limits,
+                                note_limits,
                                 move || {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
@@ -774,6 +784,7 @@ where
         instance_id,
         force_full_reindex,
         crate::index_limits::IndexLimits::default(),
+        crate::index_limits::NoteLimits::default(),
         acquire_write_guard,
     )
 }
@@ -784,6 +795,7 @@ fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     instance_id: &str,
     force_full_reindex: bool,
     limits: crate::index_limits::IndexLimits,
+    note_limits: crate::index_limits::NoteLimits,
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
@@ -821,8 +833,7 @@ where
 
     // Build a reader over the bare clone at the new SHA.
     let reader_limits = if prepared.repo_type == RepoType::Vault {
-        crate::index_limits::IndexLimits::new(crate::index_md::MAX_NOTE_SIZE_BYTES)
-            .expect("note size policy is within source-reader safety bounds")
+        note_limits.as_index_limits()
     } else {
         limits
     };

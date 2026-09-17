@@ -14390,6 +14390,11 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.limits())
                 .unwrap_or_default();
+            let worker_note_limits = state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.indexing.note_limits())
+                .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -14415,7 +14420,8 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
-                    .with_index_limits(worker_index_limits);
+                    .with_index_limits(worker_index_limits)
+                    .with_note_limits(worker_note_limits);
 
                 pool.run_with_drain(
                     worker_job_queue,
