@@ -4072,6 +4072,26 @@ fn render_dead_code_text(payload: &serde_json::Value) {
     let undecodable = num("undecodable_symbols");
     let entry_points = num("entry_points");
     let coverage_note = || {
+        // nw-500. FIRST, before any count, and on both branches: a manifest
+        // sidecar that exists and cannot be read drops every
+        // manifest-declared entry file from the reachability seed, which can
+        // only ADD symbols to the list below. The `--json` path reports this
+        // as `manifest_load_error` on every route, so the text path must say
+        // it too or a terminal reader is told less than a JSON parser (the
+        // text/JSON honesty contract). Rendered from the payload, so the
+        // direct CLI and the daemon CLI — which prints what the `dead_code`
+        // tool returned — surface the identical sentence.
+        if let Some(error) = payload
+            .get("manifest_load_error")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            println!(
+                "Coverage DEGRADED: {error}\nSymbols below that are reachable ONLY from a \
+                 package entry point are listed here because of that failure, not because \
+                 they are dead.\n"
+            );
+        }
         if undecodable > 0 {
             println!(
                 "Coverage DEGRADED: {undecodable} symbol(s) could not be read and are missing \
@@ -17899,10 +17919,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Load manifest sidecar for manifest-driven entry points.
-            let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
+            //
+            // nw-512/nw-500: through the shared loader the MCP `dead_code`
+            // tool also calls, so every route — the default daemon CLI above,
+            // MCP direct, MCP-via-daemon, and this bypass — seeds the walk
+            // from the same entry files. It also replaces a bare
+            // `.unwrap_or_default()`, which collapsed "no sidecar yet" and
+            // "sidecar is there and unreadable" into one silent empty map.
+            let manifests = nestweaver_engine::load_manifests_for_dead_code(&store, &db_path);
 
-            let result = nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests)?;
+            let result =
+                nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests.manifests)?;
 
             // Filter by minimum confidence.
             let filtered: Vec<_> = result
@@ -17942,6 +17969,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 /// count both looking fine, and no field naming which
                 /// language actually caused it.
                 languages_without_entry_points: Vec<String>,
+                /// nw-500. `Some` ONLY when the manifest sidecar exists and
+                /// could not be read, which silently drops every
+                /// manifest-declared entry file from the reachability seed
+                /// set and so moves live code onto this list. An absent
+                /// sidecar is the normal state for a graph with no code
+                /// repos and is NOT disclosed; `skip_serializing_if` keeps
+                /// the key out of a healthy payload entirely, so the JSON a
+                /// working graph emits is byte-for-byte its pre-nw-500
+                /// shape. Same key name and same rule as the `dead_code` MCP
+                /// tool, which is what lets `render_dead_code_text` surface
+                /// it from either route's payload.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                manifest_load_error: Option<String>,
                 min_confidence: String,
                 unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
             }
@@ -17962,7 +18002,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 truncated,
                 excluded_count: result.excluded_count,
                 dead_percentage: result.dead_percentage,
-                coverage: if result.coverage_is_complete() {
+                // nw-500: a failed manifest load degrades coverage on the same
+                // field, and for the same reason, as an undecodable row or a
+                // seedless walk — see the `dead_code` tool's note. The CLI and
+                // the tool must agree here or the daemon and direct routes
+                // report different coverage for one database.
+                coverage: if result.coverage_is_complete() && manifests.load_error.is_none() {
                     "complete"
                 } else {
                     "degraded"
@@ -17970,6 +18015,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 undecodable_symbols: result.undecodable_symbols,
                 entry_points: result.entry_points,
                 languages_without_entry_points: result.languages_without_entry_points.clone(),
+                manifest_load_error: manifests.load_error.clone(),
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;

@@ -926,6 +926,31 @@ impl BrainWatcher {
         Ok(())
     }
 
+    /// Advance and persist the graph generation for a manifest edit (nw-498),
+    /// so responses cached against the old generation cannot outlive it.
+    ///
+    /// Returns whether the generation actually moved.
+    ///
+    /// Skipped while an index publication is dirty, and that is not a gap.
+    /// A manifest edit only lands inside a publication window when the SAME
+    /// debounced batch also touched the graph, and that batch's own finalize
+    /// (`finalize_graph_publication_with_io`) advances and persists the
+    /// generation for the whole window — so the invalidation still happens,
+    /// once. Bumping here as well would be refused anyway: the publication
+    /// holds a reserved successor generation and `try_bump_graph_generation`
+    /// fails closed against a live reservation rather than clobbering it.
+    /// Cached reads are already bypassed for the duration
+    /// (`maybe_cached` dispatches uncached while publication is dirty), so
+    /// nothing stale can be served out of the skipped window either.
+    fn advance_generation_for_manifest_edit(&self, store: &GraphStore) -> bool {
+        if store.is_index_publication_dirty() {
+            return false;
+        }
+        let before = store.graph_generation();
+        store.bump_and_persist_graph_generation(&crate::sidecar_path(&self.db_path, ".generation"));
+        store.graph_generation() != before
+    }
+
     fn handle_non_graph_event(
         &self,
         store: &GraphStore,
@@ -959,6 +984,31 @@ impl BrainWatcher {
                 match loaded {
                     Ok(mut cache) => {
                         cache.insert(repo_key.clone(), manifest);
+                        // nw-498: advance the graph generation BEFORE saving.
+                        //
+                        // The MCP response cache keys every hit on
+                        // `graph_generation` (plus the filemeta scope digest),
+                        // and neither moves for a manifest edit: a
+                        // `package.json` is not a parsed source file, so it is
+                        // in no filemeta slice, and this refresh never touched
+                        // the counter. So a cached `dead_code` — whose entry
+                        // points come from exactly this sidecar — kept being
+                        // served from the pre-edit answer for as long as
+                        // nothing else happened to reindex. Adding or removing
+                        // a package entry point changes which symbols are
+                        // reachable, and the stale side of that is a LIVE
+                        // symbol still listed as dead.
+                        //
+                        // BEFORE the save, not after, because the canonical
+                        // sidecar is generation-bound: its envelope records
+                        // `source_graph_generation` and a later reader rejects
+                        // it when that no longer matches. Saving at N and then
+                        // advancing to N+1 would make a freshly written
+                        // artifact stale on arrival — the exact ordering rule
+                        // `finalize_code_graph_deletion` and
+                        // `advancing_generation_rebinding_manifests` already
+                        // record.
+                        self.advance_generation_for_manifest_edit(store);
                         let saved = if uses_canonical_path {
                             crate::manifest::save_manifest_cache_for_db(
                                 &cache,
@@ -1739,6 +1789,106 @@ mod tests {
         assert_eq!(
             manifests.values().next().unwrap().package_name.as_deref(),
             Some("watched-package")
+        );
+    }
+
+    /// nw-498. The MCP response cache keys every hit on `graph_generation`
+    /// (and the filemeta scope digest). A `package.json` is not a parsed
+    /// source file, so it appears in no filemeta slice, and the watcher's
+    /// manifest refresh keyed by path and advanced nothing — so a cached
+    /// `dead_code`, whose entry points come from exactly this sidecar, kept
+    /// being served from the pre-edit answer. Adding or removing a package
+    /// entry point changes which symbols are reachable, and the stale side of
+    /// that is a LIVE symbol still listed as dead.
+    ///
+    /// The generation is asserted both in memory and in the `<db>.generation`
+    /// sidecar: a short-lived CLI process loads the counter from that file on
+    /// open, so a bump that is not persisted is invisible to exactly the
+    /// callers the cache exists for.
+    #[test]
+    fn a_manifest_edit_advances_and_persists_the_graph_generation() {
+        let (_dir, root) = make_vault(&[(
+            "package.json",
+            r#"{"name":"watched-package","main":"entry.js"}"#,
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        let before = store.graph_generation();
+        watcher
+            .handle_non_graph_event(&store, root.join("package.json"))
+            .unwrap();
+        let after = store.graph_generation();
+
+        assert!(
+            after > before,
+            "a manifest edit must advance the graph generation, or every \
+             response cached against {before} outlives the edit that \
+             invalidated it (got {after})"
+        );
+        let persisted = std::fs::read_to_string(&generation_path)
+            .expect("the advance must be persisted, or a fresh process never observes it")
+            .trim()
+            .parse::<u64>()
+            .expect("the generation sidecar holds a decimal integer");
+        assert_eq!(
+            persisted, after,
+            "the persisted generation must match the live one"
+        );
+
+        // The sidecar is generation-BOUND: its envelope records
+        // `source_graph_generation` and a reader rejects it when that no
+        // longer matches. The advance therefore has to happen before the
+        // save, or this refresh writes an artifact that is stale on arrival —
+        // which would trade a cache bug for a data-loss bug.
+        let manifests = crate::load_manifest_cache_for_db(&store, &db_path)
+            .expect("the refreshed sidecar must still decode at the NEW generation");
+        assert_eq!(
+            manifests
+                .values()
+                .next()
+                .expect("the refresh wrote this repo's manifest")
+                .entry_files,
+            vec!["entry.js".to_string()],
+            "and it must carry the edited entry files, not an empty payload"
+        );
+    }
+
+    /// nw-498's counterweight. The invalidation is scoped to MANIFEST edits.
+    /// An ordinary note edit — the overwhelmingly common watcher event, many
+    /// per minute in a live vault — must not advance the generation, or the
+    /// response cache is effectively disabled for anyone running
+    /// `brain watch` and every dependent read recomputes from scratch.
+    #[test]
+    fn an_unrelated_note_edit_does_not_advance_the_graph_generation() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("package.json", r#"{"name":"watched-package"}"#),
+            ("note.md", "# Note\n\nBody.\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        let before = store.graph_generation();
+        watcher
+            .handle_non_graph_event(&store, root.join("note.md"))
+            .unwrap();
+
+        assert_eq!(
+            store.graph_generation(),
+            before,
+            "a note edit is not a manifest edit and must leave the generation \
+             alone; bumping on every watched file would invalidate every \
+             cached response in a live vault"
         );
     }
 

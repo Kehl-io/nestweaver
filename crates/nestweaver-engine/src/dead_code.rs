@@ -622,12 +622,57 @@ fn detect_dead_code_inner(
         }
     }
 
-    // 3. Collect manifest entry file paths (normalized, no leading `./`).
-    let manifest_entry_files: HashSet<String> = manifests
-        .values()
-        .flat_map(|m| m.entry_files.iter())
-        .map(|p| p.strip_prefix("./").unwrap_or(p).to_string())
-        .collect();
+    // 3. Collect manifest entry file paths (normalized, no leading `./`),
+    //    KEYED BY THE REPO THAT DECLARED THEM.
+    //
+    // nw-497. This used to be one flat `HashSet<String>` unioned across every
+    // repo in the store, and `entry_files` are REPO-RELATIVE paths. So in a
+    // multi-repo database a `package.json` in repo A declaring `index.js`
+    // rooted repo B's unrelated `index.js` as well — and `index.js`,
+    // `src/index.ts`, `main.py`, `bin/cli.js` are exactly the paths that
+    // collide across repos. The blast radius is one-directional and matches
+    // the rest of this module's bias: a spurious root can only make dead code
+    // look LIVE, so the flat set silently suppressed real findings in every
+    // repo but the declaring one.
+    //
+    // Scoping is by `Symbol::repo_uid` against the manifest map's key, which
+    // every writer of `<db>.manifests.json` keys by repo UID
+    // (`index.rs`, the daemon's index RPCs, `main.rs`'s snapshot path), and
+    // which `reconcile_deleted_graph_state` already treats as a repo UID when
+    // it retains live entries.
+    //
+    // ONE writer disagrees: `watcher.rs`'s manifest refresh keys by the
+    // repo's on-disk PATH. Rather than let a strict UID match silently drop
+    // those entries — which would turn nw-497 into a regression for anyone
+    // running `brain watch` — a path key is normalized back to its repo UID
+    // through `Repo::root_path`. A key that resolves to neither is kept as
+    // itself, so it simply matches nothing, which is the honest outcome for
+    // an entry nothing in the graph claims.
+    //
+    // Skipped entirely when there are no manifests: the no-manifest callers
+    // (`detect_dead_code`, `detect_dead_code_with_confidence`) must not start
+    // paying for a repo enumeration they have nothing to normalize against.
+    let repo_uid_by_root_path: HashMap<String, String> = if manifests.is_empty() {
+        HashMap::new()
+    } else {
+        store
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|repo| repo.root_path.map(|root| (root, repo.uid)))
+            .collect()
+    };
+    let mut manifest_entry_files: HashMap<String, HashSet<String>> = HashMap::new();
+    for (key, info) in manifests {
+        if info.entry_files.is_empty() {
+            continue;
+        }
+        let repo_uid = repo_uid_by_root_path.get(key).unwrap_or(key);
+        let bucket = manifest_entry_files.entry(repo_uid.clone()).or_default();
+        for path in &info.entry_files {
+            bucket.insert(path.strip_prefix("./").unwrap_or(path).to_string());
+        }
+    }
 
     // 4. Identify entry points (flag + manifest-driven).
     //
@@ -661,12 +706,16 @@ fn detect_dead_code_inner(
     let mut lang_totals: HashMap<String, usize> = HashMap::new();
     let mut lang_entries: HashMap<String, usize> = HashMap::new();
     for sym in &all_symbols {
-        // Manifest-driven: exported symbols in manifest entry files.
+        // Manifest-driven: exported symbols in manifest entry files declared
+        // by THIS symbol's own repo (nw-497). A same-path file in a different
+        // repo is a different file and is not rooted by this declaration.
         let is_entry = sym.is_entry_point
-            || (!manifest_entry_files.is_empty() && {
-                let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
-                manifest_entry_files.contains(normalized)
-            });
+            || manifest_entry_files
+                .get(&sym.repo_uid)
+                .is_some_and(|entry_files| {
+                    let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
+                    entry_files.contains(normalized)
+                });
         if is_entry {
             entry_point_uids.push(sym.uid.clone());
         }
@@ -2956,6 +3005,130 @@ mod tests {
         let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
         assert_eq!(result.reachable_symbols, 1);
         assert!(result.unreachable_symbols.is_empty());
+    }
+
+    /// nw-497. `entry_files` are REPO-RELATIVE paths, and the entry-file set
+    /// used to be one flat `HashSet<String>` unioned over every repo in the
+    /// database. So a `package.json` in repo A declaring `index.js` also
+    /// rooted repo B's entirely unrelated `index.js` — and `index.js`,
+    /// `src/index.ts`, `main.py`, `bin/cli.js` are precisely the paths that
+    /// repeat across repos.
+    ///
+    /// The error is one-directional: a spurious root can only make dead code
+    /// look LIVE, so the flat set silently suppressed real findings in every
+    /// repo except the declaring one. The fixture is built so the leak, if
+    /// present, is the ONLY thing that could keep `strandedInB` reachable —
+    /// it has no entry-point flag, no edges, and its own repo declares no
+    /// manifest entries at all.
+    #[test]
+    fn a_manifest_entry_file_does_not_root_a_same_path_file_in_another_repo() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut entry_in_a = make_symbol_with_kind(
+            "a-entry",
+            "entryInA",
+            SymbolKind::Function,
+            "index.js",
+            false,
+        );
+        entry_in_a.repo_uid = "repo-a".to_string();
+        let mut stranded_in_b = make_symbol_with_kind(
+            "b-stranded",
+            "strandedInB",
+            SymbolKind::Function,
+            "index.js",
+            false,
+        );
+        stranded_in_b.repo_uid = "repo-b".to_string();
+        for sym in [&entry_in_a, &stranded_in_b] {
+            store.insert_symbol(sym).unwrap();
+        }
+
+        // Only repo A declares an entry file. Repo B declares none at all.
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "repo-a".to_string(),
+            ManifestInfo {
+                package_name: Some("pkg-a".to_string()),
+                dependencies: vec![],
+                entry_files: vec!["index.js".to_string()],
+            },
+        );
+
+        let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
+
+        let unreachable: Vec<&str> = result
+            .unreachable_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            unreachable,
+            vec!["strandedInB"],
+            "repo A's `index.js` declaration must root ONLY repo A's \
+             `index.js`. Repo B's same-path file is a different file and \
+             nothing in repo B claims it as an entry point, so it must still \
+             be reported."
+        );
+        assert_eq!(
+            result.entry_points, 1,
+            "exactly one symbol may seed the walk — the one in the repo that \
+             declared it"
+        );
+    }
+
+    /// nw-497's counterweight. Scoping must be invisible to the single-repo
+    /// store, which is the overwhelmingly common shape: the declaration and
+    /// the file are in the same repo, so the entry file still roots it and
+    /// the result is what it was before the fix.
+    ///
+    /// This is the case a too-strict key comparison would break — and break
+    /// SILENTLY, by dropping every manifest root and reporting live code as
+    /// dead, which is the exact failure direction nw-500 exists to disclose.
+    #[test]
+    fn a_single_repo_store_is_unchanged_by_entry_file_repo_scoping() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // `make_symbol_with_kind` puts both symbols in `repo-1`, which is
+        // also the manifest key below — the ordinary single-repo shape.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "lib",
+                "libMain",
+                SymbolKind::Function,
+                "src/index.ts",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "orphan",
+                "orphanFn",
+                SymbolKind::Function,
+                "src/utils.ts",
+                false,
+            ))
+            .unwrap();
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "repo-1".to_string(),
+            ManifestInfo {
+                package_name: Some("my-pkg".to_string()),
+                dependencies: vec![],
+                entry_files: vec!["./src/index.ts".to_string()],
+            },
+        );
+
+        let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
+        assert_eq!(result.total_symbols, 2);
+        assert_eq!(
+            result.entry_points, 1,
+            "the declaring repo's own entry file must still seed the walk"
+        );
+        assert_eq!(result.reachable_symbols, 1);
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "orphanFn");
     }
 
     /// nw-349, cause 4. `symbol_uid` embeds the LINE, so two `#[cfg]`-gated

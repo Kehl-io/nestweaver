@@ -6476,3 +6476,343 @@ exclude = {exclude}
     write_config("[]");
     assert_eq!(rt.block_on(client.health_check()).unwrap().pid, pid);
 }
+
+// ── nw-512: manifest entry files must reach dead-code on every route ──────
+//
+// `dead_code`'s MCP tool ran `detect_dead_code_cancellable`, which hard-codes
+// an EMPTY manifest map. Every route that ends at that tool — the default CLI
+// (the daemon prints what the tool returned), MCP direct, and MCP-via-daemon —
+// therefore walked with no manifest-declared entry files at all. `main`, `bin`,
+// `exports` and `browser` entries are reachability ROOTS, so their absence does
+// not merely change the answer, it makes it WRONG in exactly one direction:
+// code reachable only from a package entry point gets reported as dead, on a
+// command whose output is a list of symbols to delete.
+//
+// Reproduced on the shipped 10.0.3 binary against a fixture whose
+// `packages/glue/package.json` declares `"main": "glue_entry.js"`: the default
+// route reported `glueInit` unreachable over a database whose own sidecar
+// named that file as an entry point.
+//
+// The assertion is therefore on the CORRECT answer — manifest-declared entry
+// files are honoured — and not on agreement with `--no-daemon`. That bypass is
+// checked here only because it still exists and must not diverge; it is not
+// the reference implementation, and nothing below treats it as one.
+//
+// `unreferencedOrphan` is the non-vacuity control. It is exported exactly like
+// `glueInit`, sits in the same package, and nothing references it. If merely
+// being an ES export rooted a symbol, it would come back live too and the
+// `glueInit` assertion would prove nothing about manifests.
+//
+// The `daemon_` prefix is load-bearing: the main Linux CI job runs
+// `--skip daemon_` and a separate job runs `-- daemon_`.
+#[test]
+fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("manifest-entry").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[
+            (
+                "packages/glue/package.json",
+                r#"{"name":"glue","version":"1.0.0","main":"glue_entry.js"}"#,
+            ),
+            (
+                "packages/glue/glue_entry.js",
+                "import { helperCalledOnlyByEntry } from './helper.js';\n\
+                 export function glueInit() { return helperCalledOnlyByEntry(); }\n",
+            ),
+            (
+                "packages/glue/helper.js",
+                "export function helperCalledOnlyByEntry() { return 1; }\n",
+            ),
+            (
+                "packages/glue/orphan.js",
+                "export function unreferencedOrphan() { return 2; }\n",
+            ),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // Re-index inside the SAME daemon session. The manifest sidecar is
+    // generation-bound, and the live daemon holds an open store — so a fix
+    // that only works against a freshly opened database, or only against the
+    // sidecar written by the cold index before the daemon existed, is caught
+    // here rather than in production.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Every route, named by how a user actually reaches it.
+    let unreachable_from_cli = |cmd: &mut Command| -> Vec<String> {
+        let output = cmd
+            .args([
+                "dead-code",
+                "--db",
+                &db_path.display().to_string(),
+                "--json",
+            ])
+            .output()
+            .expect("dead-code must run");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let value: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("dead-code --json must emit JSON ({e}): {stdout}"));
+        assert!(
+            value.get("refused").and_then(|v| v.as_bool()) != Some(true),
+            "the fixture must not trip the resolver-generation refusal, or \
+             every assertion below is vacuous: {value}"
+        );
+        value["unreachable_symbols"]
+            .as_array()
+            .unwrap_or_else(|| panic!("dead-code --json must list symbols: {value}"))
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let unreachable_from_mcp = |mode: McpMode| -> Vec<String> {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "dead_code",
+            // Bypass the response cache so each route computes its own
+            // answer. Without this a later route could be served the earlier
+            // route's cached bytes and agree with it by construction.
+            serde_json::json!({ "no_cache": true }),
+            mode,
+        );
+        let response = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("id") == Some(&serde_json::json!(2)))
+            .unwrap_or_else(|| panic!("tools/call response missing from: {output}"));
+        assert_eq!(
+            response["result"]["isError"],
+            serde_json::json!(false),
+            "dead_code must succeed: {response}"
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("dead_code must return text content: {response}"));
+        let value: serde_json::Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("dead_code content must be JSON ({e}): {text}"));
+        value["unreachable_symbols"]
+            .as_array()
+            .unwrap_or_else(|| panic!("dead_code must list symbols: {value}"))
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let routes = [
+        (
+            "default CLI (daemon)",
+            unreachable_from_cli(&mut daemon_cmd()),
+        ),
+        ("MCP direct", unreachable_from_mcp(McpMode::Direct)),
+        ("MCP via daemon", unreachable_from_mcp(McpMode::Daemon)),
+        // The `--no-daemon` bypass. Checked so it cannot drift while it still
+        // exists; it is NOT the baseline the others are compared against.
+        (
+            "CLI bypass (--no-daemon)",
+            unreachable_from_cli(&mut no_daemon_cmd()),
+        ),
+    ];
+
+    for (route, unreachable) in &routes {
+        assert!(
+            unreachable.iter().any(|name| name == "unreferencedOrphan"),
+            "{route}: the control symbol must be reported dead, or this \
+             fixture proves nothing about the two below. Got: {unreachable:?}"
+        );
+        assert!(
+            !unreachable.iter().any(|name| name == "glueInit"),
+            "{route}: `packages/glue/package.json` declares `glue_entry.js` as \
+             its `main`, so `glueInit` is a reachability ROOT and must never \
+             appear on a list of symbols to delete. Got: {unreachable:?}"
+        );
+        assert!(
+            !unreachable
+                .iter()
+                .any(|name| name == "helperCalledOnlyByEntry"),
+            "{route}: reachable only THROUGH the manifest-declared entry \
+             point, so it proves the entry file seeded a walk rather than \
+             merely marking one symbol live. Got: {unreachable:?}"
+        );
+    }
+
+    // And the routes agree with each other, not merely with the contract
+    // above — four routes over one database must be one answer.
+    for (route, unreachable) in &routes[1..] {
+        let mut this = unreachable.clone();
+        let mut first = routes[0].1.clone();
+        this.sort();
+        first.sort();
+        assert_eq!(
+            this, first,
+            "{route} disagrees with {} over the same database",
+            routes[0].0
+        );
+    }
+}
+
+// ── nw-500: a failed manifest load is disclosed, on every route ───────────
+//
+// A manifest sidecar that EXISTS and cannot be read drops every
+// manifest-declared entry file from the reachability seed. That is the same
+// one-directional, unrecoverable failure that already makes `dead-code` REFUSE
+// on a resolver-stale graph: a missing root can only move a LIVE symbol onto a
+// deletion list. Before this it degraded silently — `.unwrap_or_default()`
+// turned "unreadable" into "no manifests" and nothing said so.
+//
+// The disclosure is deliberately TWO signals. `coverage: "degraded"` is the
+// field this response already uses for "the walk did not see everything"
+// (undecodable rows, a seedless BFS), so every consumer already branching on
+// it catches this with no new key to learn; `manifest_load_error` names WHICH
+// degradation occurred, because `coverage` alone cannot distinguish them —
+// the same reason nw-435 added `languages_without_entry_points` beside
+// `undecodable_symbols`.
+#[test]
+fn daemon_dead_code_discloses_a_failed_manifest_load_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("manifest-disclosure").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[
+            (
+                "package.json",
+                r#"{"name":"disclosed","version":"1.0.0","main":"entry.js"}"#,
+            ),
+            ("entry.js", "export function entryMain() { return 1; }\n"),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let manifest_sidecar = nestweaver_engine::manifest_cache_path(&db_path);
+    assert!(
+        manifest_sidecar.exists(),
+        "precondition: the index must have written a manifest sidecar, or \
+         corrupting it below tests nothing"
+    );
+
+    let cli_payload = |cmd: &mut Command| -> serde_json::Value {
+        let output = cmd
+            .args([
+                "dead-code",
+                "--db",
+                &db_path.display().to_string(),
+                "--json",
+            ])
+            .output()
+            .expect("dead-code must run");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("dead-code --json must emit JSON ({e}): {stdout}"))
+    };
+    let mcp_payload = |mode: McpMode| -> serde_json::Value {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "dead_code",
+            serde_json::json!({ "no_cache": true }),
+            mode,
+        );
+        let response = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("id") == Some(&serde_json::json!(2)))
+            .unwrap_or_else(|| panic!("tools/call response missing from: {output}"));
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("dead_code must return text content: {response}"));
+        serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("dead_code content must be JSON ({e}): {text}"))
+    };
+
+    // COUNTERWEIGHT, taken first: a sidecar that loads cleanly must add NO
+    // disclosure anywhere. A signal that is always on is not a signal.
+    for (route, payload) in [
+        ("default CLI (daemon)", cli_payload(&mut daemon_cmd())),
+        ("MCP direct", mcp_payload(McpMode::Direct)),
+        ("MCP via daemon", mcp_payload(McpMode::Daemon)),
+        (
+            "CLI bypass (--no-daemon)",
+            cli_payload(&mut no_daemon_cmd()),
+        ),
+    ] {
+        assert!(
+            payload.get("manifest_load_error").is_none(),
+            "{route}: a healthy manifest load must add no disclosure: {payload}"
+        );
+    }
+
+    // Now make the sidecar present-and-unreadable. Absent is a DIFFERENT
+    // state — the normal one for a graph with no manifests indexed yet — and
+    // is covered by `manifest::tests::
+    // a_corrupt_manifest_sidecar_is_disclosed_and_an_absent_one_is_not`,
+    // which asserts it stays silent.
+    std::fs::write(&manifest_sidecar, b"{ this is not an artifact envelope").unwrap();
+
+    for (route, payload) in [
+        ("default CLI (daemon)", cli_payload(&mut daemon_cmd())),
+        ("MCP direct", mcp_payload(McpMode::Direct)),
+        ("MCP via daemon", mcp_payload(McpMode::Daemon)),
+        (
+            "CLI bypass (--no-daemon)",
+            cli_payload(&mut no_daemon_cmd()),
+        ),
+    ] {
+        let disclosure = payload
+            .get("manifest_load_error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{route}: the manifest sidecar exists and cannot be read, \
+                     which drops every entry point from the walk and moves \
+                     live code onto this deletion list. That must be \
+                     disclosed: {payload}"
+                )
+            });
+        assert!(
+            disclosure.contains("entry"),
+            "{route}: the disclosure must say what was lost: {disclosure}"
+        );
+        assert_eq!(
+            payload["coverage"],
+            serde_json::json!("degraded"),
+            "{route}: a lost seed set degrades coverage on the field this \
+             response already uses for an incomplete walk: {payload}"
+        );
+    }
+
+    // The text renderer must not be quieter than `--json` (the text/JSON
+    // honesty contract). Checked on the default route, which renders the
+    // payload the daemon's `dead_code` tool returned.
+    let text_output = daemon_cmd()
+        .args(["dead-code", "--db", &db_path.display().to_string()])
+        .output()
+        .expect("dead-code must run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&text_output.stdout),
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    assert!(
+        text.contains("Coverage DEGRADED") && text.contains("entry"),
+        "a developer reading a terminal must not be told less than one \
+         parsing JSON:\n{text}"
+    );
+}
