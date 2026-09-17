@@ -652,7 +652,10 @@ max_note_bytes = 2097152        # 2 MiB
 
 The accepted range for both keys is 1 KiB through a fixed 64 MiB safety
 ceiling; invalid values fail config loading rather than being clamped.
-Notes above **50%** of `max_note_bytes` are listed on `brain status` and
+This policy applies to every markdown walk: daemon vault-repo workers,
+`brain add` / `brain refresh` (daemon and `--no-daemon`), `brain watch`,
+publication materialization, and MCP `brain_add`. Notes above **50%** of
+`max_note_bytes` are listed on `brain status` and
 `brain refresh` (`notes_near_size_limit`) so a growing note is visible
 before it drops out of the graph. Notes above the limit are skipped and
 disclosed as `skipped_notes`. Every policy skip is reported by `nestweaver
