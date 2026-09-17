@@ -2098,8 +2098,24 @@ impl GraphStore {
     /// stale-check must flag. Shared so both stale-check call sites cannot
     /// drift on the predicate; errors propagate (a CI gate that cannot
     /// answer must fail, not silently pass).
+    ///
+    /// nw-523: a successful index of a repo with nothing eligible still records
+    /// SHA plus the reader eligibility policy. That is not an interrupted write;
+    /// see [`Self::repo_index_empty_complete`].
     pub fn repo_index_incomplete(&self, repo: &Repo) -> Result<bool, StoreError> {
-        Ok(!repo.indexed_sha.is_empty() && !self.repo_has_content(repo)?)
+        Ok(!repo.indexed_sha.is_empty()
+            && !self.repo_has_content(repo)?
+            && self.get_repo_index_policy(&repo.uid)?.is_none())
+    }
+
+    /// True when an index finished (SHA and eligibility policy are present)
+    /// and zero File/Note nodes landed because nothing was eligible.
+    /// Distinct from [`Self::repo_index_incomplete`]: this must not set
+    /// `needs_reindex` (nw-523).
+    pub fn repo_index_empty_complete(&self, repo: &Repo) -> Result<bool, StoreError> {
+        Ok(!repo.indexed_sha.is_empty()
+            && !self.repo_has_content(repo)?
+            && self.get_repo_index_policy(&repo.uid)?.is_some())
     }
 
     /// Returns the dimension of stored embeddings, or 0 if none exist.
@@ -3969,17 +3985,34 @@ mod repo_has_content_tests {
                 .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", ""))
                 .unwrap()
         );
-        // SHA committed, no content → incomplete.
+        // SHA committed, no content, no eligibility policy → interrupted.
         assert!(
             store
                 .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
                 .unwrap()
         );
-        // SHA committed and content landed → complete.
+        assert!(
+            !store
+                .repo_index_empty_complete(&make_repo("repo:r", "https://example.com/r", "abc"))
+                .unwrap()
+        );
+        // SHA committed, no content, eligibility recorded → finished empty.
+        store
+            .set_repo_index_policy("repo:empty-ok", "eligibility-v1:none")
+            .unwrap();
+        let empty_ok = make_repo("repo:empty-ok", "https://example.com/empty-ok", "abc");
+        assert!(!store.repo_index_incomplete(&empty_ok).unwrap());
+        assert!(store.repo_index_empty_complete(&empty_ok).unwrap());
+        // SHA committed and content landed → complete, even without policy.
         insert_code_file(&store, "repo:r", "src/a.js");
         assert!(
             !store
                 .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .repo_index_empty_complete(&make_repo("repo:r", "https://example.com/r", "abc"))
                 .unwrap()
         );
     }

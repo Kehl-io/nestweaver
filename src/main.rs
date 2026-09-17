@@ -4458,6 +4458,7 @@ fn stale_check_row_line(r: &serde_json::Value) -> String {
     let marker = match r["status"].as_str() {
         Some("missing") => "missing",
         Some("incomplete") => "incomplete",
+        Some("no_indexable_content") => "empty",
         Some("outdated_resolver") => "OLD-RESOLVER",
         _ if stale => "STALE",
         _ => "ok",
@@ -4467,6 +4468,8 @@ fn stale_check_row_line(r: &serde_json::Value) -> String {
     // Say WHY, on the row, because that is where the user is looking.
     let reason = if r["status"].as_str() == Some("outdated_resolver") {
         "  (edges built by an older resolver — re-index)"
+    } else if r["status"].as_str() == Some("no_indexable_content") {
+        "  (indexed successfully; no eligible source files)"
     } else {
         ""
     };
@@ -5243,7 +5246,8 @@ enum Commands {
     ///
     /// Gate CI on 2, never on 1: those two demand opposite responses, and a
     /// gate that treats them alike either re-indexes on a crash or passes on
-    /// real drift.
+    /// real drift. A repo that indexed successfully with no eligible source
+    /// files reports `no_indexable_content` and does not set exit 2.
     //
     // This help once said "exits 1 when any repo is stale" while the code
     // exited 2, which inverted both. What the text USED to claim is history,
@@ -26620,6 +26624,9 @@ fn run_brain(
                 let content_missing = store
                     .repo_index_incomplete(repo)
                     .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?;
+                let empty_complete = store
+                    .repo_index_empty_complete(repo)
+                    .map_err(|e| anyhow::anyhow!("repo_index_empty_complete: {e}"))?;
 
                 // nw-163: `is_stale` means BEHIND HEAD and nothing else; the
                 // actionable union lives in `needs_reindex`. Mirrors
@@ -26634,6 +26641,8 @@ fn run_brain(
                     "missing"
                 } else if content_missing {
                     "incomplete"
+                } else if empty_complete {
+                    "no_indexable_content"
                 } else if is_stale {
                     "stale"
                 } else if repo_resolver_stale {
@@ -26641,7 +26650,7 @@ fn run_brain(
                 } else {
                     "ok"
                 };
-                let needs_reindex = status != "ok";
+                let needs_reindex = status != "ok" && status != "no_indexable_content";
                 if is_stale {
                     any_stale = true;
                 }
