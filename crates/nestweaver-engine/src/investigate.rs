@@ -1283,12 +1283,11 @@ pub fn investigate_expand(
                     bundle.entries[idx].expanded = true;
                     bundle.entries[idx].unavailable_reason = None;
                 }
-                // An entry that already carries a body stays expanded — the
-                // fetch is a refresh there, not the thing that made it usable.
-                Err(_) if bundle.entries[idx].inline_body.is_some() => {
-                    bundle.entries[idx].expanded = true;
-                    bundle.entries[idx].unavailable_reason = None;
-                }
+                // nw-501: a refresh failure must not present a previously
+                // truncated (or otherwise incomplete) body as a successful
+                // expansion. Keep `expanded: false` and name the fetch error;
+                // leave `inline_body` / `body_complete` as they were so the
+                // stale snippet is not dressed up as complete source.
                 Err(reason) => {
                     bundle.entries[idx].expanded = false;
                     bundle.entries[idx].unavailable_reason = Some(reason.reason());
@@ -3519,6 +3518,64 @@ mod tests {
                 .is_some_and(|reason| reason.contains("not readable")),
             "the failure must be NAMED — 'source not readable from the supplied \
              root' is actionable, silence is not: {expanded:?}"
+        );
+    }
+
+    /// nw-501. Hydrate can leave `inline_body` set with `body_complete: false`.
+    /// A later expand whose fetch fails used to set `expanded: true` and clear
+    /// `unavailable_reason`, so an agent read the truncated snippet as complete.
+    #[test]
+    fn expand_does_not_claim_success_when_refreshing_a_truncated_body_fails() {
+        let (dir, _src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        let mut entry = entry_for(&greet_uid, "Symbol");
+        entry.inline_body = Some("truncated snippet".to_string());
+        entry.body_complete = false;
+        let asset_id = entry.asset_id.clone();
+        let bundle_id = bundle_of(&db_path, vec![entry]);
+
+        let bogus_root = dir.path().join("not-the-repo");
+        fs::create_dir_all(&bogus_root).unwrap();
+        let out = investigate_expand(
+            &store,
+            &db_path,
+            &bogus_root,
+            &bundle_id,
+            std::slice::from_ref(&asset_id),
+        )
+        .unwrap();
+
+        let expanded = out
+            .expanded
+            .iter()
+            .find(|e| e.asset_id == asset_id)
+            .expect("the target was expanded");
+        assert_eq!(
+            expanded.inline_body.as_deref(),
+            Some("truncated snippet"),
+            "a failed refresh must leave the existing truncated body in place"
+        );
+        assert!(
+            !expanded.body_complete,
+            "a failed refresh must not flip body_complete: {expanded:?}"
+        );
+        assert!(
+            !expanded.expanded,
+            "a truncated body whose refresh failed must not report expanded: true: {expanded:?}"
+        );
+        assert!(
+            expanded
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not readable")),
+            "the fetch failure must remain named: {expanded:?}"
         );
     }
 
