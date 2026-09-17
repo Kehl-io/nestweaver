@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.0.4](https://github.com/Kehl-io/nestweaver/compare/v10.0.3...v10.0.4) (2026-09-17)
+
+
+### Bug Fixes
+
+* **dead-code:** make manifest entry files reach every route, scoped and disclosed ([#398](https://github.com/Kehl-io/nestweaver/issues/398)) ([739ca89](https://github.com/Kehl-io/nestweaver/commit/739ca89f5221915463293d823227113da1cf8f4f))
+
 ## [10.0.3](https://github.com/Kehl-io/nestweaver/compare/v10.0.2...v10.0.3) (2026-09-16)
 
 
