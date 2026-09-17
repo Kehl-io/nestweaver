@@ -2314,6 +2314,22 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
     pick_effective_instance_id(requested, &configured)
 }
 
+fn resolve_request_note_limits(
+    requested: u64,
+    state: &DaemonState,
+) -> Result<nestweaver_engine::index_limits::NoteLimits, Status> {
+    if requested == 0 {
+        Ok(state
+            .instance_cfg
+            .as_ref()
+            .map(|config| config.indexing.note_limits())
+            .unwrap_or_default())
+    } else {
+        nestweaver_engine::index_limits::NoteLimits::new(requested)
+            .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+}
+
 /// Build the terminal `Phase::Done` message for `IndexRepo`. When
 /// cancellation was requested (timeout or client disconnect) but the run had
 /// already passed the point where it could abort safely, say so plainly: the
@@ -6171,6 +6187,7 @@ impl NestWeaverDaemon for DaemonService {
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
+        let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
 
         if !vault_path.exists() || !vault_path.is_dir() {
             return Ok(Response::new(WatchVaultResponse {
@@ -6203,13 +6220,7 @@ impl NestWeaverDaemon for DaemonService {
             nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
-                .with_note_limits(
-                    self.state
-                        .instance_cfg
-                        .as_ref()
-                        .map(|config| config.indexing.note_limits())
-                        .unwrap_or_default(),
-                );
+                .with_note_limits(note_limits);
 
         // Share the daemon's writer-mode Tantivy handle with the watcher
         // so live edits update BM25 in place. Opening a separate handle
@@ -7362,6 +7373,7 @@ impl NestWeaverDaemon for DaemonService {
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
+        let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -7406,11 +7418,7 @@ impl NestWeaverDaemon for DaemonService {
                     &instance_id,
                     &vault_name,
                     &extra_patterns,
-                    state
-                        .instance_cfg
-                        .as_ref()
-                        .map(|config| config.indexing.note_limits())
-                        .unwrap_or_default(),
+                    note_limits,
                 );
 
             match index_result {
@@ -7542,6 +7550,7 @@ impl NestWeaverDaemon for DaemonService {
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
+        let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
         let since = std::time::UNIX_EPOCH
             .checked_add(Duration::from_secs(req.since_unix_seconds))
             .ok_or_else(|| Status::invalid_argument("since_unix_seconds is out of range"))?;
@@ -7593,11 +7602,7 @@ impl NestWeaverDaemon for DaemonService {
                 &vault_name,
                 since,
                 &extra_patterns,
-                state
-                    .instance_cfg
-                    .as_ref()
-                    .map(|config| config.indexing.note_limits())
-                    .unwrap_or_default(),
+                note_limits,
             ) {
                 Ok(result) => {
                     let mutation = indexed_search_mutation(
@@ -8579,6 +8584,8 @@ impl NestWeaverDaemon for DaemonService {
             .holder_snapshot()
             .map(|(rpc, held)| (rpc, held.as_secs() as i64))
             .unwrap_or_else(|| (String::new(), 0));
+        let (skipped_notes, notes_near_size_limit) =
+            nestweaver_proto::skipped_notes_from_status_json(&value);
 
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
@@ -8613,6 +8620,8 @@ impl NestWeaverDaemon for DaemonService {
             search_status: Some(search_status_proto(&search_status)),
             watcher: watcher_status(&self.state),
             supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
+            skipped_notes,
+            notes_near_size_limit,
         }))
     }
 
@@ -25584,6 +25593,7 @@ external_model = "unavailable-test-model"
                 instance_id: String::new(),
                 extra_ignore_patterns: Vec::new(),
                 force: false,
+                max_note_bytes: 0,
             }))
             .await
             .expect("WatchVault RPC")
@@ -27855,6 +27865,7 @@ mod watcher_e2e_tests {
             instance_id: String::new(),
             extra_ignore_patterns: Vec::new(),
             force,
+            max_note_bytes: 0,
         };
 
         let v1 = client

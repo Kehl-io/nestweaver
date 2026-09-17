@@ -4744,6 +4744,28 @@ fn format_daemon_status_response(
             } else {
                 lines.push("  State:            unknown (older daemon)".to_string());
             }
+            if let Some(skipped) = status.skipped_notes.as_ref() {
+                if skipped.count > 0 {
+                    lines.push(format!("Skipped notes: {}", skipped.count));
+                    for path in &skipped.paths {
+                        lines.push(format!("  - {path}"));
+                    }
+                    if skipped.truncated {
+                        lines.push("  (list truncated)".to_string());
+                    }
+                }
+            }
+            if let Some(near) = status.notes_near_size_limit.as_ref() {
+                if near.count > 0 {
+                    lines.push(format!("Notes approaching size limit: {}", near.count));
+                    for note in &near.notes {
+                        lines.push(format!("  - {} ({} bytes)", note.path, note.bytes));
+                    }
+                    if near.truncated {
+                        lines.push("  (list truncated)".to_string());
+                    }
+                }
+            }
             lines.join("\n")
         }
         Err(error) => [
@@ -4821,6 +4843,34 @@ mod daemon_status_renderer_tests {
         ));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
+    }
+
+    #[test]
+    fn skipped_and_near_limit_notes_render_on_typed_status() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            skipped_notes: Some(nestweaver_proto::SkippedNotesStatus {
+                count: 1,
+                paths: vec!["big.md".to_string()],
+                truncated: false,
+            }),
+            notes_near_size_limit: Some(nestweaver_proto::NotesNearSizeLimit {
+                count: 1,
+                notes: vec![nestweaver_proto::NearLimitNote {
+                    path: "near.md".to_string(),
+                    bytes: 600_000,
+                }],
+                truncated: false,
+            }),
+            ..Default::default()
+        };
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(output.contains("Skipped notes: 1"), "{output}");
+        assert!(output.contains("big.md"), "{output}");
+        assert!(
+            output.contains("Notes approaching size limit: 1"),
+            "{output}"
+        );
+        assert!(output.contains("near.md (600000 bytes)"), "{output}");
     }
 
     /// A3 acceptance: an operator looking at `brain status` during a long
@@ -9487,6 +9537,17 @@ fn note_limits_from_config(
             .note_limits(),
         None => nestweaver_engine::index_limits::NoteLimits::default(),
     })
+}
+
+fn rpc_max_note_bytes(
+    config: Option<&Path>,
+    limits: nestweaver_engine::index_limits::NoteLimits,
+) -> u64 {
+    if config.is_some() {
+        limits.max_note_bytes()
+    } else {
+        0
+    }
 }
 
 /// Resolve the instance id for a command using the nw-019 precedence:
@@ -25763,6 +25824,7 @@ fn run_brain(
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
+                    max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
                 };
                 // nw-192: the daemon formats only a COUNT into its terminal
                 // message ("...; N eligible file(s) skipped"), while the
@@ -26893,6 +26955,7 @@ fn run_brain(
                     vault_name: vault_name.clone(),
                     instance_id: instance_id.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
+                    max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
                 };
                 let resp = rt.block_on(async {
                     client
@@ -27188,6 +27251,7 @@ fn run_brain(
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
                         since_unix_seconds,
+                        max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
                     };
                     rt.block_on(async {
                         let stream = client
@@ -27225,6 +27289,7 @@ fn run_brain(
                         vault_name: vault_name.clone(),
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
+                        max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
                     };
                     rt.block_on(async {
                         let stream = client.inner_mut().index_vault(req).await?.into_inner();

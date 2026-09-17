@@ -23,6 +23,57 @@ pub fn prune_stale_json(response: &PruneStaleResponse) -> serde_json::Value {
     })
 }
 
+/// Map the JSON `brain_status` sidecar disclosure onto the typed status RPC.
+/// A live daemon always returns `Some`, including empty counts.
+pub fn skipped_notes_from_status_json(
+    value: &serde_json::Value,
+) -> (Option<SkippedNotesStatus>, Option<NotesNearSizeLimit>) {
+    let skipped = value
+        .get("skipped_notes")
+        .map(|skipped| SkippedNotesStatus {
+            count: skipped.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            paths: skipped
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            truncated: skipped
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    let near = value
+        .get("notes_near_size_limit")
+        .map(|near| NotesNearSizeLimit {
+            count: near.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            notes: near
+                .get("notes")
+                .and_then(|v| v.as_array())
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .filter_map(|note| {
+                            Some(NearLimitNote {
+                                path: note.get("path")?.as_str()?.to_string(),
+                                bytes: note.get("bytes")?.as_u64()?,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            truncated: near
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    (skipped, near)
+}
+
 #[cfg(test)]
 mod additive_status_contract_tests {
     use super::*;
@@ -109,6 +160,11 @@ mod additive_status_contract_tests {
         assert_eq!(decoded.write_holder, "");
         assert_eq!(decoded.write_holder_seconds, 0);
         assert!(!decoded.embedding_status.expect("nested status").pass_active);
+        assert!(
+            decoded.skipped_notes.is_none(),
+            "an old daemon must omit skipped-note disclosure rather than invent an empty sidecar"
+        );
+        assert!(decoded.notes_near_size_limit.is_none());
     }
 
     /// The other direction: a 4.2 daemon's bytes must remain readable by a
@@ -241,6 +297,61 @@ mod additive_status_contract_tests {
         let unknown = BrainStatusResponse::default();
         let unknown = BrainStatusResponse::decode(unknown.encode_to_vec().as_slice()).unwrap();
         assert!(unknown.effective_config.is_none());
+    }
+
+    #[test]
+    fn skipped_note_disclosure_roundtrips_on_brain_status() {
+        let status = BrainStatusResponse {
+            skipped_notes: Some(SkippedNotesStatus {
+                count: 1,
+                paths: vec!["big.md".to_string()],
+                truncated: false,
+            }),
+            notes_near_size_limit: Some(NotesNearSizeLimit {
+                count: 1,
+                notes: vec![NearLimitNote {
+                    path: "near.md".to_string(),
+                    bytes: 600_000,
+                }],
+                truncated: false,
+            }),
+            ..Default::default()
+        };
+        let decoded = BrainStatusResponse::decode(status.encode_to_vec().as_slice()).unwrap();
+        let skipped = decoded.skipped_notes.expect("skipped_notes");
+        assert_eq!(skipped.count, 1);
+        assert_eq!(skipped.paths, ["big.md"]);
+        let near = decoded
+            .notes_near_size_limit
+            .expect("notes_near_size_limit");
+        assert_eq!(near.notes[0].path, "near.md");
+        assert_eq!(near.notes[0].bytes, 600_000);
+    }
+
+    #[test]
+    fn skipped_notes_json_maps_onto_the_typed_status_messages() {
+        let value = serde_json::json!({
+            "skipped_notes": {
+                "count": 2,
+                "paths": ["a.md", "b.md"],
+                "truncated": true
+            },
+            "notes_near_size_limit": {
+                "count": 1,
+                "notes": [{"path": "c.md", "bytes": 12}],
+                "truncated": false
+            }
+        });
+        let (skipped, near) = skipped_notes_from_status_json(&value);
+        let skipped = skipped.expect("skipped");
+        assert_eq!(skipped.count, 2);
+        assert_eq!(skipped.paths, ["a.md", "b.md"]);
+        assert!(skipped.truncated);
+        let near = near.expect("near");
+        assert_eq!(near.notes[0].path, "c.md");
+        assert_eq!(near.notes[0].bytes, 12);
+        let empty = skipped_notes_from_status_json(&serde_json::json!({}));
+        assert!(empty.0.is_none() && empty.1.is_none());
     }
 }
 
