@@ -374,6 +374,36 @@ async fn brain_notes_omitted_limit_does_not_dump_unbounded_corpus() {
 }
 
 #[tokio::test]
+async fn brain_notes_limit_0_returns_empty() {
+    let app = notes_list_app(5);
+    let (status, json) = get_json(&app, "/api/v1/brain/notes?limit=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = json
+        .as_array()
+        .expect("sibling brain list routes return a raw array");
+    assert!(
+        arr.is_empty(),
+        "?limit=0 must match /symbols/top and return an empty array, not clamp to 1"
+    );
+}
+
+#[tokio::test]
+async fn brain_notes_limit_2000_is_capped_at_1000() {
+    let cap = nestweaver_web::routes::brain::LIST_NOTES_LIMIT_MAX;
+    let app = notes_list_app(cap + 1);
+    let (status, json) = get_json(&app, "/api/v1/brain/notes?limit=2000").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = json
+        .as_array()
+        .expect("sibling brain list routes return a raw array");
+    assert_eq!(
+        arr.len(),
+        cap,
+        "?limit=2000 must be capped at LIST_NOTES_LIMIT_MAX"
+    );
+}
+
+#[tokio::test]
 async fn brain_notes_offset_pages_past_the_first_row() {
     let app = notes_list_app(3);
     let (status, first) = get_json(&app, "/api/v1/brain/notes?limit=1").await;
