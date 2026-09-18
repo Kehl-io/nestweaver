@@ -25855,3 +25855,129 @@ mod manifest_sidecar_cache_salt_tests {
         assert_ne!(corrupt, first);
     }
 }
+
+#[cfg(test)]
+mod ambiguous_name_contract_tests {
+    use super::*;
+
+    fn ambiguous_ping_store() -> GraphStore {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().unwrap();
+        for (repo_uid, url, path, uid) in [
+            (
+                "repo:js-ping",
+                "https://example.test/js-ping",
+                "src/lib.js",
+                "sym:js-ping:ping",
+            ),
+            (
+                "repo:py-ping",
+                "https://example.test/py-ping",
+                "src/lib.py",
+                "sym:py-ping:ping",
+            ),
+            (
+                "repo:rs-ping",
+                "https://example.test/rs-ping",
+                "src/lib.rs",
+                "sym:rs-ping:ping",
+            ),
+            (
+                "repo:go-ping",
+                "https://example.test/go-ping",
+                "src/lib.go",
+                "sym:go-ping:ping",
+            ),
+        ] {
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: format!("{repo_uid}-sha"),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".to_string(),
+                    name: Some(repo_uid.trim_start_matches("repo:").to_string()),
+                    root_path: None,
+                })
+                .unwrap();
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: "ping".to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: repo_uid.to_string(),
+                    file_path: path.to_string(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: "fn ping()".to_string(),
+                    summary: None,
+                    content_hash: format!("hash-{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    fn assert_ambiguous_tool_payload(tool: &str, payload: &Value) {
+        assert_eq!(
+            payload["status"].as_str(),
+            Some("ambiguous"),
+            "{tool} must refuse an ambiguous name instead of silently picking one: {payload}"
+        );
+        let uids = payload
+            .get("candidate_uids")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let candidates = payload
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            uids.len() >= 2 || candidates.len() >= 2,
+            "{tool} must list candidate_uids: {payload}"
+        );
+    }
+
+    #[test]
+    fn flow_trace_refuses_ambiguous_ping_instead_of_picking_one() {
+        let store = ambiguous_ping_store();
+        let payload = dispatch(
+            &store,
+            None,
+            "flow_trace",
+            json!({ "symbol": "ping" }),
+            None,
+        )
+        .expect("ambiguous flow_trace is a structured refusal, not a hard crash");
+        assert_ambiguous_tool_payload("flow_trace", &payload);
+        assert!(
+            payload.get("children").is_none() || payload["status"] == "ambiguous",
+            "must not return a silent callee tree for an ambiguous root: {payload}"
+        );
+    }
+
+    #[test]
+    fn cross_repo_contracts_refuses_ambiguous_ping_instead_of_picking_one() {
+        let store = ambiguous_ping_store();
+        let payload = dispatch(
+            &store,
+            None,
+            "cross_repo_contracts",
+            json!({ "name": "ping" }),
+            None,
+        )
+        .expect("ambiguous cross_repo_contracts is a structured refusal, not a hard crash");
+        assert_ambiguous_tool_payload("cross_repo_contracts", &payload);
+    }
+}

@@ -5299,3 +5299,187 @@ fn impact_counts_agree_across_all_three_routes() {
         "the cap must bite or the agreement above is vacuous: {direct}"
     );
 }
+
+/// Two exact `ping` symbols (JS + Python) plus substring `ping2`.
+///
+/// The name-lookup contract is unique / ambiguous / not_found. `read-symbols`
+/// and `impact` already refuse this fixture with exit 3; `flow-trace` and
+/// `cross-repo-contracts` used to pick one silently, and `context` used to
+/// union every substring match.
+fn setup_ambiguous_ping_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let js = dir.path().join("js-ping");
+    let py = dir.path().join("py-ping");
+    let db_path = dir.path().join("db").join("ping.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    write_repo_files(
+        &js,
+        &[(
+            "src/lib.js",
+            "export function ping() { return 1; }\n\
+             export function ping2() { return 2; }\n",
+        )],
+    );
+    write_repo_files(
+        &py,
+        &[(
+            "src/lib.py",
+            "def ping():\n    return 1\n\ndef ping2():\n    return 2\n",
+        )],
+    );
+
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &js.display().to_string(),
+            "--name",
+            "js-ping",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &py.display().to_string(),
+            "--name",
+            "py-ping",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir: js,
+    }
+}
+
+fn assert_ambiguous_name_exit(output: &Output, command: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{command} must exit 3 for an ambiguous exact name, not silently pick a language; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.to_lowercase().contains("ambiguous")
+            || stdout.contains("candidate_uids")
+            || stdout.contains("candidates"),
+        "{command} must list candidates, not a chosen tree: {combined}"
+    );
+    assert!(
+        !stdout.contains("\"root\"") || stdout.contains("\"status\""),
+        "{command} must not return a silent flow-trace tree for 'ping': {stdout}"
+    );
+}
+
+#[test]
+fn ambiguous_ping_is_exit_3_for_flow_trace_and_cross_repo_contracts() {
+    let fixture = setup_ambiguous_ping_fixture();
+
+    let impact = run_direct(&fixture.db_path, &["impact", "ping", "--json"]);
+    assert_eq!(
+        impact.status.code(),
+        Some(3),
+        "fixture must be an ambiguous `ping` the way impact already classifies it; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&impact.stdout),
+        String::from_utf8_lossy(&impact.stderr)
+    );
+
+    for args in [
+        ["flow-trace", "ping", "--json"].as_slice(),
+        ["cross-repo-contracts", "ping", "--json"].as_slice(),
+    ] {
+        let direct = run_direct(&fixture.db_path, args);
+        assert_ambiguous_name_exit(&direct, args[0]);
+    }
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    for args in [
+        ["flow-trace", "ping", "--json"].as_slice(),
+        ["cross-repo-contracts", "ping", "--json"].as_slice(),
+    ] {
+        let daemon = run_via_daemon(&fixture.db_path, args);
+        assert_ambiguous_name_exit(&daemon, &format!("{} (daemon)", args[0]));
+    }
+
+    for (tool, arguments) in [
+        ("flow_trace", serde_json::json!({ "symbol": "ping" })),
+        ("cross_repo_contracts", serde_json::json!({ "name": "ping" })),
+    ] {
+        let payload = run_via_mcp(&fixture.db_path, tool, arguments);
+        assert_eq!(
+            payload["status"].as_str(),
+            Some("ambiguous"),
+            "{tool} MCP must refuse an ambiguous name instead of picking one: {payload}"
+        );
+        let uids = payload
+            .get("candidate_uids")
+            .or_else(|| payload.get("candidates"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            uids.len() >= 2,
+            "{tool} MCP must list both language candidates: {payload}"
+        );
+    }
+}
+
+#[test]
+fn context_ping_does_not_union_substring_ping2_when_ping_is_ambiguous() {
+    let fixture = setup_ambiguous_ping_fixture();
+    let output = run_direct(&fixture.db_path, &["context", "ping", "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.code() == Some(3) {
+        assert!(
+            stdout.contains("ambiguous")
+                || stderr.to_lowercase().contains("ambiguous")
+                || stdout.contains("candidate_uids"),
+            "exit 3 must be the ambiguous-name refusal: stdout={stdout} stderr={stderr}"
+        );
+        return;
+    }
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "context ping must refuse (exit 3) or succeed without extra-seeding ping2; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("context --json: {stdout}"));
+    let seed_names: Vec<String> = value["seeds"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !seed_names.iter().any(|n| n == "ping2"),
+        "ambiguous exact name `ping` must not extra-seed substring `ping2`; seeds={seed_names:?} payload={value}"
+    );
+    if let Some(total) = value["seed_matches_total"].as_u64() {
+        let ping2_count = seed_names.iter().filter(|n| n.as_str() == "ping2").count();
+        assert_eq!(
+            ping2_count, 0,
+            "seed_matches_total={total} must not be counting ping2 into an ambiguous ping seed"
+        );
+    }
+}

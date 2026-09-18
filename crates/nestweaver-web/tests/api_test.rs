@@ -163,6 +163,109 @@ async fn symbol_lookup_not_found_returns_404() {
 }
 
 #[tokio::test]
+async fn symbol_lookup_by_ambiguous_name_is_not_bare_300() {
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:js-ping".to_string(),
+            url: "https://example.com/js-ping.git".to_string(),
+            indexed_sha: "js".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: Some("js-ping".to_string()),
+            root_path: None,
+        })
+        .unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:py-ping".to_string(),
+            url: "https://example.com/py-ping.git".to_string(),
+            indexed_sha: "py".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: Some("py-ping".to_string()),
+            root_path: None,
+        })
+        .unwrap();
+    for (uid, repo_uid, path) in [
+        ("sym:js-ping:ping", "repo:js-ping", "src/lib.js"),
+        ("sym:py-ping:ping", "repo:py-ping", "src/lib.py"),
+    ] {
+        store
+            .insert_symbol(&Symbol {
+                uid: uid.to_string(),
+                name: "ping".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: path.to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "function ping()".to_string(),
+                summary: None,
+                content_hash: format!("hash-{uid}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+    }
+
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/ping.lbug"));
+    let app = create_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/symbol/ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .cloned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+
+    assert!(
+        status != StatusCode::MULTIPLE_CHOICES || location.is_some(),
+        "GET /api/v1/symbol/ping must not be HTTP 300 without Location (fetch() treats that as failure); \
+         status={status} body={json}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an ambiguous name must not look like a unique hit: {json}"
+    );
+    assert!(
+        status == StatusCode::CONFLICT
+            || (status == StatusCode::MULTIPLE_CHOICES && location.is_some())
+            || status.is_client_error(),
+        "prefer 409 with JSON candidates; got {status} body={json}"
+    );
+    let listed = json
+        .get("candidate_uids")
+        .or_else(|| json.get("candidates"))
+        .cloned()
+        .unwrap_or(json.clone());
+    let count = listed.as_array().map(Vec::len).unwrap_or(0);
+    assert!(
+        count >= 2,
+        "ambiguous symbol lookup must list candidates: {json}"
+    );
+}
+
+#[tokio::test]
 async fn context_returns_seeds_and_connected() {
     let app = make_app();
     let (status, json) = post_json(&app, "/api/v1/context", json!({ "seeds": ["greet"] })).await;
