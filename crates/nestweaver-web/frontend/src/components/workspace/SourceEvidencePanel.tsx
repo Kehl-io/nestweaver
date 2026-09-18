@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
-import { isSymbolKind } from "../../api/kinds";
-import type { NoteDetail, SymbolDetail } from "../../api/types";
+import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
+import type { NoteDetail, SourceResponse, SymbolCandidate, SymbolDetail } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { CodePreview } from "../detail/CodePreview";
@@ -14,11 +14,15 @@ interface SourceEvidencePanelProps {
 }
 
 function isNoteLike(uid: string | null, kind: string | null): boolean {
-  return Boolean(uid?.startsWith("note:") || kind === "note" || kind === "Note");
+  return isNoteSelection(uid, kind);
 }
 
 function isSymbolLike(uid: string | null, kind: string | null): boolean {
   return Boolean(uid?.startsWith("sym:") || isSymbolKind(kind));
+}
+
+function isFileLike(uid: string | null, kind: string | null): boolean {
+  return isFileSelection(uid, kind);
 }
 
 function noteSnippet(body: string): string {
@@ -37,6 +41,8 @@ export function SourceEvidencePanel({
   const detailFocus = useStore((s) => s.detailFocus);
   const [symbolDetail, setSymbolDetail] = useState<SymbolDetail | null>(null);
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
+  const [fileSymbols, setFileSymbols] = useState<SymbolCandidate[]>([]);
+  const [fileSource, setFileSource] = useState<SourceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -72,6 +78,8 @@ export function SourceEvidencePanel({
     const controller = new AbortController();
     setSymbolDetail(null);
     setNoteDetail(null);
+    setFileSymbols([]);
+    setFileSource(null);
     setError(null);
 
     if (!selectedNodeId) {
@@ -115,16 +123,55 @@ export function SourceEvidencePanel({
       return () => controller.abort();
     }
 
+    if (isFileLike(selectedNodeId, selectedNodeKind)) {
+      setLoading(true);
+      Promise.all([
+        api.symbolsInFile(selectedNodeId).catch(() => [] as SymbolCandidate[]),
+        api.source(selectedNodeId, 1, 12).catch(() => null),
+      ])
+        .then(([symbols, source]) => {
+          if (controller.signal.aborted) return;
+          setFileSymbols(symbols);
+          setFileSource(source);
+          if (symbols.length === 0 && (!source || !source.lines?.length)) {
+            setError("File evidence is unavailable.");
+          }
+        })
+        .catch((e) => {
+          if (!controller.signal.aborted) {
+            setError(e instanceof Error ? e.message : "File evidence is unavailable.");
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setLoading(false);
+        });
+      return () => controller.abort();
+    }
+
     setLoading(false);
     return () => controller.abort();
   }, [selectedNodeId, selectedNodeKind]);
 
   const symbol = symbolDetail?.symbol;
   const note = noteDetail?.note;
+  const hasFileEvidence = Boolean(fileSource?.lines?.length || fileSymbols.length);
   const filePath = symbol?.file_path ?? graphEvidence?.filePath ?? "";
-  const line = symbol?.start_line ?? graphEvidence?.startLine ?? null;
-  const label = symbol?.name ?? note?.title ?? graphEvidence?.label ?? "No selection";
-  const kind = symbol?.kind ?? (note ? "Note" : graphEvidence?.kind ?? selectedNodeKind);
+  const line =
+    symbol?.start_line ??
+    fileSymbols[0]?.start_line ??
+    fileSource?.start_line ??
+    graphEvidence?.startLine ??
+    null;
+  const fileLabel = selectedNodeId?.split("/").pop() ?? selectedNodeId;
+  const label =
+    symbol?.name ??
+    note?.title ??
+    (hasFileEvidence ? fileLabel : null) ??
+    graphEvidence?.label ??
+    "No selection";
+  const kind =
+    symbol?.kind ??
+    (note ? "Note" : hasFileEvidence ? "file" : graphEvidence?.kind ?? selectedNodeKind);
 
   return (
     <aside
@@ -187,6 +234,32 @@ export function SourceEvidencePanel({
               </pre>
             )}
             <CodePreview filePath={filePath} line={line} context={compact ? 5 : 10} />
+          </div>
+        ) : hasFileEvidence && selectedNodeId ? (
+          <div
+            className={
+              detailFocus === "source"
+                ? "rounded border border-[var(--color-graph-selection)]/50 bg-[var(--color-graph-selection)]/5 p-2"
+                : ""
+            }
+          >
+            <div className="mb-2 flex items-center gap-2 text-[11px] text-[var(--color-text-muted)]">
+              <SearchCode className="h-3.5 w-3.5" />
+              <span className="min-w-0 truncate">
+                {selectedNodeId}
+                {line != null ? `:${line}` : ""}
+              </span>
+            </div>
+            {fileSymbols.length > 0 && (
+              <p className="mb-2 text-[11px] text-[var(--color-text-muted)]">
+                {fileSymbols.length} symbol{fileSymbols.length === 1 ? "" : "s"} in file
+              </p>
+            )}
+            <CodePreview
+              filePath={selectedNodeId}
+              line={line ?? 1}
+              context={compact ? 5 : 10}
+            />
           </div>
         ) : note && noteDetail ? (
           <div

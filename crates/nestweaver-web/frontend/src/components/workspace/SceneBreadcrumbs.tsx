@@ -42,7 +42,9 @@ export function SceneBreadcrumbs() {
       ? preview.detail.symbol.name
       : preview?.type === "note"
         ? preview.detail.note.title
-        : null;
+        : preview?.type === "file"
+          ? preview.path.split("/").pop() || preview.path
+          : null;
 
   const graphLabel =
     (selectedNodeId && graphInstance?.hasNode(selectedNodeId)

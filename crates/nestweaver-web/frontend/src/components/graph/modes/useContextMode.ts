@@ -113,6 +113,14 @@ export function useContextMode() {
       const graph = buildGraphFromContext(result);
 
       for (const seed of result.seeds) {
+        if (
+          seed.uid.startsWith("note:") ||
+          seed.kind === "Note" ||
+          seed.kind === "note" ||
+          seed.kind === "file"
+        ) {
+          continue;
+        }
         try {
           const detail = await api.symbol(seed.uid);
           if (!isCurrentRequest()) return;
