@@ -35,10 +35,10 @@ Under a `project:<slug>` scope, `investigate` treats name matches specially:
 - `matched_query` is **absent outside `project:` scope** — its absence is not a
   signal that nothing matched, only that the scope was not a project.
 
-**A pin guarantees ORDER, not token-budget survival.** A pinned exact match is
-placed first among candidates; it can still be dropped when the bundle is
-trimmed to the token budget. Do not read "it was pinned" as "it is in the
-response" — check the response.
+**Exact pins survive the token-budget cut.** The first map entry is always
+admitted; additional `matched_query: "exact"` pins are kept even after the
+budget is spent. Other entries still drop. Exact names are looked up
+directly, so a path-deboosted test/mirror file is still pinned.
 
 ## Before you trust a ranking
 

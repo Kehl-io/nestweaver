@@ -1625,21 +1625,14 @@ fn capped_query_terms(query: &str) -> Vec<String> {
 /// function. `vault`/`repo:`/`all` scope must see the unchanged fused-score
 /// order, per `investigate_vault_scope_exact_symbol_match_is_not_pinned`.
 ///
-/// CAVEAT: `search_symbols_by_name_page` ranks candidates by name quality
-/// THEN a multiplicative path-deboost factor
-/// (`[seed_resolution].path_deboost`, e.g. test/mirror paths like
-/// `__tests__/`, `*.test.ts`) before kind priority and a file-path
-/// tiebreak — see its doc comment in `nestweaver-store/src/traverse.rs`.
-/// An exact-name match living at a deboosted path can therefore rank below
-/// `SEED_NAME_MATCH_LIMIT` other same-name (exact or partial) candidates and
-/// fall outside this function's own top-`SEED_NAME_MATCH_LIMIT` page. It is
-/// then simply not in `exact`/`partial` at all — not pinned, not boosted —
-/// same as any other name this resolver never saw. This is a real,
-/// unresolved limitation, not a bug this function tries to paper over: the
-/// render-cap-injection fix in `investigate()` (nw-476, quality review)
-/// rescues a CONFIRMED exact match that this function already found but
-/// `RenderCap` later dropped; it cannot rescue a match this function never
-/// found in the first place.
+/// CAVEAT: exact-name matches are loaded via `lookup_symbols_by_name` first,
+/// so a path-deboosted test/mirror file with that exact name is still pinned.
+/// `search_symbols_by_name_page` is only the partial/substring path; it still
+/// ranks by name quality then `[seed_resolution].path_deboost`. The remaining
+/// cap is `SEED_NAME_MATCH_LIMIT` exact UIDs (store order among true name
+/// collisions). The render-cap-injection fix in `investigate()` rescues a
+/// CONFIRMED exact match that this function already found but `RenderCap`
+/// later dropped; it cannot rescue a match this function never found.
 fn resolve_query_symbol_matches(
     store: &GraphStore,
     query: &str,
@@ -4399,6 +4392,8 @@ mod tests {
 
     #[test]
     fn investigate_project_scope_pin_survives_a_tight_token_budget() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
         const SYMBOL_NAME: &str = "build_brain_context_hybrid_with_aliases";
         let notes: Vec<(String, &str, usize)> = (0..35)
             .map(|i| (format!("noise{i:03}"), SYMBOL_NAME, 30))
@@ -4409,6 +4404,39 @@ mod tests {
             .collect();
         let (dir, db_path, store, tantivy, symbol_uid) =
             make_project_with_symbol_and_noise_notes("pinbudget", SYMBOL_NAME, &notes_ref, false);
+
+        // A second exact pin sits after the first-entry exemption. Without
+        // `is_pinned_exact`, a budget that admits only entry 0 drops it.
+        let twin_uid = "sym:pinbudget:twin".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: twin_uid.clone(),
+                name: SYMBOL_NAME.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:pinbudget".to_string(),
+                file_path: "twin.js".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: format!("function {SYMBOL_NAME}()"),
+                summary: None,
+                content_hash: "h-twin".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                "proj:test:pinbudget",
+                std::slice::from_ref(&twin_uid),
+                1.0,
+            )
+            .unwrap();
 
         let result = investigate(
             &store,
@@ -4422,21 +4450,33 @@ mod tests {
         )
         .unwrap();
 
+        let uids: Vec<&str> = result.entries.iter().map(|e| e.uid.as_str()).collect();
         assert!(
-            result.entries.iter().any(|e| e.uid == symbol_uid),
-            "a pinned exact match must survive the token-budget cut; entries: {:?}",
+            uids.iter().any(|uid| *uid == symbol_uid),
+            "the first exact pin must survive; entries: {uids:?}"
+        );
+        assert!(
+            uids.iter().any(|uid| *uid == twin_uid),
+            "a later exact pin must survive the token-budget cut, not only entries[0]; entries: {:?}",
             result
                 .entries
                 .iter()
                 .map(|e| (&e.uid, &e.title, e.matched_query))
                 .collect::<Vec<_>>()
         );
-        let pinned = result
-            .entries
-            .iter()
-            .find(|e| e.uid == symbol_uid)
-            .expect("pinned uid present");
-        assert_eq!(pinned.matched_query, Some(MatchedQuery::Exact));
+        assert!(
+            result.more_available > 0,
+            "the budget must actually cut non-pinned entries or the exemption is unproven: more_available={}",
+            result.more_available
+        );
+        for uid in [&symbol_uid, &twin_uid] {
+            let pinned = result
+                .entries
+                .iter()
+                .find(|e| e.uid == *uid)
+                .unwrap_or_else(|| panic!("pinned uid {uid} present"));
+            assert_eq!(pinned.matched_query, Some(MatchedQuery::Exact));
+        }
     }
 
     /// nw-476 (quality review, IMPORTANT #1). `RenderCap.seeds` (query.rs)
