@@ -9537,7 +9537,7 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
-                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
+                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or repo to pin one symbol." },
                 "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
                     "Max contract links to return (1-1000, default 50). The total count is always reported.",
