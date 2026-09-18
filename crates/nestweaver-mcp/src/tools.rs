@@ -4332,6 +4332,9 @@ fn read_symbols_from_repo_roots(
         merged.ambiguous.extend(partial.ambiguous);
         merged.dropped.extend(partial.dropped);
         merged.truncated = merged.truncated || partial.truncated;
+        if merged.budget_exceeded_by_first_symbol.is_none() {
+            merged.budget_exceeded_by_first_symbol = partial.budget_exceeded_by_first_symbol;
+        }
     }
     merged
 }
@@ -12042,6 +12045,24 @@ fn finalize_project_budget(response: &mut Value) -> Result<(), anyhow::Error> {
     ))
 }
 
+/// Same predicate as the post-PPR `kinds` retain: a node is kept when
+/// `node.kind` (lowercased) starts with any requested filter.
+fn kinds_filter_admits(node_kind: &str, filters: &[String]) -> bool {
+    let kind_lower = node_kind.to_lowercase();
+    filters
+        .iter()
+        .any(|filter| kind_lower.starts_with(filter.as_str()))
+}
+
+/// True when every requested kind would keep `Symbol` and none would keep
+/// `Note` or `Section`. `["sym"]` matches this; `["symbol", "note"]` does not.
+fn kinds_are_symbol_only(filters: &[String]) -> bool {
+    !filters.is_empty()
+        && kinds_filter_admits("symbol", filters)
+        && !kinds_filter_admits("note", filters)
+        && !kinds_filter_admits("section", filters)
+}
+
 fn tool_project_context(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -12096,9 +12117,9 @@ fn tool_project_context(
                 .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect()
         });
-    let symbol_kinds_only = filter_kinds.as_ref().is_some_and(|kinds| {
-        !kinds.is_empty() && kinds.iter().all(|kind| kind.starts_with("symbol"))
-    });
+    let symbol_kinds_only = filter_kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds_are_symbol_only(kinds));
 
     // 1. Resolve the project: name/alias/UID.
     let project = if project_str.starts_with("proj:") {
@@ -12401,10 +12422,7 @@ fn tool_project_context(
     // 5. Apply optional kinds filter.
     if let Some(ref kinds) = filter_kinds {
         let apply_kinds = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-            nodes.retain(|n| {
-                let kind_lower = n.kind.to_lowercase();
-                kinds.iter().any(|k| kind_lower.starts_with(k.as_str()))
-            });
+            nodes.retain(|n| kinds_filter_admits(&n.kind, kinds));
         };
         apply_kinds(&mut result.seeds);
         apply_kinds(&mut result.connected);
@@ -15565,7 +15583,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it); the one case it can still miss is a match living at a path the ranker deboosts (e.g. a test-mirror path), which can fall outside the name resolver's own top-5 candidates and go unpinned. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -17074,6 +17092,119 @@ mod project_context_bug12_tests {
                 "target-prefix symbol {target} must survive the seed cut; got {connected:?}"
             );
         }
+    }
+
+    /// Member notes must not occupy the PPR seed pool when `kinds` only
+    /// admits symbols — otherwise a notes-heavy project spends the candidate
+    /// pool on notes the filter then drops.
+    #[test]
+    fn project_context_kinds_symbol_does_not_return_member_notes() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:kindsskip".into(),
+                name: "kindsskip".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        let proj = Project {
+            uid: "proj:kindsskip".into(),
+            name: "KindsSkip".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        for i in 0..40 {
+            let uid = format!("note:kindsskip:{i}");
+            store
+                .insert_note(&mk_note(
+                    &uid,
+                    "vlt:kindsskip",
+                    &format!("Projects/kindsskip/n{i}.md"),
+                    &format!("noise note {i} with a long title to spend budget"),
+                ))
+                .unwrap();
+            store
+                .batch_insert_project_note_edges(&[("proj:kindsskip", uid.as_str())])
+                .unwrap();
+        }
+
+        let mut symbol_uids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let uid = format!("sym:kindsskip{i}");
+            store
+                .insert_symbol(&mk_symbol(
+                    &uid,
+                    "repo:kindsskip",
+                    &format!("src/f{i}.rs"),
+                    &uid,
+                ))
+                .unwrap();
+            symbol_uids.push(uid);
+        }
+        store
+            .batch_insert_project_symbol_edges("proj:kindsskip", &symbol_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "KindsSkip",
+                "token_budget": 400,
+                "response_format": "detailed",
+                "kinds": ["Symbol"],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        assert!(
+            !connected.is_empty(),
+            "symbol-only kinds must still return member symbols; got {connected:?}"
+        );
+        for node in connected {
+            let kind = node["kind"].as_str().unwrap_or_default();
+            assert!(
+                kind.to_lowercase().starts_with("symbol"),
+                "kinds=[Symbol] must not return notes; got kind={kind} node={node}"
+            );
+        }
+        let returned: std::collections::HashSet<&str> =
+            connected.iter().filter_map(|n| n["uid"].as_str()).collect();
+        assert!(
+            symbol_uids
+                .iter()
+                .any(|uid| returned.contains(uid.as_str())),
+            "at least one member symbol must survive; got {connected:?}"
+        );
+
+        let prefix_only = tool_project_context(
+            &store,
+            None,
+            json!({
+                "project": "KindsSkip",
+                "token_budget": 400,
+                "response_format": "detailed",
+                "kinds": ["sym"],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let prefix_connected = prefix_only["connected"].as_array().expect("connected");
+        assert!(
+            prefix_connected.iter().all(|n| n["kind"]
+                .as_str()
+                .is_some_and(|k| k.to_lowercase().starts_with("symbol"))),
+            "`kinds: [\"sym\"]` must skip notes the same way as Symbol; got {prefix_connected:?}"
+        );
     }
 
     /// nw-470 follow-up (code-quality review). `"repos": []` (an explicit
