@@ -273,6 +273,47 @@ impl Drop for UnownedPidfileLock {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnownedPidfileReap {
+    /// Pathname inode matched the locked fd and was unlinked.
+    Unlinked {
+        pid: Option<i32>,
+    },
+    /// The locked fd is not the current pathname (typically a live daemon
+    /// still holds flock on an unlinked original inode).
+    PathnameMoved,
+    AlreadyAbsent,
+}
+
+/// Unlink `path` only after proving `file` is still that pathname's inode.
+///
+/// The caller must already hold an exclusive flock on `file`. Flock lives on
+/// the inode, not the path: after `rm daemon.pid` a live daemon keeps the
+/// lock on the unlinked file, and `create(true)` makes a new inode we can
+/// lock without contention. Unlinking that replacement would be fine; claiming
+/// we cleaned up a live owner's pidfile would not.
+fn reap_unowned_pidfile(
+    file: &fs::File,
+    path: &Path,
+    pid: Option<i32>,
+) -> std::io::Result<UnownedPidfileReap> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    match fs::symlink_metadata(path) {
+        Ok(current)
+            if current.is_file() && current.dev() == held.dev() && current.ino() == held.ino() =>
+        {
+            fs::remove_file(path)?;
+            Ok(UnownedPidfileReap::Unlinked { pid })
+        }
+        Ok(_) => Ok(UnownedPidfileReap::PathnameMoved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(UnownedPidfileReap::AlreadyAbsent)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Attempt to own this exact pidfile inode. `true` is authoritative evidence
 /// that no daemon holds it, regardless of whether its numeric contents happen
 /// to name a live (recycled) process.
@@ -409,11 +450,31 @@ fn ensure_daemon_impl(
         Err(error) => bail!("flock on pidfile failed: {error}"),
     }
 
-    // We acquired the lock, so no daemon owns this pidfile. Its numeric PID is
-    // stale even if the kernel has recycled that number for another live
+    // We acquired the lock, so no daemon owns THIS pidfile inode. Its numeric
+    // PID is stale even if the kernel has recycled that number for another live
     // process; never mistake numeric liveness for daemon ownership.
-    if let Some(pid) = read_pid_from_file(&mut file) {
-        warn!(pid, "unowned daemon pidfile is stale — cleaning up");
+    //
+    // Claiming "cleaning up" without unlinking was a no-op lie: the file kept
+    // the old PID and mtime. Only log after the pathname inode is gone, and
+    // never unlink a replacement inode (a live daemon can hold flock on an
+    // unlinked original while `create(true)` made this new file).
+    let stale_pid = read_pid_from_file(&mut file);
+    match reap_unowned_pidfile(&file, &pidfile, stale_pid) {
+        Ok(UnownedPidfileReap::Unlinked { pid: Some(pid) }) => {
+            warn!(pid, "unowned daemon pidfile is stale — cleaning up");
+        }
+        Ok(UnownedPidfileReap::Unlinked { pid: None }) => {
+            debug!("unowned empty pidfile unlinked");
+        }
+        Ok(UnownedPidfileReap::PathnameMoved) => {
+            debug!(
+                "acquired flock on a pidfile inode that is no longer the pathname; not claiming cleanup"
+            );
+        }
+        Ok(UnownedPidfileReap::AlreadyAbsent) => {}
+        Err(error) => {
+            warn!(error = %error, "failed to reap unowned pidfile");
+        }
     }
 
     // Clean up a stale socket — but never one a live daemon is still serving.
@@ -1293,6 +1354,94 @@ credential_method = "gh"
         );
         unsafe {
             libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[test]
+    fn reap_unlinks_only_the_locked_pathname_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&pidfile)
+            .unwrap();
+        write!(file, "2147483647").unwrap();
+        assert!(try_acquire_pidfile_lock(&file).unwrap());
+        assert_eq!(
+            reap_unowned_pidfile(&file, &pidfile, Some(2147483647)).unwrap(),
+            UnownedPidfileReap::Unlinked {
+                pid: Some(2147483647)
+            }
+        );
+        assert!(
+            !pidfile.exists(),
+            "claiming cleanup requires the pathname to be gone"
+        );
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[test]
+    fn reap_does_not_unlink_a_replacement_pathname_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let mut original = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&pidfile)
+            .unwrap();
+        write!(&mut original, "1").unwrap();
+        assert!(try_acquire_pidfile_lock(&original).unwrap());
+        fs::remove_file(&pidfile).unwrap();
+        fs::write(&pidfile, "replacement").unwrap();
+        assert_eq!(
+            reap_unowned_pidfile(&original, &pidfile, Some(1)).unwrap(),
+            UnownedPidfileReap::PathnameMoved
+        );
+        assert_eq!(
+            fs::read_to_string(&pidfile).unwrap(),
+            "replacement",
+            "a live daemon's replacement pidfile must not be unlinked as stale"
+        );
+        unsafe {
+            libc::flock(original.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[test]
+    fn held_pidfile_flock_prevents_a_contender_from_reaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let mut owner = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&pidfile)
+            .unwrap();
+        write!(&mut owner, "{}", std::process::id()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+        assert!(
+            !try_acquire_pidfile_lock(&contender).unwrap(),
+            "a live flock must not look unowned"
+        );
+        assert!(pidfile.exists());
+        unsafe {
+            libc::flock(owner.as_raw_fd(), libc::LOCK_UN);
         }
     }
 
