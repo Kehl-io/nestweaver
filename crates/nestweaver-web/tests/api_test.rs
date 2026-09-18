@@ -255,6 +255,90 @@ async fn symbol_lookup_by_ambiguous_name_is_not_bare_300() {
     );
 }
 
+fn error_message(json: &Value) -> &str {
+    json.get("error").and_then(Value::as_str).unwrap_or("")
+}
+
+#[tokio::test]
+async fn symbol_lookup_note_uid_is_not_missing_symbol() {
+    let store = setup_test_store();
+    store
+        .insert_vault(&Vault {
+            uid: "vault:test".to_string(),
+            name: "test-vault".to_string(),
+            root_path: "/tmp/test-vault".to_string(),
+            instance_id: String::new(),
+        })
+        .unwrap();
+    store
+        .insert_note(&Note {
+            uid: "note:test:alpha".to_string(),
+            vault_uid: "vault:test".to_string(),
+            file_path: "Alpha.md".to_string(),
+            title: "Alpha".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 12,
+            content_hash: "note-hash".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: Some(0.4),
+            embedding: None,
+        })
+        .unwrap();
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/note-symbol.lbug"));
+    let app = create_router(state);
+
+    let (missing_status, missing_json) =
+        get_json(&app, "/api/v1/symbol/note:does-not-exist").await;
+    let missing_error = error_message(&missing_json);
+    assert!(
+        !missing_error.contains("symbol 'note:"),
+        "note: UIDs must not 404 as missing code symbols: status={missing_status} body={missing_json}"
+    );
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert!(
+        missing_error.contains("note 'note:does-not-exist' not found"),
+        "missing note: UID should 404 from the note handler: {missing_json}"
+    );
+
+    let (status, json) = get_json(&app, "/api/v1/symbol/note:test:alpha").await;
+    let err = error_message(&json);
+    assert!(
+        !err.contains("symbol 'note:"),
+        "selecting a vault note must not hit symbol-by-uid 404: status={status} body={json}"
+    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["note"]["uid"], "note:test:alpha");
+    assert_eq!(json["note"]["title"], "Alpha");
+}
+
+#[tokio::test]
+async fn symbol_lookup_file_path_with_kind_file_is_not_missing_symbol() {
+    let app = make_app();
+    let (status, json) = get_json(&app, "/api/v1/symbol/src%2Fmain.js?kind=file").await;
+    let err = error_message(&json);
+    assert!(
+        !err.contains("symbol 'src/main.js' not found"),
+        "kind=file must not 404 as a missing symbol when the file exists: status={status} body={json}"
+    );
+    assert_eq!(status, StatusCode::OK);
+    let listed = json
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            json.get("symbols")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .expect("file lookup should return symbols for the path");
+    assert!(
+        listed.iter().any(|item| item["file_path"] == "src/main.js"),
+        "file selection should surface symbols from the indexed path: {json}"
+    );
+}
+
 #[tokio::test]
 async fn context_returns_seeds_and_connected() {
     let app = make_app();
