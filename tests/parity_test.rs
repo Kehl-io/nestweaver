@@ -362,6 +362,25 @@ fn setup_fixture_with_vault_note() -> Fixture {
     fixture
 }
 
+/// Extra unresolved wikilinks so `--limit 1` actually truncates a category
+/// on both CLI routes (nw-485). Unique missing targets, not fuzzy matches.
+fn add_unresolved_wikilink_notes(fixture: &Fixture, extra: usize) {
+    let vault_dir = fixture.db_path.parent().unwrap().join("memory-vault");
+    for i in 1..=extra {
+        std::fs::write(
+            vault_dir.join(format!("Gap{i}.md")),
+            format!("# Gap{i}\n\n[[DefinitelyMissingNote{i}XYZ]]\n"),
+        )
+        .unwrap();
+    }
+    no_daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db", &fixture.db_path.display().to_string()])
+        .assert()
+        .success();
+}
+
 /// A two-repo fixture for `cross_repo_contracts`: `repo-a` exports
 /// `sharedHandler`, `repo-b` exports an unrelated `useHandler`, and a
 /// `CROSS_REPO_LINK` edge is inserted directly between the two real, indexed
@@ -2945,9 +2964,17 @@ fn parity_cross_repo_contracts_direct_vs_daemon() {
 #[test]
 fn parity_memory_lint_direct_vs_daemon() {
     let fixture = setup_fixture_with_vault_note();
+    add_unresolved_wikilink_notes(&fixture, 3);
     check_parity_json_semantic(&fixture.db_path, "memory lint", &["memory", "lint"]);
-    let db = &fixture.db_path;
-    let capped = run_direct(db, &["memory", "lint", "--json", "--limit", "1"]);
+    check_parity_json_semantic(
+        &fixture.db_path,
+        "memory lint --limit 1",
+        &["memory", "lint", "--limit", "1"],
+    );
+    let capped = run_direct(
+        &fixture.db_path,
+        &["memory", "lint", "--json", "--limit", "1"],
+    );
     assert!(
         capped.status.success(),
         "memory lint --limit 1 failed:\n{}",
@@ -2955,18 +2982,21 @@ fn parity_memory_lint_direct_vs_daemon() {
     );
     let capped_json = parse_stdout("memory lint --limit 1", &capped);
     assert_eq!(capped_json["limit"], serde_json::json!(1));
-    assert!(
-        !capped_json["broken_wikilinks"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-            || capped_json["broken_wikilinks_total"].as_u64().unwrap_or(0) > 0,
-        "fixture must still produce a broken_wikilinks finding: {capped_json}"
+    let total = capped_json["broken_wikilinks_total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("broken_wikilinks_total must be present: {capped_json}"));
+    let returned = capped_json["broken_wikilinks"]
+        .as_array()
+        .unwrap()
+        .len() as u64;
+    assert_eq!(
+        returned, 1,
+        "limit 1 must return one row, not the whole category: {capped_json}"
     );
-    let total = capped_json["broken_wikilinks_total"].as_u64().unwrap_or(0);
-    let returned = capped_json["broken_wikilinks"].as_array().unwrap().len() as u64;
-    assert!(returned <= 1);
-    assert!(total >= returned);
+    assert!(
+        total > 1,
+        "the fixture must exceed the cap or truncation is unproven: total={total} {capped_json}"
+    );
 }
 
 /// nw-485. Same shared MCP envelope on both routes, including
