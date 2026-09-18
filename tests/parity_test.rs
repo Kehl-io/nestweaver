@@ -1562,6 +1562,69 @@ fn parity_read_symbols_direct_vs_daemon() {
     );
 }
 
+/// nw-470. The `--root` row above still proves an explicit tree. The product
+/// change is that OMITTING `--root` must read from each repo's recorded
+/// `local_root`, even when cwd is somewhere else — otherwise both routes can
+/// agree on empty bodies and look like parity.
+#[test]
+fn parity_read_symbols_omitted_root_reads_repo_local_root() {
+    let fixture = setup_fixture();
+    let elsewhere = fixture
+        .db_path
+        .parent()
+        .expect("db lives under a temp parent")
+        .join("not-the-repo");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let args = ["read-symbols", "mainA"];
+
+    let direct = {
+        let mut cmd = StdCommand::new(bin_path());
+        cmd.current_dir(&elsewhere)
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .args(args)
+            .arg("--db")
+            .arg(&fixture.db_path);
+        cmd.output()
+            .expect("failed to run nestweaver (direct, omitted root)")
+    };
+    assert!(
+        direct.status.success(),
+        "read-symbols omitted --root (direct) failed:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_out = String::from_utf8_lossy(&direct.stdout);
+    assert!(
+        direct_out.contains("export function mainA"),
+        "direct route must read the span from repo local_root when cwd is not the repo: {direct_out:?}"
+    );
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    let daemon = {
+        let mut cmd = StdCommand::new(bin_path());
+        cmd.current_dir(&elsewhere)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+        #[cfg(not(target_os = "macos"))]
+        cmd.env("NESTWEAVER_DAEMON_FORK", "1");
+        cmd.args(args).arg("--db").arg(&fixture.db_path);
+        cmd.output()
+            .expect("failed to run nestweaver (daemon, omitted root)")
+    };
+    assert!(
+        daemon.status.success(),
+        "read-symbols omitted --root (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    assert_both_ran_for_real("read-symbols omitted --root", "human", &direct, &daemon);
+    let daemon_out = String::from_utf8_lossy(&daemon.stdout);
+    assert_eq!(
+        direct.stdout, daemon.stdout,
+        "omitted --root must be identical on both routes\n--- direct ---\n{direct_out}\n--- daemon ---\n{daemon_out}"
+    );
+}
+
 #[test]
 fn parity_detect_changes_direct_vs_daemon() {
     let fixture = setup_fixture();
