@@ -619,6 +619,12 @@ impl SeedNameMatchTally {
         }
     }
 
+    fn record_exact(&mut self, count: usize) {
+        self.applicable = true;
+        self.resolved += count;
+        self.matched += count;
+    }
+
     /// The honest match total, or `None` when no bare-name input was resolved
     /// and there is therefore nothing to disclose.
     fn total(&self) -> Option<usize> {
@@ -906,23 +912,51 @@ pub fn build_context_with_intent(
                 seed_uids.push(sym.uid);
             }
         } else {
-            // Name search — take up to `SEED_NAME_MATCH_LIMIT` matches.
-            //
-            // nw-393: the `_page` variant, not the `total`-discarding
-            // `search_symbols_by_name` wrapper. Both run the identical scan;
-            // the wrapper's only difference is that it drops the count on the
-            // floor, and that dropped count is the entire disclosure gap —
-            // the honest number was already computed on every single call.
-            let page = store
-                .search_symbols_by_name_page(
-                    input,
-                    SEED_NAME_MATCH_LIMIT,
-                    &nestweaver_store::SeedResolutionConfig::default(),
-                )
+            // Exact name first. An ambiguous exact name is a lookup refusal
+            // (exit 3), not a substring union that also seeds `ping2`.
+            let exact = store
+                .lookup_symbols_by_name(input)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            seed_name_tally.record(&page);
-            for sym in page.symbols {
-                seed_uids.push(sym.uid);
+            match exact.len() {
+                0 => {
+                    // Name search — take up to `SEED_NAME_MATCH_LIMIT` matches.
+                    //
+                    // nw-393: the `_page` variant, not the `total`-discarding
+                    // `search_symbols_by_name` wrapper. Both run the identical scan;
+                    // the wrapper's only difference is that it drops the count on the
+                    // floor, and that dropped count is the entire disclosure gap —
+                    // the honest number was already computed on every single call.
+                    let page = store
+                        .search_symbols_by_name_page(
+                            input,
+                            SEED_NAME_MATCH_LIMIT,
+                            &nestweaver_store::SeedResolutionConfig::default(),
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    seed_name_tally.record(&page);
+                    for sym in page.symbols {
+                        seed_uids.push(sym.uid);
+                    }
+                }
+                1 => {
+                    seed_name_tally.record_exact(1);
+                    seed_uids.push(exact.into_iter().next().expect("len == 1").uid);
+                }
+                n => {
+                    let listing = exact
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "  {} [{}] {}:{}",
+                                s.uid, s.kind, s.file_path, s.start_line
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    anyhow::bail!(
+                        "Ambiguous: '{input}' matches {n} symbols (pass a UID):\n{listing}"
+                    );
+                }
             }
         }
     }

@@ -1200,11 +1200,20 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
             // DIFFERENT outcome with a different exit code (3) and a different
             // remedy, and `impact` already learned the hard way that a shape a
             // consumer cannot tell apart from a result is worse than none.
+            let candidate_uids: Vec<&str> = message
+                .lines()
+                .filter_map(|line| {
+                    let token = line.trim().split_whitespace().next()?;
+                    token.contains(':').then_some(token)
+                })
+                .collect();
             println!(
                 "{}",
                 serde_json::json!({
                     "error": "ambiguous",
+                    "status": "ambiguous",
                     "seeds": seeds,
+                    "candidate_uids": candidate_uids,
                     "message": message,
                 })
             );
@@ -1242,6 +1251,45 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
 /// its cluster id back, not a field called `name`.
 fn print_json_not_found(target_key: &str, target: &str) {
     print_json_not_found_detail(target_key, &serde_json::json!(target), None);
+}
+
+/// Shared exit-3 rendering for name-lookup refusals that are not `impact`.
+fn report_ambiguous_name_payload(
+    symbol: &str,
+    payload: &serde_json::Value,
+    json: bool,
+) -> anyhow::Result<(i32, Option<String>)> {
+    if json {
+        print_json_payload(payload)?;
+    } else {
+        let candidates = payload
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        eprintln!(
+            "Ambiguous: '{}' matches {} symbols:",
+            symbol,
+            candidates.len()
+        );
+        for c in &candidates {
+            eprintln!(
+                "  {} [{}] {}:{}",
+                c.get("uid").and_then(|v| v.as_str()).unwrap_or("?"),
+                c.get("kind").and_then(|v| v.as_str()).unwrap_or("Symbol"),
+                c.get("file_path").and_then(|v| v.as_str()).unwrap_or("?"),
+                c.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0)
+            );
+        }
+        if let Some(note) = payload.get("note").and_then(|v| v.as_str()) {
+            eprintln!("{note}");
+        }
+    }
+    Ok((EXIT_AMBIGUOUS, None))
+}
+
+fn payload_is_ambiguous(payload: &serde_json::Value) -> bool {
+    payload.get("status").and_then(|v| v.as_str()) == Some("ambiguous")
 }
 
 /// [`print_json_not_found`] where the target is not a single string (`context`
@@ -6951,6 +6999,11 @@ enum Commands {
             help = "Maximum tree depth (1-15; matches the MCP flow_trace schema)"
         )]
         max_depth: u32,
+        #[arg(
+            long,
+            help = "Disambiguate an ambiguous symbol name (uid, display name, or local root)"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15322,6 +15375,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error) if format!("{error:#}").contains("Ambiguous") => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": "ambiguous",
+                                "status": "ambiguous",
+                                "symbol": symbol,
+                                "message": format!("{error:#}"),
+                            })
+                        );
+                    } else {
+                        eprintln!("{error:#}");
+                    }
+                    return Ok((EXIT_AMBIGUOUS, None));
+                }
                 Err(error) if format!("{error:#}").contains("no symbol found") => {
                     if json {
                         print_json_not_found("symbol", &symbol);
@@ -15331,6 +15400,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&symbol, &payload, json);
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -17921,6 +17993,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::FlowTrace {
             symbol,
             max_depth,
+            repo,
             json,
             db,
             config,
@@ -17928,10 +18001,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
 
-            let args = serde_json::json!({
+            let mut args = serde_json::json!({
                 "symbol": symbol,
                 "max_depth": max_depth,
             });
+            if let Some(repo) = &repo {
+                args["repo"] = serde_json::json!(repo);
+            }
 
             // nw-399: same classification, both routes. TWO phrases, because
             // `flow_trace` has two ways to miss: a bare name dies in
@@ -17967,6 +18043,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error)
                     if {
                         let rendered = format!("{error:#}");
+                        rendered.contains("Ambiguous")
+                    } =>
+                {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": "ambiguous",
+                                "status": "ambiguous",
+                                "symbol": symbol,
+                                "message": format!("{error:#}"),
+                            })
+                        );
+                    } else {
+                        eprintln!("{error:#}");
+                    }
+                    return Ok((EXIT_AMBIGUOUS, None));
+                }
+                Err(error)
+                    if {
+                        let rendered = format!("{error:#}");
                         rendered.contains("not found") || rendered.contains("no symbol found")
                     } =>
                 {
@@ -17978,6 +18075,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&symbol, &payload, json);
+            }
 
             if json {
                 print_json_payload(&payload)?;
