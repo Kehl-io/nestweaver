@@ -15345,7 +15345,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // nw-399: BOTH routes classified in one place, so the answer to
             // "does this symbol exist?" cannot depend on whether a daemon was
             // running. `cross_repo_contracts` says `no symbol found: '<name>'`
-            // (`resolve_symbol_uid`, tools.rs) — matched on that specific
+            // (`resolve_symbol_strict`, tools.rs) — matched on that specific
             // phrase rather than on a bare "not found", because
             // `require_existing_db` above has already ruled the DATABASE in and
             // a broader substring test would reclassify a store failure as a
@@ -18011,7 +18011,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // nw-399: same classification, both routes. TWO phrases, because
             // `flow_trace` has two ways to miss: a bare name dies in
-            // `resolve_symbol_uid` as `no symbol found: '<s>'`, while a
+            // `resolve_symbol_strict` as `no symbol found: '<s>'`, while a
             // `sym:`-prefixed uid gets past it and dies in the store lookup as
             // `symbol '<s>' not found`. Matching only the second is how the
             // MEASURED case — a plain name — kept its exit 1 and its zero bytes.
