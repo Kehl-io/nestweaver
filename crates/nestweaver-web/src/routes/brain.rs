@@ -82,8 +82,10 @@ pub async fn list_notes(
         .limit
         .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
         .min(LIST_NOTES_LIMIT_MAX);
-    let offset = params.offset.unwrap_or(0);
+    let offset = params.offset.unwrap_or(0).min(LIST_NOTES_LIMIT_MAX);
     // Raw JSON array, matching `/brain/vaults`, `/brain/tags`, and `/symbols/top`.
+    // Offset is capped at LIST_NOTES_LIMIT_MAX so Cypher's LIMIT offset+limit
+    // cannot reconstruct an unbounded scan via ?limit=1000&offset=N.
     let notes = state.store.list_notes_page(None, limit, offset)?;
     let json = serde_json::to_value(&notes)?;
     Ok(Json(json).into_response())
