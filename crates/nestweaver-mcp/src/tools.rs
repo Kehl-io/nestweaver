@@ -7923,16 +7923,21 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 
 // ── 4. backlinks ────────────────────────────────────────────────────────────
 
+const BACKLINKS_DEFAULT_LIMIT: usize = 20;
+
 fn tool_schema_backlinks() -> Value {
     json!({
         "name": "backlinks",
-        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
+        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- `count` is the returned page length; `total` is the untruncated occurrence count; raise `limit` (1-1000, default 20) when `truncated` is true\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred for unambiguous lookup." },
-                "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." }
+                "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." },
+                "limit": limit_schema(
+                    "Max backlink occurrences to return (1-1000, default 20). `total` is the untruncated count; `truncated` is true when more exist than returned.",
+                    BACKLINKS_DEFAULT_LIMIT, 1, RESULT_LIMIT_MAX)
             },
             // nw-410: the either/or requirement, declared where the
             // validator, `tools/list` and `brain_guide` can all read it.
@@ -8053,12 +8058,17 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         return Err(anyhow!("provide either 'uid' or 'title'"));
     };
 
+    let limit = read_limit(&args, "limit", BACKLINKS_DEFAULT_LIMIT, 1, RESULT_LIMIT_MAX)?;
+
     let backlinks = store
         .wikilink_sources_to_note(&target_uid)
         .context("wikilink_sources_to_note")?;
 
+    let total = backlinks.len();
+    let truncated = total > limit;
     let rows: Vec<Value> = backlinks
         .iter()
+        .take(limit)
         .map(|b| {
             json!({
                 "source_note_uid": b.source_note_uid,
@@ -8075,6 +8085,9 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         "target_uid": target_uid,
         "count": rows.len(),
         "backlinks": rows,
+        "truncated": truncated,
+        "limit": limit,
+        "total": total,
     }))
 }
 
