@@ -16,6 +16,23 @@ pub fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
     }
 }
 
+/// Same pin/UID guidance as [`impact_ambiguity_remedy`], without claiming
+/// an impact walk ran. Used by flow-trace, cross-repo-contracts, and other
+/// name lookups.
+pub fn name_lookup_ambiguity_remedy(repo_filter: Option<&str>) -> String {
+    match repo_filter {
+        Some(repo) => format!(
+            "the symbol name matched multiple symbols. \
+             --repo {repo} is already set and every match is inside it, so it \
+             cannot separate them. Pass a full UID instead — each candidate \
+             below carries one."
+        ),
+        None => "the symbol name matched multiple symbols. \
+                 Disambiguate with --repo <name> or pass a full UID"
+            .to_string(),
+    }
+}
+
 /// Same candidate objects `impact` / `read-symbols` already list for exit 3.
 pub fn name_lookup_candidates(candidates: Value) -> Vec<Value> {
     let mut candidates: Vec<Value> = candidates
@@ -68,7 +85,7 @@ pub fn name_lookup_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates
         "symbol": symbol,
         "candidates": candidates,
         "candidate_uids": candidate_uids,
-        "note": impact_ambiguity_remedy(repo_filter),
+        "note": name_lookup_ambiguity_remedy(repo_filter),
     })
 }
 
@@ -226,5 +243,21 @@ mod tests {
         for key in cli.as_object().unwrap().keys() {
             assert!(empty.get(key).is_some(), "missing {key}");
         }
+    }
+
+    #[test]
+    fn name_lookup_ambiguous_does_not_claim_an_impact_walk() {
+        let payload = name_lookup_ambiguous(
+            "ping",
+            None,
+            json!([{"uid":"sym:a","name":"ping","file_path":"a.py","start_line":1}]),
+        );
+        let note = payload["note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("impact"),
+            "flow-trace/cross-repo-contracts reuse this note: {note}"
+        );
+        assert_eq!(note, name_lookup_ambiguity_remedy(None));
+        assert_ne!(note, impact_ambiguity_remedy(None));
     }
 }

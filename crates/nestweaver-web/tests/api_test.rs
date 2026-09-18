@@ -237,21 +237,11 @@ async fn symbol_lookup_by_ambiguous_name_is_not_bare_300() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
 
-    assert!(
-        status != StatusCode::MULTIPLE_CHOICES || location.is_some(),
-        "GET /api/v1/symbol/ping must not be HTTP 300 without Location (fetch() treats that as failure); \
-         status={status} body={json}"
-    );
-    assert_ne!(
+    assert_eq!(
         status,
-        StatusCode::OK,
-        "an ambiguous name must not look like a unique hit: {json}"
-    );
-    assert!(
-        status == StatusCode::CONFLICT
-            || (status == StatusCode::MULTIPLE_CHOICES && location.is_some())
-            || status.is_client_error(),
-        "prefer 409 with JSON candidates; got {status} body={json}"
+        StatusCode::CONFLICT,
+        "GET /api/v1/symbol/ping must be HTTP 409 with JSON candidates (fetch() treats bare 300 as failure); \
+         location={location:?} body={json}"
     );
     let listed = json
         .get("candidate_uids")

@@ -196,19 +196,6 @@ fn resolve_symbol_strict(
     }
 }
 
-/// Resolve a symbol name to a UID. Ambiguous exact names are refused.
-#[allow(dead_code)]
-fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, anyhow::Error> {
-    match resolve_symbol_strict(store, name_or_uid, None, None)? {
-        StrictNameResolve::Found(uid) => Ok(uid),
-        StrictNameResolve::NotFound => Err(anyhow!("no symbol found: '{name_or_uid}'")),
-        StrictNameResolve::Ambiguous(candidates) => Err(anyhow!(
-            "Ambiguous: '{name_or_uid}' matches {} symbols",
-            candidates.len()
-        )),
-    }
-}
-
 // ── nw-405/406/407: scope filters for brain_context / project_context ───────
 //
 // nw-421: `NodeOwner`, `node_owner`, `resolve_repo_filter`,
@@ -318,25 +305,6 @@ fn restricted_repo_identities(
 // restated here — this predicate's own fail-closed-on-empty-UID behavior is
 // exactly what nw-421's lift almost silently dropped by re-deriving it from
 // `VisibleRepos::allows` instead of reusing it; see that import site.
-
-/// Resolve only inside the caller's visible repositories. Hidden and unknown
-/// UIDs deliberately collapse to the same not-found error. Ambiguous visible
-/// names are refused rather than silently preferred.
-#[allow(dead_code)]
-fn resolve_visible_symbol_uid(
-    store: &GraphStore,
-    name_or_uid: &str,
-    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
-) -> Result<String, anyhow::Error> {
-    match resolve_symbol_strict(store, name_or_uid, visible, None)? {
-        StrictNameResolve::Found(uid) => Ok(uid),
-        StrictNameResolve::NotFound => Err(anyhow!("no symbol found: '{name_or_uid}'")),
-        StrictNameResolve::Ambiguous(candidates) => Err(anyhow!(
-            "Ambiguous: '{name_or_uid}' matches {} symbols",
-            candidates.len()
-        )),
-    }
-}
 
 // ── nw-403: per-repo visibility, per tool ───────────────────────────────────
 
@@ -26030,6 +25998,11 @@ mod ambiguous_name_contract_tests {
         )
         .expect("ambiguous flow_trace is a structured refusal, not a hard crash");
         assert_ambiguous_tool_payload("flow_trace", &payload);
+        let note = payload["note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("impact"),
+            "flow_trace must not reuse impact's 'no impact was computed' note: {payload}"
+        );
         assert!(
             payload.get("children").is_none() || payload["status"] == "ambiguous",
             "must not return a silent callee tree for an ambiguous root: {payload}"
