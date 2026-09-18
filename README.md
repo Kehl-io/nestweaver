@@ -404,7 +404,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain watch` | Watch vaults for changes and re-index automatically. `--force` adopts an existing watcher registration instead of being refused by it — the vault counterpart of `watch --force` |
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
-| `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. `any_stale` / `is_stale` mean *behind HEAD* specifically |
+| `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. A repo that indexed successfully with **zero eligible source files** is `no_indexable_content` (human: `empty`) and does **not** pin exit 2. `any_stale` / `is_stale` mean *behind HEAD* specifically |
 | `brain diff <repo>` | Show what changed in the graph since a commit (`--since-sha <sha>`, `--limit` 1–1000 default 50, `--json`, `--db`, `--config`). Local repos only; the CLI twin of the MCP `brain_diff` tool |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
 | `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
@@ -414,9 +414,9 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
 | `backlinks` | Resolve a note by UID or title and list the notes that link to it |
 | `note get <target>` | Read one note by `note:` UID or by title (`--json`, `--db`, `--config`). Read-only; the CLI twin of the MCP `note_get` tool. **Exits 2** when the title or UID resolves to nothing |
-| `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
-| `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files) |
-| `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.) |
+| `memory lint` | Health checks over the vault (stale notes, broken links, orphans). `--limit` 1–1000 (default 50) caps each category; `*_total` is always reported |
+| `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files). `--limit` 1–1000 (default 50) caps returned proposals |
+| `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.). `--limit` 1–1000 (default 50) with `returned`/`total`/`truncated` |
 
 </details>
 
@@ -502,7 +502,7 @@ dead:
 | `list-features` | List features spanning multiple repositories |
 | `clusters` | Detect community clusters in the dependency graph (Louvain-style local moving, single-level; results cached in a sidecar, `cluster <id\|name>` reads the cache) |
 | `cross-repo-contracts` | Run the MCP-compatible cross-repository contract query for a symbol name or UID |
-| `cross-repo-refs` | Legacy cross-repository reference view; use `cross-repo-contracts` for MCP-equivalent output |
+| `cross-repo-refs` | Same JSON envelope as `cross-repo-contracts` / the `cross_repo_contracts` MCP tool (including `link_type: "contract"` rows). `--repo` only disambiguates an ambiguous symbol name before that query; it is not the contracts row filter |
 
 </details>
 
