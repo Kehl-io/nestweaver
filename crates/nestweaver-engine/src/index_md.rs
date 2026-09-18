@@ -952,6 +952,7 @@ pub fn index_markdown_directory_since_with_ignore_and_write_lease(
 
 /// Incremental markdown indexing under an exact writer authority with a
 /// caller-supplied note-size policy.
+#[allow(clippy::too_many_arguments)]
 pub fn index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits(
     vault_root: &Path,
     db_path: &Path,
