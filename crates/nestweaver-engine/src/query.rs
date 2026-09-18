@@ -1343,7 +1343,7 @@ mod context_tests {
     }
 
     #[test]
-    fn build_context_refuses_or_does_not_extra_seed_ping2_when_ping_is_ambiguous() {
+    fn build_context_refuses_ambiguous_exact_ping() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
         fs::create_dir_all(&src).unwrap();
@@ -1362,22 +1362,13 @@ mod context_tests {
             "fixture must index two exact ping symbols; got {exact:?}"
         );
 
-        match build_context(&store, &["ping".to_string()]) {
-            Err(error) => {
-                let message = error.to_string();
-                assert!(
-                    message.contains("Ambiguous"),
-                    "ambiguous exact name must say so: {message}"
-                );
-            }
-            Ok(result) => {
-                assert!(
-                    result.seeds.iter().all(|s| s.name != "ping2"),
-                    "must not extra-seed substring ping2 when ping is an exact ambiguous name; seeds={:?}",
-                    result.seeds
-                );
-            }
-        }
+        let message = build_context(&store, &["ping".to_string()])
+            .expect_err("ambiguous exact ping must refuse, not union every ping as seeds")
+            .to_string();
+        assert!(
+            message.contains("Ambiguous"),
+            "ambiguous exact name must say so: {message}"
+        );
     }
 
     /// nw-446 (criteria 1-3): `context`'s not-found message must name

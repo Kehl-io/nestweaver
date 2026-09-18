@@ -26049,4 +26049,37 @@ mod ambiguous_name_contract_tests {
         .expect("ambiguous cross_repo_contracts is a structured refusal, not a hard crash");
         assert_ambiguous_tool_payload("cross_repo_contracts", &payload);
     }
+
+    #[test]
+    fn flow_trace_repo_uniquely_pins_python_ping() {
+        let store = ambiguous_ping_store();
+        let payload = dispatch(
+            &store,
+            None,
+            "flow_trace",
+            json!({ "symbol": "ping", "repo": "py-ping" }),
+            None,
+        )
+        .expect("unique repo pin must proceed");
+        assert_ne!(
+            payload["status"].as_str(),
+            Some("ambiguous"),
+            "py-ping uniquely names one ping: {payload}"
+        );
+        assert_eq!(
+            payload["root_uid"].as_str(),
+            Some("sym:py-ping:ping"),
+            "must trace the Python ping, not another language: {payload}"
+        );
+
+        let still = dispatch(
+            &store,
+            None,
+            "flow_trace",
+            json!({ "symbol": "ping", "repo": "ping" }),
+            None,
+        )
+        .expect("still-ambiguous selector is a structured refusal");
+        assert_ambiguous_tool_payload("flow_trace -- repo=ping", &still);
+    }
 }
