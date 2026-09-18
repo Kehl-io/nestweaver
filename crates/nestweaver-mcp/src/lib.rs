@@ -488,6 +488,23 @@ impl std::error::Error for StdoutWriteError {
     }
 }
 
+/// Write a JSON-RPC 2.0 error frame to stdout before the stdio session starts.
+///
+/// MCP clients read stdout as the wire. A boot failure that only prints a
+/// miette report on stderr leaves stdout empty and looks like a BrokenPipe.
+pub fn write_stdio_boot_error(message: impl Into<String>) -> Result<(), StdoutWriteError> {
+    write_stdio_boot_error_to(&mut std::io::stdout(), message)
+}
+
+fn write_stdio_boot_error_to(
+    out: &mut impl Write,
+    message: impl Into<String>,
+) -> Result<(), StdoutWriteError> {
+    let frame = error(Value::Null, error_code::INTERNAL_ERROR, message);
+    let serialized = serde_json::to_string(&frame).expect("JSON-RPC error is valid JSON");
+    write_stdout_frame(out, &serialized)
+}
+
 /// nw-363. Every outbound JSON-RPC frame passes through here, and it is the
 /// only place that can hold this property.
 ///
@@ -1373,6 +1390,24 @@ mod tests {
         let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
         maybe_record_terminal_success(&tracker);
         assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn boot_error_is_a_jsonrpc_error_frame() {
+        let mut buf = Vec::new();
+        write_stdio_boot_error_to(&mut buf, "database corruption (unreadable write-ahead log)")
+            .unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap().trim()).unwrap();
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], serde_json::Value::Null);
+        assert_eq!(frame["error"]["code"], -32603);
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("write-ahead")
+        );
     }
 }
 #[test]
