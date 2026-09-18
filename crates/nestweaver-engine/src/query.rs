@@ -1308,6 +1308,44 @@ mod context_tests {
         );
     }
 
+    #[test]
+    fn build_context_refuses_or_does_not_extra_seed_ping2_when_ping_is_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.js"),
+            "export function ping() { return 1; }\nexport function ping2() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(src.join("lib.py"), "def ping():\n    return 1\n").unwrap();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let exact = store.lookup_symbols_by_name("ping").unwrap();
+        assert!(
+            exact.len() >= 2,
+            "fixture must index two exact ping symbols; got {exact:?}"
+        );
+
+        match build_context(&store, &["ping".to_string()]) {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("Ambiguous"),
+                    "ambiguous exact name must say so: {message}"
+                );
+            }
+            Ok(result) => {
+                assert!(
+                    result.seeds.iter().all(|s| s.name != "ping2"),
+                    "must not extra-seed substring ping2 when ping is an exact ambiguous name; seeds={:?}",
+                    result.seeds
+                );
+            }
+        }
+    }
+
     /// nw-446 (criteria 1-3): `context`'s not-found message must name
     /// `investigate` as the command for a natural-language question,
     /// carrying the user's ACTUAL argument so the remedy is copy-pasteable
