@@ -7050,6 +7050,9 @@ mod brain_search_total_contract_tests {
         store
             .set_contract_derivation_failed("repo:broken", "COPY Contract: duplicate primary key")
             .unwrap();
+        store
+            .insert_symbol(&symbol("sym:probe", "repo:broken", "probe"))
+            .unwrap();
 
         let drift = tool_contract_drift(&store, json!({})).unwrap();
         assert_eq!(drift["clean"], json!(false), "drift envelope: {drift}");
@@ -7057,7 +7060,7 @@ mod brain_search_total_contract_tests {
         assert_eq!(drift["degraded_repos"], json!(["repo:broken"]));
 
         let cross =
-            tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" }), None).unwrap();
+            tool_cross_repo_contracts(&store, json!({ "uid": "sym:probe" }), None).unwrap();
         assert_eq!(cross["contracts_status"], json!("degraded"), "{cross}");
         assert_eq!(cross["degraded_repos"], json!(["repo:broken"]));
     }
@@ -7073,8 +7076,15 @@ mod brain_search_total_contract_tests {
         assert_eq!(drift["contracts_status"], json!("complete"));
         assert_eq!(drift["degraded_repos"], json!([]));
 
+        // UID lookup is strict; a ghost uid is not_found. Probe symbol is
+        // inserted after the empty-graph drift check so derivation status
+        // stays complete (no repo row means no failed derivation marker).
+        store
+            .insert_symbol(&symbol("sym:probe", "repo:empty", "probe"))
+            .unwrap();
+
         let cross =
-            tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" }), None).unwrap();
+            tool_cross_repo_contracts(&store, json!({ "uid": "sym:probe" }), None).unwrap();
         assert_eq!(cross["contracts_status"], json!("complete"), "{cross}");
         assert_eq!(cross["degraded_repos"], json!([]));
     }
