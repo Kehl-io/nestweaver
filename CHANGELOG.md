@@ -1,5 +1,28 @@
 # Changelog
 
+## [10.0.5](https://github.com/Kehl-io/nestweaver/compare/v10.0.4...v10.0.5) (2026-09-18)
+
+
+### Bug Fixes
+
+* **brain:** allow the incremental vault reindex wrapper's extra note-limit argument ([628d08a](https://github.com/Kehl-io/nestweaver/commit/628d08aca40c1e3e1d4203a95565d5c3caaf338f))
+* **brain:** expose skipped notes on typed status and inherit note limits ([5a219f6](https://github.com/Kehl-io/nestweaver/commit/5a219f637ccd522a22bc2fd762d96d0d3646067a))
+* **brain:** honor max_note_bytes on local vault index and watch ([e53a1ee](https://github.com/Kehl-io/nestweaver/commit/e53a1ee153f7b5452af6cec66d36c19a12b49609))
+* **brain:** make the note size limit configurable and disclose skipped notes ([80f459a](https://github.com/Kehl-io/nestweaver/commit/80f459aa0b84a9dda30d808155d852bf2d57411b))
+* **cli:** classify missing cross-repo-refs symbols as not-found ([2eb0c73](https://github.com/Kehl-io/nestweaver/commit/2eb0c73502b6e56da40c4ab5bac72101adc55ceb))
+* **cli:** collapse nested skipped-note status checks for clippy ([9f4ae29](https://github.com/Kehl-io/nestweaver/commit/9f4ae29f9bf7cfa9b7c2d9f9cd3a0f5bfa4b1bb5))
+* **cli:** disclose memory truncation and match cross-repo-refs help to behavior ([987c484](https://github.com/Kehl-io/nestweaver/commit/987c484dca8f652a5569be3e53922320926bc0bb))
+* **cli:** dispatch memory tools and cross-repo-refs through MCP ([5647fdc](https://github.com/Kehl-io/nestweaver/commit/5647fdc7a5c00cdf879b87f44fd9ac84596022c1))
+* **cli:** resolve read-symbols from each repo's recorded root when --root is omitted ([f9ec081](https://github.com/Kehl-io/nestweaver/commit/f9ec08150c2fa9cf62cd7228e19258f8338ea0df))
+* **deps:** bump actions/download-artifact from 7.0.0 to 8.0.1 ([3f14ad9](https://github.com/Kehl-io/nestweaver/commit/3f14ad998d71da0327814f217a8c498facbfe8d8))
+* **deps:** bump toml_edit ([82d1193](https://github.com/Kehl-io/nestweaver/commit/82d11930045ac89037a81c8182e6a060883f60c3))
+* **investigate:** do not mark expand successful when a truncated body cannot be refreshed ([2180260](https://github.com/Kehl-io/nestweaver/commit/2180260b53efcd202d34b3e5dfffd73d6f954c9d))
+* **investigate:** look up exact symbol names and keep pins through the token budget ([74c6e6c](https://github.com/Kehl-io/nestweaver/commit/74c6e6c0b84bc3df750de06d89be2c17486fc79f))
+* **mcp:** align symbol-only kinds skip and keep extra exact pins ([b86fb14](https://github.com/Kehl-io/nestweaver/commit/b86fb14aac71b074ba1567e441289353f3a26914))
+* **mcp:** do not seed project notes when project_context asks only for symbols ([e88c4ff](https://github.com/Kehl-io/nestweaver/commit/e88c4fff53bc98700b1d23bf1467fe4fc175a257))
+* **stale-check:** treat a finished empty index as complete, not incomplete ([7158332](https://github.com/Kehl-io/nestweaver/commit/71583324f42eb83caca31c05c23453a4f91477f2))
+* **watcher:** key the manifest cache by repo UID ([92dcba6](https://github.com/Kehl-io/nestweaver/commit/92dcba655e1980a6033122e3af0366043b10797c))
+
 ## [10.0.4](https://github.com/Kehl-io/nestweaver/compare/v10.0.3...v10.0.4) (2026-09-17)
 
 
