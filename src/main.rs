@@ -15577,14 +15577,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
             }
-            let payload = match try_hybrid_json_rpc_checked(
+            // Same classification as `cross-repo-contracts`: dispatch errors
+            // must not skip the "no symbol found" arm via `?`, or a missing
+            // name is exit 1 with the raw MCP string instead of exit 2.
+            let routed = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 None,
                 "cross_repo_contracts",
                 tool_args.clone(),
             ) {
-                Ok(Some(value)) => value,
+                Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::dispatch(
@@ -15593,8 +15596,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "cross_repo_contracts",
                         tool_args,
                         None,
-                    )?
+                    )
+                    .map(Some)
                 }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
                 Err(error) if format!("{error:#}").contains("no symbol found") => {
                     if json {
                         print_json_not_found("symbol", &name_or_uid);
@@ -15606,6 +15615,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             if json {
                 print_json_payload(&payload)?;
+            } else if payload["returned"].as_u64().unwrap_or(0) == 0
+                && payload["contracts"]
+                    .as_array()
+                    .is_none_or(|rows| rows.is_empty())
+            {
+                println!("No cross-repo references found for '{name_or_uid}'.");
             } else {
                 println!(
                     "Cross-repo references for {}: {} returned of {} ({})",
