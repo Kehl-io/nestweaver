@@ -9562,22 +9562,21 @@ fn tool_cross_repo_contracts(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let name_repo = args.get("repo").and_then(|v| v.as_str());
+    // `uid` is a handle, not a name. Restricted sessions still look the row
+    // up by UID and fail closed if it is hidden; they must not route a
+    // colon-less fixture UID (or any explicit UID) through name search.
     let uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        if matches!(
-            visible,
-            Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-        ) {
-            match resolve_symbol_strict(store, uid, visible, None)? {
-                StrictNameResolve::Found(resolved) => resolved,
-                StrictNameResolve::NotFound => {
+        match store.lookup_symbol(uid) {
+            Ok(symbol) => {
+                if !repo_is_visible(&symbol.repo_uid, visible) {
                     return Err(anyhow!("no symbol found: '{uid}'"));
                 }
-                StrictNameResolve::Ambiguous(candidates) => {
-                    return Ok(name_lookup_ambiguous_payload(uid, None, &candidates));
-                }
+                symbol.uid
             }
-        } else {
-            uid.to_string()
+            Err(nestweaver_store::StoreError::NotFound) => {
+                return Err(anyhow!("no symbol found: '{uid}'"));
+            }
+            Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
         match resolve_symbol_strict(store, name, visible, name_repo)? {

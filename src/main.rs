@@ -1203,7 +1203,7 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
             let candidate_uids: Vec<&str> = message
                 .lines()
                 .filter_map(|line| {
-                    let token = line.trim().split_whitespace().next()?;
+                    let token = line.split_whitespace().next()?;
                     token.contains(':').then_some(token)
                 })
                 .collect();

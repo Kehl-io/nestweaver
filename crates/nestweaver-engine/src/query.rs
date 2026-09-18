@@ -946,10 +946,7 @@ pub fn build_context_with_intent(
                     let listing = exact
                         .iter()
                         .map(|s| {
-                            format!(
-                                "  {} [{}] {}:{}",
-                                s.uid, s.kind, s.file_path, s.start_line
-                            )
+                            format!("  {} [{}] {}:{}", s.uid, s.kind, s.file_path, s.start_line)
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
