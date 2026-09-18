@@ -10454,3 +10454,89 @@ fn nested_package_json_main_roots_every_symbol_in_its_entry_file() {
          exist in the graph at all: {payload}"
     );
 }
+
+/// Hybrid `nestweaver mcp --db <wal-corrupt fixture>` must not die with
+/// empty stdout. A JSON-RPC error frame belongs on stdout so the client is
+/// not BrokenPipe'd.
+#[test]
+fn mcp_wal_corrupt_boot_emits_jsonrpc_error_on_stdout() {
+    let scratch = tempfile::Builder::new()
+        .prefix("nw-pidfile-reap-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let db = scratch.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(scratch.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(scratch.path().join("scratch.lbug.shadow"));
+
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db);
+    let pidfile = home
+        .join("runtime")
+        .join("nestweaver")
+        .join(instance_id)
+        .join("daemon.pid");
+    std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+    std::fs::write(&pidfile, "2147483647").unwrap();
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05" }
+    });
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_RUNTIME_DIR", home.join("runtime"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", home.join("sock"))
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nestweaver mcp");
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", serde_json::to_string(&init).unwrap()).unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "WAL-corrupt MCP must fail");
+    assert!(
+        !stdout.trim().is_empty(),
+        "WAL-corrupt MCP must not exit with empty stdout (stderr was):\n{stderr}"
+    );
+    let frame: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("stdout must contain a JSON-RPC frame, got: {stdout:?}"));
+    assert_eq!(frame["jsonrpc"], "2.0");
+    assert!(
+        frame.get("error").is_some(),
+        "boot failure must be a JSON-RPC error object: {frame}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("db_wal_corrupt")
+            || frame["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("wal") || m.contains("WAL") || m.contains("corrupt")),
+        "the envelope must identify WAL corruption:\n{combined}"
+    );
+}

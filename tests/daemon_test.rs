@@ -82,6 +82,52 @@ fn no_daemon_cmd() -> Command {
     cmd
 }
 
+/// Isolate HOME/XDG so autostart never shares a pidfile or socket with
+/// kory-brain / launchd `io.kehl.nestweaver.c37ccf01`.
+fn isolate_nestweaver_cmd(cmd: &mut Command, home: &Path) {
+    cmd.env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_RUNTIME_DIR", home.join("runtime"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", home.join("sock"))
+        .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "5");
+}
+
+fn pidfile_reap_scratch() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("nw-pidfile-reap-")
+        .tempdir_in("/tmp")
+        .expect("create /tmp/nw-pidfile-reap-* scratch")
+}
+
+fn copy_graph_into(src_db: &Path, dest_dir: &Path) -> std::path::PathBuf {
+    let name = src_db.file_name().expect("db file name");
+    let stem = name.to_string_lossy();
+    let parent = src_db.parent().expect("db parent");
+    for entry in std::fs::read_dir(parent).unwrap() {
+        let entry = entry.unwrap();
+        let fname = entry.file_name();
+        let s = fname.to_string_lossy();
+        if s == stem || s.starts_with(&format!("{stem}.")) {
+            std::fs::copy(entry.path(), dest_dir.join(&fname)).unwrap();
+        }
+    }
+    dest_dir.join(name)
+}
+
+fn isolated_pidfile(home: &Path, db_path: &Path) -> std::path::PathBuf {
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(db_path);
+    home.join("runtime")
+        .join("nestweaver")
+        .join(instance_id)
+        .join("daemon.pid")
+}
+
 /// Build a daemon subcommand with the correct arg order:
 ///   `nestweaver daemon --db <path> <action> [extra_args...]`
 fn daemon_action_cmd(db_path: &Path, action: &str) -> Command {
@@ -265,6 +311,31 @@ impl DaemonGuard {
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         stop_daemon(&self.db_path);
+    }
+}
+
+/// Like [`DaemonGuard`], but stops through the same isolated HOME/XDG the
+/// test used to start — otherwise `daemon stop` looks at the process-default
+/// runtime dir and leaves the scratch daemon running.
+struct IsolatedDaemonGuard {
+    db_path: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+impl IsolatedDaemonGuard {
+    fn new(db_path: &Path, home: &Path) -> Self {
+        Self {
+            db_path: db_path.to_path_buf(),
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for IsolatedDaemonGuard {
+    fn drop(&mut self) {
+        let mut stop = daemon_action_cmd(&self.db_path, "stop");
+        isolate_nestweaver_cmd(&mut stop, &self.home);
+        let _ = stop.ok();
     }
 }
 
@@ -6815,4 +6886,140 @@ fn daemon_dead_code_discloses_a_failed_manifest_load_on_every_route() {
         "a developer reading a terminal must not be told less than one \
          parsing JSON:\n{text}"
     );
+}
+
+/// Autostart must not log "cleaning up" a pidfile whose flock is still held
+/// by a live daemon. Counterweight: that daemon is still adopted.
+#[test]
+fn daemon_autostart_does_not_claim_stale_cleanup_when_pidfile_flock_is_live() {
+    let scratch = pidfile_reap_scratch();
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo_dir = scratch.path().join("repo");
+    let source_db = scratch.path().join("src").join("test.lbug");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &source_db);
+    let db_path = copy_graph_into(&source_db, scratch.path());
+
+    let _guard = IsolatedDaemonGuard::new(&db_path, &home);
+    let mut start = daemon_action_cmd(&db_path, "start");
+    isolate_nestweaver_cmd(&mut start, &home);
+    start.assert().success();
+
+    let pidfile = isolated_pidfile(&home, &db_path);
+    let before = std::fs::read(&pidfile).expect("live daemon must own a pidfile");
+    let before_meta = std::fs::metadata(&pidfile).unwrap();
+
+    let mut status = daemon_cmd();
+    isolate_nestweaver_cmd(&mut status, &home);
+    let output = status
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "live-flock autostart must adopt the incumbent: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unowned daemon pidfile is stale — cleaning up"),
+        "a pidfile whose flock is held must not be treated as stale-cleaned:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&pidfile).unwrap(),
+        before,
+        "live-flock pidfile contents must be left alone"
+    );
+    assert_eq!(
+        std::fs::metadata(&pidfile).unwrap().modified().unwrap(),
+        before_meta.modified().unwrap(),
+        "live-flock pidfile mtime must be left alone"
+    );
+
+    let mut stop = daemon_action_cmd(&db_path, "stop");
+    isolate_nestweaver_cmd(&mut stop, &home);
+    let _ = stop.ok();
+}
+
+/// A pidfile naming a dead process must be reaped for real (or the log must
+/// not claim cleanup), and a healthy *copy* database must not go WAL-corrupt.
+#[test]
+fn daemon_autostart_reaps_dead_pidfile_without_wal_corrupt() {
+    let scratch = pidfile_reap_scratch();
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo_dir = scratch.path().join("repo");
+    let source_db = scratch.path().join("src").join("test.lbug");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &source_db);
+    let db_path = copy_graph_into(&source_db, scratch.path());
+
+    let pidfile = isolated_pidfile(&home, &db_path);
+    std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+    let stale_pid = "2147483647";
+    std::fs::write(&pidfile, stale_pid).unwrap();
+    let before_mtime = std::fs::metadata(&pidfile).unwrap().modified().unwrap();
+
+    let _guard = IsolatedDaemonGuard::new(&db_path, &home);
+    let mut status = daemon_cmd();
+    isolate_nestweaver_cmd(&mut status, &home);
+    let output = status
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("db_wal_corrupt") && !combined.contains("checksum verification failed"),
+        "reaping a dead pid must not WAL-corrupt a healthy copy DB:\n{combined}"
+    );
+    assert!(
+        output.status.success(),
+        "autostart against a healthy copy must succeed: {combined}"
+    );
+    assert!(
+        nestweaver_daemon::lifecycle::db_wal_unreadable(&db_path).is_none(),
+        "WAL must still be readable after pidfile reap"
+    );
+
+    let claimed = stderr.contains("unowned daemon pidfile is stale — cleaning up");
+    let still_stale = std::fs::read_to_string(&pidfile)
+        .ok()
+        .is_some_and(|contents| contents.trim() == stale_pid);
+    let same_mtime = std::fs::metadata(&pidfile)
+        .ok()
+        .is_some_and(|meta| meta.modified().ok() == Some(before_mtime));
+    assert!(
+        !claimed || !(still_stale && same_mtime),
+        "log claimed pidfile cleanup but the file still names pid={stale_pid} \
+         with the same mtime — a no-op lie:\n{stderr}"
+    );
+    if claimed {
+        let leftover = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        assert_ne!(
+            leftover.trim(),
+            stale_pid,
+            "after claiming cleanup the stale pid must be gone: {leftover:?}"
+        );
+    }
+
+    let mut stop = daemon_action_cmd(&db_path, "stop");
+    isolate_nestweaver_cmd(&mut stop, &home);
+    let _ = stop.ok();
 }
