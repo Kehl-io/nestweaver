@@ -81,7 +81,7 @@ pub async fn list_notes(
     let limit = params
         .limit
         .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
-        .clamp(1, LIST_NOTES_LIMIT_MAX);
+        .min(LIST_NOTES_LIMIT_MAX);
     let offset = params.offset.unwrap_or(0);
     // Raw JSON array, matching `/brain/vaults`, `/brain/tags`, and `/symbols/top`.
     let notes = state.store.list_notes_page(None, limit, offset)?;
