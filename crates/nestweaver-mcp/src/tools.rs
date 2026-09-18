@@ -96,15 +96,17 @@ enum StrictNameResolve {
 }
 
 fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
-    json!(candidates
-        .iter()
-        .map(|s| json!({
-            "uid": s.uid,
-            "name": s.name,
-            "file_path": s.file_path,
-            "start_line": s.start_line,
-        }))
-        .collect::<Vec<_>>())
+    json!(
+        candidates
+            .iter()
+            .map(|s| json!({
+                "uid": s.uid,
+                "name": s.name,
+                "file_path": s.file_path,
+                "start_line": s.start_line,
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn name_lookup_ambiguous_payload(
@@ -1765,6 +1767,9 @@ mod tool_schema_validation_tests {
             ("hub_nodes", json!({ "limit": 0 })),
             ("hub_nodes", json!({ "top_n": 1001 })),
             ("dead_code", json!({ "limit": 1.5 })),
+            ("backlinks", json!({ "title": "Home", "limit": 0 })),
+            ("backlinks", json!({ "title": "Home", "limit": 1001 })),
+            ("backlinks", json!({ "title": "Home", "limit": -1 })),
             (
                 "read_symbols",
                 json!({ "targets": ["sym:x"], "include_neighbors": 256 }),
@@ -1803,6 +1808,8 @@ mod tool_schema_validation_tests {
             ),
             ("hub_nodes", json!({ "limit": 1000 })),
             ("dead_code", json!({ "limit": 1 })),
+            ("backlinks", json!({ "title": "Home", "limit": 1 })),
+            ("backlinks", json!({ "title": "Home", "limit": 1000 })),
             (
                 "read_symbols",
                 json!({ "targets": ["sym:x"], "include_neighbors": 255 }),
@@ -22927,6 +22934,27 @@ mod schema_default_honesty_tests {
         assert_eq!(props["members"]["maximum"], json!(200));
     }
 
+    #[test]
+    fn backlinks_schema_declares_limit_bounds() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "backlinks")
+            .expect("backlinks must be registered");
+        let limit = &tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(
+            limit["default"],
+            json!(20),
+            "must match the CLI twin's documented default"
+        );
+        assert_eq!(limit["minimum"], json!(1));
+        assert_eq!(
+            limit["maximum"],
+            json!(RESULT_LIMIT_MAX),
+            "1000 is the ceiling every comparable list tool already uses"
+        );
+        assert_eq!(limit["type"], "integer");
+    }
+
     /// F-MCP-6. `clusters.resolution` advertised 0.5 while the handler applies
     /// 0.3 on any graph over 10K symbols — i.e. on every graph this tool exists
     /// to serve. A conditional default is not expressible in JSON Schema, so
@@ -23300,6 +23328,100 @@ mod cluster_flag_forwarding_precondition_tests {
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
         );
+    }
+}
+
+#[cfg(test)]
+mod backlinks_limit_tests {
+    use super::*;
+    use nestweaver_engine::index_markdown_directory_in_memory;
+    use std::fs;
+
+    fn vault_with_repeated_links(occurrences: usize) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("A.md"), "# A\n").unwrap();
+        let links = vec!["[[A]]"; occurrences].join(" ");
+        fs::write(root.join("Long.md"), format!("# Long\n\n{links}\n")).unwrap();
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        (dir, store)
+    }
+
+    fn vault_with_one_backlink() -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("A.md"), "# A\n").unwrap();
+        fs::write(root.join("Source.md"), "Links to [[A]].\n").unwrap();
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn backlinks_dispatch_truncates_occurrences_and_sets_envelope() {
+        let (_dir, store) = vault_with_repeated_links(30);
+        let omitted = tool_backlinks(&store, json!({ "title": "A" })).unwrap();
+        let total = omitted["total"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("envelope must carry `total`: {omitted}"));
+        assert!(
+            total >= 30,
+            "expected occurrence-level backlinks (>=30 rows for 30 [[A]] in Long.md); \
+             got total={total}. If the indexer stores one row per source note, this \
+             fixture cannot prove truncation: {omitted}"
+        );
+        assert_eq!(omitted["count"], json!(20), "{omitted}");
+        assert_eq!(
+            omitted["backlinks"].as_array().map(|rows| rows.len()),
+            Some(20),
+            "{omitted}"
+        );
+        assert_eq!(omitted["limit"], json!(20), "{omitted}");
+        assert_eq!(omitted["truncated"], json!(true), "{omitted}");
+
+        let page = tool_backlinks(&store, json!({ "title": "A", "limit": 5 })).unwrap();
+        assert_eq!(page["count"], json!(5), "{page}");
+        assert_eq!(
+            page["backlinks"].as_array().map(|rows| rows.len()),
+            Some(5),
+            "{page}"
+        );
+        assert_eq!(page["limit"], json!(5), "{page}");
+        assert_eq!(page["truncated"], json!(true), "{page}");
+        assert_eq!(page["total"], json!(total), "{page}");
+
+        let via_dispatch =
+            dispatch(&store, None, "backlinks", json!({ "title": "A" }), None).unwrap();
+        assert_eq!(via_dispatch["count"], json!(20), "{via_dispatch}");
+        assert_eq!(via_dispatch["truncated"], json!(true), "{via_dispatch}");
+        assert_eq!(via_dispatch["limit"], json!(20), "{via_dispatch}");
+        assert_eq!(via_dispatch["total"], json!(total), "{via_dispatch}");
+    }
+
+    #[test]
+    fn backlinks_small_vault_is_not_truncated() {
+        let (_dir, store) = vault_with_one_backlink();
+        let payload = tool_backlinks(&store, json!({ "title": "A" })).unwrap();
+        assert_eq!(payload["count"], json!(1), "{payload}");
+        assert_eq!(
+            payload["backlinks"].as_array().map(|rows| rows.len()),
+            Some(1),
+            "{payload}"
+        );
+        assert_eq!(payload["truncated"], json!(false), "{payload}");
+        assert_eq!(payload["total"], json!(1), "{payload}");
+        assert_eq!(payload["limit"], json!(20), "{payload}");
+    }
+
+    #[test]
+    fn backlinks_zero_limit_is_refused_rather_than_emptying_the_page() {
+        let (_dir, store) = vault_with_one_backlink();
+        let error = tool_backlinks(&store, json!({ "title": "A", "limit": 0 }))
+            .expect_err("limit 0 must not silently return an empty page")
+            .to_string();
+        assert!(error.contains("limit"), "{error}");
+        assert!(error.contains("out of range"), "{error}");
     }
 }
 

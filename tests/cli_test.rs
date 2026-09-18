@@ -2512,6 +2512,165 @@ fn cli_capability_aliases_execute_mcp_equivalent_contracts() {
     assert_eq!(backlinks["backlinks"][0]["source_note_title"], "Source");
 }
 
+fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(vault_dir)
+        .arg("--db")
+        .arg(db_path)
+        .assert()
+        .success();
+}
+
+fn backlinks_json(
+    db_path: &std::path::Path,
+    extra: &[&str],
+) -> (std::process::Output, serde_json::Value) {
+    let mut cmd = nestweaver_cmd();
+    cmd.args(["backlinks", "A", "--json", "--db"]).arg(db_path);
+    cmd.args(extra);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "backlinks failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    (output, payload)
+}
+
+/// Long.md with 2000 `[[A]]` occurrences used to dump every wikilink edge
+/// (~655KB). Default `--limit` is 20; `--limit 1000` still truncates.
+#[test]
+fn backlinks_long_note_is_truncated_at_default_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("A.md"), "# A\n").unwrap();
+    let links = ["[[A]]"; 2000].join(" ");
+    std::fs::write(vault_dir.join("Long.md"), format!("# Long\n\n{links}\n")).unwrap();
+    index_vault_notes(&vault_dir, &db_path);
+
+    let (output, payload) = backlinks_json(&db_path, &[]);
+    let rows = payload["backlinks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope must carry `backlinks`: {payload}"));
+    assert_eq!(rows.len(), 20, "default cap is 20: {payload}");
+    assert_eq!(payload["count"], 20, "{payload}");
+    assert_eq!(payload["limit"], 20, "{payload}");
+    assert_eq!(payload["truncated"], true, "{payload}");
+    let total = payload["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("envelope must carry `total`: {payload}"));
+    assert!(
+        total >= 2000,
+        "expected occurrence-level backlinks (>=2000 rows for 2000 [[A]] in Long.md); \
+         got total={total}. If the indexer stores one row per source note, this \
+         fixture cannot prove truncation: {payload}"
+    );
+    assert!(
+        output.stdout.len() < 50_000,
+        "default backlinks dump was {} bytes (unbounded occurrence dump)",
+        output.stdout.len()
+    );
+
+    let (_output, limited) = backlinks_json(&db_path, &["--limit", "5"]);
+    assert_eq!(limited["count"], 5, "{limited}");
+    assert_eq!(
+        limited["backlinks"].as_array().map(|rows| rows.len()),
+        Some(5),
+        "{limited}"
+    );
+    assert_eq!(limited["limit"], 5, "{limited}");
+    assert_eq!(limited["truncated"], true, "{limited}");
+    assert!(
+        limited["total"].as_u64().unwrap_or(0) > 5,
+        "total must exceed the page: {limited}"
+    );
+
+    let (_output, hard_max) = backlinks_json(&db_path, &["--limit", "1000"]);
+    assert_eq!(hard_max["count"], 1000, "{hard_max}");
+    assert_eq!(
+        hard_max["backlinks"].as_array().map(|rows| rows.len()),
+        Some(1000),
+        "{hard_max}"
+    );
+    assert_eq!(hard_max["limit"], 1000, "{hard_max}");
+    assert_eq!(hard_max["truncated"], true, "{hard_max}");
+    assert!(
+        hard_max["total"].as_u64().unwrap_or(0) >= 2000,
+        "hard max must not dump all 2000: {hard_max}"
+    );
+}
+
+#[test]
+fn backlinks_omitted_limit_on_small_vault_is_not_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("A.md"), "# A\n").unwrap();
+    std::fs::write(vault_dir.join("Source.md"), "Links to [[A]].\n").unwrap();
+    index_vault_notes(&vault_dir, &db_path);
+
+    let (_output, payload) = backlinks_json(&db_path, &[]);
+    assert_eq!(payload["count"], 1, "{payload}");
+    assert_eq!(
+        payload["backlinks"].as_array().map(|rows| rows.len()),
+        Some(1),
+        "{payload}"
+    );
+    assert_eq!(payload["truncated"], false, "{payload}");
+    assert_eq!(payload["total"], 1, "{payload}");
+    assert_eq!(payload["limit"], 20, "{payload}");
+}
+
+#[test]
+fn backlinks_truncated_human_output_names_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("A.md"), "# A\n").unwrap();
+    let links = ["[[A]]"; 30].join(" ");
+    std::fs::write(vault_dir.join("Long.md"), format!("# Long\n\n{links}\n")).unwrap();
+    index_vault_notes(&vault_dir, &db_path);
+
+    nestweaver_cmd()
+        .args(["backlinks", "A", "--limit", "5", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stdout(contains("showing first 5 of"))
+        .stdout(contains("pass --limit"));
+}
+
+#[test]
+fn backlinks_limit_rejects_zero_and_over_max() {
+    nestweaver_cmd()
+        .args(["backlinks", "A", "--limit", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=1000"));
+
+    nestweaver_cmd()
+        .args(["backlinks", "A", "--limit", "1001"])
+        .assert()
+        .code(64)
+        .stderr(contains("1001 is not in 1..=1000"));
+}
+
+#[test]
+fn backlinks_help_documents_the_limit_bound() {
+    nestweaver_cmd()
+        .args(["backlinks", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--limit"))
+        .stdout(contains("1-1000"));
+}
+
 #[test]
 fn e2e_index_and_query_js_repo() {
     let dir = tempfile::tempdir().unwrap();
