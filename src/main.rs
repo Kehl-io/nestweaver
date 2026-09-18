@@ -4744,26 +4744,26 @@ fn format_daemon_status_response(
             } else {
                 lines.push("  State:            unknown (older daemon)".to_string());
             }
-            if let Some(skipped) = status.skipped_notes.as_ref() {
-                if skipped.count > 0 {
-                    lines.push(format!("Skipped notes: {}", skipped.count));
-                    for path in &skipped.paths {
-                        lines.push(format!("  - {path}"));
-                    }
-                    if skipped.truncated {
-                        lines.push("  (list truncated)".to_string());
-                    }
+            if let Some(skipped) = status.skipped_notes.as_ref()
+                && skipped.count > 0
+            {
+                lines.push(format!("Skipped notes: {}", skipped.count));
+                for path in &skipped.paths {
+                    lines.push(format!("  - {path}"));
+                }
+                if skipped.truncated {
+                    lines.push("  (list truncated)".to_string());
                 }
             }
-            if let Some(near) = status.notes_near_size_limit.as_ref() {
-                if near.count > 0 {
-                    lines.push(format!("Notes approaching size limit: {}", near.count));
-                    for note in &near.notes {
-                        lines.push(format!("  - {} ({} bytes)", note.path, note.bytes));
-                    }
-                    if near.truncated {
-                        lines.push("  (list truncated)".to_string());
-                    }
+            if let Some(near) = status.notes_near_size_limit.as_ref()
+                && near.count > 0
+            {
+                lines.push(format!("Notes approaching size limit: {}", near.count));
+                for note in &near.notes {
+                    lines.push(format!("  - {} ({} bytes)", note.path, note.bytes));
+                }
+                if near.truncated {
+                    lines.push("  (list truncated)".to_string());
                 }
             }
             lines.join("\n")
