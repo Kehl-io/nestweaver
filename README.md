@@ -414,9 +414,9 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
 | `backlinks` | Resolve a note by UID or title and list the notes that link to it |
 | `note get <target>` | Read one note by `note:` UID or by title (`--json`, `--db`, `--config`). Read-only; the CLI twin of the MCP `note_get` tool. **Exits 2** when the title or UID resolves to nothing |
-| `memory lint` | Health checks over the vault (stale notes, broken links, orphans). `--limit` 1–1000 (default 50) caps each category; `*_total` is always reported |
-| `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files). `--limit` 1–1000 (default 50) caps returned proposals |
-| `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.). `--limit` 1–1000 (default 50) with `returned`/`total`/`truncated` |
+| `memory lint` | Health checks over the vault (stale notes, broken links, orphans). `--limit` 1–1000 (default 50) caps each category; `*_total` is always reported, and the human summary prints `N of M` when a category is truncated |
+| `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files). `--limit` 1–1000 (default 50) caps returned proposals; human output discloses `proposals_total` when truncated |
+| `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.). `--limit` 1–1000 (default 50) with `returned`/`total`/`truncated`; human output prints `N of M` when truncated |
 
 </details>
 
@@ -502,7 +502,7 @@ dead:
 | `list-features` | List features spanning multiple repositories |
 | `clusters` | Detect community clusters in the dependency graph (Louvain-style local moving, single-level; results cached in a sidecar, `cluster <id\|name>` reads the cache) |
 | `cross-repo-contracts` | Run the MCP-compatible cross-repository contract query for a symbol name or UID |
-| `cross-repo-refs` | Same JSON envelope as `cross-repo-contracts` / the `cross_repo_contracts` MCP tool (including `link_type: "contract"` rows). `--repo` only disambiguates an ambiguous symbol name before that query; it is not the contracts row filter |
+| `cross-repo-refs` | Same JSON envelope as `cross-repo-contracts` / the `cross_repo_contracts` MCP tool (including `link_type: "contract"` rows). `--limit` 1–1000 (default 50). `--repo` only disambiguates an ambiguous symbol name before that query; it is not the contracts row filter. Without `--repo`, an ambiguous name uses the same preferred match as `cross-repo-contracts` |
 
 </details>
 

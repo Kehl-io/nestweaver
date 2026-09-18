@@ -5829,12 +5829,26 @@ enum Commands {
         command: NoteCommands,
     },
 
-    /// Show cross-repo references for a symbol (legacy command)
+    /// Show cross-repo references for a symbol
+    ///
+    /// Same JSON envelope as `cross-repo-contracts`. `--repo` only
+    /// disambiguates an ambiguous name; it does not filter result rows.
+    /// Without `--repo`, an ambiguous name uses the same preferred match
+    /// as `cross-repo-contracts`.
     CrossRepoRefs {
         /// Symbol name or UID
         name_or_uid: String,
-        #[arg(long, help = "Filter to symbols in this repo")]
+        #[arg(
+            long,
+            help = "Disambiguate an ambiguous symbol name (UID or display name); does not filter result rows"
+        )]
         repo: Option<String>,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum rows to return (1-1000; default 50, matching the MCP cross_repo_contracts schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15530,6 +15544,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::CrossRepoRefs {
             name_or_uid,
             repo: repo_filter,
+            limit,
             json,
             db,
         } => {
@@ -15544,6 +15559,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 serde_json::json!({ "name": name_or_uid })
             };
+            if let Some(limit) = limit {
+                tool_args["limit"] = serde_json::json!(limit);
+            }
             if repo_filter.is_some() {
                 let store = open_store(Some(&db_path))?;
                 match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
@@ -25087,14 +25105,30 @@ fn memory_lint_issue_count(payload: &serde_json::Value) -> usize {
         + json_total(payload, "dangling_relationships")
 }
 
+fn json_count_label(payload: &serde_json::Value, key: &str) -> String {
+    let returned = json_len(payload, key);
+    let total = json_total(payload, key);
+    if total > returned {
+        format!("{returned} of {total}")
+    } else {
+        returned.to_string()
+    }
+}
+
 fn print_memory_lint_text(payload: &serde_json::Value) {
     println!("Memory lint:");
-    println!("  stale notes:           {}", json_len(payload, "stale"));
+    println!(
+        "  stale notes:           {}",
+        json_count_label(payload, "stale")
+    );
     println!(
         "  contradictions:        {}",
-        json_len(payload, "contradictions")
+        json_count_label(payload, "contradictions")
     );
-    println!("  orphans:               {}", json_len(payload, "orphans"));
+    println!(
+        "  orphans:               {}",
+        json_count_label(payload, "orphans")
+    );
     let broken = payload
         .get("broken_wikilinks")
         .and_then(|v| v.as_array())
@@ -25104,23 +25138,28 @@ fn print_memory_lint_text(payload: &serde_json::Value) {
         .iter()
         .filter(|link| link.get("resolved_target_uid").is_none_or(|v| v.is_null()))
         .count();
+    let broken_total = json_total(payload, "broken_wikilinks");
+    let broken_count = if broken_total > broken.len() {
+        format!("{} of {broken_total}", broken.len())
+    } else {
+        broken.len().to_string()
+    };
     println!(
-        "  broken wikilinks:      {} ({} genuinely broken, {} lower-tier resolutions)",
-        broken.len(),
+        "  broken wikilinks:      {broken_count} ({} genuinely broken, {} lower-tier resolutions)",
         lint_unresolved,
         broken.len().saturating_sub(lint_unresolved)
     );
     println!(
         "  supersession chains:   {}",
-        json_len(payload, "supersession_chains")
+        json_count_label(payload, "supersession_chains")
     );
     println!(
         "  schema drift:          {}",
-        json_len(payload, "schema_drift")
+        json_count_label(payload, "schema_drift")
     );
     println!(
         "  dangling relationships: {}",
-        json_len(payload, "dangling_relationships")
+        json_count_label(payload, "dangling_relationships")
     );
     if let Some(stale) = payload["stale"].as_array() {
         for s in stale {
@@ -25179,6 +25218,10 @@ fn print_memory_consolidate_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let proposals_total = json_total(payload, "proposals");
+    if proposals_total > proposals.len() {
+        println!("  {} of {proposals_total} proposal(s):", proposals.len());
+    }
     if proposals.is_empty() {
         println!("  no promotion candidates.");
     } else {
@@ -25205,7 +25248,19 @@ fn print_memory_related_text(uid: &str, payload: &serde_json::Value) {
         println!("No typed neighbours found for {uid}.");
         return;
     }
-    println!("Typed neighbours of {uid} ({}):", related.len());
+    let related_total = payload
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(related.len());
+    if related_total > related.len() {
+        println!(
+            "Typed neighbours of {uid} ({} of {related_total}):",
+            related.len()
+        );
+    } else {
+        println!("Typed neighbours of {uid} ({}):", related.len());
+    }
     for r in &related {
         println!(
             "  [{}] {} — {} (via {})",

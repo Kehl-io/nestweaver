@@ -2179,7 +2179,7 @@ fn parse_stdout(command: &str, output: &Output) -> serde_json::Value {
 /// somewhere in transit (observed on the daemon leg, which round-trips
 /// through JSON-RPC) — same value, two different texts. That is
 /// representation noise, not the drift `parity_memory_lint_direct_vs_daemon`
-/// and `parity_cross_repo_contracts_direct_vs_daemon` exist to catch, so
+/// and `parity_cross_repo_refs_direct_vs_daemon` exist to catch, so
 /// those two normalize with this before comparing.
 fn round_floats(value: &mut serde_json::Value) {
     match value {
@@ -2912,7 +2912,7 @@ fn parity_brain_status_direct_vs_daemon() {
 /// `link_type: "contract"`) must match. The fixture writes an
 /// IMPLEMENTS_CONTRACT edge; dropping that query on one route fails this.
 #[test]
-fn parity_cross_repo_contracts_direct_vs_daemon() {
+fn parity_cross_repo_refs_direct_vs_daemon() {
     let fixture = setup_cross_repo_fixture();
     let db = &fixture.db_path;
     let args = &["cross-repo-refs", "sharedHandler", "--json"];
@@ -2985,10 +2985,7 @@ fn parity_memory_lint_direct_vs_daemon() {
     let total = capped_json["broken_wikilinks_total"]
         .as_u64()
         .unwrap_or_else(|| panic!("broken_wikilinks_total must be present: {capped_json}"));
-    let returned = capped_json["broken_wikilinks"]
-        .as_array()
-        .unwrap()
-        .len() as u64;
+    let returned = capped_json["broken_wikilinks"].as_array().unwrap().len() as u64;
     assert_eq!(
         returned, 1,
         "limit 1 must return one row, not the whole category: {capped_json}"
@@ -3026,6 +3023,20 @@ fn parity_memory_related_direct_vs_daemon() {
         db,
         "memory related",
         &["memory", "related", alpha_uid.as_str()],
+    );
+    let related = run_direct(db, &["memory", "related", alpha_uid.as_str(), "--json"]);
+    assert!(
+        related.status.success(),
+        "memory related failed:\n{}",
+        String::from_utf8_lossy(&related.stderr)
+    );
+    let related_json = parse_stdout("memory related", &related);
+    let neighbours = related_json["related"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope must carry `related`: {related_json}"));
+    assert!(
+        !neighbours.is_empty(),
+        "fixture must emit at least one typed neighbour or envelope equality is vacuous: {related_json}"
     );
 }
 
