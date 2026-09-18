@@ -8474,6 +8474,12 @@ enum MemoryCommands {
         json: bool,
         #[arg(
             long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max results per lint category (1-1000; default 50, matching the MCP brain_memory_lint schema)"
+        )]
+        limit: Option<usize>,
+        #[arg(
+            long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
@@ -8490,6 +8496,12 @@ enum MemoryCommands {
         apply: bool,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max proposals to return (1-1000; default 50, matching the MCP brain_memory_consolidate schema)"
+        )]
+        limit: Option<usize>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -8523,6 +8535,12 @@ enum MemoryCommands {
             help = "Max BFS depth (1-15; matches the MCP brain_memory_related schema)"
         )]
         depth: usize,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max related notes to return (1-1000; default 50, matching the MCP brain_memory_related schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15515,92 +15533,110 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon && repo_filter.is_none() {
-                let db_default = default_db_path();
-                let db_path = db.as_deref().unwrap_or(&db_default);
-                let args = if name_or_uid.starts_with("sym:") {
-                    serde_json::json!({ "uid": name_or_uid })
-                } else {
-                    serde_json::json!({ "name": name_or_uid })
-                };
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)?
-                {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else if let Some(refs) = value.as_array() {
-                        if refs.is_empty() {
-                            println!("No cross-repo references found for '{name_or_uid}'.");
+            let db_path = resolve_db_with_config(db, None)?;
+            require_existing_db(&db_path)?;
+            // `--repo` disambiguates an ambiguous SYMBOL NAME, then we pass
+            // the resulting UID into the shared MCP builder. Do not forward
+            // it as `cross_repo_contracts`'s row filter — that scopes the
+            // OTHER symbol's repo and drops contract-implementation rows.
+            let mut tool_args = if name_or_uid.starts_with("sym:") {
+                serde_json::json!({ "uid": name_or_uid })
+            } else {
+                serde_json::json!({ "name": name_or_uid })
+            };
+            if repo_filter.is_some() {
+                let store = open_store(Some(&db_path))?;
+                match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
+                    ResolveResult::Found(uid) => {
+                        tool_args = serde_json::json!({ "uid": uid });
+                    }
+                    ResolveResult::NotFound => {
+                        if json {
+                            print_json_not_found("symbol", &name_or_uid);
+                        }
+                        eprintln!("Symbol '{name_or_uid}' not found.");
+                        return Ok((EXIT_NOT_FOUND, None));
+                    }
+                    ResolveResult::Ambiguous(candidates) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&candidates)?);
                         } else {
-                            println!(
-                                "Cross-repo references for '{}' ({}):",
+                            eprintln!(
+                                "Ambiguous: '{}' matches {} symbols:",
                                 name_or_uid,
-                                refs.len()
+                                candidates.len()
                             );
-                            for r in refs {
-                                println!(
-                                    "  {} -> {} [{}] ({:.2})",
-                                    r["source_name"].as_str().unwrap_or("?"),
-                                    r["target_name"].as_str().unwrap_or("?"),
-                                    r["link_type"].as_str().unwrap_or("?"),
-                                    r["confidence"].as_f64().unwrap_or(0.0)
+                            for c in &candidates {
+                                eprintln!(
+                                    "  {} [{}] {}:{}",
+                                    c.uid, c.kind, c.file_path, c.start_line
                                 );
                             }
                         }
-                    } else {
-                        // Unexpected shape — dump as JSON
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        return Ok((EXIT_AMBIGUOUS, None));
                     }
-                    return Ok((EXIT_SUCCESS, None));
                 }
             }
-
-            let store = open_store(db.as_deref())?;
-            match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
-                ResolveResult::Found(uid) => {
-                    let refs = store
-                        .cross_repo_links(&uid)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&refs)?);
-                    } else if refs.is_empty() {
-                        println!("No cross-repo references found for '{name_or_uid}'.");
-                    } else {
-                        println!(
-                            "Cross-repo references for '{}' ({}):",
-                            name_or_uid,
-                            refs.len()
-                        );
-                        for r in &refs {
-                            println!(
-                                "  {} -> {} [{}] ({:.2})",
-                                r.source_name, r.target_name, r.link_type, r.confidence
-                            );
-                        }
-                    }
-                    Ok((EXIT_SUCCESS, None))
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                None,
+                "cross_repo_contracts",
+                tool_args.clone(),
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::dispatch(
+                        &store,
+                        None,
+                        "cross_repo_contracts",
+                        tool_args,
+                        None,
+                    )?
                 }
-                ResolveResult::NotFound => {
+                Err(error) if format!("{error:#}").contains("no symbol found") => {
+                    if json {
+                        print_json_not_found("symbol", &name_or_uid);
+                    }
                     eprintln!("Symbol '{name_or_uid}' not found.");
-                    Ok((EXIT_NOT_FOUND, None))
+                    return Ok((EXIT_NOT_FOUND, None));
                 }
-                ResolveResult::Ambiguous(candidates) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&candidates)?);
-                    } else {
-                        eprintln!(
-                            "Ambiguous: '{}' matches {} symbols:",
-                            name_or_uid,
-                            candidates.len()
+                Err(error) => return Err(error),
+            };
+            if json {
+                print_json_payload(&payload)?;
+            } else {
+                println!(
+                    "Cross-repo references for {}: {} returned of {} ({})",
+                    payload["uid"].as_str().unwrap_or("?"),
+                    payload["returned"].as_u64().unwrap_or(0),
+                    payload["total"].as_u64().unwrap_or(0),
+                    payload["contracts_status"].as_str().unwrap_or("unknown")
+                );
+                if let Some(contracts) = payload["contracts"].as_array() {
+                    for contract in contracts {
+                        let repo = contract["repo"].as_str().unwrap_or("?");
+                        println!(
+                            "  [{repo}] {} -> {} [{}] ({:.2})",
+                            contract["source_name"]
+                                .as_str()
+                                .or_else(|| contract["source_uid"].as_str())
+                                .unwrap_or("?"),
+                            contract["target_name"]
+                                .as_str()
+                                .or_else(|| contract["target_uid"].as_str())
+                                .unwrap_or("?"),
+                            contract["link_type"].as_str().unwrap_or("?"),
+                            contract["confidence"].as_f64().unwrap_or(0.0)
                         );
-                        for c in &candidates {
-                            eprintln!("  {} [{}] {}:{}", c.uid, c.kind, c.file_path, c.start_line);
-                        }
                     }
-                    Ok((EXIT_AMBIGUOUS, None))
+                }
+                if let Some(note) = payload["note"].as_str() {
+                    println!("{note}");
                 }
             }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Pull {
@@ -24801,15 +24837,6 @@ fn run_ranking(
     }
 }
 
-/// Dispatch a `brain` subcommand.
-/// Current wall-clock time as Unix epoch seconds (f64).
-fn now_epoch_secs() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 fn require_complete_graph_publication(
     operation: &str,
     publication: &nestweaver_engine::manifest::GraphMutationPublicationOutcome,
@@ -24842,77 +24869,31 @@ fn run_memory(
     use_daemon: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
-        MemoryCommands::Lint { json, db, config } => {
+        MemoryCommands::Lint {
+            json,
+            limit,
+            db,
+            config,
+        } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args = serde_json::json!({});
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "brain_memory_lint",
-                    args,
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
-                }
+            let mut args = serde_json::json!({});
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
             }
-            let store = open_store(Some(&db_path))?;
-            let report = nestweaver_engine::memory_lint(&store, now_epoch_secs())?;
+            let payload = dispatch_mcp_json(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_memory_lint",
+                args,
+            )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json_payload(&payload)?;
             } else {
-                println!("Memory lint:");
-                println!("  stale notes:           {}", report.stale.len());
-                println!("  contradictions:        {}", report.contradictions.len());
-                println!("  orphans:               {}", report.orphans.len());
-                // Same population split as `broken-links` (nw-297). Printing
-                // the bare length reported 1328 where 226 are genuinely broken
-                // and 1102 are lower-tier resolutions that are not broken at
-                // all — and it is the same `broken_links` call, so the two
-                // surfaces agreed only because they shared the defect.
-                let lint_unresolved = report
-                    .broken_wikilinks
-                    .iter()
-                    .filter(|l| l.is_unresolved())
-                    .count();
-                println!(
-                    "  broken wikilinks:      {} ({} genuinely broken, {} lower-tier resolutions)",
-                    report.broken_wikilinks.len(),
-                    lint_unresolved,
-                    report.broken_wikilinks.len() - lint_unresolved
-                );
-                println!(
-                    "  supersession chains:   {}",
-                    report.supersession_chains.len()
-                );
-                println!("  schema drift:          {}", report.schema_drift.len());
-                println!(
-                    "  dangling relationships: {}",
-                    report.dangling_relationships.len()
-                );
-                for s in &report.stale {
-                    println!("  stale: {} ({} days)", s.file_path, s.days_stale);
-                }
-                for c in &report.contradictions {
-                    println!("  contradiction cycle: {}", c.cycle.join(" → "));
-                }
-                for d in &report.dangling_relationships {
-                    println!(
-                        "  dangling: {} -[{}]-> {} (missing)",
-                        d.source_uid, d.edge_type, d.target_uid
-                    );
-                }
+                print_memory_lint_text(&payload);
             }
-            let issues = report.stale.len()
-                + report.contradictions.len()
-                + report.supersession_chains.len()
-                + report.schema_drift.len()
-                + report.dangling_relationships.len();
+            let issues = memory_lint_issue_count(&payload);
             let stats = format!("{} issue(s) in {}", issues, format_elapsed(t0.elapsed()));
             Ok((EXIT_SUCCESS, Some(stats)))
         }
@@ -24920,97 +24901,82 @@ fn run_memory(
         MemoryCommands::Consolidate {
             apply,
             json,
+            limit,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: fail `db_not_found` on a missing --db, matching
-            // the other read commands.
             require_existing_db(&db_path)?;
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args = serde_json::json!({ "apply": apply });
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
+            let mut args = serde_json::json!({ "apply": apply });
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
+            }
+            let payload = if apply {
+                match try_hybrid_json_rpc_checked(
+                    use_daemon,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_memory_consolidate",
+                    args.clone(),
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        let write_lease =
+                            require_exclusive_store_access(&db_path, "apply memory consolidation")?;
+                        let store = GraphStore::open_with_authority(&db_path, &write_lease)
+                            .map_err(|error| daemon_held_store_error(&db_path, error))?;
+                        nestweaver_mcp::tools::with_authoritative_writer_ownership(|| {
+                            nestweaver_mcp::tools::dispatch(
+                                &store,
+                                None,
+                                "brain_memory_consolidate",
+                                args,
+                                None,
+                            )
+                        })?
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                dispatch_mcp_json(
+                    use_daemon,
                     &db_path,
                     config.as_deref(),
                     "brain_memory_consolidate",
                     args,
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    let failed_apply = apply
-                        && !value
-                            .get("applied")
-                            .and_then(|applied| applied.as_bool())
-                            .unwrap_or(false)
-                        && value
-                            .get("proposals_total")
-                            .and_then(|total| total.as_u64())
-                            .or_else(|| {
-                                value
-                                    .get("proposals")
-                                    .and_then(|items| items.as_array())
-                                    .map(|items| items.len() as u64)
-                            })
-                            .unwrap_or(0)
-                            > 0;
-                    if failed_apply {
-                        anyhow::bail!(
-                            "memory consolidation apply did not complete; the JSON manifest above contains recovery warnings"
-                        );
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-            let write_lease = if apply {
-                Some(require_exclusive_store_access(
-                    &db_path,
-                    "apply memory consolidation",
-                )?)
-            } else {
-                None
+                )?
             };
-            let store = if apply {
-                GraphStore::open_with_authority(
-                    &db_path,
-                    write_lease
-                        .as_ref()
-                        .expect("apply acquired writer authority"),
-                )
-                .map_err(|error| daemon_held_store_error(&db_path, error))?
-            } else {
-                open_store(Some(&db_path))?
-            };
-            let manifest = nestweaver_engine::memory_consolidate(&store, apply, now_epoch_secs())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&manifest)?);
+                print_json_payload(&payload)?;
             } else {
-                println!(
-                    "Consolidation ({}):",
-                    if manifest.dry_run { "dry-run" } else { "apply" }
-                );
-                for w in &manifest.warnings {
-                    println!("  warning: {w}");
-                }
-                if manifest.proposals.is_empty() {
-                    println!("  no promotion candidates.");
-                } else {
-                    for p in &manifest.proposals {
-                        println!("  promote {} → {}", p.source_path, p.promote_to);
-                        println!("    {}", p.rationale);
-                    }
-                }
+                print_memory_consolidate_text(&payload);
             }
-            let stats = format!(
-                "{} proposal(s) in {}",
-                manifest.proposals.len(),
-                format_elapsed(t0.elapsed())
-            );
-            if apply && !manifest.applied && !manifest.proposals.is_empty() {
+            let proposal_count = payload
+                .get("proposals_total")
+                .and_then(|total| total.as_u64())
+                .or_else(|| {
+                    payload
+                        .get("proposals")
+                        .and_then(|items| items.as_array())
+                        .map(|items| items.len() as u64)
+                })
+                .unwrap_or(0);
+            let failed_apply = apply
+                && !payload
+                    .get("applied")
+                    .and_then(|applied| applied.as_bool())
+                    .unwrap_or(false)
+                && proposal_count > 0;
+            if failed_apply {
                 anyhow::bail!(
                     "memory consolidation apply did not complete; review the warnings above and recover the durable journal before retrying"
                 );
             }
+            let stats = format!(
+                "{} proposal(s) in {}",
+                proposal_count,
+                format_elapsed(t0.elapsed())
+            );
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
@@ -25018,55 +24984,221 @@ fn run_memory(
             uid,
             edge_types,
             depth,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args = serde_json::json!({
-                    "uid": uid,
-                    "edge_types": edge_types,
-                    "depth": depth,
-                });
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "brain_memory_related",
-                    args,
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
-                }
+            let mut args = serde_json::json!({
+                "uid": uid,
+                "edge_types": edge_types,
+                "depth": depth,
+            });
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
             }
-            let store = open_store(Some(&db_path))?;
-            let related =
-                nestweaver_engine::memory_related(&store, &uid, &edge_types, Some(depth))?;
+            let payload = dispatch_mcp_json(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_memory_related",
+                args,
+            )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&related)?);
-            } else if related.is_empty() {
-                println!("No typed neighbours found for {uid}.");
+                print_json_payload(&payload)?;
             } else {
-                println!("Typed neighbours of {uid} ({}):", related.len());
-                for r in &related {
-                    println!(
-                        "  [{}] {} — {} (via {})",
-                        r.depth, r.title, r.file_path, r.via_edge
-                    );
-                }
+                print_memory_related_text(&uid, &payload);
             }
+            let neighbour_count = payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    payload
+                        .get("related")
+                        .and_then(|items| items.as_array())
+                        .map(|items| items.len() as u64)
+                })
+                .unwrap_or(0);
             let stats = format!(
                 "{} neighbour(s) in {}",
-                related.len(),
+                neighbour_count,
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
         }
+    }
+}
+
+fn dispatch_mcp_json(
+    use_daemon: bool,
+    db_path: &Path,
+    config: Option<&Path>,
+    tool: &str,
+    args: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    match try_hybrid_json_rpc_checked(use_daemon, db_path, config, tool, args.clone()) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => {
+            let store = open_store(Some(db_path))?;
+            nestweaver_mcp::tools::dispatch(&store, None, tool, args, None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn json_len(payload: &serde_json::Value, key: &str) -> usize {
+    payload
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn json_total(payload: &serde_json::Value, key: &str) -> usize {
+    payload
+        .get(format!("{key}_total"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| json_len(payload, key))
+}
+
+fn memory_lint_issue_count(payload: &serde_json::Value) -> usize {
+    json_total(payload, "stale")
+        + json_total(payload, "contradictions")
+        + json_total(payload, "supersession_chains")
+        + json_total(payload, "schema_drift")
+        + json_total(payload, "dangling_relationships")
+}
+
+fn print_memory_lint_text(payload: &serde_json::Value) {
+    println!("Memory lint:");
+    println!("  stale notes:           {}", json_len(payload, "stale"));
+    println!(
+        "  contradictions:        {}",
+        json_len(payload, "contradictions")
+    );
+    println!("  orphans:               {}", json_len(payload, "orphans"));
+    let broken = payload
+        .get("broken_wikilinks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let lint_unresolved = broken
+        .iter()
+        .filter(|link| link.get("resolved_target_uid").is_none_or(|v| v.is_null()))
+        .count();
+    println!(
+        "  broken wikilinks:      {} ({} genuinely broken, {} lower-tier resolutions)",
+        broken.len(),
+        lint_unresolved,
+        broken.len().saturating_sub(lint_unresolved)
+    );
+    println!(
+        "  supersession chains:   {}",
+        json_len(payload, "supersession_chains")
+    );
+    println!(
+        "  schema drift:          {}",
+        json_len(payload, "schema_drift")
+    );
+    println!(
+        "  dangling relationships: {}",
+        json_len(payload, "dangling_relationships")
+    );
+    if let Some(stale) = payload["stale"].as_array() {
+        for s in stale {
+            println!(
+                "  stale: {} ({} days)",
+                s["file_path"].as_str().unwrap_or("?"),
+                s["days_stale"].as_u64().unwrap_or(0)
+            );
+        }
+    }
+    if let Some(contradictions) = payload["contradictions"].as_array() {
+        for c in contradictions {
+            let cycle = c["cycle"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                })
+                .unwrap_or_default();
+            println!("  contradiction cycle: {cycle}");
+        }
+    }
+    if let Some(dangling) = payload["dangling_relationships"].as_array() {
+        for d in dangling {
+            println!(
+                "  dangling: {} -[{}]-> {} (missing)",
+                d["source_uid"].as_str().unwrap_or("?"),
+                d["edge_type"].as_str().unwrap_or("?"),
+                d["target_uid"].as_str().unwrap_or("?")
+            );
+        }
+    }
+}
+
+fn print_memory_consolidate_text(payload: &serde_json::Value) {
+    let dry_run = payload
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    println!(
+        "Consolidation ({}):",
+        if dry_run { "dry-run" } else { "apply" }
+    );
+    if let Some(warnings) = payload["warnings"].as_array() {
+        for w in warnings {
+            if let Some(text) = w.as_str() {
+                println!("  warning: {text}");
+            }
+        }
+    }
+    let proposals = payload
+        .get("proposals")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if proposals.is_empty() {
+        println!("  no promotion candidates.");
+    } else {
+        for p in &proposals {
+            println!(
+                "  promote {} → {}",
+                p["source_path"].as_str().unwrap_or("?"),
+                p["promote_to"].as_str().unwrap_or("?")
+            );
+            if let Some(rationale) = p["rationale"].as_str() {
+                println!("    {rationale}");
+            }
+        }
+    }
+}
+
+fn print_memory_related_text(uid: &str, payload: &serde_json::Value) {
+    let related = payload
+        .get("related")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if related.is_empty() {
+        println!("No typed neighbours found for {uid}.");
+        return;
+    }
+    println!("Typed neighbours of {uid} ({}):", related.len());
+    for r in &related {
+        println!(
+            "  [{}] {} — {} (via {})",
+            r["depth"].as_u64().unwrap_or(0),
+            r["title"].as_str().unwrap_or("?"),
+            r["file_path"].as_str().unwrap_or("?"),
+            r["via_edge"].as_str().unwrap_or("?")
+        );
     }
 }
 
