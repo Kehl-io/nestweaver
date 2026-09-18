@@ -38,6 +38,15 @@ export function RelationshipChips({ data, fallbackKind }: RelationshipChipsProps
     );
   }
 
+  if (data.type === "file") {
+    return (
+      <div className="flex flex-wrap gap-1.5" aria-label="Relationship summary">
+        {chip("symbols", data.symbols.length, "Indexed symbols in this file.")}
+        {chip("lines", data.sourceLines.length, "Loaded source excerpt lines.")}
+      </div>
+    );
+  }
+
   const { headings, sections, note } = data.detail;
   return (
     <div className="flex flex-wrap gap-1.5" aria-label="Relationship summary">

@@ -30,16 +30,48 @@ pub async fn search(
     Ok(Json(json).into_response())
 }
 
+#[derive(Deserialize, Default)]
+pub struct SymbolLookupParams {
+    pub kind: Option<String>,
+}
+
+fn is_file_kind(kind: Option<&str>) -> bool {
+    kind.is_some_and(|k| k.eq_ignore_ascii_case("file"))
+}
+
+async fn symbols_for_file(state: &AppState, path: &str) -> Result<Response, ApiError> {
+    let symbols = state.store.symbols_in_file(path)?;
+    if symbols.is_empty() {
+        return Err(ApiError::not_found(format!("file '{path}' not found")));
+    }
+    let json = serde_json::to_value(&symbols)?;
+    Ok(Json(json).into_response())
+}
+
 pub async fn symbol_by_uid(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
+    Query(params): Query<SymbolLookupParams>,
 ) -> Result<Response, ApiError> {
+    if uid.starts_with("note:") {
+        return crate::routes::brain::note_by_uid(State(state), Path(uid)).await;
+    }
+
+    if is_file_kind(params.kind.as_deref()) {
+        return symbols_for_file(&state, &uid).await;
+    }
+
     match nestweaver_engine::lookup_symbol(&state.store, &uid, None)? {
         nestweaver_engine::LookupResult::Found(detail) => {
             let json = serde_json::to_value(&*detail)?;
             Ok(Json(json).into_response())
         }
         nestweaver_engine::LookupResult::NotFound => {
+            let symbols = state.store.symbols_in_file(&uid)?;
+            if !symbols.is_empty() {
+                let json = serde_json::to_value(&symbols)?;
+                return Ok(Json(json).into_response());
+            }
             Err(ApiError::not_found(format!("symbol '{uid}' not found")))
         }
         nestweaver_engine::LookupResult::Ambiguous(candidates) => {

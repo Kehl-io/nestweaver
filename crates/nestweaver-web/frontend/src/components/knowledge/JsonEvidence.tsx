@@ -45,6 +45,21 @@ function sanitizedPreview(data: PreviewData) {
     };
   }
 
+  if (data.type === "file") {
+    return {
+      type: "file",
+      path: data.path,
+      symbols: data.symbols.slice(0, 24).map((symbol) => ({
+        uid: symbol.uid,
+        name: symbol.name,
+        kind: symbol.kind,
+        file_path: symbol.file_path,
+        start_line: symbol.start_line,
+      })),
+      source_excerpt: data.sourceLines.slice(0, 12),
+    };
+  }
+
   return {
     type: "note",
     note: data.detail.note,

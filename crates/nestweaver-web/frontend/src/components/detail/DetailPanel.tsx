@@ -1,7 +1,8 @@
-import { isSymbolKind } from "../../api/kinds";
+import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
 import { useStore } from "../../stores";
 import { GlassPanel } from "../panels/GlassPanel";
 import { DiffDetail } from "./DiffDetail";
+import { FileDetail } from "./FileDetail";
 import { FlowDetail } from "./FlowDetail";
 import { GapDetail } from "./GapDetail";
 import { LlmResultDetail } from "../llm/LlmResultDetail";
@@ -62,10 +63,8 @@ export function DetailPanel() {
   const isSymbol =
     selectedNodeId.startsWith("sym:") ||
     isSymbolKind(selectedNodeKind);
-  const isNote =
-    selectedNodeId.startsWith("note:") ||
-    selectedNodeKind === "note" ||
-    selectedNodeKind === "Note";
+  const isNote = isNoteSelection(selectedNodeId, selectedNodeKind);
+  const isFile = isFileSelection(selectedNodeId, selectedNodeKind);
 
   return (
     <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]">
@@ -88,6 +87,8 @@ export function DetailPanel() {
           <SymbolDetail uid={selectedNodeId} />
         ) : isNote ? (
           <NoteDetail uid={selectedNodeId} />
+        ) : isFile ? (
+          <FileDetail path={selectedNodeId} />
         ) : (
           <div className="p-4">
             <h2 className="mb-2 text-sm font-semibold">Selected</h2>

@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import type { NoteDetail, SourceResponse, SymbolDetail } from "../api/types";
+import { isFileSelection, isNoteSelection } from "../api/kinds";
+import type {
+  NoteDetail,
+  SourceResponse,
+  SymbolCandidate,
+  SymbolDetail,
+} from "../api/types";
 
 export type PreviewData =
   | { type: "symbol"; detail: SymbolDetail; sourceLines: string[] }
   | { type: "note"; detail: NoteDetail }
+  | { type: "file"; path: string; symbols: SymbolCandidate[]; sourceLines: string[] }
   | null;
 
 const cache = new Map<string, PreviewData>();
@@ -32,6 +39,10 @@ function symbolUrl(uid: string): string {
 
 function noteUrl(uid: string): string {
   return `/api/v1/brain/note/${encodeURIComponent(uid)}`;
+}
+
+function symbolsInFileUrl(path: string): string {
+  return `/api/v1/symbols/file?path=${encodeURIComponent(path)}`;
 }
 
 function sourceUrl(file: string, line?: number, context?: number): string {
@@ -77,10 +88,8 @@ export function useNodePreview(
     setLoading(true);
     setError(null);
 
-    const isNote =
-      nodeId.startsWith("note:") ||
-      nodeKind === "note" ||
-      nodeKind === "Note";
+    const isNote = isNoteSelection(nodeId, nodeKind);
+    const isFile = isFileSelection(nodeId, nodeKind);
 
     // Repos and services have no symbol detail; treat "no preview" as an
     // expected empty state, not an error (repo hubs are the landing scene)
@@ -101,6 +110,32 @@ export function useNodePreview(
         if (isNote) {
           const detail = await fetchJson<NoteDetail>(noteUrl(nodeId), controller.signal);
           const result: PreviewData = { type: "note", detail };
+          cacheSet(nodeId, result);
+          if (isCurrent()) setData(result);
+        } else if (isFile) {
+          let symbols: SymbolCandidate[] = [];
+          try {
+            symbols = await fetchJson<SymbolCandidate[]>(
+              symbolsInFileUrl(nodeId),
+              controller.signal,
+            );
+          } catch (symbolsError) {
+            if (controller.signal.aborted) throw symbolsError;
+          }
+          let sourceLines: string[] = [];
+          try {
+            const source = await fetchJson<SourceResponse>(
+              sourceUrl(nodeId, symbols[0]?.start_line ?? 1, 12),
+              controller.signal,
+            );
+            sourceLines = source.lines ?? [];
+          } catch (sourceError) {
+            if (controller.signal.aborted) throw sourceError;
+          }
+          if (symbols.length === 0 && sourceLines.length === 0) {
+            throw new Error("File evidence is unavailable.");
+          }
+          const result: PreviewData = { type: "file", path: nodeId, symbols, sourceLines };
           cacheSet(nodeId, result);
           if (isCurrent()) setData(result);
         } else {

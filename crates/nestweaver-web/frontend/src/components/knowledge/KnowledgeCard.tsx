@@ -46,6 +46,11 @@ function excerptFor(data: PreviewData, fallback: KnowledgeCardNode): string {
     return data.detail.symbol.summary ?? "No source excerpt is available for this symbol.";
   }
 
+  if (data.type === "file") {
+    if (data.sourceLines.length > 0) return data.sourceLines.slice(0, 8).join("\n");
+    return `${data.symbols.length} indexed symbol${data.symbols.length === 1 ? "" : "s"} in ${data.path}.`;
+  }
+
   const preview = stripFrontmatterAndHeadings(data.detail.body);
   return preview || "No note excerpt is available.";
 }
@@ -56,6 +61,9 @@ function roleFor(data: PreviewData, fallback: KnowledgeCardNode): string {
     const signature = data.detail.symbol.signature;
     return signature ? signature : `${data.detail.symbol.kind} in ${data.detail.symbol.repo_uid}`;
   }
+  if (data.type === "file") {
+    return `Indexed file with ${data.symbols.length} symbol${data.symbols.length === 1 ? "" : "s"}`;
+  }
   return `${data.detail.note.note_kind} note`;
 }
 
@@ -63,6 +71,9 @@ function locationFor(data: PreviewData, fallback: KnowledgeCardNode): string {
   if (!data) return fallback.location ?? fallback.uid;
   if (data.type === "symbol") {
     return `${data.detail.symbol.file_path}:${data.detail.symbol.start_line}`;
+  }
+  if (data.type === "file") {
+    return data.path;
   }
   return data.detail.note.file_path;
 }
@@ -81,14 +92,27 @@ export function KnowledgeCard({
 }: KnowledgeCardProps) {
   const nodeContext = {
     uid: node.uid,
-    kind: data?.type === "symbol" ? data.detail.symbol.kind : data?.type === "note" ? "note" : node.kind,
-    label: data?.type === "symbol" ? data.detail.symbol.name : data?.type === "note" ? data.detail.note.title : node.label,
+    kind: data?.type === "symbol"
+      ? data.detail.symbol.kind
+      : data?.type === "note"
+        ? "note"
+        : data?.type === "file"
+          ? "file"
+          : node.kind,
+    label: data?.type === "symbol"
+      ? data.detail.symbol.name
+      : data?.type === "note"
+        ? data.detail.note.title
+        : data?.type === "file"
+          ? data.path.split("/").pop() || data.path
+          : node.label,
   };
   const state = loading ? "loading" : error ? "error" : data ? "ready" : "empty";
   const excerpt = excerptFor(data, node);
   const role = roleFor(data, node);
   const location = locationFor(data, node);
-  const isCode = data?.type === "symbol" && data.sourceLines.length > 0;
+  const isCode =
+    (data?.type === "symbol" || data?.type === "file") && data.sourceLines.length > 0;
 
   return (
     <article className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[var(--color-surface)] text-[var(--color-text)]">

@@ -287,11 +287,14 @@ async fn symbol_lookup_note_uid_is_not_missing_symbol() {
             embedding: None,
         })
         .unwrap();
-    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/note-symbol.lbug"));
+    let state = AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/note-symbol.lbug"),
+    );
     let app = create_router(state);
 
-    let (missing_status, missing_json) =
-        get_json(&app, "/api/v1/symbol/note:does-not-exist").await;
+    let (missing_status, missing_json) = get_json(&app, "/api/v1/symbol/note:does-not-exist").await;
     let missing_error = error_message(&missing_json);
     assert!(
         !missing_error.contains("symbol 'note:"),
@@ -327,11 +330,7 @@ async fn symbol_lookup_file_path_with_kind_file_is_not_missing_symbol() {
     let listed = json
         .as_array()
         .cloned()
-        .or_else(|| {
-            json.get("symbols")
-                .and_then(Value::as_array)
-                .cloned()
-        })
+        .or_else(|| json.get("symbols").and_then(Value::as_array).cloned())
         .expect("file lookup should return symbols for the path");
     assert!(
         listed.iter().any(|item| item["file_path"] == "src/main.js"),
