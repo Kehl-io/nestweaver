@@ -438,6 +438,37 @@ fn setup_cross_repo_fixture() -> Fixture {
         store
             .insert_cross_repo_link(&uid_a, &uid_b, 0.9, "shared_import")
             .unwrap();
+        // nw-486. The daemon/MCP envelope includes `contracts_implemented_by`
+        // rows; the old direct `cross-repo-refs` path never called that
+        // query, so a fixture without an IMPLEMENTS_CONTRACT edge could not
+        // fail when one route dropped them.
+        store
+            .insert_contract(&nestweaver_schema::Contract {
+                uid: "ctr:test:sharedHandler".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/shared".to_string()),
+                operation_id: None,
+                repo_uid: symbols
+                    .iter()
+                    .find(|s| s.name == "sharedHandler")
+                    .unwrap()
+                    .repo_uid
+                    .clone(),
+                source_path: "src/handler.js".to_string(),
+                confidence: 1.0,
+            })
+            .unwrap();
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid: uid_a,
+                target_uid: "ctr:test:sharedHandler".to_string(),
+                edge_type: nestweaver_schema::EdgeType::ImplementsContract,
+                confidence: 1.0,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
     }
 
     Fixture {
@@ -2857,25 +2888,10 @@ fn parity_brain_status_direct_vs_daemon() {
     }
 }
 
-/// nw-218. `cross_repo_contracts` had no CLI-vs-MCP coverage; its only prior
-/// appearance in this file is the `_meta` provenance-only sweep above.
-///
-/// The two routes do not even share a JSON top-level TYPE today: the
-/// direct/no-daemon `cross-repo-refs` leg prints the bare
-/// `Vec<CrossRepoRef>` `store.cross_repo_links` returns
-/// (`src/main.rs`'s `Commands::CrossRepoRefs` direct arm), while the
-/// daemon leg prints the `cross_repo_contracts` MCP tool's envelope verbatim
-/// (`{uid, total, returned, note, contracts_status, degraded_repos,
-/// contracts: [...]}`) — an array on one route, an object on the other, and
-/// the direct route never calls `contracts_implemented_by` at all, so it can
-/// never emit a `link_type: "contract"` row the daemon route can. That is a
-/// real, newly-found shape gap and it is not this task's to fix (6.1 is
-/// coverage, not a production change) — worth filing as its own item, the
-/// same way nw-485 was split out of nw-218 for the memory tools. This
-/// compares the ONLY thing genuinely comparable today: the per-row fields
-/// BOTH routes emit for the same cross-repo link (source/target identity,
-/// link type, confidence) — the same "compare only fields both routes emit"
-/// treatment nw-485 prescribes for the memory tools.
+/// nw-486. Both `cross-repo-refs` routes dispatch through
+/// `cross_repo_contracts`, so JSON type, keys, and row set (including
+/// `link_type: "contract"`) must match. The fixture writes an
+/// IMPLEMENTS_CONTRACT edge; dropping that query on one route fails this.
 #[test]
 fn parity_cross_repo_contracts_direct_vs_daemon() {
     let fixture = setup_cross_repo_fixture();
@@ -2890,9 +2906,6 @@ fn parity_cross_repo_contracts_direct_vs_daemon() {
     );
     let mut direct_json = parse_stdout("cross-repo-refs (direct)", &direct);
     round_floats(&mut direct_json);
-    let direct_rows = direct_json
-        .as_array()
-        .unwrap_or_else(|| panic!("direct route must print a bare array: {direct_json}"));
 
     let _guard = DaemonGuard::new(db);
     start_daemon(db);
@@ -2905,229 +2918,84 @@ fn parity_cross_repo_contracts_direct_vs_daemon() {
     assert_both_ran_for_real("cross-repo-refs", "json", &direct, &daemon);
     let mut daemon_json = parse_stdout("cross-repo-refs (daemon)", &daemon);
     round_floats(&mut daemon_json);
-    let daemon_rows = daemon_json["contracts"]
-        .as_array()
-        .unwrap_or_else(|| panic!("daemon route must carry a `contracts` array: {daemon_json}"));
-
-    fn common_fields(row: &serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "source_uid": row["source_uid"],
-            "source_name": row["source_name"],
-            "target_uid": row["target_uid"],
-            "target_name": row["target_name"],
-            "link_type": row["link_type"],
-            "confidence": row["confidence"],
-        })
-    }
-    fn sort_key(v: &serde_json::Value) -> String {
-        format!("{}/{}", v["source_uid"], v["target_uid"])
-    }
-    let mut direct_common: Vec<serde_json::Value> = direct_rows.iter().map(common_fields).collect();
-    let mut daemon_common: Vec<serde_json::Value> = daemon_rows.iter().map(common_fields).collect();
-    direct_common.sort_by_key(sort_key);
-    daemon_common.sort_by_key(sort_key);
 
     assert!(
-        !direct_common.is_empty(),
-        "the fixture must produce at least one cross-repo link, or this proves \
-         nothing: {direct_json}"
+        direct_json.is_object(),
+        "direct route must print the MCP envelope, not a bare array: {direct_json}"
     );
     assert_eq!(
-        direct_common, daemon_common,
-        "cross_repo_contracts: the two routes disagree on the fields they both \
-         emit for the same cross-repo link\ndirect: {direct_json}\ndaemon: {daemon_json}"
+        direct_json, daemon_json,
+        "cross-repo-refs: the two routes disagree on JSON\ndirect: {direct_json}\ndaemon: {daemon_json}"
+    );
+    let rows = direct_json["contracts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope must carry `contracts`: {direct_json}"));
+    assert!(
+        rows.iter().any(|row| row["link_type"] == "shared_import"),
+        "fixture must still emit the cross-repo link: {direct_json}"
+    );
+    assert!(
+        rows.iter().any(|row| row["link_type"] == "contract"),
+        "fixture must emit a contract-implementation row on BOTH routes: {direct_json}"
     );
 }
 
-/// nw-218 / nw-485. `memory lint` has no `--limit` flag, and the two routes
-/// call different code paths entirely: the direct route calls
-/// `nestweaver_engine::memory_lint` and prints it UNBOUNDED
-/// (`MemoryCommands::Lint`'s no-daemon leg, `src/main.rs`), while the daemon
-/// route dispatches to the `brain_memory_lint` MCP tool, which truncates each
-/// of the seven categories to `limit` (default 50) and adds
-/// `<category>_total`/`limit` keys the direct route never emits. That
-/// shape-AND-limit divergence is filed as nw-485 and is explicitly NOT this
-/// item's to fix (task 6.1 is coverage). This compares ONLY the seven fields
-/// both routes emit, on a fixture small enough that neither side's limit ever
-/// engages — so a mismatch here is a genuine content bug, not nw-485's
-/// truncation difference showing up under a different name.
+/// nw-485. Both routes dispatch through `brain_memory_lint`, so the envelope
+/// (`limit`, `*_total`, truncated category arrays) must match.
 #[test]
 fn parity_memory_lint_direct_vs_daemon() {
     let fixture = setup_fixture_with_vault_note();
+    check_parity_json_semantic(&fixture.db_path, "memory lint", &["memory", "lint"]);
     let db = &fixture.db_path;
-    let args = &["memory", "lint", "--json"];
-
-    let direct = run_direct(db, args);
+    let capped = run_direct(db, &["memory", "lint", "--json", "--limit", "1"]);
     assert!(
-        direct.status.success(),
-        "memory lint (direct) failed:\n{}",
-        String::from_utf8_lossy(&direct.stderr)
+        capped.status.success(),
+        "memory lint --limit 1 failed:\n{}",
+        String::from_utf8_lossy(&capped.stderr)
     );
-    let mut direct_json = parse_stdout("memory lint (direct)", &direct);
-    round_floats(&mut direct_json);
-
-    let _guard = DaemonGuard::new(db);
-    start_daemon(db);
-    let daemon = run_via_daemon(db, args);
+    let capped_json = parse_stdout("memory lint --limit 1", &capped);
+    assert_eq!(capped_json["limit"], serde_json::json!(1));
     assert!(
-        daemon.status.success(),
-        "memory lint (daemon) failed:\n{}",
-        flatten_miette(&daemon.stderr)
-    );
-    assert_both_ran_for_real("memory lint", "json", &direct, &daemon);
-    let mut daemon_json = parse_stdout("memory lint (daemon)", &daemon);
-    round_floats(&mut daemon_json);
-
-    const CATEGORIES: &[&str] = &[
-        "stale",
-        "contradictions",
-        "orphans",
-        "broken_wikilinks",
-        "supersession_chains",
-        "schema_drift",
-        "dangling_relationships",
-    ];
-    for category in CATEGORIES {
-        let direct_value = &direct_json[category];
-        assert!(
-            direct_value.is_array(),
-            "memory lint (direct): `{category}` must be an array: {direct_json}"
-        );
-        assert_eq!(
-            direct_value, &daemon_json[category],
-            "memory lint: `{category}` differs between routes (nw-485 tracks the \
-             known shape/limit divergence; this fixture stays under the default \
-             limit, so a mismatch here is a real content bug, not that)\n\
-             direct: {direct_json}\ndaemon: {daemon_json}"
-        );
-    }
-    // Pin WHICH category makes the loop above non-vacuous: `broken_wikilinks`
-    // (`[[Beta]]` resolves only through a lower-tier fuzzy match), NOT
-    // `supersession_chains` — `memory_lint`'s "still linked from" check
-    // (`brain_memory.rs` ~301-305) excludes the superseding note's own link
-    // to the note it supersedes, and Alpha is the only backlink to Beta, so
-    // `supersession_chains` stays empty on this fixture. Asserted here rather
-    // than left as prose, so a future change to either the fixture or the
-    // lint categories cannot silently make this comparison vacuous again.
-    assert!(
-        !direct_json["broken_wikilinks"]
+        !capped_json["broken_wikilinks"]
             .as_array()
             .unwrap()
-            .is_empty(),
-        "the fixture must produce a broken_wikilinks finding, or the equality \
-         checks above pass vacuously on two empty reports: {direct_json}"
+            .is_empty()
+            || capped_json["broken_wikilinks_total"].as_u64().unwrap_or(0) > 0,
+        "fixture must still produce a broken_wikilinks finding: {capped_json}"
     );
+    let total = capped_json["broken_wikilinks_total"].as_u64().unwrap_or(0);
+    let returned = capped_json["broken_wikilinks"].as_array().unwrap().len() as u64;
+    assert!(returned <= 1);
+    assert!(total >= returned);
 }
 
-/// nw-218 / nw-485. Same class as `parity_memory_lint_direct_vs_daemon`: the
-/// direct route calls `nestweaver_engine::memory_consolidate` and prints the
-/// raw manifest, while the daemon route dispatches to
-/// `brain_memory_consolidate`, which truncates `proposals` to `limit` and
-/// adds `proposals_total`/`proposals_returned`. Compares only the fields both
-/// emit (`dry_run`/`applied`/`proposals`/`warnings`). The fixture has no
-/// `_logs`/`_ideas` promotion candidates, so this asserts on the
-/// EMPTY-but-PRESENT shape rather than manufacturing a promotion scenario —
-/// still enough to fail if either route's output is replaced with `{}`, since
-/// `{}` has none of these four keys at all.
+/// nw-485. Same shared MCP envelope on both routes, including
+/// `proposals_total` / `proposals_returned`.
 #[test]
 fn parity_memory_consolidate_direct_vs_daemon() {
     let fixture = setup_fixture_with_vault_note();
-    let db = &fixture.db_path;
-    let args = &["memory", "consolidate", "--json"];
-
-    let direct = run_direct(db, args);
-    assert!(
-        direct.status.success(),
-        "memory consolidate (direct) failed:\n{}",
-        String::from_utf8_lossy(&direct.stderr)
-    );
-    let direct_json = parse_stdout("memory consolidate (direct)", &direct);
-
-    let _guard = DaemonGuard::new(db);
-    start_daemon(db);
-    let daemon = run_via_daemon(db, args);
-    assert!(
-        daemon.status.success(),
-        "memory consolidate (daemon) failed:\n{}",
-        flatten_miette(&daemon.stderr)
-    );
-    assert_both_ran_for_real("memory consolidate", "json", &direct, &daemon);
-    let daemon_json = parse_stdout("memory consolidate (daemon)", &daemon);
-
-    for field in ["dry_run", "applied", "proposals", "warnings"] {
-        assert_eq!(
-            direct_json[field], daemon_json[field],
-            "memory consolidate: `{field}` differs between routes (nw-485)\n\
-             direct: {direct_json}\ndaemon: {daemon_json}"
-        );
-    }
-    assert_eq!(
-        direct_json["dry_run"],
-        serde_json::json!(true),
-        "a dry-run must actually be a dry run, or the equality above passed \
-         trivially on an apply path neither route took: {direct_json}"
+    check_parity_json_semantic(
+        &fixture.db_path,
+        "memory consolidate",
+        &["memory", "consolidate"],
     );
 }
 
-/// nw-218 / nw-485. Same class again, and the sharpest of the three: the
-/// direct route's top-level JSON is a bare array of typed neighbours, while
-/// the daemon route dispatches to `brain_memory_related`, whose envelope is
-/// an OBJECT (`{depth, related: [...], total, returned, truncated}`).
-/// Compares the direct array against the daemon's `related` array
-/// item-for-item — `RelatedNode` (uid/title/file_path/depth/via_edge) is
-/// serialized identically on both sides, so unlike `cross_repo_contracts`
-/// there is no extra per-row field to drop, only the top-level envelope
-/// differs.
+/// nw-485. Direct used to print a bare neighbour array; both routes now
+/// print `{depth, related, total, returned, truncated}`.
 #[test]
 fn parity_memory_related_direct_vs_daemon() {
     let fixture = setup_fixture_with_vault_note();
     let db = &fixture.db_path;
-
-    // Discover Alpha's uid the same way `contract_cluster_by_numeric_id_via_daemon`
-    // discovers a real cluster id: read it back off a route that names it,
-    // rather than reimplementing `note_uid`'s hash scheme in the test.
     let backlinks = run_via_mcp(db, "backlinks", serde_json::json!({ "title": "Beta" }));
     let alpha_uid = backlinks["backlinks"][0]["source_note_uid"]
         .as_str()
         .unwrap_or_else(|| panic!("fixture must have one backlink from Alpha to Beta: {backlinks}"))
         .to_string();
-
-    let args = ["memory", "related", alpha_uid.as_str(), "--json"];
-
-    let direct = run_direct(db, &args);
-    assert!(
-        direct.status.success(),
-        "memory related (direct) failed:\n{}",
-        String::from_utf8_lossy(&direct.stderr)
-    );
-    let direct_json = parse_stdout("memory related (direct)", &direct);
-    let direct_rows = direct_json
-        .as_array()
-        .unwrap_or_else(|| panic!("direct route must print a bare array: {direct_json}"));
-
-    let _guard = DaemonGuard::new(db);
-    start_daemon(db);
-    let daemon = run_via_daemon(db, &args);
-    assert!(
-        daemon.status.success(),
-        "memory related (daemon) failed:\n{}",
-        flatten_miette(&daemon.stderr)
-    );
-    assert_both_ran_for_real("memory related", "json", &direct, &daemon);
-    let daemon_json = parse_stdout("memory related (daemon)", &daemon);
-    let daemon_rows = daemon_json["related"]
-        .as_array()
-        .unwrap_or_else(|| panic!("daemon route must carry a `related` array: {daemon_json}"));
-
-    assert!(
-        !direct_rows.is_empty(),
-        "Alpha must have at least one typed neighbour (Beta, via SUPERSEDES), \
-         or this proves nothing: {direct_json}"
-    );
-    assert_eq!(
-        direct_rows, daemon_rows,
-        "memory related: the two routes disagree on the neighbours they both \
-         report (nw-485)\ndirect: {direct_json}\ndaemon: {daemon_json}"
+    check_parity_json_semantic(
+        db,
+        "memory related",
+        &["memory", "related", alpha_uid.as_str()],
     );
 }
 
