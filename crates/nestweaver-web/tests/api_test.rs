@@ -418,6 +418,20 @@ async fn brain_notes_offset_pages_past_the_first_row() {
 }
 
 #[tokio::test]
+async fn brain_notes_huge_offset_is_capped() {
+    let app = notes_list_app(5);
+    let (status, json) = get_json(&app, "/api/v1/brain/notes?limit=1&offset=999999999").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = json
+        .as_array()
+        .expect("sibling brain list routes return a raw array");
+    assert!(
+        arr.is_empty(),
+        "offset must be capped so a huge skip cannot scan the vault"
+    );
+}
+
+#[tokio::test]
 async fn brain_note_not_found_returns_404() {
     let app = make_app();
     let (status, _) = get_json(&app, "/api/v1/brain/note/nonexistent").await;
