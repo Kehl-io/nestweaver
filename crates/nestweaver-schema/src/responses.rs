@@ -16,9 +16,8 @@ pub fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
     }
 }
 
-/// Render ambiguity candidates consistently regardless of whether the caller
-/// supplied full Symbol records or an already reduced transport representation.
-pub fn impact_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates: Value) -> Value {
+/// Same candidate objects `impact` / `read-symbols` already list for exit 3.
+pub fn name_lookup_candidates(candidates: Value) -> Vec<Value> {
     let mut candidates: Vec<Value> = candidates
         .as_array()
         .into_iter()
@@ -42,8 +41,35 @@ pub fn impact_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates: Val
         };
         key(a).cmp(&key(b))
     });
+    candidates
+}
+
+/// Render ambiguity candidates consistently regardless of whether the caller
+/// supplied full Symbol records or an already reduced transport representation.
+pub fn impact_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates: Value) -> Value {
+    let candidates = name_lookup_candidates(candidates);
     impact(json!({"status": "ambiguous", "symbol": symbol,
         "candidates": candidates, "note": impact_ambiguity_remedy(repo_filter)}))
+}
+
+/// Structured name-lookup refusal for tools that are not `brain_impact`.
+///
+/// Carries the same candidate listing as [`impact_ambiguous`] plus
+/// `candidate_uids` so CLI/MCP clients can disambiguate without scraping.
+pub fn name_lookup_ambiguous(symbol: &str, repo_filter: Option<&str>, candidates: Value) -> Value {
+    let candidates = name_lookup_candidates(candidates);
+    let candidate_uids: Vec<Value> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.get("uid").cloned())
+        .collect();
+    json!({
+        "status": "ambiguous",
+        "error": "ambiguous",
+        "symbol": symbol,
+        "candidates": candidates,
+        "candidate_uids": candidate_uids,
+        "note": impact_ambiguity_remedy(repo_filter),
+    })
 }
 
 /// Attach bounded "did you mean" candidate names (nw-481) to a response

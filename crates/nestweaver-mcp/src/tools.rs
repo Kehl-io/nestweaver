@@ -87,48 +87,125 @@ fn annotate_lexical_embedding_identity_degradation(
     );
 }
 
-/// Resolve a symbol name to a UID. When multiple symbols share the name,
-/// pick the most likely canonical definition using a composite heuristic:
-/// PageRank score (if computed), then source-path priority (src/ over tests/),
-/// then lowest start line (definitions before re-imports).
-fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, anyhow::Error> {
-    if name_or_uid.contains(':') {
-        return Ok(name_or_uid.to_string());
-    }
-    let matches = store
-        .lookup_symbols_by_name(name_or_uid)
-        .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-    match matches.len() {
-        0 => Err(anyhow!("no symbol found: '{name_or_uid}'")),
-        1 => Ok(matches.into_iter().next().unwrap().uid),
-        _ => {
-            let best = matches
+/// How a name-or-UID lookup resolved. Unique proceeds; ambiguous is refused
+/// (exit 3 / structured `candidate_uids`) instead of a silent preferred pick.
+enum StrictNameResolve {
+    Found(String),
+    NotFound,
+    Ambiguous(Vec<nestweaver_schema::Symbol>),
+}
+
+fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
+    json!(candidates
+        .iter()
+        .map(|s| json!({
+            "uid": s.uid,
+            "name": s.name,
+            "file_path": s.file_path,
+            "start_line": s.start_line,
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn name_lookup_ambiguous_payload(
+    name: &str,
+    repo_filter: Option<&str>,
+    candidates: &[nestweaver_schema::Symbol],
+) -> Value {
+    nestweaver_schema::responses::name_lookup_ambiguous(
+        name,
+        repo_filter,
+        candidates_json(candidates),
+    )
+}
+
+fn filter_name_matches_by_repo(
+    store: &GraphStore,
+    matches: Vec<nestweaver_schema::Symbol>,
+    repo_filter: Option<&str>,
+) -> Result<Vec<nestweaver_schema::Symbol>, anyhow::Error> {
+    let Some(selector) = repo_filter.filter(|s| !s.is_empty()) else {
+        return Ok(matches);
+    };
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow!("list_repos: {e}"))?;
+    match nestweaver_engine::resolve_repo_selector(&repos, selector) {
+        Ok(repo) => Ok(matches
+            .into_iter()
+            .filter(|s| s.repo_uid == repo.uid)
+            .collect()),
+        Err(_) => {
+            let filter_lower = selector.to_lowercase();
+            let repo_names: HashMap<String, String> = repos
+                .iter()
+                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+                .collect();
+            Ok(matches
                 .into_iter()
-                .max_by(|a, b| {
-                    // Prefer symbols with PageRank scores (computed by hubs)
-                    let pr_a = a.pagerank_score.unwrap_or(0.0);
-                    let pr_b = b.pagerank_score.unwrap_or(0.0);
-                    if (pr_a - pr_b).abs() > f64::EPSILON {
-                        return pr_a.partial_cmp(&pr_b).unwrap_or(std::cmp::Ordering::Equal);
-                    }
-                    // Prefer src/ over tests/test/__tests__/migrations/
-                    let non_src = |p: &str| {
-                        let lp = p.to_lowercase();
-                        lp.starts_with("test")
-                            || lp.contains("__tests__")
-                            || lp.starts_with("migrations")
-                    };
-                    let a_test = non_src(&a.file_path);
-                    let b_test = non_src(&b.file_path);
-                    if a_test != b_test {
-                        return b_test.cmp(&a_test);
-                    }
-                    // Prefer lower start line (definition site)
-                    b.start_line.cmp(&a.start_line)
+                .filter(|s| {
+                    repo_names
+                        .get(&s.repo_uid)
+                        .is_some_and(|name| name.to_lowercase().contains(&filter_lower))
+                        || s.file_path.to_lowercase().starts_with(&filter_lower)
+                        || s.uid.to_lowercase().contains(&filter_lower)
+                        || s.repo_uid.to_lowercase().contains(&filter_lower)
                 })
-                .unwrap();
-            Ok(best.uid)
+                .collect())
         }
+    }
+}
+
+fn classify_name_matches(matches: Vec<nestweaver_schema::Symbol>) -> StrictNameResolve {
+    match matches.len() {
+        0 => StrictNameResolve::NotFound,
+        1 => StrictNameResolve::Found(matches.into_iter().next().unwrap().uid),
+        _ => StrictNameResolve::Ambiguous(matches),
+    }
+}
+
+fn resolve_symbol_strict(
+    store: &GraphStore,
+    name_or_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    repo_filter: Option<&str>,
+) -> Result<StrictNameResolve, anyhow::Error> {
+    if name_or_uid.contains(':') {
+        match store.lookup_symbol(name_or_uid) {
+            Ok(symbol) => {
+                if !repo_is_visible(&symbol.repo_uid, visible) {
+                    return Ok(StrictNameResolve::NotFound);
+                }
+                if let Some(selector) = repo_filter.filter(|s| !s.is_empty()) {
+                    let filtered =
+                        filter_name_matches_by_repo(store, vec![symbol.clone()], Some(selector))?;
+                    return Ok(classify_name_matches(filtered));
+                }
+                Ok(StrictNameResolve::Found(symbol.uid))
+            }
+            Err(nestweaver_store::StoreError::NotFound) => Ok(StrictNameResolve::NotFound),
+            Err(e) => Err(anyhow!("lookup_symbol: {e}")),
+        }
+    } else {
+        let mut matches = store
+            .lookup_symbols_by_name(name_or_uid)
+            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+        matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
+        let matches = filter_name_matches_by_repo(store, matches, repo_filter)?;
+        Ok(classify_name_matches(matches))
+    }
+}
+
+/// Resolve a symbol name to a UID. Ambiguous exact names are refused.
+#[allow(dead_code)]
+fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, anyhow::Error> {
+    match resolve_symbol_strict(store, name_or_uid, None, None)? {
+        StrictNameResolve::Found(uid) => Ok(uid),
+        StrictNameResolve::NotFound => Err(anyhow!("no symbol found: '{name_or_uid}'")),
+        StrictNameResolve::Ambiguous(candidates) => Err(anyhow!(
+            "Ambiguous: '{name_or_uid}' matches {} symbols",
+            candidates.len()
+        )),
     }
 }
 
@@ -243,45 +320,22 @@ fn restricted_repo_identities(
 // `VisibleRepos::allows` instead of reusing it; see that import site.
 
 /// Resolve only inside the caller's visible repositories. Hidden and unknown
-/// UIDs deliberately collapse to the same not-found error.
+/// UIDs deliberately collapse to the same not-found error. Ambiguous visible
+/// names are refused rather than silently preferred.
+#[allow(dead_code)]
 fn resolve_visible_symbol_uid(
     store: &GraphStore,
     name_or_uid: &str,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<String, anyhow::Error> {
-    if name_or_uid.contains(':') {
-        let symbol = store
-            .lookup_symbol(name_or_uid)
-            .map_err(|_| anyhow!("no symbol found: '{name_or_uid}'"))?;
-        if !repo_is_visible(&symbol.repo_uid, visible) {
-            anyhow::bail!("no symbol found: '{name_or_uid}'");
-        }
-        return Ok(symbol.uid);
+    match resolve_symbol_strict(store, name_or_uid, visible, None)? {
+        StrictNameResolve::Found(uid) => Ok(uid),
+        StrictNameResolve::NotFound => Err(anyhow!("no symbol found: '{name_or_uid}'")),
+        StrictNameResolve::Ambiguous(candidates) => Err(anyhow!(
+            "Ambiguous: '{name_or_uid}' matches {} symbols",
+            candidates.len()
+        )),
     }
-
-    let mut matches = store
-        .lookup_symbols_by_name(name_or_uid)
-        .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-    matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
-    let best = matches.into_iter().max_by(|a, b| {
-        let pr_a = a.pagerank_score.unwrap_or(0.0);
-        let pr_b = b.pagerank_score.unwrap_or(0.0);
-        if (pr_a - pr_b).abs() > f64::EPSILON {
-            return pr_a.partial_cmp(&pr_b).unwrap_or(std::cmp::Ordering::Equal);
-        }
-        let non_src = |path: &str| {
-            let path = path.to_lowercase();
-            path.starts_with("test") || path.contains("__tests__") || path.starts_with("migrations")
-        };
-        let a_test = non_src(&a.file_path);
-        let b_test = non_src(&b.file_path);
-        if a_test != b_test {
-            return b_test.cmp(&a_test);
-        }
-        b.start_line.cmp(&a.start_line)
-    });
-    best.map(|symbol| symbol.uid)
-        .ok_or_else(|| anyhow!("no symbol found: '{name_or_uid}'"))
 }
 
 // ── nw-403: per-repo visibility, per tool ───────────────────────────────────
@@ -9519,27 +9573,33 @@ fn tool_cross_repo_contracts(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    let restricted = matches!(
-        visible,
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    );
+    let name_repo = args.get("repo").and_then(|v| v.as_str());
     let uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        if restricted {
-            let symbol = store
-                .lookup_symbol(uid)
-                .map_err(|_| anyhow!("no symbol found: '{uid}'"))?;
-            if !repo_is_visible(&symbol.repo_uid, visible) {
-                anyhow::bail!("no symbol found: '{uid}'");
+        if matches!(
+            visible,
+            Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+        ) {
+            match resolve_symbol_strict(store, uid, visible, None)? {
+                StrictNameResolve::Found(resolved) => resolved,
+                StrictNameResolve::NotFound => {
+                    return Err(anyhow!("no symbol found: '{uid}'"));
+                }
+                StrictNameResolve::Ambiguous(candidates) => {
+                    return Ok(name_lookup_ambiguous_payload(uid, None, &candidates));
+                }
             }
-            symbol.uid
         } else {
             uid.to_string()
         }
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        if restricted {
-            resolve_visible_symbol_uid(store, name, visible)?
-        } else {
-            resolve_symbol_uid(store, name)?
+        match resolve_symbol_strict(store, name, visible, name_repo)? {
+            StrictNameResolve::Found(resolved) => resolved,
+            StrictNameResolve::NotFound => {
+                return Err(anyhow!("no symbol found: '{name}'"));
+            }
+            StrictNameResolve::Ambiguous(candidates) => {
+                return Ok(name_lookup_ambiguous_payload(name, name_repo, &candidates));
+            }
         }
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
@@ -10026,6 +10086,10 @@ fn tool_schema_flow_trace() -> Value {
             "type": "object",
             "properties": {
                 "symbol": { "type": "string", "description": "Symbol name (e.g. \"handleRequest\") or full UID (e.g. \"sym:repo:...:hash:42\") to trace from." },
+                "repo": {
+                    "type": "string",
+                    "description": "Disambiguate an ambiguous symbol name (repo UID, display name, or local root). When this uniquely pins one candidate the trace proceeds; otherwise the tool returns status=ambiguous with candidate_uids."
+                },
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
@@ -10072,15 +10136,20 @@ fn tool_flow_trace(
         // brain_search.
         .clamp(1, 15);
     let concise = is_concise(&args);
+    let repo_filter = args.get("repo").and_then(|v| v.as_str());
 
-    let restricted = matches!(
-        visible,
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    );
-    let resolved_uid = if restricted {
-        resolve_visible_symbol_uid(store, symbol, visible)?
-    } else {
-        resolve_symbol_uid(store, symbol)?
+    let resolved_uid = match resolve_symbol_strict(store, symbol, visible, repo_filter)? {
+        StrictNameResolve::Found(uid) => uid,
+        StrictNameResolve::NotFound => {
+            return Err(anyhow!("no symbol found: '{symbol}'"));
+        }
+        StrictNameResolve::Ambiguous(candidates) => {
+            return Ok(name_lookup_ambiguous_payload(
+                symbol,
+                repo_filter,
+                &candidates,
+            ));
+        }
     };
 
     let root = store
