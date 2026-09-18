@@ -930,6 +930,36 @@ mod tests {
     }
 
     #[test]
+    fn list_notes_page_caps_and_offsets() {
+        use nestweaver_schema::{Note, NoteKind};
+        let store = test_store();
+        for i in 0..5 {
+            store
+                .insert_note(&Note {
+                    uid: format!("note:p:{i}"),
+                    vault_uid: "vlt:p".to_string(),
+                    file_path: format!("{i}.md"),
+                    title: format!("P{i}"),
+                    note_kind: NoteKind::General,
+                    word_count: 0,
+                    content_hash: "h".to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        let page = store.list_notes_page(None, 2, 0).unwrap();
+        assert_eq!(page.len(), 2);
+        let rest = store.list_notes_page(None, 10, 2).unwrap();
+        assert_eq!(rest.len(), 3);
+        assert_eq!(store.list_notes_page(None, 0, 0).unwrap().len(), 0);
+    }
+
+    #[test]
     fn lookup_note_by_uid() {
         use nestweaver_schema::{Note, NoteKind};
         let store = test_store();

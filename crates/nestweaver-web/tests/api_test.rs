@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Visibility};
+use nestweaver_schema::{
+    EdgeType, Note, NoteKind, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault, Visibility,
+};
 use nestweaver_store::{GraphScope, GraphStore};
 use nestweaver_web::create_router;
 use nestweaver_web::state::AppState;
@@ -300,6 +302,89 @@ async fn brain_vaults_returns_list() {
     let (status, json) = get_json(&app, "/api/v1/brain/vaults").await;
     assert_eq!(status, StatusCode::OK);
     assert!(json.as_array().is_some(), "response should be an array");
+}
+
+fn insert_vault_notes(store: &GraphStore, count: usize) {
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:notes".to_string(),
+            name: "Notes".to_string(),
+            root_path: "/tmp/notes".to_string(),
+            instance_id: "local".to_string(),
+        })
+        .unwrap();
+    for i in 0..count {
+        store
+            .insert_note(&Note {
+                uid: format!("note:notes:{i:03}"),
+                vault_uid: "vlt:notes".to_string(),
+                file_path: format!("n{i:03}.md"),
+                title: format!("Note {i:03}"),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: format!("h{i:03}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+    }
+}
+
+fn notes_list_app(note_count: usize) -> axum::Router {
+    let store = setup_test_store();
+    insert_vault_notes(&store, note_count);
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/test.lbug"));
+    create_router(state)
+}
+
+#[tokio::test]
+async fn brain_notes_limit_1_returns_one_row() {
+    let app = notes_list_app(5);
+    let (status, json) = get_json(&app, "/api/v1/brain/notes?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = json
+        .as_array()
+        .expect("sibling brain list routes return a raw array");
+    assert_eq!(arr.len(), 1, "?limit=1 must return exactly one note");
+}
+
+#[tokio::test]
+async fn brain_notes_omitted_limit_does_not_dump_unbounded_corpus() {
+    // Documented default matches `/symbols/top`: 20, hard cap 1000.
+    const CORPUS: usize = 25;
+    let app = notes_list_app(CORPUS);
+    let (status, json) = get_json(&app, "/api/v1/brain/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = json
+        .as_array()
+        .expect("sibling brain list routes return a raw array");
+    assert_eq!(
+        arr.len(),
+        nestweaver_web::routes::brain::LIST_NOTES_DEFAULT_LIMIT,
+        "omitted limit must use the documented default cap, not the whole vault"
+    );
+    assert!(
+        arr.len() < CORPUS,
+        "omitted limit must not dump the unbounded corpus"
+    );
+}
+
+#[tokio::test]
+async fn brain_notes_offset_pages_past_the_first_row() {
+    let app = notes_list_app(3);
+    let (status, first) = get_json(&app, "/api/v1/brain/notes?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, second) = get_json(&app, "/api/v1/brain/notes?limit=1&offset=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let a = first.as_array().unwrap();
+    let b = second.as_array().unwrap();
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert_ne!(a[0]["uid"], b[0]["uid"], "offset must skip the first row");
 }
 
 #[tokio::test]
