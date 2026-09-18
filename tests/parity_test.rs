@@ -5419,7 +5419,10 @@ fn ambiguous_ping_is_exit_3_for_flow_trace_and_cross_repo_contracts() {
 
     for (tool, arguments) in [
         ("flow_trace", serde_json::json!({ "symbol": "ping" })),
-        ("cross_repo_contracts", serde_json::json!({ "name": "ping" })),
+        (
+            "cross_repo_contracts",
+            serde_json::json!({ "name": "ping" }),
+        ),
     ] {
         let payload = run_via_mcp(&fixture.db_path, tool, arguments);
         assert_eq!(
@@ -5475,7 +5478,12 @@ fn flow_trace_repo_uniquely_pins_one_ping() {
         String::from_utf8_lossy(&unique.stderr)
     );
     let value: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&unique.stdout))
-        .unwrap_or_else(|_| panic!("flow-trace --json: {}", String::from_utf8_lossy(&unique.stdout)));
+        .unwrap_or_else(|_| {
+            panic!(
+                "flow-trace --json: {}",
+                String::from_utf8_lossy(&unique.stdout)
+            )
+        });
     assert_ne!(
         value["status"].as_str(),
         Some("ambiguous"),
