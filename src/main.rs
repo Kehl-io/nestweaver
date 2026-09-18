@@ -5848,11 +5848,17 @@ enum Commands {
     /// Find notes that link to a note UID or title
     #[command(
         name = "backlinks",
-        after_help = "Examples:\n  nestweaver backlinks 'Architecture Overview'\n  nestweaver backlinks note:vault:Notes:abc123 --json"
+        after_help = "Examples:\n  nestweaver backlinks 'Architecture Overview'\n  nestweaver backlinks note:vault:Notes:abc123 --json\n  nestweaver backlinks A --limit 5 --json"
     )]
     Backlinks {
         /// Target note UID (`note:...`) or title
         target: String,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum backlink occurrences to return (1-1000; default 20, matching the MCP backlinks schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15446,17 +15452,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Backlinks {
             target,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
-            let args = if target.starts_with("note:") {
+            let mut args = if target.starts_with("note:") {
                 serde_json::json!({ "uid": target })
             } else {
                 serde_json::json!({ "title": target })
             };
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
+            }
             // nw-399: same classification, both routes. The `backlinks` tool
             // says `no note found with title '<t>'`, so that phrase — and not a
             // bare "not found" — is what decides. Measured at exit 1 with zero
@@ -15505,6 +15515,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             backlink["confidence"].as_f64().unwrap_or(0.0)
                         );
                     }
+                }
+                if payload
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let returned = payload["count"].as_u64().unwrap_or(0);
+                    let total = payload["total"].as_u64().unwrap_or(returned);
+                    println!("(showing first {returned} of {total} — pass --limit to change)");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -41359,8 +41378,16 @@ mod capability_alias_cli_tests {
                 .unwrap();
                 assert!(matches!(
                     backlinks.command,
-                    Commands::Backlinks { target, json: true, .. }
+                    Commands::Backlinks { target, json: true, limit: None, .. }
                         if target == "Architecture Overview"
+                ));
+
+                let backlinks_limited =
+                    Cli::try_parse_from(["nestweaver", "backlinks", "A", "--limit", "5"]).unwrap();
+                assert!(matches!(
+                    backlinks_limited.command,
+                    Commands::Backlinks { target, limit: Some(5), .. }
+                        if target == "A"
                 ));
             })
             .unwrap()
