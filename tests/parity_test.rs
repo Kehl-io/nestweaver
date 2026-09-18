@@ -5441,45 +5441,90 @@ fn ambiguous_ping_is_exit_3_for_flow_trace_and_cross_repo_contracts() {
 }
 
 #[test]
-fn context_ping_does_not_union_substring_ping2_when_ping_is_ambiguous() {
+fn context_ping_exits_3_when_exact_ping_is_ambiguous() {
     let fixture = setup_ambiguous_ping_fixture();
     let output = run_direct(&fixture.db_path, &["context", "ping", "--json"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if output.status.code() == Some(3) {
-        assert!(
-            stdout.contains("ambiguous")
-                || stderr.to_lowercase().contains("ambiguous")
-                || stdout.contains("candidate_uids"),
-            "exit 3 must be the ambiguous-name refusal: stdout={stdout} stderr={stderr}"
-        );
-        return;
-    }
-
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "context ping must refuse (exit 3) or succeed without extra-seeding ping2; \
+        Some(3),
+        "context ping must refuse an ambiguous exact name (exit 3), not union every ping; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let value: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("context --json: {stdout}"));
-    let seed_names: Vec<String> = value["seeds"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|s| s["name"].as_str().map(str::to_string))
-        .collect();
+    let combined = format!("{stdout}\n{stderr}").to_lowercase();
     assert!(
-        !seed_names.iter().any(|n| n == "ping2"),
-        "ambiguous exact name `ping` must not extra-seed substring `ping2`; seeds={seed_names:?} payload={value}"
+        combined.contains("ambiguous") || stdout.contains("candidate_uids"),
+        "exit 3 must be the ambiguous-name refusal: stdout={stdout} stderr={stderr}"
     );
-    if let Some(total) = value["seed_matches_total"].as_u64() {
-        let ping2_count = seed_names.iter().filter(|n| n.as_str() == "ping2").count();
-        assert_eq!(
-            ping2_count, 0,
-            "seed_matches_total={total} must not be counting ping2 into an ambiguous ping seed"
+}
+
+#[test]
+fn flow_trace_repo_uniquely_pins_one_ping() {
+    let fixture = setup_ambiguous_ping_fixture();
+
+    let unique = run_direct(
+        &fixture.db_path,
+        &["flow-trace", "ping", "--repo", "py-ping", "--json"],
+    );
+    assert_eq!(
+        unique.status.code(),
+        Some(0),
+        "flow-trace --repo py-ping must uniquely pin the Python ping; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&unique.stdout),
+        String::from_utf8_lossy(&unique.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&unique.stdout))
+        .unwrap_or_else(|_| panic!("flow-trace --json: {}", String::from_utf8_lossy(&unique.stdout)));
+    assert_ne!(
+        value["status"].as_str(),
+        Some("ambiguous"),
+        "unique --repo must not still be ambiguous: {value}"
+    );
+    let root = value["root_uid"].as_str().unwrap_or_default();
+    assert!(
+        !root.is_empty(),
+        "unique pin must return a single flow-trace root: {value}"
+    );
+    let rendered = value.to_string();
+    assert!(
+        rendered.contains("lib.py") || rendered.contains("py-ping") || root.contains("py"),
+        "pinned root must be the Python ping, not JS; {value}"
+    );
+
+    let still = run_direct(
+        &fixture.db_path,
+        &["flow-trace", "ping", "--repo", "ping", "--json"],
+    );
+    assert_ambiguous_name_exit(&still, "flow-trace --repo ping");
+
+    // Remaining limitation: `cross-repo-contracts --repo` is also a ROW filter
+    // on the other symbol. Unique name pin must not become not-found; an empty
+    // contract list at exit 0 is the dual-purpose flag, not a silent miss.
+    let contracts = run_direct(
+        &fixture.db_path,
+        &[
+            "cross-repo-contracts",
+            "ping",
+            "--repo",
+            "py-ping",
+            "--json",
+        ],
+    );
+    assert_ne!(
+        contracts.status.code(),
+        Some(2),
+        "unique --repo pin must not report the Python ping as not found; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&contracts.stdout),
+        String::from_utf8_lossy(&contracts.stderr)
+    );
+    if contracts.status.code() == Some(0) {
+        let payload: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&contracts.stdout)).unwrap_or_default();
+        assert_ne!(
+            payload["status"].as_str(),
+            Some("not_found"),
+            "unique pin must not look like a missing symbol: {payload}"
         );
     }
 }
