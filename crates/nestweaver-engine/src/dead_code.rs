@@ -637,37 +637,14 @@ fn detect_dead_code_inner(
     //
     // Scoping is by `Symbol::repo_uid` against the manifest map's key, which
     // every writer of `<db>.manifests.json` keys by repo UID
-    // (`index.rs`, the daemon's index RPCs, `main.rs`'s snapshot path), and
-    // which `reconcile_deleted_graph_state` already treats as a repo UID when
-    // it retains live entries.
-    //
-    // ONE writer disagrees: `watcher.rs`'s manifest refresh keys by the
-    // repo's on-disk PATH. Rather than let a strict UID match silently drop
-    // those entries — which would turn nw-497 into a regression for anyone
-    // running `brain watch` — a path key is normalized back to its repo UID
-    // through `Repo::root_path`. A key that resolves to neither is kept as
-    // itself, so it simply matches nothing, which is the honest outcome for
-    // an entry nothing in the graph claims.
-    //
-    // Skipped entirely when there are no manifests: the no-manifest callers
-    // (`detect_dead_code`, `detect_dead_code_with_confidence`) must not start
-    // paying for a repo enumeration they have nothing to normalize against.
-    let repo_uid_by_root_path: HashMap<String, String> = if manifests.is_empty() {
-        HashMap::new()
-    } else {
-        store
-            .list_repos(None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|repo| repo.root_path.map(|root| (root, repo.uid)))
-            .collect()
-    };
+    // (`index.rs`, the daemon's index RPCs, `main.rs`'s snapshot path, and
+    // `watcher.rs`). `reconcile_deleted_graph_state` retains live entries
+    // against the same UID set. Path keys are no longer written (nw-522).
     let mut manifest_entry_files: HashMap<String, HashSet<String>> = HashMap::new();
-    for (key, info) in manifests {
+    for (repo_uid, info) in manifests {
         if info.entry_files.is_empty() {
             continue;
         }
-        let repo_uid = repo_uid_by_root_path.get(key).unwrap_or(key);
         let bucket = manifest_entry_files.entry(repo_uid.clone()).or_default();
         for path in &info.entry_files {
             bucket.insert(path.strip_prefix("./").unwrap_or(path).to_string());

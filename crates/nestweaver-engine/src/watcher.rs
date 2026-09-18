@@ -36,6 +36,20 @@ impl<T: Send> WatchMutationLease for T {}
 pub type WatchMutationLeaseFactory =
     Arc<dyn Fn(&'static str) -> Result<Box<dyn WatchMutationLease>, anyhow::Error> + Send + Sync>;
 
+/// Resolve the manifest-cache key for a watched package directory.
+///
+/// Match on the indexed working-tree location (`Repo::local_root`), not the
+/// identity URL, so a repo whose path changed between indexes still updates
+/// the same UID entry once `root_path` has been moved with it.
+fn manifest_cache_repo_uid(store: &GraphStore, repo_path: &Path) -> Option<String> {
+    let wanted = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    store.list_repos(None).ok()?.into_iter().find_map(|repo| {
+        let root = repo.local_root()?;
+        let rooted = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+        (rooted == wanted).then_some(repo.uid)
+    })
+}
+
 /// A batch was refused because daemon shutdown has begun. Watchers treat this
 /// as a normal stop, not as graph corruption or a retryable filesystem error.
 #[derive(Debug, thiserror::Error)]
@@ -983,8 +997,24 @@ impl BrainWatcher {
                 let manifest = crate::manifest::parse_manifest(
                     &crate::content_reader::FilesystemReader::new(&repo_path),
                 );
-                // Load the existing cache, update this repo's entry, and save.
-                let repo_key = repo_path.to_string_lossy().into_owned();
+                // nw-522: every other writer keys this map by repo UID.
+                // A path key is treated as non-live by
+                // `reconcile_deleted_graph_state` and cannot match
+                // `Symbol::repo_uid` without a read-side remap. Skip the
+                // insert when no indexed repo owns this directory — writing
+                // a path would recreate the divergence this refresh exists
+                // to close. A later index (or a root_path update) is what
+                // makes the same directory resolvable again.
+                let Some(repo_key) = manifest_cache_repo_uid(store, &repo_path) else {
+                    tracing::debug!(
+                        path = %repo_path.display(),
+                        "watcher: manifest edit has no indexed repo; skipping cache insert"
+                    );
+                    return Ok(UpdateOutcome::Skipped {
+                        path,
+                        reason: "manifest file — no indexed repo",
+                    });
+                };
                 let canonical_manifests_path = crate::manifest::manifest_cache_path(&self.db_path);
                 let uses_canonical_path = manifests_path == &canonical_manifests_path;
                 let loaded = if uses_canonical_path {
@@ -1312,6 +1342,20 @@ mod tests {
             fs::write(&p, content).unwrap();
         }
         (dir, root)
+    }
+
+    fn insert_watched_repo(store: &GraphStore, root: &Path, uid: &str) {
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.to_string(),
+                url: format!("file://{}", root.display()),
+                indexed_sha: "test".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: Some("watched-package".into()),
+                root_path: Some(root.to_string_lossy().into_owned()),
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1836,6 +1880,7 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:watched");
         let legacy_path = db_path.with_extension("manifests.json");
         crate::save_manifest_cache(&HashMap::new(), &legacy_path).unwrap();
         let canonical_path = crate::manifest_cache_path(&db_path);
@@ -1851,8 +1896,16 @@ mod tests {
         let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
         assert_eq!(manifests.len(), 1);
         assert_eq!(
-            manifests.values().next().unwrap().package_name.as_deref(),
+            manifests
+                .get("repo:watched")
+                .unwrap()
+                .package_name
+                .as_deref(),
             Some("watched-package")
+        );
+        assert!(
+            !manifests.contains_key(&root.to_string_lossy().into_owned()),
+            "watcher must not key the cache by on-disk path: {manifests:?}"
         );
     }
 
@@ -1878,6 +1931,7 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:watched");
         let canonical_path = crate::manifest_cache_path(&db_path);
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
@@ -1920,6 +1974,110 @@ mod tests {
                 .entry_files,
             vec!["entry.js".to_string()],
             "and it must carry the edited entry files, not an empty payload"
+        );
+        assert_eq!(
+            manifests.keys().next().map(String::as_str),
+            Some("repo:watched")
+        );
+    }
+
+    /// nw-522. Path keys were purged as non-live by
+    /// `reconcile_deleted_graph_state` because that retain is a UID set.
+    /// After a UID-keyed write, reconciliation must keep the entry.
+    #[test]
+    fn a_watched_manifest_survives_deleted_graph_reconciliation() {
+        let (_dir, root) = make_vault(&[(
+            "package.json",
+            r#"{"name":"watched-package","main":"entry.js"}"#,
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:watched");
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        watcher
+            .handle_non_graph_event(&store, root.join("package.json"))
+            .unwrap();
+        crate::reconcile_deleted_graph_state(&store, &db_path);
+        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
+        assert_eq!(
+            manifests.get("repo:watched").map(|m| m.entry_files.clone()),
+            Some(vec!["entry.js".to_string()]),
+            "UID-keyed watcher entries must survive live-repo retain: {manifests:?}"
+        );
+    }
+
+    /// nw-522's counterweight. A path key accidentally survived a working-tree
+    /// move because the new path was a new map entry. UID lookup follows
+    /// `root_path`, so after the graph records the move the same UID is
+    /// refreshed rather than a second (path) key appearing.
+    #[test]
+    fn a_moved_repo_still_refreshes_manifests_under_its_uid() {
+        let (_dir, root) = make_vault(&[(
+            "package.json",
+            r#"{"name":"watched-package","main":"old.js"}"#,
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:watched");
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        watcher
+            .handle_non_graph_event(&store, root.join("package.json"))
+            .unwrap();
+
+        let moved = db_dir.path().join("moved-tree");
+        fs::create_dir_all(&moved).unwrap();
+        fs::write(
+            moved.join("package.json"),
+            r#"{"name":"moved-package","main":"new.js"}"#,
+        )
+        .unwrap();
+        let moved = fs::canonicalize(&moved).unwrap();
+        store
+            .update_repo_root_path("repo:watched", &moved.to_string_lossy())
+            .unwrap();
+
+        watcher
+            .handle_non_graph_event(&store, moved.join("package.json"))
+            .unwrap();
+        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
+        assert_eq!(manifests.len(), 1, "{manifests:?}");
+        let info = manifests
+            .get("repo:watched")
+            .expect("UID key must survive the move");
+        assert_eq!(info.package_name.as_deref(), Some("moved-package"));
+        assert_eq!(info.entry_files, vec!["new.js".to_string()]);
+    }
+
+    #[test]
+    fn a_manifest_edit_without_an_indexed_repo_does_not_write_a_path_key() {
+        let (_dir, root) = make_vault(&[("package.json", r#"{"name":"orphan"}"#)]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        let outcome = watcher
+            .handle_non_graph_event(&store, root.join("package.json"))
+            .unwrap();
+        match outcome {
+            UpdateOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason, "manifest file — no indexed repo");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+        assert!(
+            !canonical_path.exists(),
+            "no indexed repo means no cache write"
         );
     }
 
