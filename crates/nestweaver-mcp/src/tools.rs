@@ -11911,7 +11911,7 @@ fn tool_schema_project_context() -> Value {
                 "kinds": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match."
+                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match. When this is only Symbol, member notes are not seeded into the PPR walk — otherwise a notes-heavy project spends the whole candidate pool on notes that this filter then drops."
                 },
                 "include_components": {
                     "type": "boolean",
@@ -12096,6 +12096,9 @@ fn tool_project_context(
                 .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect()
         });
+    let symbol_kinds_only = filter_kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty() && kinds.iter().all(|kind| kind.starts_with("symbol"))
+    });
 
     // 1. Resolve the project: name/alias/UID.
     let project = if project_str.starts_with("proj:") {
@@ -12296,7 +12299,9 @@ fn tool_project_context(
 
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
     ppr_seeds.extend(component_uids.iter().cloned());
-    ppr_seeds.extend(member_note_uids.iter().cloned());
+    if !symbol_kinds_only {
+        ppr_seeds.extend(member_note_uids.iter().cloned());
+    }
     ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
     let intent: nestweaver_store::QueryIntent = args
@@ -12352,7 +12357,9 @@ fn tool_project_context(
     //     were seeded above, so they live in `result.seeds` — which is
     //     disjoint from `connected` and not rendered. For project orientation
     //     the curated notes are the answer, so promote them (Bug #12).
-    nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+    if !symbol_kinds_only {
+        nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+    }
     // 4b'. Mirror the notes promotion for the seeded top-K member symbols
     //      (Bug #18 / wave-5 regression). Without this, the symbols stay in
     //      `seeds` and never appear in the rendered `connected` list.
