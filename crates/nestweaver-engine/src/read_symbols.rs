@@ -211,6 +211,83 @@ pub fn read_symbols(
     result
 }
 
+/// Read spans using each symbol's recorded repo `local_root` when the caller
+/// did not pass an explicit root. An explicit `--root` still uses
+/// [`read_symbols`] against that one tree. A repo with no usable
+/// `local_root` falls back to `fallback_root` rather than inventing a path.
+pub fn read_symbols_from_repo_roots(
+    store: &GraphStore,
+    specs: &[String],
+    neighbors: u8,
+    token_budget: Option<usize>,
+    fallback_root: &Path,
+    limits: crate::index_limits::IndexLimits,
+) -> ReadSymbolsResult {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use crate::content_reader::FilesystemReader;
+
+    let mut repo_groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut repo_index: HashMap<String, usize> = HashMap::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for spec in specs {
+        if let Some(repo_uid) = repo_uid_for_spec(store, spec) {
+            if let Some(&idx) = repo_index.get(&repo_uid) {
+                repo_groups[idx].1.push(spec.clone());
+            } else {
+                let idx = repo_groups.len();
+                repo_index.insert(repo_uid.clone(), idx);
+                repo_groups.push((repo_uid, vec![spec.clone()]));
+            }
+        } else {
+            unresolved.push(spec.clone());
+        }
+    }
+
+    if repo_groups.is_empty() {
+        let reader = FilesystemReader::with_limits(fallback_root, limits);
+        return read_symbols(store, specs, &reader, neighbors, token_budget);
+    }
+
+    let mut merged = ReadSymbolsResult::default();
+    merged.not_found.extend(unresolved);
+    let mut remaining_budget = token_budget;
+
+    for (repo_uid, group_targets) in &repo_groups {
+        let root = store
+            .lookup_repo(repo_uid)
+            .ok()
+            .flatten()
+            .and_then(|repo| repo.local_root().map(PathBuf::from))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| fallback_root.to_path_buf());
+        let reader = FilesystemReader::with_limits(&root, limits);
+        let partial = read_symbols(store, group_targets, &reader, neighbors, remaining_budget);
+        if let Some(budget) = remaining_budget {
+            let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
+            remaining_budget = Some(budget.saturating_sub(used));
+        }
+        merged.symbols.extend(partial.symbols);
+        merged.not_found.extend(partial.not_found);
+        merged.ambiguous.extend(partial.ambiguous);
+        merged.dropped.extend(partial.dropped);
+        merged.truncated = merged.truncated || partial.truncated;
+        if merged.budget_exceeded_by_first_symbol.is_none() {
+            merged.budget_exceeded_by_first_symbol = partial.budget_exceeded_by_first_symbol;
+        }
+    }
+    merged
+}
+
+fn repo_uid_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
+    resolve(store, spec)
+        .into_iter()
+        .next()
+        .map(|symbol| symbol.repo_uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +405,30 @@ mod tests {
         assert!(
             !w.body_available,
             "an unreadable source span must set body_available = false"
+        );
+    }
+
+    #[test]
+    fn omitted_root_reads_from_the_repo_local_root_not_cwd() {
+        let (_dir, _src, store) = test_repo();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let res = read_symbols_from_repo_roots(
+            &store,
+            &["greet".to_string()],
+            0,
+            None,
+            elsewhere.path(),
+            crate::index_limits::IndexLimits::default(),
+        );
+        assert_eq!(res.symbols.len(), 1);
+        assert!(
+            res.symbols[0].body_available,
+            "the recorded repo root must be used when the caller omits --root; got {:?}",
+            res.symbols[0]
+        );
+        assert!(
+            res.symbols[0].body.contains("function greet"),
+            "body must come from the indexed tree, not the fallback cwd"
         );
     }
 }
