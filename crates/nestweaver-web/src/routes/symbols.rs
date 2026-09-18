@@ -43,8 +43,15 @@ pub async fn symbol_by_uid(
             Err(ApiError::not_found(format!("symbol '{uid}' not found")))
         }
         nestweaver_engine::LookupResult::Ambiguous(candidates) => {
-            let json = serde_json::to_value(&candidates)?;
-            Ok((StatusCode::MULTIPLE_CHOICES, Json(json)).into_response())
+            let candidate_uids: Vec<String> = candidates.iter().map(|c| c.uid.clone()).collect();
+            let json = serde_json::json!({
+                "error": "ambiguous",
+                "status": "ambiguous",
+                "candidates": candidates,
+                "candidate_uids": candidate_uids,
+            });
+            // fetch() treats a bare 300 (no Location) as a network failure.
+            Ok((StatusCode::CONFLICT, Json(json)).into_response())
         }
     }
 }
