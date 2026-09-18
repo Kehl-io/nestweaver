@@ -1117,12 +1117,12 @@ pub fn investigate(
         let cost = entry_token_cost(&entry);
         // Always admit the first entry so a single oversized node never starves
         // the whole map (mirrors populate_inline_bodies / read_symbols).
-        // nw-476 (quality review, round 3, left as-is/non-blocking): only
-        // entries[0] is guaranteed by this. A pin (`matched_query:
-        // Some(Exact)`) guarantees ORDER — pinned entries at positions 1-4
-        // are still ordinary candidates for this token-budget cut and can
-        // be dropped like any other entry past the first.
-        if !entries.is_empty() && used_tokens + cost > budget {
+        // A pinned exact match is the thing the query named: keep it even after
+        // the budget is spent so project-scope maps cannot collapse to notes
+        // only. Other entries past the first still drop when they would exceed
+        // the budget.
+        let is_pinned_exact = exact_match_uids.contains(&node.uid);
+        if !entries.is_empty() && !is_pinned_exact && used_tokens + cost > budget {
             more_available += 1;
             continue;
         }
@@ -1654,6 +1654,16 @@ fn resolve_query_symbol_matches(
     for term in &terms {
         if term.is_empty() {
             continue;
+        }
+        if let Ok(named) = store.lookup_symbols_by_name(term) {
+            for sym in named {
+                if sym.name == *term
+                    && exact.len() < SEED_NAME_MATCH_LIMIT
+                    && exact_seen.insert(sym.uid.clone())
+                {
+                    exact.push(sym.uid);
+                }
+            }
         }
         let Ok(page) =
             store.search_symbols_by_name_page(term, SEED_NAME_MATCH_LIMIT, seed_resolution)
@@ -4385,6 +4395,48 @@ mod tests {
             Some(MatchedQuery::Exact),
             "a pinned entry must be flagged matched_query: exact"
         );
+    }
+
+    #[test]
+    fn investigate_project_scope_pin_survives_a_tight_token_budget() {
+        const SYMBOL_NAME: &str = "build_brain_context_hybrid_with_aliases";
+        let notes: Vec<(String, &str, usize)> = (0..35)
+            .map(|i| (format!("noise{i:03}"), SYMBOL_NAME, 30))
+            .collect();
+        let notes_ref: Vec<(&str, &str, usize)> = notes
+            .iter()
+            .map(|(slug, term, n)| (slug.as_str(), *term, *n))
+            .collect();
+        let (dir, db_path, store, tantivy, symbol_uid) =
+            make_project_with_symbol_and_noise_notes("pinbudget", SYMBOL_NAME, &notes_ref, false);
+
+        let result = investigate(
+            &store,
+            Some(&tantivy),
+            Some(&db_path),
+            dir.path(),
+            SYMBOL_NAME,
+            "project:pinbudget",
+            Some(80),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.entries.iter().any(|e| e.uid == symbol_uid),
+            "a pinned exact match must survive the token-budget cut; entries: {:?}",
+            result
+                .entries
+                .iter()
+                .map(|e| (&e.uid, &e.title, e.matched_query))
+                .collect::<Vec<_>>()
+        );
+        let pinned = result
+            .entries
+            .iter()
+            .find(|e| e.uid == symbol_uid)
+            .expect("pinned uid present");
+        assert_eq!(pinned.matched_query, Some(MatchedQuery::Exact));
     }
 
     /// nw-476 (quality review, IMPORTANT #1). `RenderCap.seeds` (query.rs)
