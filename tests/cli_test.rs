@@ -10531,12 +10531,15 @@ fn mcp_wal_corrupt_boot_emits_jsonrpc_error_on_stdout() {
         frame.get("error").is_some(),
         "boot failure must be a JSON-RPC error object: {frame}"
     );
-    let combined = format!("{stdout}{stderr}");
+    let message = frame["error"]["message"].as_str().unwrap_or("");
     assert!(
-        combined.contains("db_wal_corrupt")
-            || frame["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("wal") || m.contains("WAL") || m.contains("corrupt")),
-        "the envelope must identify WAL corruption:\n{combined}"
+        message.contains("db_wal_corrupt")
+            || message.contains("checksum")
+            || message.contains("Checksum")
+            || message.contains("unreadable write-ahead")
+            || message.contains("WAL file is corrupted")
+            || message.contains("write-ahead log"),
+        "stdout error.message must identify WAL corruption, not merely stderr:\n\
+         message={message:?}\nstderr={stderr}"
     );
 }

@@ -19203,65 +19203,63 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
             }
-            let mcp_result = (|| -> anyhow::Result<()> {
-                if use_daemon_mcp {
-                    let rt = tokio::runtime::Runtime::new()
-                        .context("create tokio runtime for daemon proxy")?;
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    // nw-088 leg (2) FOLLOW-UP: an MCP stdio session is a
-                    // foreground server for the caller's whole agent session,
-                    // not a one-shot RPC — it can idle far longer than 60s
-                    // between tool calls while the agent/human reads or thinks.
-                    // Declare it so the autostarted daemon keeps its normal
-                    // idle-timeout budget.
-                    let hybrid = rt
-                        .block_on(
-                            nestweaver_client::hybrid::HybridClient::connect_long_running(
-                                &db_path,
-                                config.as_deref().map(std::path::Path::new),
-                                &cwd,
-                            ),
-                        )
-                        .context("connect to daemon (hybrid)")?;
-                    if hybrid.has_upstreams() {
-                        tracing::info!(
-                            upstreams = ?hybrid.upstream_info(),
-                            "MCP daemon proxy with hybrid routing"
-                        );
-                        run_mcp_hybrid(hybrid, rt, lite, track_interactions, &db_path)
-                            .context("mcp server (hybrid mode)")?;
-                    } else {
-                        let grpc_client = hybrid.inner().clone();
-                        nestweaver_mcp::run_stdio_server_daemon(
-                            grpc_client,
-                            rt,
-                            lite,
-                            track_interactions,
-                            &db_path,
-                        )
-                        .context("mcp server (daemon mode)")?;
-                    }
-                } else {
-                    nestweaver_mcp::run_stdio_server(
+            if use_daemon_mcp {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("create tokio runtime for daemon proxy")?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                // nw-088 leg (2) FOLLOW-UP: an MCP stdio session is a
+                // foreground server for the caller's whole agent session,
+                // not a one-shot RPC — it can idle far longer than 60s
+                // between tool calls while the agent/human reads or thinks.
+                // Declare it so the autostarted daemon keeps its normal
+                // idle-timeout budget.
+                let hybrid = match rt.block_on(
+                    nestweaver_client::hybrid::HybridClient::connect_long_running(
                         &db_path,
-                        allow_mcp_add_sources,
+                        config.as_deref().map(std::path::Path::new),
+                        &cwd,
+                    ),
+                ) {
+                    Ok(hybrid) => hybrid,
+                    Err(error) => {
+                        let error = error.context("connect to daemon (hybrid)");
+                        // Stdout is the MCP wire. A connect/open failure that
+                        // only prints miette on stderr leaves the client with
+                        // empty stdout. Once the session is running, errors
+                        // must not append a trailing id:null frame.
+                        let _ = nestweaver_mcp::write_stdio_boot_error(format!("{error:#}"));
+                        return Err(error);
+                    }
+                };
+                if hybrid.has_upstreams() {
+                    tracing::info!(
+                        upstreams = ?hybrid.upstream_info(),
+                        "MCP daemon proxy with hybrid routing"
+                    );
+                    run_mcp_hybrid(hybrid, rt, lite, track_interactions, &db_path)
+                        .context("mcp server (hybrid mode)")?;
+                } else {
+                    let grpc_client = hybrid.inner().clone();
+                    nestweaver_mcp::run_stdio_server_daemon(
+                        grpc_client,
+                        rt,
                         lite,
                         track_interactions,
-                        config.as_deref(),
+                        &db_path,
                     )
-                    .context("mcp server")?;
+                    .context("mcp server (daemon mode)")?;
                 }
-                Ok(())
-            })();
-            match mcp_result {
-                Ok(()) => Ok((EXIT_SUCCESS, None)),
-                Err(error) => {
-                    // Stdout is the MCP wire. A boot failure that only prints
-                    // miette on stderr leaves the client with empty stdout.
-                    let _ = nestweaver_mcp::write_stdio_boot_error(format!("{error:#}"));
-                    Err(error)
-                }
+            } else {
+                nestweaver_mcp::run_stdio_server(
+                    &db_path,
+                    allow_mcp_add_sources,
+                    lite,
+                    track_interactions,
+                    config.as_deref(),
+                )
+                .context("mcp server")?;
             }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Ui {
