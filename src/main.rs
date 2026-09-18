@@ -45209,7 +45209,7 @@ mod cli_honesty_sweep_tests {
     /// bisecting for it is not a remedy.
     #[test]
     fn the_bound_appears_in_help_and_not_only_in_the_rejection() {
-        let help = std::thread::Builder::new()
+        let help_blobs = std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let mut command = Cli::command();
@@ -45217,41 +45217,66 @@ mod cli_honesty_sweep_tests {
                     .find_subcommand_mut("brain")
                     .expect("brain subcommand")
                     .clone();
-                let mut rendered = String::new();
+                let mut blobs = Vec::new();
                 for name in ["topic-clusters", "orphans", "tag-graph", "broken-links"] {
                     let mut subcommand = brain
                         .clone()
                         .find_subcommand_mut(name)
                         .expect("brain leaf subcommand")
                         .clone();
-                    rendered.push_str(&subcommand.render_long_help().to_string());
+                    blobs.push((
+                        format!("brain {name}"),
+                        subcommand.render_long_help().to_string(),
+                    ));
                 }
                 let mut clusters = command
                     .find_subcommand_mut("clusters")
                     .expect("clusters subcommand")
                     .clone();
-                rendered.push_str(&clusters.render_long_help().to_string());
-                let mut related = command
+                let clusters_help = clusters.render_long_help().to_string();
+                let memory = command
                     .find_subcommand_mut("memory")
                     .expect("memory subcommand")
-                    .clone()
-                    .find_subcommand_mut("related")
-                    .expect("memory related")
                     .clone();
-                rendered.push_str(&related.render_long_help().to_string());
-                rendered
+                for name in ["lint", "consolidate", "related"] {
+                    let mut subcommand = memory
+                        .clone()
+                        .find_subcommand_mut(name)
+                        .expect("memory leaf")
+                        .clone();
+                    blobs.push((
+                        format!("memory {name}"),
+                        subcommand.render_long_help().to_string(),
+                    ));
+                }
+                let mut refs = command
+                    .find_subcommand_mut("cross-repo-refs")
+                    .expect("cross-repo-refs")
+                    .clone();
+                blobs.push((
+                    "cross-repo-refs".to_string(),
+                    refs.render_long_help().to_string(),
+                ));
+                (blobs, clusters_help)
             })
             .expect("spawn")
             .join()
             .expect("join");
 
-        assert_eq!(
-            help.matches("1-1000").count(),
-            4,
-            "each of the four --limit flags must state its bound in --help: {help}"
-        );
-        assert!(help.contains("greater than 0"), "{help}");
-        assert!(help.contains("1-15"), "{help}");
+        let (help_blobs, clusters_help) = help_blobs;
+        for (name, help) in &help_blobs {
+            assert!(
+                help.contains("1-1000"),
+                "{name} --limit must state its bound in --help: {help}"
+            );
+        }
+        assert!(clusters_help.contains("greater than 0"), "{clusters_help}");
+        let related = help_blobs
+            .iter()
+            .find(|(name, _)| name == "memory related")
+            .map(|(_, help)| help.as_str())
+            .expect("memory related help");
+        assert!(related.contains("1-15"), "{related}");
     }
 
     // ── nw-414 ───────────────────────────────────────────────────────────
