@@ -170,9 +170,10 @@ pub fn run_stdio_server(
                 .with_context(|| format!("load --config {display}"))?;
             Ok::<_, anyhow::Error>((config, display))
         })
-        .transpose()?;
+        .transpose()
+        .map_err(abort_stdio_before_session)?;
 
-    let store = open_direct_read_only_store(db_path)?;
+    let store = open_direct_read_only_store(db_path).map_err(abort_stdio_before_session)?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
     //
     // nw-391: and disclose a refusal. stderr is the only channel available
@@ -255,17 +256,20 @@ pub fn run_stdio_server(
                     Ok(_) => true,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
-                        anyhow::bail!("cannot inspect discovered config {}: {e}", path.display())
+                        return Err(abort_stdio_before_session(anyhow::anyhow!(
+                            "cannot inspect discovered config {}: {e}",
+                            path.display()
+                        )));
                     }
                 } =>
             {
                 match nestweaver_engine::InstanceConfig::from_file(path) {
                     Ok(config) => (Some(config), Some(path.display().to_string())),
                     Err(error) => {
-                        anyhow::bail!(
+                        return Err(abort_stdio_before_session(anyhow::anyhow!(
                             "invalid discovered instance config {}: {error:#}",
                             path.display()
-                        );
+                        )));
                     }
                 }
             }
@@ -503,6 +507,11 @@ fn write_stdio_boot_error_to(
     let frame = error(Value::Null, error_code::INTERNAL_ERROR, message);
     let serialized = serde_json::to_string(&frame).expect("JSON-RPC error is valid JSON");
     write_stdout_frame(out, &serialized)
+}
+
+fn abort_stdio_before_session(error: anyhow::Error) -> anyhow::Error {
+    let _ = write_stdio_boot_error(format!("{error:#}"));
+    error
 }
 
 /// nw-363. Every outbound JSON-RPC frame passes through here, and it is the

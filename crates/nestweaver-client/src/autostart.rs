@@ -290,8 +290,9 @@ enum UnownedPidfileReap {
 /// The caller must already hold an exclusive flock on `file`. Flock lives on
 /// the inode, not the path: after `rm daemon.pid` a live daemon keeps the
 /// lock on the unlinked file, and `create(true)` makes a new inode we can
-/// lock without contention. Unlinking that replacement would be fine; claiming
-/// we cleaned up a live owner's pidfile would not.
+/// lock without contention. That replacement pathname is not ours to reap —
+/// unlinking it would drop a file we did not prove unowned (see
+/// `reap_does_not_unlink_a_replacement_pathname_inode`).
 fn reap_unowned_pidfile(
     file: &fs::File,
     path: &Path,
