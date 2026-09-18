@@ -128,8 +128,11 @@ export const api = {
     return get<Tag[]>("/api/v1/brain/tags");
   },
 
-  brainNotes() {
-    return get<Note[]>("/api/v1/brain/notes");
+  // NotesTab is a catalog, not a "top N" view, so request the API maximum
+  // (1000). Pagination is not wired; the handler still caps omitted `limit`
+  // at 20 so curl/MCP cannot dump the whole vault.
+  brainNotes(limit = 1000) {
+    return get<Note[]>(`/api/v1/brain/notes?limit=${limit}`);
   },
 
   brainNote(uid: string) {

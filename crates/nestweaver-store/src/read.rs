@@ -1529,21 +1529,62 @@ impl GraphStore {
         Ok(self.list_notes_with_integrity(vault_uid)?.0)
     }
 
+    /// Page of Note nodes, optionally filtered by vault UID.
+    ///
+    /// `limit` is applied in Cypher (`LIMIT` is inlined — Ladybug/Kuzu does not
+    /// bind LIMIT) so a catalog caller does not materialize the whole vault.
+    /// `offset` is applied after the scan of `offset + limit` rows; SKIP is not
+    /// assumed. Same corrupt-row policy as [`Self::list_notes`].
+    pub fn list_notes_page(
+        &self,
+        vault_uid: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Note>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch = offset.saturating_add(limit);
+        Ok(self
+            .list_notes_scan(vault_uid, Some(fetch))?
+            .0
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
     /// [`Self::list_notes`] plus what the scan actually covered.
     pub fn list_notes_with_integrity(
         &self,
         vault_uid: Option<&str>,
     ) -> Result<(Vec<Note>, ScanIntegrity), StoreError> {
+        self.list_notes_scan(vault_uid, None)
+    }
+
+    fn list_notes_scan(
+        &self,
+        vault_uid: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Note>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
+        // KuzuDB does not support LIMIT with a bound parameter — embed the
+        // integer directly (safe: it's a usize from caller code, not user input).
+        let limit_clause = match limit {
+            Some(n) => format!(" LIMIT {n}"),
+            None => String::new(),
+        };
         let result = if let Some(vid) = vault_uid {
-            let q = format!("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN {NOTE_COLUMNS}");
+            let q = format!(
+                "MATCH (n:Note) WHERE n.vault_uid = $vid RETURN {NOTE_COLUMNS}{limit_clause}"
+            );
             let mut stmt = conn
                 .prepare(&q)
                 .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
             conn.execute(&mut stmt, vec![("vid", Value::String(vid.to_string()))])
                 .map_err(|e| StoreError::Query(format!("execute: {e}")))?
         } else {
-            let q = format!("MATCH (n:Note) RETURN {NOTE_COLUMNS}");
+            let q = format!("MATCH (n:Note) RETURN {NOTE_COLUMNS}{limit_clause}");
             conn.query(&q)
                 .map_err(|e| StoreError::Query(e.to_string()))?
         };

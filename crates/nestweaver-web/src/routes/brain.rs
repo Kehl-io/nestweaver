@@ -61,8 +61,30 @@ pub async fn list_tags(State(state): State<Arc<AppState>>) -> Result<Response, A
     Ok(Json(json).into_response())
 }
 
-pub async fn list_notes(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let notes = state.store.list_notes(None)?;
+/// Default `limit` for GET `/api/v1/brain/notes` when the query param is omitted.
+/// Matches `/api/v1/symbols/top`. Callers that need a larger page must pass
+/// `limit` (hard-capped at [`LIST_NOTES_LIMIT_MAX`]).
+pub const LIST_NOTES_DEFAULT_LIMIT: usize = 20;
+/// Hard cap on `limit` / effective page size for GET `/api/v1/brain/notes`.
+pub const LIST_NOTES_LIMIT_MAX: usize = 1000;
+
+#[derive(Deserialize)]
+pub struct ListNotesParams {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+pub async fn list_notes(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListNotesParams>,
+) -> Result<Response, ApiError> {
+    let limit = params
+        .limit
+        .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
+        .clamp(1, LIST_NOTES_LIMIT_MAX);
+    let offset = params.offset.unwrap_or(0);
+    // Raw JSON array, matching `/brain/vaults`, `/brain/tags`, and `/symbols/top`.
+    let notes = state.store.list_notes_page(None, limit, offset)?;
     let json = serde_json::to_value(&notes)?;
     Ok(Json(json).into_response())
 }
