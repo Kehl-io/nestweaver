@@ -379,7 +379,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
 | `detect-changes` | Run the MCP-compatible changed-file impact contract directly from the CLI, including risk, gate state, status, and blind spots |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
-| `read-symbols` | Read a symbol's source span |
+| `read-symbols` | Read a symbol's source span. Omitting `--root` reads each symbol from its recorded repo working tree; `--root` still pins a single filesystem root |
 | `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh now with `index --with-trigrams`, or set `[indexing] with_trigrams = true` so the daemon's reconcile loop keeps the pre-filter fresh on `trigram_reconcile_interval`) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
@@ -494,7 +494,7 @@ dead:
 | Command | Description |
 |---------|-------------|
 | `list-projects` | List all projects defined in the instance config |
-| `project-context` | Get context scoped to a specific project. `--include-components` is now three-state: **omitting it means `true`**, which is the documented default the schema always declared — pass `--include-components false` to exclude component sub-projects. Before 9.0.0 the CLI sent an unconditional `false`, so the documented default was unreachable on this route |
+| `project-context` | Get context scoped to a specific project. `--include-components` is now three-state: **omitting it means `true`**, which is the documented default the schema always declared — pass `--include-components false` to exclude component sub-projects. Before 9.0.0 the CLI sent an unconditional `false`, so the documented default was unreachable on this route. The MCP `kinds` filter, when it is only Symbol, does not seed or promote member notes into the walk |
 | `materialize-projects` | Materialize declared projects, wiki sources, and cross-repo links from instance config |
 | `detect-implicit-projects` | Detect implicit projects from vault structure and code patterns |
 | `suggest-links` | Discover potential cross-repo links between symbols |
