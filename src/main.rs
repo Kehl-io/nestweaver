@@ -5436,7 +5436,7 @@ enum Commands {
         token_budget: Option<usize>,
         #[arg(
             long,
-            help = "Repository root for resolving file paths (default: current dir)"
+            help = "Repository root for resolving file paths (default: each symbol's recorded repo root)"
         )]
         root: Option<PathBuf>,
         #[arg(long, help = "Output as JSON")]
@@ -13677,20 +13677,10 @@ fn client_source_root(root: Option<&std::path::Path>) -> String {
         .into_owned()
 }
 
-/// `read_symbols` reads `include_neighbors` (never `neighbors`, nw-088) and an
-/// optional integer `token_budget`. The budget key is OMITTED when unset — the
-/// tool's integer schema rejects an explicit null, which used to fail schema
-/// validation on every budget-less call and silently fall back to the direct
-/// path.
-///
-/// `root`, by contrast, is ALWAYS sent (nw-340). It used to be omitted when
-/// `--root` was not passed, and the daemon then filled it from its own
-/// `current_dir()`. The daemon is long-lived and started wherever it happened
-/// to be started, so every repo-relative `file_path` failed to resolve, every
-/// `read_span` returned `None`, and `read-symbols` printed a well-formed header
-/// with no body under it. Since `resolve_use_daemon` returns true by default,
-/// that was the normal path, not an edge case. The client's cwd is the only
-/// working directory that means anything to the caller, so it is the default.
+/// `root` is sent only when the caller passed `--root`. Omitting it lets the
+/// daemon resolve each symbol from its repo `local_root` (the MCP
+/// `read_symbols` contract). Sending the client's cwd here used to replay the
+/// original empty-body failure whenever that cwd was not the repo.
 fn read_symbols_rpc_args(
     targets: &[String],
     neighbors: u8,
@@ -13704,7 +13694,9 @@ fn read_symbols_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
-    args["root"] = serde_json::json!(client_source_root(root));
+    if let Some(root) = root {
+        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+    }
     args
 }
 
@@ -19919,7 +19911,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let limits = match config.as_deref() {
                 Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
                     .with_context(|| format!("failed to load config from {}", path.display()))?
@@ -19927,15 +19918,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .limits(),
                 None => nestweaver_engine::index_limits::IndexLimits::default(),
             };
-            let reader =
-                nestweaver_engine::content_reader::FilesystemReader::with_limits(&root, limits);
-            let res = nestweaver_engine::read_symbols::read_symbols(
-                &store,
-                &targets,
-                &reader,
-                neighbors,
-                token_budget,
-            );
+            let res = match root.as_deref() {
+                Some(root) => {
+                    let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
+                        root, limits,
+                    );
+                    nestweaver_engine::read_symbols::read_symbols(
+                        &store,
+                        &targets,
+                        &reader,
+                        neighbors,
+                        token_budget,
+                    )
+                }
+                None => {
+                    let fallback = std::env::current_dir().unwrap_or_default();
+                    nestweaver_engine::read_symbols::read_symbols_from_repo_roots(
+                        &store,
+                        &targets,
+                        neighbors,
+                        token_budget,
+                        &fallback,
+                        limits,
+                    )
+                }
+            };
             render_read_symbols(&res, json)
         }
         Commands::Symbol {
@@ -39535,8 +39542,10 @@ credential_method = "gh"
         let args = read_symbols_rpc_args(&["main".to_string()], 0, None, None);
         assert!(args.get("token_budget").is_none());
         assert!(args.get("neighbors").is_none());
-        // `root` is NOT omitted — see
-        // `read_symbols_rpc_args_always_sends_a_root` (nw-340).
+        assert!(
+            args.get("root").is_none(),
+            "an absent --root must omit root so the daemon uses each repo local_root"
+        );
         assert_eq!(
             args["targets"],
             serde_json::json!(["main"]),
@@ -39561,25 +39570,23 @@ credential_method = "gh"
         );
     }
 
-    /// nw-340. With no `--root` the CLI omitted `root`, so the DAEMON resolved
-    /// repo-relative file paths against ITS OWN cwd
-    /// (`nestweaver-mcp/src/tools.rs`, `unwrap_or_else(|| current_dir())`).
-    /// The daemon is long-lived and was started somewhere else, so EVERY body
-    /// came back empty and `read-symbols` printed headers with nothing under
-    /// them. `resolve_use_daemon` returns true by default, which is why this
-    /// looked universal rather than cwd-dependent.
+    /// The CLI used to always send the client's cwd as `root`, which blocked
+    /// the daemon from using each symbol's recorded `local_root` and reproduced
+    /// empty bodies whenever cwd was not the repo.
     #[test]
-    fn read_symbols_rpc_args_always_sends_a_root() {
+    fn read_symbols_rpc_args_omit_root_when_flag_absent() {
         let args = read_symbols_rpc_args(&["greet".to_string()], 0, None, None);
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .expect("root must always be sent: the daemon's cwd is not the caller's");
-        assert_eq!(
-            std::path::Path::new(root),
-            std::env::current_dir().unwrap().as_path(),
-            "root must default to the CLIENT's cwd"
+        assert!(
+            args.get("root").is_none(),
+            "omitting --root must omit the field, not send cwd; got {args}"
         );
+        let args = read_symbols_rpc_args(
+            &["greet".to_string()],
+            0,
+            None,
+            Some(std::path::Path::new("/explicit/repo")),
+        );
+        assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
     }
 
     /// nw-340, the honesty half. The engine already sets
