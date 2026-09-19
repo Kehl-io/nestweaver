@@ -145,6 +145,12 @@ fn agent_daemon_is_live(label: &str) -> bool {
 /// its pidfile flock. Agents whose DB exists are kept; agents whose DB is gone
 /// but whose daemon is still alive (transient unmount) are spared.
 pub fn gc_orphaned_agents() -> Result<GcReport> {
+    gc_orphaned_agents_for(None)
+}
+
+/// Sweep orphaned launch agents, optionally limited to one database instance.
+pub fn gc_orphaned_agents_for(only_db: Option<&std::path::Path>) -> Result<GcReport> {
+    let only_instance = only_db.map(lifecycle::instance_id_from_db_path);
     let dir = launchd_agents_dir();
     let uid = unsafe { libc::getuid() };
     let mut removed = Vec::new();
@@ -174,6 +180,12 @@ pub fn gc_orphaned_agents() -> Result<GcReport> {
         else {
             continue;
         };
+        if let Some(want) = only_instance.as_deref() {
+            let label_id = label.strip_prefix("io.kehl.nestweaver.");
+            if label_id != Some(want) {
+                continue;
+            }
+        }
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let db = parse_db_path_from_plist(&content);

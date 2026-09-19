@@ -2364,7 +2364,15 @@ fn collect_fallback_candidates(
 /// wait on a busy spawn is needed. Direct non-cooperating filesystem mutation
 /// by the data owner is outside this admission protocol.
 pub fn gc_orphaned_daemon_dirs() -> std::io::Result<DaemonGcReport> {
-    gc_orphaned_daemon_dirs_in(&daemon_gc_roots())
+    gc_orphaned_daemon_dirs_filtered(&daemon_gc_roots(), None)
+}
+
+/// Sweep orphaned runtime/state for one database's instance only.
+///
+/// Live ownership still spares that instance. Other instances are left
+/// untouched — unlike [`gc_orphaned_daemon_dirs`], which is the global pass.
+pub fn gc_orphaned_daemon_dirs_for(db_path: &Path) -> std::io::Result<DaemonGcReport> {
+    gc_orphaned_daemon_dirs_filtered(&daemon_gc_roots(), Some(db_path))
 }
 
 #[cfg(unix)]
@@ -2427,7 +2435,16 @@ fn retire_gc_runtime(runtime: &Path) -> std::io::Result<()> {
 
 /// [`gc_orphaned_daemon_dirs`] against explicit roots — the seam that keeps
 /// every test on scratch directories and off the operator's real roots.
+#[cfg(test)]
 fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGcReport> {
+    gc_orphaned_daemon_dirs_filtered(roots, None)
+}
+
+fn gc_orphaned_daemon_dirs_filtered(
+    roots: &DaemonGcRoots,
+    only_db: Option<&Path>,
+) -> std::io::Result<DaemonGcReport> {
+    let only_instance = only_db.map(instance_id_from_db_path);
     let mut report = DaemonGcReport::default();
 
     // Phase 1: gather candidates from every root BEFORE any deletion, keyed
@@ -2457,6 +2474,12 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
 
     // Phase 2: identify, test ownership, then reap from every root at once.
     for (name, locations) in candidates {
+        if let Some(want) = only_instance.as_deref()
+            && name != want
+        {
+            // Scoped `--db` must not touch other instances, even orphans.
+            continue;
+        }
         // The boot line lives in the state root's log directory, wherever the
         // candidate itself was found — in `daemon.log` for a launchd-started
         // daemon, or in `daemon.log.<date>` for any other.
@@ -3984,6 +4007,55 @@ mod tests {
         let report = gc_orphaned_daemon_dirs_in(&roots).unwrap();
         assert!(report.removed.iter().any(|(_, name)| name == "aaaaaaaa"));
         assert!(!runtime.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_for_one_db_does_not_reap_another_instance() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db_a = scratch.path().join("a.lbug");
+        let db_b = scratch.path().join("b.lbug");
+        let id_a = instance_id_from_db_path(&db_a);
+        let id_b = instance_id_from_db_path(&db_b);
+        assert_ne!(id_a, id_b, "distinct databases must hash to distinct ids");
+        let roots = DaemonGcRoots {
+            state: scratch.path().join("state"),
+            runtime: Some(scratch.path().join("runtime")),
+            socket_fallback: scratch.path().join("fallback"),
+        };
+        for (name, db) in [(&id_a, db_a.as_path()), (&id_b, db_b.as_path())] {
+            let state = roots.state.join(name);
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(
+                state.join("daemon.log"),
+                format!(
+                    "[daemon] starting for {} (instance label-{name})\n",
+                    db.display()
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(roots.pidfile_root().join(name)).unwrap();
+            std::fs::create_dir_all(roots.socket_fallback.join(name)).unwrap();
+        }
+        let report = gc_orphaned_daemon_dirs_filtered(&roots, Some(&db_a)).unwrap();
+        assert!(
+            report.removed.iter().any(|(_, name)| name == &id_a),
+            "scoped gc must reap the named database's orphan: {report:?}"
+        );
+        assert!(
+            !report.removed.iter().any(|(_, name)| name == &id_b),
+            "scoped gc must not delete another instance: {report:?}"
+        );
+        assert!(
+            !roots.state.join(&id_a).exists(),
+            "named instance orphan must be gone"
+        );
+        assert!(
+            roots.state.join(&id_b).exists(),
+            "other instance dirs must remain"
+        );
+        assert!(roots.pidfile_root().join(&id_b).exists());
+        assert!(roots.socket_fallback.join(&id_b).exists());
     }
 
     #[cfg(unix)]
