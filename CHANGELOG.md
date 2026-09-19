@@ -1,5 +1,36 @@
 # Changelog
 
+## [10.0.6](https://github.com/Kehl-io/nestweaver/compare/v10.0.5...v10.0.6) (2026-09-19)
+
+
+### Bug Fixes
+
+* **cli,mcp,engine:** refuse ambiguous duplicate note titles ([7b3362b](https://github.com/Kehl-io/nestweaver/commit/7b3362bb7db034e100a6f7b91e876b23309c499a))
+* **cli,mcp:** bound backlinks occurrences ([ccfc341](https://github.com/Kehl-io/nestweaver/commit/ccfc341b455674309a69f8334efdb37e282406b8))
+* **client:** adopt live daemon after pidfile inode replacement ([66c895f](https://github.com/Kehl-io/nestweaver/commit/66c895f9ed5081ad59a8a8e6f8c13ba95a37ede9))
+* **client:** only unlink a pidfile after proving the owner is gone ([53ffb3e](https://github.com/Kehl-io/nestweaver/commit/53ffb3eb924ffde9ce364305959e349dfed736bb))
+* **cli:** parse note and symbol UIDs from ambiguous context errors ([0a3c5a0](https://github.com/Kehl-io/nestweaver/commit/0a3c5a03042bc0efbcfadf3e841516dee84b194d))
+* **cli:** treat unknown hubs --repo as not-found and cap selector length ([c0619fd](https://github.com/Kehl-io/nestweaver/commit/c0619fd169809846ef34417372a68b9792df3a75))
+* **daemon,cli:** scope daemon gc --db to one instance ([0b7197a](https://github.com/Kehl-io/nestweaver/commit/0b7197a9e01910568017163ddd6a6ee35482ebd8))
+* **engine,cli,mcp:** refuse ambiguous flow-trace and context seeds ([c4de800](https://github.com/Kehl-io/nestweaver/commit/c4de800a76cc866e0505f35c25b9ea275ba13ea8))
+* **engine:** keep read-symbols, context seeds, and hubs honest under caps ([3e1c30d](https://github.com/Kehl-io/nestweaver/commit/3e1c30d7c04ec3473b9c0cb63386b13ff2609d3d))
+* **mcp,cli:** look up contract UIDs as UIDs and satisfy clippy/fmt ([a48cfdd](https://github.com/Kehl-io/nestweaver/commit/a48cfddea513fdc11496d2271a330ee4191c5fe7))
+* **mcp,schema,web:** drop dead resolvers and impact-only ambiguity note ([435e90c](https://github.com/Kehl-io/nestweaver/commit/435e90c9da7caabfe12381313188fd018f21d0d9))
+* **mcp:** boot WAL-corrupt as a JSON-RPC error envelope ([3853385](https://github.com/Kehl-io/nestweaver/commit/3853385cccc612351177e2af509418ec330c46d8))
+* **mcp:** emit boot envelope only before the stdio session ([16e817c](https://github.com/Kehl-io/nestweaver/commit/16e817cb9ac6cf377a8328cf31535d0690574e50))
+* **mcp:** stop advertising first-match for contract names ([bec5019](https://github.com/Kehl-io/nestweaver/commit/bec5019d5a715e3c0cfaa7462c8773eceb61881c))
+* **web:** cap HTTP backlinks like notes-list ([9976d2c](https://github.com/Kehl-io/nestweaver/commit/9976d2cbe88315b30385459fa9ba1dded7ea994c))
+* **web:** cap notes list offset ([337a950](https://github.com/Kehl-io/nestweaver/commit/337a95000f1affe591d75845bea33bc2c42e9138))
+* **web:** dispatch file and note deep links to the typed APIs ([4b07c33](https://github.com/Kehl-io/nestweaver/commit/4b07c3330e59180253d84aba18d490e5a0a03d83))
+* **web:** do not reject valid context seeds that contain angle brackets ([578b037](https://github.com/Kehl-io/nestweaver/commit/578b037a7d9a9893358e8ed6e516cf8c9bc9e603))
+* **web:** drop graph-missing notes from search hits ([57dccac](https://github.com/Kehl-io/nestweaver/commit/57dccacee1512eeb0088451728fb99fb9e543992))
+* **web:** honor limit on GET /api/v1/brain/notes ([d960639](https://github.com/Kehl-io/nestweaver/commit/d9606397a15de6acd52c2e855d5636d355492e78))
+* **web:** honor search scope and pin search Detail selection ([fdeb360](https://github.com/Kehl-io/nestweaver/commit/fdeb3606a3d7aa082fa3c1a95242869d906eb48b))
+* **web:** return 4xx for unresolved context seeds ([1501c23](https://github.com/Kehl-io/nestweaver/commit/1501c2306e2f13fa1433c9206d85db92deba97c3))
+* **web:** scope phrase search and remount detail on uid change ([57c026b](https://github.com/Kehl-io/nestweaver/commit/57c026b52ddb270a906f26634abdaf28556fe058))
+* **web:** stop advertising HTTP 300 without Location for symbol names ([399819a](https://github.com/Kehl-io/nestweaver/commit/399819a79a4de99191a990524e092ef547b1672c))
+* **web:** treat notes list limit=0 as empty ([a8a2a9c](https://github.com/Kehl-io/nestweaver/commit/a8a2a9c1501768a502e5552e4f88fcdcea0d2beb))
+
 ## [10.0.5](https://github.com/Kehl-io/nestweaver/compare/v10.0.4...v10.0.5) (2026-09-18)
 
 
