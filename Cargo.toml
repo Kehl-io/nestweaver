@@ -122,6 +122,8 @@ nestweaver-embed = { workspace = true, optional = true }
 daemonize2 = "0.7"
 
 [features]
+# Internal CI-only artifact. Never enable in local or distributed builds.
+ci-direct-tests = []
 default = ["embed"]
 embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
 metal = ["nestweaver-embed?/metal", "nestweaver-daemon/metal"]
@@ -168,3 +170,13 @@ test = false
 name = "remove_repo_benchmarks"
 harness = false
 test = false
+
+# Legacy fixtures still contain direct-store legs; isolated daemon coverage is
+# in release_daemon_test. These targets belong only to the separate CI artifact.
+[[test]]
+name = "daemon_test"
+required-features = ["ci-direct-tests"]
+
+[[test]]
+name = "parity_test"
+required-features = ["ci-direct-tests"]

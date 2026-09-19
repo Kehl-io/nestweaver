@@ -1727,7 +1727,8 @@ struct Cli {
     /// scripts and agents. Requests that this command skip autostarting a
     /// daemon and open the database directly.
     ///
-    /// The gate is `NESTWEAVER_ALLOW_NO_DAEMON`, NOT `NESTWEAVER_NO_DAEMON` —
+    /// CI-only: requires the internal CI build, a truthful CI marker, and
+    /// `NESTWEAVER_ALLOW_NO_DAEMON=1`. `NESTWEAVER_NO_DAEMON` requests access —
     /// the latter is a second way to REQUEST the bypass, not to permit it.
     /// Without the gate this flag is ignored and the command routes through
     /// the daemon.
@@ -14118,61 +14119,36 @@ mod impact_floor_clause_tests {
     }
 }
 
-/// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
-/// without mutating process-global environment variables (which race under
-/// parallel `cargo test`). The daemon bypass is permitted when an explicit
-/// local opt-in is set, or when we are running under a CI system.
-fn no_daemon_allowed_from(allow_optin: bool, _github_actions: bool, _ci: Option<&str>) -> bool {
-    // `CI` and `GITHUB_ACTIONS` confer NOTHING. They used to permit the bypass,
-    // which meant an ambient variable set by dozens of unrelated tools decided
-    // whether this database could have two writers.
-    //
-    // `CI` is not ours. Every CI provider sets it, so do many Docker images,
-    // shell profiles and wrapper scripts, and developers set it locally to
-    // reproduce CI failures. The canonical incident is Netlify beginning to set
-    // `CI=true` in 2020, which broke thousands of Create React App builds
-    // overnight — for a COSMETIC setting. This one decided writer exclusivity.
-    //
-    // The closest analogue in Rust is `RUSTC_BOOTSTRAP`, which leaked so far
-    // beyond its intended use that the compiler team proposed renaming it to
-    // force a conscious decision. An inherited, invisible, ambiently-settable
-    // channel is exactly wrong for a mode nobody should enter by accident.
-    //
-    // Correctness no longer depends on this answer in any case:
-    // `require_exclusive_store_access` takes the lock at the moment of the
-    // write, so a wrong answer here costs a confusing refusal, never a second
-    // writer.
-    //
-    // An earlier version of this comment claimed "in CI no daemon is running,
-    // so the lock is free and everything works with no gate at all". CI
-    // disproved it: with the bypass no longer conferred, `--no-daemon` was
-    // IGNORED, so the step's index command autostarted a daemon that took the
-    // lease, and the embed command that followed refused. Removing an implicit
-    // permission does not make a job daemon-free — it makes it daemon-ROUTED,
-    // which is a different thing. Jobs that want isolation now set
-    // NESTWEAVER_ALLOW_NO_DAEMON explicitly.
-    allow_optin
+/// CI-only direct-store policy, kept pure for exhaustive unit coverage.
+/// Standard artifacts cannot bypass, even with both runtime opt-ins present.
+fn ci_direct_policy(
+    ci_build: bool,
+    allow_optin: bool,
+    github_actions: bool,
+    ci: Option<&str>,
+) -> bool {
+    ci_build && allow_optin && (github_actions || matches!(ci, Some("true" | "1")))
 }
 
-/// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
-/// is permitted in the current environment.
-///
-/// Honored by exactly ONE thing: `NESTWEAVER_ALLOW_NO_DAEMON`. `GITHUB_ACTIONS`
-/// and `CI` confer nothing — they are still read and passed in, but only so
-/// [`no_daemon_allowed_from`]'s tests can pin that they never grant permission.
-/// See that function for why an ambient, inherited variable is the wrong
-/// channel for this decision.
-///
-/// What the answer actually controls is narrow: whether a command may skip
-/// autostarting a daemon. It is NOT what protects the store from two writers —
-/// [`require_exclusive_store_access`] takes the write lease at the moment of
-/// the write and fails closed if anyone holds it, so a bypass against a
-/// daemon-owned database is refused rather than silently doubled. A wrong
-/// answer here costs a confusing refusal, not corruption.
+fn no_daemon_allowed_from(allow_optin: bool, github_actions: bool, ci: Option<&str>) -> bool {
+    ci_direct_policy(
+        cfg!(feature = "ci-direct-tests"),
+        allow_optin,
+        github_actions,
+        ci,
+    )
+}
+
+/// Only the separate internal CI artifact can honor an explicit bypass permit.
+/// Runtime markers alone never authorize direct access. Setting CI locally is
+/// not a supported way to run database tests; local fixtures use the daemon.
 fn no_daemon_allowed() -> bool {
     no_daemon_allowed_from(
-        std::env::var_os("NESTWEAVER_ALLOW_NO_DAEMON").is_some(),
-        std::env::var_os("GITHUB_ACTIONS").is_some(),
+        matches!(
+            std::env::var("NESTWEAVER_ALLOW_NO_DAEMON").as_deref(),
+            Ok("1" | "true")
+        ),
+        matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("1" | "true")),
         std::env::var("CI").ok().as_deref(),
     )
 }
@@ -14550,7 +14526,7 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     }
     if warn {
         eprintln!(
-            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a test-harness-only escape \
+            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI-only escape \
              hatch and is not permitted here. Routing through the daemon, which is the \
              single writer for this database. If you are trying to stop a daemon that is \
              holding the write lease, use `nestweaver daemon --db <path> stop`."
@@ -38705,45 +38681,43 @@ mod exit_code_contract_tests {
 mod no_daemon_gate_tests {
     use super::*;
 
-    /// `CI` and `GITHUB_ACTIONS` must confer NOTHING.
-    ///
-    /// They used to permit the bypass, so an ambient variable set by dozens of
-    /// unrelated tools decided whether this database could have two writers.
-    /// `CI` is not ours: every provider sets it, so do many Docker images and
-    /// shell profiles, and developers set it locally to reproduce CI failures.
-    /// The canonical incident is Netlify beginning to set `CI=true` in 2020,
-    /// breaking thousands of Create React App builds overnight — for a
-    /// COSMETIC setting. This one decided writer exclusivity.
     #[test]
-    fn ci_environment_variables_confer_no_privileges() {
-        for ci in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("True"),
-            Some("1"),
-            Some("yes"),
-        ] {
-            assert!(
-                !no_daemon_allowed_from(false, false, ci),
-                "CI={ci:?} must not permit the bypass"
-            );
-            assert!(
-                !no_daemon_allowed_from(false, true, ci),
-                "GITHUB_ACTIONS must not permit the bypass either (CI={ci:?})"
-            );
+    fn ci_direct_policy_truth_table() {
+        for build in [false, true] {
+            for permit in [false, true] {
+                for github in [false, true] {
+                    for ci in [
+                        None,
+                        Some(""),
+                        Some("0"),
+                        Some("false"),
+                        Some("True"),
+                        Some("yes"),
+                        Some("true"),
+                        Some("1"),
+                    ] {
+                        let expected =
+                            build && permit && (github || matches!(ci, Some("true" | "1")));
+                        assert_eq!(ci_direct_policy(build, permit, github, ci), expected);
+                    }
+                }
+            }
         }
     }
 
-    /// The explicit opt-in is the ONLY thing that still answers yes — and even
-    /// then it now means only "do not autostart a daemon". Correctness no
-    /// longer rests on this answer: `require_exclusive_store_access` takes the
-    /// lock at the moment of the write.
     #[test]
-    fn only_the_explicit_opt_in_permits_the_bypass() {
-        assert!(no_daemon_allowed_from(true, false, None));
-        assert!(no_daemon_allowed_from(true, true, Some("1")));
+    fn standard_artifact_cannot_authorize_bypass() {
+        for permit in [false, true] {
+            for github in [false, true] {
+                for ci in [None, Some("true"), Some("1")] {
+                    assert!(!ci_direct_policy(false, permit, github, ci));
+                    assert_eq!(
+                        no_daemon_allowed_from(permit, github, ci),
+                        ci_direct_policy(cfg!(feature = "ci-direct-tests"), permit, github, ci)
+                    );
+                }
+            }
+        }
     }
 }
 

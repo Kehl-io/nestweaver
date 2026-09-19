@@ -117,8 +117,8 @@ exactly like the rest.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NESTWEAVER_DB` | `./nestweaver.lbug` | Path to the NestWeaver database |
-| `NESTWEAVER_NO_DAEMON` | unset | *Requests* a daemon bypass. On its own it does nothing — see `NESTWEAVER_ALLOW_NO_DAEMON` |
-| `NESTWEAVER_ALLOW_NO_DAEMON` | unset | The only thing that *permits* the bypass. `CI` and `GITHUB_ACTIONS` confer nothing |
+| `NESTWEAVER_NO_DAEMON` | unset | *Requests* a daemon bypass. CI-only; standard artifacts ignore the request and use the daemon |
+| `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Explicit CI-only permit; also requires the internal CI test artifact and a truthful CI runtime marker |
 
 The daemon's idle timeout is a `daemon run --idle-timeout <secs>` flag (3600 by
 default when autostarted), **not** an environment variable. See CLAUDE.md for the
@@ -135,7 +135,7 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon
 
 Daemon logs are written to `~/.local/state/nestweaver/<instance>/daemon.log`.
 
-For CI or environments where the daemon can't run, you need **both**:
-`NESTWEAVER_ALLOW_NO_DAEMON=1` to permit the bypass and `NESTWEAVER_NO_DAEMON=1`
-(or `--no-daemon`) to request it. With only the request, the flag is disclosed on
-stderr and the command autostarts a daemon anyway.
+Daemon bypass is CI-only. Local MCP sessions, fixtures, and recovery must use
+the daemon. Standard development and release artifacts cannot honor bypass
+requests. An internal unpublished CI artifact additionally requires an explicit
+permit and a truthful CI runtime marker; setting CI locally is not an exception.
