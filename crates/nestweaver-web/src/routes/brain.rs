@@ -272,6 +272,7 @@ pub async fn brain_search(
     if let Some(tantivy) = &state.tantivy {
         match tantivy.search(&q, limit) {
             Ok(hits) => {
+                let hits = retain_graph_backed_search_hits(&state.store, hits);
                 let json = serde_json::to_value(&hits)?;
                 return Ok(Json(json).into_response());
             }
@@ -334,6 +335,7 @@ fn tantivy_scoped_note_search(
         }
     };
     let saturated = hits.len() >= fetch_limit;
+    let hits = retain_graph_backed_search_hits(&state.store, hits);
 
     let project_note_uids: Option<HashSet<String>> = if workspace.kind == WorkspaceKind::Project {
         Some(
@@ -501,6 +503,7 @@ fn scoped_brain_search(
     {
         match tantivy.search(q, limit) {
             Ok(hits) => {
+                let hits = retain_graph_backed_search_hits(&state.store, hits);
                 let saturated = limit > 0 && hits.len() >= limit;
                 let results: Vec<_> = hits
                     .into_iter()
