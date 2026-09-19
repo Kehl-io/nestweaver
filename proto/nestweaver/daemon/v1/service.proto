@@ -648,6 +648,9 @@ message NoteGetResponse {
   string frontmatter_json = 8;
   // Heading outline, matching the local note_get 'outline' field.
   repeated NoteHeading outline = 9;
+  // Lossless tool outcome, including ambiguity candidates. Fields 1-9 remain
+  // populated for found notes for compatibility with older clients.
+  string result_json = 10;
 }
 message NoteHeading {
   string uid = 1;

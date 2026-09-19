@@ -8466,6 +8466,7 @@ impl NestWeaverDaemon for DaemonService {
             .await?;
 
         Ok(Response::new(NoteGetResponse {
+            result_json: value.to_string(),
             uid: value
                 .get("uid")
                 .and_then(|v| v.as_str())

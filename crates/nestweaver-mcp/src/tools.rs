@@ -135,7 +135,7 @@ fn name_lookup_ambiguous_payload(
 }
 
 fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Value {
-    nestweaver_schema::responses::name_lookup_ambiguous(
+    let mut payload = nestweaver_schema::responses::name_lookup_ambiguous(
         title,
         None,
         json!(
@@ -149,7 +149,16 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
                 }))
                 .collect::<Vec<_>>()
         ),
-    )
+    );
+    payload["entity_kind"] = json!("note");
+    payload["title"] = json!(title);
+    payload["note"] = json!(
+        "Multiple notes share this title. Pass a candidate note UID or a vault-relative path to select the intended note."
+    );
+    for candidate in payload["candidates"].as_array_mut().into_iter().flatten() {
+        candidate["kind"] = json!("Note");
+    }
+    payload
 }
 
 fn filter_name_matches_by_repo(
@@ -15085,37 +15094,8 @@ fn dispatch_via_daemon_inner(
                     sections: str_array("sections"),
                 });
                 let resp = client.get_note(req).await.map_err(grpc_status_err)?;
-                let inner = resp.into_inner();
-                let mut value = serde_json::json!({
-                    "uid": inner.uid,
-                    "title": inner.title,
-                    "path": inner.path,
-                    "note_kind": inner.note_kind,
-                    "word_count": inner.word_count,
-                    "section_count": inner.section_count,
-                    // Parity with the local path: frontmatter and outline are
-                    // always present (local defaults to {} / []).
-                    "frontmatter": serde_json::from_str::<serde_json::Value>(
-                        &inner.frontmatter_json
-                    )
-                    .unwrap_or_else(|_| serde_json::json!({})),
-                    "outline": inner
-                        .outline
-                        .iter()
-                        .map(|h| {
-                            serde_json::json!({
-                                "uid": h.uid,
-                                "level": h.level,
-                                "text": h.text,
-                                "slug": h.slug,
-                                "line": h.line,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                });
-                if let Some(ref body) = inner.body {
-                    value["body"] = serde_json::json!(body);
-                }
+                let value = nestweaver_proto::note_get_json(&resp.into_inner())
+                    .map_err(anyhow::Error::msg)?;
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_status" => {

@@ -498,35 +498,7 @@ async fn dispatch_typed_note_get(
         .await
         .context("note_get RPC failed")?
         .into_inner();
-    let mut result = serde_json::json!({
-        "uid": resp.uid,
-        "title": resp.title,
-        "path": resp.path,
-        "note_kind": resp.note_kind,
-        "word_count": resp.word_count,
-        "section_count": resp.section_count,
-        // Match the daemon-proxy note_get shape (tools.rs): frontmatter and
-        // outline are always present (local defaults to {} / []).
-        "frontmatter": serde_json::from_str::<Value>(&resp.frontmatter_json)
-            .unwrap_or_else(|_| serde_json::json!({})),
-        "outline": resp
-            .outline
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "uid": h.uid,
-                    "level": h.level,
-                    "text": h.text,
-                    "slug": h.slug,
-                    "line": h.line,
-                })
-            })
-            .collect::<Vec<_>>(),
-    });
-    if let Some(body) = resp.body {
-        result["body"] = Value::String(body);
-    }
-    Ok(result)
+    nestweaver_proto::note_get_json(&resp).map_err(anyhow::Error::msg)
 }
 
 /// Typed dispatch for `hub_nodes` -> `HubNodes` RPC.

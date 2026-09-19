@@ -1269,8 +1269,13 @@ fn report_ambiguous_name_payload(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let entity = if payload["entity_kind"].as_str() == Some("note") {
+            "notes"
+        } else {
+            "symbols"
+        };
         eprintln!(
-            "Ambiguous: '{}' matches {} symbols:",
+            "Ambiguous: '{}' matches {} {entity}:",
             symbol,
             candidates.len()
         );
@@ -15570,6 +15575,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload["status"].as_str() == Some("not_found") {
+                if json {
+                    print_json_payload(&payload)?;
+                }
+                eprintln!("Note '{target}' not found.");
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             if payload_is_ambiguous(&payload) {
                 return report_ambiguous_name_payload(&target, &payload, json);
             }
