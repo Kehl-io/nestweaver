@@ -118,6 +118,25 @@ pub fn read_symbols(
     neighbors: u8,
     token_budget: Option<usize>,
 ) -> ReadSymbolsResult {
+    read_symbols_budgeted(store, specs, reader, neighbors, token_budget, true)
+}
+
+/// Like [`read_symbols`], with explicit control over the first-symbol
+/// exemption.
+///
+/// `exempt_first_symbol` is the nw-111 guarantee: a single-call read never
+/// returns an empty `symbols` list just because the first window overruns
+/// `token_budget`. Callers that merge per-repo groups must pass `false` once
+/// any window has already been returned, otherwise a later repo re-applies
+/// the exemption after the budget is already spent (nw-542).
+pub fn read_symbols_budgeted(
+    store: &GraphStore,
+    specs: &[String],
+    reader: &dyn ContentReader,
+    neighbors: u8,
+    token_budget: Option<usize>,
+    exempt_first_symbol: bool,
+) -> ReadSymbolsResult {
     let mut result = ReadSymbolsResult::default();
 
     // 1. Resolve specs → primary symbols (preserving input order).
@@ -168,19 +187,20 @@ pub fn read_symbols(
         let body_available = body_opt.is_some();
         let body = body_opt.unwrap_or_default();
         let cost = window_cost(&body);
+        let may_exempt = exempt_first_symbol && result.symbols.is_empty();
         if let Some(budget) = token_budget
-            && !result.symbols.is_empty()
+            && !may_exempt
             && used + cost > budget
         {
             result.dropped.push(sym.uid.clone());
             result.truncated = true;
             continue;
         }
-        // The first symbol is exempt from the budget so the caller never gets an
-        // empty answer — but say so rather than reporting a clean result that
-        // silently blew the budget.
+        // The first symbol of a fresh call is exempt from the budget so the
+        // caller never gets an empty answer — but say so rather than reporting
+        // a clean result that silently blew the budget.
         if let Some(budget) = token_budget
-            && result.symbols.is_empty()
+            && may_exempt
             && cost > budget
         {
             result.truncated = true;
@@ -264,7 +284,18 @@ pub fn read_symbols_from_repo_roots(
             .filter(|path| path.is_dir())
             .unwrap_or_else(|| fallback_root.to_path_buf());
         let reader = FilesystemReader::with_limits(&root, limits);
-        let partial = read_symbols(store, group_targets, &reader, neighbors, remaining_budget);
+        // Only the overall first returned window may exceed the budget.
+        // Passing the leftover budget into a fresh `read_symbols` would
+        // re-apply that exemption for every repo group (nw-542).
+        let exempt_first = merged.symbols.is_empty();
+        let partial = read_symbols_budgeted(
+            store,
+            group_targets,
+            &reader,
+            neighbors,
+            remaining_budget,
+            exempt_first,
+        );
         if let Some(budget) = remaining_budget {
             let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
             remaining_budget = Some(budget.saturating_sub(used));
@@ -430,5 +461,77 @@ mod tests {
             res.symbols[0].body.contains("function greet"),
             "body must come from the indexed tree, not the fallback cwd"
         );
+    }
+
+    /// nw-542: a token budget spent by the first repo group must drop later
+    /// groups rather than re-applying the first-symbol exemption.
+    #[test]
+    fn a_spent_budget_does_not_exempt_the_first_symbol_of_a_later_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("a");
+        let repo_b = dir.path().join("b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(
+            repo_a.join("main.js"),
+            "function mainA() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_b.join("ping.js"),
+            "function ping() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+
+        let (_r, store) =
+            index_directory_in_memory(&repo_a, "test", "https://example.com/a", "aaa").unwrap();
+        let reader_b = FilesystemReader::new(&repo_b);
+        crate::index::index_with_reader(
+            &reader_b,
+            &store,
+            "test",
+            "https://example.com/b",
+            "bbb",
+            Some("b"),
+        )
+        .unwrap();
+        assert!(
+            store.list_repos(None).unwrap().len() >= 2,
+            "fixture must index two repos so the merge path is exercised"
+        );
+
+        let greet_cost = {
+            let r = FilesystemReader::new(&repo_a);
+            let res = read_symbols(&store, &["mainA".to_string()], &r, 0, None);
+            window_cost(&res.symbols[0].body)
+        };
+        let ping = store
+            .lookup_symbols_by_name("ping")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("ping indexed");
+
+        let res = read_symbols_from_repo_roots(
+            &store,
+            &["mainA".to_string(), "ping".to_string()],
+            0,
+            Some(greet_cost),
+            dir.path(),
+            crate::index_limits::IndexLimits::default(),
+        );
+        assert_eq!(
+            res.symbols.len(),
+            1,
+            "only the first repo's symbol should fit; got {:?}",
+            res.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(res.symbols[0].name, "mainA");
+        assert!(
+            res.dropped.iter().any(|uid| uid == &ping.uid),
+            "the second repo's symbol must be dropped, not exempted: {:?}",
+            res.dropped
+        );
+        assert!(res.truncated);
     }
 }

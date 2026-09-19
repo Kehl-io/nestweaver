@@ -140,9 +140,10 @@ impl HubNodes {
     /// re-derive it from the already-cut list and each get `false` for free.
     ///
     /// Deliberately `>` and not `!=`: when the caller asks for MORE than the
-    /// graph has, the heap pads the tail with zero-degree symbols, so
-    /// `hubs.len()` can exceed `candidate_total`. That is a caller who was
-    /// given everything, which is the opposite of truncation.
+    /// graph has, the heap used to pad the tail with zero-degree symbols, so
+    /// `hubs.len()` could exceed `candidate_total`. Degree-0 symbols are no
+    /// longer admitted (they are not hubs), so an over-large `top_n` returns
+    /// exactly the candidate population, which is still not a truncation.
     pub fn truncated(&self) -> bool {
         self.candidate_total > self.hubs.len()
     }
@@ -319,6 +320,12 @@ pub fn find_hub_nodes_bounded_in_repos(
             pagerank,
             index,
         };
+        // A hub is a connected symbol. Padding `--top` with degree-0 rows
+        // made `hubs --json` list more rows than `total` (and `--repo` of a
+        // graph with no in-scope edges returned isolated symbols as hubs).
+        if key.total_degree == 0 {
+            continue;
+        }
         if best.len() < top_n {
             best.push(Reverse(key));
         } else if best.peek().is_some_and(|weakest| key > weakest.0) {
@@ -573,6 +580,41 @@ mod tests {
         assert_eq!(scoped.candidate_total, 0);
     }
 
+    /// Isolated in-scope symbols are not hubs: asking for more rows than the
+    /// scoped graph has connected symbols must not invent degree-0 hubs.
+    #[test]
+    fn a_scoped_ranking_does_not_pad_with_zero_degree_symbols() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("lone", "lonely", "repo-small"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("a", "fn_a", "repo-small"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_in_repo("b", "fn_b", "repo-small"))
+            .unwrap();
+        store.insert_edge(&make_edge("a", "b")).unwrap();
+
+        let scope: HashSet<String> = ["repo-small".to_string()].into_iter().collect();
+        let scoped = find_hub_nodes_bounded_in_repos(&store, 10, Some(&scope)).unwrap();
+        assert_eq!(scoped.candidate_total, 2);
+        assert_eq!(scoped.hubs.len(), scoped.candidate_total);
+        assert!(
+            scoped
+                .hubs
+                .iter()
+                .all(|h| h.total_degree > 0 && h.uid != "lone"),
+            "degree-0 symbols must not appear as hubs: {:?}",
+            scoped
+                .hubs
+                .iter()
+                .map(|h| (&h.uid, h.total_degree))
+                .collect::<Vec<_>>()
+        );
+        assert!(!scoped.truncated());
+    }
+
     /// Ranking still uses the FULL graph: a symbol that is central because
     /// OTHER repos depend on it keeps that standing when scoped to its own repo.
     /// Recomputing degree on the induced subgraph would rank a widely-consumed
@@ -746,8 +788,7 @@ mod tests {
                 .unwrap();
         }
         // Two symbols with no edges at all: they can never be hubs, so they
-        // are not candidates, but the heap will still pad the tail with them
-        // once the caller asks for more rows than there are candidates.
+        // are not candidates and must not occupy `--top` slots.
         for i in 0..2 {
             store
                 .insert_symbol(&make_symbol(
@@ -769,8 +810,8 @@ mod tests {
 
     /// COUNTERWEIGHT: a ranking that took everything must report
     /// `truncated == false`, including when the caller asked for MORE than the
-    /// graph has and got zero-degree padding back — `hubs.len()` then exceeds
-    /// `candidate_total`, and a `!=` would call a complete answer truncated.
+    /// graph has. Degree-0 padding used to make `hubs.len()` exceed
+    /// `candidate_total`; the rows must now match the candidate population.
     #[test]
     fn an_uncut_hub_ranking_reports_no_truncation_even_when_asked_for_more() {
         let store = GraphStore::in_memory().unwrap();
@@ -807,8 +848,13 @@ mod tests {
         );
 
         let over = find_hub_nodes_bounded(&store, 50).unwrap();
-        assert_eq!(over.hubs.len(), 12, "every symbol is returned");
+        assert_eq!(over.hubs.len(), 10, "degree-0 symbols are not hubs");
         assert_eq!(over.candidate_total, 10);
+        assert!(
+            over.hubs.iter().all(|h| h.total_degree > 0),
+            "a hub row must have edges: {:?}",
+            over.hubs
+        );
         assert!(
             !over.truncated(),
             "asking for 50 and being given everything is not a truncation"
@@ -877,10 +923,7 @@ mod tests {
 
         // `top_n` is deliberately exactly the count of symbols with a REAL
         // (non-dropped) edge, so the assertion below cannot be satisfied by
-        // hubs' documented zero-degree padding (asking for more slots than
-        // there are candidates pads the tail with insertion-order zero-degree
-        // symbols, and `phantom` — inserted first — would legitimately win
-        // that unrelated tie-break). `candidate_total` pins the same claim
+        // leftover degree-0 admission. `candidate_total` pins the same claim
         // from the other side: only `real` and `caller0` ever accrued degree.
         let found = find_hub_nodes_bounded(&store, 2).unwrap();
         assert_eq!(

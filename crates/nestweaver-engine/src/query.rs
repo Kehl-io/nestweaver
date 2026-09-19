@@ -2393,6 +2393,10 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // Dedupe seeds.
     let mut seen = std::collections::HashSet::new();
     seed_uids.retain(|u| seen.insert(u.clone()));
+    // Snapshot BEFORE semantic blending. KNN extras must not occupy the
+    // connected-list prefix the caller actually reads under a tight
+    // `--token-budget` (nw-584).
+    let direct_seed_uids = seed_uids.clone();
 
     // ── Semantic seed blending ────────────────────────────────────────────
     // When an embedding model is available and the semantic weight is nonzero
@@ -2635,6 +2639,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
     }
 
+    pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
+
     // Cover cancellation after inference/vector work but before the completed
     // result crosses the engine boundary into single-flight/cache publication.
     ensure_brain_context_not_cancelled(cancel)?;
@@ -2697,6 +2703,38 @@ pub fn nestweaver_store_stoplist() -> &'static [&'static str] {
             .chain(ENGLISH.iter().copied())
             .collect()
     })
+}
+
+/// Put query-resolved seeds at the front of `connected` so a tight token
+/// budget cannot spend itself on semantic extras and omit the named seed.
+///
+/// `brain_context` JSON (the agent-visible payload) is the connected list.
+/// Direct seeds used to live only in `seeds`, which that payload omits unless
+/// `include_seeds` is set — and when they *were* copied into `connected`
+/// (empty-connected fallback), they trailed KNN extras in fused order.
+fn pin_direct_seeds_in_connected(
+    seeds: &[BrainNode],
+    connected: &mut Vec<BrainNode>,
+    direct_seed_uids: &[String],
+) {
+    if direct_seed_uids.is_empty() {
+        return;
+    }
+    let direct: std::collections::HashSet<&str> =
+        direct_seed_uids.iter().map(String::as_str).collect();
+    let mut pinned: Vec<BrainNode> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for node in seeds.iter().chain(connected.iter()) {
+        if direct.contains(node.uid.as_str()) && seen.insert(node.uid.clone()) {
+            pinned.push(node.clone());
+        }
+    }
+    if pinned.is_empty() {
+        return;
+    }
+    connected.retain(|node| !direct.contains(node.uid.as_str()));
+    pinned.append(connected);
+    *connected = pinned;
 }
 
 /// Tanh-based score normalization.
@@ -4787,6 +4825,46 @@ mod dedup_heading_section_tests {
         dedup_heading_section_pairs(&mut r);
         // Note nodes are never dropped, only Heading nodes.
         assert_eq!(r.connected.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod pin_direct_seeds_tests {
+    use super::{BrainNode, pin_direct_seeds_in_connected};
+
+    fn node(uid: &str) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol/Function".to_string(),
+            title: uid.to_string(),
+            location: "src/lib.rs".to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    #[test]
+    fn a_named_seed_is_moved_to_the_front_of_connected() {
+        let seeds = vec![node("sym:Long")];
+        let mut connected = vec![node("sym:extra1"), node("sym:extra2")];
+        pin_direct_seeds_in_connected(&seeds, &mut connected, &["sym:Long".to_string()]);
+        assert_eq!(connected[0].uid, "sym:Long");
+        assert_eq!(
+            connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:Long", "sym:extra1", "sym:extra2"]
+        );
+    }
+
+    #[test]
+    fn a_seed_already_in_connected_is_not_duplicated() {
+        let seeds = vec![node("sym:Long")];
+        let mut connected = vec![node("sym:extra"), node("sym:Long")];
+        pin_direct_seeds_in_connected(&seeds, &mut connected, &["sym:Long".to_string()]);
+        assert_eq!(
+            connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:Long", "sym:extra"]
+        );
     }
 }
 
