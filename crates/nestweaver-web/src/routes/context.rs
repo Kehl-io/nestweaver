@@ -20,6 +20,46 @@ fn default_limit() -> usize {
     50
 }
 
+/// HTTP context seeds must not echo attacker-controlled text into 500s.
+/// Hostile markup/path forms and graph-missing `note:` UIDs are client errors.
+fn reject_unresolved_http_seeds(
+    store: &nestweaver_store::GraphStore,
+    seeds: &[String],
+) -> Result<(), ApiError> {
+    for seed in seeds {
+        if seed.contains('<') || seed.contains('>') || seed.contains("..") {
+            return Err(ApiError::bad_request("invalid context seed"));
+        }
+        let trimmed = seed.trim();
+        if trimmed.starts_with("note:") {
+            match store.lookup_note(trimmed) {
+                Ok(_) => {}
+                Err(nestweaver_store::StoreError::NotFound) => {
+                    return Err(ApiError::not_found("note seed not found"));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Engine not-found / ambiguous lookup failures are 4xx. Messages stay generic
+/// so unresolved seeds never round-trip into the HTTP body.
+fn map_context_engine_error(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("No matching symbols")
+        || message.contains("No symbols found")
+        || message.contains("No seeds resolved")
+    {
+        return ApiError::not_found("no matching context seeds");
+    }
+    if message.contains("Ambiguous") {
+        return ApiError::bad_request("ambiguous context seed");
+    }
+    ApiError::from(err)
+}
+
 pub async fn code_context(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ContextRequest>,
@@ -27,7 +67,9 @@ pub async fn code_context(
     if body.seeds.is_empty() {
         return Err(ApiError::bad_request("seeds must not be empty"));
     }
-    let result = nestweaver_engine::build_context(&state.store, &body.seeds)?;
+    reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+    let result = nestweaver_engine::build_context(&state.store, &body.seeds)
+        .map_err(map_context_engine_error)?;
     let mut json = serde_json::to_value(&result)?;
     crate::bridge::annotate_context_payload(&state, &mut json);
     Ok(Json(json).into_response())
@@ -51,6 +93,7 @@ pub async fn brain_context(
     if body.seeds.is_empty() {
         return Err(ApiError::bad_request("seeds must not be empty"));
     }
+    reject_unresolved_http_seeds(&state.store, &body.seeds)?;
     let workspace = workspaces::resolve_workspace(
         &state.store,
         workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
@@ -63,7 +106,8 @@ pub async fn brain_context(
         &config,
         None,
         None,
-    )?;
+    )
+    .map_err(map_context_engine_error)?;
     filter_brain_context_result(&state, &workspace, &mut result)?;
     let empty_result = result.seeds.is_empty() && result.connected.is_empty();
     let meta = brain_context_meta(&workspace, body.token_budget, empty_result);
