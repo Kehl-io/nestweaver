@@ -414,6 +414,107 @@ async fn brain_context_valid_seed_still_200() {
     assert!(json.get("seeds").is_some(), "response should have 'seeds'");
 }
 
+fn make_app_with_ellipsis_and_angle_seeds() -> axum::Router {
+    let store = setup_test_store();
+    store
+        .insert_symbol(&Symbol {
+            uid: "sym:test:wait-ellipsis".to_string(),
+            name: "Wait...".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/wait.js".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "function Wait...()".to_string(),
+            summary: None,
+            content_hash: "hash-wait".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.5),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        })
+        .unwrap();
+    store
+        .insert_symbol(&Symbol {
+            uid: "sym:test:vector-t".to_string(),
+            name: "vector<T>".to_string(),
+            kind: SymbolKind::Class,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/vector.h".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "template <typename T> class vector".to_string(),
+            summary: None,
+            content_hash: "hash-vector".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.4),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        })
+        .unwrap();
+    store
+        .insert_vault(&Vault {
+            uid: "vault:ellipsis".to_string(),
+            name: "ellipsis-vault".to_string(),
+            root_path: "/tmp/ellipsis-vault".to_string(),
+            instance_id: String::new(),
+        })
+        .unwrap();
+    store
+        .insert_note(&Note {
+            uid: "note:ellipsis:wait".to_string(),
+            vault_uid: "vault:ellipsis".to_string(),
+            file_path: "Wait.md".to_string(),
+            title: "Wait...".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 8,
+            content_hash: "note-wait".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: Some(0.3),
+            embedding: None,
+        })
+        .unwrap();
+    let state = AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/ellipsis-context.lbug"),
+    );
+    create_router(state)
+}
+
+#[tokio::test]
+async fn context_resolvable_seed_with_ellipsis_or_angles_is_200() {
+    let app = make_app_with_ellipsis_and_angle_seeds();
+    for (uri, seed) in [
+        ("/api/v1/context", "Wait..."),
+        ("/api/v1/context", "vector<T>"),
+        ("/api/v1/brain/context", "Wait..."),
+        ("/api/v1/brain/context", "vector<T>"),
+    ] {
+        let (status, json) = post_json(&app, uri, json!({ "seeds": [seed] })).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri} seed {seed:?} must not be rejected for containing '..' or '<'/'>': {json}"
+        );
+        assert!(
+            json.get("seeds").is_some(),
+            "{uri} seed {seed:?} should have 'seeds': {json}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn impact_not_found_returns_404() {
     let app = make_app();

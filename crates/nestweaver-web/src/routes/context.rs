@@ -20,16 +20,15 @@ fn default_limit() -> usize {
     50
 }
 
-/// HTTP context seeds must not echo attacker-controlled text into 500s.
-/// Hostile markup/path forms and graph-missing `note:` UIDs are client errors.
+/// Graph-missing `note:` UIDs are client errors. Brain-context otherwise
+/// accepts the UID as a seed and drops it at render time, which would 200
+/// an empty body instead of 4xx. Name/path misses still go through the
+/// engine and [`map_context_engine_error`].
 fn reject_unresolved_http_seeds(
     store: &nestweaver_store::GraphStore,
     seeds: &[String],
 ) -> Result<(), ApiError> {
     for seed in seeds {
-        if seed.contains('<') || seed.contains('>') || seed.contains("..") {
-            return Err(ApiError::bad_request("invalid context seed"));
-        }
         let trimmed = seed.trim();
         if trimmed.starts_with("note:") {
             match store.lookup_note(trimmed) {
