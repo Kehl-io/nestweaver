@@ -21,10 +21,10 @@ export function DiffDetail() {
   const onlyB = [...uidsB].filter((uid) => !uidsA.has(uid));
 
   return (
-    <div className="p-3 text-sm border-b border-[var(--color-border)]">
+    <div role="region" aria-label="Context comparison result" className="p-3 text-sm border-b border-[var(--color-border)]">
       <div className="flex items-center justify-between mb-2">
         <h3 className="font-semibold text-xs uppercase text-[var(--color-text-muted)]">
-          Diff
+          Context comparison
         </h3>
         <button
           onClick={clearDiff}

@@ -1659,10 +1659,15 @@ fn parse_cluster_resolution(value: &str) -> Result<f64, String> {
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
+#[cfg(feature = "release-fixture-hooks")]
+const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+release-fixture-hooks");
+#[cfg(not(feature = "release-fixture-hooks"))]
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "nestweaver",
-    version,
+    version = CLI_VERSION,
     about = "Code knowledge graph for AI agents",
     long_about = "NestWeaver builds structural knowledge graphs of codebases and serves them\n\
                   to AI agents through query commands. Index a repo, then search symbols,\n\
@@ -4203,15 +4208,28 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         }
     };
     coverage_note();
-
+    println!("Review candidates only; static reachability does not establish safe deletion.");
+    if payload
+        .get("confidence_filter_status")
+        .and_then(|v| v.as_str())
+        == Some("unavailable_no_validated_population")
+    {
+        println!(
+            "High confidence is unavailable: no validated population exists. This empty result is not evidence that no dead code exists."
+        );
+        excluded_note();
+        return;
+    }
     if matching == 0 {
-        println!("No dead code detected ({total} symbols, all reachable from entry points).");
+        println!(
+            "No review candidates match this filter ({total} analyzed symbols); this is not proof of no dead code."
+        );
         excluded_note();
         return;
     }
 
     println!(
-        "Dead code analysis: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
+        "Reachability review: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
         num("unreachable_count"),
         payload
             .get("dead_percentage")
@@ -4233,7 +4251,9 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        println!("(showing first {returned} of {matching} — pass --limit to change)\n");
+        println!(
+            "(showing {returned} of {matching}; JSON next_offset identifies any remaining page)\n"
+        );
     }
 
     // Group by file path, matching the direct path's BTreeMap ordering.
@@ -6861,7 +6881,7 @@ enum Commands {
         stats: bool,
     },
 
-    /// Detect potentially dead code via entry point reachability
+    /// Review statically unreachable symbols (never deletion approval)
     ///
     /// Walks forward from every entry point following CALLS, IMPORTS,
     /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
@@ -6882,14 +6902,14 @@ enum Commands {
     /// is one-directional and points at deleting live code. Re-index the repos
     /// it names with `nestweaver index --repo <path> --force` and re-run.
     #[command(
-        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  a list was produced\n  2  REFUSED — the graph's edges predate the running resolver; re-index with\n     `nestweaver index --repo <path> --force` (each stale repo is named on stderr)"
+        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  review results produced (high has no validated population)\n  2  REFUSED — stale resolver or invalid/changed result page; follow the response note"
     )]
     DeadCode {
         #[arg(
             long,
             default_value = "low",
             value_parser = ["low", "medium", "high"],
-            help = "Minimum confidence to report (low, medium, high)"
+            help = "Review tier (low, medium, high); high has no validated output population"
         )]
         min_confidence: String,
         #[arg(long, help = "Output as JSON")]
@@ -6903,9 +6923,25 @@ enum Commands {
             // to get every row silently got 50 and a `truncated: true` they had
             // been told could not happen. Help text is a claim a user acts on:
             // this is nw-334's class in help rather than in an error message.
-            help = "Max unreachable symbols to report (1-1000; default 50, or [limits].default_result_limit from config; matches the MCP dead_code schema). Pass an explicit --limit to widen it — there is no 'all'."
+            help = "Max unreachable symbols to report (1-1000; default 50, or [limits].default_result_limit from config; matches the MCP dead_code schema). Use next_offset, graph_generation and page_token to retrieve subsequent bounded pages."
         )]
         limit: Option<usize>,
+        #[arg(
+            long = "repo",
+            visible_alias = "repos",
+            value_delimiter = ',',
+            help = "Restrict result population to repository names or UIDs (repeatable)"
+        )]
+        repos: Vec<String>,
+        #[arg(long, default_value_t = 0, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000_000))]
+        offset: usize,
+        #[arg(
+            long,
+            help = "Graph generation from the first page; required when offset > 0"
+        )]
+        generation: Option<u64>,
+        #[arg(long, help = "Prior page token; required when offset > 0")]
+        page_token: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -7573,6 +7609,11 @@ enum DaemonAction {
     Gc,
     /// Run daemon in foreground (used by launchd)
     Run {
+        /// Internal single-use owned-daemon fixture activation.
+        #[cfg(feature = "release-fixture-hooks")]
+        #[arg(long, hide = true)]
+        release_fixture_control: Option<PathBuf>,
+
         /// Enable server mode (TCP listener alongside UDS)
         #[arg(long)]
         server: bool,
@@ -18120,183 +18161,131 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             min_confidence,
             json,
             limit,
+            repos,
+            offset,
+            generation,
+            page_token,
             db,
         } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
-                let mut args = serde_json::json!({ "min_confidence": min_confidence });
-                if let Some(n) = limit {
-                    args["limit"] = serde_json::json!(n);
-                }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
-                    // nw-372: the daemon PRINTS what it was sent. The refusal
-                    // is computed by the `dead_code` tool the daemon ran, from
-                    // `ResolverGenerations::stale_repos` — the sole
-                    // computation — so this route decides nothing and cannot
-                    // disagree with the tool about one database. That is the
-                    // same rule `ResolverStaleness::from_daemon_response`
-                    // follows, and the reason `hubs` had three answers before
-                    // nw-358 was that its daemon route re-derived instead.
-                    if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&value)?);
-                        }
-                        eprintln!("Error: {}", dead_code_refusal_note(&value));
-                        return Ok((EXIT_NEEDS_REINDEX, None));
-                    }
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        render_dead_code_text(&value);
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-
-            let min_conf = DeadCodeConfidence::from_str_loose(&min_confidence)
-                .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence: {min_confidence}"))?;
-            let store = open_store(db.as_deref())?;
-
+            use nestweaver_engine::dead_code::{
+                DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
+                serialize_dead_code_page,
+            };
             let db_path = db.clone().unwrap_or_else(default_db_path);
-
-            // nw-372: REFUSE before the walk. `DeadCodeRefusal::for_repos`
-            // wraps `ResolverGenerations::stale_repos` — the sole computation
-            // — and returns `None` only when every repo is provably current.
-            //
-            // The enumeration PROPAGATES rather than becoming a refusal. A
-            // store that cannot list repos cannot serve a reachability walk
-            // either, and the CLI's error classifier turns that failure into
-            // the diagnostic it earned: a zero-length database reports
-            // `nestweaver::db_no_schema` with its size and a runnable
-            // `nestweaver index`, which nw-285 built and which a refusal here
-            // would have replaced with a binder exception quoted inside a
-            // paragraph about resolver generations.
-            let repos = store.list_repos(None)?;
-            if let Some(refusal) =
-                nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos)
-            {
-                // stdout stays pure JSON for a `--json` gate; the paragraph
-                // goes to stderr on BOTH modes, the same split `stale-check`
-                // and every ranking surface already use.
-                if json {
-                    print_json_payload(&refusal.payload())?;
+            let mut args =
+                serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
+            if let Some(n) = limit {
+                args["limit"] = serde_json::json!(n);
+            }
+            if !repos.is_empty() {
+                args["repos"] = serde_json::json!(repos);
+            }
+            if let Some(value) = generation {
+                args["expected_generation"] = serde_json::json!(value);
+            }
+            if let Some(value) = &page_token {
+                args["page_token"] = serde_json::json!(value);
+            }
+            let payload = if use_daemon {
+                // A reproducible page belongs to the selected database. Never
+                // substitute or merge an upstream population for this route.
+                require_existing_db(&db_path)?;
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(async {
+                    let query = async {
+                        let mut client =
+                            nestweaver_client::DaemonClient::connect(&db_path, None).await?;
+                        let response = client
+                            .inner_mut()
+                            .dead_code(nestweaver_proto::JsonRequest {
+                                args_json: serde_json::to_string(&args)?,
+                            })
+                            .await?;
+                        Ok::<serde_json::Value, anyhow::Error>(serde_json::from_str(
+                            &response.into_inner().result_json,
+                        )?)
+                    };
+                    match daemon_rpc_timeout(&args) {
+                        Some(budget) => tokio::time::timeout(budget, query)
+                            .await
+                            .context("local daemon dead-code request timed out")?,
+                        None => query.await,
+                    }
+                })?
+            } else {
+                let store = open_store(db.as_deref())?;
+                let all_repos = store.list_repos(None)?;
+                if let Some(refusal) =
+                    nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
+                        &db_path, &all_repos,
+                    )
+                {
+                    let mut value = refusal.payload();
+                    value["review_only"] = serde_json::json!(true);
+                    value["high_confidence_available"] = serde_json::json!(false);
+                    if json {
+                        print_json_payload(&value)?;
+                    }
+                    eprintln!("Error: {}", refusal.message());
+                    return Ok((EXIT_NEEDS_REINDEX, None));
                 }
-                eprintln!("Error: {}", refusal.message());
+                let scope = if repos.is_empty() {
+                    None
+                } else {
+                    Some(resolve_repo_filter(&store, &repos)?)
+                };
+                let request = DeadCodePageRequest {
+                    min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
+                        .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence"))?,
+                    limit: limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT),
+                    offset,
+                    expected_generation: generation,
+                    page_token: page_token.as_deref(),
+                    concise: false,
+                };
+                let observed_generation = store.graph_generation();
+                if let Some(refusal) = dead_code_page_guard(&store, observed_generation, &request) {
+                    refusal
+                } else {
+                    let manifests =
+                        nestweaver_engine::load_manifests_for_dead_code(&store, &db_path);
+                    let result =
+                        nestweaver_engine::dead_code::detect_dead_code_in_repos_cancellable(
+                            &store,
+                            0.3,
+                            &manifests.manifests,
+                            scope.as_ref(),
+                            None,
+                        )?;
+                    let identity = dead_code_database_identity(&store)?;
+                    let page = serialize_dead_code_page(
+                        &result,
+                        manifests.load_error.as_deref(),
+                        &request,
+                        observed_generation,
+                        &identity,
+                    )?;
+                    dead_code_page_guard(&store, observed_generation, &request).unwrap_or(page)
+                }
+            };
+            if payload.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                if json {
+                    print_json_payload(&payload)?;
+                }
+                eprintln!("Error: {}", dead_code_refusal_note(&payload));
                 return Ok((EXIT_NEEDS_REINDEX, None));
             }
-
-            // Load manifest sidecar for manifest-driven entry points.
-            //
-            // nw-512/nw-500: through the shared loader the MCP `dead_code`
-            // tool also calls, so every route — the default daemon CLI above,
-            // MCP direct, MCP-via-daemon, and this bypass — seeds the walk
-            // from the same entry files. It also replaces a bare
-            // `.unwrap_or_default()`, which collapsed "no sidecar yet" and
-            // "sidecar is there and unreadable" into one silent empty map.
-            let manifests = nestweaver_engine::load_manifests_for_dead_code(&store, &db_path);
-
-            let result =
-                nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests.manifests)?;
-
-            // Filter by minimum confidence.
-            let filtered: Vec<_> = result
-                .unreachable_symbols
-                .iter()
-                .filter(|s| s.confidence >= min_conf)
-                .collect();
-            let filtered_count = filtered.len();
-            let (shown, truncated) = dead_code_cut(filtered, limit);
-
-            #[derive(serde::Serialize)]
-            struct DeadCodeJson<'a> {
-                total_symbols: usize,
-                reachable_symbols: usize,
-                unreachable_count: usize,
-                matching_count: usize,
-                returned: usize,
-                truncated: bool,
-                excluded_count: usize,
-                dead_percentage: f64,
-                /// "complete" | "degraded". Every count above is a claim over
-                /// the WHOLE symbol corpus, and the store's whole-corpus scan
-                /// tolerates a row it cannot decode (nw-335) instead of
-                /// failing — so a caller cannot tell an exact total from a
-                /// floor unless the scan says which it produced.
-                coverage: &'static str,
-                undecodable_symbols: usize,
-                /// How many symbols SEEDED the reachability walk. Zero means
-                /// the BFS never started, so "N of M unreachable" is the
-                /// absence of a finding rather than one (nw-351).
-                entry_points: usize,
-                /// nw-435, surfaced. `coverage_is_complete()` already reads
-                /// this field to decide "complete" vs "degraded" — it was
-                /// consulted but never serialized, so a polyglot repo (the
-                /// normal case, not the exception) degraded with
-                /// `undecodable_symbols: 0` and a healthy `entry_points`
-                /// count both looking fine, and no field naming which
-                /// language actually caused it.
-                languages_without_entry_points: Vec<String>,
-                /// nw-500. `Some` ONLY when the manifest sidecar exists and
-                /// could not be read, which silently drops every
-                /// manifest-declared entry file from the reachability seed
-                /// set and so moves live code onto this list. An absent
-                /// sidecar is the normal state for a graph with no code
-                /// repos and is NOT disclosed; `skip_serializing_if` keeps
-                /// the key out of a healthy payload entirely, so the JSON a
-                /// working graph emits is byte-for-byte its pre-nw-500
-                /// shape. Same key name and same rule as the `dead_code` MCP
-                /// tool, which is what lets `render_dead_code_text` surface
-                /// it from either route's payload.
-                #[serde(skip_serializing_if = "Option::is_none")]
-                manifest_load_error: Option<String>,
-                min_confidence: String,
-                unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
-            }
-            // Count contract (same as the dead_code MCP tool):
-            // `unreachable_count` is the UNFILTERED total, consistent with
-            // total_symbols/reachable_symbols/dead_percentage;
-            // `matching_count` is the post-min-confidence count.
-            //
-            // Built unconditionally so the text path renders from the SAME
-            // payload the JSON path prints, and from the same payload the
-            // daemon returns (nw-108).
-            let payload = serde_json::to_value(DeadCodeJson {
-                total_symbols: result.total_symbols,
-                reachable_symbols: result.reachable_symbols,
-                unreachable_count: result.unreachable_symbols.len(),
-                matching_count: filtered_count,
-                returned: shown.len(),
-                truncated,
-                excluded_count: result.excluded_count,
-                dead_percentage: result.dead_percentage,
-                // nw-500: a failed manifest load degrades coverage on the same
-                // field, and for the same reason, as an undecodable row or a
-                // seedless walk — see the `dead_code` tool's note. The CLI and
-                // the tool must agree here or the daemon and direct routes
-                // report different coverage for one database.
-                coverage: if result.coverage_is_complete() && manifests.load_error.is_none() {
-                    "complete"
-                } else {
-                    "degraded"
-                },
-                undecodable_symbols: result.undecodable_symbols,
-                entry_points: result.entry_points,
-                languages_without_entry_points: result.languages_without_entry_points.clone(),
-                manifest_load_error: manifests.load_error.clone(),
-                min_confidence: min_conf.to_string(),
-                unreachable_symbols: shown,
-            })?;
             if json {
                 print_json_payload(&payload)?;
             } else {
                 render_dead_code_text(&payload);
             }
-
             let stats = format!(
-                "{} unreachable of {} symbols in {}",
-                filtered_count,
-                result.total_symbols,
+                "{} review candidates in {}",
+                payload
+                    .get("matching_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -23398,6 +23387,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Run {
+                    #[cfg(feature = "release-fixture-hooks")]
+                    release_fixture_control,
                     server,
                     bind,
                     tls_cert,
@@ -23414,6 +23405,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     acme_email,
                     acme_production,
                 } => {
+                    #[cfg(feature = "release-fixture-hooks")]
+                    if let Some(control) = release_fixture_control.as_deref() {
+                        anyhow::ensure!(
+                            !server && config.is_none() && snapshot.is_none(),
+                            "release fixture requires an unconfigured local foreground daemon"
+                        );
+                        nestweaver_engine::release_fixture::activate(control, &db_path)?;
+                    }
                     // A temporary macOS daemon is a fresh `daemon run` exec,
                     // so the process-local ownership marker from `daemon
                     // start` cannot cross the boundary. Accept ownership only
@@ -29912,6 +29911,7 @@ fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> 
 /// route, where the daemon reads its own — which is what the help's "or
 /// [limits].default_result_limit from config" clause names, and why a value is
 /// NOT synthesised here and sent, which would override it.
+#[cfg(test)]
 fn dead_code_cut<T>(rows: Vec<T>, limit: Option<usize>) -> (Vec<T>, bool) {
     let total = rows.len();
     let effective = limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT);
@@ -43035,6 +43035,31 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn release_fixture_activation_argument_matches_compiled_capability() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let parsed = Cli::try_parse_from([
+                    "nestweaver",
+                    "daemon",
+                    "--db",
+                    "/tmp/fixture.lbug",
+                    "run",
+                    "--release-fixture-control",
+                    "/tmp/control",
+                ]);
+                assert_eq!(parsed.is_ok(), cfg!(feature = "release-fixture-hooks"));
+                assert_eq!(
+                    CLI_VERSION.contains("+release-fixture-hooks"),
+                    cfg!(feature = "release-fixture-hooks")
+                );
             })
             .expect("spawn")
             .join()

@@ -78,11 +78,14 @@ export function GraphMatrixView() {
         (attrs.edgeType as string | undefined) ||
         (attrs.label as string | undefined) ||
         "edge";
+      const previous = edgeMap.get(edgeKey(source, target));
       edgeMap.set(edgeKey(source, target), {
         source,
         target,
-        type,
-        confidence: attrs.confidence as number | undefined,
+        type: previous ? [...new Set([...previous.type.split(", "), type])].join(", ") : type,
+        // Multiple stored relationships have separate confidence values.
+        // A single combined score would misrepresent the matrix cell.
+        confidence: previous ? undefined : attrs.confidence as number | undefined,
       });
     });
 

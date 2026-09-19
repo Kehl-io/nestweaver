@@ -118,6 +118,7 @@ jobs:
             rust:
               - '**/*.rs'
               - 'tests/support/isolated_daemon.py'
+              - 'tests/support/release_*.py'
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -775,6 +776,13 @@ jobs:
           unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
           chmod 555 staged/standard/nestweaver
           python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
+      - name: Standard artifact release contracts
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          for suite in release_selectors release_gates release_notes release_dead_code release_dead_code_witnesses release_routes release_publication; do
+            python3 "tests/support/$suite.py" --binary "$PWD/staged/standard/nestweaver"
+          done
+          python3 tests/support/release_selectors.py --binary "$PWD/staged/standard/nestweaver" --during-index
       - name: Retain owned daemon evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -783,6 +791,7 @@ jobs:
           path: |
             /tmp/nw-release-*/evidence.jsonl
             /tmp/nw-release-*/daemon.log
+            /tmp/nw-release-*/ui.log
           if-no-files-found: error
 
   clippy:
@@ -1770,10 +1779,6 @@ jobs:
     # side changes.
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
-    env:
-      # See the note on the Tests step: the bypass is explicit now.
-      NESTWEAVER_ALLOW_NO_DAEMON: "1"
-      NESTWEAVER_NO_DAEMON: "1"
     steps:
       - name: Free disk space
         run: |
@@ -1817,27 +1822,33 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build (triggers lbug prebuilt download on first run)
-        run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
-          sleep 2
-          cargo build --features ci-direct-tests
-      - name: Index test data
-        env:
-          NESTWEAVER_ALLOW_NO_DAEMON: "1"
-        run: ./target/debug/nestweaver --no-daemon index --repo testdata/js --db /tmp/test.lbug
+      - name: Build frontend for standard browser acceptance
+        working-directory: crates/nestweaver-web/frontend
+        run: npm run build
+      - name: Build standard daemon and embedded UI
+        run: cargo build --locked
       - name: Install Playwright browsers
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright install --with-deps chromium
       - name: Run E2E tests
         working-directory: crates/nestweaver-web/frontend
-        run: npx playwright test
+        run: |
+          browser_executable=$(node -e 'process.stdout.write(require("@playwright/test").chromium.executablePath())')
+          python3 ../../../tests/support/release_ui.py \
+            --binary ../../../target/debug/nestweaver \
+            --node "$(command -v node)" \
+            --browser "$browser_executable"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-report
-          path: crates/nestweaver-web/frontend/playwright-report/
+          path: |
+            /tmp/nw-release-*/browser-results/
+            /tmp/nw-release-*/browser.log
+            /tmp/nw-release-*/ui.log
+            /tmp/nw-release-*/daemon.log
+            /tmp/nw-release-*/evidence.jsonl
 
   required-ci:
     name: Required CI
@@ -1882,6 +1893,7 @@ jobs:
           python3 scripts/test-verify-release-fault.py
           python3 scripts/test-release-publication-gates.py
           python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v
+          python3 -m unittest discover -s tests/support -p test_release_publication_failure.py -v
           python3 scripts/verify-ci-runtime-contracts.py
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test

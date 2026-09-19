@@ -23,6 +23,7 @@ import type {
 } from "./types";
 import { loadImpactLens } from "./impactLens";
 import { appendWorkspaceParam } from "./workspaces";
+import { normalizeBrainContext } from "./context";
 
 export class ApiError extends Error {
   status: number;
@@ -49,11 +50,12 @@ function get<T>(url: string, init?: RequestInit): Promise<T> {
   return request<T>(url, init);
 }
 
-function post<T>(url: string, body: unknown): Promise<T> {
+function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   return request<T>(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -89,14 +91,17 @@ export const api = {
 
   brainContext(
     seeds: string[],
-    tokenBudget = 4096,
+    tokenBudget: number | null = 4096,
     scope: ScopeFilter = "all",
+    workspaceId?: string | null,
+    signal?: AbortSignal,
   ) {
-    return post<BrainContextResult>("/api/v1/brain/context", {
+    return post<unknown>("/api/v1/brain/context", {
       seeds,
-      token_budget: tokenBudget,
+      token_budget: tokenBudget ?? undefined,
       scope,
-    });
+      workspace: workspaceId ?? undefined,
+    }, signal).then(normalizeBrainContext);
   },
 
   overview(limit = 24) {

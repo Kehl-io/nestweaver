@@ -26,6 +26,7 @@ toml_edit = "0.25"
 serde_yaml = "0.9"
 openapiv3 = "2"
 serde_yaml_ng = "0.10"
+roxmltree = "0.21.1"
 protox-parse = "0.9"
 prost-types = "0.14"
 apollo-parser = "0.8"
@@ -51,11 +52,10 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 nestweaver-embed = { path = "../nestweaver-embed", optional = true }
 
 [features]
+release-fixture-hooks = []
 embed = ["dep:nestweaver-embed"]
 
 [dev-dependencies]
-# Namespace-aware GraphML interoperability regression tests only.
-roxmltree = "0.21.1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"

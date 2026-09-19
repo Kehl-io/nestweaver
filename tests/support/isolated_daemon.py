@@ -196,6 +196,9 @@ class IsolatedDaemon:
     def check_standard_artifact_policy_in_ci(self):
         if not any(os.environ.get(key) in ("true", "1") for key in ("CI", "GITHUB_ACTIONS")):
             raise RuntimeError("actual bypass rejection probes are CI-only")
+        version = self.run("--version").stdout
+        if "+release-fixture-hooks" in version:
+            raise AssertionError("fixture-hook artifact must never be distributed")
         original = self.env.copy()
         try:
             for flag in (False, True):
@@ -252,6 +255,7 @@ class IsolatedDaemon:
             except subprocess.TimeoutExpired:
                 self.record(kind="cleanup", draining=True, daemon_pid=self.child.pid)
                 raise RuntimeError(f"owned daemon still draining; preserved {self.root}")
+        if self.child is not None:
             self.record(kind="cleanup", daemon_pid=self.child.pid,
                         exit_code=self.child.returncode)
         if self.log:
@@ -262,6 +266,9 @@ class IsolatedDaemon:
         self.record(kind="production_daemon_check", unchanged=not changed, changed=changed)
         if changed:
             raise AssertionError(f"pre-existing daemon identity changed: {changed}")
+        if self.child is not None and self.child.returncode != 0:
+            raise RuntimeError(
+                f"owned daemon exited with {self.child.returncode}; preserved {self.root}")
 
     def __enter__(self):
         self.install_signal_handlers()

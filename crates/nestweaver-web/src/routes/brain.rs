@@ -140,6 +140,7 @@ pub async fn backlinks(
         .limit
         .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
         .min(LIST_NOTES_LIMIT_MAX);
+    state.admit_vault_derivation()?;
     let links = state.store.wikilink_sources_to_note(&uid)?;
     let total = links.len();
     let truncated = total > limit;

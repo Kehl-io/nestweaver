@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from isolated_daemon import IsolatedDaemon
 
@@ -167,6 +167,91 @@ with fixture:
             fixture.close()
         checks = [event for event in fixture.events if event["kind"] == "production_daemon_check"]
         self.assertEqual(len(checks), 1)
+
+    def cleanup_with_child(self, *, already_exited, exit_code):
+        fixture = self.make_fixture()
+        fixture.initial_daemons = {}
+        child = Mock(pid=23456)
+        child.returncode = exit_code if already_exited else None
+        child.poll.return_value = child.returncode
+
+        def finish_wait(timeout):
+            self.assertEqual(timeout, 30)
+            child.returncode = exit_code
+            return exit_code
+
+        child.wait.side_effect = finish_wait
+        fixture.child = child
+        return fixture, child
+
+    def test_nonzero_exit_during_graceful_close_is_recorded_and_rejected(self):
+        for exit_code in (7, -signal.SIGSEGV):
+            with self.subTest(exit_code=exit_code):
+                fixture, child = self.cleanup_with_child(already_exited=False,
+                                                         exit_code=exit_code)
+                with patch.object(fixture, "daemons", return_value={}):
+                    with self.assertRaisesRegex(RuntimeError, f"exited with {exit_code}"):
+                        fixture.close()
+                child.send_signal.assert_called_once_with(signal.SIGTERM)
+                child.wait.assert_called_once_with(timeout=30)
+                cleanup = [event for event in fixture.events if event["kind"] == "cleanup"]
+                self.assertEqual(len(cleanup), 1)
+                self.assertEqual(cleanup[0]["exit_code"], exit_code)
+                self.assertTrue(any(event["kind"] == "production_daemon_check"
+                                    for event in fixture.events))
+
+    def test_already_exited_nonzero_child_cannot_skip_failure_check(self):
+        fixture, child = self.cleanup_with_child(already_exited=True, exit_code=9)
+        with patch.object(fixture, "daemons", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "exited with 9"):
+                fixture.close()
+        child.send_signal.assert_not_called()
+        child.wait.assert_not_called()
+        cleanup = [event for event in fixture.events if event["kind"] == "cleanup"]
+        self.assertEqual(len(cleanup), 1)
+        self.assertEqual(cleanup[0]["daemon_pid"], child.pid)
+        self.assertEqual(cleanup[0]["exit_code"], 9)
+
+    def test_clean_exit_remains_accepted_and_close_remains_idempotent(self):
+        for already_exited in (False, True):
+            with self.subTest(already_exited=already_exited):
+                fixture, child = self.cleanup_with_child(already_exited=already_exited,
+                                                         exit_code=0)
+                with patch.object(fixture, "daemons", return_value={}):
+                    fixture.close()
+                    fixture.close()
+                if already_exited:
+                    child.send_signal.assert_not_called()
+                    child.wait.assert_not_called()
+                else:
+                    child.send_signal.assert_called_once_with(signal.SIGTERM)
+                    child.wait.assert_called_once_with(timeout=30)
+                cleanup = [event for event in fixture.events if event["kind"] == "cleanup"]
+                self.assertEqual(len(cleanup), 1)
+                self.assertEqual(cleanup[0]["exit_code"], 0)
+
+    def test_changed_pidfile_does_not_authorize_signaling_another_process(self):
+        fixture, child = self.cleanup_with_child(already_exited=False, exit_code=0)
+        fixture.runtime.mkdir(parents=True)
+        fixture.pidfile.write_text(str(child.pid + 1))
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            fixture.close()
+        child.send_signal.assert_not_called()
+        child.wait.assert_not_called()
+
+    def test_drain_timeout_keeps_child_and_fixture_without_escalation(self):
+        fixture, child = self.cleanup_with_child(already_exited=False, exit_code=0)
+        child.wait.side_effect = subprocess.TimeoutExpired("owned-child", 30)
+        with self.assertRaisesRegex(RuntimeError, "still draining"):
+            fixture.close()
+        child.send_signal.assert_called_once_with(signal.SIGTERM)
+        child.kill.assert_not_called()
+        self.assertIsNone(child.returncode)
+        self.assertTrue(fixture.root.exists())
+        cleanup = [event for event in fixture.events if event["kind"] == "cleanup"]
+        self.assertEqual(len(cleanup), 1)
+        self.assertIs(cleanup[0]["draining"], True)
+        self.assertNotIn("exit_code", cleanup[0])
 
 
 if __name__ == "__main__":

@@ -91,6 +91,15 @@ function relationshipForNode(
   lensLabel: string,
 ): string {
   const lower = lensLabel.toLowerCase();
+  if (lower === "local" || lower === "features") {
+    const types = new Set<string>();
+    graph.forEachEdge(uid, (_edge, attrs) => {
+      if (typeof attrs.edgeType === "string") types.add(attrs.edgeType);
+    });
+    return types.size > 0
+      ? `${graph.inDegree(uid)} incoming, ${graph.outDegree(uid)} outgoing: ${[...types].sort().join(", ")}`
+      : "No stored relationships among returned nodes";
+  }
   if (targetUid && lower.startsWith("callers of")) {
     const summary = edgeSummary(graph, uid, targetUid);
     return summary

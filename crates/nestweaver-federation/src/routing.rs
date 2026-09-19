@@ -11,7 +11,7 @@ pub enum ToolRouting {
     /// Used for: read_symbols, investigate, investigate_hydrate
     LocalFirst,
     /// Query server preferentially. Local overlays for uncommitted changes.
-    /// Used for: hub_nodes, bridge_nodes, clusters, dead_code, cross_repo_contracts, contract_drift
+    /// Used for: hub_nodes, bridge_nodes, clusters, cross_repo_contracts, contract_drift
     ServerPreferred,
     /// Two-tier: show local impact + org-wide impact separately.
     /// Used for: blast_radius, brain_impact, affected_tests
@@ -20,7 +20,7 @@ pub enum ToolRouting {
     /// Used for: regex_search, count_patterns
     FanOut,
     /// Local only — never query server.
-    /// Used for: detect_changes
+    /// Used for: detect_changes, dead_code (database-bound review pages)
     LocalOnly,
     /// Combined view from both sources.
     /// Used for: brain_status, stale_check, brain_doc_stats
@@ -44,12 +44,9 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         "flow_trace" | "investigate_expand" => ToolRouting::Continuation,
 
         // Structural analysis — server-preferred
-        "hub_nodes"
-        | "bridge_nodes"
-        | "clusters"
-        | "dead_code"
-        | "cross_repo_contracts"
-        | "contract_drift" => ToolRouting::ServerPreferred,
+        "hub_nodes" | "bridge_nodes" | "clusters" | "cross_repo_contracts" | "contract_drift" => {
+            ToolRouting::ServerPreferred
+        }
 
         // Impact analysis — two-tier
         "blast_radius" | "brain_impact" | "affected_tests" => ToolRouting::TwoTier,
@@ -58,7 +55,7 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         "regex_search" | "count_patterns" => ToolRouting::FanOut,
 
         // Local-only
-        "detect_changes" => ToolRouting::LocalOnly,
+        "detect_changes" | "dead_code" => ToolRouting::LocalOnly,
 
         // Metadata — combined
         "brain_status"
@@ -146,7 +143,6 @@ mod tests {
         assert_eq!(tool_routing("hub_nodes"), ToolRouting::ServerPreferred);
         assert_eq!(tool_routing("bridge_nodes"), ToolRouting::ServerPreferred);
         assert_eq!(tool_routing("clusters"), ToolRouting::ServerPreferred);
-        assert_eq!(tool_routing("dead_code"), ToolRouting::ServerPreferred);
         assert_eq!(
             tool_routing("cross_repo_contracts"),
             ToolRouting::ServerPreferred
@@ -165,6 +161,11 @@ mod tests {
     fn fan_out_tools() {
         assert_eq!(tool_routing("regex_search"), ToolRouting::FanOut);
         assert_eq!(tool_routing("count_patterns"), ToolRouting::FanOut);
+    }
+
+    #[test]
+    fn database_bound_review_pages_are_local_only() {
+        assert_eq!(tool_routing("dead_code"), ToolRouting::LocalOnly);
     }
 
     #[test]

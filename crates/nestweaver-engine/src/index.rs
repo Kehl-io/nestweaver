@@ -831,6 +831,8 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
         path: &Path,
         generation: u64,
     ) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "release-fixture-hooks")]
+        crate::release_fixture::index_generation_save(store)?;
         store.save_graph_generation_value(path, generation)?;
         Ok(())
     }
@@ -2628,8 +2630,8 @@ fn index_directory_with_store_inner(
     // N+2. Loading it after the graph commit would correctly reject it as
     // stale and, historically, `unwrap_or_default` then discarded every other
     // repository's manifest entry.
-    let mut manifest_cache =
-        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
+    let manifest_cache = crate::manifest::current_manifest_snapshot(store, db_path).ok();
+    crate::manifest::mark_manifest_reconciliation_pending(db_path, "repository index")?;
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -2712,11 +2714,7 @@ fn index_directory_with_store_inner(
         tracing::warn!("failed to save resolution deps: {e}");
     }
 
-    let manifest = crate::manifest::parse_manifest(&reader);
-    manifest_cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
-        tracing::warn!("failed to save manifest cache: {e}");
-    }
+    publish_manifest_after_local_index(store, db_path, &r_uid, manifest_cache, reader);
 
     // nw-029: warm PageRank at index time so first queries (UI overview, impact,
     // repo-map, hubs) never pay the lazy compute. Mirrors the incremental path.
@@ -2725,6 +2723,56 @@ fn index_directory_with_store_inner(
     // durable. nw-055 (P1b): delete-only re-indexes also need fresh surviving
     // ranks even though files_count is zero.
     Ok(result)
+}
+
+fn publish_manifest_after_local_index(
+    store: &GraphStore,
+    db_path: &Path,
+    r_uid: &str,
+    manifest_cache: Option<std::collections::HashMap<String, crate::manifest::ManifestInfo>>,
+    reader: crate::content_reader::FilesystemReader,
+) {
+    // An invalid predecessor is not an empty map. Never publish a singleton
+    // as a complete cache; durable debt lets the daemon rebuild all repos.
+    if let Some(mut manifest_cache) = manifest_cache {
+        let mut budget = 32 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let strict_reader = reader.strict_enumeration();
+        let saved = (|| -> anyhow::Result<()> {
+            let inputs =
+                crate::manifest::capture_manifest_inputs(&strict_reader, &mut budget, deadline)?;
+            manifest_cache.insert(r_uid.to_string(), crate::manifest::parse_manifest(&inputs));
+            let live = store.list_repos(None)?;
+            manifest_cache.retain(|uid, _| live.iter().any(|repo| &repo.uid == uid));
+            anyhow::ensure!(
+                live.iter()
+                    .all(|repo| manifest_cache.contains_key(&repo.uid)),
+                "incomplete manifest coverage"
+            );
+            crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path)?;
+            let mut verification_budget = 32 * 1024 * 1024;
+            let verified = crate::manifest::capture_manifest_inputs(
+                &strict_reader,
+                &mut verification_budget,
+                deadline,
+            )?;
+            anyhow::ensure!(
+                inputs == verified,
+                "manifest sources changed during index publication"
+            );
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
+                &crate::manifest::manifest_debt_path(db_path),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            tracing::warn!(%error, "graph indexed; manifest suggestions await daemon reconciliation");
+        }
+    } else {
+        tracing::info!(
+            "graph indexed; incomplete manifest cache queued for complete daemon reconciliation"
+        );
+    }
 }
 
 /// Index a directory into an in-memory GraphStore (for testing).
@@ -4017,6 +4065,16 @@ where
             services_written = all_services.len(),
             "phase write complete"
         );
+
+        // The internal fixture returns through graph_result, preserving the
+        // common publication finalizer and the daemon's write ownership.
+        #[cfg(feature = "release-fixture-hooks")]
+        crate::release_fixture::index_content_committed(
+            store,
+            &r_uid,
+            all_files.len(),
+            all_symbols.len(),
+        )?;
 
         // nw-204: the symbols are back in the graph now, so the liveness
         // difference is meaningful — nearly every UID deleted above has just
@@ -6024,6 +6082,14 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // 4. Nothing changed.
     if old_sha == new_sha {
+        // Working-tree manifests can change without a commit. This shortcut
+        // does not publish a new graph generation, so explicitly invalidate
+        // derived suggestions for the daemon's complete-map reconciler.
+        crate::manifest::mark_manifest_reconciliation_pending(
+            db_path,
+            "unchanged-SHA local index requires working-tree manifest reconciliation",
+        )?;
+        tracing::info!("manifest suggestions await daemon reconciliation");
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
         // nw-387 RESIDUAL: THE DISCLOSURE HAS TO BE DURABLE, AND THIS IS THE
         // BRANCH THAT BROKE IT. On the item's own fixture (`canary.py` plus a
@@ -7447,8 +7513,8 @@ fn full_index_fallback(
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
-    let mut manifest_cache =
-        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
+    let manifest_cache = crate::manifest::current_manifest_snapshot(store, db_path).ok();
+    crate::manifest::mark_manifest_reconciliation_pending(db_path, "fallback repository index")?;
     let filemeta_cache = load_filemeta_sidecar(&filemeta_path)
         .repos
         .get(&r_uid)
@@ -7512,12 +7578,7 @@ fn full_index_fallback(
         tracing::warn!("failed to save resolution deps: {e}");
     }
 
-    // Update the manifest cache sidecar (same as index_directory does).
-    let manifest = crate::manifest::parse_manifest(&reader);
-    manifest_cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
-        tracing::warn!("failed to save manifest cache: {e}");
-    }
+    publish_manifest_after_local_index(store, db_path, &r_uid, manifest_cache, reader);
 
     // nw-029: warm PageRank at index time so first queries (UI overview, impact,
     // repo-map, hubs) never pay the lazy compute. This is the first-index-of-a-
@@ -14414,6 +14475,39 @@ function hello(name) { return "Hello " + name; }
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
+        );
+    }
+
+    #[test]
+    fn unchanged_sha_manifest_edit_queues_recovery_without_graph_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "export function live() { return 1; }").unwrap();
+        fs::write(repo.join("package.json"), r#"{"name":"before"}"#).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/manifest-noop";
+        index_directory(&repo, &db_path, "test", url, &head).unwrap();
+        let uid = nestweaver_schema::repo_uid("test", url);
+        let generation = {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+            assert_eq!(snapshot[&uid].package_name.as_deref(), Some("before"));
+            store.graph_generation()
+        };
+        fs::write(repo.join("package.json"), r#"{"name":"after"}"#).unwrap();
+        let result = incremental_index(&repo, &db_path, "test", url).unwrap();
+        assert!(!result.fell_back_to_full);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(store.graph_generation(), generation);
+        assert_eq!(store.lookup_repo(&uid).unwrap().unwrap().indexed_sha, head);
+        assert_eq!(
+            crate::manifest::current_manifest_snapshot(&store, &db_path)
+                .unwrap_err()
+                .reason,
+            crate::manifest::ManifestUnavailableReason::PendingSourceChange
         );
     }
 

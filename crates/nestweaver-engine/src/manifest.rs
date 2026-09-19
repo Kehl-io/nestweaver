@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::content_reader::ContentReader;
+
+#[path = "manifest_validation.rs"]
+mod validation;
 
 pub(crate) const MANIFEST_ARTIFACT_KIND: &str = "repo_manifest";
 pub(crate) const MANIFEST_ARTIFACT_SCHEMA_VERSION: u32 = 2;
@@ -100,31 +103,394 @@ pub fn load_manifest_cache_for_db(
     .unwrap_or_default())
 }
 
-/// The manifest sidecar as a dead-code run must see it: the payload, plus
-/// whether loading it FAILED.
-///
-/// nw-500. Every dead-code call site loaded manifests with
-/// `load_manifest_cache_for_db(..).unwrap_or_default()`, which collapses two
-/// materially different states into one empty map. Entry files are
-/// reachability ROOTS, so losing them can only move LIVE code onto a list of
-/// symbols to delete — the caller has to be told when that happened.
-///
-/// ABSENT AND CORRUPT ARE DIFFERENT, and the distinction needs no new
-/// plumbing: [`crate::artifact_sidecar::load_json`] already returns `Ok(None)`
-/// for a sidecar that is not there and `Err` for one that is there and cannot
-/// be decoded (wrong envelope, foreign identity, stale generation, unreadable
-/// bytes). `load_manifest_cache_for_db` maps the first to an empty map and
-/// propagates the second. An absent sidecar is the NORMAL state for a graph
-/// with no code repos indexed yet, so it must not raise a disclosure; only a
-/// genuine load failure may.
+/// Availability of the manifest input snapshot, separate from index success.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestUnavailableReason {
+    Missing,
+    StaleGeneration,
+    ProducerChanged,
+    PublicationInProgress,
+    PendingSourceChange,
+    IncompleteCoverage,
+    SourceUnavailable,
+    Corrupt,
+    ForeignIdentity,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, thiserror::Error)]
+#[error("manifest unavailable ({reason:?}): {message}")]
+pub struct ManifestUnavailable {
+    pub code: &'static str,
+    pub reason: ManifestUnavailableReason,
+    pub actual_generation: Option<u64>,
+    pub expected_generation: u64,
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl ManifestUnavailable {
+    pub fn new(
+        reason: ManifestUnavailableReason,
+        generation: u64,
+        message: impl Into<String>,
+    ) -> Self {
+        let retryable = !matches!(
+            reason,
+            ManifestUnavailableReason::Corrupt
+                | ManifestUnavailableReason::ForeignIdentity
+                | ManifestUnavailableReason::Incompatible
+                | ManifestUnavailableReason::SourceUnavailable
+        );
+        Self {
+            code: if retryable {
+                "manifest_temporarily_unavailable"
+            } else {
+                "manifest_unavailable"
+            },
+            reason,
+            actual_generation: None,
+            expected_generation: generation,
+            retryable,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestRecoveryStatus {
+    pub state: &'static str,
+    pub attempts: u32,
+    pub retry_after_seconds: Option<u64>,
+    pub error: Option<ManifestUnavailable>,
+    pub revision: u64,
+}
+
+/// Shared read-side status and wakeup only; the daemon is the sole job owner.
+pub struct ManifestRecoveryRuntime {
+    status: std::sync::Mutex<ManifestRecoveryStatus>,
+    pub wake: tokio::sync::Notify,
+    pub changed: tokio::sync::watch::Sender<u64>,
+}
+impl Default for ManifestRecoveryRuntime {
+    fn default() -> Self {
+        Self {
+            status: std::sync::Mutex::new(ManifestRecoveryStatus {
+                state: "queued",
+                attempts: 0,
+                retry_after_seconds: Some(2),
+                error: None,
+                revision: 0,
+            }),
+            wake: tokio::sync::Notify::new(),
+            changed: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+impl ManifestRecoveryRuntime {
+    pub fn status(&self) -> ManifestRecoveryStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn publish(
+        &self,
+        state: &'static str,
+        attempts: u32,
+        delay: Option<u64>,
+        error: Option<ManifestUnavailable>,
+    ) {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if status.state == state
+            && status.attempts == attempts
+            && status.retry_after_seconds == delay
+            && status.error == error
+        {
+            return;
+        }
+        status.revision = status.revision.saturating_add(1);
+        status.state = state;
+        status.attempts = attempts;
+        status.retry_after_seconds = delay;
+        status.error = error;
+        self.changed.send_replace(status.revision);
+    }
+}
+
+pub fn manifest_debt_path(db_path: &Path) -> PathBuf {
+    crate::sidecar_path(db_path, ".manifest-debt.json")
+}
+
+/// Written before source invalidation. Its unique revision prevents an old
+/// repair from clearing a newer edit, including edits at the same generation.
+pub fn mark_manifest_reconciliation_pending(db_path: &Path, reason: &str) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "revision": uuid::Uuid::new_v4().to_string(), "reason": reason,
+    }))?;
+    atomic_replace_file(&manifest_debt_path(db_path), |file| file.write_all(&bytes))?;
+    Ok(())
+}
+
+pub fn manifest_debt_revision(db_path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::File::open(manifest_debt_path(db_path)) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(8193).read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() <= 8192, "manifest debt exceeds 8 KiB");
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let revision = value
+                .get("revision")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("manifest debt revision is absent"))?;
+            uuid::Uuid::parse_str(revision)?;
+            anyhow::ensure!(
+                value
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty()),
+                "manifest debt reason is absent"
+            );
+            Ok(Some(bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// This loader is for current suggestions: absence is only empty when the
+/// authoritative repository inventory is empty. Errors retain typed causes.
+pub fn current_manifest_snapshot(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<HashMap<String, ManifestInfo>, ManifestUnavailable> {
+    use ManifestUnavailableReason::*;
+    use nestweaver_store::artifact_envelope::{
+        ArtifactEnvelope, ArtifactExpectation, ArtifactRejection,
+    };
+    let generation = store.graph_generation();
+    let failure = |reason, message: String| ManifestUnavailable::new(reason, generation, message);
+    if store.is_index_publication_dirty() {
+        return Err(failure(
+            PublicationInProgress,
+            "graph publication is incomplete".into(),
+        ));
+    }
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| failure(SourceUnavailable, e.to_string()))?;
+    let path = manifest_cache_path(db_path);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024 * 1024) {
+        return Err(failure(
+            Corrupt,
+            "manifest artifact exceeds the 64 MiB read bound".into(),
+        ));
+    }
+    let bounded_read = std::fs::File::open(&path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest artifact exceeds 64 MiB",
+            ));
+        }
+        Ok(bytes)
+    });
+    let bytes = match bounded_read {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && repos.is_empty() => {
+            if manifest_debt_revision(db_path)
+                .map_err(|e| failure(Corrupt, format!("cannot inspect manifest debt: {e}")))?
+                .is_some()
+            {
+                return Err(failure(
+                    PendingSourceChange,
+                    "source changes await complete manifest derivation".into(),
+                ));
+            }
+            ensure_manifest_generation(store, generation)?;
+            return Ok(HashMap::new());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(failure(
+                Missing,
+                "manifest snapshot has not been published".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(failure(
+                Corrupt,
+                format!("cannot read manifest snapshot: {e}"),
+            ));
+        }
+    };
+    let envelope: ArtifactEnvelope = serde_json::from_slice(&bytes)
+        .map_err(|e| failure(Corrupt, format!("invalid artifact envelope: {e}")))?;
+    let identity = store
+        .publication_identity()
+        .map_err(|e| failure(Incompatible, e.to_string()))?
+        .ok_or_else(|| failure(Incompatible, "graph publication identity is absent".into()))?;
+    let manifests: HashMap<String, ManifestInfo> = envelope
+        .validate_and_decode_typed(ArtifactExpectation {
+            artifact_kind: MANIFEST_ARTIFACT_KIND,
+            artifact_schema_version: MANIFEST_ARTIFACT_SCHEMA_VERSION,
+            identity: &identity,
+            producer_version: env!("CARGO_PKG_VERSION"),
+            source_graph_generation: generation,
+            algorithm_fingerprint: MANIFEST_ALGORITHM_FINGERPRINT,
+        })
+        .map_err(|e| {
+            let reason = match &e {
+                ArtifactRejection::StaleGeneration { .. } => StaleGeneration,
+                ArtifactRejection::ProducerChanged { .. } => ProducerChanged,
+                ArtifactRejection::ForeignIdentity => ForeignIdentity,
+                ArtifactRejection::Corrupt(_) => Corrupt,
+                ArtifactRejection::Incompatible(_) => Incompatible,
+            };
+            let mut error = failure(reason, e.to_string());
+            error.actual_generation = Some(envelope.source_graph_generation);
+            error
+        })?;
+    if manifest_debt_revision(db_path)
+        .map_err(|e| failure(Corrupt, format!("cannot inspect manifest debt: {e}")))?
+        .is_some()
+    {
+        return Err(failure(
+            PendingSourceChange,
+            "source changes await complete manifest derivation".into(),
+        ));
+    }
+    if repos.len() != manifests.len() || repos.iter().any(|r| !manifests.contains_key(&r.uid)) {
+        return Err(failure(
+            IncompleteCoverage,
+            "manifest snapshot does not cover the live repository inventory".into(),
+        ));
+    }
+    ensure_manifest_generation(store, generation)?;
+    Ok(manifests)
+}
+
+pub fn ensure_manifest_generation(
+    store: &nestweaver_store::GraphStore,
+    generation: u64,
+) -> Result<(), ManifestUnavailable> {
+    if store.is_index_publication_dirty() || generation != store.graph_generation() {
+        let mut error = ManifestUnavailable::new(
+            ManifestUnavailableReason::PublicationInProgress,
+            store.graph_generation(),
+            "graph changed while computing suggestions; retry after publication",
+        );
+        error.actual_generation = Some(generation);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Immutable eligible input bytes. Reusing the normal parser against this
+/// reader removes fallible I/O from format fallback and allows exact rechecks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestInputs {
+    root: PathBuf,
+    files: std::collections::BTreeMap<PathBuf, String>,
+}
+impl ContentReader for ManifestInputs {
+    fn read_file(&self, path: &Path) -> anyhow::Result<String> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("manifest absent: {}", path.display()))
+    }
+    fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(self.files.keys().cloned().collect())
+    }
+    fn file_meta_nanos(&self, _: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+        Ok(None)
+    }
+    fn root(&self) -> &Path {
+        &self.root
+    }
+    fn version_id(&self) -> &str {
+        "captured-manifests"
+    }
+}
+
+impl ManifestInputs {
+    pub fn digest(&self) -> String {
+        let mut hash = blake3::Hasher::new();
+        for (path, content) in &self.files {
+            let path = path.to_string_lossy();
+            hash.update(&(path.len() as u64).to_le_bytes());
+            hash.update(path.as_bytes());
+            hash.update(&(content.len() as u64).to_le_bytes());
+            hash.update(content.as_bytes());
+        }
+        hash.finalize().to_hex().to_string()
+    }
+}
+
+pub fn is_manifest_input(path: &Path) -> bool {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    name == "package.json"
+        || (path.components().count() <= 2 && path.extension().is_some_and(|s| s == "csproj"))
+        || (path.components().count() == 1
+            && [
+                "Cargo.toml",
+                "go.mod",
+                "pyproject.toml",
+                "requirements.txt",
+                "composer.json",
+                "Gemfile",
+                "pubspec.yaml",
+                "Package.swift",
+                "build.gradle.kts",
+                "CMakeLists.txt",
+            ]
+            .contains(&name))
+}
+
+pub fn capture_manifest_inputs(
+    reader: &dyn ContentReader,
+    remaining_bytes: &mut usize,
+    deadline: std::time::Instant,
+) -> anyhow::Result<ManifestInputs> {
+    let mut files = std::collections::BTreeMap::new();
+    let inventory = reader.list_files()?;
+    for path in inventory.into_iter().filter(|p| is_manifest_input(p)) {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "manifest derivation exceeded its 60-second cooperative deadline"
+        );
+        let content = reader.read_file(&path)?;
+        anyhow::ensure!(
+            content.len() <= *remaining_bytes,
+            "manifest capture exceeds the remaining bounded snapshot budget"
+        );
+        *remaining_bytes -= content.len();
+        validation::validate(&path, &content)
+            .map_err(|error| anyhow::anyhow!("{}: {error:#}", path.display()))?;
+        files.insert(path, content);
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "manifest derivation exceeded its 60-second cooperative deadline"
+    );
+    Ok(ManifestInputs {
+        root: reader.root().to_path_buf(),
+        files,
+    })
+}
+
+/// A dead-code run must disclose any loss of current manifest entry roots.
+/// Absence is legitimately empty only when the graph has no repositories.
+/// Pending source debt, incomplete coverage, dirty publication and envelope
+/// failures all prevent old roots from being presented as current.
 #[derive(Debug, Default, Clone)]
 pub struct DeadCodeManifests {
-    /// Parsed manifests keyed by repo UID. Empty when the sidecar is absent
-    /// OR when loading it failed — read `load_error` to tell which.
+    /// Current manifests keyed by repo UID, or empty with `load_error` on failure.
     pub manifests: HashMap<String, ManifestInfo>,
-    /// `Some(message)` only when the sidecar EXISTS and could not be loaded.
-    /// `None` covers both a successful load and a legitimately absent
-    /// sidecar, so a healthy graph adds no disclosure at all.
+    /// Disclosure for unavailable current roots. None means complete coverage.
     pub load_error: Option<String>,
 }
 
@@ -152,7 +518,7 @@ pub fn load_manifests_for_dead_code(
     store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> DeadCodeManifests {
-    match load_manifest_cache_for_db(store, db_path) {
+    match current_manifest_snapshot(store, db_path) {
         Ok(manifests) => DeadCodeManifests {
             manifests,
             load_error: None,
@@ -162,8 +528,8 @@ pub fn load_manifests_for_dead_code(
             load_error: Some(format!(
                 "manifest sidecar {} could not be read ({error:#}); manifest-declared entry \
                  files did NOT seed the reachability walk, so code reachable only from a \
-                 package entry point is reported as unreachable. Re-index to repair \
-                 (`nestweaver index --force`).",
+                 package entry point may appear unreachable. The daemon reports manifest \
+                 reconciliation progress through the suggestions endpoint.",
                 manifest_cache_path(db_path).display()
             )),
         },
@@ -568,6 +934,8 @@ pub fn save_manifest_cache_for_db(
     store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> Result<(), anyhow::Error> {
+    #[cfg(feature = "release-fixture-hooks")]
+    crate::release_fixture::manifest_before_save()?;
     let canonical_path = manifest_cache_path(db_path);
     crate::artifact_sidecar::save_json(
         store,
@@ -784,37 +1152,7 @@ fn discover_package_json_entry_files(reader: &dyn ContentReader) -> Vec<String> 
 
 fn parse_go_mod(reader: &dyn ContentReader) -> Option<ManifestInfo> {
     let content = reader.read_file(Path::new("go.mod")).ok()?;
-
-    let mut package_name = None;
-    let mut deps = Vec::new();
-    let mut in_require = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("module ") {
-            package_name = Some(trimmed.strip_prefix("module ")?.trim().to_string());
-        } else if trimmed == "require (" {
-            in_require = true;
-        } else if trimmed == ")" {
-            in_require = false;
-        } else if in_require && !trimmed.is_empty() && !trimmed.starts_with("//") {
-            // "github.com/pkg/errors v0.9.1" or "… // indirect"
-            let module_path = trimmed.split_whitespace().next()?;
-            deps.push(module_path.to_string());
-        } else if trimmed.starts_with("require ") && !trimmed.contains('(') {
-            // Single-line require: "require github.com/pkg/errors v0.9.1"
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                deps.push(parts[1].to_string());
-            }
-        }
-    }
-
-    Some(ManifestInfo {
-        package_name,
-        dependencies: deps,
-        entry_files: vec![],
-    })
+    validation::go_manifest(&content).ok()
 }
 
 fn parse_cargo_toml(reader: &dyn ContentReader) -> Option<ManifestInfo> {
@@ -2294,5 +2632,111 @@ mod hardening_embedding_recovery_tests {
         drop(authority);
         let reopened = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
         assert!(!reopened.has_embedding("sym:deleted"));
+    }
+}
+
+#[cfg(test)]
+mod release_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn captured_manifest_inputs_distinguish_absent_malformed_and_changed_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(dir.path()).strict_enumeration();
+        let capture = || {
+            capture_manifest_inputs(
+                &reader,
+                &mut (64 * 1024 * 1024),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+        };
+        let empty = capture().unwrap();
+        assert!(parse_manifest(&empty).package_name.is_none());
+        std::fs::write(dir.path().join("package.json"), "{").unwrap();
+        assert!(
+            capture().is_err(),
+            "malformed JSON must not become an empty manifest"
+        );
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"fixed"}"#).unwrap();
+        let fixed = capture().unwrap();
+        assert_ne!(fixed.digest(), empty.digest());
+        assert_eq!(
+            parse_manifest(&fixed).package_name.as_deref(),
+            Some("fixed")
+        );
+        assert!(
+            capture_manifest_inputs(
+                &reader,
+                &mut 1,
+                std::time::Instant::now() + std::time::Duration::from_secs(60)
+            )
+            .is_err()
+        );
+        assert!(capture_manifest_inputs(&reader, &mut 1000, std::time::Instant::now()).is_err());
+    }
+
+    #[test]
+    fn manifest_debt_rejects_oversized_or_malformed_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        mark_manifest_reconciliation_pending(&db, "fixture").unwrap();
+        assert!(manifest_debt_revision(&db).unwrap().is_some());
+        for bytes in [vec![b'x'; 8193], b"{}".to_vec(), b"not JSON".to_vec()] {
+            std::fs::write(manifest_debt_path(&db), &bytes).unwrap();
+            assert!(manifest_debt_revision(&db).is_err());
+            assert_eq!(std::fs::read(manifest_debt_path(&db)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn current_manifest_requires_exact_inventory_and_no_pending_source_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        assert!(current_manifest_snapshot(&store, &db).unwrap().is_empty());
+        mark_manifest_reconciliation_pending(&db, "initial index failed before repo insertion")
+            .unwrap();
+        assert_eq!(
+            current_manifest_snapshot(&store, &db).unwrap_err().reason,
+            ManifestUnavailableReason::PendingSourceChange
+        );
+        std::fs::remove_file(manifest_debt_path(&db)).unwrap();
+        for uid in ["repo:a", "repo:b"] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.into(),
+                    url: format!("file:///fixture/{uid}"),
+                    indexed_sha: "sha".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "fixture".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            current_manifest_snapshot(&store, &db).unwrap_err().reason,
+            ManifestUnavailableReason::Missing
+        );
+        let mut map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        assert_eq!(
+            current_manifest_snapshot(&store, &db).unwrap_err().reason,
+            ManifestUnavailableReason::IncompleteCoverage
+        );
+        map.insert("repo:b".into(), ManifestInfo::default());
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        assert_eq!(current_manifest_snapshot(&store, &db).unwrap().len(), 2);
+        mark_manifest_reconciliation_pending(&db, "source edit").unwrap();
+        assert_eq!(
+            current_manifest_snapshot(&store, &db).unwrap_err().reason,
+            ManifestUnavailableReason::PendingSourceChange
+        );
+        let before = std::fs::read(manifest_cache_path(&db)).unwrap();
+        store.bump_graph_generation();
+        let error = current_manifest_snapshot(&store, &db).unwrap_err();
+        assert_eq!(error.reason, ManifestUnavailableReason::StaleGeneration);
+        assert_eq!(error.expected_generation, store.graph_generation());
+        assert_eq!(std::fs::read(manifest_cache_path(&db)).unwrap(), before);
     }
 }

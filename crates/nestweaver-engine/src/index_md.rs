@@ -22,6 +22,8 @@ use nestweaver_schema::{
     repo_uid, section_uid, tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
+mod derivation;
+pub use derivation::{MARKDOWN_LINK_DERIVATION_VERSION, refresh_indexed_markdown_derivation};
 // walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
 // still use direct fs access.
 
@@ -285,6 +287,14 @@ fn filesystem_note_reader(
 ) -> crate::content_reader::FilesystemReader {
     crate::content_reader::FilesystemReader::with_limits(root, note_reader_limits(limits))
         .with_skip_dirs(SKIP_DIRS)
+}
+
+/// Vault filesystem reader used by daemon-owned derivation/migration.
+pub fn filesystem_vault_reader(
+    root: &Path,
+    limits: crate::index_limits::NoteLimits,
+) -> crate::content_reader::FilesystemReader {
+    filesystem_note_reader(root, limits)
 }
 
 fn cap_sidecar_list<T>(mut items: Vec<T>) -> (Vec<T>, bool) {

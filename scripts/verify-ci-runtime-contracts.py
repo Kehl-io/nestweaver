@@ -73,11 +73,25 @@ class RuntimeContracts(unittest.TestCase):
         self.assertIn('NESTWEAVER_ALLOW_NO_DAEMON: "1"', metal)
         self.assertIn('staged/ci-direct/nestweaver', step(metal, 'Populate model cache on CPU'))
 
-    def test_advisory_and_browser_legacy_builds_enable_feature(self):
+    def test_advisory_legacy_builds_enable_feature(self):
         self.assertIn('cargo llvm-cov --workspace --features ci-direct-tests', job(CI, 'coverage'))
-        self.assertIn('cargo build --features ci-direct-tests', job(CI, 'e2e'))
         self.assertIn('scripts/ci-direct-cargo.sh', job(CI, 'mutants'))
         self.assertIn('scripts/run-mutation-scope.sh', job(CI, 'mutants'))
+
+    def test_browser_uses_owned_daemon_and_standard_artifact(self):
+        browser = job(CI, 'e2e')
+        self.assertIn('cargo build --locked', browser)
+        self.assertIn('npm run build', step(browser, 'Build frontend for standard browser acceptance'))
+        self.assertLess(browser.index('Build frontend for standard browser acceptance'),
+                        browser.index('Build standard daemon and embedded UI'))
+        for forbidden in ('ci-direct-tests', 'NESTWEAVER_NO_DAEMON',
+                          'NESTWEAVER_ALLOW_NO_DAEMON', '--no-daemon', '/tmp/test.lbug'):
+            self.assertNotIn(forbidden, browser)
+        self.assertIn('tests/support/release_ui.py', browser)
+        self.assertIn('--binary ../../../target/debug/nestweaver', browser)
+        config = (ROOT / 'crates/nestweaver-web/frontend/playwright.config.ts').read_text()
+        self.assertIn('NESTWEAVER_UI_FIXTURE_URL', config)
+        self.assertNotIn('webServer:', config)
 
     def test_mutation_feature_selection_without_running_cargo_or_forging_ci(self):
         # Exercise only the argument transformer extracted from the workflow.

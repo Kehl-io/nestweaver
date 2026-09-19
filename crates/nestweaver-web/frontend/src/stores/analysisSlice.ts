@@ -95,7 +95,7 @@ export interface AnalysisSlice {
 
   diffActive: boolean;
   diffState: DiffState;
-  startDiff: (snapshotA: BrainContextResult, seedsA: string[]) => void;
+  startDiff: (snapshotA: BrainContextResult | null, seedsA: string[]) => void;
   setDiffB: (snapshotB: BrainContextResult, seedsB: string[]) => void;
   clearDiff: () => void;
 

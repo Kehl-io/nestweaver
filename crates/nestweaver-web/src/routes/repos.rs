@@ -55,14 +55,86 @@ pub async fn cross_repo_refs(
     Ok(Json(json).into_response())
 }
 
-pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)?;
-    let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)?;
-    let json = json!({
-        "links": serde_json::to_value(&suggestions.links)?,
-        "features": serde_json::to_value(&suggestions.features)?,
+fn manifest_unavailable(
+    state: &AppState,
+    mut error: nestweaver_engine::manifest::ManifestUnavailable,
+) -> Response {
+    let rebuild = state.manifest_recovery.get().map(|runtime| {
+        runtime.wake.notify_one();
+        runtime.status()
     });
-    Ok(Json(json).into_response())
+    if let Some(status) = &rebuild
+        && let Some(source_error) = &status.error
+        && error.retryable
+        && source_error.expected_generation == error.expected_generation
+        && source_error.reason
+            == nestweaver_engine::manifest::ManifestUnavailableReason::SourceUnavailable
+    {
+        error = source_error.clone();
+    }
+    let retryable = error.retryable
+        && rebuild.as_ref().is_some_and(|s| {
+            matches!(
+                s.state,
+                "queued" | "running" | "retry_scheduled" | "deferred"
+            )
+        });
+    let mut response = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+        "code": error.code, "reason": error.reason, "actual_generation": error.actual_generation,
+        "expected_generation": error.expected_generation, "retryable": retryable,
+        "message": error.message, "rebuild": rebuild,
+        "diagnostic_id": format!("manifest-{:?}", error.reason).to_lowercase(),
+    }))).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    if retryable {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("2"),
+        );
+    }
+    response
+}
+
+pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let state2 = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let generation = state2.store.graph_generation();
+        let manifests = match nestweaver_engine::manifest::current_manifest_snapshot(
+            &state2.store,
+            &state2.db_path,
+        ) {
+            Ok(manifests) => manifests,
+            Err(error) => return Ok(manifest_unavailable(&state2, error)),
+        };
+        let suggestions = nestweaver_engine::suggest_links(&state2.store, &manifests)?;
+        if let Err(error) =
+            nestweaver_engine::manifest::ensure_manifest_generation(&state2.store, generation)
+        {
+            return Ok(manifest_unavailable(&state2, error));
+        }
+        if nestweaver_engine::manifest::manifest_debt_revision(&state2.db_path)?.is_some() {
+            return Ok(manifest_unavailable(
+                &state2,
+                nestweaver_engine::manifest::ManifestUnavailable::new(
+                    nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
+                    generation,
+                    "manifest source changed while computing suggestions",
+                ),
+            ));
+        }
+        Ok(Json(
+            json!({ "links": suggestions.links, "features": suggestions.features,
+                "graph_generation": generation,
+                "manifest_revision": state2.manifest_recovery.get().map(|s| s.status().revision),
+            }),
+        )
+        .into_response())
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("suggestions worker failed: {e}")))?
 }
 
 #[cfg(test)]
@@ -91,6 +163,49 @@ mod tests {
             "the error must name ranking as unavailable: {}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn current_artifact_integrity_failure_overrides_prior_source_failure() {
+        use nestweaver_engine::manifest::{
+            ManifestRecoveryRuntime, ManifestUnavailable, ManifestUnavailableReason,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let state = AppState::new(store, None, db_path);
+        let runtime = Arc::new(ManifestRecoveryRuntime::default());
+        runtime.publish(
+            "blocked",
+            0,
+            None,
+            Some(ManifestUnavailable::new(
+                ManifestUnavailableReason::SourceUnavailable,
+                generation,
+                "earlier source failure",
+            )),
+        );
+        assert!(state.manifest_recovery.set(runtime).is_ok());
+        for (reason, wire_reason) in [
+            (ManifestUnavailableReason::Corrupt, "corrupt"),
+            (
+                ManifestUnavailableReason::ForeignIdentity,
+                "foreign_identity",
+            ),
+            (ManifestUnavailableReason::Incompatible, "incompatible"),
+        ] {
+            let response = manifest_unavailable(
+                &state,
+                ManifestUnavailable::new(reason, generation, "current artifact failure"),
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["reason"], wire_reason);
+            assert_eq!(payload["message"], "current artifact failure");
+        }
     }
 
     #[tokio::test]
@@ -144,12 +259,16 @@ mod tests {
         let response = suggest_links(State(state))
             .await
             .unwrap_or_else(|_| panic!("suggest_links endpoint failed"));
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let suggestions: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(suggestions["links"].as_array().unwrap().is_empty());
+        assert_eq!(suggestions["reason"], "missing");
         assert!(!canonical_path.exists());
         assert!(legacy_path.exists());
     }

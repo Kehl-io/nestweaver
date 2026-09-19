@@ -56,6 +56,7 @@ candle-transformers = "0.11"
 tokenizers = "0.23"
 
 [features]
+release-fixture-hooks = ["nestweaver-engine/release-fixture-hooks"]
 embed = ["dep:nestweaver-embed", "nestweaver-engine/embed", "nestweaver-mcp/embed"]
 # Metal passthrough, for the same reason `acme` has one below: without it,
 # `-p nestweaver-daemon --features metal` is an error, so the Metal CI job had

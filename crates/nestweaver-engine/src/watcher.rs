@@ -43,11 +43,19 @@ pub type WatchMutationLeaseFactory =
 /// the same UID entry once `root_path` has been moved with it.
 fn manifest_cache_repo_uid(store: &GraphStore, repo_path: &Path) -> Option<String> {
     let wanted = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
-    store.list_repos(None).ok()?.into_iter().find_map(|repo| {
-        let root = repo.local_root()?;
-        let rooted = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
-        (rooted == wanted).then_some(repo.uid)
-    })
+    store
+        .list_repos(None)
+        .ok()?
+        .into_iter()
+        .filter_map(|repo| {
+            let root = repo.local_root()?;
+            let rooted = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+            wanted
+                .starts_with(&rooted)
+                .then_some((rooted.components().count(), repo.uid))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, uid)| uid)
 }
 
 /// A batch was refused because daemon shutdown has begun. Watchers treat this
@@ -68,6 +76,7 @@ const MANIFEST_FILES: &[&str] = &[
     "pubspec.yaml",
     "Package.swift",
     "CMakeLists.txt",
+    "build.gradle.kts",
 ];
 
 /// Names of directories the MARKDOWN VAULT watcher never descends into.
@@ -377,11 +386,11 @@ impl BrainWatcher {
 
     fn event_targets_manifest(&self, path: &Path) -> bool {
         self.manifests_path.is_some()
-            && path.exists()
-            && path
+            && (path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| MANIFEST_FILES.contains(&name))
+                || path.extension().is_some_and(|s| s == "csproj"))
     }
 
     /// Set the debounce interval for filesystem events.
@@ -989,11 +998,30 @@ impl BrainWatcher {
                 .file_name()
                 .and_then(|f| f.to_str())
                 .is_some_and(|name| MANIFEST_FILES.contains(&name));
-            if is_manifest && path.exists() {
+            if is_manifest || path.extension().is_some_and(|s| s == "csproj") {
                 let repo_path = path
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
+                if manifests_path == &crate::manifest::manifest_cache_path(&self.db_path) {
+                    if manifest_cache_repo_uid(store, &repo_path).is_none() {
+                        return Ok(UpdateOutcome::Skipped {
+                            path,
+                            reason: "manifest file — no indexed repo",
+                        });
+                    }
+                    // Durable debt precedes invalidation, including deletion.
+                    // A complete-map daemon job owns parsing and publication.
+                    crate::manifest::mark_manifest_reconciliation_pending(
+                        &self.db_path,
+                        "manifest watcher edit",
+                    )?;
+                    self.advance_generation_for_manifest_edit(store);
+                    return Ok(UpdateOutcome::Skipped {
+                        path,
+                        reason: "manifest file — reconciliation pending",
+                    });
+                }
                 let manifest = crate::manifest::parse_manifest(
                     &crate::content_reader::FilesystemReader::new(&repo_path),
                 );
@@ -1060,10 +1088,10 @@ impl BrainWatcher {
                             crate::manifest::save_manifest_cache(&cache, manifests_path)
                         };
                         if let Err(e) = saved {
-                            tracing::warn!(
-                                "watcher: failed to save manifest cache after {}: {e}",
+                            return Err(e.context(format!(
+                                "watcher manifest save failed after {}",
                                 path.display()
-                            );
+                            )));
                         } else {
                             tracing::info!(
                                 repo = %repo_key,
@@ -1073,7 +1101,9 @@ impl BrainWatcher {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("watcher: failed to load manifest cache for update: {e}");
+                        return Err(
+                            e.context("watcher manifest load failed; cache was not refreshed")
+                        );
                     }
                 }
                 return Ok(UpdateOutcome::Skipped {
@@ -1872,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_manifest_watch_update_retires_legacy_sidecar() {
+    fn canonical_manifest_watch_queues_recovery_without_trusting_legacy_sidecar() {
         let (_dir, root) = make_vault(&[(
             "package.json",
             r#"{"name":"watched-package","dependencies":{"watched-dep":"1"}}"#,
@@ -1891,21 +1921,19 @@ mod tests {
             .handle_non_graph_event(&store, root.join("package.json"))
             .unwrap();
 
-        assert!(canonical_path.exists());
-        assert!(!legacy_path.exists());
-        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
-        assert_eq!(manifests.len(), 1);
-        assert_eq!(
-            manifests
-                .get("repo:watched")
-                .unwrap()
-                .package_name
-                .as_deref(),
-            Some("watched-package")
+        assert!(!canonical_path.exists());
+        assert!(
+            legacy_path.exists(),
+            "legacy evidence stays until daemon publication"
         );
         assert!(
-            !manifests.contains_key(&root.to_string_lossy().into_owned()),
-            "watcher must not key the cache by on-disk path: {manifests:?}"
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            manifest_cache_repo_uid(&store, &root).as_deref(),
+            Some("repo:watched")
         );
     }
 
@@ -1959,25 +1987,14 @@ mod tests {
             "the persisted generation must match the live one"
         );
 
-        // The sidecar is generation-BOUND: its envelope records
-        // `source_graph_generation` and a reader rejects it when that no
-        // longer matches. The advance therefore has to happen before the
-        // save, or this refresh writes an artifact that is stale on arrival —
-        // which would trade a cache bug for a data-loss bug.
-        let manifests = crate::load_manifest_cache_for_db(&store, &db_path)
-            .expect("the refreshed sidecar must still decode at the NEW generation");
-        assert_eq!(
-            manifests
-                .values()
-                .next()
-                .expect("the refresh wrote this repo's manifest")
-                .entry_files,
-            vec!["entry.js".to_string()],
-            "and it must carry the edited entry files, not an empty payload"
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_some()
         );
-        assert_eq!(
-            manifests.keys().next().map(String::as_str),
-            Some("repo:watched")
+        assert!(
+            !canonical_path.exists(),
+            "watcher queues a complete derivation, not a singleton"
         );
     }
 
@@ -1985,7 +2002,7 @@ mod tests {
     /// `reconcile_deleted_graph_state` because that retain is a UID set.
     /// After a UID-keyed write, reconciliation must keep the entry.
     #[test]
-    fn a_watched_manifest_survives_deleted_graph_reconciliation() {
+    fn pending_manifest_debt_survives_deleted_graph_reconciliation() {
         let (_dir, root) = make_vault(&[(
             "package.json",
             r#"{"name":"watched-package","main":"entry.js"}"#,
@@ -2002,12 +2019,12 @@ mod tests {
             .handle_non_graph_event(&store, root.join("package.json"))
             .unwrap();
         crate::reconcile_deleted_graph_state(&store, &db_path);
-        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
-        assert_eq!(
-            manifests.get("repo:watched").map(|m| m.entry_files.clone()),
-            Some(vec!["entry.js".to_string()]),
-            "UID-keyed watcher entries must survive live-repo retain: {manifests:?}"
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_some()
         );
+        assert!(crate::manifest::current_manifest_snapshot(&store, &db_path).is_err());
     }
 
     /// nw-522's counterweight. A path key accidentally survived a working-tree
@@ -2015,7 +2032,7 @@ mod tests {
     /// `root_path`, so after the graph records the move the same UID is
     /// refreshed rather than a second (path) key appearing.
     #[test]
-    fn a_moved_repo_still_refreshes_manifests_under_its_uid() {
+    fn a_moved_repo_queues_manifest_recovery_under_its_uid() {
         let (_dir, root) = make_vault(&[(
             "package.json",
             r#"{"name":"watched-package","main":"old.js"}"#,
@@ -2047,13 +2064,17 @@ mod tests {
         watcher
             .handle_non_graph_event(&store, moved.join("package.json"))
             .unwrap();
-        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
-        assert_eq!(manifests.len(), 1, "{manifests:?}");
-        let info = manifests
-            .get("repo:watched")
-            .expect("UID key must survive the move");
-        assert_eq!(info.package_name.as_deref(), Some("moved-package"));
-        assert_eq!(info.entry_files, vec!["new.js".to_string()]);
+        assert_eq!(
+            manifest_cache_repo_uid(&store, &moved).as_deref(),
+            Some("repo:watched")
+        );
+        assert_eq!(manifest_cache_repo_uid(&store, &root), None);
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!canonical_path.exists());
     }
 
     #[test]
@@ -2078,6 +2099,33 @@ mod tests {
         assert!(
             !canonical_path.exists(),
             "no indexed repo means no cache write"
+        );
+    }
+
+    #[test]
+    fn deleted_nested_manifest_is_admitted_and_queues_complete_recovery() {
+        let (_dir, root) = make_vault(&[("packages/app/package.json", r#"{"name":"app"}"#)]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:watched");
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(crate::manifest_cache_path(&db_path));
+        let path = root.join("packages/app/package.json");
+        fs::remove_file(&path).unwrap();
+        assert!(watcher.event_targets_manifest(&path));
+        let outcome = watcher.handle_non_graph_event(&store, path).unwrap();
+        assert!(matches!(
+            outcome,
+            UpdateOutcome::Skipped {
+                reason: "manifest file — reconciliation pending",
+                ..
+            }
+        ));
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_some()
         );
     }
 

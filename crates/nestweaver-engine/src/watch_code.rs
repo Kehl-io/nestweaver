@@ -50,6 +50,7 @@ pub struct CodeWatcher {
 #[derive(Debug)]
 enum WatchBatchOutcome {
     Unchanged,
+    ManifestPending,
     Published { files_processed: usize },
     Skipped { reason: anyhow::Error },
 }
@@ -292,7 +293,9 @@ impl CodeWatcher {
                     &crate::index::FileSystemIndexEpilogueIo,
                     on_change.as_deref().map(|callback| callback as &dyn Fn()),
                 )? {
-                    WatchBatchOutcome::Published { .. } | WatchBatchOutcome::Unchanged => break,
+                    WatchBatchOutcome::Published { .. }
+                    | WatchBatchOutcome::Unchanged
+                    | WatchBatchOutcome::ManifestPending => break,
                     WatchBatchOutcome::Skipped { reason } => {
                         // A save racing the cold snapshot is expected to be
                         // queued because notification was registered first.
@@ -397,7 +400,7 @@ impl CodeWatcher {
             )?;
             let files_processed = match outcome {
                 WatchBatchOutcome::Published { files_processed } => files_processed,
-                WatchBatchOutcome::Unchanged => continue,
+                WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
                 WatchBatchOutcome::Skipped { reason } => {
                     tracing::warn!(
                         error = %reason,
@@ -593,12 +596,64 @@ impl CodeWatcher {
     {
         let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
         let reader = self.reader_for(repo_url)?;
-        let relevant = match self.expand_event_paths(store, r_uid, &reader, repo_url, relevant) {
+        // Manifest edits do not require source parsing or symbol writes. Debt
+        // must precede generation invalidation so interruption cannot leave a
+        // valid-looking cache for old package inputs.
+        let mut manifest_changed = false;
+        for path in relevant {
+            let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+                continue;
+            };
+            let manifest_or_directory = crate::manifest::is_manifest_input(relative)
+                || path.is_dir()
+                || (!path.exists() && path.extension().is_none());
+            if manifest_or_directory
+                && reader.accepts_path(relative)
+                && !path_has_symlink(&self.repo_root, relative)?
+                && manifest_path_not_gitignored(&self.repo_root, relative)?
+            {
+                manifest_changed = true;
+            }
+        }
+        if manifest_changed {
+            crate::manifest::mark_manifest_reconciliation_pending(
+                &self.db_path,
+                "code watcher manifest edit",
+            )?;
+            let publication = crate::manifest::begin_graph_mutation_publication(
+                store,
+                "manifest watcher invalidation",
+            )?;
+            let outcome = publication.finish(true)?;
+            anyhow::ensure!(
+                !outcome.is_degraded(),
+                "manifest source edit committed with degraded generation publication: {:?}",
+                outcome.warnings
+            );
+            tracing::info!(repo = %r_uid, "manifest source changed; complete daemon derivation pending");
+        }
+        let code_events: Vec<_> = relevant
+            .iter()
+            .filter(|path| {
+                path.strip_prefix(&self.repo_root).is_ok_and(|rel| {
+                    !crate::manifest::is_manifest_input(rel)
+                        || is_supported_source(path)
+                        || crate::contracts::is_spec_file(&path.to_string_lossy())
+                })
+            })
+            .cloned()
+            .collect();
+        let relevant = match self.expand_event_paths(store, r_uid, &reader, repo_url, &code_events)
+        {
             Ok(paths) => paths,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
         if relevant.is_empty() && !insert_initial_repo {
-            return Ok(WatchBatchOutcome::Unchanged);
+            return Ok(if manifest_changed {
+                WatchBatchOutcome::ManifestPending
+            } else {
+                WatchBatchOutcome::Unchanged
+            });
         }
         let contract_plan =
             match crate::index::prepare_watcher_contract_derivation(&reader, r_uid, repo_url) {
@@ -778,6 +833,11 @@ impl CodeWatcher {
                 },
             )
             .context("insert initial watcher Repo node")?;
+        }
+
+        if insert_initial_repo {
+            GraphStore::set_repo_index_policy_on(&txn, r_uid, &reader.eligibility_fingerprint())
+                .context("persist initial watcher source eligibility")?;
         }
 
         let mut files_processed = 0usize;
@@ -984,6 +1044,27 @@ fn is_supported_source(path: &Path) -> bool {
 
 fn is_watcher_input(path: &Path) -> bool {
     is_supported_source(path) || crate::contracts::is_spec_file(&path.to_string_lossy())
+}
+
+fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
+    if !root.join(".git").exists() {
+        return Ok(true);
+    }
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(root)
+        .args(["check-ignore", "--no-index", "--quiet", "--"])
+        .arg(relative);
+    crate::git_cmd::apply_git_isolation(&mut command);
+    let result = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(5))?;
+    match result.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => anyhow::bail!(
+            "cannot determine manifest gitignore eligibility: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ),
+    }
 }
 
 struct PreparedCodeFile {
@@ -1384,6 +1465,71 @@ mod tests {
                 &crate::index::FileSystemIndexEpilogueIo,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn release_code_watcher_manifest_edit_and_delete_leave_durable_pending_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, uid, root) = index_fixture_repo(&dir);
+        let db = dir.path().join("graph.lbug");
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let path = root.join("package.json");
+        std::fs::write(&path, r#"{"name":"app","dependencies":{"dep":"1"}}"#).unwrap();
+        let before = store.graph_generation();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, std::slice::from_ref(&path)),
+            WatchBatchOutcome::ManifestPending
+        ));
+        assert!(store.graph_generation() > before);
+        let first_debt = crate::manifest::manifest_debt_revision(&db).unwrap();
+        assert!(first_debt.is_some());
+        assert!(!crate::manifest::manifest_cache_path(&db).exists());
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[path]),
+            WatchBatchOutcome::ManifestPending
+        ));
+        assert_ne!(
+            crate::manifest::manifest_debt_revision(&db).unwrap(),
+            first_debt
+        );
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            "sha1"
+        );
+    }
+
+    #[test]
+    fn release_code_watcher_ignores_excluded_and_gitignored_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, uid, root) = index_fixture_repo(&dir);
+        let db = dir.path().join("graph.lbug");
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let ignored = root.join("node_modules/dep/package.json");
+        std::fs::create_dir_all(ignored.parent().unwrap()).unwrap();
+        std::fs::write(&ignored, "{}").unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[ignored]),
+            WatchBatchOutcome::Unchanged
+        ));
+        let status = std::process::Command::new("git")
+            .args(["init", "--template="])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        std::fs::write(root.join(".gitignore"), "package.json\n").unwrap();
+        let path = root.join("package.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[path]),
+            WatchBatchOutcome::Unchanged
+        ));
+        assert!(
+            crate::manifest::manifest_debt_revision(&db)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

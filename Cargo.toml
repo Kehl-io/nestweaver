@@ -124,6 +124,8 @@ daemonize2 = "0.7"
 [features]
 # Internal CI-only artifact. Never enable in local or distributed builds.
 ci-direct-tests = []
+# Internal owned-daemon acceptance artifact; never enable for distribution.
+release-fixture-hooks = ["nestweaver-engine/release-fixture-hooks", "nestweaver-daemon/release-fixture-hooks"]
 default = ["embed"]
 embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
 metal = ["nestweaver-embed?/metal", "nestweaver-daemon/metal"]

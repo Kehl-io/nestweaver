@@ -27,9 +27,32 @@ pub struct AppState {
     /// within-process staleness is acceptable.
     pub bridge_scores: OnceLock<Arc<HashMap<String, f64>>>,
     pub gaps_cache: GapsCache,
+    pub manifest_recovery: OnceLock<Arc<nestweaver_engine::manifest::ManifestRecoveryRuntime>>,
+    pub vault_derivation: OnceLock<VaultDerivationHttp>,
+}
+
+pub struct VaultDerivationHttp {
+    pub data_instance_id: String,
+    pub read_only: bool,
+    pub max_note_bytes: u64,
 }
 
 impl AppState {
+    pub fn admit_vault_derivation(&self) -> Result<(), crate::error::ApiError> {
+        let Some(config) = self.vault_derivation.get() else {
+            return Ok(());
+        };
+        nestweaver_engine::markdown_derivation::admit_all_vaults(
+            &self.store,
+            &self.db_path,
+            &config.data_instance_id,
+            &[],
+            config.max_note_bytes,
+            config.read_only,
+        )
+        .map_err(|error| crate::error::ApiError::unavailable(error.to_string()))
+    }
+
     pub fn new(store: GraphStore, tantivy: Option<TantivyIndex>, db_path: PathBuf) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
@@ -40,6 +63,8 @@ impl AppState {
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
+            manifest_recovery: OnceLock::new(),
+            vault_derivation: OnceLock::new(),
         })
     }
 
@@ -57,6 +82,8 @@ impl AppState {
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
+            manifest_recovery: OnceLock::new(),
+            vault_derivation: OnceLock::new(),
         })
     }
 
@@ -74,6 +101,8 @@ impl AppState {
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
+            manifest_recovery: OnceLock::new(),
+            vault_derivation: OnceLock::new(),
         })
     }
 }

@@ -5,6 +5,7 @@ import {
   nodeSize,
   desaturate,
   relevanceToSaturation,
+  EDGE_COLORS,
 } from "./graphColors";
 import { deterministicGraphPosition } from "./preserveGraphLayout";
 
@@ -43,6 +44,20 @@ export function buildGraphFromContext(result: BrainContextResult): Graph {
     });
   }
 
+  for (const [index, edge] of (result.edges ?? []).entries()) {
+    if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) {
+      throw new Error("Context relationship refers to an unavailable node.");
+    }
+    graph.addDirectedEdgeWithKey(`context:${index}`, edge.source, edge.target, {
+      edgeType: edge.edge_type,
+      label: edge.edge_type,
+      confidence: edge.confidence,
+      evidence: edge.evidence,
+      color: EDGE_COLORS[edge.edge_type.toLowerCase()] ?? "#6b7280",
+      size: 1,
+    });
+  }
+  graph.setAttribute("contextGraphMeta", result.graph_meta ?? null);
   return graph;
 }
 
