@@ -9902,7 +9902,13 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let request = request.into_inner();
         let store = self.state.store.clone();
+        let runtime_status = self.state.embedding_runtime.status();
         let response = tokio::task::spawn_blocking(move || {
+            require_verified_embedding_runtime_identity(
+                &store,
+                &runtime_status,
+                "embedding preflight",
+            )?;
             plan_embeddings(&store, &request.scope, request.force)
         })
         .await
@@ -23300,6 +23306,46 @@ external_model = "external-model"
         assert_eq!(degraded.get_embedding_pipeline().unwrap(), None);
         assert_eq!(degraded.embedding_count(), 0);
         assert!(!embedding_path.exists());
+    }
+
+    #[tokio::test]
+    async fn embed_plan_rejects_unreadable_identity_even_when_no_nodes_are_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed-plan-identity.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("recorded-model", 3).unwrap();
+        {
+            let conn = store.begin_transaction().unwrap();
+            conn.query("MATCH (m:Meta {key: 'embedding'}) SET m.value = '{not-json'")
+                .unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let degraded = Arc::new(GraphStore::open(&db_path).unwrap());
+        assert!(degraded.embedding_identity_error().is_some());
+        assert_eq!(
+            plan_embeddings(&degraded, "all", false).unwrap().eligible,
+            0
+        );
+        let service = DaemonService::new(test_state_with_authz(
+            degraded,
+            build_daemon_permission_source(None),
+        ));
+
+        for force in [false, true] {
+            let status = service
+                .plan_embed(Request::new(EmbedRequest {
+                    scope: "all".to_string(),
+                    force,
+                    batch_size: 0,
+                    repair_identity: false,
+                }))
+                .await
+                .expect_err("an empty plan must not bypass identity validation");
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(status.message().contains("embedding preflight"));
+            assert!(status.message().contains("identity is unreadable"));
+        }
     }
 
     #[cfg(feature = "embed")]

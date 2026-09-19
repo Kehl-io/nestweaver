@@ -34059,41 +34059,25 @@ where
     // breaks the direct path with a confusing "could not set lock" error (and
     // leaks the daemon). Skip straight to the in-process path instead.
     if use_daemon && endpoint.is_none() && !local {
-        // The daemon embeds with the model recorded in the database (or the
-        // compiled-in default for a fresh DB) — it cannot honor a different
-        // --model-id, so bail early instead of silently embedding with the
-        // wrong model. Read the recorded model through a read-only open: the
-        // daemon may hold the write lock. A missing DB legitimately falls back
-        // to the default (that is what the daemon would load); a DB that
-        // exists but cannot be read gets a warning, because comparing against
-        // the default could then produce a spurious "cannot honor" error.
-        let recorded_model = if repair_identity {
-            None
-        } else {
-            match nestweaver_store::GraphStore::open_read_only(path) {
-                Ok(store) => store
-                    .get_embedding_metadata()
-                    .context("read the database embedding identity before daemon embedding")?,
-                Err(e) => {
-                    if path.exists() {
-                        eprintln!(
-                            "Warning: could not read the recorded embedding model ({e:#}); \
-                             assuming the default model"
-                        );
-                    }
-                    None
-                }
-            }
-        };
-        let recorded_model = recorded_model
-            .as_ref()
-            .map(|(model_id, _)| model_id.as_str());
-        if let Err(error) = daemon_route_model_override_is_honored(model_id, recorded_model) {
-            anyhow::bail!("{error}");
-        }
+        // The owning daemon validates semantic identity and selects its backend.
+        // Client-side metadata reads would open a second database runtime.
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
+                if model_id.is_some() {
+                    let status = rt
+                        .block_on(client.brain_status())
+                        .context("read the daemon's selected embedding model")?;
+                    let selected = status.embedding_status.as_ref()
+                        .map(|embedding| embedding.model_id.as_str())
+                        .filter(|model| !model.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "daemon did not report its selected embedding model; restart it before using --model-id"
+                        ))?;
+                    daemon_route_model_override_is_honored(model_id, Some(selected))
+                        .map_err(anyhow::Error::msg)?;
+                }
+
                 if !repair_identity {
                     match rt.block_on(client.plan_embed(scope, force)) {
                         Ok(plan) => {
@@ -34170,8 +34154,7 @@ where
                 return Err(error).with_context(|| {
                     format!(
                         "failed to connect to daemon for {}; start it with \
-                         'nestweaver daemon --db {} start' or use --no-daemon \
-                         (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
+                         'nestweaver daemon --db {} start'; direct fallback is refused",
                         path.display(),
                         path.display()
                     )
@@ -34185,8 +34168,7 @@ where
     // or when the daemon is explicitly disabled (--no-daemon / NESTWEAVER_NO_DAEMON=1).
     if use_daemon && endpoint.is_none() && !local {
         anyhow::bail!(
-            "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
-             or use --no-daemon (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
+            "daemon is not running. Start it with 'nestweaver daemon --db {} start'; direct fallback is refused",
             path.display()
         );
     }
