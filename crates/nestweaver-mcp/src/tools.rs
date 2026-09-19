@@ -95,6 +95,19 @@ enum StrictNameResolve {
     Ambiguous(Vec<nestweaver_schema::Symbol>),
 }
 
+/// Note title/path/UID lookup. Unique proceeds; duplicate titles refuse
+/// with the same structured `candidate_uids` contract as symbols.
+#[derive(Debug)]
+enum StrictNoteResolve {
+    Found(Box<nestweaver_schema::Note>),
+    NotFound,
+    Ambiguous(Vec<nestweaver_schema::Note>),
+}
+
+fn note_found(note: nestweaver_schema::Note) -> StrictNoteResolve {
+    StrictNoteResolve::Found(Box::new(note))
+}
+
 fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
     json!(
         candidates
@@ -118,6 +131,24 @@ fn name_lookup_ambiguous_payload(
         name,
         repo_filter,
         candidates_json(candidates),
+    )
+}
+
+fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Value {
+    nestweaver_schema::responses::name_lookup_ambiguous(
+        title,
+        None,
+        json!(
+            notes
+                .iter()
+                .map(|n| json!({
+                    "uid": n.uid,
+                    "name": n.title,
+                    "file_path": n.file_path,
+                    "start_line": 0,
+                }))
+                .collect::<Vec<_>>()
+        ),
     )
 }
 
@@ -5494,6 +5525,14 @@ fn tool_brain_context(
     if seeds.is_empty() {
         return Err(anyhow!("'seeds' must contain at least one string"));
     }
+    for seed in &seeds {
+        match resolve_note_by_title(store, seed)? {
+            StrictNoteResolve::Ambiguous(notes) => {
+                return Ok(notes_ambiguous_payload(seed, &notes));
+            }
+            StrictNoteResolve::Found(_) | StrictNoteResolve::NotFound => {}
+        }
+    }
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
@@ -7769,13 +7808,13 @@ mod brain_search_total_contract_tests {
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid for unambiguous lookup, or title for case-insensitive first-match\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
+        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred over title for unambiguous lookup." },
-                "title": { "type": "string", "description": "Note title (case-insensitive). Returns the first match if multiple notes share the same title." },
+                "title": { "type": "string", "description": "Note title (case-insensitive). Ambiguous titles refuse with candidate UIDs; pass a UID or vault-relative path to pin one note." },
                 "include_body": {
                     "type": "boolean",
                     "description": "Include the full markdown body. Default true. Set to false to get only metadata (outline, frontmatter, section count).",
@@ -7820,8 +7859,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             .with_context(|| format!("failed to look up note with uid '{uid}'"))?
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         match resolve_note_by_title(store, title)? {
-            Some(n) => n,
-            None => return Err(anyhow!("no note found with title '{title}'")),
+            StrictNoteResolve::Found(n) => *n,
+            StrictNoteResolve::NotFound => {
+                return Err(anyhow!("no note found with title '{title}'"));
+            }
+            StrictNoteResolve::Ambiguous(notes) => {
+                return Ok(notes_ambiguous_payload(title, &notes));
+            }
         }
     } else {
         return Err(anyhow!("provide either 'uid' or 'title'"));
@@ -7936,13 +7980,13 @@ const BACKLINKS_DEFAULT_LIMIT: usize = 20;
 fn tool_schema_backlinks() -> Value {
     json!({
         "name": "backlinks",
-        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- `count` is the returned page length; `total` is the untruncated occurrence count; raise `limit` (1-1000, default 20) when `truncated` is true\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
+        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid, a vault-relative path, or an unambiguous title to identify the target\n- Duplicate titles refuse with candidate UIDs instead of picking the first match\n- Returns source note paths, linking sections, confidence scores, and display text\n- `count` is the returned page length; `total` is the untruncated occurrence count; raise `limit` (1-1000, default 20) when `truncated` is true\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred for unambiguous lookup." },
-                "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." },
+                "title": { "type": "string", "description": "Note title (case-insensitive match). Ambiguous titles refuse with candidate UIDs; pass a UID or vault-relative path to pin one note." },
                 "limit": limit_schema(
                     "Max backlink occurrences to return (1-1000, default 20). `total` is the untruncated count; `truncated` is true when more exist than returned.",
                     BACKLINKS_DEFAULT_LIMIT, 1, RESULT_LIMIT_MAX)
@@ -7971,7 +8015,20 @@ fn slug_normalize(s: &str) -> String {
         .join("-")
 }
 
-/// Resolve a note by title, tolerating case, slug form, and FILENAME STEM.
+fn looks_like_note_path(input: &str) -> bool {
+    input.contains('/') || input.contains('\\') || input.to_lowercase().ends_with(".md")
+}
+
+fn note_path_matches(file_path: &str, query: &str) -> bool {
+    let fp = file_path.replace('\\', "/").to_lowercase();
+    let q = query
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_lowercase();
+    fp == q || fp.ends_with(&format!("/{q}"))
+}
+
+/// Resolve a note by UID, vault-relative path, or title.
 ///
 /// nw-168: `note_get`/`backlinks` matched only the H1 title (plus a
 /// case/slug fallback), while the wikilink resolver's priority-3b tier also
@@ -7981,11 +8038,12 @@ fn slug_normalize(s: &str) -> String {
 /// The filename is often the only handle a user has.
 ///
 /// Stem matching runs LAST, after exact and slug matches, so a real title
-/// always wins over a coincidental filename.
+/// always wins over a coincidental filename. Duplicate titles or paths are
+/// Ambiguous instead of a silent first-match pick.
 fn resolve_note_by_title(
     store: &GraphStore,
     title: &str,
-) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
+) -> Result<StrictNoteResolve, anyhow::Error> {
     resolve_note_by_title_with(store, title, |uid| store.lookup_note(uid))
 }
 
@@ -8007,12 +8065,51 @@ fn resolve_note_by_title_with(
     store: &GraphStore,
     title: &str,
     hydrate: impl Fn(&str) -> Result<nestweaver_schema::Note, nestweaver_store::StoreError>,
-) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
-    let mut matches = store
+) -> Result<StrictNoteResolve, anyhow::Error> {
+    let trimmed = title.trim();
+    if trimmed.starts_with("note:") {
+        return match hydrate(trimmed) {
+            Ok(note) => Ok(note_found(note)),
+            Err(nestweaver_store::StoreError::NotFound) => Ok(StrictNoteResolve::NotFound),
+            Err(e) => Err(anyhow!("failed to look up note with uid '{trimmed}': {e}")),
+        };
+    }
+
+    let hydrate_one =
+        |uid: &str| hydrate(uid).with_context(|| format!("hydrate note '{uid}' matched by title"));
+    let hydrate_all = |uids: Vec<String>| -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
+        uids.into_iter().map(|uid| hydrate_one(&uid)).collect()
+    };
+
+    if looks_like_note_path(trimmed) {
+        let all_notes = store
+            .list_notes_lite(None)
+            .with_context(|| format!("scan notes while resolving path '{trimmed}'"))?;
+        let path_uids: Vec<String> = all_notes
+            .iter()
+            .filter(|n| note_path_matches(&n.file_path, trimmed))
+            .map(|n| n.uid.clone())
+            .collect();
+        match path_uids.len() {
+            0 => {}
+            1 => {
+                return Ok(note_found(hydrate_one(&path_uids[0])?));
+            }
+            _ => {
+                return Ok(StrictNoteResolve::Ambiguous(hydrate_all(path_uids)?));
+            }
+        }
+    }
+
+    let matches = store
         .lookup_notes_by_title(title)
         .with_context(|| format!("failed to look up notes with title '{title}'"))?;
-    if let Some(note) = matches.drain(..).next() {
-        return Ok(Some(note));
+    match matches.len() {
+        0 => {}
+        1 => {
+            return Ok(note_found(matches.into_iter().next().unwrap()));
+        }
+        _ => return Ok(StrictNoteResolve::Ambiguous(matches)),
     }
 
     // Uses list_notes_lite to avoid loading full note bodies during the scan.
@@ -8032,25 +8129,28 @@ fn resolve_note_by_title_with(
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_lowercase())
     };
-    let hit = all_notes
+    let title_uids: Vec<String> = all_notes
         .iter()
-        .find(|n| n.title.to_lowercase() == needle || slug_normalize(&n.title) == wanted_slug)
-        .or_else(|| {
-            all_notes.iter().find(|n| {
-                stem_of(&n.file_path)
-                    .is_some_and(|stem| stem == needle || slug_normalize(&stem) == wanted_slug)
-            })
-        });
-    match hit {
-        // `.ok()` here was the sharpest form of the same defect: the title
-        // MATCHED a row, and then a failed hydration of that row became `None`
-        // — "no note found with that title" about a note we had just found.
-        // The uid branch at the top of this function already propagates with
-        // `with_context(...)?`; same function, opposite handling.
-        Some(hit) => hydrate(&hit.uid)
-            .map(Some)
-            .with_context(|| format!("hydrate note '{}' matched by title", hit.uid)),
-        None => Ok(None),
+        .filter(|n| n.title.to_lowercase() == needle || slug_normalize(&n.title) == wanted_slug)
+        .map(|n| n.uid.clone())
+        .collect();
+    match title_uids.len() {
+        0 => {}
+        1 => return Ok(note_found(hydrate_one(&title_uids[0])?)),
+        _ => return Ok(StrictNoteResolve::Ambiguous(hydrate_all(title_uids)?)),
+    }
+    let stem_uids: Vec<String> = all_notes
+        .iter()
+        .filter(|n| {
+            stem_of(&n.file_path)
+                .is_some_and(|stem| stem == needle || slug_normalize(&stem) == wanted_slug)
+        })
+        .map(|n| n.uid.clone())
+        .collect();
+    match stem_uids.len() {
+        0 => Ok(StrictNoteResolve::NotFound),
+        1 => Ok(note_found(hydrate_one(&stem_uids[0])?)),
+        _ => Ok(StrictNoteResolve::Ambiguous(hydrate_all(stem_uids)?)),
     }
 }
 
@@ -8059,8 +8159,13 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         uid.to_string()
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         match resolve_note_by_title(store, title)? {
-            Some(n) => n.uid,
-            None => return Err(anyhow!("no note found with title '{title}'")),
+            StrictNoteResolve::Found(n) => n.uid,
+            StrictNoteResolve::NotFound => {
+                return Err(anyhow!("no note found with title '{title}'"));
+            }
+            StrictNoteResolve::Ambiguous(notes) => {
+                return Ok(notes_ambiguous_payload(title, &notes));
+            }
         }
     } else {
         return Err(anyhow!("provide either 'uid' or 'title'"));
@@ -18089,7 +18194,7 @@ mod cache_dispatch_tests {
         let resolved = resolve_note_by_title(&store, "no such note exists anywhere")
             .expect("a miss is not an error");
 
-        assert!(resolved.is_none());
+        assert!(matches!(resolved, StrictNoteResolve::NotFound));
     }
 
     fn note_fixture(uid: &str) -> nestweaver_schema::Note {
@@ -18368,12 +18473,62 @@ mod cache_dispatch_tests {
         // the assertion above cannot be satisfied by failing unconditionally.
         let resolved = resolve_note_by_title_with(&store, "Home", |uid| store.lookup_note(uid))
             .expect("a stem-matched title resolves");
+        let uid = match resolved {
+            StrictNoteResolve::Found(note) => note.uid,
+            other => panic!("expected Found, got {other:?}"),
+        };
         assert_eq!(
-            resolved.map(|n| n.uid),
-            Some("note:home".to_string()),
+            uid,
+            "note:home".to_string(),
             "the fixture must reach the hydration arm, or this test proves \
              nothing"
         );
+    }
+
+    fn two_same_title_notes() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let mut one = note_fixture("note:same-a");
+        one.title = "Same".to_string();
+        one.file_path = "folder1/Same.md".to_string();
+        let mut two = note_fixture("note:same-b");
+        two.title = "Same".to_string();
+        two.file_path = "folder2/Same.md".to_string();
+        let mut unique = note_fixture("note:unique");
+        unique.title = "Unique".to_string();
+        unique.file_path = "Unique.md".to_string();
+        store.insert_note(&one).unwrap();
+        store.insert_note(&two).unwrap();
+        store.insert_note(&unique).unwrap();
+        store
+    }
+
+    #[test]
+    fn duplicate_note_titles_refuse_with_candidates() {
+        let store = two_same_title_notes();
+
+        let payload = tool_note_get(&store, json!({"title": "Same"})).unwrap();
+        assert_eq!(payload["status"], "ambiguous", "{payload}");
+        let uids = payload["candidate_uids"]
+            .as_array()
+            .expect("ambiguous payload lists candidate_uids");
+        assert_eq!(uids.len(), 2, "{payload}");
+
+        let backlinks = tool_backlinks(&store, json!({"title": "Same"})).unwrap();
+        assert_eq!(backlinks["status"], "ambiguous", "{backlinks}");
+
+        let context =
+            tool_brain_context(&store, None, json!({"seeds": ["Same"]}), None, None, None).unwrap();
+        assert_eq!(context["status"], "ambiguous", "{context}");
+
+        let unique = tool_note_get(&store, json!({"title": "Unique"})).unwrap();
+        assert_eq!(unique["uid"], "note:unique", "{unique}");
+
+        let pinned = tool_note_get(&store, json!({"title": "folder1/Same.md"})).unwrap();
+        assert_eq!(pinned["uid"], "note:same-a", "{pinned}");
+
+        let by_uid = tool_note_get(&store, json!({"uid": "note:same-b"})).unwrap();
+        assert_eq!(by_uid["title"], "Same", "{by_uid}");
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──

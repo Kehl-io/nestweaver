@@ -2272,10 +2272,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             continue;
         }
 
-        // Try note title match first — exact (case-insensitive).
-        let note_matches = lookup_note_uids_by_title(store, trimmed)?;
-        if !note_matches.is_empty() {
-            seed_uids.extend(note_matches);
+        if let Some(note_uids) = resolve_brain_note_seeds(store, trimmed)? {
+            seed_uids.extend(note_uids);
             continue;
         }
 
@@ -2373,8 +2371,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             if let Some(canonicals) = alias_to_canonical.get(&key) {
                 let mut resolved_via_alias = false;
                 for canonical in canonicals {
-                    let canon_matches = lookup_note_uids_by_title(store, canonical)?;
-                    if !canon_matches.is_empty() {
+                    if let Some(canon_matches) = resolve_brain_note_seeds(store, canonical)? {
                         tracing::debug!(
                             alias = trimmed,
                             canonical = %canonical,
@@ -2813,17 +2810,74 @@ pub fn weighted_score_fuse(
     results
 }
 
-fn lookup_note_uids_by_title(
+fn looks_like_note_path(input: &str) -> bool {
+    input.contains('/') || input.contains('\\') || input.to_lowercase().ends_with(".md")
+}
+
+fn note_path_matches(file_path: &str, query: &str) -> bool {
+    let fp = file_path.replace('\\', "/").to_lowercase();
+    let q = query
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_lowercase();
+    fp == q || fp.ends_with(&format!("/{q}"))
+}
+
+fn notes_matching_title(
     store: &GraphStore,
     title: &str,
-) -> Result<Vec<String>, anyhow::Error> {
+) -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
     let needle = title.to_lowercase();
     let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     Ok(notes
         .into_iter()
         .filter(|n| n.title.to_lowercase() == needle)
-        .map(|n| n.uid)
         .collect())
+}
+
+fn notes_matching_path(
+    store: &GraphStore,
+    path: &str,
+) -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
+    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(notes
+        .into_iter()
+        .filter(|n| note_path_matches(&n.file_path, path))
+        .collect())
+}
+
+fn ambiguous_notes_error(input: &str, notes: &[nestweaver_schema::Note]) -> anyhow::Error {
+    let listing = notes
+        .iter()
+        .map(|n| format!("  {} [Note] {}:0", n.uid, n.file_path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::anyhow!(
+        "Ambiguous: '{input}' matches {} notes (pass a UID or path):\n{listing}",
+        notes.len()
+    )
+}
+
+/// Unique note title or vault-relative path becomes a seed. Two+ title
+/// matches refuse instead of silently unioning every homonym.
+fn resolve_brain_note_seeds(
+    store: &GraphStore,
+    trimmed: &str,
+) -> Result<Option<Vec<String>>, anyhow::Error> {
+    if looks_like_note_path(trimmed) {
+        let path_hits = notes_matching_path(store, trimmed)?;
+        match path_hits.len() {
+            0 => {}
+            1 => return Ok(Some(path_hits.into_iter().map(|n| n.uid).collect())),
+            _ => return Err(ambiguous_notes_error(trimmed, &path_hits)),
+        }
+    }
+    let title_hits = notes_matching_title(store, trimmed)?;
+    match title_hits.len() {
+        0 => Ok(None),
+        1 => Ok(Some(title_hits.into_iter().map(|n| n.uid).collect())),
+        _ => Err(ambiguous_notes_error(trimmed, &title_hits)),
+    }
 }
 
 fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyhow::Error> {
@@ -5417,6 +5471,78 @@ mod semantic_leg_tests {
             !result.seeds.is_empty(),
             "Payment should resolve to at least one seed"
         );
+    }
+
+    #[test]
+    fn duplicate_note_titles_are_ambiguous_not_unioned() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:notes".to_string(),
+                name: "Notes".to_string(),
+                root_path: "/tmp/notes".to_string(),
+                instance_id: "local".to_string(),
+            })
+            .unwrap();
+        for (uid, path) in [
+            ("note:notes:one", "folder1/Same.md"),
+            ("note:notes:two", "folder2/Same.md"),
+        ] {
+            store
+                .insert_note(&nestweaver_schema::Note {
+                    uid: uid.to_string(),
+                    vault_uid: "vlt:notes".to_string(),
+                    file_path: path.to_string(),
+                    title: "Same".to_string(),
+                    note_kind: nestweaver_schema::NoteKind::General,
+                    word_count: 1,
+                    content_hash: uid.to_string(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Same".to_string()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("duplicate titles must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Ambiguous"),
+            "expected an ambiguity refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("note:notes:one") && msg.contains("note:notes:two"),
+            "candidates must be listed: {msg}"
+        );
+
+        let pinned = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["folder1/Same.md".to_string()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a vault-relative path must pin one note");
+        let seed_uids: Vec<&str> = pinned.seeds.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(seed_uids, vec!["note:notes:one"]);
     }
 }
 
