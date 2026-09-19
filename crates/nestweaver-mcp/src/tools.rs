@@ -156,13 +156,15 @@ fn filter_name_matches_by_repo(
     store: &GraphStore,
     matches: Vec<nestweaver_schema::Symbol>,
     repo_filter: Option<&str>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Vec<nestweaver_schema::Symbol>, anyhow::Error> {
     let Some(selector) = repo_filter.filter(|s| !s.is_empty()) else {
         return Ok(matches);
     };
-    let repos = store
+    let mut repos = store
         .list_repos(None)
         .map_err(|e| anyhow!("list_repos: {e}"))?;
+    repos.retain(|repo| repo_is_visible(&repo.uid, visible));
     match nestweaver_engine::resolve_repo_selector(&repos, selector) {
         Ok(repo) => Ok(matches
             .into_iter()
@@ -210,8 +212,12 @@ fn resolve_symbol_strict(
                     return Ok(StrictNameResolve::NotFound);
                 }
                 if let Some(selector) = repo_filter.filter(|s| !s.is_empty()) {
-                    let filtered =
-                        filter_name_matches_by_repo(store, vec![symbol.clone()], Some(selector))?;
+                    let filtered = filter_name_matches_by_repo(
+                        store,
+                        vec![symbol.clone()],
+                        Some(selector),
+                        visible,
+                    )?;
                     return Ok(classify_name_matches(filtered));
                 }
                 Ok(StrictNameResolve::Found(symbol.uid))
@@ -224,7 +230,7 @@ fn resolve_symbol_strict(
             .lookup_symbols_by_name(name_or_uid)
             .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
         matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
-        let matches = filter_name_matches_by_repo(store, matches, repo_filter)?;
+        let matches = filter_name_matches_by_repo(store, matches, repo_filter, visible)?;
         Ok(classify_name_matches(matches))
     }
 }
@@ -9605,7 +9611,8 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
-                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or repo to pin one symbol." },
+                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or name_repo to pin one symbol." },
+                "name_repo": { "type": "string", "description": "Disambiguate duplicate visible symbol names by repo; ignored for UIDs and globally unique visible names. Does not filter result rows." },
                 "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
                     "Max contract links to return (1-1000, default 50). The total count is always reported.",
@@ -9629,7 +9636,7 @@ fn tool_cross_repo_contracts(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    let name_repo = args.get("repo").and_then(|v| v.as_str());
+    let name_repo = args.get("name_repo").and_then(|v| v.as_str());
     // `uid` is a handle, not a name. Restricted sessions still look the row
     // up by UID and fail closed if it is hidden; they must not route a
     // colon-less fixture UID (or any explicit UID) through name search.
@@ -9647,7 +9654,14 @@ fn tool_cross_repo_contracts(
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        match resolve_symbol_strict(store, name, visible, name_repo)? {
+        let initial = resolve_symbol_strict(store, name, visible, None)?;
+        let resolved = match initial {
+            StrictNameResolve::Ambiguous(candidates) => classify_name_matches(
+                filter_name_matches_by_repo(store, candidates, name_repo, visible)?,
+            ),
+            other => other,
+        };
+        match resolved {
             StrictNameResolve::Found(resolved) => resolved,
             StrictNameResolve::NotFound => {
                 return Err(anyhow!("no symbol found: '{name}'"));
@@ -9673,9 +9687,8 @@ fn tool_cross_repo_contracts(
 
     // nw-369(a). `--repo` here is a SELECTOR for the row filter below —
     // distinct from `cross-repo-refs --repo`, which disambiguates an
-    // ambiguous SYMBOL NAME before this tool is ever reached (that command
-    // bypasses this tool's RPC entirely once its own `--repo` is set, so
-    // there is no argument collision). Resolved with the same
+    // ambiguous SYMBOL NAME using the separate `name_repo` RPC argument.
+    // Resolved with the same
     // `resolve_repo_selector` every other `--repo` flag in this binary uses,
     // rather than a bespoke string-equality check that would drift from it.
     let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
@@ -9808,6 +9821,7 @@ fn tool_cross_repo_contracts(
         "repo_filter": repo_filter,
         "total": total,
         "returned": rows.len(),
+        "truncated": rows.len() < total,
         "note": note,
         "contracts_status": contracts_status,
         "degraded_repos": degraded_repos,
@@ -9860,7 +9874,10 @@ fn tool_schema_brain_impact() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Names are resolved via first-match lookup." },
+                "repo": { "type": "string", "description": "Scope the target symbol to this repository (UID or display name)." },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Minimum edge confidence." },
+                "min_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum traversal impact score; 0 disables pruning." },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Ambiguous names require a repo selector or UID." },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
@@ -9902,6 +9919,15 @@ fn tool_brain_impact(
         1,
         RESULT_LIMIT_MAX,
     )?;
+    let repo = args.get("repo").and_then(Value::as_str);
+    let confidence = args
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let threshold = args
+        .get("min_score")
+        .and_then(Value::as_f64)
+        .unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
     let concise = is_concise(&args);
     let owners = restricted_symbol_owners(store, visible)?;
     let uid_is_visible = |uid: &str| {
@@ -9935,58 +9961,19 @@ fn tool_brain_impact(
     // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
     // contract in daemon mode, instead of the daemon path silently returning the best of
     // several matches (which diverged from the direct path).
-    let uid = if symbol.contains(':') {
-        // Fail closed on unknown/garbage/cross-DB UIDs — verify the UID
-        // actually resolves in this store instead of trusting its shape. Keeps
-        // the same not_found contract as the name path; a legit zero-dependent
-        // symbol still resolves and returns status ok with an empty list.
-        match store.lookup_symbol(symbol) {
-            Ok(sym) if uid_is_visible(&sym.uid) => sym.uid,
-            Ok(_) | Err(nestweaver_store::StoreError::NotFound) => {
-                return Ok(nestweaver_schema::responses::impact(json!({
-                    "status": "not_found",
-                    "symbol": symbol,
-                    "impact_nodes": [],
-                    "total": 0,
-                    "returned": 0,
-                })));
-            }
-            Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
+    let uid = match resolve_symbol_strict(store, symbol, visible, repo)? {
+        StrictNameResolve::Found(uid) => uid,
+        StrictNameResolve::NotFound => {
+            return Ok(nestweaver_schema::responses::impact(json!({
+                "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
+            })));
         }
-    } else {
-        let mut matches = store
-            .lookup_symbols_by_name(symbol)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-        matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
-        match matches.len() {
-            0 => {
-                return Ok(nestweaver_schema::responses::impact(json!({
-                    "status": "not_found",
-                    "symbol": symbol,
-                    "impact_nodes": [],
-                    "total": 0,
-                    "returned": 0,
-                })));
-            }
-            1 => matches.into_iter().next().unwrap().uid,
-            _ => {
-                let candidates: Vec<Value> = matches
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "uid": s.uid,
-                            "name": s.name,
-                            "file_path": s.file_path,
-                            "start_line": s.start_line,
-                        })
-                    })
-                    .collect();
-                return Ok(nestweaver_schema::responses::impact_ambiguous(
-                    symbol,
-                    None,
-                    json!(candidates),
-                ));
-            }
+        StrictNameResolve::Ambiguous(candidates) => {
+            return Ok(nestweaver_schema::responses::impact_ambiguous(
+                symbol,
+                repo,
+                candidates_json(&candidates),
+            ));
         }
     };
 
@@ -9996,17 +9983,18 @@ fn tool_brain_impact(
             .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
             .map(|(uid, _)| uid.clone())
             .collect();
-        store.impact_with_flags_within(&uid, depth, 0.0, &allowed, cancel)?
+        store.impact_with_flags_and_threshold_within(
+            &uid, depth, confidence, threshold, &allowed, cancel,
+        )?
     } else {
-        store.impact_with_flags(&uid, depth, 0.0, cancel)?
+        store.impact_with_flags_and_threshold(&uid, depth, confidence, threshold, cancel)?
     };
     let truncated_by_threshold = result.truncated_by_threshold;
     let truncated_by_depth = result.truncated_by_depth;
     // nw-317 leg 1. Built by the SAME function the CLI's direct path calls,
     // so the default (daemon) route can no longer be the weaker disclosure.
-    // `impact_with_flags` prunes at `DEFAULT_IMPACT_THRESHOLD`, so that is the
-    // threshold this note reports.
-    let note = result.truncation_note(nestweaver_store::DEFAULT_IMPACT_THRESHOLD, depth);
+    // Report the same effective threshold used by the authorization-scoped walk.
+    let note = result.truncation_note(threshold, depth);
     let mut nodes = result.nodes;
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
@@ -21258,6 +21246,24 @@ mod blast_radius_visibility_tests {
         store
     }
 
+    #[test]
+    fn release_name_repo_preserves_reference_limit_and_totals() {
+        let store = attributable_cross_repo_store();
+        for selector in [
+            json!({"name": "Handler"}),
+            json!({"uid": "sym:repo:inst:apiowner:filehash1:1"}),
+        ] {
+            let mut args = selector;
+            args["name_repo"] = json!("client-service");
+            args["limit"] = json!(1);
+            let limited = tool_cross_repo_contracts(&store, args, None).unwrap();
+            assert_eq!(limited["total"], 2);
+            assert_eq!(limited["returned"], 1);
+            assert_eq!(limited["contracts"].as_array().unwrap().len(), 1);
+            assert_eq!(limited["truncated"], true);
+        }
+    }
+
     /// nw-369(a). Every cross-repo-links row must carry `repo` — the OTHER
     /// symbol's repo, derived from its UID rather than a store lookup — and
     /// `--repo`/`repo` must scope rows to the requested repo without
@@ -26269,6 +26275,100 @@ mod ambiguous_name_contract_tests {
             payload.get("children").is_none() || payload["status"] == "ambiguous",
             "must not return a silent callee tree for an ambiguous root: {payload}"
         );
+    }
+
+    #[test]
+    fn release_hidden_exact_repo_cannot_change_visible_selector_resolution() {
+        let store = ambiguous_ping_store();
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:py-ping".to_string(), "repo:rs-ping".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let before = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(before["uid"], "sym:py-ping:ping");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:hidden-exact".into(),
+                url: "https://example.test/hidden".into(),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: Some("py".into()),
+                root_path: None,
+            })
+            .unwrap();
+        let after = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "hidden repo must not alter the visible result or diagnostics"
+        );
+        for symbol in ["ping", "sym:py-ping:ping"] {
+            match resolve_symbol_strict(&store, symbol, Some(&visible), Some("py")).unwrap() {
+                StrictNameResolve::Found(uid) => assert_eq!(uid, "sym:py-ping:ping"),
+                _ => panic!("hidden exact name stole visible substring resolution"),
+            }
+        }
+    }
+
+    #[test]
+    fn release_name_repo_disambiguates_without_scoping_unique_names_or_uids() {
+        let store = ambiguous_ping_store();
+        let pinned = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py-ping", "limit": 1}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pinned["uid"], "sym:py-ping:ping");
+        let uid = tool_cross_repo_contracts(
+            &store,
+            json!({"uid": "sym:py-ping:ping", "name_repo": "unrelated"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(uid["uid"], "sym:py-ping:ping");
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:py-ping".to_string()].into_iter().collect(),
+        );
+        let unique = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "unrelated"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(unique["uid"], "sym:py-ping:ping");
+        assert!(
+            tool_cross_repo_contracts(
+                &store,
+                json!({"name": "ping", "name_repo": "unrelated"}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:js-ping:ping"}), Some(&visible))
+                .is_err()
+        );
+        assert!(matches!(
+            resolve_symbol_strict(&store, "sym:py-ping:ping", None, Some("js-ping")).unwrap(),
+            StrictNameResolve::NotFound
+        ));
+        // Result repo filtering remains independent from target resolution.
+        let ambiguous =
+            tool_cross_repo_contracts(&store, json!({"name": "ping", "repo": "py-ping"}), None)
+                .unwrap();
+        assert_eq!(ambiguous["status"], "ambiguous");
     }
 
     #[test]

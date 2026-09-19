@@ -855,6 +855,29 @@ impl GraphStore {
         )
     }
 
+    /// Threshold-aware traversal on the authorization-induced symbol graph.
+    pub fn impact_with_flags_and_threshold_within(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        threshold: f64,
+        allowed_symbols: &HashSet<String>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            &[],
+            0,
+            threshold,
+            Some(allowed_symbols),
+            cancel,
+        )
+    }
+
     /// Confidence-weighted reverse BFS that also reports whether the walk was
     /// complete. `edges` selects which incoming relationship types to follow;
     /// pass [`IMPACT_EDGE_TYPES`] for the default impact edge set. The returned
@@ -2441,6 +2464,55 @@ mod tests {
             1,
             "only a survives; b is pruned below threshold"
         );
+    }
+
+    #[test]
+    fn release_scoped_threshold_preserves_authz_and_pruning() {
+        use nestweaver_schema::ResolvedEdge;
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "allowed", "hidden", "behind-hidden"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        for (source, target) in [
+            ("allowed", "target"),
+            ("hidden", "target"),
+            ("behind-hidden", "hidden"),
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.into(),
+                    target_uid: target.into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.3,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        let allowed: HashSet<String> = ["target", "allowed", "behind-hidden"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let full = store
+            .impact_with_flags_and_threshold_within("target", 5, 0.0, 0.0, &allowed, None)
+            .unwrap();
+        assert_eq!(
+            full.nodes
+                .iter()
+                .map(|n| n.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allowed"]
+        );
+        assert!(!full.truncated_by_threshold);
+        let pruned = store
+            .impact_with_flags_and_threshold_within("target", 5, 0.0, 0.4, &allowed, None)
+            .unwrap();
+        assert!(pruned.nodes.is_empty());
+        assert!(pruned.truncated_by_threshold);
+        let confidence = store
+            .impact_with_flags_and_threshold_within("target", 5, 0.4, 0.0, &allowed, None)
+            .unwrap();
+        assert!(confidence.nodes.is_empty());
     }
 
     /// The opt-out: `impact_with_flags_and_threshold` with `0.0` must return the

@@ -9664,6 +9664,11 @@ fn vault_registrations_for_root(
     config: Option<&Path>,
     root: &Path,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    // This is a CREATE preflight, not a read query: an uncreated local DB
+    // cannot contain registrations. Do not dial or discover remote vaults.
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
     let root_str = root.to_string_lossy().to_string();
     let matches_root = |candidate: &str| candidate == root_str;
 
@@ -9696,10 +9701,7 @@ fn vault_registrations_for_root(
             .unwrap_or_default());
     }
 
-    // Direct fallback. A missing database is not an error here.
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
+    // Explicit CI direct branch only; normal RPC failures already returned.
     Ok(match open_store(Some(db_path)) {
         Ok(store) => store
             .list_vaults(None)
@@ -15630,38 +15632,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(limit) = limit {
                 tool_args["limit"] = serde_json::json!(limit);
             }
-            if repo_filter.is_some() {
-                let store = open_store(Some(&db_path))?;
-                match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
-                    ResolveResult::Found(uid) => {
-                        tool_args = serde_json::json!({ "uid": uid });
-                    }
-                    ResolveResult::NotFound => {
-                        if json {
-                            print_json_not_found("symbol", &name_or_uid);
-                        }
-                        eprintln!("Symbol '{name_or_uid}' not found.");
-                        return Ok((EXIT_NOT_FOUND, None));
-                    }
-                    ResolveResult::Ambiguous(candidates) => {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&candidates)?);
-                        } else {
-                            eprintln!(
-                                "Ambiguous: '{}' matches {} symbols:",
-                                name_or_uid,
-                                candidates.len()
-                            );
-                            for c in &candidates {
-                                eprintln!(
-                                    "  {} [{}] {}:{}",
-                                    c.uid, c.kind, c.file_path, c.start_line
-                                );
-                            }
-                        }
-                        return Ok((EXIT_AMBIGUOUS, None));
-                    }
-                }
+            if let Some(repo) = repo_filter {
+                tool_args["name_repo"] = serde_json::json!(repo);
             }
             // Same classification as `cross-repo-contracts`: dispatch errors
             // must not skip the "no symbol found" arm via `?`, or a missing
@@ -15699,6 +15671,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&name_or_uid, &payload, json);
+            }
             if json {
                 print_json_payload(&payload)?;
             } else if payload["returned"].as_u64().unwrap_or(0) == 0
@@ -20776,40 +20751,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 load_instance_config_opt(config_opt.as_deref()).as_ref(),
                 nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
             );
-            // ── daemon guard ──────────────────────────────────────
-            // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
-            // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
-            // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
-            // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
-            // Likewise, --min-score has no daemon-side equivalent (the brain_impact schema is
-            // additionalProperties:false and the daemon envelope carries no truncation flags),
-            // so an explicit threshold also forces the direct path, where pruning is both
-            // honored and surfaced. Same for a non-default --confidence: the daemon tool
-            // hardcodes 0.0, so an explicit filter must take the direct path or it would be
-            // silently ignored.
-            // Keep the daemon eligibility guard separate from the RPC result:
-            // collapsing them would reindent this large response-rendering block
-            // and obscure the small database-resolution change in this patch.
+            // Resolve selectors and thresholds in the owning daemon.
+            let mut impact_args = serde_json::json!({
+                "symbol": name_or_uid, "depth": depth, "limit": limit,
+                "confidence": confidence,
+            });
+            if let Some(repo) = &repo_filter {
+                impact_args["repo"] = serde_json::json!(repo);
+            }
+            if let Some(score) = min_score {
+                impact_args["min_score"] = serde_json::json!(score);
+            }
             #[allow(clippy::collapsible_if)]
-            if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
+            if use_daemon {
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "brain_impact",
-                    // NOTE: do NOT send `min_confidence` here — that is a
-                    // `dead_code` arg, and the `brain_impact` schema is
-                    // additionalProperties:false, so the daemon path would
-                    // reject the call outright.
-                    serde_json::json!({
-                        // nw-357: `limit` was never sent, so the daemon fell
-                        // to the schema default of 50 while the direct route
-                        // capped nothing. Sending the effective limit is what
-                        // makes the cap a property of the contract.
-                        "symbol": name_or_uid,
-                        "depth": depth,
-                        "limit": limit,
-                    }),
+                    impact_args,
                 )? {
                     // nw-451: unwrap a two-tier envelope BEFORE anything reads
                     // this payload. `brain_impact` is TwoTier-routed, so with a
@@ -20855,11 +20815,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     "{}",
                                     serde_json::to_string_pretty(&impact_json_ambiguous(
                                         &name_or_uid,
-                                        // Always `None` here: `--repo` forces
-                                        // the direct path (see the routing
-                                        // condition on this arm). Passing it
-                                        // makes that explicit rather than
-                                        // implicit.
                                         repo_filter.as_deref(),
                                         cands
                                     ))?
@@ -25421,10 +25376,8 @@ fn print_memory_related_text(uid: &str, payload: &serde_json::Value) {
 
 /// Dispatch a read-only brain command through the `HybridClient`, which
 /// queries the local daemon **and** any configured upstream servers.
-/// Returns `Some(json_value)` on success and `None` when a configless caller
-/// may use the legacy direct-disk fallback. With an explicit config, daemon
-/// connection or hybrid query failures are returned: falling through would
-/// silently discard configured provenance/upstreams while still exiting 0.
+/// Normal query failures always refuse a second direct store owner.
+/// The explicit CI direct route is selected before this fallback guard.
 fn ensure_direct_store_fallback_allowed(
     db_path: &std::path::Path,
     explicit_config: Option<&std::path::Path>,
@@ -25437,7 +25390,11 @@ fn ensure_direct_store_fallback_allowed(
     }
 
     match nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, None)? {
-        nestweaver_client::RestartConfig::CompiledDefaults => Ok(()),
+        nestweaver_client::RestartConfig::CompiledDefaults => anyhow::bail!(
+            "daemon unavailable for {}; refusing direct fallback. Retry `nestweaver daemon --db {} start`",
+            db_path.display(),
+            db_path.display()
+        ),
         nestweaver_client::RestartConfig::Configured(config) => anyhow::bail!(
             "persisted daemon config {} for {} cannot be honored by the direct store, which refuses to fall back. Retry the daemon or deliberately reset with `nestweaver daemon --db {} start --reset`",
             config.display(),
@@ -25731,6 +25688,63 @@ mod repo_filter_honesty_tests {
     }
 }
 
+/// Only initial transport failures may use configured remote reads. Identity,
+/// configuration, restart, and unknown startup failures must stay failures.
+fn initial_daemon_transport_unavailable(error: &anyhow::Error) -> bool {
+    let context = error.to_string();
+    let initial_transport = context.starts_with("failed to connect to daemon at ")
+        || context == "health check failed"
+        || context == "health check timed out — daemon connected but unresponsive";
+    if !initial_transport
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                || cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                    matches!(
+                        status.code(),
+                        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+                    )
+                })
+        })
+    {
+        return false;
+    }
+    // A transport wrapper can hide EACCES or a policy error. Only a known
+    // terminal connection failure/timeout grants remote fallback; opaque
+    // wrappers and unknown leaves remain failures.
+    let cause = error.root_cause();
+    cause
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+        || cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        })
+        || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+fn validated_upstream_fallback_config(
+    db_path: &Path,
+    config: Option<&Path>,
+    connect_error: &anyhow::Error,
+) -> anyhow::Result<Option<nestweaver_client::RestartConfig>> {
+    // Validate persisted intent even when the connection error is opaque;
+    // discovery intentionally tolerates unreadable files and is not a guard.
+    let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)?;
+    Ok(initial_daemon_transport_unavailable(connect_error).then_some(effective))
+}
+
 fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
@@ -25757,8 +25771,7 @@ fn try_hybrid_json_rpc_checked(
     // daemon that CREATES an empty store — that turns a typo'd `--db` path into a
     // silent "0 results / status: complete" success (false-green in CI). Skip the
     // local connect when the db file is absent; still try configured upstreams
-    // (federated read), else return None so the caller's direct path reports
-    // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
+    // (federated read), else report `db_not_found` without a direct store open. `index` creates dbs and does NOT route
     // through here, so it is unaffected.
     // nw-309: refuse an exists-but-not-a-database `--db` HERE, before the
     // dial. This is the one funnel every daemon-routed read passes through, so
@@ -25775,18 +25788,14 @@ fn try_hybrid_json_rpc_checked(
         }
     })?;
     if !db_path.exists() {
-        if let Some(config_path) = config {
-            nestweaver_engine::InstanceConfig::from_file(config_path).with_context(|| {
-                format!(
-                    "load explicit instance config {} before missing-DB upstream routing",
-                    config_path.display()
-                )
-            })?;
-        }
+        let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)
+            .context("load explicit instance config or persisted intent before missing-DB upstream routing")?;
+        let config = effective.as_path();
         let discovered =
             nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config);
         if discovered.is_empty() {
-            return Ok(None);
+            require_existing_db(db_path)?;
+            unreachable!("missing database must return its typed diagnostic");
         }
         return match rt.block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
             config, &start_dir, rpc_name, &args,
@@ -25797,7 +25806,9 @@ fn try_hybrid_json_rpc_checked(
                     "explicit-config upstream query {rpc_name} failed; refusing direct fallback"
                 )
             }),
-            Err(_) => Ok(None),
+            Err(error) => {
+                Err(error).context("configured upstream read failed; refusing direct fallback")
+            }
         };
     }
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
@@ -25836,20 +25847,25 @@ fn try_hybrid_json_rpc_checked(
             }
         },
         Err(e) => {
-            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
-                format!(
-                    "daemon configuration could not be safely honored for {rpc_name} ({e:#}); refusing direct fallback"
-                )
-            })?;
-            let upstream = rt
-                .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
-                    config, &start_dir, rpc_name, &args,
-                ))
-                .ok();
-            if upstream.is_none() {
-                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+            if let Some(effective) = validated_upstream_fallback_config(db_path, config, &e)? {
+                let config = effective.as_path();
+                if !nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config)
+                    .is_empty()
+                {
+                    return rt
+                        .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                            config, &start_dir, rpc_name, &args,
+                        ))
+                        .map(Some)
+                        .with_context(|| {
+                            format!("daemon unavailable ({e:#}); upstream query {rpc_name} failed")
+                        });
+                }
             }
-            Ok(upstream)
+            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                format!("daemon query {rpc_name} unavailable ({e:#}); refusing direct fallback")
+            })?;
+            unreachable!("normal reads cannot fall back to direct store")
         }
     }
 }
@@ -35537,8 +35553,14 @@ mod refresh_instance_resolution_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.lbug");
         let root = dir.path().join("vault");
-        let found = vault_registrations_for_root(false, &missing, None, &root).unwrap();
-        assert!(found.is_empty(), "got: {found:?}");
+        for use_daemon in [true, false] {
+            let found = vault_registrations_for_root(use_daemon, &missing, None, &root).unwrap();
+            assert!(found.is_empty(), "got: {found:?}");
+            assert!(
+                !missing.exists(),
+                "registration preflight created a database"
+            );
+        }
     }
 }
 
@@ -40630,22 +40652,23 @@ credential_method = "ssh"
     }
 
     #[test]
-    fn missing_db_with_valid_local_only_config_preserves_direct_not_found_path() {
+    fn missing_db_with_valid_local_only_config_preserves_typed_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let missing_db = dir.path().join("missing.lbug");
         let config = dir.path().join("instance.toml");
         std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
 
-        let value = try_hybrid_json_rpc_checked(
+        let error = try_hybrid_json_rpc_checked(
             true,
             &missing_db,
             Some(&config),
             "list_repos",
             serde_json::json!({}),
         )
-        .expect("a valid local-only config is not an upstream failure");
+        .expect_err("a read must report the missing DB without a direct store attempt");
 
-        assert!(value.is_none());
+        assert!(format!("{error:#}").contains("database not found at"));
+        assert!(!missing_db.exists());
     }
 
     #[test]
@@ -40681,12 +40704,89 @@ timeout = "20ms"
     }
 
     #[test]
+    fn upstream_fallback_rejects_wrapped_io_denial_and_unknown_transport_leaf() {
+        #[derive(Debug)]
+        struct TransportWrapper(std::io::Error);
+        impl std::fmt::Display for TransportWrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "transport error")
+            }
+        }
+        impl std::error::Error for TransportWrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for (kind, allowed) in [
+            (std::io::ErrorKind::PermissionDenied, false),
+            (std::io::ErrorKind::Other, false),
+            (std::io::ErrorKind::ConnectionRefused, true),
+            (std::io::ErrorKind::TimedOut, true),
+        ] {
+            let wrapped = anyhow::Error::new(TransportWrapper(std::io::Error::from(kind)))
+                .context("failed to connect to daemon at /isolated/daemon.sock");
+            assert_eq!(
+                initial_daemon_transport_unavailable(&wrapped),
+                allowed,
+                "{wrapped:#}"
+            );
+        }
+        // Even a recognizable timeout leaf cannot override an earlier denial.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            TransportWrapper(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ))
+        .context("failed to connect to daemon at /isolated/daemon.sock");
+        assert!(!initial_daemon_transport_unavailable(&denied));
+    }
+
+    #[test]
+    fn upstream_fallback_requires_transport_and_preserves_persisted_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let unavailable =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("failed to connect to daemon at /isolated/daemon.sock");
+        assert!(initial_daemon_transport_unavailable(&unavailable));
+        let refusal = anyhow::anyhow!("effective configuration identity did not match");
+        assert!(!initial_daemon_transport_unavailable(&refusal));
+        let denied = anyhow::Error::new(tonic::Status::permission_denied("restricted"))
+            .context("health check failed");
+        assert!(!initial_daemon_transport_unavailable(&denied));
+        let restart_refusal = anyhow::Error::new(tonic::Status::unavailable("offline"))
+            .context("refusing automatic daemon restart: identity not verified");
+        assert!(!initial_daemon_transport_unavailable(&restart_refusal));
+        assert!(
+            validated_upstream_fallback_config(&db, None, &refusal)
+                .unwrap()
+                .is_none()
+        );
+
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
+        nestweaver_daemon::lifecycle::write_last_successful_config(&db, &config).unwrap();
+        let selected = validated_upstream_fallback_config(&db, None, &unavailable)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.as_path(),
+            Some(config.canonicalize().unwrap().as_path())
+        );
+        std::fs::write(&config, "instance_id = [broken").unwrap();
+        let corrupt = validated_upstream_fallback_config(&db, None, &unavailable).unwrap_err();
+        assert!(format!("{corrupt:#}").contains("persisted daemon config"));
+        std::fs::remove_file(&config).unwrap();
+        assert!(validated_upstream_fallback_config(&db, None, &unavailable).is_err());
+        nestweaver_daemon::lifecycle::remove_last_successful_config(&db).unwrap();
+    }
+
+    #[test]
     fn direct_fallback_policy_distinguishes_absent_and_configured_intent() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
-            ensure_direct_store_fallback_allowed(&db, None).is_ok(),
-            "record absence preserves ordinary daemon-unavailable fallback"
+            ensure_direct_store_fallback_allowed(&db, None).is_err(),
+            "record absence must not permit a second store owner"
         );
 
         let config = dir.path().join("instance.toml");
