@@ -357,6 +357,62 @@ async fn context_empty_seeds_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+fn assert_context_seed_is_client_error(status: StatusCode, json: &Value, raw_seed: &str) {
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unresolved context seeds must not 500: {json}"
+    );
+    assert!(
+        status.is_client_error(),
+        "unresolved context seeds must be 4xx, got {status}: {json}"
+    );
+    let body = json.to_string();
+    assert!(
+        !body.contains(raw_seed),
+        "error body must not echo the raw attacker seed: {json}"
+    );
+}
+
+#[tokio::test]
+async fn context_unresolved_xss_seed_is_4xx_without_echo() {
+    let app = make_app();
+    let seed = "<script>alert(1)</script>";
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        let (status, json) = post_json(&app, uri, json!({ "seeds": [seed] })).await;
+        assert_context_seed_is_client_error(status, &json, seed);
+    }
+}
+
+#[tokio::test]
+async fn context_unresolved_path_seed_is_4xx_without_echo() {
+    let app = make_app();
+    let seed = "../etc/passwd";
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        let (status, json) = post_json(&app, uri, json!({ "seeds": [seed] })).await;
+        assert_context_seed_is_client_error(status, &json, seed);
+    }
+}
+
+#[tokio::test]
+async fn context_ghost_note_uid_is_4xx_without_echo() {
+    let app = make_app();
+    let seed = "note:vlt:ghost:deadbeef";
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        let (status, json) = post_json(&app, uri, json!({ "seeds": [seed] })).await;
+        assert_context_seed_is_client_error(status, &json, seed);
+    }
+}
+
+#[tokio::test]
+async fn brain_context_valid_seed_still_200() {
+    let app = make_app();
+    let (status, json) =
+        post_json(&app, "/api/v1/brain/context", json!({ "seeds": ["greet"] })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("seeds").is_some(), "response should have 'seeds'");
+}
+
 #[tokio::test]
 async fn impact_not_found_returns_404() {
     let app = make_app();
