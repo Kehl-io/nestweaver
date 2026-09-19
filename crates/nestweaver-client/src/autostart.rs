@@ -447,7 +447,20 @@ fn ensure_daemon_impl(
             }
             return Ok(sock);
         }
-        Ok(true) => {}
+        Ok(true) => {
+            // Flock is on THIS inode, not the path. A live daemon can still
+            // hold the original after the pathname was unlinked and rewritten;
+            // `create(true)` then opens a new inode we can lock with no
+            // contention. Adopt that incumbent — never describe it as a
+            // stale-cleaned pidfile.
+            if socket_accepts_connections(&sock) {
+                debug!(
+                    "acquired flock on a pidfile inode while a live daemon still serves the socket; adopting without cleanup"
+                );
+                wait_for_socket(&sock)?;
+                return Ok(sock);
+            }
+        }
         Err(error) => bail!("flock on pidfile failed: {error}"),
     }
 
