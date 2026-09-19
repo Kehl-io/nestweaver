@@ -1,7 +1,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nestweaver_schema::{
-    EdgeType, Note, NoteKind, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault, Visibility,
+    EdgeType, Note, NoteKind, Repo, ResolvedEdge, Section, Service, Symbol, SymbolKind, Vault,
+    Visibility,
 };
 use nestweaver_store::{GraphScope, GraphStore};
 use nestweaver_web::create_router;
@@ -573,6 +574,85 @@ fn notes_list_app(note_count: usize) -> axum::Router {
     create_router(state)
 }
 
+fn backlinks_app(source_count: usize) -> axum::Router {
+    let store = setup_test_store();
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:notes".to_string(),
+            name: "Notes".to_string(),
+            root_path: "/tmp/notes".to_string(),
+            instance_id: "local".to_string(),
+        })
+        .unwrap();
+    store
+        .insert_note(&Note {
+            uid: "note:notes:target".to_string(),
+            vault_uid: "vlt:notes".to_string(),
+            file_path: "Target.md".to_string(),
+            title: "Target".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "ht".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        })
+        .unwrap();
+    let mut note_secs: Vec<(String, String)> = Vec::new();
+    for i in 0..source_count {
+        let note_uid = format!("note:notes:src{i:03}");
+        let sec_uid = format!("sec:notes:src{i:03}");
+        store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: "vlt:notes".to_string(),
+                file_path: format!("src{i:03}.md"),
+                title: format!("Src {i:03}"),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: format!("hs{i:03}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: sec_uid.clone(),
+                note_uid: note_uid.clone(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 2,
+                text_hash: format!("th{i:03}"),
+                text_content: "[[Target]]".to_string(),
+                word_count: 1,
+                pagerank_score: None,
+            })
+            .unwrap();
+        note_secs.push((note_uid, sec_uid));
+    }
+    let section_edges: Vec<(&str, &str)> = note_secs
+        .iter()
+        .map(|(n, s)| (n.as_str(), s.as_str()))
+        .collect();
+    store
+        .batch_insert_note_section_edges(&section_edges)
+        .unwrap();
+    let wiki: Vec<(&str, &str, f32, &str, &str)> = note_secs
+        .iter()
+        .map(|(_, s)| (s.as_str(), "note:notes:target", 1.0, "Target", "Target"))
+        .collect();
+    store.batch_insert_wikilink_to_note_edges(&wiki).unwrap();
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/test.lbug"));
+    create_router(state)
+}
+
 #[tokio::test]
 async fn brain_notes_limit_1_returns_one_row() {
     let app = notes_list_app(5);
@@ -661,6 +741,53 @@ async fn brain_notes_huge_offset_is_capped() {
         arr.is_empty(),
         "offset must be capped so a huge skip cannot scan the vault"
     );
+}
+
+#[tokio::test]
+async fn brain_backlinks_omitted_limit_uses_notes_list_default() {
+    const CORPUS: usize = 25;
+    let app = backlinks_app(CORPUS);
+    let (status, json) = get_json(&app, "/api/v1/brain/backlinks/note:notes:target").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows = json["backlinks"]
+        .as_array()
+        .expect("backlinks envelope must carry an array");
+    assert_eq!(
+        rows.len(),
+        nestweaver_web::routes::brain::LIST_NOTES_DEFAULT_LIMIT,
+        "omitted limit must default to 20: {json}"
+    );
+    assert_eq!(json["total"], CORPUS);
+    assert_eq!(json["truncated"], true);
+    assert_eq!(
+        json["limit"],
+        nestweaver_web::routes::brain::LIST_NOTES_DEFAULT_LIMIT
+    );
+    assert_eq!(json["count"], rows.len());
+}
+
+#[tokio::test]
+async fn brain_backlinks_limit_1_returns_one_row() {
+    let app = backlinks_app(5);
+    let (status, json) = get_json(&app, "/api/v1/brain/backlinks/note:notes:target?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["backlinks"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["total"], 5);
+    assert_eq!(json["truncated"], true);
+}
+
+#[tokio::test]
+async fn brain_backlinks_limit_2000_is_capped_at_1000() {
+    let cap = nestweaver_web::routes::brain::LIST_NOTES_LIMIT_MAX;
+    let app = backlinks_app(cap + 1);
+    let (status, json) =
+        get_json(&app, "/api/v1/brain/backlinks/note:notes:target?limit=2000").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["backlinks"].as_array().map(Vec::len), Some(cap));
+    assert_eq!(json["limit"], cap);
+    assert_eq!(json["truncated"], true);
+    assert_eq!(json["total"], cap + 1);
 }
 
 #[tokio::test]

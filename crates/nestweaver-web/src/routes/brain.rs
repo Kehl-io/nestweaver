@@ -125,13 +125,33 @@ pub async fn note_by_uid(
     .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct BacklinksParams {
+    pub limit: Option<usize>,
+}
+
+/// GET `/api/v1/brain/backlinks/{uid}` — same default/cap as notes-list.
 pub async fn backlinks(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
+    Query(params): Query<BacklinksParams>,
 ) -> Result<Response, ApiError> {
+    let limit = params
+        .limit
+        .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
+        .min(LIST_NOTES_LIMIT_MAX);
     let links = state.store.wikilink_sources_to_note(&uid)?;
-    let json = serde_json::to_value(&links)?;
-    Ok(Json(json).into_response())
+    let total = links.len();
+    let truncated = total > limit;
+    let backlinks: Vec<_> = links.into_iter().take(limit).collect();
+    Ok(Json(json!({
+        "backlinks": backlinks,
+        "count": backlinks.len(),
+        "total": total,
+        "truncated": truncated,
+        "limit": limit,
+    }))
+    .into_response())
 }
 
 #[derive(serde::Serialize)]
@@ -553,4 +573,92 @@ fn scoped_brain_search(
         unsupported: vec!["note-body-search"],
         total_count: Some(total_count),
     })
+}
+
+/// Drop Tantivy hits whose note identity is absent from the graph so search
+/// cannot present a ghost UID as a real note (404 on `/brain/note/{uid}`).
+fn retain_graph_backed_search_hits(
+    store: &nestweaver_store::GraphStore,
+    hits: Vec<SearchHit>,
+) -> Vec<SearchHit> {
+    hits.into_iter()
+        .filter(|hit| search_hit_exists_in_graph(store, hit))
+        .collect()
+}
+
+fn search_hit_exists_in_graph(store: &nestweaver_store::GraphStore, hit: &SearchHit) -> bool {
+    let note_uid = if hit.kind.eq_ignore_ascii_case("note") || hit.uid.starts_with("note:") {
+        Some(hit.uid.as_str())
+    } else if !hit.note_uid.is_empty() {
+        Some(hit.note_uid.as_str())
+    } else {
+        None
+    };
+    match note_uid {
+        Some(uid) => store.lookup_note(uid).is_ok(),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nestweaver_schema::{Note, NoteKind, Vault};
+    use nestweaver_store::GraphStore;
+
+    fn hit(uid: &str, kind: &str) -> SearchHit {
+        SearchHit {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: uid.to_string(),
+            vault_uid: "vlt:notes".to_string(),
+            note_uid: String::new(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn graph_missing_note_hits_are_dropped_from_search() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:notes".to_string(),
+                name: "Notes".to_string(),
+                root_path: "/tmp/notes".to_string(),
+                instance_id: "local".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:notes:real".to_string(),
+                vault_uid: "vlt:notes".to_string(),
+                file_path: "real.md".to_string(),
+                title: "Real".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let kept = retain_graph_backed_search_hits(
+            &store,
+            vec![
+                hit("note:notes:ghost", "note"),
+                hit("note:notes:real", "note"),
+                hit("sym:test:greet", "symbol"),
+            ],
+        );
+        let uids: Vec<&str> = kept.iter().map(|h| h.uid.as_str()).collect();
+        assert_eq!(uids, vec!["note:notes:real", "sym:test:greet"]);
+        assert!(
+            !uids.contains(&"note:notes:ghost"),
+            "a UID that 404s on brain/note must not appear as a search hit"
+        );
+    }
 }

@@ -139,10 +139,18 @@ export const api = {
     return get<NoteDetail>(`/api/v1/brain/note/${encodeURIComponent(uid)}`);
   },
 
-  brainBacklinks(uid: string) {
-    return get<BacklinkRow[]>(
-      `/api/v1/brain/backlinks/${encodeURIComponent(uid)}`,
+  // Envelope `{ backlinks, count, total, truncated, limit }` since the HTTP
+  // handler gained a notes-list-style cap. Unwrap so UI callers still receive
+  // `BacklinkRow[]`. Default 1000 matches `brainNotes` (the UI needs the full
+  // page; omitted `limit` on the API is 20).
+  async brainBacklinks(uid: string, limit = 1000) {
+    const payload = await get<BacklinkRow[] | { backlinks?: BacklinkRow[] }>(
+      `/api/v1/brain/backlinks/${encodeURIComponent(uid)}?limit=${limit}`,
     );
+    if (Array.isArray(payload)) {
+      return payload;
+    }
+    return payload.backlinks ?? [];
   },
 
   brainUnlinkedMentions(uid: string) {
