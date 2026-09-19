@@ -67,7 +67,7 @@ async fn all_endpoints_respond() {
     );
 
     // ── Context ──────────────────────────────────────────────────────────────
-    // With unknown seeds on an empty store, build_context bails -> 500
+    // Unknown seeds are client errors (nw-619); empty seeds stay 400.
     assert_eq!(
         check(
             &app,
@@ -76,7 +76,7 @@ async fn all_endpoints_respond() {
             Some(r#"{"seeds":["x"]}"#)
         )
         .await,
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         check(
@@ -90,7 +90,6 @@ async fn all_endpoints_respond() {
     );
 
     // ── Brain context ────────────────────────────────────────────────────────
-    // With unknown seeds on an empty store, build_brain_context_hybrid bails -> 500
     assert_eq!(
         check(
             &app,
@@ -99,7 +98,7 @@ async fn all_endpoints_respond() {
             Some(r#"{"seeds":["x"]}"#)
         )
         .await,
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::NOT_FOUND
     );
 
     // ── Impact ───────────────────────────────────────────────────────────────
