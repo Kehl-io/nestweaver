@@ -378,7 +378,6 @@ fn detect_changes_impact_with_work_budget(
     let mut affected_uids: HashSet<String> = HashSet::new();
     let mut status = AnalysisStatus::Complete;
     let mut notifications = Vec::new();
-    let mut unassessed = Vec::new();
     // nw-424: the SET is unchanged (every incompatible repository still
     // degrades), but the message now says whether the caller owns the problem.
     let incompatibility =
@@ -407,10 +406,14 @@ fn detect_changes_impact_with_work_budget(
                 continue;
             }
         };
-        if syms.is_empty()
-            && nestweaver_parser::detect_language(std::path::Path::new(file_path)).is_some()
-        {
-            unassessed.push(file_path.as_str());
+        let class = crate::changed_files::disclose_changed_file(
+            std::path::Path::new(file_path),
+            !syms.is_empty(),
+            &mut status,
+            &mut notifications,
+        );
+        if class == crate::changed_files::ChangedFileClass::DocumentationOnly {
+            continue;
         }
         for sym in syms {
             GraphStore::check_read_deadline()?;
@@ -423,23 +426,10 @@ fn detect_changes_impact_with_work_budget(
             }
         }
     }
-    if !unassessed.is_empty() {
-        status = status.max(AnalysisStatus::Partial);
-        notifications.push(Notification {
-            level: NotificationLevel::Warning,
-            message: format!(
-                "changed source file(s) with no indexed symbols (new file, stale index, or path \
-                 drift) — their impact was not assessed: {}",
-                unassessed.join(", ")
-            ),
-            descriptor: "changed-file-no-symbols".to_string(),
-        });
-    }
-
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
         // nw-472: a missing/unindexed source is not a confident Low finding.
-        // README.md and other non-source files stay Complete + Low.
+        // Explicitly classified Markdown documentation stays Complete + Low.
         let risk = crate::blast_radius::risk_if_unassessed(RiskLevel::Low, &notifications);
         // Traversal has not started, so any non-Complete status here reflects
         // drift, an undecodable row, or resolver staleness. The outer deadline
@@ -752,6 +742,23 @@ mod tests {
     }
 
     #[test]
+    fn release_process_unassessed_inputs_never_clear() {
+        let store = GraphStore::in_memory().expect("store");
+        for file in [
+            "Makefile",
+            "Cargo.toml",
+            ".github/workflows/ci.yml",
+            "unknown.input",
+            "src/計算.rs",
+        ] {
+            let impact = detect_changes_impact(&store, &[file.into()], 10).unwrap();
+            assert_eq!(impact.status, AnalysisStatus::Partial, "{file}");
+            assert_eq!(impact.risk, RiskLevel::Unknown, "{file}");
+            assert_eq!(impact.gate_state, GateState::DegradedUnknown, "{file}");
+        }
+    }
+
+    #[test]
     fn detect_changes_impact_marks_unknown_source_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");
         let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10)
@@ -770,11 +777,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_impact_ignores_zero_symbol_non_source_files() {
+    fn detect_changes_impact_explicitly_excludes_documentation() {
         let store = GraphStore::in_memory().expect("in_memory store");
         let impact = detect_changes_impact(&store, &["README.md".to_string()], 10)
             .expect("detect_changes_impact");
 
+        assert!(
+            impact
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "docs-only-excluded")
+        );
         assert_eq!(impact.status, AnalysisStatus::Complete);
         assert_eq!(impact.risk, RiskLevel::Low);
         assert_eq!(impact.gate_state, GateState::Ok);

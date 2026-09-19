@@ -8,6 +8,142 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+/// Classification of the input, independent of whether the parser emitted symbols.
+/// Build/configuration inputs are not covered by the source call graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangedFileClass {
+    Source,
+    ExecutionDependency,
+    DocumentationOnly,
+    Unknown,
+}
+
+pub(crate) fn classify_changed_file(path: &Path) -> ChangedFileClass {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let execution_path = path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some(".github" | ".circleci" | "generated" | "__generated__")
+        )
+    });
+    if execution_path
+        || matches!(
+            name,
+            "Makefile"
+                | "GNUmakefile"
+                | "makefile"
+                | "Dockerfile"
+                | "Containerfile"
+                | "Jenkinsfile"
+                | "Justfile"
+                | "justfile"
+                | "build.rs"
+                | "build.gradle.kts"
+                | "settings.gradle.kts"
+                | "CMakeLists.txt"
+                | "go.mod"
+                | "go.sum"
+                | "Gemfile"
+                | "Rakefile"
+                | "setup.py"
+                | "conftest.py"
+                | "Package.swift"
+                | "mix.exs"
+                | "meson.build"
+                | "SConstruct"
+                | "SConscript"
+        )
+        || name.starts_with("Dockerfile.")
+        || name.starts_with(".env")
+        || name.contains(".config.")
+        || name.contains(".generated.")
+        || name.contains(".gen.")
+        || name.ends_with(".g.cs")
+        || name.ends_with(".pb.go")
+        || name.ends_with(".pb.cc")
+        || name.ends_with(".pb.h")
+        || matches!(
+            extension,
+            "json"
+                | "jsonc"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "xml"
+                | "lock"
+                | "ini"
+                | "cfg"
+                | "conf"
+                | "mk"
+                | "cmake"
+                | "gradle"
+                | "tf"
+                | "hcl"
+                | "sh"
+                | "bash"
+                | "ps1"
+                | "psm1"
+        )
+    {
+        ChangedFileClass::ExecutionDependency
+    } else if nestweaver_parser::is_markdown(path) {
+        ChangedFileClass::DocumentationOnly
+    } else if nestweaver_parser::detect_language(path).is_some() {
+        ChangedFileClass::Source
+    } else {
+        ChangedFileClass::Unknown
+    }
+}
+
+/// Apply the common coverage contract. A successful symbol lookup alone does
+/// not establish coverage of execution/configuration inputs or unknown formats.
+pub(crate) fn disclose_changed_file(
+    path: &Path,
+    has_symbols: bool,
+    status: &mut crate::blast_radius::AnalysisStatus,
+    notifications: &mut Vec<crate::blast_radius::Notification>,
+) -> ChangedFileClass {
+    use crate::blast_radius::{AnalysisStatus, Notification, NotificationLevel};
+    let class = classify_changed_file(path);
+    let (descriptor, message) = match class {
+        ChangedFileClass::Source if has_symbols => return class,
+        ChangedFileClass::DocumentationOnly => {
+            notifications.push(Notification {
+                level: NotificationLevel::Note,
+                descriptor: "docs-only-excluded".into(),
+                message: format!("{} is classified as Markdown documentation and excluded from executable impact coverage", path.display()),
+            });
+            return class;
+        }
+        ChangedFileClass::Source => (
+            "changed-file-no-symbols",
+            "has no indexed symbols (new file, stale index, or path drift); its impact was not assessed",
+        ),
+        ChangedFileClass::ExecutionDependency => (
+            "changed-file-unassessed",
+            "is an execution/build/configuration dependency whose effects are not covered by the source call graph; review manually and run the full suite",
+        ),
+        ChangedFileClass::Unknown => (
+            "changed-file-unassessed",
+            "has an unsupported or unknown file type; its impact was not assessed; review manually and run the full suite",
+        ),
+    };
+    *status = (*status).max(AnalysisStatus::Partial);
+    notifications.push(Notification {
+        level: NotificationLevel::Warning,
+        descriptor: descriptor.into(),
+        message: format!("{} {message}", path.display()),
+    });
+    class
+}
+
 /// Maximum number of paths accepted by any public changed-file analysis.
 pub const MAX_CHANGED_FILES: usize = 1000;
 /// Maximum UTF-8 byte length of one repository-relative changed-file path.
@@ -106,6 +242,80 @@ fn validate_changed_file(raw: &str, index: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_change_gate_contract() {
+        use crate::blast_radius::{
+            AnalysisStatus, GateState, RiskLevel, derive_gate_state, risk_if_unassessed,
+        };
+        for (file, has_symbols, expected) in [
+            ("Makefile", false, ChangedFileClass::ExecutionDependency),
+            ("Makefile", true, ChangedFileClass::ExecutionDependency),
+            ("Cargo.toml", false, ChangedFileClass::ExecutionDependency),
+            (
+                ".github/workflows/ci.yml",
+                false,
+                ChangedFileClass::ExecutionDependency,
+            ),
+            ("build.rs", true, ChangedFileClass::ExecutionDependency),
+            (
+                "vite.config.ts",
+                true,
+                ChangedFileClass::ExecutionDependency,
+            ),
+            (
+                "generated/wiring.rs",
+                true,
+                ChangedFileClass::ExecutionDependency,
+            ),
+            (
+                "tests/Makefile",
+                false,
+                ChangedFileClass::ExecutionDependency,
+            ),
+            ("src/unknown.input", true, ChangedFileClass::Unknown),
+            ("src/missing.rs", false, ChangedFileClass::Source),
+            ("src/計算.rs", false, ChangedFileClass::Source),
+            ("src/huge.rs", false, ChangedFileClass::Source),
+        ] {
+            let mut status = AnalysisStatus::Complete;
+            let mut notes = Vec::new();
+            assert_eq!(
+                disclose_changed_file(Path::new(file), has_symbols, &mut status, &mut notes),
+                expected
+            );
+            assert_eq!(status, AnalysisStatus::Partial, "{file}");
+            let risk = risk_if_unassessed(RiskLevel::Low, &notes);
+            assert_eq!(risk, RiskLevel::Unknown, "{file}");
+            assert_eq!(
+                derive_gate_state(status, risk, false),
+                GateState::DegradedUnknown,
+                "{file}"
+            );
+            assert_eq!(risk_if_unassessed(RiskLevel::High, &notes), RiskLevel::High);
+        }
+        let mut status = AnalysisStatus::Complete;
+        let mut notes = Vec::new();
+        disclose_changed_file(Path::new("src/lib.rs"), true, &mut status, &mut notes);
+        assert_eq!(status, AnalysisStatus::Complete);
+        assert!(notes.is_empty());
+        disclose_changed_file(Path::new("README.md"), false, &mut status, &mut notes);
+        assert_eq!(status, AnalysisStatus::Complete);
+        assert_eq!(notes[0].descriptor, "docs-only-excluded");
+        disclose_changed_file(Path::new("Makefile"), false, &mut status, &mut notes);
+        assert_eq!(
+            status,
+            AnalysisStatus::Partial,
+            "a mixed source/build change cannot be complete"
+        );
+        status = AnalysisStatus::Degraded;
+        disclose_changed_file(Path::new("README.md"), false, &mut status, &mut notes);
+        assert_eq!(
+            status,
+            AnalysisStatus::Degraded,
+            "documentation cannot erase stale/resolver failures"
+        );
+    }
 
     #[test]
     fn trims_valid_paths_and_preserves_missing_new_files() {

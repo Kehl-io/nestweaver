@@ -104,9 +104,9 @@ pub struct AffectedTestsResult {
     /// `ResolverStaleness` in `src/main.rs` for the full list.
     #[serde(default)]
     pub resolver_stale_repos: Vec<String>,
-    /// Machine-readable CI directive derived from `status` (TIA-style
-    /// fail-safe widening): any non-Complete run says "run-full-suite" so a
-    /// pipeline can act on degradation without parsing notifications.
+    /// Machine-readable CI directive derived from coverage and selected files:
+    /// non-Complete runs and non-documentation changes with zero selected test
+    /// files say "run-full-suite" without requiring notification prose parsing.
     /// Values: "selection-usable" | "run-full-suite".
     #[serde(default)]
     pub recommendation: String,
@@ -136,12 +136,22 @@ Published prior: static symbol-level selection violated safety on ~10.6% of revi
 versus dynamic coverage-based selection (FSE 2016), reflection being the dominant cause — \
 measure your own recall with `nestweaver rts-eval report` rather than assuming.";
 
-/// Fail-safe widening (Microsoft TIA precedent): an incomplete selection is
-/// only safe to act on by running the FULL suite; never narrow on degradation.
-pub(crate) fn derive_recommendation(status: AnalysisStatus) -> &'static str {
-    match status {
-        AnalysisStatus::Complete => "selection-usable",
-        _ => "run-full-suite",
+/// Fail-safe widening includes complete graph analyses that found no test
+/// files for a non-documentation change. File count (not test-symbol count)
+/// preserves newly changed tests without extracted symbols and proven empty diffs.
+pub(crate) fn derive_recommendation(
+    status: AnalysisStatus,
+    changed_files: &[String],
+    selected_files: usize,
+) -> &'static str {
+    let needs_tests = changed_files.iter().any(|file| {
+        crate::changed_files::classify_changed_file(std::path::Path::new(file))
+            != crate::changed_files::ChangedFileClass::DocumentationOnly
+    });
+    if status != AnalysisStatus::Complete || (needs_tests && selected_files == 0) {
+        "run-full-suite"
+    } else {
+        "selection-usable"
     }
 }
 
@@ -261,7 +271,27 @@ fn affected_tests_within(
                         allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid))
                     })
                     .collect();
-                if syms.is_empty() {
+                let class =
+                    crate::changed_files::classify_changed_file(std::path::Path::new(file_path));
+                // A changed source test file is selected directly below even
+                // without symbols. This is test-file selection coverage, not
+                // a claim that its graph impact was assessed.
+                let directly_selected_test = class
+                    == crate::changed_files::ChangedFileClass::Source
+                    && syms.is_empty()
+                    && is_test_file(file_path);
+                if !directly_selected_test {
+                    crate::changed_files::disclose_changed_file(
+                        std::path::Path::new(file_path),
+                        !syms.is_empty(),
+                        &mut status,
+                        &mut notifications,
+                    );
+                }
+                if class == crate::changed_files::ChangedFileClass::DocumentationOnly {
+                    continue;
+                }
+                if directly_selected_test {
                     files_without_symbols.push(file_path);
                 }
                 for s in syms {
@@ -423,40 +453,19 @@ fn affected_tests_within(
     let tier_2 = group_by_file(tier_2_syms);
     let tier_3 = group_by_file(tier_3_syms);
 
-    // nw-064: always-include + disclosure for changed files the index doesn't
-    // know (new file or stale index). A changed TEST file goes straight into
-    // tier 1 — TIA includes newly added tests, Develocity always selects
-    // "recently new/changed" tests; missing them during the stale-index window
-    // was a silent under-selection. A changed non-test SOURCE file is
-    // disclosed as unassessed (mirrors blast_radius's changed-file-no-symbols
-    // honesty) and forces fail-safe widening to the full suite.
+    // Always include a changed source test file itself when symbols are
+    // missing. Build/config inputs under tests/ are not executable test files.
     let selected_files: HashSet<&str> = tier_1
         .iter()
         .chain(&tier_2)
         .chain(&tier_3)
         .map(|f| f.test_file.as_str())
         .collect();
-    let mut always_included: Vec<String> = Vec::new();
-    let mut unassessed: Vec<&str> = Vec::new();
-    for file_path in files_without_symbols {
-        if selected_files.contains(file_path.as_str()) {
-            continue;
-        }
-        if is_test_file(file_path) {
-            always_included.push(file_path.clone());
-        } else if nestweaver_parser::is_markdown(std::path::Path::new(file_path)) {
-            // Docs-only changes cannot break tests — keep the selection
-            // usable (deliberate nw-064 behavior).
-        } else {
-            // A recognized source file with no indexed symbols is
-            // "new file or stale index"; an UNRECOGNIZED extension (Makefile,
-            // ci.yml, …) means we cannot even tell what the file is — the
-            // parser may simply not cover a real source language. Both must
-            // fail safe (partial + notification) instead of silently claiming
-            // a complete selection.
-            unassessed.push(file_path);
-        }
-    }
+    let always_included: Vec<String> = files_without_symbols
+        .into_iter()
+        .filter(|file| !selected_files.contains(file.as_str()))
+        .cloned()
+        .collect();
     for file_path in always_included.iter() {
         tier_1.push(AffectedTestFile {
             test_file: file_path.clone(),
@@ -469,23 +478,25 @@ fn affected_tests_within(
         notifications.push(Notification {
             level: NotificationLevel::Note,
             message: format!(
-                "always-included {} changed test file(s) not yet in the index (new test or stale index): {}",
+                "always-included {} changed test file(s) not yet in the index (new test or stale index); test files are selected directly, graph impact remains unassessed: {}",
                 always_included.len(),
                 always_included.join(", ")
             ),
             descriptor: "always-include-changed-test".to_string(),
         });
     }
-    if !unassessed.is_empty() {
-        status = status.max(AnalysisStatus::Partial);
+    let selected_file_count = tier_1.len() + tier_2.len() + tier_3.len();
+    let recommendation = derive_recommendation(status, changed_files, selected_file_count);
+    if selected_file_count == 0
+        && changed_files.iter().any(|file| {
+            crate::changed_files::classify_changed_file(std::path::Path::new(file))
+                != crate::changed_files::ChangedFileClass::DocumentationOnly
+        })
+    {
         notifications.push(Notification {
             level: NotificationLevel::Warning,
-            message: format!(
-                "changed file(s) with no indexed symbols (new file, unrecognized file type, or \
-                 stale index) — their impact was not assessed: {}",
-                unassessed.join(", ")
-            ),
-            descriptor: "changed-file-no-symbols".to_string(),
+            descriptor: "no-tests-selected".into(),
+            message: "non-documentation changes selected no test files; run the full suite".into(),
         });
     }
 
@@ -504,7 +515,7 @@ fn affected_tests_within(
         tier_3,
         summary,
         disclaimer: DISCLAIMER.to_string(),
-        recommendation: derive_recommendation(status).to_string(),
+        recommendation: recommendation.to_string(),
         status,
         notifications,
         resolver_stale_repos,
@@ -711,6 +722,126 @@ mod tests {
             link_type: None,
             evidence: vec![],
         }
+    }
+
+    #[test]
+    fn release_empty_test_selection_widens() {
+        for file in [
+            "src/lib.rs",
+            "src/計算.rs",
+            "Makefile",
+            "tests/Makefile",
+            "unknown.input",
+        ] {
+            assert_eq!(
+                derive_recommendation(AnalysisStatus::Complete, &[file.into()], 0),
+                "run-full-suite",
+                "{file}"
+            );
+        }
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Complete, &["src/lib.rs".into()], 1),
+            "selection-usable"
+        );
+        // A selected file may contain zero extracted test symbols.
+        let selected_test = AffectedTestFile {
+            test_file: "tests/new.rs".into(),
+            tests: Vec::new(),
+            symbol_uid: String::new(),
+            confidence: 1.0,
+        };
+        assert!(selected_test.tests.is_empty());
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Complete, &[selected_test.test_file], 1),
+            "selection-usable"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Complete, &["README.md".into()], 0),
+            "selection-usable"
+        );
+        let empty = empty_derived_selection();
+        assert!(empty.changed_files.is_empty());
+        assert_eq!(empty.recommendation, "selection-usable");
+        for status in [
+            AnalysisStatus::Partial,
+            AnalysisStatus::Degraded,
+            AnalysisStatus::Failed,
+        ] {
+            assert_eq!(derive_recommendation(status, &[], 0), "run-full-suite");
+            assert_eq!(
+                derive_recommendation(status, &["tests/new.rs".into()], 1),
+                "run-full-suite"
+            );
+        }
+    }
+
+    #[test]
+    fn release_indexed_source_without_tests_requests_full_suite() {
+        let store = GraphStore::in_memory().expect("store");
+        store
+            .insert_symbol(&sym("sym:untested", "untested", "src/lib.rs"))
+            .unwrap();
+        let result = affected_tests(&store, &["src/lib.rs".into()]).unwrap();
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.changed_symbols.len(), 1);
+        assert!(result.tier_1.is_empty() && result.tier_2.is_empty() && result.tier_3.is_empty());
+        assert_eq!(result.recommendation, "run-full-suite");
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "no-tests-selected")
+        );
+    }
+
+    #[test]
+    fn release_changed_test_file_without_symbols_remains_selected() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(&store, &["tests/new.rs".into()]).unwrap();
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.recommendation, "selection-usable");
+        assert_eq!(result.tier_1.len(), 1);
+        assert!(result.tier_1[0].tests.is_empty());
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "always-include-changed-test")
+        );
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "no-tests-selected")
+        );
+        for file in ["tests/Makefile", "tests/config.yaml", "tests/unknown.input"] {
+            let result = affected_tests(&store, &[file.into()]).unwrap();
+            assert_eq!(result.status, AnalysisStatus::Partial, "{file}");
+            assert_eq!(result.recommendation, "run-full-suite", "{file}");
+            assert!(result.tier_1.is_empty(), "{file}");
+        }
+    }
+
+    #[test]
+    fn release_indexed_build_input_cannot_be_covered_by_test_edges() {
+        let store = GraphStore::in_memory().expect("store");
+        store
+            .insert_symbol(&sym("sym:build", "build", "build.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&sym("sym:test", "test_build", "tests/build_test.rs"))
+            .unwrap();
+        store.insert_edge(&edge("sym:test", "sym:build")).unwrap();
+        let result = affected_tests(&store, &["build.rs".into()]).unwrap();
+        assert!(!result.tier_1.is_empty());
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.recommendation, "run-full-suite");
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-unassessed")
+        );
     }
 
     #[test]
@@ -1040,6 +1171,12 @@ mod tests {
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert_eq!(result.recommendation, "selection-usable");
         assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "docs-only-excluded")
+        );
+        assert!(
             !result
                 .notifications
                 .iter()
@@ -1065,14 +1202,16 @@ mod tests {
 
         assert_eq!(result.status, AnalysisStatus::Partial);
         assert_eq!(result.recommendation, "run-full-suite");
-        let notice = result
-            .notifications
-            .iter()
-            .find(|n| n.descriptor == "changed-file-no-symbols")
-            .expect("unrecognized file types must be disclosed");
-        assert_eq!(notice.level, NotificationLevel::Warning);
-        assert!(notice.message.contains("Makefile"));
-        assert!(notice.message.contains("ci.yml"));
+        for file in ["Makefile", "ci.yml"] {
+            assert!(
+                result.notifications.iter().any(|n| {
+                    n.descriptor == "changed-file-unassessed"
+                        && n.level == NotificationLevel::Warning
+                        && n.message.contains(file)
+                }),
+                "unassessed file must be disclosed: {file}"
+            );
+        }
     }
 
     /// The always-include rule must not duplicate a test file the graph
@@ -1109,19 +1248,19 @@ mod tests {
         // Fail-safe widening (TIA precedent): ANY non-complete status must
         // recommend the full suite.
         assert_eq!(
-            derive_recommendation(AnalysisStatus::Complete),
+            derive_recommendation(AnalysisStatus::Complete, &["src/lib.rs".into()], 1),
             "selection-usable"
         );
         assert_eq!(
-            derive_recommendation(AnalysisStatus::Partial),
+            derive_recommendation(AnalysisStatus::Partial, &["src/lib.rs".into()], 1),
             "run-full-suite"
         );
         assert_eq!(
-            derive_recommendation(AnalysisStatus::Degraded),
+            derive_recommendation(AnalysisStatus::Degraded, &["src/lib.rs".into()], 1),
             "run-full-suite"
         );
         assert_eq!(
-            derive_recommendation(AnalysisStatus::Failed),
+            derive_recommendation(AnalysisStatus::Failed, &["src/lib.rs".into()], 1),
             "run-full-suite"
         );
     }
