@@ -7559,6 +7559,9 @@ enum DaemonAction {
     /// socket path exceeds the 104-byte sun_path limit). Live instances are
     /// spared under every root, and each ownership proof (database write
     /// lock, pidfile lock) is reported as its own separate fact.
+    ///
+    /// Pass `--db PATH` to limit the sweep to that database's instance.
+    /// Omitting `--db` remains a global sweep.
     Gc,
     /// Run daemon in foreground (used by launchd)
     Run {
@@ -14196,18 +14199,13 @@ fn no_daemon_allowed() -> bool {
 /// still checked first so that ordering can never resolve to on-by-accident.
 /// `daemon gc` — sweep orphaned daemon runtime state.
 ///
-/// `--db` / `NESTWEAVER_DB` are accepted and IGNORED: the sweep is global.
-///
-/// Deliberately takes NO database path. It sweeps orphaned launch agents and
-/// orphaned per-instance directories under all three roots, sparing live
-/// instances by ownership proof (database write lock, pidfile lock) rather than
-/// by matching a database. Requiring `--db` made the one command meant to clean
-/// up after departed databases refuse to run without naming a live one, and
-/// contradicted its own `--help`, which lists `--db` as optional.
-fn run_daemon_gc() -> Result<(i32, Option<String>), anyhow::Error> {
+/// With `--db PATH`, only that database's instance is considered. Omitting
+/// `--db` remains a global sweep of every instance under the three roots.
+/// Live daemons are still spared by ownership proof (write lock, pidfile lock).
+fn run_daemon_gc(db: Option<PathBuf>) -> Result<(i32, Option<String>), anyhow::Error> {
     #[cfg(target_os = "macos")]
     {
-        let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
+        let report = nestweaver_daemon::launchd::gc_orphaned_agents_for(db.as_deref())?;
         if report.removed.is_empty() {
             println!(
                 "No orphaned launch agents found ({} kept, {} spared).",
@@ -14241,8 +14239,11 @@ fn run_daemon_gc() -> Result<(i32, Option<String>), anyhow::Error> {
     // daemon auto-spawns, and nothing removed it when the
     // database went away. Sweeping only the state root while
     // reporting "clean" was the actual defect.
-    let report = nestweaver_daemon::lifecycle::gc_orphaned_daemon_dirs()
-        .context("sweep orphaned daemon directories")?;
+    let report = match db.as_deref() {
+        Some(path) => nestweaver_daemon::lifecycle::gc_orphaned_daemon_dirs_for(path),
+        None => nestweaver_daemon::lifecycle::gc_orphaned_daemon_dirs(),
+    }
+    .context("sweep orphaned daemon directories")?;
     let count_in = |root: nestweaver_daemon::lifecycle::GcRoot| {
         report.removed.iter().filter(|(r, _)| *r == root).count()
     };
@@ -22421,22 +22422,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::Daemon { action, db } => {
-            // `gc` is database-independent and must resolve BEFORE the shared
-            // db_path requirement below.
-            //
-            // It sweeps orphaned launch agents and orphaned per-instance
-            // directories across all three roots, sparing live instances by
-            // ownership proof (database write lock, pidfile lock) rather than by
-            // matching a database path — `gc_orphaned_agents` and
-            // `gc_orphaned_daemon_dirs` take no arguments at all. Requiring
-            // --db was therefore asking for a value the command never reads,
-            // and its own --help documents --db as optional (no default, no
-            // required marker), so the failure contradicted the help text. The
-            // user-visible symptom: the one command whose whole purpose is
-            // cleaning up after databases that no longer exist could not run
-            // without naming a database that does.
+            // `gc` must resolve BEFORE the shared db_path requirement below:
+            // omitting `--db` is a global sweep. When `--db` is set, the sweep
+            // is scoped to that instance; the path need not exist on disk.
             if matches!(action, DaemonAction::Gc) {
-                return run_daemon_gc();
+                return run_daemon_gc(db);
             }
             let lifecycle_config = match &action {
                 DaemonAction::Start { config, .. }
@@ -24067,7 +24057,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                     Ok((EXIT_SUCCESS, None))
                 }
-                DaemonAction::Gc => run_daemon_gc(),
+                DaemonAction::Gc => run_daemon_gc(None),
                 DaemonAction::Restart {
                     idle_timeout,
                     config,

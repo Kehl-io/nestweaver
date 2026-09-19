@@ -5463,7 +5463,13 @@ fn gc_spares_running_daemon_reaps_orphans_and_stop_leaves_nothing() {
     let orphan_fallback = fallback.join(orphan);
     std::fs::create_dir_all(&orphan_fallback).unwrap();
 
-    scratch_cmd("gc")
+    // Global sweep (no --db): `--db` now scopes gc to one instance, so this
+    // counterweight must omit it to still reap the unrelated orphan.
+    let mut gc = daemon_cmd();
+    gc.env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", &fallback)
+        .args(["daemon", "gc"])
         .assert()
         .success()
         .stdout(contains("Removed 3 orphaned daemon director"))
@@ -5497,6 +5503,90 @@ fn gc_spares_running_daemon_reaps_orphans_and_stop_leaves_nothing() {
         !fallback.join(&instance_id).exists(),
         "clean stop must unlink the socket-fallback dir"
     );
+}
+
+/// `daemon gc --db PATH` must only reap that database's instance dirs.
+/// A live daemon for PATH is still spared; a different instance's orphan remains.
+#[test]
+fn daemon_gc_db_scopes_to_that_instance_and_spares_a_live_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("brain.lbug");
+    let other_db = tmp.path().join("other.lbug");
+    let state = tmp.path().join("state");
+    let runtime = tmp.path().join("runtime");
+    let fallback = tmp.path().join("fallback");
+
+    let isolate = |cmd: &mut Command| {
+        cmd.env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", &fallback);
+    };
+
+    let mut start = daemon_cmd();
+    isolate(&mut start);
+    start
+        .args(["daemon", "--db", &db_path.display().to_string(), "start"])
+        .assert()
+        .success();
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let other_id = nestweaver_daemon::instance_id_from_db_path(&other_db);
+    assert_ne!(instance_id, other_id);
+
+    let sock = runtime
+        .join("nestweaver")
+        .join(&instance_id)
+        .join("daemon.sock");
+    let readiness = wait_for_daemon_readiness(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || std::os::unix::net::UnixStream::connect(&sock).map(drop),
+        || {
+            let mut stop = daemon_cmd();
+            isolate(&mut stop);
+            let _ = stop
+                .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+                .ok();
+        },
+    );
+    assert!(readiness.is_ok(), "daemon never came up: {readiness:?}");
+
+    let other_state = state.join("nestweaver").join(&other_id);
+    std::fs::create_dir_all(&other_state).unwrap();
+    std::fs::write(
+        other_state.join("daemon.log"),
+        format!(
+            "[daemon] starting for {} (instance x-{other_id})\n",
+            other_db.display()
+        ),
+    )
+    .unwrap();
+    let other_runtime = runtime.join("nestweaver").join(&other_id);
+    std::fs::create_dir_all(&other_runtime).unwrap();
+    std::fs::write(other_runtime.join("daemon.spawnlock"), b"").unwrap();
+
+    let mut gc = daemon_cmd();
+    isolate(&mut gc);
+    gc.args(["daemon", "--db", &db_path.display().to_string(), "gc"])
+        .assert()
+        .success();
+
+    assert!(
+        other_state.exists(),
+        "scoped gc --db must not delete another instance's dirs"
+    );
+    assert!(
+        state.join("nestweaver").join(&instance_id).exists(),
+        "live daemon for --db must be spared"
+    );
+    std::os::unix::net::UnixStream::connect(&sock)
+        .expect("live daemon socket must still answer after scoped gc");
+
+    let mut stop = daemon_cmd();
+    isolate(&mut stop);
+    stop.args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+        .assert()
+        .success();
 }
 
 /// nw-246 (daemon path): a config-less `nestweaver index` through a RUNNING

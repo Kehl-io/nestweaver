@@ -5378,13 +5378,12 @@ fn list_projects_fails_on_a_missing_database() {
 
 /// `daemon gc` must not require a database.
 ///
-/// It sweeps orphaned launch agents and orphaned per-instance directories,
-/// sparing live instances by ownership proof (write lock, pidfile lock) rather
-/// than by matching a database path — the underlying `gc_orphaned_agents` and
-/// `gc_orphaned_daemon_dirs` take no arguments. Requiring `--db` made the one
-/// command whose purpose is cleaning up after databases that no longer exist
-/// refuse to run without naming one that does, and contradicted its own
-/// `--help`, which lists `--db` as optional with no default.
+/// Omitting `--db` sweeps globally, sparing live instances by ownership proof
+/// (write lock, pidfile lock) rather than by matching a database path.
+/// `--db PATH` scopes the sweep to that instance. Requiring `--db` made the
+/// one command whose purpose is cleaning up after databases that no longer
+/// exist refuse to run without naming one that does, and contradicted its
+/// own `--help`, which lists `--db` as optional with no default.
 #[test]
 fn daemon_gc_runs_without_a_database() {
     // `gc` is DESTRUCTIVE: it sweeps orphaned per-instance directories under the
@@ -5438,6 +5437,56 @@ fn daemon_gc_help_presents_db_as_optional() {
     assert!(
         !stdout.contains("required"),
         "daemon gc --help presents --db as optional; keep behaviour and help in step"
+    );
+}
+
+/// `daemon gc --db PATH` reaps only that instance's orphaned dirs.
+#[test]
+fn daemon_gc_db_reaps_only_that_instance() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let db_a = scratch.path().join("a.lbug");
+    let db_b = scratch.path().join("b.lbug");
+    let id_a = nestweaver_daemon::instance_id_from_db_path(&db_a);
+    let id_b = nestweaver_daemon::instance_id_from_db_path(&db_b);
+    let state = scratch.path().join("state");
+    let runtime = scratch.path().join("runtime");
+    let fallback = scratch.path().join("fallback");
+    for (name, db) in [(&id_a, db_a.as_path()), (&id_b, db_b.as_path())] {
+        let dir = state.join("nestweaver").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("daemon.log"),
+            format!(
+                "[daemon] starting for {} (instance label-{name})\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime.join("nestweaver").join(name)).unwrap();
+        std::fs::create_dir_all(fallback.join(name)).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["daemon", "gc", "--db"])
+        .arg(&db_a)
+        .env_remove("NESTWEAVER_DB")
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", &fallback)
+        .output()
+        .expect("daemon gc --db must run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "daemon gc --db must succeed; stderr: {stderr}"
+    );
+    assert!(
+        !state.join("nestweaver").join(&id_a).exists(),
+        "scoped gc must reap the named instance"
+    );
+    assert!(
+        state.join("nestweaver").join(&id_b).exists(),
+        "scoped gc must leave other instances alone"
     );
 }
 
