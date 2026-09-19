@@ -117,6 +117,7 @@ jobs:
           filters: |
             rust:
               - '**/*.rs'
+              - 'tests/support/isolated_daemon.py'
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -161,6 +162,7 @@ jobs:
               # regression tests (see the "Ready-regression integration
               # tests" step below), so a change to it must re-run the job.
               - 'tests/ready_regression_test.rs'
+              - 'tests/support/isolated_daemon.py'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
 
@@ -181,6 +183,7 @@ jobs:
     # back to back. The budget has to cover a cold build, not just a warm one.
     timeout-minutes: 90
     env:
+      NESTWEAVER_ALLOW_NO_DAEMON: "1"
       MACOSX_DEPLOYMENT_TARGET: "13.3"
       NESTWEAVER_METAL_SMOKE_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
     steps:
@@ -215,7 +218,25 @@ jobs:
           brew untap aws/tap || true
           brew install protobuf
       - name: Build Metal-enabled CLI
-        run: cargo build --locked --release --features metal
+        run: |
+          cargo build --locked --release --features metal
+          mkdir -p staged/standard
+          cp target/release/nestweaver staged/standard/nestweaver
+          codesign --force --sign - staged/standard/nestweaver
+          chmod a-w staged/standard/nestweaver
+      - name: Standard Metal artifact daemon acceptance
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
+      - name: Retain standard Metal daemon evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: standard-metal-daemon-evidence
+          path: |
+            /tmp/nw-release-*/evidence.jsonl
+            /tmp/nw-release-*/daemon.log
+          if-no-files-found: error
       - name: Record real model cache baseline (nw-483)
         # nw-483: distinct from this job's own $MODEL_CACHE (set up below by
         # "Configure isolated smoke paths" and deliberately exercised by the
@@ -261,18 +282,21 @@ jobs:
       # at all. That is how a daemon-crate flake hid the store and engine
       # suites entirely. Every other test job here already passes it.
       - name: Workspace unit tests (macOS portability gate)
-        run: cargo test --locked --release --features metal --workspace --lib --no-fail-fast
+        run: cargo test --locked --release --features metal,ci-direct-tests --workspace --lib --no-fail-fast
       # The --lib gate above did not cover INTEGRATION tests, and two of them
       # were failing on macOS the whole time: one #[cfg(target_os = "macos")]
       # test Linux CI can never run, and one gc test that passes on Linux but
       # diverges on macOS. Both are fixed; this keeps them fixed.
       - name: Daemon integration tests (macOS portability gate)
         run: |
-          cargo test --locked --release --features metal --test daemon_test --no-run
+          cargo test --locked --release --features metal,ci-direct-tests --test daemon_test --no-run
           codesign --force --sign - target/release/nestweaver
           codesign --verify --strict --verbose=2 target/release/nestweaver
           codesign --display --verbose=2 target/release/nestweaver
-          cargo test --locked --release --features metal --test daemon_test
+          cargo test --locked --release --features metal,ci-direct-tests --test daemon_test
+          mkdir -p staged/ci-direct
+          cp target/release/nestweaver staged/ci-direct/nestweaver
+          chmod a-w staged/ci-direct/nestweaver
       # nw-461: THE THREE macOS-divergent regressions in this repo's history
       # (nw-450 GNU-vs-BSD `tar | grep -q` under `pipefail`, nw-440 GNU-only
       # `find -printf`/`mapfile` in both release verifiers, and an
@@ -301,7 +325,7 @@ jobs:
       # report. `--no-fail-fast` for the same reason nw-205 added it to the
       # step above: one failing test must not hide the other 15.
       - name: Ready-regression integration tests (macOS portability gate)
-        run: cargo test --locked --release --features metal --test ready_regression_test --no-fail-fast
+        run: cargo test --locked --release --features metal,ci-direct-tests --test ready_regression_test --no-fail-fast
       # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
       #
       # A test binary has died with `signal: 11` on ~15% of runs of this job,
@@ -397,7 +421,7 @@ jobs:
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          BIN="$PWD/staged/ci-direct/nestweaver"
           "$BIN" --no-daemon index \
             --repo testdata/js --db "$SETUP_DB"
           "$BIN" --no-daemon embed --local --accelerator cpu \
@@ -409,7 +433,7 @@ jobs:
           chmod -R a-w "$MODEL_CACHE"
       - name: Assert clean daemon preconditions
         run: |
-          cargo test --locked --release --features metal --test metal_smoke \
+          cargo test --locked --release --features metal,ci-direct-tests --test metal_smoke \
             apple_hardware::cold_daemon_preconditions_are_clean \
             -- --ignored --exact --nocapture
       - name: Write explicit Metal instance config
@@ -430,7 +454,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           mkdir -p "$OUTPUT_DIR"
           "$BIN" index --repo testdata/js --db "$TARGET_DB" --config "$TARGET_CONFIG" \
             >"$OUTPUT_DIR/cold-index.stdout" 2>"$OUTPUT_DIR/cold-index.stderr"
@@ -465,7 +490,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           "$BIN" daemon --db "$TARGET_DB" stop \
             >"$OUTPUT_DIR/stop.stdout" 2>"$OUTPUT_DIR/stop.stderr"
 
@@ -497,7 +523,7 @@ jobs:
           grep -q "Embedding via daemon" "$OUTPUT_DIR/warm-embed.stderr"
       - name: Verify cache-only Metal vector
         run: |
-          cargo test --locked --release --features metal --test metal_smoke \
+          cargo test --locked --release --features metal,ci-direct-tests --test metal_smoke \
             apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal \
             -- --ignored --exact --nocapture
           find "$MODEL_CACHE" -type f -print0 |
@@ -532,7 +558,8 @@ jobs:
         run: |
           OUTPUT_DIR="${OUTPUT_DIR:-$RUNNER_TEMP/nestweaver-metal-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}}"
           mkdir -p "$OUTPUT_DIR"
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           "$BIN" diagnostics capabilities --json \
             >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
           if [ -n "${TARGET_DB:-}" ]; then
@@ -655,7 +682,18 @@ jobs:
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
       - name: Build CLI
-        run: cargo build --locked
+        run: |
+          cargo build --locked
+          mkdir -p staged/standard
+          cp target/debug/nestweaver staged/standard/nestweaver
+          chmod a-w staged/standard/nestweaver
+      - name: Stage standard acceptance artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-standard-linux
+          path: staged/standard/nestweaver
+          if-no-files-found: error
+          retention-days: 1
       - name: Validate canonical instance config
         run: cargo run --locked -- config validate examples/minimal-instance.toml
       - name: Type-check benchmarks
@@ -683,7 +721,14 @@ jobs:
         # [workspace], so `cargo test` without it runs ONLY the root package's
         # tests and silently skips every sub-crate's unit tests (engine, store,
         # federation, mcp, …) — where most of the logic lives.
-        run: cargo test --locked --workspace --no-fail-fast -- --skip daemon_
+        # One target directory retains native dependencies; immutable copies
+        # keep the standard artifact separate from the unpublished CI binary.
+        run: |
+          cargo test --locked --workspace --features ci-direct-tests --no-fail-fast --no-run
+          mkdir -p staged/ci-direct
+          cp target/debug/nestweaver staged/ci-direct/nestweaver
+          chmod a-w staged/ci-direct/nestweaver
+          cargo test --locked --workspace --features ci-direct-tests --no-fail-fast -- --skip daemon_
         env:
           # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
           # the bypass. An ambient variable set by dozens of unrelated tools must
@@ -709,6 +754,36 @@ jobs:
           fi
           echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
           exit 1
+
+  standard-daemon:
+    name: Standard artifact daemon acceptance
+    needs: [changes, build-and-check]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-standard-linux
+          path: staged/standard
+      - name: Standard daemon bootstrap and explicit CI rejection probe
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          chmod 555 staged/standard/nestweaver
+          python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
+      - name: Retain owned daemon evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: standard-daemon-evidence
+          path: |
+            /tmp/nw-release-*/evidence.jsonl
+            /tmp/nw-release-*/daemon.log
+          if-no-files-found: error
 
   clippy:
     name: Clippy
@@ -751,7 +826,7 @@ jobs:
       # Parallel with Build & Tests: when the shared rust cache is warm this
       # finishes in minutes instead of adding ~20 min serial to the build job.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --features ci-direct-tests --all-targets -- -D warnings
 
   daemon-tests:
     name: Daemon Integration Tests
@@ -833,11 +908,13 @@ jobs:
             echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
           fi
       - name: Daemon-named tests (skipped in the main job)
+        env:
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
         # (authz boundary, migration self-heal, daemon proxy, …) is not lost.
         # The `daemon_` filter is the exact complement of the main job's skip.
-        run: cargo test --locked --workspace --no-fail-fast -- daemon_
+        run: cargo test --locked --workspace --features ci-direct-tests --no-fail-fast -- daemon_
       - name: MCP daemon-feature tests
         # Check the standalone daemon-feature configuration separately from
         # workspace feature unification (which also enables embedding support).
@@ -920,11 +997,11 @@ jobs:
         run: |
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --locked --tests
+          cargo build --locked --tests --features ci-direct-tests
       - name: Generate coverage
         # --workspace so coverage reflects the whole codebase, not just the root
         # package (see the Tests step note on the [package]+[workspace] manifest).
-        run: cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
+        run: cargo llvm-cov --workspace --features ci-direct-tests --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
         env:
           # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
           # the bypass. An ambient variable set by dozens of unrelated tools must
@@ -1339,7 +1416,9 @@ jobs:
           set -euo pipefail
           for pkg in "$@"; do
             echo "pre-warming: ${pkg}"
-            cargo test --locked --no-run --verbose --package="${pkg}"
+            feature_args=()
+            if [ "$pkg" = nestweaver ]; then feature_args=(--features ci-direct-tests); fi
+            cargo test --locked --no-run --verbose --package="${pkg}" "${feature_args[@]}"
           done
           PREWARM_SCRIPT
           # Branch on 124 SPECIFICALLY, which GNU `timeout` reserves for "the
@@ -1545,6 +1624,52 @@ jobs:
           # every one would misreport as "caught" (a false all-clear, not a
           # false alarm — the dangerous direction, since it hides real
           # coverage gaps behind an apparently-clean mutation report).
+          # cargo-mutants tests one selected package at a time. A blanket
+          # --features nestweaver/ci-direct-tests fails for every other package.
+          # Keep its original selection, timeout and outcomes, adding the feature
+          # only to root-package compile/test commands. Both CARGO and PATH cover
+          # subprocess discovery; launch cargo-mutants directly so Cargo cannot
+          # replace CARGO with the underlying toolchain executable.
+          NW_REAL_CARGO="$(command -v cargo)"
+          export NW_REAL_CARGO
+          mkdir -p "$RUNNER_TEMP/ci-cargo"
+          cat > "$RUNNER_TEMP/ci-cargo/cargo" <<'CARGO_SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "${GITHUB_ACTIONS:-}:${CI:-}" in
+            true:*|1:*|*:true|*:1) ;;
+            *) echo 'internal direct-test Cargo wrapper requires real CI' >&2; exit 1 ;;
+          esac
+          root=false
+          package_next=false
+          for arg in "$@"; do
+            if [ "$package_next" = true ]; then
+              case "$arg" in nestweaver|nestweaver@*) root=true ;; esac
+              package_next=false
+            fi
+            case "$arg" in
+              --package|-p) package_next=true ;;
+              --package=nestweaver|--package=nestweaver@*) root=true ;;
+            esac
+          done
+          args=()
+          added=false
+          for arg in "$@"; do
+            if [ "$arg" = -- ] && [ "$root" = true ]; then
+              args+=(--features ci-direct-tests)
+              root=false
+              added=true
+            fi
+            args+=("$arg")
+          done
+          if [ "$root" = true ] && [ "$added" = false ]; then
+            args+=(--features ci-direct-tests)
+          fi
+          exec "$NW_REAL_CARGO" "${args[@]}"
+          CARGO_SHIM
+          chmod 700 "$RUNNER_TEMP/ci-cargo/cargo"
+          export CARGO="$RUNNER_TEMP/ci-cargo/cargo"
+          export PATH="$RUNNER_TEMP/ci-cargo:$PATH"
           # Combined stdout+stderr is captured to mutants-console.log for the
           # next step, WITHOUT losing the real exit status: `tee` is the last
           # command in the pipeline, so a bare `$?` here would be `tee`'s own
@@ -1558,7 +1683,7 @@ jobs:
           # relying on that default rather than reading it off the array
           # would be silently wrong the day that default changes).
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
-            cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
+            cargo-mutants mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
               --in-place --build-timeout 300 \
               --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
             2>&1 | tee mutants-console.log
@@ -2070,7 +2195,7 @@ jobs:
         run: |
           cargo build -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build
+          cargo build --features ci-direct-tests
       - name: Index test data
         env:
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
@@ -2101,6 +2226,7 @@ jobs:
       - build-and-check
       - clippy
       - daemon-tests
+      - standard-daemon
       - audit
       - secret-scan
       - npm-install-smoke
@@ -2128,6 +2254,9 @@ jobs:
           bash scripts/verify-main-rules.sh --ruleset .github/main-ruleset.json
           bash scripts/verify-main-rules.sh --self-test
           python3 scripts/test-verify-release-fault.py
+          python3 scripts/test-release-publication-gates.py
+          python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v
+          python3 scripts/verify-ci-runtime-contracts.py
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test

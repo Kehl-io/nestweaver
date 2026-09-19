@@ -52,6 +52,7 @@ verify_required_ci() {
     require_success build-and-check || return 1
     require_success clippy || return 1
     require_success daemon-tests || return 1
+    require_success standard-daemon || return 1
     require_success audit || return 1
     require_success npm-install-smoke || return 1
   fi
@@ -72,6 +73,7 @@ self_test() {
     "build-and-check": {"result":"success"},
     "clippy": {"result":"success"},
     "daemon-tests": {"result":"success"},
+    "standard-daemon": {"result":"success"},
     "audit": {"result":"success"},
     "metal-smoke": {"result":"success"},
     "npm-install-smoke": {"result":"success"},
@@ -87,10 +89,24 @@ self_test() {
     | .["build-and-check"].result = "skipped"
     | .clippy.result = "skipped"
     | .["daemon-tests"].result = "skipped"
+    | .["standard-daemon"].result = "skipped"
     | .audit.result = "skipped"
     | .["metal-smoke"].result = "skipped"
     | .["npm-install-smoke"].result = "skipped"
     | .e2e.result = "skipped"' <<< "$baseline")"
+
+  # Both independent lanes must report success; none may silently disappear.
+  local lane state candidate
+  for lane in standard-daemon daemon-tests build-and-check; do
+    for state in missing skipped failure cancelled; do
+      candidate=$(jq --arg lane "$lane" --arg state "$state" '
+        if $state == "missing" then del(.[$lane]) else .[$lane].result = $state end' <<< "$baseline")
+      if verify_required_ci "$candidate" >/dev/null 2>&1; then
+        echo "self-test failed: $lane $state was accepted" >&2
+        return 1
+      fi
+    done
+  done
 
   failed=$(jq '.clippy.result = "failure"' <<< "$baseline")
   if verify_required_ci "$failed" >/dev/null 2>&1; then

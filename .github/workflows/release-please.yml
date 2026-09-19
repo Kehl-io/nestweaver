@@ -1168,6 +1168,11 @@ jobs:
           # specific assembly from the ARM64 crash surface.
           CFLAGS: "-DZSTD_DISABLE_ASM"
         run: |
+          # Only shipping feature sets are accepted; internal CI binaries never enter this job.
+          case "$FEATURES" in
+            ""|metal) ;;
+            *) echo "::error::unsupported shipping features: $FEATURES" >&2; exit 1 ;;
+          esac
           if [ -n "$FEATURES" ]; then
             cargo build --locked --release --target "$TARGET" --features "$FEATURES"
           else
@@ -1308,37 +1313,29 @@ jobs:
           fi
           "$BIN" --version
           "$BIN" diagnostics capabilities --json
-          mkdir -p "$SMOKE_DIR/source"
-          printf '%s\n' 'pub fn release_archive_probe() -> bool { true }' > "$SMOKE_DIR/source/lib.rs"
-
-          if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
-            "$BIN" index \
-              --repo "$SMOKE_DIR/source" \
-              --name release-artifact-smoke \
-              --db "$SMOKE_DIR/smoke.lbug" \
-              --with-trigrams \
-              --json; then
-            :
-          else
-            SMOKE_STATUS=$?
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              DEBUG_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-debug.XXXXXX")"
-              NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
-                gdb --batch --quiet \
-                  -ex run \
-                  -ex 'thread apply all backtrace' \
-                  --args "$BIN" index \
-                    --repo "$SMOKE_DIR/source" \
-                    --name release-artifact-debug \
-                    --db "$DEBUG_DIR/debug.lbug" \
-                    --with-trigrams \
-                    --json || true
-            fi
-            exit "$SMOKE_STATUS"
-          fi
-          NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
-            "$BIN" search release_archive_probe --db "$SMOKE_DIR/smoke.lbug" --json \
-            | jq -e '[.. | strings | select(. == "release_archive_probe")] | length > 0'
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          # The archive's actual executable owns a real fixture daemon. The CI-only
+          # request matrix proves this shipping artifact cannot grant a bypass.
+          PYTHONPATH=tests/support python3 - "$BIN" <<'PYFIXTURE'
+          import json
+          import sys
+          from isolated_daemon import IsolatedDaemon
+          with IsolatedDaemon(sys.argv[1]) as fixture:
+              fixture.bootstrap()
+              fixture.run("index", "--repo", fixture.repo, "--db", fixture.db, "--with-trigrams")
+              response = fixture.run("search", "releaseTarget", "--db", fixture.db, "--json")
+              assert "releaseTarget" in response.stdout, json.loads(response.stdout)
+              fixture.check_standard_artifact_policy_in_ci()
+          PYFIXTURE
+      - name: Retain archive daemon evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: archive-daemon-evidence-${{ matrix.target }}
+          path: |
+            /tmp/nw-release-*/evidence.jsonl
+            /tmp/nw-release-*/daemon.log
+          if-no-files-found: warn
       - name: Exercise a failed target
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.fault_mode == 'fail' && inputs.fault_target == matrix.target }}
         run: |
