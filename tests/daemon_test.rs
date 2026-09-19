@@ -6948,6 +6948,58 @@ fn daemon_autostart_does_not_claim_stale_cleanup_when_pidfile_flock_is_live() {
     let _ = stop.ok();
 }
 
+/// Unlinking and rewriting the pidfile pathname replaces the inode. The live
+/// daemon still holds flock on the original, so autostart can lock the
+/// replacement. That must adopt the incumbent — never log stale-cleanup.
+#[test]
+fn daemon_autostart_does_not_claim_stale_cleanup_after_pidfile_inode_replacement() {
+    let scratch = pidfile_reap_scratch();
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo_dir = scratch.path().join("repo");
+    let source_db = scratch.path().join("src").join("test.lbug");
+    std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &source_db);
+    let db_path = copy_graph_into(&source_db, scratch.path());
+
+    let _guard = IsolatedDaemonGuard::new(&db_path, &home);
+    let mut start = daemon_action_cmd(&db_path, "start");
+    isolate_nestweaver_cmd(&mut start, &home);
+    start.assert().success();
+
+    let pidfile = isolated_pidfile(&home, &db_path);
+    std::fs::remove_file(&pidfile).expect("unlink live daemon pidfile pathname");
+    std::fs::write(&pidfile, "replacement\n").expect("rewrite pidfile onto a new inode");
+
+    let mut status = daemon_cmd();
+    isolate_nestweaver_cmd(&mut status, &home);
+    let output = status
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "inode-replaced pidfile must still adopt the live daemon: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unowned daemon pidfile is stale — cleaning up"),
+        "a live daemon whose pidfile pathname was replaced must not be \
+         described as stale-cleaned:\n{stderr}"
+    );
+
+    let mut stop = daemon_action_cmd(&db_path, "stop");
+    isolate_nestweaver_cmd(&mut stop, &home);
+    let _ = stop.ok();
+}
+
 /// A pidfile naming a dead process must be reaped for real (or the log must
 /// not claim cleanup), and a healthy *copy* database must not go WAL-corrupt.
 #[test]
@@ -7006,7 +7058,7 @@ fn daemon_autostart_reaps_dead_pidfile_without_wal_corrupt() {
         .ok()
         .is_some_and(|meta| meta.modified().ok() == Some(before_mtime));
     assert!(
-        !claimed || !(still_stale && same_mtime),
+        !(claimed && still_stale && same_mtime),
         "log claimed pidfile cleanup but the file still names pid={stale_pid} \
          with the same mtime — a no-op lie:\n{stderr}"
     );
