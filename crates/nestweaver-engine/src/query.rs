@@ -2237,6 +2237,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 
     let mut seed_uids: Vec<String> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
+    let mut resolved_inputs: Vec<String> = Vec::new();
     // nw-393. Only bare-name symbol resolution is capped here; UID, tag, note
     // title and project seeds are exhaustive, so an inapplicable tally reports
     // nothing rather than a misleading `0 of 0`.
@@ -2258,7 +2259,12 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             || trimmed.starts_with("vlt:")
             || trimmed.starts_with("proj:")
         {
-            seed_uids.push(trimmed.to_string());
+            if brain_seed_uid_exists(store, trimmed)? {
+                seed_uids.push(trimmed.to_string());
+                resolved_inputs.push(trimmed.to_string());
+            } else {
+                unresolved.push(raw.clone());
+            }
             continue;
         }
 
@@ -2266,6 +2272,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         if let Some(tag_name) = trimmed.strip_prefix('#') {
             if let Some(uid) = lookup_tag_uid(store, tag_name)? {
                 seed_uids.push(uid);
+                resolved_inputs.push(trimmed.to_string());
                 continue;
             }
             unresolved.push(raw.clone());
@@ -2274,6 +2281,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 
         if let Some(note_uids) = resolve_brain_note_seeds(store, trimmed)? {
             seed_uids.extend(note_uids);
+            resolved_inputs.push(trimmed.to_string());
             continue;
         }
 
@@ -2294,12 +2302,14 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             for s in symbol_page.symbols {
                 seed_uids.push(s.uid);
             }
+            resolved_inputs.push(trimmed.to_string());
             continue;
         }
 
         // Last resort: tag without #.
         if let Some(uid) = lookup_tag_uid(store, trimmed)? {
             seed_uids.push(uid);
+            resolved_inputs.push(trimmed.to_string());
             continue;
         }
 
@@ -2319,6 +2329,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
                 project_resolved = true;
             }
             if project_resolved {
+                resolved_inputs.push(trimmed.to_string());
                 continue;
             }
         }
@@ -2354,13 +2365,17 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             }
             let alias_project = alias_matches.into_iter().next().cloned();
             if let Some(project) = alias_project {
+                let before = seed_uids.len();
                 if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
                     seed_uids.extend(note_uids);
                 }
                 if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid) {
                     seed_uids.extend(sym_uids);
                 }
-                continue;
+                if seed_uids.len() > before {
+                    resolved_inputs.push(trimmed.to_string());
+                    continue;
+                }
             }
         }
 
@@ -2382,6 +2397,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
                     }
                 }
                 if resolved_via_alias {
+                    resolved_inputs.push(trimmed.to_string());
                     continue;
                 }
             }
@@ -2414,6 +2430,18 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     if semantic_requested {
         store.require_verified_embedding_identity()?;
     }
+    ensure_brain_context_not_cancelled(cancel)?;
+    if seed_uids.is_empty() {
+        anyhow::bail!(
+            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol \
+             names. Semantic enrichment requires a resolved input seed. This command resolves a NAME (UID, note title, tag, or \
+             symbol name) — for a natural-language question, run `nestweaver investigate {}` \
+             instead, which falls back to full-text search. Unresolved: {:?}",
+            shell_single_quote_seeds(inputs),
+            unresolved,
+        );
+    }
+
     let mut semantic_applied = false;
     let mut semantic_detail = None;
     let mut semantic_reason = if embed_model.is_none() {
@@ -2430,7 +2458,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         // every brain_context pay a full embed on un-embedded DBs).
         && store_has_embeddings(store)
     {
-        let query_text = inputs.join(" ");
+        let query_text = resolved_inputs.join(" ");
         ensure_brain_context_not_cancelled(cancel)?;
         let query_embedding = model.embed_query(&query_text);
         // Inference is a synchronous, potentially long-running boundary. A
@@ -2517,17 +2545,6 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
     }
 
-    if seed_uids.is_empty() {
-        anyhow::bail!(
-            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol \
-             names, and semantic search. This command resolves a NAME (UID, note title, tag, or \
-             symbol name) — for a natural-language question, run `nestweaver investigate {}` \
-             instead, which falls back to full-text search. Unresolved: {:?}",
-            shell_single_quote_seeds(inputs),
-            unresolved,
-        );
-    }
-
     // Run unified PPR with optional intent tuning.
     let damping = intent.map_or(0.85, |i| i.damping());
     // nw-181: this path already carries the daemon's disconnect/timeout flag,
@@ -2552,7 +2569,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // result for auditing.
     let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
-        let bm25_query = inputs.join(" ");
+        let bm25_query = resolved_inputs.join(" ");
         let bm25_hits = if config.prf {
             match tantivy.search_prf(&bm25_query, config.bm25_limit, nestweaver_store_stoplist()) {
                 Ok((hits, terms)) => {
@@ -2925,6 +2942,27 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
     }
     let tags = store.list_tags(None).map_err(|e| anyhow::anyhow!(e))?;
     Ok(tags.into_iter().find(|t| t.name == needle).map(|t| t.uid))
+}
+
+/// Existence is an identity check, not rendering: rendering may supply
+/// fallback labels for orphan nodes. Only NotFound means an unresolved seed.
+fn brain_seed_uid_exists(store: &GraphStore, uid: &str) -> Result<bool, anyhow::Error> {
+    let exists = match uid.split_once(':').map(|(prefix, _)| prefix) {
+        Some("sym") => store.lookup_symbol(uid).map(|_| true),
+        Some("note") => store.lookup_note(uid).map(|_| true),
+        Some("head") => store.lookup_heading(uid).map(|_| true),
+        Some("sec") => store.lookup_section(uid).map(|_| true),
+        Some("tag") => store.lookup_tag(uid).map(|_| true),
+        Some("vlt") => store.lookup_vault(uid).map(|_| true),
+        Some("repo") => store.lookup_repo(uid).map(|repo| repo.is_some()),
+        Some("proj") => store.project_exists(uid),
+        _ => return Ok(false),
+    };
+    match exists {
+        Ok(exists) => Ok(exists),
+        Err(nestweaver_store::StoreError::NotFound) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Resolve a UID to a printable `BrainNode` by dispatching on UID prefix.
@@ -5195,6 +5233,99 @@ mod semantic_leg_tests {
     }
 
     #[test]
+    fn release_context_requires_resolved_seed() {
+        struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
+        impl EmbedQueryFn for RecordingEmbed {
+            fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let model = RecordingEmbed(std::sync::Mutex::new(Vec::new()));
+        let config = HybridSearchConfig::default();
+        let aliases = std::collections::HashMap::new();
+        for invalid in [
+            "absent-input-qzv987",
+            "sym:absent",
+            "note:absent",
+            "head:absent",
+            "sec:absent",
+            "tag:absent",
+            "repo:absent",
+            "vlt:absent",
+            "proj:absent",
+        ] {
+            let error = build_brain_context_hybrid_with_aliases(
+                &store,
+                &[invalid.into()],
+                None,
+                &config,
+                &aliases,
+                None,
+                None,
+                Some(&model),
+                None,
+            )
+            .expect_err("unknown input must not invent semantic neighbors");
+            assert!(
+                error.to_string().starts_with("No seeds resolved."),
+                "{error}"
+            );
+            assert!(error.to_string().contains(invalid), "{error}");
+            assert!(
+                model.0.lock().unwrap().is_empty(),
+                "invalid seeds must not invoke inference"
+            );
+        }
+        let mixed = build_brain_context_hybrid_with_aliases(
+            &store,
+            &[
+                "Payment".into(),
+                "absent-input-qzv987".into(),
+                "head:absent".into(),
+            ],
+            None,
+            &config,
+            &aliases,
+            None,
+            None,
+            Some(&model),
+            None,
+        )
+        .unwrap();
+        assert!(
+            mixed.semantic_applied,
+            "vectors and model must actually be used by the positive control"
+        );
+        assert_eq!(*model.0.lock().unwrap(), ["Payment"]);
+        assert_eq!(
+            mixed.unresolved_seeds,
+            ["absent-input-qzv987", "head:absent"]
+        );
+        assert!(!mixed.seeds.is_empty() || !mixed.connected.is_empty());
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["sym:absent".into()],
+            None,
+            &config,
+            &aliases,
+            None,
+            None,
+            Some(&model),
+            Some(&cancelled),
+        )
+        .expect_err("cancellation must retain priority over unresolved input");
+        assert!(
+            error
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled)
+        );
+    }
+
+    #[test]
     fn semantic_leg_skipped_when_store_has_no_embeddings() {
         // Regression: brain_context used to pay a full BERT forward pass per
         // call even on databases with zero embedding vectors, where the
@@ -5506,7 +5637,7 @@ mod semantic_leg_tests {
             "the is_no_seed_resolution_error prefix contract must be preserved; got: {msg}"
         );
         assert!(
-            msg.contains("symbol names, and semantic search"),
+            msg.contains("symbol names. Semantic enrichment requires a resolved input seed"),
             "expected the existing enumerated strategies to survive; got: {msg}"
         );
         assert!(
