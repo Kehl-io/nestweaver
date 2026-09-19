@@ -166,12 +166,19 @@ export function useContextMode() {
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
-      setActiveLens({
-        lens: "context",
-        label: "Context",
-        targetUid: requestSeeds[0] ?? null,
-        workspaceId: requestWorkspaceId,
-      });
+      const latest = useStore.getState();
+      const searchPinned =
+        latest.activeLens.lens === "search" &&
+        latest.selectedNodeId != null &&
+        latest.selectedNodeId !== requestSeeds[0];
+      if (!searchPinned) {
+        setActiveLens({
+          lens: "context",
+          label: "Context",
+          targetUid: requestSeeds[0] ?? null,
+          workspaceId: requestWorkspaceId,
+        });
+      }
       setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
       start(graph);

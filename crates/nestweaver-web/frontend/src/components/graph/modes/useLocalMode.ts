@@ -14,24 +14,36 @@ export function useLocalMode() {
   const setActiveLens = useStore((s) => s.setActiveLens);
   const [hops, setHops] = useState(2);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestIdRef = useRef(0);
 
   const { start, stop, kill, isRunning } = useForceLayout();
 
   const loadLocalData = useCallback(async () => {
-    if (graphMode !== "local" || !selectedNodeId) return;
-    setActiveLens({ lens: "overview", label: "Local", targetUid: selectedNodeId, workspaceId: null });
+    if (graphMode !== "local" || !selectedNodeId) {
+      requestIdRef.current += 1;
+      return;
+    }
+    const requestId = ++requestIdRef.current;
+    const requestUid = selectedNodeId;
+    const isCurrentRequest = () =>
+      requestId === requestIdRef.current &&
+      useStore.getState().graphMode === "local" &&
+      useStore.getState().selectedNodeId === requestUid;
+
+    setActiveLens({ lens: "overview", label: "Local", targetUid: requestUid, workspaceId: null });
 
     const budget = HOP_BUDGETS[hops] ?? 2000;
 
     try {
-      const result = await api.brainContext([selectedNodeId], budget, "all");
+      const result = await api.brainContext([requestUid], budget, "all");
+      if (!isCurrentRequest()) return;
       const graph = buildGraphFromContext(result);
       finalizeNodeSizes(graph);
 
       // Pin seed node at center
-      if (graph.hasNode(selectedNodeId)) {
-        graph.setNodeAttribute(selectedNodeId, "x", 0);
-        graph.setNodeAttribute(selectedNodeId, "y", 0);
+      if (graph.hasNode(requestUid)) {
+        graph.setNodeAttribute(requestUid, "x", 0);
+        graph.setNodeAttribute(requestUid, "y", 0);
       }
 
       setGraphData(graph);
@@ -40,6 +52,7 @@ export function useLocalMode() {
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
       stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);
     } catch (err) {
+      if (!isCurrentRequest()) return;
       console.error("Failed to load local graph:", err);
     }
   }, [graphMode, selectedNodeId, hops, setGraphData, setActiveLens, start, stop]);
@@ -57,6 +70,7 @@ export function useLocalMode() {
   useEffect(() => {
     loadLocalData();
     return () => {
+      requestIdRef.current += 1;
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
       kill();
     };

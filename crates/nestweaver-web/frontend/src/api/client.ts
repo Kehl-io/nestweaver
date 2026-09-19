@@ -35,6 +35,9 @@ export class ApiError extends Error {
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
+  if (init?.signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new ApiError(res.status, body.error || res.statusText);
@@ -42,8 +45,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-function get<T>(url: string): Promise<T> {
-  return request<T>(url);
+function get<T>(url: string, init?: RequestInit): Promise<T> {
+  return request<T>(url, init);
 }
 
 function post<T>(url: string, body: unknown): Promise<T> {
@@ -55,14 +58,18 @@ function post<T>(url: string, body: unknown): Promise<T> {
 }
 
 export const api = {
-  search(q: string, limit = 20) {
+  search(q: string, limit = 20, init?: RequestInit) {
     return get<SymbolCandidate[]>(
       `/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+      init,
     );
   },
 
-  symbol(uid: string) {
-    return get<SymbolDetail>(`/api/v1/symbol/${encodeURIComponent(uid)}`);
+  symbol(uid: string, init?: RequestInit) {
+    return get<SymbolDetail>(
+      `/api/v1/symbol/${encodeURIComponent(uid)}`,
+      init,
+    );
   },
 
   symbolsInFile(path: string) {
@@ -135,17 +142,21 @@ export const api = {
     return get<Note[]>(`/api/v1/brain/notes?limit=${limit}`);
   },
 
-  brainNote(uid: string) {
-    return get<NoteDetail>(`/api/v1/brain/note/${encodeURIComponent(uid)}`);
+  brainNote(uid: string, init?: RequestInit) {
+    return get<NoteDetail>(
+      `/api/v1/brain/note/${encodeURIComponent(uid)}`,
+      init,
+    );
   },
 
   // Envelope `{ backlinks, count, total, truncated, limit }` since the HTTP
   // handler gained a notes-list-style cap. Unwrap so UI callers still receive
   // `BacklinkRow[]`. Default 1000 matches `brainNotes` (the UI needs the full
   // page; omitted `limit` on the API is 20).
-  async brainBacklinks(uid: string, limit = 1000) {
+  async brainBacklinks(uid: string, limit = 1000, init?: RequestInit) {
     const payload = await get<BacklinkRow[] | { backlinks?: BacklinkRow[] }>(
       `/api/v1/brain/backlinks/${encodeURIComponent(uid)}?limit=${limit}`,
+      init,
     );
     if (Array.isArray(payload)) {
       return payload;
@@ -153,23 +164,25 @@ export const api = {
     return payload.backlinks ?? [];
   },
 
-  brainUnlinkedMentions(uid: string) {
+  brainUnlinkedMentions(uid: string, init?: RequestInit) {
     return get<UnlinkedMention[]>(
       `/api/v1/brain/unlinked-mentions/${encodeURIComponent(uid)}`,
+      init,
     );
   },
 
-  brainSearch(q: string, limit = 20) {
+  brainSearch(q: string, limit = 20, init?: RequestInit) {
     return get<SearchHit[]>(
       `/api/v1/brain/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+      init,
     );
   },
 
-  source(file: string, line?: number, context?: number) {
+  source(file: string, line?: number, context?: number, init?: RequestInit) {
     let url = `/api/v1/source?file=${encodeURIComponent(file)}`;
     if (line != null) url += `&line=${line}`;
     if (context != null) url += `&context=${context}`;
-    return get<SourceResponse>(url);
+    return get<SourceResponse>(url, init);
   },
 
   paths(from: string, to: string, maxDepth = 5, limit = 10) {

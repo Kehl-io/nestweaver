@@ -87,20 +87,25 @@ export function SourceEvidencePanel({
       return () => controller.abort();
     }
 
+    const requestedUid = selectedNodeId;
+    const isCurrent = () =>
+      !controller.signal.aborted &&
+      useStore.getState().selectedNodeId === requestedUid;
+
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
       api
-        .symbol(selectedNodeId)
+        .symbol(selectedNodeId, { signal: controller.signal })
         .then((detail) => {
-          if (!controller.signal.aborted) setSymbolDetail(detail);
+          if (isCurrent()) setSymbolDetail(detail);
         })
         .catch((e) => {
-          if (!controller.signal.aborted) {
+          if (isCurrent()) {
             setError(e instanceof Error ? e.message : "Symbol evidence is unavailable.");
           }
         })
         .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
+          if (isCurrent()) setLoading(false);
         });
       return () => controller.abort();
     }
@@ -108,17 +113,17 @@ export function SourceEvidencePanel({
     if (isNoteLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
       api
-        .brainNote(selectedNodeId)
+        .brainNote(selectedNodeId, { signal: controller.signal })
         .then((detail) => {
-          if (!controller.signal.aborted) setNoteDetail(detail);
+          if (isCurrent()) setNoteDetail(detail);
         })
         .catch((e) => {
-          if (!controller.signal.aborted) {
+          if (isCurrent()) {
             setError(e instanceof Error ? e.message : "Note evidence is unavailable.");
           }
         })
         .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
+          if (isCurrent()) setLoading(false);
         });
       return () => controller.abort();
     }

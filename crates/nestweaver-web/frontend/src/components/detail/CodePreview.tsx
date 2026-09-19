@@ -23,7 +23,7 @@ export function CodePreview({
     setSource(null);
     setError(null);
     api
-      .source(filePath, line, context)
+      .source(filePath, line, context, { signal: controller.signal })
       .then((data) => {
         if (!controller.signal.aborted) setSource(data);
       })

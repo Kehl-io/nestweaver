@@ -33,10 +33,11 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     setLoading(true);
     setError(null);
 
+    const init = { signal: controller.signal };
     Promise.all([
-      api.brainNote(uid),
-      api.brainBacklinks(uid).catch(() => [] as BacklinkRow[]),
-      api.brainUnlinkedMentions(uid).catch(() => [] as UnlinkedMention[]),
+      api.brainNote(uid, init),
+      api.brainBacklinks(uid, 1000, init).catch(() => [] as BacklinkRow[]),
+      api.brainUnlinkedMentions(uid, init).catch(() => [] as UnlinkedMention[]),
     ])
       .then(([note, bl, um]) => {
         if (!controller.signal.aborted) {

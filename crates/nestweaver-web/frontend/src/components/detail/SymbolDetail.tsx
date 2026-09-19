@@ -25,12 +25,13 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
     setLoading(true);
     setError(null);
     api
-      .symbol(uid)
+      .symbol(uid, { signal: controller.signal })
       .then((data) => {
         if (!controller.signal.aborted) setDetail(data);
       })
       .catch((e) => {
-        if (!controller.signal.aborted) setError(e.message ?? "Failed to load symbol");
+        if (controller.signal.aborted) return;
+        setError(e.message ?? "Failed to load symbol");
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
