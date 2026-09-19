@@ -74,21 +74,38 @@ export function TopBar() {
     generation: number,
     q: string,
     workspaceId: string | null,
+    scope: typeof scopeFilter,
   ) {
     const state = useStore.getState();
     return (
       searchGenerationRef.current === generation &&
       state.searchQuery === q &&
-      state.activeWorkspaceId === workspaceId
+      state.activeWorkspaceId === workspaceId &&
+      state.scopeFilter === scope
     );
+  }
+
+  function beginSearch(q: string, workspaceId: string | null) {
+    const generation = searchGenerationRef.current + 1;
+    searchGenerationRef.current = generation;
+    if (!q.trim()) {
+      setSearchResults([], []);
+      setSearchLoading(false);
+      setSearchOpen(false);
+      return;
+    }
+    setSearchOpen(true);
+    setSearchLoading(true);
+    debouncedSearch(q, workspaceId, scopeFilter, generation);
   }
 
   const debouncedSearch = useDebouncedCallback(async (
     q: string,
     workspaceId: string | null,
+    scope: typeof scopeFilter,
     generation: number,
   ) => {
-    if (!isCurrentSearch(generation, q, workspaceId)) return;
+    if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
     if (!q.trim()) {
       setSearchOpen(false);
       return;
@@ -96,23 +113,26 @@ export function TopBar() {
     setSearchLoading(true);
     try {
       if (workspaceId === "all") {
-        const [symbols, brain] = await Promise.all([
-          api.search(q, 10),
-          api.brainSearch(q, 5),
-        ]);
-        if (!isCurrentSearch(generation, q, workspaceId)) return;
+        const symbolsPromise =
+          scope === "notes_only" ? Promise.resolve([]) : api.search(q, 10);
+        const brainPromise =
+          scope === "code_only" ? Promise.resolve([]) : api.brainSearch(q, 5);
+        const [symbols, brain] = await Promise.all([symbolsPromise, brainPromise]);
+        if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
         setSearchResults(symbols, brain);
       } else {
         const scoped = await brainSearchInWorkspace(q, {
           workspaceId,
           limit: 15,
         });
-        if (!isCurrentSearch(generation, q, workspaceId)) return;
-        const { symbols, brain } = splitScopedSearchResults(scoped.results);
-        setSearchResults(symbols.slice(0, 10), brain.slice(0, 5));
+        if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
+        const split = splitScopedSearchResults(scoped.results);
+        const symbols = scope === "notes_only" ? [] : split.symbols.slice(0, 10);
+        const brain = scope === "code_only" ? [] : split.brain.slice(0, 5);
+        setSearchResults(symbols, brain);
       }
     } catch (error) {
-      if (!isCurrentSearch(generation, q, workspaceId)) return;
+      if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
       useStore.getState().notify({
         kind: "error",
         title: "Search failed",
@@ -120,7 +140,7 @@ export function TopBar() {
       });
       setSearchResults([], []);
     } finally {
-      if (isCurrentSearch(generation, q, workspaceId)) {
+      if (isCurrentSearch(generation, q, workspaceId, scope)) {
         setSearchLoading(false);
       }
     }
@@ -129,37 +149,21 @@ export function TopBar() {
   useEffect(() => {
     if (previousWorkspaceIdRef.current === activeWorkspaceId) return;
     previousWorkspaceIdRef.current = activeWorkspaceId;
-    const generation = searchGenerationRef.current + 1;
-    searchGenerationRef.current = generation;
     setSearchResults([], []);
-    setSearchLoading(false);
+    beginSearch(searchQuery, activeWorkspaceId);
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
     if (!searchQuery.trim()) return;
-    setSearchLoading(true);
-    setSearchOpen(true);
-    debouncedSearch(searchQuery, activeWorkspaceId, generation);
-  }, [
-    activeWorkspaceId,
-    debouncedSearch,
-    searchQuery,
-    setSearchLoading,
-    setSearchOpen,
-    setSearchResults,
-  ]);
+    beginSearch(searchQuery, activeWorkspaceId);
+    // Scope changes must re-issue the same query against the matching APIs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeFilter]);
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const q = e.target.value;
-    const generation = searchGenerationRef.current + 1;
-    searchGenerationRef.current = generation;
     setSearchQuery(q);
-    setSearchOpen(true);
-    setSearchResults([], []);
-    if (!q.trim()) {
-      setSearchLoading(false);
-      setSearchOpen(false);
-      return;
-    }
-    setSearchLoading(true);
-    debouncedSearch(q, activeWorkspaceId, generation);
+    beginSearch(q, activeWorkspaceId);
   }
 
   function handleSelect(uid: string, kind: string) {
