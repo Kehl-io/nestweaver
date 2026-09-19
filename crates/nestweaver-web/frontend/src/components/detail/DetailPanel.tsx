@@ -84,11 +84,11 @@ export function DetailPanel() {
         {flowTraceActive && <FlowDetail />}
         {pathfindingActive && <PathDetail />}
         {isSymbol ? (
-          <SymbolDetail uid={selectedNodeId} />
+          <SymbolDetail key={selectedNodeId} uid={selectedNodeId} />
         ) : isNote ? (
-          <NoteDetail uid={selectedNodeId} />
+          <NoteDetail key={selectedNodeId} uid={selectedNodeId} />
         ) : isFile ? (
-          <FileDetail path={selectedNodeId} />
+          <FileDetail key={selectedNodeId} path={selectedNodeId} />
         ) : (
           <div className="p-4">
             <h2 className="mb-2 text-sm font-semibold">Selected</h2>

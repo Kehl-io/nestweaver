@@ -99,6 +99,13 @@ test.describe("Search Flow", () => {
     codeUrls.length = 0;
     brainUrls.length = 0;
     await page.getByLabel("Search filter").click();
+    await page.getByRole("option", { name: "All" }).click();
+    await expect.poll(() => codeUrls.length).toBeGreaterThan(0);
+    await expect.poll(() => brainUrls.length).toBeGreaterThan(0);
+
+    codeUrls.length = 0;
+    brainUrls.length = 0;
+    await page.getByLabel("Search filter").click();
     await page.getByRole("option", { name: "Notes only" }).click();
     await expect.poll(() => brainUrls.length).toBeGreaterThan(0);
     expect(codeUrls).toEqual([]);

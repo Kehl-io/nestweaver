@@ -66,7 +66,14 @@ export function useContextMode() {
       return;
     }
 
-    setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
+    const latest = useStore.getState();
+    const searchPinned =
+      latest.activeLens.lens === "search" &&
+      latest.selectedNodeId != null &&
+      latest.selectedNodeId !== seeds[0];
+    if (!searchPinned) {
+      setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
+    }
 
     if (seeds.length === 0) {
       requestIdRef.current += 1;

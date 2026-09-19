@@ -1,7 +1,7 @@
 import { api } from "../api/client";
 import { isSymbolKind } from "../api/kinds";
 import type { SceneMetadata, ScopedSearchHit, WorkspaceEntry } from "../api/p1Types";
-import type { SearchHit, SymbolCandidate } from "../api/types";
+import type { ScopeFilter, SearchHit, SymbolCandidate } from "../api/types";
 import { brainSearchInWorkspace } from "../api/workspaces";
 import { phraseCoverage } from "./phraseCoverage";
 import type {
@@ -21,6 +21,7 @@ export interface ResolvePhraseOptions {
   workspaces: WorkspaceEntry[];
   symbolResults?: SymbolCandidate[];
   brainResults?: SearchHit[];
+  scopeFilter?: ScopeFilter;
 }
 
 interface SearchPool {
@@ -87,10 +88,15 @@ function splitScopedSearchResults(results: ScopedSearchHit[]): SearchPool {
 }
 
 async function searchTargets(query: string, options: ResolvePhraseOptions): Promise<SearchPool> {
+  const scope = options.scopeFilter ?? "all";
   if (options.activeWorkspaceId === "all") {
     const [symbols, brain] = await Promise.all([
-      api.search(query, 8).catch(() => [] as SymbolCandidate[]),
-      api.brainSearch(query, 8).catch(() => [] as SearchHit[]),
+      scope === "notes_only"
+        ? Promise.resolve([] as SymbolCandidate[])
+        : api.search(query, 8).catch(() => [] as SymbolCandidate[]),
+      scope === "code_only"
+        ? Promise.resolve([] as SearchHit[])
+        : api.brainSearch(query, 8).catch(() => [] as SearchHit[]),
     ]);
     return { symbols, brain };
   }
@@ -99,7 +105,11 @@ async function searchTargets(query: string, options: ResolvePhraseOptions): Prom
     workspaceId: options.activeWorkspaceId,
     limit: 12,
   });
-  return splitScopedSearchResults(scoped.results);
+  const split = splitScopedSearchResults(scoped.results);
+  return {
+    symbols: scope === "notes_only" ? [] : split.symbols,
+    brain: scope === "code_only" ? [] : split.brain,
+  };
 }
 
 function symbolCandidate(symbol: SymbolCandidate): PhraseCandidate {
