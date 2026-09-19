@@ -4223,12 +4223,13 @@ fn try_read_symbols_from_bare(
             }
         };
 
-        let partial = nestweaver_engine::read_symbols::read_symbols(
+        let partial = nestweaver_engine::read_symbols::read_symbols_budgeted(
             store,
             group_targets,
             &reader,
             neighbors,
             remaining_budget,
+            merged.symbols.is_empty(),
         );
 
         // Subtract consumed budget.
@@ -4343,60 +4344,14 @@ fn read_symbols_from_repo_roots(
     token_budget: Option<usize>,
     fallback_root: &std::path::Path,
 ) -> nestweaver_engine::read_symbols::ReadSymbolsResult {
-    use std::path::PathBuf;
-
-    let (repo_groups, unresolved) = group_targets_by_repo(store, targets);
-    if repo_groups.is_empty() {
-        let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-            fallback_root,
-            configured_index_limits(),
-        );
-        return nestweaver_engine::read_symbols::read_symbols(
-            store,
-            targets,
-            &reader,
-            neighbors,
-            token_budget,
-        );
-    }
-
-    let mut merged = nestweaver_engine::read_symbols::ReadSymbolsResult::default();
-    merged.not_found.extend(unresolved);
-    let mut remaining_budget = token_budget;
-
-    for (repo_uid, group_targets) in &repo_groups {
-        let root = store
-            .lookup_repo(repo_uid)
-            .ok()
-            .flatten()
-            .and_then(|r| r.local_root().map(PathBuf::from))
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(|| fallback_root.to_path_buf());
-        let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-            &root,
-            configured_index_limits(),
-        );
-        let partial = nestweaver_engine::read_symbols::read_symbols(
-            store,
-            group_targets,
-            &reader,
-            neighbors,
-            remaining_budget,
-        );
-        if let Some(budget) = remaining_budget {
-            let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
-            remaining_budget = Some(budget.saturating_sub(used));
-        }
-        merged.symbols.extend(partial.symbols);
-        merged.not_found.extend(partial.not_found);
-        merged.ambiguous.extend(partial.ambiguous);
-        merged.dropped.extend(partial.dropped);
-        merged.truncated = merged.truncated || partial.truncated;
-        if merged.budget_exceeded_by_first_symbol.is_none() {
-            merged.budget_exceeded_by_first_symbol = partial.budget_exceeded_by_first_symbol;
-        }
-    }
-    merged
+    nestweaver_engine::read_symbols::read_symbols_from_repo_roots(
+        store,
+        targets,
+        neighbors,
+        token_budget,
+        fallback_root,
+        configured_index_limits(),
+    )
 }
 
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
@@ -13104,7 +13059,8 @@ fn tool_schema_hub_nodes() -> Value {
                 },
                 "repos": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "items": { "type": "string", "minLength": 1, "maxLength": MAX_IDENTIFIER_LEN },
                     "description": "Restrict to these repos (names or UIDs), matching blast_radius/cross_repo_contracts. Applied BEFORE top_n, so results are the requested scope's top-N rather than whatever of the global top-N happens to fall in it — filtering client-side is not equivalent and can return nothing for a small repo. Ranking still uses the FULL graph, so a symbol that is central because other repos depend on it keeps that standing. An unknown repo name is an error, never a silent empty result."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
@@ -13137,10 +13093,13 @@ fn tool_hub_nodes(
     // in a new channel.
     let repo_scope = match args.get("repos").and_then(|v| v.as_array()) {
         Some(entries) => {
-            let selectors: Vec<String> = entries
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+            let selectors: Vec<String> = bound_identifiers(
+                entries
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                "repos",
+            )?;
             Some(resolve_repo_filter(store, &selectors, visible)?)
         }
         None => None,
@@ -13248,7 +13207,8 @@ fn tool_schema_bridge_nodes() -> Value {
                 },
                 "repos": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "items": { "type": "string", "minLength": 1, "maxLength": MAX_IDENTIFIER_LEN },
                     "description": "Restrict to these repos (names or UIDs), matching blast_radius/cross_repo_contracts. Applied BEFORE top_n, so results are the requested scope's top-N rather than whatever of the global top-N happens to fall in it. Betweenness is still computed over the FULL graph, because a bridge's score is a property of the paths around it; scoping the graph itself would erase the cross-repo connector this tool exists to find. An unknown repo name is an error, never a silent empty result."
                 }
             }
@@ -13278,10 +13238,13 @@ fn tool_bridge_nodes(
     // in a new channel.
     let repo_scope = match args.get("repos").and_then(|v| v.as_array()) {
         Some(entries) => {
-            let selectors: Vec<String> = entries
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+            let selectors: Vec<String> = bound_identifiers(
+                entries
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                "repos",
+            )?;
             Some(resolve_repo_filter(store, &selectors, visible)?)
         }
         None => None,
@@ -25322,6 +25285,8 @@ mod request_bound_tests {
             ("read_symbols", "targets"),
             ("read_symbols", "uids_or_fqns"),
             ("affected_tests", "changed_files"),
+            ("hub_nodes", "repos"),
+            ("bridge_nodes", "repos"),
         ] {
             let schema = all_tool_schemas_undecorated()
                 .into_iter()

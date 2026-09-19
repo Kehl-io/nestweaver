@@ -1167,7 +1167,9 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // engine's message is better than the replacement in every case, so it
     // falls through to `General` and is printed verbatim.
 
-    if lower.contains("database is empty") || (lower.contains("empty") && lower.contains("graph")) {
+    if lower.contains("database is empty")
+        || (lower.contains("empty") && lower.contains("graph") && !lower.contains("not found"))
+    {
         return CliDiagnostic::EmptyDatabase.into();
     }
 
@@ -16701,6 +16703,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
 
             // nw-468: the daemon route is the DEFAULT route, so the scope has to
             // travel with the request. Passing it only on the direct path below
@@ -16715,91 +16721,98 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── hybrid guard (routes through local + upstream) ────
-            if let Some(value) = try_hybrid_json_rpc_checked(
+            match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "hub_nodes",
                 hub_args,
-            )? {
-                // Deserialize into the direct path's type so
-                // both output modes match direct output byte-for-byte
-                // (the daemon envelope carries _meta/count the direct
-                // path never prints).
-                // nw-249: `.ok().unwrap_or_default()` turned a DECODE FAILURE
-                // into an empty list, which the branch below then renders as
-                // "No hub nodes found (graph may be empty)" — a confident claim
-                // about the graph made on the strength of a parse error. Same
-                // shape as the `list-repos` / `list-services` defect.
-                let hubs: Vec<HubNode> = match value.get("hubs") {
-                    Some(raw) => serde_json::from_value(raw.clone())
-                        .context("decode hub nodes from the daemon")?,
-                    None => Vec::new(),
-                };
-                // nw-347: the daemon knows more about provenance than this
-                // layer can (upstreams, a background staleness verdict), so its
-                // stamp is carried to the printer rather than discarded and
-                // re-invented.
-                let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
-                // nw-358: read the answer the daemon already sent.
-                // nw-365: hoisted out of the `if json` branch. It used to be
-                // built inside it, which is precisely why the text route had
-                // no verdict to print and fell back to a sidecar-existence
-                // test that the generation bump made useless. ONE verdict,
-                // both renderings.
-                let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
-                // nw-398: whatever the daemon said about the cut, which today
-                // is nothing — see `RankingBounds::from_daemon_response`. Read
-                // rather than re-derived from `hubs`, because deriving it from
-                // an already-cut list can only ever produce `truncated: false`.
-                let bounds = RankingBounds::from_daemon_response(&value);
-                if json {
-                    // nw-308: the daemon route is the DEFAULT route, so the
-                    // payload disclosure has to be here as well as on the
-                    // direct path below.
-                    print_ranking_json("hubs", &hubs, &staleness, daemon_meta, &bounds)?;
-                } else if hubs.is_empty() {
-                    println!("No hub nodes found (graph may be empty).");
-                } else {
-                    println!(
-                        "Top {} hub nodes (by total degree):\n",
-                        bounds.header_count(hubs.len())
-                    );
-                    for h in &hubs {
-                        let cluster = h
-                            .cluster_id
-                            .map(|id| format!(" cluster={id}"))
-                            .unwrap_or_default();
-                        println!(
-                            "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
-                            h.name,
-                            h.file_path,
-                            h.in_degree,
-                            h.out_degree,
-                            h.total_degree,
-                            h.pagerank_score,
-                        );
-                    }
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
                 }
-                // nw-124: the daemon serves this path, so the
-                // disclosure has to live here too — otherwise it
-                // only ever fires on the direct path users are
-                // told not to use.
-                warn_stale_resolver_rankings_no_store(&staleness);
-                // nw-398: counted from the list this route DECODED and printed,
-                // not from `value["count"]`. The old read was coupled to one
-                // spelling in a payload this crate does not own
-                // (`crates/nestweaver-mcp/src/tools.rs`); the day that key is
-                // renamed — `returned` is the name every other tool moved to —
-                // `unwrap_or(0)` would have printed "0 hubs" beside a full
-                // listing, silently. The decoded length cannot drift from what
-                // was shown, because it IS what was shown.
-                let stats = format!(
-                    "{} hubs in {} (via hybrid)",
-                    hubs.len(),
-                    format_elapsed(t0.elapsed())
-                );
-                return Ok((EXIT_SUCCESS, Some(stats)));
+                Err(error) => return Err(error),
+                Ok(Some(value)) => {
+                    // Deserialize into the direct path's type so
+                    // both output modes match direct output byte-for-byte
+                    // (the daemon envelope carries _meta/count the direct
+                    // path never prints).
+                    // nw-249: `.ok().unwrap_or_default()` turned a DECODE FAILURE
+                    // into an empty list, which the branch below then renders as
+                    // "No hub nodes found (graph may be empty)" — a confident claim
+                    // about the graph made on the strength of a parse error. Same
+                    // shape as the `list-repos` / `list-services` defect.
+                    let hubs: Vec<HubNode> = match value.get("hubs") {
+                        Some(raw) => serde_json::from_value(raw.clone())
+                            .context("decode hub nodes from the daemon")?,
+                        None => Vec::new(),
+                    };
+                    // nw-347: the daemon knows more about provenance than this
+                    // layer can (upstreams, a background staleness verdict), so its
+                    // stamp is carried to the printer rather than discarded and
+                    // re-invented.
+                    let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
+                    // nw-358: read the answer the daemon already sent.
+                    // nw-365: hoisted out of the `if json` branch. It used to be
+                    // built inside it, which is precisely why the text route had
+                    // no verdict to print and fell back to a sidecar-existence
+                    // test that the generation bump made useless. ONE verdict,
+                    // both renderings.
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                    // nw-398: whatever the daemon said about the cut, which today
+                    // is nothing — see `RankingBounds::from_daemon_response`. Read
+                    // rather than re-derived from `hubs`, because deriving it from
+                    // an already-cut list can only ever produce `truncated: false`.
+                    let bounds = RankingBounds::from_daemon_response(&value);
+                    if json {
+                        // nw-308: the daemon route is the DEFAULT route, so the
+                        // payload disclosure has to be here as well as on the
+                        // direct path below.
+                        print_ranking_json("hubs", &hubs, &staleness, daemon_meta, &bounds)?;
+                    } else if hubs.is_empty() {
+                        println!("No hub nodes found (graph may be empty).");
+                    } else {
+                        println!(
+                            "Top {} hub nodes (by total degree):\n",
+                            bounds.header_count(hubs.len())
+                        );
+                        for h in &hubs {
+                            let cluster = h
+                                .cluster_id
+                                .map(|id| format!(" cluster={id}"))
+                                .unwrap_or_default();
+                            println!(
+                                "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                                h.name,
+                                h.file_path,
+                                h.in_degree,
+                                h.out_degree,
+                                h.total_degree,
+                                h.pagerank_score,
+                            );
+                        }
+                    }
+                    // nw-124: the daemon serves this path, so the
+                    // disclosure has to live here too — otherwise it
+                    // only ever fires on the direct path users are
+                    // told not to use.
+                    warn_stale_resolver_rankings_no_store(&staleness);
+                    // nw-398: counted from the list this route DECODED and printed,
+                    // not from `value["count"]`. The old read was coupled to one
+                    // spelling in a payload this crate does not own
+                    // (`crates/nestweaver-mcp/src/tools.rs`); the day that key is
+                    // renamed — `returned` is the name every other tool moved to —
+                    // `unwrap_or(0)` would have printed "0 hubs" beside a full
+                    // listing, silently. The decoded length cannot drift from what
+                    // was shown, because it IS what was shown.
+                    let stats = format!(
+                        "{} hubs in {} (via hybrid)",
+                        hubs.len(),
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
+                }
+                Ok(None) => {}
             }
 
             let store = open_store(Some(&db_path))?;
@@ -16819,9 +16832,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let hub_scope = if repos.is_empty() {
                 None
             } else {
-                Some(nestweaver_engine::node_scope::resolve_repo_filter(
-                    &store, &repos, None,
-                )?)
+                match nestweaver_engine::node_scope::resolve_repo_filter(&store, &repos, None) {
+                    Ok(scope) => Some(scope),
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             let found = nestweaver_engine::hubs::find_hub_nodes_bounded_in_repos(
                 &store,
@@ -16890,90 +16907,108 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: config_opt,
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = bridge_nodes_rpc_args(top, &repos);
-                if let Some(value) = try_hybrid_json_rpc_checked(
+                match try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "bridge_nodes",
                     args,
-                )? {
-                    // Deserialize the tool's `bridges` array into the
-                    // direct path's type so both modes render identically.
-                    // nw-249: same defect as `hubs` above — a decode failure
-                    // became an empty list and rendered as "graph may be
-                    // empty". A `null` (no `bridges` key at all) is still an
-                    // honest empty result and stays one.
-                    // nw-347: `strip_hybrid_meta` exists so the typed decode
-                    // below sees the shape the direct store produces. Stripping
-                    // for the decode used to mean the PRINTER had nothing to put
-                    // back, so the daemon's own stamp was discarded on a route
-                    // where it is strictly richer than anything this layer knows.
-                    let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
-                    // nw-358: captured BEFORE `strip_hybrid_meta` consumes
-                    // `value`, for the same reason `daemon_meta` is — the
-                    // daemon already computed this from `store.list_repos` and
-                    // this layer cannot do better.
-                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
-                    // nw-398: captured BEFORE `strip_hybrid_meta` consumes
-                    // `value`, alongside the other two. Empty today — the MCP
-                    // `bridge_nodes` twin publishes these as of this commit; an older daemon does not, so
-                    // the payload says `null`, which is the honest "this route
-                    // was not told" rather than a fabricated `false`.
-                    let bounds = RankingBounds::from_daemon_response(&value);
-                    let bridges: Vec<nestweaver_engine::BridgeNode> =
-                        match strip_hybrid_meta(value).get("bridges").cloned() {
-                            Some(serde_json::Value::Null) | None => Vec::new(),
-                            Some(raw) => serde_json::from_value(raw)
-                                .context("decode bridge nodes from the daemon")?,
-                        };
-                    if json {
-                        // nw-308: same disclosure as `hubs`; bridges are
-                        // downstream of the same edges.
-                        print_ranking_json("bridges", &bridges, &staleness, daemon_meta, &bounds)?;
-                    } else if bridges.is_empty() {
-                        println!("No bridge nodes found (graph may be empty).");
-                    } else {
-                        println!(
-                            "Top {} bridge nodes (by betweenness centrality):\n",
-                            bounds.header_count(bridges.len())
-                        );
-                        if let Some(note) = bridge_sampling_note(&bounds) {
-                            println!("  NOTE: {note}\n");
-                        }
-                        for b in &bridges {
-                            let communities = if b.communities_connected.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " connects=[{}]",
-                                    b.communities_connected
-                                        .iter()
-                                        .map(|c| c.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(",")
-                                )
-                            };
-                            println!(
-                                "  {} ({}) betweenness={:.2}{communities}",
-                                b.name, b.file_path, b.betweenness_score,
-                            );
-                        }
+                ) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
                     }
-                    // nw-124: bridges are downstream of the same import
-                    // fan-out nw-103 fixed, so they carry the same staleness.
-                    // nw-365: the same verdict the payload leg prints, so the
-                    // two renderings cannot disagree.
-                    warn_stale_resolver_rankings_no_store(&staleness);
-                    let stats = format!(
-                        "{} bridges in {} (via daemon)",
-                        bridges.len(),
-                        format_elapsed(t0.elapsed())
-                    );
-                    return Ok((EXIT_SUCCESS, Some(stats)));
+                    Err(error) => return Err(error),
+                    Ok(Some(value)) => {
+                        // Deserialize the tool's `bridges` array into the
+                        // direct path's type so both modes render identically.
+                        // nw-249: same defect as `hubs` above — a decode failure
+                        // became an empty list and rendered as "graph may be
+                        // empty". A `null` (no `bridges` key at all) is still an
+                        // honest empty result and stays one.
+                        // nw-347: `strip_hybrid_meta` exists so the typed decode
+                        // below sees the shape the direct store produces. Stripping
+                        // for the decode used to mean the PRINTER had nothing to put
+                        // back, so the daemon's own stamp was discarded on a route
+                        // where it is strictly richer than anything this layer knows.
+                        let daemon_meta =
+                            value.get(nestweaver_schema::provenance::META_KEY).cloned();
+                        // nw-358: captured BEFORE `strip_hybrid_meta` consumes
+                        // `value`, for the same reason `daemon_meta` is — the
+                        // daemon already computed this from `store.list_repos` and
+                        // this layer cannot do better.
+                        let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                        // nw-398: captured BEFORE `strip_hybrid_meta` consumes
+                        // `value`, alongside the other two. Empty today — the MCP
+                        // `bridge_nodes` twin publishes these as of this commit; an older daemon does not, so
+                        // the payload says `null`, which is the honest "this route
+                        // was not told" rather than a fabricated `false`.
+                        let bounds = RankingBounds::from_daemon_response(&value);
+                        let bridges: Vec<nestweaver_engine::BridgeNode> =
+                            match strip_hybrid_meta(value).get("bridges").cloned() {
+                                Some(serde_json::Value::Null) | None => Vec::new(),
+                                Some(raw) => serde_json::from_value(raw)
+                                    .context("decode bridge nodes from the daemon")?,
+                            };
+                        if json {
+                            // nw-308: same disclosure as `hubs`; bridges are
+                            // downstream of the same edges.
+                            print_ranking_json(
+                                "bridges",
+                                &bridges,
+                                &staleness,
+                                daemon_meta,
+                                &bounds,
+                            )?;
+                        } else if bridges.is_empty() {
+                            println!("No bridge nodes found (graph may be empty).");
+                        } else {
+                            println!(
+                                "Top {} bridge nodes (by betweenness centrality):\n",
+                                bounds.header_count(bridges.len())
+                            );
+                            if let Some(note) = bridge_sampling_note(&bounds) {
+                                println!("  NOTE: {note}\n");
+                            }
+                            for b in &bridges {
+                                let communities = if b.communities_connected.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " connects=[{}]",
+                                        b.communities_connected
+                                            .iter()
+                                            .map(|c| c.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    )
+                                };
+                                println!(
+                                    "  {} ({}) betweenness={:.2}{communities}",
+                                    b.name, b.file_path, b.betweenness_score,
+                                );
+                            }
+                        }
+                        // nw-124: bridges are downstream of the same import
+                        // fan-out nw-103 fixed, so they carry the same staleness.
+                        // nw-365: the same verdict the payload leg prints, so the
+                        // two renderings cannot disagree.
+                        warn_stale_resolver_rankings_no_store(&staleness);
+                        let stats = format!(
+                            "{} bridges in {} (via daemon)",
+                            bridges.len(),
+                            format_elapsed(t0.elapsed())
+                        );
+                        return Ok((EXIT_SUCCESS, Some(stats)));
+                    }
+                    Ok(None) => {}
                 }
             }
 
@@ -16999,9 +17034,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let bridge_scope = if repos.is_empty() {
                 None
             } else {
-                Some(nestweaver_engine::node_scope::resolve_repo_filter(
-                    &store, &repos, None,
-                )?)
+                match nestweaver_engine::node_scope::resolve_repo_filter(&store, &repos, None) {
+                    Ok(scope) => Some(scope),
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             let found = nestweaver_engine::bridges::find_bridge_nodes_bounded_in_repos(
                 &store,
@@ -25621,6 +25660,99 @@ fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
 /// route that has an alternative.
 fn daemon_may_serve(use_daemon: bool, config: Option<&std::path::Path>) -> bool {
     use_daemon && config.is_none()
+}
+
+/// Matches MCP `MAX_IDENTIFIER_LEN`. A 10k-character `--repo` used to leave
+/// the CLI as gRPC PROTOCOL_ERROR rather than an honest client rejection.
+const MAX_REPO_SELECTOR_LEN: usize = 512;
+
+fn reject_oversized_repo_selectors(repos: &[String]) -> Result<(), (i32, String)> {
+    for (index, selector) in repos.iter().enumerate() {
+        if selector.len() > MAX_REPO_SELECTOR_LEN {
+            return Err((
+                EXIT_USAGE,
+                format!(
+                    "--repo[{index}] is {} bytes; the maximum is {MAX_REPO_SELECTOR_LEN}. \
+                     The request is REJECTED rather than forwarded: an over-long selector \
+                     previously failed as PROTOCOL_ERROR instead of an honest client error.",
+                    selector.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn error_is_unresolved_repo_filter(error: &anyhow::Error) -> bool {
+    if error
+        .chain()
+        .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>())
+    {
+        return true;
+    }
+    let stamped = error.chain().find_map(|cause| {
+        cause.downcast_ref::<tonic::Status>().and_then(|status| {
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|value| value.to_str().ok().map(str::to_string))
+        })
+    });
+    if stamped.as_deref() == Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE) {
+        return true;
+    }
+    format!("{error:#}").contains("repo filter entry ")
+}
+
+fn report_unresolved_repo_filter(error: &anyhow::Error, json: bool) -> i32 {
+    let message = format!("{error:#}");
+    let ambiguous = message.to_ascii_lowercase().contains("ambiguous");
+    let (status, code) = if ambiguous {
+        ("ambiguous", EXIT_AMBIGUOUS)
+    } else {
+        ("not_found", EXIT_NOT_FOUND)
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "error": status,
+                "status": status,
+                "message": message,
+            })
+        );
+    }
+    eprintln!("{message}");
+    code
+}
+
+#[cfg(test)]
+mod repo_filter_honesty_tests {
+    use super::*;
+
+    #[test]
+    fn an_over_long_repo_selector_is_rejected_before_rpc() {
+        let long = "Z".repeat(MAX_REPO_SELECTOR_LEN + 1);
+        let err = reject_oversized_repo_selectors(&[long]).expect_err("must reject");
+        assert_eq!(err.0, EXIT_USAGE);
+        assert!(err.1.contains("PROTOCOL_ERROR") || err.1.contains("REJECTED"));
+    }
+
+    #[test]
+    fn a_typed_unresolved_repo_filter_is_recognized() {
+        let error = anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "missing",
+            &anyhow::anyhow!("repo 'missing' not found in graph"),
+        ));
+        assert!(error_is_unresolved_repo_filter(&error));
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_a_missing_repo() {
+        assert!(!error_is_unresolved_repo_filter(&anyhow::anyhow!(
+            "connection refused"
+        )));
+    }
 }
 
 fn try_hybrid_json_rpc_checked(

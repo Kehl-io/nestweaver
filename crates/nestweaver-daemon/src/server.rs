@@ -71,14 +71,24 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
             }
         };
     }
-    let mut status = Status::internal(format!("tool {tool_name} failed: {e}"));
+    let mut status = if e
+        .chain()
+        .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>())
+    {
+        // An unknown `--repo` is a client error (4xx), not an internal
+        // failure. Leaving this as `internal` made `hubs --repo` look like
+        // a daemon crash (and a 10k-character selector as PROTOCOL_ERROR).
+        Status::invalid_argument(format!("tool {tool_name} failed: {e}"))
+    } else {
+        Status::internal(format!("tool {tool_name} failed: {e}"))
+    };
 
     // nw-443. A typed engine error gets a MACHINE-READABLE code in the
     // status metadata, so `nestweaver-client`'s two-tier degrade can match on
     // a code instead of substring-matching this message's prose across three
-    // crates. The `internal` gRPC code and the message text are deliberately
-    // unchanged -- other consumers (upstream-health detection among them)
-    // read those, and this is meant to be purely additive.
+    // crates. For `RepoFilterUnresolved` the gRPC code is InvalidArgument
+    // (a client error); other failures stay Internal. The metadata stamp is
+    // additive either way.
     //
     // `chain()` rather than a bare downcast: the error may already carry
     // `.context()` from the tool layer, and the type is what matters, not
@@ -189,6 +199,11 @@ mod dispatch_err_to_status_tests {
         ));
         let status = dispatch_err_to_status("blast_radius", error);
 
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "an unresolved repo filter is a client error, not Internal"
+        );
         let code = status
             .metadata()
             .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
