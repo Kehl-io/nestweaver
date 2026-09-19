@@ -1204,7 +1204,7 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
                 .lines()
                 .filter_map(|line| {
                     let token = line.split_whitespace().next()?;
-                    token.contains(':').then_some(token)
+                    (token.starts_with("note:") || token.starts_with("sym:")).then_some(token)
                 })
                 .collect();
             println!(
