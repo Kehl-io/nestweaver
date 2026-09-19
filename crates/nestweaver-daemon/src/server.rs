@@ -23905,11 +23905,12 @@ external_model = "unavailable-test-model"
     const NW415_VISIBLE_SYMBOL: &str = "sym:nw415-visible";
     const NW415_TOKEN: &str = "nw415-repo-scoped-token";
 
-    /// Two repos, one symbol each, and a vault note — the smallest graph in
-    /// which "answered from the hidden repo" is observable on every one of the
-    /// six RPCs.
+    /// Two repos, one named symbol each, a CALLS edge so those symbols are
+    /// real hub candidates (degree-0 rows are not hubs), and a vault note —
+    /// the smallest graph in which "answered from the hidden repo" is
+    /// observable on every one of the six RPCs.
     fn nw415_store() -> Arc<GraphStore> {
-        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        use nestweaver_schema::{ResolvedEdge, Symbol, SymbolKind, Visibility};
 
         let store = Arc::new(GraphStore::in_memory().unwrap());
         for repo in [
@@ -23928,6 +23929,16 @@ external_model = "unavailable-test-model"
                 NW415_HIDDEN_SYMBOL,
                 "repo:nw415-hidden",
                 "nw415needle_hidden",
+            ),
+            (
+                "sym:nw415-visible-callee",
+                "repo:nw415-visible",
+                "nw415callee_visible",
+            ),
+            (
+                "sym:nw415-hidden-callee",
+                "repo:nw415-hidden",
+                "nw415callee_hidden",
             ),
         ] {
             store
@@ -23950,6 +23961,21 @@ external_model = "unavailable-test-model"
                     type_info: None,
                     framework_hint: None,
                     canonical_id: Some(format!("canonical:{uid}")),
+                })
+                .unwrap();
+        }
+        for (source, target) in [
+            (NW415_VISIBLE_SYMBOL, "sym:nw415-visible-callee"),
+            (NW415_HIDDEN_SYMBOL, "sym:nw415-hidden-callee"),
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.to_string(),
+                    target_uid: target.to_string(),
+                    edge_type: nestweaver_schema::EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: Vec::new(),
                 })
                 .unwrap();
         }
