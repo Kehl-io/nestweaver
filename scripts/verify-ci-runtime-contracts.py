@@ -76,16 +76,15 @@ class RuntimeContracts(unittest.TestCase):
     def test_advisory_and_browser_legacy_builds_enable_feature(self):
         self.assertIn('cargo llvm-cov --workspace --features ci-direct-tests', job(CI, 'coverage'))
         self.assertIn('cargo build --features ci-direct-tests', job(CI, 'e2e'))
-        self.assertIn('args+=(--features ci-direct-tests)', job(CI, 'mutants'))
-        self.assertIn('cargo-mutants mutants "${pkg_args[@]}" --in-diff', job(CI, 'mutants'))
+        self.assertIn('scripts/ci-direct-cargo.sh', job(CI, 'mutants'))
+        self.assertIn('scripts/run-mutation-scope.sh', job(CI, 'mutants'))
 
     def test_mutation_feature_selection_without_running_cargo_or_forging_ci(self):
         # Exercise only the argument transformer extracted from the workflow.
         # The CI runtime guard and exec are deliberately not executed locally.
-        mutation = job(CI, 'mutants')
-        shim = mutation.split("<<'CARGO_SHIM'\n", 1)[1].split('          CARGO_SHIM', 1)[0]
-        transform = shim.split('          root=false\n', 1)[1].split('          exec ', 1)[0]
-        transform = 'root=false\n' + transform + 'printf "%s\\0" "${args[@]}"\n'
+        shim = (ROOT / 'scripts/ci-direct-cargo.sh').read_text()
+        transform = shim.split('# BEGIN ARGUMENT TRANSFORM', 1)[1].split('\n', 1)[1].split('# END ARGUMENT TRANSFORM', 1)[0]
+        transform += 'printf "%s\\0" "${args[@]}"\n'
         cases = [
             (['test', '--package=nestweaver@1.0.0', '--no-run'],
              ['test', '--package=nestweaver@1.0.0', '--no-run', '--features', 'ci-direct-tests']),
@@ -94,12 +93,28 @@ class RuntimeContracts(unittest.TestCase):
             (['test', '--package=nestweaver-mcp@1.0.0', '--', '--nocapture'],
              ['test', '--package=nestweaver-mcp@1.0.0', '--', '--nocapture']),
             (['metadata', '--format-version', '1'], ['metadata', '--format-version', '1']),
+            (['metadata', '-p', 'nestweaver'], ['metadata', '-p', 'nestweaver']),
+            (['test', '--', '-p', 'nestweaver'], ['test', '--', '-p', 'nestweaver']),
+            (['build', '-pnestweaver@1.0.0'], ['build', '-pnestweaver@1.0.0', '--features', 'ci-direct-tests']),
         ]
         for original, expected in cases:
             with self.subTest(original=original):
                 result = subprocess.run(['bash', '-c', transform, 'transform', *original],
                                         check=True, capture_output=True, timeout=5)
                 self.assertEqual(result.stdout.decode().split('\0')[:-1], expected)
+
+    def test_shared_mutation_helpers_offline(self):
+        for script in ('test-mutation-results.py', 'test-mutation-canary.py'):
+            subprocess.run(['python3', str(ROOT / 'scripts' / script)], check=True,
+                           capture_output=True, text=True, timeout=20)
+        canary = (ROOT / '.github/workflows/mutation-canary.yml').read_text()
+        self.assertNotIn('continue-on-error:', canary)
+        self.assertNotIn('rust-cache', canary)
+        self.assertNotIn('contents: write', canary)
+        self.assertIn('timeout-minutes: 8', canary)
+        self.assertIn('timeout-minutes: 3', canary)
+        self.assertNotIn('- canary-cases', job(CI, 'required-ci'))
+        self.assertNotRegex(canary, r'(?m)^\s+(CI|GITHUB_ACTIONS):\s*["\']?(true|1)')
 
     def test_shipping_features_fail_closed(self):
         build = step(RELEASE, 'Build binary')
