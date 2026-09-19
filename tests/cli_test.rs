@@ -2760,6 +2760,18 @@ fn duplicate_note_titles_exit_ambiguous_and_paths_pin() {
         String::from_utf8_lossy(&context.stdout),
         String::from_utf8_lossy(&context.stderr)
     );
+    let context_payload: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    let context_uids = context_payload["candidate_uids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(context_uids.len(), 2, "{context_payload}");
+    assert!(
+        context_uids.iter().all(|uid| uid
+            .as_str()
+            .is_some_and(|s| s.starts_with("note:") && !s.starts_with("Ambiguous:"))),
+        "{context_payload}"
+    );
 }
 
 #[test]
