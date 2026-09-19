@@ -246,8 +246,9 @@ mod tests {
     #[test]
     fn release_change_gate_contract() {
         use crate::blast_radius::{
-            AnalysisStatus, GateState, RiskLevel, derive_gate_state, risk_if_unassessed,
+            AnalysisStatus, GateState, derive_gate_state, risk_if_unassessed,
         };
+        use crate::process::RiskLevel;
         for (file, has_symbols, expected) in [
             ("Makefile", false, ChangedFileClass::ExecutionDependency),
             ("Makefile", true, ChangedFileClass::ExecutionDependency),
