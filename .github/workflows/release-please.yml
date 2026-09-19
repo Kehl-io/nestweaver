@@ -1591,47 +1591,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
+          RELEASE_MODE: ${{ needs.release-context.outputs.mode }}
         run: |
           set -euo pipefail
-          DEADLINE=$((SECONDS + 5100))
-          while true; do
-            RUNS="$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&event=push&per_page=20")"
-            RUN="$(jq -c --arg sha "$RELEASE_SHA" \
-              '[.workflow_runs[] | select(.head_sha == $sha and .event == "push")]
-               | sort_by(.id) | last // empty' <<< "$RUNS")"
-
-            if [ -n "$RUN" ]; then
-              RUN_ID="$(jq -r '.id' <<< "$RUN")"
-              RUN_STATUS="$(jq -r '.status' <<< "$RUN")"
-              RUN_CONCLUSION="$(jq -r '.conclusion // "pending"' <<< "$RUN")"
-              RUN_URL="$(jq -r '.html_url' <<< "$RUN")"
-              if [ "$RUN_STATUS" = completed ]; then
-                [ "$RUN_CONCLUSION" = success ] || {
-                  echo "::error::exact-SHA CI concluded $RUN_CONCLUSION: $RUN_URL" >&2
-                  exit 1
-                }
-                JOBS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100")"
-                jq -e --arg sha "$RELEASE_SHA" \
-                  'any(.jobs[]; .name == "Required CI" and .head_sha == $sha and
-                    .status == "completed" and .conclusion == "success")' \
-                  <<< "$JOBS" >/dev/null || {
-                    echo "::error::successful CI run $RUN_ID lacks exact-SHA Required CI" >&2
-                    exit 1
-                  }
-                echo "exact-SHA main CI passed: $RUN_URL"
-                break
-              fi
-              echo "exact-SHA CI is $RUN_STATUS; waiting: $RUN_URL"
-            else
-              echo "no main CI run is visible yet for $RELEASE_SHA; waiting"
-            fi
-            [ "$SECONDS" -lt "$DEADLINE" ] || {
-              echo "::error::timed out waiting for exact-SHA main CI" >&2
-              exit 1
-            }
-            sleep 15
-          done
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$RELEASE_MODE" = resume ]; then
+            policy_root="$GITHUB_WORKSPACE/.release-policy"
+          fi
+          # The helper has an explicit 85-minute deadline and paginates every
+          # exact-SHA run/job response, using filter=all for rerun attempts.
+          # Required CI reduces all required dependencies; Coverage is advisory.
+          python3 "$policy_root/scripts/verify-release-required-ci.py" \
+            --repo "$GITHUB_REPOSITORY" --sha "$RELEASE_SHA"
       - name: Download all four artifacts from the bound source run
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -2091,6 +2062,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PACKAGES_JSON: ${{ needs.preflight-package.outputs.packages }}
+          RELEASE_MODE: ${{ needs.release-context.outputs.mode }}
           RELEASE_ID: ${{ needs.release-context.outputs.release_id }}
           RELEASE_SHA: ${{ needs.release-context.outputs.release_sha }}
           RELEASE_TAG: ${{ needs.release-context.outputs.tag_name }}
@@ -2100,6 +2072,11 @@ jobs:
           jq -e --arg tag "$RELEASE_TAG" --arg sha "$RELEASE_SHA" \
             '.draft == false and .immutable == true and .tag_name == $tag and .target_commitish == $sha' \
             <<< "$release" >/dev/null
+
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$RELEASE_MODE" = resume ] || [ "$RELEASE_MODE" = recover-npm ]; then
+            policy_root="$GITHUB_WORKSPACE/.release-policy"
+          fi
 
           # nw-425: one package per platform triple (the esbuild/@rollup/swc
           # pattern) instead of a single wrapper with a postinstall download,
@@ -2133,36 +2110,34 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-please.yml" \
               --source-digest "$RELEASE_SHA"
 
-            # NOT gitHead. `npm publish <tarball-path>` -- what this step does,
-            # deliberately, so the published bytes are exactly the attested
-            # ones -- never attaches `gitHead` at all; npm only populates it
-            # when publishing a DIRECTORY inside a clean git working tree.
-            # Requiring `.gitHead == $sha` was checked against a real `npm
-            # view` response for a tarball-path publish and the field is
-            # simply absent, so that comparison is permanently false: even a
-            # publish that succeeded on the very first attempt (exit 0,
-            # provenance signed) would run all six retries and still report
-            # failure. `dist.integrity` is the SHA-512 of the exact packed
-            # bytes and is what the registry actually returns for any publish
-            # method -- a stronger, content-addressed proof of "this is
-            # precisely the artifact we attested", not a weaker substitute
-            # for the SHA it used to compare against.
-            verify_registry() {
-              local metadata
-              metadata="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" \
-                name version dist.integrity --json 2>/dev/null)" || return 1
-              jq -e \
-                --arg name "$PACKAGE_NAME" \
-                --arg version "$PACKAGE_VERSION" \
-                --arg integrity "$PACKAGE_INTEGRITY" \
-                '.name == $name and .version == $version and
-                 .["dist.integrity"] == $integrity' <<< "$metadata" >/dev/null
+            # SHA-512 proves exact attested bytes for tarball publication.
+            # One monotonic budget spans precheck, publication, and verification.
+            registry_state="$(mktemp)"
+            registry_result="$(mktemp)"
+            registry() {
+              python3 "$policy_root/scripts/verify-npm-immutable.py" "$1" \
+                --name "$PACKAGE_NAME" --version "$PACKAGE_VERSION" \
+                --integrity "$PACKAGE_INTEGRITY" --state "$registry_state"
             }
-
-            if verify_registry; then
-              echo "Verified existing immutable $PACKAGE_NAME@$PACKAGE_VERSION; nothing to republish."
+            report_registry() {
+              final_reason="$(jq -er '.final_reason' "$registry_result")"
+              echo "$PACKAGE_NAME@$PACKAGE_VERSION publish_status=$publish_status registry=$final_reason"
+              echo "$PACKAGE_NAME@$PACKAGE_VERSION publish_status=$publish_status registry=$final_reason" >> "$GITHUB_STEP_SUMMARY"
+              rm -f "$registry_state" "$registry_result"
+            }
+            publish_status=not-attempted
+            if registry precheck > "$registry_result"; then
+              report_registry
               echo "::endgroup::"
               continue
+            else
+              registry_status=$?
+              if [ "$registry_status" -ne 2 ]; then
+                report_registry
+                overall_status=1
+                echo "::endgroup::"
+                continue
+              fi
             fi
 
             # nw-423. npm provenance is the mechanism the hand-rolled
@@ -2175,47 +2150,60 @@ jobs:
             # tarball, which is what this job publishes so the artifact is
             # byte-identical to the attested one. Try it, fall back to
             # unsigned if npm rejects it, and REPORT which happened.
-            set +e
-            npm publish "$package_tarball" --ignore-scripts --access public --provenance
-            publish_status=$?
+            # Bound each publish by the same remaining package budget.
+            publish_package() {
+              local remaining
+              remaining="$(registry remaining)" || return 124
+              timeout --signal=KILL "$remaining" npm publish "$package_tarball" \
+                --ignore-scripts --access public "$@"
+            }
             provenance_attempted=1
-            if [ "$publish_status" -ne 0 ]; then
-              echo "::warning::npm publish --provenance exited $publish_status for $PACKAGE_NAME; retrying without provenance so the release still lands." >&2
-              npm publish "$package_tarball" --ignore-scripts --access public
+            if publish_package --provenance; then
+              publish_status=0
+            else
               publish_status=$?
-              provenance_attempted=0
+              # Preserve provenance fallback, but first reject immutable conflicts
+              # (or accept a successful publish whose client response was lost).
+              if registry probe > "$registry_result"; then
+                :
+              else
+                registry_status=$?
+                if [ "$registry_status" -ne 2 ]; then
+                  report_registry
+                  overall_status=1
+                  echo "::endgroup::"
+                  continue
+                fi
+                echo "::warning::npm publish --provenance exited $publish_status for $PACKAGE_NAME; retrying without provenance." >&2
+                provenance_attempted=0
+                if publish_package; then
+                  publish_status=0
+                else
+                  publish_status=$?
+                fi
+              fi
             fi
-            set -e
 
             report_provenance() {
               local attestations
-              attestations="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" dist.attestations --json 2>/dev/null || true)"
+              attestations="$(timeout --signal=KILL 20 npm view "$PACKAGE_NAME@$PACKAGE_VERSION" dist.attestations --json --fetch-timeout=20000 --fetch-retries=0 2>/dev/null || true)"
               if [ -n "$attestations" ] && [ "$attestations" != "null" ]; then
                 echo "PROVENANCE: attestation published for $PACKAGE_NAME@$PACKAGE_VERSION."
                 echo "PROVENANCE: attestation published for $PACKAGE_NAME (nw-423 can close on this)." >> "$GITHUB_STEP_SUMMARY"
               elif [ "$provenance_attempted" = "1" ]; then
-                echo "::warning::npm publish --provenance SUCCEEDED for $PACKAGE_NAME but no attestation is visible; provenance is silently not applying to pre-packed tarballs." >&2
-                echo "PROVENANCE: requested for $PACKAGE_NAME, publish succeeded, NO attestation visible (nw-423 stays open)." >> "$GITHUB_STEP_SUMMARY"
+                echo "::warning::npm provenance was requested for $PACKAGE_NAME (publish status $publish_status), but no attestation is visible." >&2
+                echo "PROVENANCE: requested for $PACKAGE_NAME, publish status $publish_status, NO attestation visible (nw-423 stays open)." >> "$GITHUB_STEP_SUMMARY"
               else
                 echo "PROVENANCE: not published for $PACKAGE_NAME; npm rejected --provenance for this publish shape." >> "$GITHUB_STEP_SUMMARY"
               fi
             }
 
-            published=0
-            for attempt in 1 2 3 4 5 6; do
-              if verify_registry; then
-                echo "Verified exact $PACKAGE_NAME@$PACKAGE_VERSION from $RELEASE_SHA."
-                report_provenance
-                published=1
-                break
-              fi
-              echo "Registry has not caught up for $PACKAGE_NAME (attempt $attempt/6); retrying in 10s."
-              sleep 10
-            done
-            if [ "$published" -ne 1 ]; then
-              echo "::error::npm publish status $publish_status for $PACKAGE_NAME did not produce the exact expected immutable package." >&2
+            if registry wait > "$registry_result"; then
+              report_provenance
+            else
               overall_status=1
             fi
+            report_registry
             echo "::endgroup::"
           done < <(jq -c '.[]' <<< "$PACKAGES_JSON")
 
