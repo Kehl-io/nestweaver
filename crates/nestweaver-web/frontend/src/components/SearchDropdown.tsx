@@ -26,6 +26,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const phraseResolution = useStore((s) => s.phraseResolution);
   const phraseResolving = useStore((s) => s.phraseResolving);
   const phraseError = useStore((s) => s.phraseError);
+  const scopeFilter = useStore((s) => s.scopeFilter);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const workspaces = useStore((s) => s.workspaces);
   const selectNode = useStore((s) => s.selectNode);
@@ -75,6 +76,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
       workspaces,
       symbolResults: searchResults,
       brainResults: brainSearchResults,
+      scopeFilter,
     })
       .then((resolution) => {
         if (requestId !== phraseRequestIdRef.current) return;
@@ -92,6 +94,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
     activeWorkspaceId,
     brainSearchResults,
     phraseIntent,
+    scopeFilter,
     searchResults,
     setPhraseError,
     setPhraseResolution,

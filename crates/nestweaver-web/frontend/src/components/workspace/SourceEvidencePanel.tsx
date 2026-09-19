@@ -157,8 +157,10 @@ export function SourceEvidencePanel({
     return () => controller.abort();
   }, [selectedNodeId, selectedNodeKind]);
 
-  const symbol = symbolDetail?.symbol;
-  const note = noteDetail?.note;
+  const symbol =
+    symbolDetail?.symbol.uid === selectedNodeId ? symbolDetail.symbol : undefined;
+  const note =
+    noteDetail?.note.uid === selectedNodeId ? noteDetail.note : undefined;
   const hasFileEvidence = Boolean(fileSource?.lines?.length || fileSymbols.length);
   const filePath = symbol?.file_path ?? graphEvidence?.filePath ?? "";
   const line =
