@@ -5851,7 +5851,7 @@ enum Commands {
         after_help = "Examples:\n  nestweaver backlinks 'Architecture Overview'\n  nestweaver backlinks note:vault:Notes:abc123 --json\n  nestweaver backlinks A --limit 5 --json"
     )]
     Backlinks {
-        /// Target note UID (`note:...`) or title
+        /// Target note UID (`note:...`), vault-relative path, or title
         target: String,
         #[arg(
             long,
@@ -7815,7 +7815,7 @@ enum NoteCommands {
         after_help = "Examples:\n  nestweaver note get 'Architecture Overview'\n  nestweaver note get note:vault:Notes:abc123 --json"
     )]
     Get {
-        /// Target note UID (`note:...`) or title
+        /// Target note UID (`note:...`), vault-relative path, or title
         target: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -15499,6 +15499,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&target, &payload, json);
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -15587,6 +15590,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&target, &payload, json);
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -28325,6 +28331,13 @@ fn run_brain(
                     Err(error)
                         if error
                             .chain()
+                            .any(|cause| cause.to_string().contains("Ambiguous")) =>
+                    {
+                        return Ok((report_context_lookup_failure(&error, json, &seeds), None));
+                    }
+                    Err(error)
+                        if error
+                            .chain()
                             .any(|cause| cause.to_string().contains("No seeds resolved")) =>
                     {
                         if json {
@@ -28343,6 +28356,10 @@ fn run_brain(
                     other => other?,
                 };
                 if let Some(result_json) = context_response {
+                    if payload_is_ambiguous(&result_json) {
+                        let label = seeds.first().map(String::as_str).unwrap_or("seed");
+                        return report_ambiguous_name_payload(label, &result_json, json);
+                    }
                     let source = hybrid_source_label(&result_json);
                     // Read the daemon's disclosure BEFORE `from_value` narrows
                     // the payload to the fields `BrainContextResult` declares —
@@ -28700,7 +28717,9 @@ fn run_brain(
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("No seeds resolved") {
+                    if msg.contains("Ambiguous") {
+                        Ok((report_context_lookup_failure(&e, json, &seeds), None))
+                    } else if msg.contains("No seeds resolved") {
                         if json {
                             println!(
                                 "{}",

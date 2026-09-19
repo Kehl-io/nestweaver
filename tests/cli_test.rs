@@ -2672,6 +2672,97 @@ fn backlinks_help_documents_the_limit_bound() {
 }
 
 #[test]
+fn duplicate_note_titles_exit_ambiguous_and_paths_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(vault_dir.join("folder1")).unwrap();
+    std::fs::create_dir_all(vault_dir.join("folder2")).unwrap();
+    std::fs::write(vault_dir.join("folder1").join("Same.md"), "# Same\n\none\n").unwrap();
+    std::fs::write(vault_dir.join("folder2").join("Same.md"), "# Same\n\ntwo\n").unwrap();
+    std::fs::write(vault_dir.join("Unique.md"), "# Unique\n").unwrap();
+    index_vault_notes(&vault_dir, &db_path);
+
+    let same = nestweaver_cmd()
+        .args(["note", "get", "Same", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        same.status.code(),
+        Some(3),
+        "duplicate titles must exit 3\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&same.stdout),
+        String::from_utf8_lossy(&same.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&same.stdout).unwrap();
+    assert_eq!(payload["status"], "ambiguous", "{payload}");
+    assert!(
+        payload["candidate_uids"]
+            .as_array()
+            .is_some_and(|uids| uids.len() == 2),
+        "{payload}"
+    );
+
+    let unique = nestweaver_cmd()
+        .args(["note", "get", "Unique", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        unique.status.success(),
+        "unique titles must still resolve\n{}",
+        String::from_utf8_lossy(&unique.stderr)
+    );
+    let unique_payload: serde_json::Value = serde_json::from_slice(&unique.stdout).unwrap();
+    assert_eq!(unique_payload["title"], "Unique", "{unique_payload}");
+
+    let pinned = nestweaver_cmd()
+        .args(["note", "get", "folder1/Same.md", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        pinned.status.success(),
+        "a vault-relative path must pin one note\n{}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let pinned_payload: serde_json::Value = serde_json::from_slice(&pinned.stdout).unwrap();
+    assert_eq!(pinned_payload["title"], "Same", "{pinned_payload}");
+    assert!(
+        pinned_payload["path"]
+            .as_str()
+            .is_some_and(|p| p.contains("folder1")),
+        "{pinned_payload}"
+    );
+
+    let backlinks = nestweaver_cmd()
+        .args(["backlinks", "Same", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        backlinks.status.code(),
+        Some(3),
+        "duplicate titles must exit 3 for backlinks\n{}",
+        String::from_utf8_lossy(&backlinks.stderr)
+    );
+
+    let context = nestweaver_cmd()
+        .args(["brain", "context", "Same", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        context.status.code(),
+        Some(3),
+        "duplicate titles must exit 3 for brain context\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&context.stdout),
+        String::from_utf8_lossy(&context.stderr)
+    );
+}
+
+#[test]
 fn e2e_index_and_query_js_repo() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
