@@ -66,10 +66,13 @@ fn manifest_unavailable(
     if let Some(status) = &rebuild
         && let Some(source_error) = &status.error
         && error.retryable
-        && source_error.expected_generation == error.expected_generation
         && source_error.reason
             == nestweaver_engine::manifest::ManifestUnavailableReason::SourceUnavailable
     {
+        // A later retryable stale/pending generation must not hide a blocked
+        // source failure, and must not prescribe `--force`. Recovery owns the
+        // sidecar catch-up; generation can advance while the source error is
+        // still the operator-relevant cause.
         error = source_error.clone();
     }
     let retryable = error.retryable
@@ -162,6 +165,51 @@ mod tests {
             error.message.contains("ranking"),
             "the error must name ranking as unavailable: {}",
             error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_source_failure_overrides_later_retryable_stale_generation() {
+        use nestweaver_engine::manifest::{
+            ManifestRecoveryRuntime, ManifestUnavailable, ManifestUnavailableReason,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let state = AppState::new(store, None, db_path);
+        let runtime = Arc::new(ManifestRecoveryRuntime::default());
+        runtime.publish(
+            "blocked",
+            0,
+            None,
+            Some(ManifestUnavailable::new(
+                ManifestUnavailableReason::SourceUnavailable,
+                generation,
+                "repo:default:fixture: go.mod: unsupported Go module directive this",
+            )),
+        );
+        assert!(state.manifest_recovery.set(runtime).is_ok());
+        let mut stale = ManifestUnavailable::new(
+            ManifestUnavailableReason::StaleGeneration,
+            generation + 2,
+            "repo_manifest stale artifact generation 4, expected 6; re-index with `nestweaver index --repo <path> --force`",
+        );
+        stale.actual_generation = Some(generation);
+        let response = manifest_unavailable(&state, stale);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["reason"], "source_unavailable");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.to_ascii_lowercase().contains("force"),
+            "blocked source recovery must not prescribe --force: {payload}"
+        );
+        assert!(
+            message.contains("go.mod"),
+            "operator-relevant source failure must remain visible: {payload}"
         );
     }
 
