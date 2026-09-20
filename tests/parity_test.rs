@@ -118,11 +118,10 @@ fn wait_for_daemon_readiness(
 /// socket accept; derivation-gated reads (backlinks) must wait until Current.
 fn wait_for_vault_derivation_current(db_path: &Path) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut last = String::from("<no status yet>");
+    let mut last;
     loop {
         let output = run_via_daemon(db_path, &["brain", "status", "--json"]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        last = stdout.into_owned();
+        last = String::from_utf8_lossy(&output.stdout).into_owned();
         if output.status.success() {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&last) {
                 let vault_count = status_vault_count(&value);
