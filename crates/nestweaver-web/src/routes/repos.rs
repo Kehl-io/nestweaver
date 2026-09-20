@@ -55,6 +55,13 @@ pub async fn cross_repo_refs(
     Ok(Json(json).into_response())
 }
 
+fn without_force_index_advice(message: &str) -> String {
+    message.replace(
+        "; re-index with `nestweaver index --repo <path> --force`",
+        "",
+    )
+}
+
 fn manifest_unavailable(
     state: &AppState,
     mut error: nestweaver_engine::manifest::ManifestUnavailable,
@@ -74,6 +81,12 @@ fn manifest_unavailable(
         // sidecar catch-up; generation can advance while the source error is
         // still the operator-relevant cause.
         error = source_error.clone();
+    }
+    if rebuild.is_some() && error.retryable {
+        // A watching coordinator owns sidecar catch-up. A 503 that still names
+        // `--force` while recovery is installed tells the operator to smash a
+        // generation the watcher is already going to rebuild.
+        error.message = without_force_index_advice(&error.message);
     }
     let retryable = error.retryable
         && rebuild.as_ref().is_some_and(|s| {
@@ -210,6 +223,42 @@ mod tests {
         assert!(
             message.contains("go.mod"),
             "operator-relevant source failure must remain visible: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_recovery_does_not_prescribe_force_for_stale_generation() {
+        use nestweaver_engine::manifest::{
+            ManifestRecoveryRuntime, ManifestUnavailable, ManifestUnavailableReason,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let state = AppState::new(store, None, db_path);
+        let runtime = Arc::new(ManifestRecoveryRuntime::default());
+        runtime.publish("ready", 0, None, None);
+        assert!(state.manifest_recovery.set(runtime).is_ok());
+        let mut stale = ManifestUnavailable::new(
+            ManifestUnavailableReason::StaleGeneration,
+            generation + 1,
+            "repo_manifest stale artifact generation 16, expected 17; re-index with `nestweaver index --repo <path> --force`",
+        );
+        stale.actual_generation = Some(generation);
+        let response = manifest_unavailable(&state, stale);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["reason"], "stale_generation");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.to_ascii_lowercase().contains("force"),
+            "watching recovery must not prescribe --force for a one-generation sidecar lag: {payload}"
+        );
+        assert!(
+            message.contains("stale artifact generation"),
+            "the operator still needs the stale generation numbers: {payload}"
         );
     }
 
