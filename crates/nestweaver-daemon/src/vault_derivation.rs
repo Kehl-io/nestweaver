@@ -301,6 +301,12 @@ pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> 
     if !requires_current_derivation(tool) {
         return Ok(());
     }
+    // In-memory test graphs use a non-durable db_path marker and have no
+    // derivation sidecar. Fail-closing those RPCs would mask authorization
+    // refusals with RecordUnavailable.
+    if state.db_path == Path::new(":memory:") {
+        return Ok(());
+    }
     admit_all_vaults(
         &state.store,
         &state.db_path,
@@ -323,16 +329,14 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
     )
     .ok()
     .flatten();
+    let Some(records) = records else {
+        return;
+    };
     let pending = records
-        .as_ref()
-        .map(|records| {
-            records
-                .vaults
-                .values()
-                .filter(|record| record.phase != DerivationPhase::Current)
-                .count()
-        })
-        .unwrap_or(0);
+        .vaults
+        .values()
+        .filter(|record| record.phase != DerivationPhase::Current)
+        .count();
     if let serde_json::Value::Object(object) = value {
         object.insert(
             "vault_derivation".to_string(),

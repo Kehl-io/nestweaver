@@ -1829,8 +1829,19 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         );
         assert!(absent.manifests.is_empty());
 
-        // PRESENT AND VALID — also no disclosure. This is the counterweight:
-        // a healthy load must add nothing at all.
+        // PRESENT AND VALID — also no disclosure. Coverage is measured against
+        // the live inventory, so the fixture must own the repo the sidecar names.
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:canonical".into(),
+                url: "https://example.test/canonical".into(),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: Some("canonical".into()),
+                root_path: None,
+            })
+            .unwrap();
         let manifests = HashMap::from([(
             "repo:canonical".to_string(),
             ManifestInfo {

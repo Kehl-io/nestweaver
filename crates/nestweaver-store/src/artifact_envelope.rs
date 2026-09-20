@@ -93,8 +93,14 @@ pub struct ArtifactExpectation<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ArtifactRejection {
-    #[error("stale artifact generation {actual}, expected {expected}; regenerate derived data")]
-    StaleGeneration { actual: u64, expected: u64 },
+    #[error(
+        "{kind} stale artifact generation {actual}, expected {expected}; re-index with `nestweaver index --repo <path> --force`"
+    )]
+    StaleGeneration {
+        kind: String,
+        actual: u64,
+        expected: u64,
+    },
     #[error(
         "rebuildable artifact: producer {actual}, expected {expected}; regenerate derived data"
     )]
@@ -167,11 +173,16 @@ impl ArtifactEnvelope {
         if self.envelope_version != ARTIFACT_ENVELOPE_VERSION
             || self.artifact_kind != expectation.artifact_kind
             || self.artifact_schema_version != expectation.artifact_schema_version
-            || self.algorithm_fingerprint != expectation.algorithm_fingerprint
         {
             return Err(Incompatible(
                 "envelope version, kind, schema or algorithm mismatch".into(),
             ));
+        }
+        if self.algorithm_fingerprint != expectation.algorithm_fingerprint {
+            return Err(Incompatible(format!(
+                "algorithm fingerprint mismatch (envelope '{}', expected '{}')",
+                self.algorithm_fingerprint, expectation.algorithm_fingerprint
+            )));
         }
         let observed_identity = PublicationIdentity {
             brain_uuid: self.brain_uuid.clone(),
@@ -199,6 +210,7 @@ impl ArtifactEnvelope {
             .map_err(|e| Corrupt(format!("decode artifact payload: {e}")))?;
         if self.source_graph_generation != expectation.source_graph_generation {
             return Err(StaleGeneration {
+                kind: expectation.artifact_kind.to_string(),
                 actual: self.source_graph_generation,
                 expected: expectation.source_graph_generation,
             });
