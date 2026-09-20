@@ -63,7 +63,12 @@ pub(crate) fn load_json<T: DeserializeOwned>(
             algorithm_fingerprint,
         })
         .map(Some)
-        .map_err(Into::into)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{artifact_kind} sidecar {}: {error}; re-index with `nestweaver index --repo <path> --force`",
+                path.display()
+            )
+        })
 }
 
 #[cfg(test)]

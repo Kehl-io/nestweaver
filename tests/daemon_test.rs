@@ -2073,12 +2073,11 @@ fn brain_status_adopts_the_incumbent_daemon_after_pidfile_unlink() {
 }
 
 /// The other side of the anti-impersonation gate: a rogue process squatting
-/// on the instance socket with NO daemon behind it is never adopted — the
-/// read degrades to the direct path, disclosed both on stderr and in-band
-/// (`degraded_components`, a `daemon_bypassed` warning, null daemon-runtime
-/// fields). Stdout alone must carry the disclosure.
+/// on the instance socket with NO daemon behind it is never adopted. Package A
+/// fail-closes rather than answering from a second store owner after the
+/// health timeout.
 #[test]
-fn brain_status_behind_a_rogue_socket_listener_degrades_with_disclosure() {
+fn brain_status_behind_a_rogue_socket_listener_refuses_direct_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("rogue").join("test.lbug");
@@ -2110,50 +2109,13 @@ fn brain_status_behind_a_rogue_socket_listener_degrades_with_disclosure() {
     let _ = std::fs::remove_dir_all(&runtime);
 
     assert!(
-        output.status.success(),
-        "the disclosed direct fallback still answers with exit 0: {output:?}"
+        !output.status.success(),
+        "a rogue socket must not be answered by a silent direct fallback: {output:?}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let value: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("brain status stdout is not JSON: {error}\n{stdout}"));
     let stderr = String::from_utf8_lossy(&output.stderr);
-
     assert!(
-        stderr.contains("answering from the read-only direct path"),
-        "the stderr disclosure must survive: {stderr}"
-    );
-    assert_eq!(
-        value["degraded_components"],
-        serde_json::json!(["daemon_runtime"]),
-        "the degraded marker must be in-band: {value}"
-    );
-    assert!(
-        value["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["kind"] == "daemon_bypassed"),
-        "a daemon_bypassed warning must carry the disclosure: {value}"
-    );
-    for field in [
-        "embedding_status",
-        "indexing_active",
-        "indexing_repo",
-        "queue_depth",
-        "write_queue_depth",
-        "write_holder",
-        "write_holder_seconds",
-        "tantivy_available",
-        "tantivy_doc_count",
-    ] {
-        assert!(
-            value.get(field).is_some_and(|v| v.is_null()),
-            "{field} must be an explicit null on the direct path: {value}"
-        );
-    }
-    assert!(
-        value["index_publication"].is_object(),
-        "file-derived fields still populate on the direct path: {value}"
+        stderr.contains("refusing direct fallback"),
+        "the refusal must name the closed fallback: {stderr}"
     );
 }
 

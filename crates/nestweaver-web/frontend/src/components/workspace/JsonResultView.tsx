@@ -87,6 +87,7 @@ function buildGraphPayload() {
     nodes,
     edges,
     attributes: impactAttributes(graph),
+    context_graph_meta: graphAttribute(graph, "contextGraphMeta"),
     _meta: {
       node_count: nodeCount,
       edge_count: edgeCount,
@@ -212,7 +213,7 @@ function capList<T>(items: T[], limit: number) {
 
 function capBrainContextResult(
   snapshot: BrainContextResult | null,
-): (BrainContextResult & { _meta: Record<string, unknown> }) | null {
+): (Omit<BrainContextResult, "_meta"> & { _meta: Record<string, unknown> }) | null {
   if (!snapshot) return null;
   const seeds = capList(snapshot.seeds, JSON_CAPS.diffSeeds);
   const connected = capList(snapshot.connected, JSON_CAPS.diffConnected);

@@ -117,6 +117,8 @@ jobs:
           filters: |
             rust:
               - '**/*.rs'
+              - 'tests/support/isolated_daemon.py'
+              - 'tests/support/release_*.py'
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -161,6 +163,7 @@ jobs:
               # regression tests (see the "Ready-regression integration
               # tests" step below), so a change to it must re-run the job.
               - 'tests/ready_regression_test.rs'
+              - 'tests/support/isolated_daemon.py'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
 
@@ -181,6 +184,7 @@ jobs:
     # back to back. The budget has to cover a cold build, not just a warm one.
     timeout-minutes: 90
     env:
+      NESTWEAVER_ALLOW_NO_DAEMON: "1"
       MACOSX_DEPLOYMENT_TARGET: "13.3"
       NESTWEAVER_METAL_SMOKE_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
     steps:
@@ -215,7 +219,25 @@ jobs:
           brew untap aws/tap || true
           brew install protobuf
       - name: Build Metal-enabled CLI
-        run: cargo build --locked --release --features metal
+        run: |
+          cargo build --locked --release --features metal
+          mkdir -p staged/standard
+          cp target/release/nestweaver staged/standard/nestweaver
+          codesign --force --sign - staged/standard/nestweaver
+          chmod a-w staged/standard/nestweaver
+      - name: Standard Metal artifact daemon acceptance
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
+      - name: Retain standard Metal daemon evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: standard-metal-daemon-evidence
+          path: |
+            /tmp/nw-release-*/evidence.jsonl
+            /tmp/nw-release-*/daemon.log
+          if-no-files-found: error
       - name: Record real model cache baseline (nw-483)
         # nw-483: distinct from this job's own $MODEL_CACHE (set up below by
         # "Configure isolated smoke paths" and deliberately exercised by the
@@ -261,18 +283,21 @@ jobs:
       # at all. That is how a daemon-crate flake hid the store and engine
       # suites entirely. Every other test job here already passes it.
       - name: Workspace unit tests (macOS portability gate)
-        run: cargo test --locked --release --features metal --workspace --lib --no-fail-fast
+        run: cargo test --locked --release --features metal,ci-direct-tests --workspace --lib --no-fail-fast
       # The --lib gate above did not cover INTEGRATION tests, and two of them
       # were failing on macOS the whole time: one #[cfg(target_os = "macos")]
       # test Linux CI can never run, and one gc test that passes on Linux but
       # diverges on macOS. Both are fixed; this keeps them fixed.
       - name: Daemon integration tests (macOS portability gate)
         run: |
-          cargo test --locked --release --features metal --test daemon_test --no-run
+          cargo test --locked --release --features metal,ci-direct-tests --test daemon_test --no-run
           codesign --force --sign - target/release/nestweaver
           codesign --verify --strict --verbose=2 target/release/nestweaver
           codesign --display --verbose=2 target/release/nestweaver
-          cargo test --locked --release --features metal --test daemon_test
+          cargo test --locked --release --features metal,ci-direct-tests --test daemon_test
+          mkdir -p staged/ci-direct
+          cp target/release/nestweaver staged/ci-direct/nestweaver
+          chmod a-w staged/ci-direct/nestweaver
       # nw-461: THE THREE macOS-divergent regressions in this repo's history
       # (nw-450 GNU-vs-BSD `tar | grep -q` under `pipefail`, nw-440 GNU-only
       # `find -printf`/`mapfile` in both release verifiers, and an
@@ -301,7 +326,7 @@ jobs:
       # report. `--no-fail-fast` for the same reason nw-205 added it to the
       # step above: one failing test must not hide the other 15.
       - name: Ready-regression integration tests (macOS portability gate)
-        run: cargo test --locked --release --features metal --test ready_regression_test --no-fail-fast
+        run: cargo test --locked --release --features metal,ci-direct-tests --test ready_regression_test --no-fail-fast
       # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
       #
       # A test binary has died with `signal: 11` on ~15% of runs of this job,
@@ -397,7 +422,7 @@ jobs:
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          BIN="$PWD/staged/ci-direct/nestweaver"
           "$BIN" --no-daemon index \
             --repo testdata/js --db "$SETUP_DB"
           "$BIN" --no-daemon embed --local --accelerator cpu \
@@ -409,7 +434,7 @@ jobs:
           chmod -R a-w "$MODEL_CACHE"
       - name: Assert clean daemon preconditions
         run: |
-          cargo test --locked --release --features metal --test metal_smoke \
+          cargo test --locked --release --features metal,ci-direct-tests --test metal_smoke \
             apple_hardware::cold_daemon_preconditions_are_clean \
             -- --ignored --exact --nocapture
       - name: Write explicit Metal instance config
@@ -430,7 +455,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           mkdir -p "$OUTPUT_DIR"
           "$BIN" index --repo testdata/js --db "$TARGET_DB" --config "$TARGET_CONFIG" \
             >"$OUTPUT_DIR/cold-index.stdout" 2>"$OUTPUT_DIR/cold-index.stderr"
@@ -465,7 +491,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           "$BIN" daemon --db "$TARGET_DB" stop \
             >"$OUTPUT_DIR/stop.stdout" 2>"$OUTPUT_DIR/stop.stderr"
 
@@ -497,7 +524,7 @@ jobs:
           grep -q "Embedding via daemon" "$OUTPUT_DIR/warm-embed.stderr"
       - name: Verify cache-only Metal vector
         run: |
-          cargo test --locked --release --features metal --test metal_smoke \
+          cargo test --locked --release --features metal,ci-direct-tests --test metal_smoke \
             apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal \
             -- --ignored --exact --nocapture
           find "$MODEL_CACHE" -type f -print0 |
@@ -532,7 +559,8 @@ jobs:
         run: |
           OUTPUT_DIR="${OUTPUT_DIR:-$RUNNER_TEMP/nestweaver-metal-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}}"
           mkdir -p "$OUTPUT_DIR"
-          BIN="$PWD/target/release/nestweaver"
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          BIN="$PWD/staged/standard/nestweaver"
           "$BIN" diagnostics capabilities --json \
             >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
           if [ -n "${TARGET_DB:-}" ]; then
@@ -655,7 +683,18 @@ jobs:
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
       - name: Build CLI
-        run: cargo build --locked
+        run: |
+          cargo build --locked
+          mkdir -p staged/standard
+          cp target/debug/nestweaver staged/standard/nestweaver
+          chmod a-w staged/standard/nestweaver
+      - name: Stage standard acceptance artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-standard-linux
+          path: staged/standard/nestweaver
+          if-no-files-found: error
+          retention-days: 1
       - name: Validate canonical instance config
         run: cargo run --locked -- config validate examples/minimal-instance.toml
       - name: Type-check benchmarks
@@ -683,7 +722,14 @@ jobs:
         # [workspace], so `cargo test` without it runs ONLY the root package's
         # tests and silently skips every sub-crate's unit tests (engine, store,
         # federation, mcp, …) — where most of the logic lives.
-        run: cargo test --locked --workspace --no-fail-fast -- --skip daemon_
+        # One target directory retains native dependencies; immutable copies
+        # keep the standard artifact separate from the unpublished CI binary.
+        run: |
+          cargo test --locked --workspace --features ci-direct-tests --no-fail-fast --no-run
+          mkdir -p staged/ci-direct
+          cp target/debug/nestweaver staged/ci-direct/nestweaver
+          chmod a-w staged/ci-direct/nestweaver
+          cargo test --locked --workspace --features ci-direct-tests --no-fail-fast -- --skip daemon_
         env:
           # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
           # the bypass. An ambient variable set by dozens of unrelated tools must
@@ -709,6 +755,44 @@ jobs:
           fi
           echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
           exit 1
+
+  standard-daemon:
+    name: Standard artifact daemon acceptance
+    needs: [changes, build-and-check]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-standard-linux
+          path: staged/standard
+      - name: Standard daemon bootstrap and explicit CI rejection probe
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          chmod 555 staged/standard/nestweaver
+          python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
+      - name: Standard artifact release contracts
+        run: |
+          unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
+          for suite in release_selectors release_gates release_notes release_dead_code release_dead_code_witnesses release_routes release_publication; do
+            python3 "tests/support/$suite.py" --binary "$PWD/staged/standard/nestweaver"
+          done
+          python3 tests/support/release_selectors.py --binary "$PWD/staged/standard/nestweaver" --during-index
+      - name: Retain owned daemon evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: standard-daemon-evidence
+          path: |
+            /tmp/nw-release-*/evidence.jsonl
+            /tmp/nw-release-*/daemon.log
+            /tmp/nw-release-*/ui.log
+          if-no-files-found: error
 
   clippy:
     name: Clippy
@@ -751,7 +835,7 @@ jobs:
       # Parallel with Build & Tests: when the shared rust cache is warm this
       # finishes in minutes instead of adding ~20 min serial to the build job.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --features ci-direct-tests --all-targets -- -D warnings
 
   daemon-tests:
     name: Daemon Integration Tests
@@ -833,11 +917,13 @@ jobs:
             echo "NW_MODEL_CACHE_PREEXISTED=false" >> "$GITHUB_ENV"
           fi
       - name: Daemon-named tests (skipped in the main job)
+        env:
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
         # (authz boundary, migration self-heal, daemon proxy, …) is not lost.
         # The `daemon_` filter is the exact complement of the main job's skip.
-        run: cargo test --locked --workspace --no-fail-fast -- daemon_
+        run: cargo test --locked --workspace --features ci-direct-tests --no-fail-fast -- daemon_
       - name: MCP daemon-feature tests
         # Check the standalone daemon-feature configuration separately from
         # workspace feature unification (which also enables embedding support).
@@ -920,11 +1006,11 @@ jobs:
         run: |
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --locked --tests
+          cargo build --locked --tests --features ci-direct-tests
       - name: Generate coverage
         # --workspace so coverage reflects the whole codebase, not just the root
         # package (see the Tests step note on the [package]+[workspace] manifest).
-        run: cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
+        run: cargo llvm-cov --workspace --features ci-direct-tests --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
         env:
           # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
           # the bypass. An ambient variable set by dozens of unrelated tools must
@@ -955,8 +1041,8 @@ jobs:
     # PR #389 jobs 103681801425/103757379892/103770556730, PR #392 job
     # 103841693321 — three truncations in a row, each rendered green with
     # ZERO mutants tested). The contract as of this change:
-    #   - a genuine cargo-mutants error/timeout, or a run that tested zero
-    #     mutants when it should have tested some, is now a real job
+    #   - a genuine cargo-mutants error/timeout, or a run with incomplete
+    #     mutant accounting, is now a real job
     #     `failure` (red X on the PR, `::error::` annotation, step summary
     #     line) — see the "Surviving mutants" step;
     #   - "no Rust package in the diff" and "diff generated zero mutants" stay
@@ -1095,13 +1181,7 @@ jobs:
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
           git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.files
-          mapfile -t pkgs < <(awk -F/ '
-            /^crates\/[^\/]+\// { print $2 }
-            /^src\//            { print "nestweaver" }
-            /^build\.rs$/       { print "nestweaver" }
-          ' /tmp/pr.files | sort -u)
-          printf '%s\n' "${pkgs[@]}" > /tmp/pr.pkgs
-          echo "package_count=${#pkgs[@]}" >> "$GITHUB_OUTPUT"
+          python3 scripts/select-mutation-packages.py /tmp/pr.files /tmp/pr.pkgs >> "$GITHUB_OUTPUT"
       - name: Warm the -p build shape before the mutation budget starts
         id: prewarm
         if: steps.prdiff.outputs.package_count != '0'
@@ -1339,7 +1419,9 @@ jobs:
           set -euo pipefail
           for pkg in "$@"; do
             echo "pre-warming: ${pkg}"
-            cargo test --locked --no-run --verbose --package="${pkg}"
+            feature_args=()
+            if [ "$pkg" = nestweaver ]; then feature_args=(--features ci-direct-tests); fi
+            cargo test --locked --no-run --verbose --package="${pkg}" "${feature_args[@]}"
           done
           PREWARM_SCRIPT
           # Branch on 124 SPECIFICALLY, which GNU `timeout` reserves for "the
@@ -1487,112 +1569,15 @@ jobs:
         # for more throughput cannot combine it with `--in-place` and would
         # need to re-litigate this whole tradeoff first.
         run: |
-          set +e
-          # nw-272: mutate the packages this DIFF touches, not the whole
-          # workspace. `--workspace` (nw-243) made cargo-mutants build and run
-          # every crate's test suite as its BASELINE before evaluating a single
-          # mutant, and on a 15-crate workspace that alone exceeds the budget:
-          # on #322 and #323 it found 53 and 110 mutants and tested ZERO, each
-          # time burning the full 35m on the baseline and reporting a green
-          # advisory check. nw-243's intent was that library crates be
-          # REACHABLE — not that the workspace be rebuilt every run.
-          #
-          # `--in-diff` already restricts which mutants are GENERATED; `-p`
-          # restricts what gets BUILT and baselined, which is the expensive
-          # half. Task 0.2b: read from /tmp/pr.pkgs, written ONCE by "Compute
-          # the PR diff" above and already consumed by "Warm the -p build
-          # shape" — recomputing the awk block here a second time would reopen
-          # the exact same-diff-two-computations drift risk that step's own
-          # comment warns about, just between two steps instead of two
-          # artifacts.
-          mapfile -t pkgs < /tmp/pr.pkgs
-          if [ "${#pkgs[@]}" -eq 0 ]; then
-            echo "no Rust package in this diff; nothing to mutate"
-            {
-              echo "status=0"
-              echo "truncated=false"
-              echo "no_packages=true"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          pkg_args=()
-          for pkg in "${pkgs[@]}"; do pkg_args+=(-p "${pkg}"); done
-          echo "mutating packages: ${pkgs[*]}"
-          # `--baseline skip` relies on THIS PR's commit already being GREEN in
-          # the `build-and-check` job before this job's result means anything
-          # (per the cargo-mutants book: "If you use --baseline=skip, you must
-          # make sure that the tests are actually passing, otherwise the
-          # results of cargo-mutants will be meaningless" —
-          # https://mutants.rs/baseline.html). That green run is NOT the same
-          # shape as this one, though: `build-and-check` runs
-          # `cargo test --workspace` (unified feature resolution across every
-          # crate) while this job runs `cargo test -p <touched-crate>` per
-          # package (see the nw-272 comment above for why). CLAUDE.md's "Build
-          # & Test" section documents concretely that `-p` and `--workspace`
-          # can resolve to DIFFERENT feature sets and therefore run different
-          # test counts for the same crate (nestweaver-daemon: 238 vs 264;
-          # nestweaver-mcp: 154 vs 180). Both shapes also set
-          # NESTWEAVER_NO_DAEMON=1 (this job further sets
-          # NESTWEAVER_ALLOW_NO_DAEMON=1, since CI/GITHUB_ACTIONS confer
-          # nothing per CLAUDE.md's daemon-architecture section), so daemon
-          # bypass itself is not the divergence — feature unification is. THE
-          # RISK: a test that is genuinely red only under the `-p` feature
-          # shape (never exercised, or exercised differently, under
-          # `--workspace`) would be invisible to `build-and-check`'s green
-          # checkmark, and with `--baseline skip` this job has no baseline run
-          # of its own left to catch it — every mutant's test run would then
-          # fail for a reason that has NOTHING to do with the mutation, and
-          # every one would misreport as "caught" (a false all-clear, not a
-          # false alarm — the dangerous direction, since it hides real
-          # coverage gaps behind an apparently-clean mutation report).
-          # Combined stdout+stderr is captured to mutants-console.log for the
-          # next step, WITHOUT losing the real exit status: `tee` is the last
-          # command in the pipeline, so a bare `$?` here would be `tee`'s own
-          # status (always 0 on a healthy write), not `timeout`'s/
-          # cargo-mutants'. `${PIPESTATUS[0]}` is bash's array of each
-          # pipeline stage's own exit code, taken BEFORE anything else can
-          # overwrite `$?` — index 0 is the `timeout ... cargo mutants ...`
-          # stage, i.e. exactly what `status=$?` captured before this was a
-          # pipeline. This is deliberately independent of whether `pipefail`
-          # is set (GitHub's default bash invocation already sets it, but
-          # relying on that default rather than reading it off the array
-          # would be silently wrong the day that default changes).
-          timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
-            cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
-              --in-place --build-timeout 300 \
-              --baseline skip --timeout 600 --no-shuffle -- --no-fail-fast \
-            2>&1 | tee mutants-console.log
-          status="${PIPESTATUS[0]}"
-          set -e
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
-          # GNU timeout reports 124 when it had to interrupt, 137 when the
-          # --kill-after SIGKILL was needed.
-          if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
-            echo "truncated=true" >> "$GITHUB_OUTPUT"
-            # NOT "partial" — a run cut short during the baseline tests ZERO
-            # mutants, and "partial" reads identically whether it reached 80 or
-            # none. The job summary carries the real count.
-            echo "::warning::Mutation testing hit its ${MUTANTS_BUDGET} budget and was cut short. It may have tested NO mutants at all — read the job summary for how far it actually got before treating this as a clean result."
-          else
-            echo "truncated=false" >> "$GITHUB_OUTPUT"
-          fi
-          # Exit status is a REPORT for the next step to classify, not a
-          # verdict on its own — the wrapper always exits 0 so `if: always()`
-          # below runs unconditionally. cargo-mutants' own exit codes
-          # (https://mutants.rs/exit-codes.html, confirmed against
-          # `src/exit_code.rs` in sourcefrog/cargo-mutants): 0 all caught,
-          # 1 usage error, 2 some mutants survived (a finding to report, not a
-          # build failure — mutation SCORE is not a merge gate), 3 some tests
-          # timed out, 4 the BASELINE failed or hung before any mutant ran
-          # (NOT "unviable mutants" — unviable mutants have no exit code of
-          # their own; they land in outcomes.json's `unviable` count but do
-          # not change `exit_code()`, whose only inputs are a non-mutant
-          # scenario failing, `timeout > 0`, or `missed > 0`), 5/6 the
-          # `--in-diff` diff didn't match the tree / couldn't be parsed,
-          # 70 an internal cargo-mutants error (`sysexit`'s EX_SOFTWARE). GNU
-          # `timeout`'s 124/137 below are a distinct, OUTER signal — this
-          # wrapper's own, not cargo-mutants'.
-          exit 0
+          set -euo pipefail
+          NW_REAL_CARGO="$(rustup which cargo)"
+          export NW_REAL_CARGO
+          mkdir -p "$RUNNER_TEMP/ci-cargo"
+          ln -s "$PWD/scripts/ci-direct-cargo.sh" "$RUNNER_TEMP/ci-cargo/cargo"
+          export CARGO="$RUNNER_TEMP/ci-cargo/cargo"
+          export PATH="$RUNNER_TEMP/ci-cargo:$PATH"
+          bash scripts/run-mutation-scope.sh --packages /tmp/pr.pkgs --diff /tmp/pr.diff \
+            --output "$PWD/mutation-evidence" --budget "$MUTANTS_BUDGET"
         env:
           # Deliberately shorter than the job's timeout-minutes so this
           # wrapper, not the runner, is what stops a long run. The gap between
@@ -1610,243 +1595,18 @@ jobs:
         # stopped early, or never ran at all, reports that in place of the
         # all-clear — it never gets to print "No surviving mutants".
         env:
-          TRUNCATED: ${{ steps.mutate.outputs.truncated }}
-          NO_PACKAGES: ${{ steps.mutate.outputs.no_packages }}
-          MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
           PREWARM_TIMED_OUT: ${{ steps.prewarm.outputs.timed_out }}
-          PREWARM_BUDGET: 30m
-          # Same value as the "Mutate only what this PR changed" step's env —
-          # only needed here to name the budget in the failure summary.
-          MUTANTS_BUDGET: 35m
         run: |
-          set -uo pipefail
-          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
-
-          # The pre-warm could not build this diff's packages inside its
-          # budget, so no mutation run was attempted. Reported as a SKIP, not
-          # a pass and not a finding: nothing here says anything about whether
-          # this PR's tests can kill mutants. Deliberately loud — the whole
-          # recurring defect in this job (nw-272, nw-445) is an absent signal
-          # that reads like a clean one, and "skipped" must never be mistaken
-          # for "no surviving mutants".
-          if [ "${PREWARM_TIMED_OUT:-}" = "true" ]; then
-            summary "### Mutation testing — SKIPPED (diff too wide)"
-            summary ""
-            summary "> **No mutation coverage was measured for this PR.** This is NOT a clean result."
-            summary ""
-            summary "Pre-warming the packages this diff touches did not finish inside \`${PREWARM_BUDGET}\`, so the mutation run was not started. cargo-mutants builds one package per mutant, and with a diff this wide it would have spent its entire budget building and tested zero mutants."
-            summary ""
-            summary "Nothing about this PR's mutation resistance is known. Review the diff's test coverage by hand, or split the PR so a budgeted run can complete."
-            echo "::warning::Mutation testing SKIPPED — diff too wide to pre-warm in ${PREWARM_BUDGET}. No mutation coverage measured; this is not a clean result."
-            exit 0
-          fi
-
-          # nw-272: no Rust package in the diff is legitimately nothing to do —
-          # distinct from "the report is missing", which the branches below
-          # treat as a non-result. Saying the wrong one of those is the whole
-          # defect this job keeps re-learning.
-          if [ "${NO_PACKAGES}" = "true" ]; then
-            summary "### Mutation testing"
-            summary "No Rust package in this diff, so no mutants were generated. Nothing to report."
-            exit 0
-          fi
-
-          # cargo-mutants itself (not just this job's own NO_PACKAGES check
-          # above) has a second, legitimate "nothing to mutate" outcome: an
-          # empty `--in-diff` diff, a diff touching no Rust source files, or
-          # a diff that resolves to zero mutants after filtering. Verified in
-          # the pinned source (cargo-mutants v27.1.0, `src/in_diff.rs`):
-          # `DiffFilterError::{EmptyDiff, NoSourceFiles, NoMutants}` all map
-          # to `ExitCode::Success` (0) and are logged via `info!("{err}")`
-          # BEFORE any lab/output is written — so `mutants.out/` is genuinely
-          # absent, not missing-because-something-broke. RE-VERIFY these
-          # three strings (`grep -n Display -A6 src/in_diff.rs` at the pinned
-          # tag) if the `cargo-mutants@` version in the "Install cargo-mutants"
-          # step above ever changes — they are Display-impl text, not a
-          # stable machine-readable contract.
-          CARGO_MUTANTS_NO_MUTANTS_MESSAGES=(
-            "Diff file is empty"
-            "Diff changes no Rust source files"
-            "No mutants to filter"
-          )
-          if [ "${MUTANTS_STATUS}" = "0" ] && [ ! -d mutants.out ] && [ -f mutants-console.log ]; then
-            for msg in "${CARGO_MUTANTS_NO_MUTANTS_MESSAGES[@]}"; do
-              if grep -qF -- "${msg}" mutants-console.log; then
-                summary "### Mutation testing"
-                summary "cargo-mutants reported \"${msg}\" — nothing to mutate in this diff. Nothing to report."
-                exit 0
-              fi
-            done
-          fi
-
-          # `total` MUST come from mutants.out/mutants.json, unconditionally,
-          # whenever that file exists — never from outcomes.json's
-          # `total_mutants`. cargo-mutants writes mutants.json UP FRONT,
-          # before any build or test (`cargo_mutants::lab`, src/lab.rs ~44),
-          # so its length is the PLANNED mutant count regardless of how many
-          # have actually been processed. `total_mutants` in outcomes.json is
-          # NOT that: `LabOutcome::add()` (src/outcome.rs) increments
-          # `total_mutants` in the SAME call that increments a
-          # caught/missed/timeout/unviable counter, so on outcomes.json alone
-          # `total_mutants` always equals the already-processed count — a run
-          # that planned N mutants and was killed (or crashed) before testing
-          # any of them would read `total_mutants=0`, `tested=0`, and fall
-          # into the "diff generated no mutants" branch below: the exact
-          # nw-445 false all-clear this job exists to catch, just moved one
-          # layer down. If mutants.json is itself missing, `total` stays
-          # unknown (""). That case is NOT left to the "status not in
-          # {0,2,3}" rule to catch incidentally — an unknown total is
-          # EXPLICITLY failed below (`[ -z "${total}" ] && fail=true`),
-          # because outcomes.json can exist and parse cleanly with
-          # MUTANTS_STATUS=0 even when mutants.json is gone (e.g. it was
-          # deleted between steps, or a future cargo-mutants version moves
-          # where it's written), and that combination must not silently pass
-          # just because no other rule happened to fire.
-          total=""
-          if [ -f mutants.out/mutants.json ]; then
-            total=$(jq 'length' mutants.out/mutants.json 2>/dev/null || echo "")
-          fi
-
-          # `tested` (the caught/missed/timeout/unviable breakdown) still
-          # prefers mutants.out/outcomes.json — cargo-mutants' own summary;
-          # field names confirmed against `LabOutcome` in
-          # sourcefrog/cargo-mutants `src/outcome.rs`, since the mutants.rs
-          # book documents the file's existence but not its exact fields.
-          # `write_lab_outcome()` runs "multiple times as the lab runs, and
-          # once at the end" per that source, so even a run cut short by the
-          # outer `timeout` (SIGINT) below should leave a last-written, if
-          # incomplete, outcomes.json. Fall back to the historical
-          # *.txt-line-count method (every mutant that produced a verdict
-          # lands in exactly one of caught/missed/timeout/unviable.txt) both
-          # for a run killed before outcomes.json's first write, AND for a
-          # SIGINT that lands mid-write and leaves a half-flushed,
-          # unparseable outcomes.json — `jq -e .` below rejects that case
-          # rather than trusting a torn read.
-          report_present=false
-          tested=""
-          if [ -f mutants.out/outcomes.json ] && jq -e . mutants.out/outcomes.json >/dev/null 2>&1; then
-            report_present=true
-            caught=$(jq -r '.caught // 0' mutants.out/outcomes.json)
-            missed_n=$(jq -r '.missed // 0' mutants.out/outcomes.json)
-            timeout_n=$(jq -r '.timeout // 0' mutants.out/outcomes.json)
-            unviable=$(jq -r '.unviable // 0' mutants.out/outcomes.json)
-            tested=$(( caught + missed_n + timeout_n + unviable ))
-          elif [ -d mutants.out ]; then
-            report_present=true
-            tested=0
-            for f in caught missed timeout unviable; do
-              if [ -f "mutants.out/${f}.txt" ]; then
-                tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
-              fi
-            done
-          fi
-          tested="${tested:-0}"
-
-          progress="${tested} mutants"
-          if [ -n "${total}" ]; then
-            progress="${tested} of ${total} mutants"
-          fi
-
-          # FAIL — a real job failure, not a hidden warning — whenever
-          # cargo-mutants' own exit code isn't one that leaves a trustworthy
-          # report (0 all caught, 2 some survived, 3 some timed out; see the
-          # exit-code comment on the step above, confirmed against
-          # `src/exit_code.rs`), OR the planned mutant count can't be
-          # verified at all (mutants.json missing), OR mutants were planned
-          # but NONE were actually tested. Succeed — with an explicit summary
-          # line, never a silent no-op — only for the two legitimate
-          # all-clears: nothing to mutate (handled above) or a complete run
-          # that planned zero mutants. Surviving mutants (status 2) alone are
-          # NOT a failure: mutation testing is a report, not a merge gate.
-          fail=false
-          if [ "${MUTANTS_STATUS}" != "0" ] && [ "${MUTANTS_STATUS}" != "2" ] && [ "${MUTANTS_STATUS}" != "3" ]; then
-            fail=true
-          fi
-          if [ "${report_present}" = "false" ]; then
-            fail=true
-          fi
-          # An unverifiable total is ALWAYS a failure, independent of status —
-          # this must not depend on MUTANTS_STATUS happening to also be bad.
-          # Without this line, a parseable outcomes.json plus MUTANTS_STATUS=0
-          # and a missing mutants.json passed every other check above and
-          # fell through to the "diff generated no mutants" success message,
-          # which is a false all-clear (nw-445) hiding behind a status the
-          # other two conditions treat as trustworthy.
-          if [ -z "${total}" ]; then
-            fail=true
-          fi
-          if [ -n "${total}" ] && [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
-            fail=true
-          fi
-
-          summary "## Mutation testing (advisory)"
-          summary ""
-
-          if [ "${fail}" = "true" ]; then
-            if [ "${report_present}" = "false" ]; then
-              reason="cargo-mutants produced no report at all (exit status \`${MUTANTS_STATUS:-unknown}\`) — mutants.out/ is missing."
-            elif [ "${TRUNCATED}" = "true" ]; then
-              reason="the run hit its \`${MUTANTS_BUDGET}\` budget and was cut short (exit status \`${MUTANTS_STATUS}\`), reaching only ${progress} before being stopped."
-            elif [ -z "${total}" ]; then
-              reason="mutants.out/mutants.json (the planned mutant list, written before any build or test) is missing, so the planned mutant count cannot be verified (exit status \`${MUTANTS_STATUS}\`)."
-            elif [ "${total}" -gt 0 ] && [ "${tested}" -eq 0 ]; then
-              reason="${total} mutants were planned but zero were tested (exit status \`${MUTANTS_STATUS}\`)."
-            else
-              reason="cargo-mutants exited with status \`${MUTANTS_STATUS}\`, which is not one of the trustworthy codes (0, 2, 3)."
-            fi
-            echo "::error::Mutation testing produced no usable signal: ${reason}"
-            summary "> [!CAUTION]"
-            summary "> **FAILED — no usable mutation signal.**"
-            summary "> ${reason}"
-            summary "> An absent signal must not read as an all-clear — see this job's own header comment for the full pass/fail contract."
-            summary ""
-          fi
-
-          if [ -s mutants.out/missed.txt ]; then
-            summary "### Surviving mutants"
-            summary ""
-            summary "Each line is a change to this PR's code that NO test noticed."
-            summary "That is not automatically a defect — but it is a test that would"
-            summary "not have caught the bug it appears to guard."
-            summary ""
-            summary '```'
-            cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
-            summary '```'
-          elif [ "${fail}" = "true" ]; then
-            summary "No mutants were tested (or the report was missing) — see the failure above."
-          elif [ "${tested}" -eq 0 ]; then
-            # Not a pass and not a failure: the diff touched nothing mutable.
-            summary "This PR's diff generated no mutants — nothing in it was mutable."
-          else
-            summary "No surviving mutants in this diff (${progress} tested)."
-          fi
-
-          if [ "${fail}" = "true" ]; then
-            exit 1
-          fi
+          args=()
+          if [ "$PREWARM_TIMED_OUT" = true ]; then args+=(--prewarm-skipped); fi
+          python3 scripts/report-mutation-results.py --evidence "$PWD/mutation-evidence" "${args[@]}"
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-report
-          # Multiple paths, one per line (actions/upload-artifact's own
-          # README at this pinned SHA, "Upload using Multiple Paths and
-          # Exclusions") — mutants-console.log is the raw stdout+stderr
-          # capture the mutate step now writes (`tee`) for the "legitimate
-          # zero mutants" evaluation branch, and is useful on its own for
-          # diagnosing a genuine failure too.
-          path: |
-            mutants.out/
-            mutants-console.log
-          # `if-no-files-found` only fires when NONE of the paths above
-          # match anything — per the same README ("If a path (or paths),
-          # result in no files being found for the artifact..."). So
-          # mutants.out/ being absent (the legitimate no-mutants case, or
-          # any other run that never produced a report) does not trigger
-          # this on its own as long as mutants-console.log exists; `ignore`
-          # only matters for the true no-packages-in-diff case, where
-          # neither path has anything to upload.
-          if-no-files-found: ignore
+          path: mutation-evidence/
+          if-no-files-found: error
 
   audit:
     name: Security Audit
@@ -2019,10 +1779,6 @@ jobs:
     # side changes.
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
-    env:
-      # See the note on the Tests step: the bypass is explicit now.
-      NESTWEAVER_ALLOW_NO_DAEMON: "1"
-      NESTWEAVER_NO_DAEMON: "1"
     steps:
       - name: Free disk space
         run: |
@@ -2066,27 +1822,33 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build (triggers lbug prebuilt download on first run)
-        run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
-          sleep 2
-          cargo build
-      - name: Index test data
-        env:
-          NESTWEAVER_ALLOW_NO_DAEMON: "1"
-        run: ./target/debug/nestweaver --no-daemon index --repo testdata/js --db /tmp/test.lbug
+      - name: Build frontend for standard browser acceptance
+        working-directory: crates/nestweaver-web/frontend
+        run: npm run build
+      - name: Build standard daemon and embedded UI
+        run: cargo build --locked
       - name: Install Playwright browsers
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright install --with-deps chromium
       - name: Run E2E tests
         working-directory: crates/nestweaver-web/frontend
-        run: npx playwright test
+        run: |
+          browser_executable=$(node -e 'process.stdout.write(require("@playwright/test").chromium.executablePath())')
+          python3 ../../../tests/support/release_ui.py \
+            --binary ../../../target/debug/nestweaver \
+            --node "$(command -v node)" \
+            --browser "$browser_executable"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-report
-          path: crates/nestweaver-web/frontend/playwright-report/
+          path: |
+            /tmp/nw-release-*/browser-results/
+            /tmp/nw-release-*/browser.log
+            /tmp/nw-release-*/ui.log
+            /tmp/nw-release-*/daemon.log
+            /tmp/nw-release-*/evidence.jsonl
 
   required-ci:
     name: Required CI
@@ -2101,6 +1863,7 @@ jobs:
       - build-and-check
       - clippy
       - daemon-tests
+      - standard-daemon
       - audit
       - secret-scan
       - npm-install-smoke
@@ -2128,6 +1891,10 @@ jobs:
           bash scripts/verify-main-rules.sh --ruleset .github/main-ruleset.json
           bash scripts/verify-main-rules.sh --self-test
           python3 scripts/test-verify-release-fault.py
+          python3 scripts/test-release-publication-gates.py
+          python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v
+          python3 -m unittest discover -s tests/support -p test_release_publication_failure.py -v
+          python3 scripts/verify-ci-runtime-contracts.py
           node npm/nestweaver.test.js
           bash scripts/dedupe-changelog-entries.sh --self-test
           bash scripts/verify-release-bundle.sh --self-test

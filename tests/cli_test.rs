@@ -1224,8 +1224,9 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
         "the Linux archive must carry and resolve the exact GCC 13 runtimes it was built against"
     );
     assert!(
-        workflow.contains("NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1")
-            && workflow.contains("--name release-artifact-smoke")
+        workflow.contains("with IsolatedDaemon(sys.argv[1]) as fixture:")
+            && workflow.contains("fixture.bootstrap()")
+            && workflow.contains("fixture.check_standard_artifact_policy_in_ci()")
             && workflow.contains("--with-trigrams"),
         "release verification must open a real database and index code; \
          `--version` did not catch the v9.0.3 runtime segfault"
@@ -1243,11 +1244,11 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
             && workflow.contains("CFLAGS: \"-DZSTD_DISABLE_ASM\"")
             && !workflow.contains("fuse-ld=mold")
             && workflow.contains("zstdnoasm-gnuld")
-            && workflow.contains("thread apply all backtrace")
+            && workflow.contains("/tmp/nw-release-*/daemon.log")
             && workflow.contains("visibility_after: $after, automation_pr: $canary"),
         "release dry-run must be mode-isolated and preserve observed tag/release/npm plus \
          automation-PR evidence; Linux must use the system linker and the same zstd \
-         native-code contract as normal CI, with a backtrace on functional-smoke failure"
+         native-code contract as normal CI, with daemon evidence on functional-smoke failure"
     );
 }
 
@@ -1830,7 +1831,7 @@ fn ci_metal_smoke_runs_ready_regression_between_the_real_cache_guards() {
     // compile (see CONTRIBUTING.md's `just test-crate` / `-p` re-fingerprint
     // warning for why a differing shape is expensive here).
     for required in [
-        "cargo test --locked --release --features metal --test ready_regression_test",
+        "cargo test --locked --release --features metal,ci-direct-tests --test ready_regression_test",
         "--no-fail-fast",
     ] {
         assert!(
@@ -1869,12 +1870,14 @@ fn ci_metal_smoke_runs_ready_regression_between_the_real_cache_guards() {
     );
     assert!(
         job.contains(
-            "cargo test --locked --release --features metal --workspace --lib --no-fail-fast"
+            "cargo test --locked --release --features metal,ci-direct-tests --workspace --lib --no-fail-fast"
         ),
         "the pre-existing workspace --lib gate must stay in place unchanged"
     );
     assert!(
-        job.contains("cargo test --locked --release --features metal --test daemon_test"),
+        job.contains(
+            "cargo test --locked --release --features metal,ci-direct-tests --test daemon_test"
+        ),
         "the pre-existing daemon_test gate must stay in place unchanged"
     );
 }
@@ -3556,7 +3559,9 @@ fn cli_limit_help_states_the_default_the_code_actually_applies() {
         .assert()
         .success()
         .stdout(contains("default 50"))
-        .stdout(contains("default: all").not());
+        .stdout(contains("default: all").not())
+        .stdout(contains("confidence scoring based on visibility").not())
+        .stdout(contains("review candidates"));
 
     // … and "there is no 'all'" must be true: the cap has no off switch.
     nestweaver_cmd()
@@ -8381,8 +8386,8 @@ fn the_autostart_guard_only_refuses_a_log_no_open_can_replay() {
 ///
 /// The item's stated trigger was wrong and is corrected here. Bare
 /// `NESTWEAVER_NO_DAEMON=1` routing through the daemon is CORRECT by policy:
-/// `no_daemon_allowed_from` grants the bypass on `NESTWEAVER_ALLOW_NO_DAEMON`
-/// alone, and `CI`/`GITHUB_ACTIONS` confer nothing, deliberately. The case that
+/// The internal CI feature, `NESTWEAVER_ALLOW_NO_DAEMON`, and a GitHub
+/// Actions runner context must all be present to grant a bypass. The case that
 /// matters is the one where the bypass IS granted.
 ///
 /// The cost is concrete and is already recorded elsewhere in this repo:

@@ -88,6 +88,7 @@ function clipboardUnavailable(): boolean {
 }
 
 let latestTraceActionId = 0;
+let latestCompareActionId = 0;
 
 export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const selectNode = useStore((s) => s.selectNode);
@@ -232,6 +233,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
       icon: GitCompare,
       focus: "analysis",
       run: async () => {
+        const compareActionId = ++latestCompareActionId;
         selectForLens(
           {
             lens: "context",
@@ -241,8 +243,21 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
           },
           "analysis",
         );
-        const result = await api.brainContext([node.uid], 2000, "all");
-        startDiff(result, [node.uid]);
+        startDiff(null, [node.uid]);
+        const current = () => {
+          const state = useStore.getState();
+          return compareActionId === latestCompareActionId && state.diffActive &&
+            state.selectedNodeId === node.uid && state.activeWorkspaceId === activeWorkspaceId &&
+            state.activeLens.label === `Compare ${label}` && state.activeLens.targetUid === node.uid;
+        };
+        try {
+          const result = await api.brainContext([node.uid], null, "all", activeWorkspaceId);
+          if (current()) startDiff(result, [node.uid]);
+        } catch (error) {
+          if (!current()) return;
+          useStore.getState().clearDiff();
+          notify({ kind: "error", title: "Compare failed", message: error instanceof Error ? error.message : "The first context could not be loaded." });
+        }
       },
     },
     {

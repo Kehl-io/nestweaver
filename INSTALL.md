@@ -252,11 +252,16 @@ nestweaver mcp --db ./nestweaver.lbug
 The daemon owns the database exclusively. It auto-starts on first use and logs
 to `~/.local/state/nestweaver/<instance>/daemon.log`.
 
-In CI, `--no-daemon` / `NESTWEAVER_NO_DAEMON=1` only **request** a daemon
-bypass. `NESTWEAVER_ALLOW_NO_DAEMON=1` is the only thing that **permits** one —
-`CI=true` and `GITHUB_ACTIONS` confer nothing. Without the opt-in the flag is
-disclosed on stderr and the command autostarts a daemon anyway, which then holds
-the write lease for the rest of the job.
+Daemon bypass is CI-only and is disabled in all standard development and
+release artifacts, including when a runtime permit is set. Local CLI, MCP,
+HTTP, fixtures, and recovery use a daemon. An unavailable daemon must be
+reconnected or diagnosed; bypassing it is not a recovery option.
+
+Internal CI direct-store suites use a separately built, unpublished
+`ci-direct-tests` artifact, an explicit `NESTWEAVER_ALLOW_NO_DAEMON=1` permit,
+and a GitHub Actions runner context. Ambient `CI=true` is not a permit. CI must
+also test the standard artifact through a real isolated daemon with bypass
+variables absent.
 
 ## Optional: Git history analysis
 

@@ -1238,6 +1238,24 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
 
 // ── core parse ─────────────────────────────────────────────────────────────
 
+/// Validate the syntax of executable manifest DSLs without evaluating them.
+/// This intentionally supports only the grammars used by manifest recovery;
+/// ordinary code indexing retains its error-tolerant extraction behavior.
+pub fn validate_manifest_syntax(path: &Path, source: &str) -> Result<(), ParseError> {
+    let lang = detect_language(path)
+        .filter(|lang| matches!(lang, Language::Ruby | Language::Swift | Language::Kotlin))
+        .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_string_lossy().into_owned()))?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&build_ts_language(lang, path))
+        .map_err(|_| ParseError::ParseFailed)?;
+    let tree = parser.parse(source, None).ok_or(ParseError::ParseFailed)?;
+    if tree.root_node().has_error() {
+        return Err(ParseError::ParseFailed);
+    }
+    Ok(())
+}
+
 /// Parse a single source file and extract symbols and references.
 pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError> {
     // Arena for intermediate string allocations during tree-sitter traversal.
@@ -1339,6 +1357,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
+    let exported_locals = if matches!(lang, Language::JavaScript | Language::TypeScript) {
+        collect_export_clause_names(tree.root_node(), source_bytes)
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
     while let Some(m) = matches.next() {
@@ -1549,7 +1572,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
                 // is reachable by regression-test selection regardless of filename.
-                let ep_kind = if node.kind() == "call_expression" {
+                let ep_kind = if exported_locals.contains(name.as_str())
+                    && is_local_runtime_declaration(node)
+                {
+                    Some(EntryPointKind::Main)
+                } else if node.kind() == "call_expression" {
                     Some(EntryPointKind::TestEntry)
                 } else {
                     // Rust `#[test]`/`#[tokio::test]` attributes are preceding
@@ -1575,8 +1602,14 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     )
                 };
 
-                let visibility =
-                    infer_visibility(&name, node_text, lang, has_export_ancestor(&node));
+                let visibility = infer_visibility(
+                    &name,
+                    node_text,
+                    lang,
+                    has_export_ancestor(&node)
+                        || (exported_locals.contains(name.as_str())
+                            && is_local_runtime_declaration(node)),
+                );
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     find_parent_name(&node, source_bytes)
@@ -1891,35 +1924,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
-    // nw-155: promote symbols named in an `export { .. }` clause to Public.
-    //
-    // has_export_ancestor only recognises the INLINE form, where the declaration
-    // is nested under an export_statement. The list form is a separate statement
-    // elsewhere in the file, so `function _init() {}` + `export { _init as
-    // default }` left _init marked Private -- and dead_code::infer_confidence
-    // returns High for anything private, so a module's DEFAULT EXPORT was
-    // reported as high-confidence dead code. All 154 high-confidence results on
-    // the reference graph were of this shape.
-    if matches!(
-        lang,
-        Language::JavaScript
-            | Language::TypeScript
-            | Language::Vue
-            | Language::Svelte
-            | Language::Astro
-    ) {
-        let exported = collect_export_clause_names(tree.root_node(), source_bytes);
-        if !exported.is_empty() {
-            for symbol in &mut symbols {
-                if symbol.visibility == Visibility::Private
-                    && exported.contains(symbol.name.as_str())
-                {
-                    symbol.visibility = Visibility::Public;
-                }
-            }
-        }
-    }
-
     // Type extraction: walk the same tree with type-specific queries
     let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
 
@@ -1931,26 +1935,72 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     })
 }
 
-/// Collect the LOCAL names bound by every `export { .. }` clause in a file.
-///
-/// For `export { alpha, beta as default }` this yields {"alpha", "beta"} — the
-/// local name is what identifies the declaration, not the exported alias.
+/// Recognize an actual module-level runtime declaration while its AST node
+/// is available. Names/line spans alone cannot distinguish nested shadows.
+fn is_local_runtime_declaration(node: tree_sitter::Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "class_declaration"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "enum_declaration"
+            | "export_statement"
+    ) {
+        return false;
+    }
+    match node.parent() {
+        Some(parent) if parent.kind() == "program" => true,
+        Some(parent) if parent.kind() == "export_statement" => {
+            parent.parent().is_some_and(|p| p.kind() == "program")
+        }
+        _ => false,
+    }
+}
+
+/// Local value exports only: re-exports and TypeScript type-only clauses do
+/// not bind declarations in this module. Match the local name, not its alias.
 fn collect_export_clause_names<'a>(
     node: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
 ) -> std::collections::HashSet<&'a str> {
+    fn has_type_token(node: tree_sitter::Node<'_>) -> bool {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| child.kind() == "type")
+    }
     let mut names = std::collections::HashSet::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "export_specifier"
-            && let Some(local) = current.child_by_field_name("name")
-            && let Ok(text) = local.utf8_text(source_bytes)
+    let mut cursor = node.walk();
+    for statement in node.named_children(&mut cursor) {
+        if statement.kind() != "export_statement"
+            || statement.child_by_field_name("source").is_some()
+            || has_type_token(statement)
         {
-            names.insert(text);
+            continue;
         }
-        let mut cursor = current.walk();
-        for child in current.children(&mut cursor) {
-            stack.push(child);
+        // `export default local;` is a local identifier expression.
+        if let Some(value) = statement.child_by_field_name("value")
+            && value.kind() == "identifier"
+            && let Ok(name) = value.utf8_text(source_bytes)
+        {
+            names.insert(name);
+        }
+        let mut statement_cursor = statement.walk();
+        for clause in statement.named_children(&mut statement_cursor) {
+            if clause.kind() != "export_clause" {
+                continue;
+            }
+            let mut clause_cursor = clause.walk();
+            for specifier in clause.named_children(&mut clause_cursor) {
+                if specifier.kind() == "export_specifier"
+                    && !has_type_token(specifier)
+                    && let Some(local) = specifier.child_by_field_name("name")
+                    && let Ok(name) = local.utf8_text(source_bytes)
+                {
+                    names.insert(name);
+                }
+            }
         }
     }
     names
@@ -8695,6 +8745,174 @@ mod js_const_scope_tests {
 mod export_clause_tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn local_list_exports_root_value_declarations_and_aliases_only() {
+        let parsed = parse_source(
+            Path::new("src/library.js"),
+            concat!(
+                "function alpha() { return 1; }\n",
+                "function beta() { return 2; }\n",
+                "const arrow = () => 3;\n",
+                "function untouched() { return 4; }\n",
+                "export { alpha as renamed, beta as default, arrow };\n",
+            ),
+        )
+        .unwrap();
+        for name in ["alpha", "beta", "arrow"] {
+            let symbol = parsed.symbols.iter().find(|s| s.name == name).unwrap();
+            assert!(symbol.is_entry_point, "local export {name} must be a root");
+            assert_eq!(symbol.visibility, Visibility::Public);
+        }
+        assert!(
+            !parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "untouched")
+                .unwrap()
+                .is_entry_point
+        );
+    }
+
+    #[test]
+    fn list_exports_bind_each_declarator_without_promoting_same_named_methods() {
+        let parsed = parse_source(
+            Path::new("src/library.js"),
+            concat!(
+                "const kept = () => 1, hidden = () => 2;\n",
+                "class Container { kept() { return 3; } hidden() { return 4; } }\n",
+                "export { kept as default, Container };\n",
+            ),
+        )
+        .unwrap();
+        let kept = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "kept" && s.start_line == 1)
+            .unwrap();
+        assert!(kept.is_entry_point);
+        assert_eq!(kept.visibility, Visibility::Public);
+        assert!(
+            !parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "hidden" && s.start_line == 1)
+                .unwrap()
+                .is_entry_point
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "Container")
+                .unwrap()
+                .is_entry_point
+        );
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2);
+        assert!(methods.iter().all(|s| !s.is_entry_point));
+    }
+
+    #[test]
+    fn export_from_and_nested_shadows_do_not_root_local_names() {
+        let parsed = parse_source(Path::new("src/library.js"), concat!(
+            "function exported() { return 1; }\n",
+            "function outer() {\n  function exported() { return 2; }\n  return exported();\n}\n",
+            "function remote() { return 3; }\n",
+            "export { exported };\nexport { remote as default } from './other.js';\n",
+        )).unwrap();
+        let shadows: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "exported")
+            .collect();
+        assert_eq!(shadows.len(), 2);
+        assert_eq!(shadows.iter().filter(|s| s.is_entry_point).count(), 1);
+        assert!(
+            shadows
+                .iter()
+                .find(|s| s.start_line == 1)
+                .unwrap()
+                .is_entry_point
+        );
+        assert!(
+            !parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "remote")
+                .unwrap()
+                .is_entry_point
+        );
+    }
+
+    #[test]
+    fn typescript_type_only_exports_do_not_root_runtime_values() {
+        let parsed = parse_source(
+            Path::new("src/library.ts"),
+            concat!(
+                "class Shape {}\nclass Other {}\nfunction value() { return 1; }\n",
+                "export type { Shape };\nexport { type Other, value as renamed };\n",
+            ),
+        )
+        .unwrap();
+        for name in ["Shape", "Other"] {
+            assert!(
+                !parsed
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap()
+                    .is_entry_point,
+                "{name}"
+            );
+        }
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "value")
+                .unwrap()
+                .is_entry_point
+        );
+    }
+
+    #[test]
+    fn default_identifier_export_roots_local_value_not_imported_shadow() {
+        let local = parse_source(
+            Path::new("src/library.js"),
+            "function localValue() {}\nexport default localValue;\n",
+        )
+        .unwrap();
+        assert!(
+            local
+                .symbols
+                .iter()
+                .find(|s| s.name == "localValue")
+                .unwrap()
+                .is_entry_point
+        );
+        let imported = parse_source(
+            Path::new("src/library.js"),
+            concat!(
+                "import { borrowed } from './other.js';\n",
+                "function outer() { function borrowed() {} return borrowed(); }\n",
+                "export { borrowed };\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            !imported
+                .symbols
+                .iter()
+                .find(|s| s.name == "borrowed")
+                .unwrap()
+                .is_entry_point
+        );
+    }
 
     /// nw-155: `export { .. }` is a separate statement from the declaration, so
     /// has_export_ancestor never saw it and the symbol stayed Private. Since

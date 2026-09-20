@@ -22,6 +22,8 @@ use nestweaver_schema::{
     repo_uid, section_uid, tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
+mod derivation;
+pub use derivation::{MARKDOWN_LINK_DERIVATION_VERSION, refresh_indexed_markdown_derivation};
 // walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
 // still use direct fs access.
 
@@ -285,6 +287,14 @@ fn filesystem_note_reader(
 ) -> crate::content_reader::FilesystemReader {
     crate::content_reader::FilesystemReader::with_limits(root, note_reader_limits(limits))
         .with_skip_dirs(SKIP_DIRS)
+}
+
+/// Vault filesystem reader used by daemon-owned derivation/migration.
+pub fn filesystem_vault_reader(
+    root: &Path,
+    limits: crate::index_limits::NoteLimits,
+) -> crate::content_reader::FilesystemReader {
+    filesystem_note_reader(root, limits)
 }
 
 fn cap_sidecar_list<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
@@ -1408,26 +1418,13 @@ fn index_markdown_since_with_reader_mode(
             } else {
                 heading_note.get(&target).map(String::as_str)
             };
-            let normalized_target = link_target.trim().replace('\\', "/").to_lowercase();
-            let source_relative_affected = section_note
+            let source_reference_affected = section_note
                 .get(&source_section)
                 .and_then(|source_uid| note_path_by_uid.get(source_uid.as_str()))
-                .and_then(|path| Path::new(path).parent())
-                .map(|folder| {
-                    let joined = folder
-                        .join(&normalized_target)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    affected_names.contains(&joined)
-                        || affected_names
-                            .iter()
-                            .any(|identity| identity.ends_with(&format!("/{normalized_target}")))
-                })
-                .unwrap_or(false);
+                .is_some_and(|path| wikilink_target_affected(&link_target, path, &affected_names));
             if (target_note
                 .is_some_and(|uid| changed_uids.contains(uid) || removed_uids.contains(uid))
-                || affected_names.contains(&normalized_target)
-                || source_relative_affected)
+                || source_reference_affected)
                 && let Some(source_note) = section_note.get(&source_section)
             {
                 affected_sources.insert(source_note.clone());
@@ -1442,21 +1439,7 @@ fn index_markdown_since_with_reader_mode(
         if !existing_note_uids.contains(&source_note) {
             continue;
         }
-        let normalized = link_target.trim().replace('\\', "/").to_lowercase();
-        let joined = Path::new(&source_path).parent().map(|folder| {
-            folder
-                .join(&normalized)
-                .to_string_lossy()
-                .replace('\\', "/")
-        });
-        if affected_names.contains(&normalized)
-            || joined
-                .as_ref()
-                .is_some_and(|path| affected_names.contains(path))
-            || affected_names
-                .iter()
-                .any(|identity| identity.ends_with(&format!("/{normalized}")))
-        {
+        if wikilink_target_affected(&link_target, &source_path, &affected_names) {
             affected_sources.insert(source_note);
         }
     }
@@ -1582,6 +1565,7 @@ fn index_markdown_since_with_reader_mode(
         rebuild_link_source_uids.push(candidate.note_uid.clone());
         let context = context_by_uid[&candidate.note_uid.as_str()];
         for wikilink in &context.wikilinks {
+            let raw_target = wikilink_target_text(wikilink);
             // nw-344: the same silent drop as the full-index path above, and it
             // has to close on both or `--since` and a full re-index disagree
             // about the vault's own link count.
@@ -1598,58 +1582,48 @@ fn index_markdown_since_with_reader_mode(
                     format!(
                         "unresolved:{}:{}",
                         candidate.note_uid,
-                        crate::hash::blake3_hex_short(&wikilink.target)
+                        crate::hash::blake3_hex_short(&raw_target)
                     ),
                     candidate.note_uid.clone(),
                     candidate.rel_path.clone(),
                     candidate.parsed.title.clone(),
-                    wikilink.target.clone(),
+                    raw_target.clone(),
                 ));
                 continue;
             };
             let display = wikilink
                 .display
                 .clone()
-                .unwrap_or_else(|| wikilink.target.clone());
-            match lookup.resolve(&wikilink.target, &context.folder) {
-                ResolveOutcome::Unresolved => unresolved.push((
+                .unwrap_or_else(|| raw_target.clone());
+            let resolved = lookup.resolve_wikilink(wikilink, &context.folder);
+            if resolved.unresolved {
+                unresolved.push((
                     format!(
                         "unresolved:{}:{}",
                         source_section,
-                        crate::hash::blake3_hex_short(&wikilink.target)
+                        crate::hash::blake3_hex_short(&raw_target)
                     ),
                     candidate.note_uid.clone(),
                     candidate.rel_path.clone(),
                     candidate.parsed.title.clone(),
-                    wikilink.target.clone(),
-                )),
-                ResolveOutcome::Resolved(targets) => {
-                    let confidence = targets[0].confidence / targets.len().max(1) as f32;
-                    for target in targets {
-                        if let Some(anchor) = &wikilink.heading_anchor
-                            && let Some(heading_uid) =
-                                lookup.find_heading(&target.note_uid, &slugify_anchor(anchor))
-                        {
-                            wikilink_to_heading.push((
-                                source_section.clone(),
-                                heading_uid,
-                                confidence,
-                                display.clone(),
-                                wikilink.target.clone(),
-                            ));
-                        } else {
-                            wikilink_to_note.push((
-                                source_section.clone(),
-                                target.note_uid,
-                                confidence,
-                                display.clone(),
-                                wikilink.target.clone(),
-                            ));
-                        }
-                        if candidate.changed {
-                            changed_wikilinks += 1;
-                        }
-                    }
+                    raw_target.clone(),
+                ));
+            }
+            for (target, confidence, heading) in resolved.targets {
+                let edge = (
+                    source_section.clone(),
+                    target,
+                    confidence,
+                    display.clone(),
+                    raw_target.clone(),
+                );
+                if heading {
+                    wikilink_to_heading.push(edge);
+                } else {
+                    wikilink_to_note.push(edge);
+                }
+                if candidate.changed {
+                    changed_wikilinks += 1;
                 }
             }
         }
@@ -2872,6 +2846,7 @@ where
 
     for ctx in &note_contexts {
         for wl in &ctx.wikilinks {
+            let raw_target = wikilink_target_text(wl);
             // Pass the source section's UID (where the link appears).
             //
             // nw-344: this was a bare `continue`. A link taken by it produced no
@@ -2896,70 +2871,44 @@ where
                     format!(
                         "unresolved:{}:{}",
                         ctx.note_uid,
-                        crate::hash::blake3_hex_short(&wl.target)
+                        crate::hash::blake3_hex_short(&raw_target)
                     ),
                     ctx.note_uid.clone(),
                     ctx.rel_path.clone(),
                     ctx.title.clone(),
-                    wl.target.clone(),
+                    raw_target.clone(),
                 ));
                 continue;
             };
-            let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
+            let display = wl.display.clone().unwrap_or_else(|| raw_target.clone());
 
-            match lookup.resolve(&wl.target, &ctx.folder) {
-                ResolveOutcome::Resolved(candidates) => {
-                    // Confidence: split 1/N for ambiguous resolutions, otherwise use the priority's base.
-                    let n = candidates.len() as f32;
-                    let conf_per = candidates[0].confidence / n.max(1.0);
-                    for cand in &candidates {
-                        if let Some(anchor) = &wl.heading_anchor {
-                            // Try to find a matching heading slug in the target note.
-                            let anchor_lc = slugify_anchor(anchor);
-                            if let Some(h_uid) = lookup.find_heading(&cand.note_uid, &anchor_lc) {
-                                wikilink_to_heading.push((
-                                    source_section_uid.clone(),
-                                    h_uid,
-                                    conf_per,
-                                    display.clone(),
-                                    wl.target.clone(),
-                                ));
-                                continue;
-                            }
-                            // Anchor missing — fall back to note-level link.
-                        }
-                        wikilink_to_note.push((
-                            source_section_uid.clone(),
-                            cand.note_uid.clone(),
-                            conf_per,
-                            display.clone(),
-                            wl.target.clone(),
-                        ));
-                    }
-                }
-                ResolveOutcome::Unresolved => {
-                    wikilinks_unresolved += 1;
-                    tracing::debug!(
-                        "unresolved wikilink: '{}' in note '{}'",
-                        wl.target,
-                        ctx.title,
-                    );
-                    // Record it so broken-links can surface a genuinely-broken
-                    // wikilink (one that resolves to no note at all). UID is
-                    // derived from the source section + target text so a
-                    // re-index replaces rather than duplicates.
-                    let uw_uid = format!(
+            let resolved = lookup.resolve_wikilink(wl, &ctx.folder);
+            if resolved.unresolved {
+                wikilinks_unresolved += 1;
+                unresolved_records.push((
+                    format!(
                         "unresolved:{}:{}",
                         source_section_uid,
-                        crate::hash::blake3_hex_short(&wl.target)
-                    );
-                    unresolved_records.push((
-                        uw_uid,
-                        ctx.note_uid.clone(),
-                        ctx.rel_path.clone(),
-                        ctx.title.clone(),
-                        wl.target.clone(),
-                    ));
+                        crate::hash::blake3_hex_short(&raw_target)
+                    ),
+                    ctx.note_uid.clone(),
+                    ctx.rel_path.clone(),
+                    ctx.title.clone(),
+                    raw_target.clone(),
+                ));
+            }
+            for (target, confidence, heading) in resolved.targets {
+                let edge = (
+                    source_section_uid.clone(),
+                    target,
+                    confidence,
+                    display.clone(),
+                    raw_target.clone(),
+                );
+                if heading {
+                    wikilink_to_heading.push(edge);
+                } else {
+                    wikilink_to_note.push(edge);
                 }
             }
         }
@@ -3198,6 +3147,69 @@ fn folder_components(folder: &str) -> Vec<String> {
         .filter(|segment| !segment.is_empty())
         .map(|segment| segment.to_lowercase())
         .collect()
+}
+
+/// Preserve fragment identity in diagnostics and persisted edge metadata.
+/// The parser separates the note, vault prefix, and heading components.
+fn wikilink_target_text(link: &RawWikilink) -> String {
+    let mut target = match &link.vault_prefix {
+        Some(vault) => format!("{vault}:{}", link.target),
+        None => link.target.clone(),
+    };
+    if let Some(anchor) = &link.heading_anchor {
+        target.push('#');
+        target.push_str(anchor);
+    }
+    target
+}
+
+/// Relinking follows the note's identity even when the broken record names a
+/// missing heading. Otherwise a heading restoration never revisits its source.
+fn wikilink_note_target(target: &str) -> &str {
+    let note = target.split_once('#').map_or(target, |(note, _)| note);
+    // Match the parser's existing vault-prefix split. This restores the local
+    // lookup key, not cross-vault routing: resolve_wikilink currently resolves
+    // RawWikilink.target within this vault. Keep the prefix in raw diagnostics.
+    let slash = note.find('/').unwrap_or(usize::MAX);
+    if let Some(colon) = note.find(':')
+        && colon > 1
+        && colon < slash
+    {
+        &note[colon + 1..]
+    } else {
+        note
+    }
+}
+
+fn wikilink_target_affected(
+    raw_target: &str,
+    source_path: &str,
+    affected_names: &HashSet<String>,
+) -> bool {
+    let target = wikilink_note_target(raw_target)
+        .trim()
+        .replace('\\', "/")
+        .to_lowercase();
+    let source = source_path.replace('\\', "/").to_lowercase();
+    let folder = source.rsplit_once('/').map_or("", |(folder, _)| folder);
+    // Join is insufficient for ../target: identities contain target, not
+    // sub/../target. Use the same lexical normalization as note resolution.
+    let relative = normalize_relative(folder, &target);
+    affected_names.contains(&target)
+        || relative
+            .as_ref()
+            .is_some_and(|path| affected_names.contains(path))
+        || affected_names
+            .iter()
+            .any(|identity| identity.ends_with(&format!("/{target}")))
+}
+
+struct ResolvedWikilink {
+    /// (target UID, confidence, is heading). An anchor never becomes a note edge.
+    targets: Vec<(String, f32, bool)>,
+    /// One unresolved record per original reference, even if several candidate
+    /// notes lack its heading. A missing note is not also a missing heading.
+    unresolved: bool,
 }
 
 struct WikilinkLookup<'a> {
@@ -3625,6 +3637,36 @@ impl<'a> WikilinkLookup<'a> {
         best.map(|uid| uid.to_string())
     }
 
+    fn resolve_wikilink(&self, link: &RawWikilink, folder: &str) -> ResolvedWikilink {
+        let ResolveOutcome::Resolved(candidates) = self.resolve(&link.target, folder) else {
+            return ResolvedWikilink {
+                targets: Vec::new(),
+                unresolved: true,
+            };
+        };
+        let confidence = candidates[0].confidence / candidates.len().max(1) as f32;
+        let mut resolved = ResolvedWikilink {
+            targets: Vec::new(),
+            unresolved: false,
+        };
+        for candidate in candidates {
+            if let Some(anchor) = &link.heading_anchor {
+                if let Some(heading) =
+                    self.find_heading(&candidate.note_uid, &slugify_anchor(anchor))
+                {
+                    resolved.targets.push((heading, confidence, true));
+                } else {
+                    resolved.unresolved = true;
+                }
+            } else {
+                resolved
+                    .targets
+                    .push((candidate.note_uid, confidence, false));
+            }
+        }
+        resolved
+    }
+
     fn find_heading(&self, note_uid: &str, slug: &str) -> Option<String> {
         let headings = self.headings_by_note.get(note_uid)?;
         headings.get(slug).map(|s| s.to_string())
@@ -3726,6 +3768,11 @@ fn derive_typed_edges(notes: &[NoteContext], lookup: &WikilinkLookup<'_>) -> Vec
             let Some(edge_type) = heading_to_edge_type(heading) else {
                 continue;
             };
+            // A heading-grouped reference must not derive a note edge from
+            // a missing anchor after the ordinary wikilink was marked broken.
+            if lookup.resolve_wikilink(wl, &ctx.folder).unresolved {
+                continue;
+            }
             // Resolve the wikilink target to a note via the shared resolver.
             if let ResolveOutcome::Resolved(candidates) = lookup.resolve(&wl.target, &ctx.folder)
                 && candidates.len() == 1
@@ -5496,6 +5543,182 @@ sub b body
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.resolved_link_edges, 0);
         assert_eq!(result.unresolved_link_occurrences, 1);
+    }
+
+    #[test]
+    fn release_missing_anchor_stays_unresolved() {
+        let (_dir, root) = make_vault(&[
+            ("target.md", "# Target\n\n## Setup\nbody\n"),
+            (
+                "caller.md",
+                "# Caller\n\n[[Target#Setup]] [[Target#Missing]] [[Target#Other]] [[Absent#Setup]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 3);
+        assert_eq!(result.unresolved_link_section_targets, 3);
+        assert_eq!(result.unresolved_link_targets, 3);
+        let targets: HashSet<_> = store
+            .all_unresolved_wikilinks()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.4)
+            .collect();
+        assert_eq!(
+            targets,
+            HashSet::from([
+                "Target#Missing".into(),
+                "Target#Other".into(),
+                "Absent#Setup".into()
+            ])
+        );
+        assert_eq!(wikilink_note_target("Target#Missing"), "Target");
+    }
+
+    #[test]
+    fn release_missing_anchor_lifecycle_relinks_unchanged_source() {
+        let (_dir, root) = make_vault(&[
+            ("target.md", "# Target\n\n## Setup\nbody\n"),
+            ("caller.md", "# Caller\n\n## Depends On\n[[Target#Setup]]\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db, "owned", "v", &[]).unwrap();
+        // Keep the caller older than each cutoff without sleeps, proving that
+        // incoming-edge/unresolved-record closure (not reparsing every file)
+        // discovers it after target-only edits.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("caller.md"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2);
+        for (body, broken) in [
+            ("# Target\nbody\n", true),
+            ("# Target\n\n## Setup\nrestored\n", false),
+            ("# Target\n\n## Renamed\nrenamed\n", true),
+            ("# Target\n\n## Setup\nrestored again\n", false),
+        ] {
+            fs::write(root.join("target.md"), body).unwrap();
+            let before = store.graph_generation();
+            let result = index_markdown_directory_since_with_store_and_ignore(
+                &store,
+                &root,
+                "owned",
+                "v",
+                since,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                result.notes_updated, 1,
+                "only the target is a changed source"
+            );
+            assert_eq!(store.graph_generation(), before + 1);
+            assert_eq!(
+                result.publication.disposition,
+                crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+            );
+            let unresolved = store.all_unresolved_wikilinks().unwrap();
+            assert_eq!(unresolved.len(), usize::from(broken));
+            if broken {
+                assert_eq!(unresolved[0].4, "Target#Setup");
+            }
+            assert_eq!(store.count_wikilink_edges().unwrap(), usize::from(!broken));
+            assert_eq!(
+                store.typed_note_edges().unwrap().len(),
+                usize::from(!broken)
+            );
+        }
+    }
+
+    #[test]
+    fn release_relative_anchor_restoration_relinks_unchanged_callers() {
+        let references = [
+            ("sub/up.md", "../target#Setup"),
+            ("sub/up_ext.md", "../target.md#Setup"),
+            ("dot.md", "./target#Setup"),
+            ("dot_ext.md", "./target.md#Setup"),
+            ("sub/prefixed.md", "work:../target#Setup"),
+        ];
+        let (_dir, root) = make_vault(&[("target.md", "# Target\nmissing heading\n")]);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        for (path, target) in references {
+            fs::write(root.join(path), format!("# Caller\n\n[[{target}]]\n")).unwrap();
+        }
+        let store = GraphStore::in_memory().unwrap();
+        let db = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db, "owned", "v", &[]).unwrap();
+        let expected: HashSet<String> = references
+            .iter()
+            .map(|(_, target)| target.to_string())
+            .collect();
+        let initial: HashSet<String> = store
+            .all_unresolved_wikilinks()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.4)
+            .collect();
+        assert_eq!(
+            initial, expected,
+            "raw fragments and prefixes must survive diagnostics"
+        );
+        for (path, _) in references {
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(path))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2);
+        for (body, broken) in [
+            ("# Target\n\n## Setup\nrestored\n", false),
+            ("# Target\nheading deleted\n", true),
+            ("# Target\n\n## Setup\nrestored again\n", false),
+        ] {
+            fs::write(root.join("target.md"), body).unwrap();
+            let before = store.graph_generation();
+            let result = index_markdown_directory_since_with_store_and_ignore(
+                &store,
+                &root,
+                "owned",
+                "v",
+                since,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                result.notes_updated, 1,
+                "unchanged callers must be discovered through relinking"
+            );
+            assert_eq!(store.graph_generation(), before + 1);
+            assert_eq!(
+                result.publication.disposition,
+                crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
+            );
+            let unresolved: HashSet<String> = store
+                .all_unresolved_wikilinks()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.4)
+                .collect();
+            if broken {
+                assert_eq!(unresolved, expected);
+            } else {
+                assert!(unresolved.is_empty());
+            }
+            assert_eq!(
+                store.count_wikilink_edges().unwrap(),
+                if broken { 0 } else { references.len() }
+            );
+        }
     }
 
     #[test]

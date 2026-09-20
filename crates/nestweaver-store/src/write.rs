@@ -1623,6 +1623,11 @@ impl GraphStore {
     /// transaction. This prevents concurrent readers from seeing an empty repo
     /// between the delete and the insert (the concurrency bug where the
     /// `write_mutex` serialises writes but does not block reads).
+    ///
+    /// `resolved_edges` (CALLS, IMPORTS, MEMBER_OF, CROSS_REPO_LINK, …) must
+    /// be computed before this call and committed here. `DETACH DELETE` of
+    /// the incumbent symbols otherwise publishes a committed graph that has
+    /// every symbol and zero callers until a later `batch_insert_edges`.
     #[allow(clippy::too_many_arguments)]
     pub fn bulk_reindex_write(
         &self,
@@ -1633,6 +1638,7 @@ impl GraphStore {
         file_symbol_edges: &[(&str, &str)],
         services: &[Service],
         service_symbol_edges: &[(&str, &str)],
+        resolved_edges: &[ResolvedEdge],
     ) -> Result<(usize, usize, Vec<String>), StoreError> {
         Self::validate_bulk_reindex_input(
             repo_uid,
@@ -1660,6 +1666,7 @@ impl GraphStore {
             services,
             service_symbol_edges,
         )?;
+        Self::batch_insert_edges_on(&conn, resolved_edges)?;
 
         Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
 
@@ -11974,6 +11981,7 @@ mod tests {
             &[(new_file.uid.as_str(), new_symbol.uid.as_str())],
             &[duplicate_service.clone(), duplicate_service],
             &[],
+            &[],
         );
         let error = result.expect_err("duplicate Service uid must fail preflight");
         assert!(error.to_string().contains("duplicate Service uid"));
@@ -11995,6 +12003,120 @@ mod tests {
             .next()
             .unwrap_or_default();
         assert_eq!(count, 1, "failed repo reindex must preserve the old graph");
+    }
+
+    #[test]
+    fn bulk_reindex_write_commits_calls_with_replacement_symbols() {
+        use nestweaver_schema::{EdgeType, File, Repo, ResolvedEdge, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repo-calls.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:calls";
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: "file:///repo-calls".to_string(),
+                indexed_sha: "old".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some("calls".to_string()),
+                root_path: Some("/repo-calls".to_string()),
+            })
+            .unwrap();
+        let file = File {
+            uid: "file:repo-calls:main".to_string(),
+            path: "main.js".to_string(),
+            repo_uid: repo_uid.to_string(),
+            content_hash: "v1".to_string(),
+        };
+        let caller = Symbol {
+            uid: "sym:repo-calls:caller".to_string(),
+            name: "caller".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.path.clone(),
+            start_line: 1,
+            end_line: 1,
+            signature: "function caller()".to_string(),
+            summary: None,
+            content_hash: "caller".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let target = Symbol {
+            uid: "sym:repo-calls:target".to_string(),
+            name: "target".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.path.clone(),
+            start_line: 2,
+            end_line: 2,
+            signature: "function target()".to_string(),
+            summary: None,
+            content_hash: "target".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .bulk_index_write(
+                std::slice::from_ref(&file),
+                &[caller.clone(), target.clone()],
+                &[(repo_uid, file.uid.as_str())],
+                &[
+                    (file.uid.as_str(), caller.uid.as_str()),
+                    (file.uid.as_str(), target.uid.as_str()),
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let calls = ResolvedEdge {
+            source_uid: caller.uid.clone(),
+            target_uid: target.uid.clone(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+        store
+            .bulk_reindex_write(
+                repo_uid,
+                std::slice::from_ref(&file),
+                &[caller.clone(), target.clone()],
+                &[(repo_uid, file.uid.as_str())],
+                &[
+                    (file.uid.as_str(), caller.uid.as_str()),
+                    (file.uid.as_str(), target.uid.as_str()),
+                ],
+                &[],
+                &[],
+                std::slice::from_ref(&calls),
+            )
+            .unwrap();
+
+        let callers = store.callers_of(&target.uid).unwrap();
+        assert_eq!(
+            callers
+                .iter()
+                .map(|symbol| symbol.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec![caller.uid.as_str()],
+            "replacement CALLS must commit in the same transaction as symbols"
+        );
     }
 
     #[test]

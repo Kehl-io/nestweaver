@@ -24,6 +24,7 @@ use nestweaver_schema::Repo;
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Current resolver generation.
@@ -276,6 +277,132 @@ pub fn load(db_path: &Path) -> ResolverGenerations {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Recovery admission must distinguish missing evidence from unreadable or
+/// incompatible evidence. Ordinary query callers retain [`load`]'s fallback.
+pub const MAX_RESOLVER_GENERATION_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictResolverGenerations {
+    #[serde(deserialize_with = "deserialize_unique_generations")]
+    repos: BTreeMap<String, u32>,
+}
+
+fn deserialize_unique_generations<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueGenerations;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueGenerations {
+        type Value = BTreeMap<String, u32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a repository generation map without duplicate keys")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut repos = BTreeMap::new();
+            while let Some((uid, generation)) = map.next_entry::<String, u32>()? {
+                if uid.trim().is_empty() {
+                    return Err(serde::de::Error::custom("empty repository UID"));
+                }
+                if repos.insert(uid, generation).is_some() {
+                    return Err(serde::de::Error::custom("duplicate repository UID"));
+                }
+            }
+            Ok(repos)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueGenerations)
+}
+
+/// Strict, bounded sidecar read for a future recovery writer.
+///
+/// Only a missing path returns `None`. Malformed/unknown shapes, duplicate
+/// entries, non-regular files, oversized records and any future generation
+/// return an error. A legacy generation (including zero) is evidence to be
+/// evaluated by the caller, not permission to migrate it.
+pub fn load_strict(db_path: &Path) -> anyhow::Result<Option<ResolverGenerations>> {
+    let path = crate::sidecar_path(db_path, RESOLVER_GENERATION_SIDECAR);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect resolver generation sidecar"),
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "resolver generation sidecar is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_RESOLVER_GENERATION_BYTES as u64,
+        "resolver generation sidecar exceeds byte limit"
+    );
+    let file = std::fs::File::open(&path).context("open resolver generation sidecar")?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RESOLVER_GENERATION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("read resolver generation sidecar")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_RESOLVER_GENERATION_BYTES,
+        "resolver generation sidecar exceeds byte limit"
+    );
+    let parsed: StrictResolverGenerations =
+        serde_json::from_slice(&bytes).context("decode resolver generation sidecar")?;
+    anyhow::ensure!(
+        parsed
+            .repos
+            .values()
+            .all(|generation| *generation <= RESOLVER_GENERATION),
+        "resolver generation sidecar contains a future generation"
+    );
+    Ok(Some(ResolverGenerations {
+        repos: parsed.repos,
+    }))
+}
+
+/// Strictly merge the current generation into a durably replaced sidecar.
+///
+/// The caller must hold the database owner's mutation lease across its graph
+/// publication and this read/merge/write. This is not a cross-process lock or
+/// migration admission check. Missing evidence can be initialized by an
+/// explicit successful index; recovery must establish its prerequisites first.
+/// Unknown/corrupt/future records are never overwritten. Unrelated entries are
+/// preserved. A parent-directory sync failure is an error even though the
+/// complete new record may already be canonical; callers must not claim success.
+pub fn record_strict(db_path: &Path, repo_uid: &str) -> anyhow::Result<()> {
+    record_strict_with_writer(db_path, repo_uid, |file, bytes| file.write_all(bytes))
+}
+
+fn record_strict_with_writer(
+    db_path: &Path,
+    repo_uid: &str,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !repo_uid.trim().is_empty() && repo_uid.len() <= MAX_RESOLVER_GENERATION_BYTES,
+        "invalid repository UID for resolver generation record"
+    );
+    let mut current = load_strict(db_path)?.unwrap_or_default();
+    current
+        .repos
+        .insert(repo_uid.to_owned(), RESOLVER_GENERATION);
+    let bytes = serde_json::to_vec(&current).context("encode resolver generation sidecar")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_RESOLVER_GENERATION_BYTES,
+        "merged resolver generation sidecar exceeds byte limit"
+    );
+    let path = crate::sidecar_path(db_path, RESOLVER_GENERATION_SIDECAR);
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| write(file, &bytes))
+        .context("publish resolver generation sidecar")
 }
 
 /// Stable descriptor carried by every edge-dependent analysis that cannot
@@ -1199,6 +1326,159 @@ mod tests {
             note.contains("nestweaver index --repo <path> --force"),
             "plain `index` reports `0 modified` on a repo already at HEAD and \
              leaves the old edges — and the old generation — in place: {note}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn strict_missing_and_empty_records_are_distinct_and_can_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert!(load_strict(&db).unwrap().is_none());
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        std::fs::write(&path, br#"{"repos":{}}"#).unwrap();
+        assert!(load_strict(&db).unwrap().unwrap().repos.is_empty());
+        std::fs::remove_file(&path).unwrap();
+        record_strict(&db, "repo-a").unwrap();
+        assert_eq!(
+            load_strict(&db).unwrap().unwrap().generation_for("repo-a"),
+            RESOLVER_GENERATION
+        );
+        assert!(!db.exists(), "these are sidecar-only tests, with no store");
+    }
+
+    #[test]
+    fn strict_merge_preserves_unrelated_and_explicit_legacy_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        std::fs::write(&path, br#"{"repos":{"target":1,"other":2,"legacy":0}}"#).unwrap();
+        record_strict(&db, "target").unwrap();
+        record_strict(&db, "added").unwrap();
+        let actual = load_strict(&db).unwrap().unwrap().repos;
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("target".to_string(), RESOLVER_GENERATION),
+                ("added".to_string(), RESOLVER_GENERATION),
+                ("other".to_string(), 2),
+                ("legacy".to_string(), 0),
+            ])
+        );
+    }
+
+    #[test]
+    fn strict_rejects_bad_shapes_without_overwriting_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        for bytes in [
+            b"".as_slice(),
+            b"{",
+            br#"{}"#,
+            br#"{"repos":null}"#,
+            br#"{"repos":{"a":-1}}"#,
+            br#"{"repos":{"a":"6"}}"#,
+            br#"{"repos":{"a":1,"a":2}}"#,
+            br#"{"repos":{},"repos":{"a":2}}"#,
+            br#"{"repos":{" ":1}}"#,
+            br#"{"repos":{},"future_shape":true}"#,
+            br#"{"repos":{}} trailing"#,
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(load_strict(&db).is_err(), "accepted {bytes:?}");
+            assert!(record_strict(&db, "target").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn strict_rejects_future_target_or_unrelated_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        for uid in ["target", "other"] {
+            let bytes = serde_json::to_vec(&ResolverGenerations {
+                repos: BTreeMap::from([(uid.to_string(), RESOLVER_GENERATION + 1)]),
+            })
+            .unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                load_strict(&db)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("future generation")
+            );
+            assert!(record_strict(&db, "target").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(load(&db).generation_for(uid), RESOLVER_GENERATION + 1);
+        }
+    }
+
+    #[test]
+    fn strict_bounds_input_and_merged_output_without_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        let oversized = vec![b' '; MAX_RESOLVER_GENERATION_BYTES + 1];
+        std::fs::write(&path, &oversized).unwrap();
+        assert!(
+            load_strict(&db)
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
+        );
+        assert!(record_strict(&db, "target").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), oversized);
+
+        let original = br#"{"repos":{"other":2}}"#;
+        std::fs::write(&path, original).unwrap();
+        let oversized_uid = "a".repeat(MAX_RESOLVER_GENERATION_BYTES);
+        assert!(record_strict(&db, &oversized_uid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(record_strict(&db, " ").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn strict_io_failure_is_not_missing_and_query_fallback_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_strict(&db).is_err());
+        assert!(record_strict(&db, "target").is_err());
+        assert!(path.is_dir());
+        assert!(load(&db).repos.is_empty());
+    }
+
+    #[test]
+    fn strict_partial_temp_write_failure_preserves_old_record_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let path = crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR);
+        let original = br#"{"repos":{"target":1,"other":2}}"#;
+        std::fs::write(&path, original).unwrap();
+        let error = record_strict_with_writer(&db, "target", |file, bytes| {
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("injected partial write failure"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected partial write failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            load_strict(&db).unwrap().unwrap().generation_for("target"),
+            1
+        );
+        record_strict(&db, "target").unwrap();
+        assert_eq!(
+            load_strict(&db).unwrap().unwrap().generation_for("other"),
+            2
         );
     }
 }

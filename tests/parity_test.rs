@@ -79,6 +79,7 @@ fn start_daemon(db_path: &Path) {
         || stop_daemon(db_path),
     );
     let Err(last_error) = readiness else {
+        wait_for_vault_derivation_current(db_path);
         return;
     };
 
@@ -110,6 +111,67 @@ fn wait_for_daemon_readiness(
             Err(_) => std::thread::sleep(retry_interval),
         }
     }
+}
+
+/// Vault-note fixtures are indexed on the CI direct path, which does not stamp
+/// Markdown derivation records. The background migrator creates them after
+/// socket accept; derivation-gated reads (backlinks) must wait until Current.
+fn wait_for_vault_derivation_current(db_path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last;
+    loop {
+        let output = run_via_daemon(db_path, &["brain", "status", "--json"]);
+        last = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&last)
+        {
+            let vault_count = status_vault_count(&value);
+            let pending = derivation_pending_count(&value);
+            if vault_count == 0 || pending == Some(0) {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "daemon vault derivation did not become current within 30s (last status: {last})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn status_vault_count(value: &serde_json::Value) -> u64 {
+    let named = value
+        .pointer("/vault_count")
+        .or_else(|| value.pointer("/result/vault_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let listed = value
+        .pointer("/vaults")
+        .or_else(|| value.pointer("/result/vaults"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
+    named.max(listed)
+}
+
+fn derivation_pending_count(value: &serde_json::Value) -> Option<u64> {
+    fn walk(value: &serde_json::Value) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(count) = map
+                    .get("pending_or_blocked_vaults")
+                    .and_then(|v| v.as_u64())
+                {
+                    return Some(count);
+                }
+                map.values().find_map(walk)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    walk(value)
 }
 
 /// Stop the daemon for a given DB path, ignoring errors (best-effort cleanup).
@@ -1732,6 +1794,7 @@ fn start_daemon_with_config(db_path: &Path, config_path: &Path) {
         || stop_daemon(db_path),
     )
     .unwrap_or_else(|error| panic!("daemon socket did not accept connections: {error}"));
+    wait_for_vault_derivation_current(db_path);
 }
 
 /// nw-429, permanent regression coverage. `daemon_may_serve` forces `--config`
@@ -4928,7 +4991,7 @@ fn dead_code_refuses_to_list_on_a_generation_stale_graph_on_every_route() {
         );
     }
     assert!(
-        String::from_utf8_lossy(&clean_text.stdout).contains("Dead code analysis"),
+        String::from_utf8_lossy(&clean_text.stdout).contains("Review candidates only"),
         "direct text (clean): {}",
         String::from_utf8_lossy(&clean_text.stdout)
     );

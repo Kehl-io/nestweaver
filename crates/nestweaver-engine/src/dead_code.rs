@@ -2,9 +2,8 @@
 //!
 //! Walks forward from every entry point in the graph following
 //! CALLS, IMPORTS, EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Any
-//! symbol not reached is potentially dead. Confidence scoring
-//! accounts for visibility: private unreachable symbols are
-//! high-confidence dead code; public ones could be library API.
+//! symbol not reached is a review candidate. Compatibility confidence labels
+//! distinguish public from other symbols; no tier proves safe deletion.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,7 +15,7 @@ use serde::Serialize;
 
 use crate::manifest::ManifestInfo;
 
-/// Confidence that a symbol is truly dead code.
+/// Compatibility review tier, never a calibrated probability of dead code.
 ///
 /// Serialised lowercase to match [`Display`](std::fmt::Display), the daemon's
 /// own payload, and the `--min-confidence` values a caller passes in. The
@@ -34,10 +33,7 @@ pub enum DeadCodeConfidence {
     /// its visibility. Explicitly `private` lands HERE, not in [`Self::High`] —
     /// see [`infer_confidence`] for why.
     Medium,
-    /// Unreachable AND spelled private-by-convention (leading `_`, or a
-    /// lowercase-initial name in a Go file, which is unexported at the
-    /// language level). This is the only signal that has ever discriminated
-    /// on a real index.
+    /// Accepted for input compatibility; no validated output population exists.
     High,
 }
 
@@ -168,6 +164,184 @@ impl DeadCodeResult {
             && (self.entry_points > 0 || self.total_symbols == 0)
             && self.languages_without_entry_points.is_empty()
     }
+}
+
+/// A bounded page over one database's review candidate population.
+#[derive(Clone, Copy)]
+pub struct DeadCodePageRequest<'a> {
+    pub min_confidence: DeadCodeConfidence,
+    pub limit: usize,
+    pub offset: usize,
+    pub expected_generation: Option<u64>,
+    pub page_token: Option<&'a str>,
+    pub concise: bool,
+}
+
+/// Bind pages to the actual database file, including replacement at one path.
+/// This identity is hashed into the token and is never returned as a host path.
+pub fn dead_code_database_identity(store: &GraphStore) -> anyhow::Result<String> {
+    let Some(path) = store.db_path() else {
+        return Ok(format!("memory:{store:p}"));
+    };
+    let publication = store.publication_identity()?.ok_or_else(|| anyhow::anyhow!(
+        "dead-code pages require persistent database identity; upgrade or reindex through the daemon"
+    ))?;
+    let canonical = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&canonical)?;
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let file_id: Option<(u64, u64)> = None;
+    let identity = serde_json::json!({
+        "brain_uuid": publication.brain_uuid,
+        "path": canonical,
+        "created": metadata.created().ok().map(|created| format!("{created:?}")),
+        "file_id": file_id,
+    });
+    Ok(serde_json::to_string(&identity)?)
+}
+
+pub fn dead_code_page_refusal(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "refused": true, "reason": reason, "review_only": true,
+        "high_confidence_available": false, "paging_scope": "local_database",
+        "note": "Review page unavailable. Retry from offset 0 on the same database after indexing completes; retain its generation and page_token for subsequent pages."
+    })
+}
+
+/// Check both before and after computation; an open publication cannot
+/// support a reproducible result page, even when its generation is unchanged.
+pub fn dead_code_page_guard(
+    store: &GraphStore,
+    generation: u64,
+    request: &DeadCodePageRequest<'_>,
+) -> Option<serde_json::Value> {
+    dead_code_page_state_refusal(
+        generation,
+        store.graph_generation(),
+        store.is_index_publication_dirty(),
+        request,
+    )
+}
+
+fn dead_code_page_state_refusal(
+    generation: u64,
+    current_generation: u64,
+    publication_dirty: bool,
+    request: &DeadCodePageRequest<'_>,
+) -> Option<serde_json::Value> {
+    let reason = if publication_dirty {
+        Some("publication_in_progress")
+    } else if generation != current_generation
+        || request
+            .expected_generation
+            .is_some_and(|expected| expected != generation)
+    {
+        Some("page_generation_changed")
+    } else if request.offset > 0
+        && (request.expected_generation.is_none() || request.page_token.is_none())
+    {
+        Some("page_continuation_required")
+    } else {
+        None
+    };
+    reason.map(dead_code_page_refusal)
+}
+
+/// Shared JSON contract for CLI and MCP; pure serialization, no store access.
+/// The token also binds ordered rows so ranking/manifest changes which do not
+/// advance graph generation cannot silently duplicate or skip a population.
+pub fn serialize_dead_code_page(
+    result: &DeadCodeResult,
+    manifest_load_error: Option<&str>,
+    request: &DeadCodePageRequest<'_>,
+    generation: u64,
+    database_identity: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(
+        (1..=1000).contains(&request.limit),
+        "dead-code limit must be 1..1000"
+    );
+    if request
+        .expected_generation
+        .is_some_and(|expected| expected != generation)
+    {
+        return Ok(dead_code_page_refusal("page_generation_changed"));
+    }
+    if request.offset > 0 && (request.expected_generation.is_none() || request.page_token.is_none())
+    {
+        return Ok(dead_code_page_refusal("page_continuation_required"));
+    }
+    // Hash a structured representation to avoid delimiter ambiguity. The
+    // resolved scope is sorted by the engine before it reaches this seam.
+    let binding = serde_json::to_vec(&json!({
+        "version": 1, "database": database_identity, "generation": generation,
+        "min_confidence": request.min_confidence, "population": result,
+        "manifest_load_error": manifest_load_error
+    }))?;
+    let token: String = Sha256::digest(binding)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if request.page_token.is_some_and(|expected| expected != token) {
+        return Ok(dead_code_page_refusal(
+            "page_population_or_database_changed",
+        ));
+    }
+    let matching: Vec<_> = result
+        .unreachable_symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.confidence != DeadCodeConfidence::High
+                && symbol.confidence >= request.min_confidence
+        })
+        .collect();
+    if request.offset > matching.len() {
+        return Ok(dead_code_page_refusal("page_offset_out_of_range"));
+    }
+    let rows: Vec<_> = matching
+        .iter()
+        .skip(request.offset)
+        .take(request.limit)
+        .map(|symbol| {
+            if request.concise {
+                json!({"uid": symbol.uid, "name": symbol.name, "confidence": symbol.confidence})
+            } else {
+                json!(symbol)
+            }
+        })
+        .collect();
+    let next = request.offset + rows.len();
+    let mut payload = json!({
+        "total_symbols": result.total_symbols, "reachable_symbols": result.reachable_symbols,
+        "unreachable_count": result.unreachable_symbols.len(), "matching_count": matching.len(),
+        "returned": rows.len(), "truncated": rows.len() < matching.len(), "has_more": next < matching.len(),
+        "excluded_count": result.excluded_count, "dead_percentage": result.dead_percentage,
+        "coverage": if result.coverage_is_complete() && manifest_load_error.is_none() {"complete"} else {"degraded"},
+        "undecodable_symbols": result.undecodable_symbols, "entry_points": result.entry_points,
+        "languages_without_entry_points": result.languages_without_entry_points,
+        "min_confidence": request.min_confidence, "requested_min_confidence": request.min_confidence,
+        "review_only": true, "high_confidence_available": false,
+        "confidence_filter_status": if request.min_confidence == DeadCodeConfidence::High {
+            "unavailable_no_validated_population"
+        } else { "available_review_candidates" },
+        "unreachable_symbols": rows, "graph_generation": generation,
+        "offset": request.offset, "limit": request.limit,
+        "next_offset": if next < matching.len() { Some(next) } else { None },
+        "page_token": token, "paging_scope": "local_database"
+    });
+    if let Some(scope) = &result.scope {
+        payload["scope"] = json!(scope);
+    }
+    if let Some(error) = manifest_load_error {
+        payload["manifest_load_error"] = json!(error);
+    }
+    Ok(payload)
 }
 
 /// Returns `true` for symbols that should be excluded from dead code analysis
@@ -998,11 +1172,7 @@ fn detect_dead_code_inner(
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.confidence
             .cmp(&a.confidence)
-            .then_with(|| {
-                b_rank
-                    .partial_cmp(a_rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .then_with(|| b_rank.total_cmp(a_rank))
             .then_with(|| a.file_path.cmp(&b.file_path))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.uid.cmp(&b.uid))
@@ -1031,65 +1201,163 @@ fn detect_dead_code_inner(
     })
 }
 
-/// Infer dead-code confidence from visibility and naming conventions.
-///
-/// - Explicitly public -> Low (could be library API); this wins over every
-///   naming convention below (nw-155).
-/// - Names starting with `_`, or lowercase-initial in Go files -> High
-///   (private by convention AND unaddressable from outside the file/package).
-/// - Everything else, INCLUDING an explicitly private/internal/protected
-///   symbol -> Medium.
-///
-/// # Why `private` alone does not reach High (nw-291 follow-up)
-///
-/// Before visibility was persisted, symbol reads rebuilt every row as
-/// `Inferred`, so the `visibility == "private"` guard here was unreachable and
-/// this population scored Medium. Persisting the column made the guard live —
-/// and promoted the same rows to High without anything having validated that
-/// the rows were right. On a fresh Rust index the resulting High tier was
-/// 1000/1000 `private`, and its top 15 contained zero true positives: all were
-/// `criterion_group!`-registered benchmark functions or file-local constants
-/// whose references the graph does not yet carry.
-///
-/// The command's own help scopes its caveats to LOW-confidence results, so
-/// promoting that population to High would present the least trustworthy list
-/// as the most trustworthy one — strictly worse for a caller than the Medium
-/// it used to get. `private` is a NECESSARY condition for "cannot be called
-/// from outside", not a SUFFICIENT one for "is dead": it says nothing about
-/// whether the in-file references were captured at all.
-///
-/// So visibility keeps demoting (public -> Low, which is safe: it moves rows
-/// AWAY from the trustworthy tier) and no longer promotes. High is reserved
-/// for the naming conventions that were the live discriminator before this
-/// column existed, so this branch is not worse-calibrated than the tier it
-/// replaces. Re-couple `private` to High only with a measured precision number
-/// on a real index behind it.
-fn infer_confidence(name: &str, visibility: &str, file_path: &str) -> DeadCodeConfidence {
-    // Explicitly public wins over every naming convention below (nw-155).
-    //
-    // A leading underscore means "private by convention", but an explicit
-    // export overrides the convention: `export { __wbg_init as default }`
-    // makes that symbol a module's PUBLIC entry point no matter how it is
-    // spelled. Reporting it as high-confidence dead code invites a user to
-    // delete live, exported API.
+/// Preserve Low/Medium compatibility labels without emitting an unvalidated
+/// High population. Naming conventions say nothing about captured references.
+fn infer_confidence(_name: &str, visibility: &str, _file_path: &str) -> DeadCodeConfidence {
     if visibility == "public" {
-        return DeadCodeConfidence::Low;
+        DeadCodeConfidence::Low
+    } else {
+        DeadCodeConfidence::Medium
+    }
+}
+
+#[cfg(test)]
+mod page_contract_tests {
+    use super::*;
+
+    fn population() -> DeadCodeResult {
+        DeadCodeResult {
+            unreachable_symbols: ["a", "b", "c"]
+                .into_iter()
+                .map(|uid| UnreachableSymbol {
+                    uid: uid.into(),
+                    name: format!("candidate_{uid}"),
+                    kind: "function".into(),
+                    file_path: "library.js".into(),
+                    visibility: "private".into(),
+                    confidence: DeadCodeConfidence::Medium,
+                })
+                .collect(),
+            total_symbols: 4,
+            reachable_symbols: 1,
+            dead_percentage: 75.0,
+            excluded_count: 0,
+            undecodable_symbols: 0,
+            entry_points: 1,
+            languages_without_entry_points: vec![],
+            scope: Some(DeadCodeScope {
+                repos: vec!["repo:a".into()],
+                totals_population: "filtered",
+            }),
+        }
     }
 
-    // Naming-convention heuristics for private scope:
-    //   - Leading underscore (Python, JS/TS, Dart, Ruby)
-    //   - Lowercase first char in Go files (unexported)
-    if name.starts_with('_') {
-        return DeadCodeConfidence::High;
-    }
-    let is_go = file_path.ends_with(".go");
-    if is_go && name.chars().next().is_some_and(|c| c.is_lowercase()) {
-        return DeadCodeConfidence::High;
+    fn first_request() -> DeadCodePageRequest<'static> {
+        DeadCodePageRequest {
+            min_confidence: DeadCodeConfidence::Low,
+            limit: 2,
+            offset: 0,
+            expected_generation: None,
+            page_token: None,
+            concise: false,
+        }
     }
 
-    // Everything else — including an explicitly private/internal/protected
-    // symbol with no naming signal — is Medium. See the note above.
-    DeadCodeConfidence::Medium
+    #[test]
+    fn publication_or_generation_change_never_returns_an_empty_success() {
+        for (after, dirty, reason) in [
+            (42, true, "publication_in_progress"),
+            (43, false, "page_generation_changed"),
+        ] {
+            let refusal = dead_code_page_state_refusal(42, after, dirty, &first_request()).unwrap();
+            assert_eq!(refusal["refused"], true);
+            assert_eq!(refusal["reason"], reason);
+            assert!(refusal.get("unreachable_symbols").is_none());
+        }
+        assert!(dead_code_page_state_refusal(42, 42, false, &first_request()).is_none());
+    }
+
+    #[test]
+    fn review_tiers_never_emit_high_and_high_empty_is_explicitly_unavailable() {
+        for name in ["plain", "_private", "lowercaseGo"] {
+            for visibility in ["public", "private", "inferred", "internal", "protected"] {
+                assert_ne!(
+                    infer_confidence(name, visibility, "library.go"),
+                    DeadCodeConfidence::High
+                );
+            }
+        }
+        assert_eq!(
+            DeadCodeConfidence::from_str_loose("high"),
+            Some(DeadCodeConfidence::High)
+        );
+        let request = DeadCodePageRequest {
+            min_confidence: DeadCodeConfidence::High,
+            ..first_request()
+        };
+        let page = serialize_dead_code_page(&population(), None, &request, 42, "db:a").unwrap();
+        assert_eq!(page["review_only"], true);
+        assert_eq!(page["high_confidence_available"], false);
+        assert_eq!(
+            page["confidence_filter_status"],
+            "unavailable_no_validated_population"
+        );
+        assert_eq!(page["requested_min_confidence"], "high");
+        assert_eq!(page["returned"], 0);
+        assert_eq!(page["unreachable_count"], 3);
+    }
+
+    #[test]
+    fn complete_pages_retain_uids_and_refuse_missing_continuation() {
+        let result = population();
+        let first = serialize_dead_code_page(&result, None, &first_request(), 42, "db:a").unwrap();
+        assert_eq!(first["next_offset"], 2);
+        let missing = DeadCodePageRequest {
+            offset: 2,
+            ..first_request()
+        };
+        let refused = serialize_dead_code_page(&result, None, &missing, 42, "db:a").unwrap();
+        assert_eq!(refused["refused"], true);
+        assert!(refused.get("unreachable_symbols").is_none());
+        let next = DeadCodePageRequest {
+            offset: 2,
+            expected_generation: Some(42),
+            page_token: first["page_token"].as_str(),
+            concise: true,
+            ..first_request()
+        };
+        let last = serialize_dead_code_page(&result, None, &next, 42, "db:a").unwrap();
+        assert_eq!(last["unreachable_symbols"][0]["uid"], "c");
+        assert_eq!(last["returned"], 1);
+        assert_eq!(last["next_offset"], serde_json::Value::Null);
+        assert_eq!(last["truncated"], true);
+        assert_eq!(last["has_more"], false);
+    }
+
+    #[test]
+    fn continuation_binds_database_generation_scope_filter_and_ordered_population() {
+        let result = population();
+        let first = serialize_dead_code_page(&result, None, &first_request(), 42, "db:a").unwrap();
+        let next = DeadCodePageRequest {
+            offset: 2,
+            expected_generation: Some(42),
+            page_token: first["page_token"].as_str(),
+            ..first_request()
+        };
+        let assert_refused = |page: serde_json::Value| {
+            assert_eq!(page["refused"], true);
+            assert!(page.get("unreachable_symbols").is_none());
+        };
+        assert_refused(serialize_dead_code_page(&result, None, &next, 42, "db:b").unwrap());
+        assert_refused(serialize_dead_code_page(&result, None, &next, 43, "db:a").unwrap());
+        let changed_filter = DeadCodePageRequest {
+            min_confidence: DeadCodeConfidence::Medium,
+            ..next
+        };
+        assert_refused(
+            serialize_dead_code_page(&result, None, &changed_filter, 42, "db:a").unwrap(),
+        );
+        let mut changed = result.clone();
+        changed.scope.as_mut().unwrap().repos = vec!["repo:b".into()];
+        assert_refused(serialize_dead_code_page(&changed, None, &next, 42, "db:a").unwrap());
+        changed = result.clone();
+        changed.unreachable_symbols.swap(0, 1);
+        assert_refused(serialize_dead_code_page(&changed, None, &next, 42, "db:a").unwrap());
+        assert_refused(
+            serialize_dead_code_page(&result, Some("manifest unavailable"), &next, 42, "db:a")
+                .unwrap(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1512,7 +1780,7 @@ mod tests {
         assert_eq!(result.unreachable_symbols[0].name, "_unusedHelper");
         assert_eq!(
             result.unreachable_symbols[0].confidence,
-            DeadCodeConfidence::High
+            DeadCodeConfidence::Medium
         );
     }
 
@@ -2035,10 +2303,10 @@ mod tests {
             DeadCodeConfidence::Low,
             "an exported symbol must not be high-confidence dead code however it is spelled"
         );
-        // The convention still applies where nothing contradicts it.
+        // Naming conventions no longer promote unvalidated deletion confidence.
         assert_eq!(
             infer_confidence("_helper", "inferred", "src/lib.py"),
-            DeadCodeConfidence::High
+            DeadCodeConfidence::Medium
         );
     }
 
@@ -2335,34 +2603,32 @@ mod tests {
     /// uid ever won early, at least one of these would flip.
     #[test]
     fn dead_code_sort_primary_ranking_unaffected_by_uid_for_non_ties() {
-        // 1. Confidence: High (leading underscore) must still outrank
-        //    Medium even though the High row's uid sorts alphabetically
-        //    LAST.
+        // 1. Medium still precedes Low before UID or name ties.
         {
             let store = GraphStore::in_memory().unwrap();
             store
                 .insert_symbol(&make_symbol_with_kind(
-                    "zzz-high",
-                    "_private_helper",
+                    "zzz-medium",
+                    "zzz_private_helper",
                     SymbolKind::Function,
                     "src/lib.rs",
                     false,
                 ))
                 .unwrap();
-            store
-                .insert_symbol(&make_symbol_with_kind(
-                    "aaa-medium",
-                    "plain_helper",
-                    SymbolKind::Function,
-                    "src/lib.rs",
-                    false,
-                ))
-                .unwrap();
+            let mut public = make_symbol_with_kind(
+                "aaa-low",
+                "aaa_public_helper",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            );
+            public.visibility = Visibility::Public;
+            store.insert_symbol(&public).unwrap();
             let result = detect_dead_code(&store).unwrap();
-            assert_eq!(result.unreachable_symbols[0].uid, "zzz-high");
+            assert_eq!(result.unreachable_symbols[0].uid, "zzz-medium");
             assert_eq!(
                 result.unreachable_symbols[0].confidence,
-                DeadCodeConfidence::High
+                DeadCodeConfidence::Medium
             );
         }
 
@@ -2447,15 +2713,15 @@ mod tests {
 
     #[test]
     fn confidence_scoring_private_names() {
-        // Leading underscore -> High
+        // Leading underscore remains a Medium review candidate
         assert_eq!(
             infer_confidence("_helper", "inferred", "src/lib.py"),
-            DeadCodeConfidence::High
+            DeadCodeConfidence::Medium
         );
-        // Go lowercase -> High
+        // Go lowercase remains a Medium review candidate
         assert_eq!(
             infer_confidence("helper", "inferred", "pkg/utils.go"),
-            DeadCodeConfidence::High
+            DeadCodeConfidence::Medium
         );
         // Public -> Low
         assert_eq!(

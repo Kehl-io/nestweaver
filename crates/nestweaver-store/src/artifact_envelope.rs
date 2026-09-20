@@ -91,6 +91,28 @@ pub struct ArtifactExpectation<'a> {
     pub algorithm_fingerprint: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ArtifactRejection {
+    #[error(
+        "{kind} stale artifact generation {actual}, expected {expected}; re-index with `nestweaver index --repo <path> --force`"
+    )]
+    StaleGeneration {
+        kind: String,
+        actual: u64,
+        expected: u64,
+    },
+    #[error(
+        "rebuildable artifact: producer {actual}, expected {expected}; regenerate derived data"
+    )]
+    ProducerChanged { actual: String, expected: String },
+    #[error("foreign artifact identity")]
+    ForeignIdentity,
+    #[error("corrupt artifact {0}")]
+    Corrupt(String),
+    #[error("incompatible artifact: {0}")]
+    Incompatible(String),
+}
+
 impl ArtifactEnvelope {
     pub fn new<T: Serialize>(
         expectation: ArtifactExpectation<'_>,
@@ -132,52 +154,34 @@ impl ArtifactEnvelope {
         &self,
         expectation: ArtifactExpectation<'_>,
     ) -> Result<T, StoreError> {
-        expectation.identity.validate()?;
-        validate_expectation(expectation)?;
-        if self.envelope_version != ARTIFACT_ENVELOPE_VERSION {
-            return Err(incompatible(format!(
-                "envelope version {} does not match supported version {}",
-                self.envelope_version, ARTIFACT_ENVELOPE_VERSION
-            )));
-        }
-        // nw-459: the producer is checked SEPARATELY and FIRST, because a
-        // producer-only difference is rebuildable rather than incompatible.
-        // Kind, schema and fingerprint must still match exactly — those
-        // describe WHAT the artifact is and HOW it was computed, and a
-        // mismatch there means the payload cannot be trusted at all.
-        if self.artifact_kind == expectation.artifact_kind
-            && self.artifact_schema_version == expectation.artifact_schema_version
-            && self.algorithm_fingerprint == expectation.algorithm_fingerprint
-            && self.producer_version != expectation.producer_version
-        {
-            return Err(StoreError::Query(format!(
-                "{REBUILDABLE_ARTIFACT_MARKER}: the {} artifact was produced by version {}, \
-                 but this build is {}. The algorithm ({}) and schema (v{}) are unchanged, so \
-                 this is derived data an upgrade invalidated, not a corrupt or foreign \
-                 artifact — re-index the repository \
-                 (`nestweaver index --repo <path> --force`) to regenerate it.",
-                self.artifact_kind,
-                self.producer_version,
-                expectation.producer_version,
-                self.algorithm_fingerprint,
-                self.artifact_schema_version
-            )));
-        }
-        if self.artifact_kind != expectation.artifact_kind
+        self.validate_and_decode_typed(expectation)
+            .map_err(|error| StoreError::Query(error.to_string()))
+    }
+
+    /// Integrity and identity take precedence over temporal invalidation. An
+    /// old producer or generation cannot conceal damaged or foreign bytes.
+    pub fn validate_and_decode_typed<T: DeserializeOwned>(
+        &self,
+        expectation: ArtifactExpectation<'_>,
+    ) -> Result<T, ArtifactRejection> {
+        use ArtifactRejection::*;
+        expectation
+            .identity
+            .validate()
+            .map_err(|e| Incompatible(e.to_string()))?;
+        validate_expectation(expectation).map_err(|e| Incompatible(e.to_string()))?;
+        if self.envelope_version != ARTIFACT_ENVELOPE_VERSION
+            || self.artifact_kind != expectation.artifact_kind
             || self.artifact_schema_version != expectation.artifact_schema_version
-            || self.producer_version != expectation.producer_version
-            || self.algorithm_fingerprint != expectation.algorithm_fingerprint
         {
-            return Err(incompatible(format!(
-                "metadata is {}/{}/producer {}/fingerprint {}, expected {}/{}/producer {}/fingerprint {}",
-                self.artifact_kind,
-                self.artifact_schema_version,
-                self.producer_version,
-                self.algorithm_fingerprint,
-                expectation.artifact_kind,
-                expectation.artifact_schema_version,
-                expectation.producer_version,
-                expectation.algorithm_fingerprint
+            return Err(Incompatible(
+                "envelope version, kind, schema or algorithm mismatch".into(),
+            ));
+        }
+        if self.algorithm_fingerprint != expectation.algorithm_fingerprint {
+            return Err(Incompatible(format!(
+                "algorithm fingerprint mismatch (envelope '{}', expected '{}')",
+                self.algorithm_fingerprint, expectation.algorithm_fingerprint
             )));
         }
         let observed_identity = PublicationIdentity {
@@ -186,48 +190,38 @@ impl ArtifactEnvelope {
         };
         observed_identity
             .validate()
-            .map_err(|error| StoreError::Query(format!("corrupt artifact identity: {error}")))?;
-        if !uuid_equal(&self.brain_uuid, &expectation.identity.brain_uuid)?
+            .map_err(|e| Corrupt(e.to_string()))?;
+        if !uuid_equal(&self.brain_uuid, &expectation.identity.brain_uuid)
+            .map_err(|e| Corrupt(e.to_string()))?
             || !uuid_equal(
                 &self.publication_uuid,
                 &expectation.identity.publication_uuid,
-            )?
+            )
+            .map_err(|e| Corrupt(e.to_string()))?
         {
-            return Err(StoreError::Query(format!(
-                "foreign artifact identity {}/{}, expected {}/{}",
-                self.brain_uuid,
-                self.publication_uuid,
-                expectation.identity.brain_uuid,
-                expectation.identity.publication_uuid
-            )));
+            return Err(ForeignIdentity);
         }
+        let digest = payload_digest(&canonical_value(self.payload.clone()))
+            .map_err(|e| Corrupt(e.to_string()))?;
+        if digest != self.payload_blake3 {
+            return Err(Corrupt("payload checksum mismatch".into()));
+        }
+        let payload = serde_json::from_value(self.payload.clone())
+            .map_err(|e| Corrupt(format!("decode artifact payload: {e}")))?;
         if self.source_graph_generation != expectation.source_graph_generation {
-            // nw-289: the message this replaces was
-            // `stale artifact generation 93, expected 95` — two numbers, no
-            // artifact, no file, no remedy. `backup save` failed 100% against
-            // a 5.6 GB production graph and printed exactly that. The
-            // neighbouring PageRank guard already meets the in-repo standard
-            // ("...declares damping 0.5 but this build computes with 0.85 —
-            // re-index"); this one did not. `self.artifact_kind` was known
-            // thirty lines above.
-            return Err(StoreError::Query(format!(
-                "{STALE_ARTIFACT_MARKER}: the {} artifact describes graph generation {}, \
-                 but the graph is at {}. It is derived data — re-index the repository \
-                 (`nestweaver index --repo <path> --force`) to regenerate it.",
-                self.artifact_kind,
-                self.source_graph_generation,
-                expectation.source_graph_generation
-            )));
+            return Err(StaleGeneration {
+                kind: expectation.artifact_kind.to_string(),
+                actual: self.source_graph_generation,
+                expected: expectation.source_graph_generation,
+            });
         }
-        let observed_digest = payload_digest(&canonical_value(self.payload.clone()))?;
-        if observed_digest != self.payload_blake3 {
-            return Err(StoreError::Query(format!(
-                "corrupt artifact payload checksum: recorded {}, observed {}",
-                self.payload_blake3, observed_digest
-            )));
+        if self.producer_version != expectation.producer_version {
+            return Err(ProducerChanged {
+                actual: self.producer_version.clone(),
+                expected: expectation.producer_version.into(),
+            });
         }
-        serde_json::from_value(self.payload.clone())
-            .map_err(|error| StoreError::Query(format!("decode artifact payload: {error}")))
+        Ok(payload)
     }
 }
 
@@ -243,10 +237,6 @@ fn validate_expectation(expectation: ArtifactExpectation<'_>) -> Result<(), Stor
         ));
     }
     Ok(())
-}
-
-fn incompatible(message: String) -> StoreError {
-    StoreError::Query(format!("incompatible artifact: {message}"))
 }
 
 fn uuid_equal(left: &str, right: &str) -> Result<bool, StoreError> {
@@ -418,5 +408,28 @@ mod tests {
                 .to_string()
                 .contains("corrupt artifact payload checksum")
         );
+    }
+    #[test]
+    fn temporal_mismatch_never_masks_integrity_or_foreign_identity() {
+        let identity = identity();
+        let mut envelope =
+            ArtifactEnvelope::new(expectation(&identity), &serde_json::json!({"ok": true}))
+                .unwrap();
+        envelope.payload = serde_json::json!({"ok": false});
+        let mut stale = expectation(&identity);
+        stale.source_graph_generation += 1;
+        assert!(matches!(
+            envelope.validate_and_decode_typed::<serde_json::Value>(stale),
+            Err(ArtifactRejection::Corrupt(_))
+        ));
+        let mut envelope =
+            ArtifactEnvelope::new(expectation(&identity), &serde_json::json!({"ok": true}))
+                .unwrap();
+        envelope.producer_version = "old".into();
+        envelope.brain_uuid = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            envelope.validate_and_decode_typed::<serde_json::Value>(expectation(&identity)),
+            Err(ArtifactRejection::ForeignIdentity)
+        ));
     }
 }

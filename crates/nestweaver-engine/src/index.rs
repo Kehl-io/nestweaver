@@ -831,6 +831,8 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
         path: &Path,
         generation: u64,
     ) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "release-fixture-hooks")]
+        crate::release_fixture::index_generation_save(store)?;
         store.save_graph_generation_value(path, generation)?;
         Ok(())
     }
@@ -2628,8 +2630,8 @@ fn index_directory_with_store_inner(
     // N+2. Loading it after the graph commit would correctly reject it as
     // stale and, historically, `unwrap_or_default` then discarded every other
     // repository's manifest entry.
-    let mut manifest_cache =
-        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
+    let manifest_cache = crate::manifest::current_manifest_snapshot(store, db_path).ok();
+    crate::manifest::mark_manifest_reconciliation_pending(db_path, "repository index")?;
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -2712,11 +2714,7 @@ fn index_directory_with_store_inner(
         tracing::warn!("failed to save resolution deps: {e}");
     }
 
-    let manifest = crate::manifest::parse_manifest(&reader);
-    manifest_cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
-        tracing::warn!("failed to save manifest cache: {e}");
-    }
+    publish_manifest_after_local_index(store, db_path, &r_uid, manifest_cache, reader);
 
     // nw-029: warm PageRank at index time so first queries (UI overview, impact,
     // repo-map, hubs) never pay the lazy compute. Mirrors the incremental path.
@@ -2725,6 +2723,56 @@ fn index_directory_with_store_inner(
     // durable. nw-055 (P1b): delete-only re-indexes also need fresh surviving
     // ranks even though files_count is zero.
     Ok(result)
+}
+
+fn publish_manifest_after_local_index(
+    store: &GraphStore,
+    db_path: &Path,
+    r_uid: &str,
+    manifest_cache: Option<std::collections::HashMap<String, crate::manifest::ManifestInfo>>,
+    reader: crate::content_reader::FilesystemReader,
+) {
+    // An invalid predecessor is not an empty map. Never publish a singleton
+    // as a complete cache; durable debt lets the daemon rebuild all repos.
+    if let Some(mut manifest_cache) = manifest_cache {
+        let mut budget = 32 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let strict_reader = reader.strict_enumeration();
+        let saved = (|| -> anyhow::Result<()> {
+            let inputs =
+                crate::manifest::capture_manifest_inputs(&strict_reader, &mut budget, deadline)?;
+            manifest_cache.insert(r_uid.to_string(), crate::manifest::parse_manifest(&inputs));
+            let live = store.list_repos(None)?;
+            manifest_cache.retain(|uid, _| live.iter().any(|repo| &repo.uid == uid));
+            anyhow::ensure!(
+                live.iter()
+                    .all(|repo| manifest_cache.contains_key(&repo.uid)),
+                "incomplete manifest coverage"
+            );
+            crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path)?;
+            let mut verification_budget = 32 * 1024 * 1024;
+            let verified = crate::manifest::capture_manifest_inputs(
+                &strict_reader,
+                &mut verification_budget,
+                deadline,
+            )?;
+            anyhow::ensure!(
+                inputs == verified,
+                "manifest sources changed during index publication"
+            );
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
+                &crate::manifest::manifest_debt_path(db_path),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            tracing::warn!(%error, "graph indexed; manifest suggestions await daemon reconciliation");
+        }
+    } else {
+        tracing::info!(
+            "graph indexed; incomplete manifest cache queued for complete daemon reconciliation"
+        );
+    }
 }
 
 /// Index a directory into an in-memory GraphStore (for testing).
@@ -2925,8 +2973,8 @@ fn infer_cross_repo_call_edges(
             // nw-127: this is one store round-trip PER CALL SITE, and call names
             // repeat heavily across a repo, so the same name was looked up
             // thousands of times per run. The store is not mutated inside this
-            // loop (symbol writes happen earlier in the phase), so memoising the
-            // lookup for the duration of the call is a pure win.
+            // loop (symbol writes happen after resolution is prepared), so
+            // memoising the lookup for the duration of the call is a pure win.
             let by_name = match name_lookup_cache.get(reference.name.as_str()) {
                 Some(hits) => hits,
                 None => {
@@ -3008,6 +3056,304 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
                 .filter(|s| s.start_line <= line && s.end_line <= s.start_line)
                 .max_by_key(|s| s.start_line)
         })
+}
+
+struct IndexResolution {
+    skip_resolution: bool,
+    resolve_filter: Option<std::collections::HashSet<String>>,
+    insertable_edges: Vec<nestweaver_schema::ResolvedEdge>,
+    inferred_cross_repo_edges: Vec<nestweaver_schema::ResolvedEdge>,
+    member_of_edges: Vec<nestweaver_schema::ResolvedEdge>,
+}
+
+#[derive(Clone, Copy)]
+struct PrepareIndexResolution<'a> {
+    store: &'a GraphStore,
+    reader: &'a dyn crate::content_reader::ContentReader,
+    r_uid: &'a str,
+    parsed_files_for_resolver: &'a [ParsedFileEntry],
+    detected_languages: &'a [Language],
+    ast_bindings_by_file: &'a HashMap<String, Vec<AstTypeBinding>>,
+    actually_changed_files: &'a std::collections::HashSet<String>,
+    files_unchanged: usize,
+    resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
+    cpu_throttle: &'a crate::cpu_throttle::CpuThrottle,
+}
+
+impl IndexResolution {
+    fn all_edges(&self) -> Vec<nestweaver_schema::ResolvedEdge> {
+        let mut edges = Vec::with_capacity(self.edges_count());
+        edges.extend(self.insertable_edges.iter().cloned());
+        edges.extend(self.inferred_cross_repo_edges.iter().cloned());
+        edges.extend(self.member_of_edges.iter().cloned());
+        edges
+    }
+
+    fn edges_count(&self) -> usize {
+        self.insertable_edges.len()
+            + self.inferred_cross_repo_edges.len()
+            + self.member_of_edges.len()
+    }
+}
+
+/// Resolve CALLS/IMPORTS/MEMBER_OF (and inferred cross-repo links) from the
+/// in-memory parse before any graph replacement. Force re-index commits these
+/// edges in the same transaction as the replacement symbols so concurrent
+/// readers never observe a published graph that has `releaseTarget` and zero
+/// callers.
+fn prepare_index_resolution(
+    prep: PrepareIndexResolution<'_>,
+) -> Result<IndexResolution, anyhow::Error> {
+    use nestweaver_schema::{EdgeType, ResolvedEdge};
+    use rayon::prelude::*;
+
+    let PrepareIndexResolution {
+        store,
+        reader,
+        r_uid,
+        parsed_files_for_resolver,
+        detected_languages,
+        ast_bindings_by_file,
+        actually_changed_files,
+        files_unchanged,
+        resolution_deps,
+        cpu_throttle,
+    } = prep;
+
+    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
+    let resolve_pb = ProgressBar::new_spinner();
+    resolve_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    resolve_pb.set_message("Resolving cross-file references...");
+    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let language = {
+        let mut counts: HashMap<Language, usize> = HashMap::new();
+        for language in detected_languages {
+            *counts.entry(*language).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(language, _)| language)
+            .unwrap_or(Language::JavaScript)
+    };
+
+    let workspace_ctx = if matches!(
+        language,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    ) {
+        discover_workspace_context_with(|rel_path| {
+            reader
+                .read_file(rel_path)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+    } else {
+        Default::default()
+    };
+
+    let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
+        cpu_throttle.check();
+        let source_owned;
+        let source: &str = if let Some(s) = source_opt.as_deref() {
+            s
+        } else {
+            source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
+            &source_owned
+        };
+
+        let empty_bindings = Vec::new();
+        let file_ast_bindings = ast_bindings_by_file
+            .get(file_path.as_str())
+            .unwrap_or(&empty_bindings);
+
+        let env = nestweaver_resolver::types::TypeEnvironment::build(
+            source,
+            language,
+            symbols,
+            file_ast_bindings,
+        );
+
+        if env.binding_count() > 0 {
+            Some((file_path.clone(), env))
+        } else {
+            None
+        }
+    };
+    let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
+        crate::parse_pool::install_parse_pool(|| {
+            parsed_files_for_resolver
+                .par_iter()
+                .filter_map(build_env)
+                .collect()
+        });
+    tracing::info!(
+        files_with_bindings = type_envs.len(),
+        total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
+        "type environments built"
+    );
+
+    {
+        let all_symbols_with_returns: std::collections::HashMap<
+            &str,
+            &nestweaver_parser::RawSymbol,
+        > = parsed_files_for_resolver
+            .iter()
+            .flat_map(|(_, syms, _, _)| syms.iter())
+            .filter(|s| {
+                s.type_info
+                    .as_ref()
+                    .and_then(|ti| ti.return_type.as_ref())
+                    .is_some()
+            })
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+
+        if !all_symbols_with_returns.is_empty() {
+            let mut seeded = 0usize;
+            for (file_path, _symbols, _refs, source_opt) in parsed_files_for_resolver {
+                if let Some(env) = type_envs.get_mut(file_path) {
+                    let source_str = match source_opt {
+                        Some(s) => s.clone(),
+                        None => match reader.read_file(Path::new(file_path.as_str())) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        },
+                    };
+                    let before = env.binding_count();
+                    env.seed_return_types(&source_str, &all_symbols_with_returns);
+                    seeded += env.binding_count() - before;
+                }
+            }
+            if seeded > 0 {
+                tracing::info!(new_bindings = seeded, "cross-file return type propagation");
+            }
+        }
+    }
+
+    let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = parsed_files_for_resolver
+        .iter()
+        .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
+        .collect();
+
+    let skip_resolution = actually_changed_files.is_empty()
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
+
+    let resolve_filter = if !skip_resolution
+        && !actually_changed_files.is_empty()
+        && files_unchanged > 0
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
+    {
+        let affected = resolution_deps
+            .as_ref()
+            .unwrap()
+            .affected_files_for_repo(r_uid, actually_changed_files);
+        tracing::info!(
+            changed = actually_changed_files.len(),
+            affected = affected.len(),
+            total = resolver_view.len(),
+            "incremental resolution"
+        );
+        Some(affected)
+    } else {
+        None
+    };
+
+    if skip_resolution {
+        tracing::info!("no files changed, skipping resolution");
+    }
+
+    let resolved_edges = if skip_resolution {
+        Vec::new()
+    } else {
+        resolve_references_with_context(
+            &resolver_view,
+            language,
+            r_uid,
+            &workspace_ctx,
+            Some(&type_envs),
+            resolve_filter.as_ref(),
+        )
+    };
+
+    let insertable_edges: Vec<_> = resolved_edges
+        .into_iter()
+        .filter(|e| !e.target_uid.starts_with("unresolved:"))
+        .collect();
+
+    let inferred_cross_repo_edges = if skip_resolution {
+        Vec::new()
+    } else {
+        infer_cross_repo_call_edges(store, r_uid, parsed_files_for_resolver)?
+    };
+    if !inferred_cross_repo_edges.is_empty() {
+        tracing::debug!(
+            count = inferred_cross_repo_edges.len(),
+            "emitted inferred CROSS_REPO_LINK edges"
+        );
+    }
+
+    let member_of_edges = {
+        let container_kinds = [
+            nestweaver_schema::SymbolKind::Class,
+            nestweaver_schema::SymbolKind::Interface,
+            nestweaver_schema::SymbolKind::Enum,
+            nestweaver_schema::SymbolKind::Trait,
+        ];
+
+        let mut container_map: HashMap<(String, String), String> = HashMap::new();
+        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
+            for raw_sym in raw_symbols {
+                if container_kinds.contains(&raw_sym.kind) {
+                    let uid = symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
+                }
+            }
+        }
+
+        let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
+        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
+            for raw_sym in raw_symbols {
+                if let Some(parent_name) = &raw_sym.parent_name {
+                    let key = (rel_path.clone(), parent_name.clone());
+                    if let Some(parent_uid) = container_map.get(&key) {
+                        let child_uid =
+                            symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                        member_of_edges.push(ResolvedEdge {
+                            source_uid: child_uid,
+                            target_uid: parent_uid.clone(),
+                            edge_type: EdgeType::MemberOf,
+                            confidence: 1.0,
+                            link_type: None,
+                            evidence: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        member_of_edges
+    };
+
+    resolve_pb.finish_and_clear();
+    let resolution = IndexResolution {
+        skip_resolution,
+        resolve_filter,
+        insertable_edges,
+        inferred_cross_repo_edges,
+        member_of_edges,
+    };
+    tracing::info!(
+        edges_resolved = resolution.edges_count(),
+        "phase resolve complete"
+    );
+    drop(_phase_resolve_span);
+    Ok(resolution)
 }
 
 /// Core indexing logic shared by both public functions.
@@ -3877,9 +4223,9 @@ where
         //     For the incremental path, per-file deletes happen here (the window
         //     is tiny per-file). For the force re-index path, the bulk delete is
         //     deferred to step 3 and runs inside the same transaction as the
-        //     insert — see `bulk_reindex_write` — to prevent concurrent readers
-        //     from seeing zero symbols while the CPU-heavy service-grouping work
-        //     runs between delete and insert.
+        //     insert of files, symbols, AND resolved edges — see
+        //     `bulk_reindex_write` — so concurrent readers never see symbols
+        //     without CALLS while type-env/resolve CPU runs.
         let force_reindex = existing_repo.is_some() && files_unchanged == 0;
         // nw-204: this whole-store re-index path deletes symbols too, and used
         // to discard the fact entirely. Accumulate what it removed so the
@@ -3971,10 +4317,25 @@ where
             .map(|(s, sym)| (s.as_str(), sym.as_str()))
             .collect();
 
+        let resolution = prepare_index_resolution(PrepareIndexResolution {
+            store,
+            reader,
+            r_uid: &r_uid,
+            parsed_files_for_resolver: &parsed_files_for_resolver,
+            detected_languages: &detected_languages,
+            ast_bindings_by_file: &ast_bindings_by_file,
+            actually_changed_files: &actually_changed_files,
+            files_unchanged,
+            resolution_deps: resolution_deps.as_deref(),
+            cpu_throttle: &cpu_throttle,
+        })?;
+        let publication_edges = resolution.all_edges();
+
         if force_reindex {
             // Atomic delete+insert: old data is only removed within the same
-            // transaction that inserts the replacement, so concurrent readers
-            // never see an empty repo.
+            // transaction that inserts the replacement symbols AND their
+            // resolved edges, so concurrent readers never see an empty repo
+            // or a repo whose symbols have no CALLS.
             let (deleted_files, deleted_symbols, removed_symbol_uids) = store
                 .bulk_reindex_write(
                     &r_uid,
@@ -3984,6 +4345,7 @@ where
                     &file_sym_refs,
                     &all_services,
                     &svc_sym_refs,
+                    &publication_edges,
                 )
                 .context("bulk_reindex_write")?;
             files_deleted += deleted_files;
@@ -4010,13 +4372,36 @@ where
                     &svc_sym_refs,
                 )
                 .context("bulk_index_write")?;
+            if !resolution.skip_resolution {
+                if let Some(ref filter) = resolution.resolve_filter {
+                    for file_path in filter {
+                        let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
+                    }
+                } else {
+                    let _ = store.delete_resolved_edges_for_repo(&r_uid);
+                }
+                store
+                    .batch_insert_edges(&publication_edges)
+                    .context("batch_insert_edges (resolved)")?;
+            }
         }
+        let edges_count = resolution.edges_count();
         tracing::info!(
             files_written = all_files.len(),
             symbols_written = all_symbols.len(),
             services_written = all_services.len(),
             "phase write complete"
         );
+
+        // The internal fixture returns through graph_result, preserving the
+        // common publication finalizer and the daemon's write ownership.
+        #[cfg(feature = "release-fixture-hooks")]
+        crate::release_fixture::index_content_committed(
+            store,
+            &r_uid,
+            all_files.len(),
+            all_symbols.len(),
+        )?;
 
         // nw-204: the symbols are back in the graph now, so the liveness
         // difference is meaningful — nearly every UID deleted above has just
@@ -4031,241 +4416,6 @@ where
             "full index over existing store",
         );
         drop(_phase_write_span);
-
-        // ── Phase 3: Resolve cross-file references ────────────────────────────
-        let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
-        let resolve_pb = ProgressBar::new_spinner();
-        resolve_pb.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        resolve_pb.set_message("Resolving cross-file references...");
-        resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-        // 8. Run full cross-file resolution via the resolver.
-        //    Use the most common language detected across files; fall back to JavaScript.
-        let language = {
-            let mut counts: HashMap<Language, usize> = HashMap::new();
-            for l in &detected_languages {
-                *counts.entry(*l).or_insert(0) += 1;
-            }
-            counts
-                .into_iter()
-                .max_by_key(|(_, c)| *c)
-                .map(|(l, _)| l)
-                .unwrap_or(Language::JavaScript)
-        };
-
-        // Load workspace context (monorepo packages + tsconfig aliases) for JS/TS resolution.
-        // Uses the ContentReader so this works with both filesystem and bare-repo readers.
-        let workspace_ctx = if matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        ) {
-            discover_workspace_context_with(|rel_path| {
-                reader
-                    .read_file(rel_path)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            })
-        } else {
-            Default::default()
-        };
-
-        // Build type environments per file for type-aware resolution.
-        // Each file's type env is independent, so we build them in parallel.
-        let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
-            // Same CPU budget as the parse phase above.
-            cpu_throttle.check();
-            let source_owned;
-            let source: &str = if let Some(s) = source_opt.as_deref() {
-                s
-            } else {
-                source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
-                &source_owned
-            };
-
-            let empty_bindings = Vec::new();
-            let file_ast_bindings = ast_bindings_by_file
-                .get(file_path.as_str())
-                .unwrap_or(&empty_bindings);
-
-            let env = nestweaver_resolver::types::TypeEnvironment::build(
-                source,
-                language,
-                symbols,
-                file_ast_bindings,
-            );
-
-            if env.binding_count() > 0 {
-                Some((file_path.clone(), env))
-            } else {
-                None
-            }
-        };
-        // Same dedicated low-priority pool as the parse phase.
-        let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
-            crate::parse_pool::install_parse_pool(|| {
-                parsed_files_for_resolver
-                    .par_iter()
-                    .filter_map(build_env)
-                    .collect()
-            });
-        tracing::info!(
-            files_with_bindings = type_envs.len(),
-            total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
-            "type environments built"
-        );
-
-        // Cross-file return type propagation: seed bindings from known function return types
-        {
-            let all_symbols_with_returns: std::collections::HashMap<
-                &str,
-                &nestweaver_parser::RawSymbol,
-            > = parsed_files_for_resolver
-                .iter()
-                .flat_map(|(_, syms, _, _)| syms.iter())
-                .filter(|s| {
-                    s.type_info
-                        .as_ref()
-                        .and_then(|ti| ti.return_type.as_ref())
-                        .is_some()
-                })
-                .map(|s| (s.name.as_str(), s))
-                .collect();
-
-            if !all_symbols_with_returns.is_empty() {
-                let mut seeded = 0usize;
-                for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
-                    if let Some(env) = type_envs.get_mut(file_path) {
-                        let source_str = match source_opt {
-                            Some(s) => s.clone(),
-                            None => match reader.read_file(Path::new(file_path.as_str())) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            },
-                        };
-                        let before = env.binding_count();
-                        env.seed_return_types(&source_str, &all_symbols_with_returns);
-                        seeded += env.binding_count() - before;
-                    }
-                }
-                if seeded > 0 {
-                    tracing::info!(new_bindings = seeded, "cross-file return type propagation");
-                }
-            }
-        }
-
-        // Build a 3-tuple view for the resolver (it does not need source strings).
-        let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
-            parsed_files_for_resolver
-                .iter()
-                .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
-                .collect();
-
-        // Compute the incremental resolution filter: only re-resolve files that
-        // changed plus files that depend on changed files.
-        // When no files changed and we have prior resolution data, skip resolution
-        // entirely — edges from the previous run are still valid in the DB.
-        let skip_resolution = actually_changed_files.is_empty()
-            && resolution_deps
-                .as_ref()
-                .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid));
-
-        let resolve_filter = if !skip_resolution
-            && !actually_changed_files.is_empty()
-            && files_unchanged > 0
-            && resolution_deps
-                .as_ref()
-                .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid))
-        {
-            let affected = resolution_deps
-                .as_ref()
-                .unwrap()
-                .affected_files_for_repo(&r_uid, &actually_changed_files);
-            tracing::info!(
-                changed = actually_changed_files.len(),
-                affected = affected.len(),
-                total = resolver_view.len(),
-                "incremental resolution"
-            );
-            Some(affected)
-        } else {
-            None
-        };
-
-        if skip_resolution {
-            tracing::info!("no files changed, skipping resolution");
-        }
-
-        let resolved_edges = if skip_resolution {
-            Vec::new()
-        } else {
-            resolve_references_with_context(
-                &resolver_view,
-                language,
-                &r_uid,
-                &workspace_ctx,
-                Some(&type_envs),
-                resolve_filter.as_ref(),
-            )
-        };
-
-        // Filter out unresolved edges whose target doesn't exist in the DB.
-        let insertable_edges: Vec<_> = resolved_edges
-            .into_iter()
-            .filter(|e| !e.target_uid.starts_with("unresolved:"))
-            .collect();
-
-        // Delete old resolved edges before inserting the new ones, or every
-        // re-resolution accumulates duplicates. Incremental resolution clears
-        // per affected file; a full (unfiltered) run re-creates every
-        // resolved edge in the repo, so it must clear them repo-wide. When
-        // `skip_resolution` holds, nothing is re-created and nothing is
-        // cleared.
-        if let Some(ref filter) = resolve_filter {
-            for file_path in filter {
-                let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
-            }
-        } else if !skip_resolution {
-            let _ = store.delete_resolved_edges_for_repo(&r_uid);
-        }
-
-        let mut edges_count = insertable_edges.len();
-        store
-            .batch_insert_edges(&insertable_edges)
-            .context("batch_insert_edges (resolved)")?;
-
-        // nw-127: this walks EVERY parsed file — including unchanged ones, which
-        // are deliberately fed to the resolver — and issues a store lookup per
-        // call site. It ran unconditionally, so an index with zero changed files
-        // still paid for it: 57 minutes on a 755-file repo against a 130k-symbol
-        // graph, which is what pushed large repos past the 1800s ceiling and made
-        // them report failure for work that had actually succeeded.
-        //
-        // When nothing changed, this repo's call sites are identical to the last
-        // run and the edges it would infer are already in the database, so the
-        // whole pass is recomputing a known answer. Skipping matches what
-        // `skip_resolution` already does for ordinary resolution one block above,
-        // and for the same reason.
-        let inferred_cross_repo_edges = if skip_resolution {
-            Vec::new()
-        } else {
-            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?
-        };
-        if !inferred_cross_repo_edges.is_empty() {
-            edges_count += inferred_cross_repo_edges.len();
-            store
-                .batch_insert_edges(&inferred_cross_repo_edges)
-                .context("batch_insert_edges (inferred cross-repo calls)")?;
-            tracing::debug!(
-                count = inferred_cross_repo_edges.len(),
-                "emitted inferred CROSS_REPO_LINK edges"
-            );
-        }
 
         // Record file-level dependency information for future incremental runs.
         if let Some(ref mut rd) = resolution_deps {
@@ -4282,7 +4432,7 @@ where
                 })
                 .collect();
             let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-            for edge in &insertable_edges {
+            for edge in &resolution.insertable_edges {
                 if let (Some(src_file), Some(tgt_file)) = (
                     symbol_file_index.get(&edge.source_uid),
                     symbol_file_index.get(&edge.target_uid),
@@ -4306,8 +4456,8 @@ where
             // records); other files' records carry over. Nothing is recorded
             // when resolution was skipped: the previous records are still
             // accurate.
-            if !skip_resolution {
-                match &resolve_filter {
+            if !resolution.skip_resolution {
+                match &resolution.resolve_filter {
                     Some(filter) => {
                         // Only files actually fed to the resolver may have
                         // their records refreshed: a filter member that was
@@ -4334,73 +4484,6 @@ where
                 }
             }
         }
-
-        // ── Structural MEMBER_OF edges ────────────────────────────────────────
-        // Build a lookup: (file_path, type_name) → type_symbol_uid for all
-        // container symbols (Class / Interface / Enum / Trait).  Then for every
-        // raw symbol that carries a parent_name, emit a MEMBER_OF edge from the
-        // member to its parent container.
-        {
-            use nestweaver_schema::{EdgeType, ResolvedEdge};
-
-            // nw-330: `Extension` is deliberately NOT a container kind here.
-            // `container_map` is keyed by (file, name) and overwrites, so while
-            // Rust `impl` blocks were `SymbolKind::Class` a type's methods
-            // bound to whichever impl block was parsed LAST rather than to the
-            // type. Now that impl blocks carry their own kind, the struct is
-            // the only candidate and the binding is deterministic.
-            let container_kinds = [
-                nestweaver_schema::SymbolKind::Class,
-                nestweaver_schema::SymbolKind::Interface,
-                nestweaver_schema::SymbolKind::Enum,
-                nestweaver_schema::SymbolKind::Trait,
-            ];
-
-            // (file_path, type_name) → uid — built from ALL files (including cached)
-            // so incremental runs don't lose MEMBER_OF edges for CachedParsed files.
-            let mut container_map: HashMap<(String, String), String> = HashMap::new();
-            for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
-                for raw_sym in raw_symbols {
-                    if container_kinds.contains(&raw_sym.kind) {
-                        let uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                        container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
-                    }
-                }
-            }
-
-            let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-            for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
-                for raw_sym in raw_symbols {
-                    if let Some(parent_name) = &raw_sym.parent_name {
-                        let key = (rel_path.clone(), parent_name.clone());
-                        if let Some(parent_uid) = container_map.get(&key) {
-                            let child_uid =
-                                symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                            member_of_edges.push(ResolvedEdge {
-                                source_uid: child_uid,
-                                target_uid: parent_uid.clone(),
-                                edge_type: EdgeType::MemberOf,
-                                confidence: 1.0,
-                                link_type: None,
-                                evidence: Vec::new(),
-                            });
-                        }
-                    }
-                }
-            }
-
-            if !member_of_edges.is_empty() {
-                edges_count += member_of_edges.len();
-                store
-                    .batch_insert_edges(&member_of_edges)
-                    .context("batch_insert_edges (member_of)")?;
-                tracing::debug!(count = member_of_edges.len(), "emitted MEMBER_OF edges");
-            }
-        }
-
-        resolve_pb.finish_and_clear();
-        tracing::info!(edges_resolved = edges_count, "phase resolve complete");
-        drop(_phase_resolve_span);
 
         // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
         let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
@@ -6024,6 +6107,34 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // 4. Nothing changed.
     if old_sha == new_sha {
+        // Working-tree manifests can change without a commit. This shortcut
+        // does not publish a new graph generation, so invalidate derived
+        // suggestions only when captured package inputs actually differ from
+        // the published cache. A second index of an up-to-date tree must not
+        // 503 suggestions until daemon recovery.
+        let needs_reconciliation =
+            match crate::manifest::working_tree_manifest_requires_reconciliation(
+                &store,
+                db_path,
+                &r_uid,
+                &policy_reader,
+            ) {
+                Ok(needed) => needed,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not compare working-tree manifests on an unchanged SHA; queuing reconciliation"
+                    );
+                    true
+                }
+            };
+        if needs_reconciliation {
+            crate::manifest::mark_manifest_reconciliation_pending(
+                db_path,
+                "unchanged-SHA local index requires working-tree manifest reconciliation",
+            )?;
+            tracing::info!("manifest suggestions await daemon reconciliation");
+        }
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
         // nw-387 RESIDUAL: THE DISCLOSURE HAS TO BE DURABLE, AND THIS IS THE
         // BRANCH THAT BROKE IT. On the item's own fixture (`canary.py` plus a
@@ -7447,8 +7558,8 @@ fn full_index_fallback(
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
-    let mut manifest_cache =
-        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
+    let manifest_cache = crate::manifest::current_manifest_snapshot(store, db_path).ok();
+    crate::manifest::mark_manifest_reconciliation_pending(db_path, "fallback repository index")?;
     let filemeta_cache = load_filemeta_sidecar(&filemeta_path)
         .repos
         .get(&r_uid)
@@ -7512,12 +7623,7 @@ fn full_index_fallback(
         tracing::warn!("failed to save resolution deps: {e}");
     }
 
-    // Update the manifest cache sidecar (same as index_directory does).
-    let manifest = crate::manifest::parse_manifest(&reader);
-    manifest_cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
-        tracing::warn!("failed to save manifest cache: {e}");
-    }
+    publish_manifest_after_local_index(store, db_path, &r_uid, manifest_cache, reader);
 
     // nw-029: warm PageRank at index time so first queries (UI overview, impact,
     // repo-map, hubs) never pay the lazy compute. This is the first-index-of-a-
@@ -12026,6 +12132,78 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn force_reindex_with_added_files_keeps_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "export function releaseTarget(name) { return name; }\n\
+             export function releaseCaller() { return releaseTarget('release'); }\n\
+             export function secondCaller() { return releaseTarget('second'); }\n",
+        )
+        .unwrap();
+
+        index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-1",
+            false,
+            None,
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let target = store
+            .lookup_symbols_by_name("releaseTarget")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("releaseTarget indexed");
+        let before = store.callers_of(&target.uid).unwrap();
+        assert!(
+            before.len() >= 2,
+            "precondition: expected two callers, got {before:?}"
+        );
+        drop(store);
+
+        for number in 0..8 {
+            fs::write(
+                src.join(format!("writer{number}.js")),
+                format!("export function writer{number}() {{ return {number}; }}\n"),
+            )
+            .unwrap();
+        }
+
+        index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-2",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let target = store
+            .lookup_symbols_by_name("releaseTarget")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("releaseTarget survived force reindex");
+        let after = store.callers_of(&target.uid).unwrap();
+        assert!(
+            after.len() >= 2,
+            "force reindex with extra files must keep CALLS on unchanged symbols; got {after:?}"
+        );
+    }
+
+    #[test]
     fn deletion_finalizer_removes_phantom_manifest_suggestions_and_preserves_survivors() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
@@ -14414,6 +14592,69 @@ function hello(name) { return "Hello " + name; }
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
+        );
+    }
+
+    #[test]
+    fn unchanged_sha_without_manifest_edit_does_not_queue_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "export function live() { return 1; }").unwrap();
+        fs::write(repo.join("package.json"), r#"{"name":"stable"}"#).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/manifest-steady";
+        index_directory(&repo, &db_path, "test", url, &head).unwrap();
+        let uid = nestweaver_schema::repo_uid("test", url);
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+            assert_eq!(snapshot[&uid].package_name.as_deref(), Some("stable"));
+        }
+        incremental_index(&repo, &db_path, "test", url).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_none(),
+            "a second index of an unchanged tree must not 503 current suggestions"
+        );
+        let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+        assert_eq!(snapshot[&uid].package_name.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn unchanged_sha_manifest_edit_queues_recovery_without_graph_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "export function live() { return 1; }").unwrap();
+        fs::write(repo.join("package.json"), r#"{"name":"before"}"#).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/manifest-noop";
+        index_directory(&repo, &db_path, "test", url, &head).unwrap();
+        let uid = nestweaver_schema::repo_uid("test", url);
+        let generation = {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+            assert_eq!(snapshot[&uid].package_name.as_deref(), Some("before"));
+            store.graph_generation()
+        };
+        fs::write(repo.join("package.json"), r#"{"name":"after"}"#).unwrap();
+        let result = incremental_index(&repo, &db_path, "test", url).unwrap();
+        assert!(!result.fell_back_to_full);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(store.graph_generation(), generation);
+        assert_eq!(store.lookup_repo(&uid).unwrap().unwrap().indexed_sha, head);
+        assert_eq!(
+            crate::manifest::current_manifest_snapshot(&store, &db_path)
+                .unwrap_err()
+                .reason,
+            crate::manifest::ManifestUnavailableReason::PendingSourceChange
         );
     }
 

@@ -71,7 +71,11 @@ export function useContextMode() {
       latest.activeLens.lens === "search" &&
       latest.selectedNodeId != null &&
       latest.selectedNodeId !== seeds[0];
-    if (!searchPinned) {
+    const compareActive =
+      latest.diffActive || latest.activeLens.label.toLowerCase().startsWith("compare");
+    // Search pinning and an in-flight Compare both own the lens. Reloading
+    // the scene graph must not select Context and clear that analysis.
+    if (!searchPinned && !compareActive) {
       setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
     }
 
@@ -132,7 +136,9 @@ export function useContextMode() {
           const detail = await api.symbol(seed.uid);
           if (!isCurrentRequest()) return;
 
-          for (const caller of detail.callers) {
+          const callers = Array.isArray(detail.callers) ? detail.callers : [];
+          const callees = Array.isArray(detail.callees) ? detail.callees : [];
+          for (const caller of callers) {
             if (
               graph.hasNode(caller.uid) &&
               !graph.hasEdge(caller.uid, seed.uid)
@@ -145,7 +151,7 @@ export function useContextMode() {
               });
             }
           }
-          for (const callee of detail.callees) {
+          for (const callee of callees) {
             if (
               graph.hasNode(callee.uid) &&
               !graph.hasEdge(seed.uid, callee.uid)
@@ -173,19 +179,9 @@ export function useContextMode() {
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
-      const latest = useStore.getState();
-      const searchPinned =
-        latest.activeLens.lens === "search" &&
-        latest.selectedNodeId != null &&
-        latest.selectedNodeId !== requestSeeds[0];
-      if (!searchPinned) {
-        setActiveLens({
-          lens: "context",
-          label: "Context",
-          targetUid: requestSeeds[0] ?? null,
-          workspaceId: requestWorkspaceId,
-        });
-      }
+      // The request selected its lens before loading. A user can start Compare
+      // (or another analysis) while it is pending; completing graph data must
+      // not select the old lens again and clear that newer analysis state.
       setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
       start(graph);

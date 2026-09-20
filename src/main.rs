@@ -1269,8 +1269,13 @@ fn report_ambiguous_name_payload(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let entity = if payload["entity_kind"].as_str() == Some("note") {
+            "notes"
+        } else {
+            "symbols"
+        };
         eprintln!(
-            "Ambiguous: '{}' matches {} symbols:",
+            "Ambiguous: '{}' matches {} {entity}:",
             symbol,
             candidates.len()
         );
@@ -1654,10 +1659,15 @@ fn parse_cluster_resolution(value: &str) -> Result<f64, String> {
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
+#[cfg(feature = "release-fixture-hooks")]
+const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+release-fixture-hooks");
+#[cfg(not(feature = "release-fixture-hooks"))]
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "nestweaver",
-    version,
+    version = CLI_VERSION,
     about = "Code knowledge graph for AI agents",
     long_about = "NestWeaver builds structural knowledge graphs of codebases and serves them\n\
                   to AI agents through query commands. Index a repo, then search symbols,\n\
@@ -1727,10 +1737,11 @@ struct Cli {
     /// scripts and agents. Requests that this command skip autostarting a
     /// daemon and open the database directly.
     ///
-    /// The gate is `NESTWEAVER_ALLOW_NO_DAEMON`, NOT `NESTWEAVER_NO_DAEMON` —
-    /// the latter is a second way to REQUEST the bypass, not to permit it.
-    /// Without the gate this flag is ignored and the command routes through
-    /// the daemon.
+    /// CI-only: requires the unpublished `ci-direct-tests` build, a GitHub
+    /// Actions runner context, and `NESTWEAVER_ALLOW_NO_DAEMON=1`.
+    /// `NESTWEAVER_NO_DAEMON` requests access — it does not permit it.
+    /// Setting `CI=true` locally is not a permit. Without the gate this flag
+    /// is ignored and the command routes through the daemon.
     ///
     /// This is not what keeps the store single-writer: the write lease is
     /// taken at the moment of the write and fails closed, so a bypass against
@@ -4197,15 +4208,28 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         }
     };
     coverage_note();
-
+    println!("Review candidates only; static reachability does not establish safe deletion.");
+    if payload
+        .get("confidence_filter_status")
+        .and_then(|v| v.as_str())
+        == Some("unavailable_no_validated_population")
+    {
+        println!(
+            "High confidence is unavailable: no validated population exists. This empty result is not evidence that no dead code exists."
+        );
+        excluded_note();
+        return;
+    }
     if matching == 0 {
-        println!("No dead code detected ({total} symbols, all reachable from entry points).");
+        println!(
+            "No review candidates match this filter ({total} analyzed symbols); this is not proof of no dead code."
+        );
         excluded_note();
         return;
     }
 
     println!(
-        "Dead code analysis: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
+        "Reachability review: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
         num("unreachable_count"),
         payload
             .get("dead_percentage")
@@ -4227,7 +4251,9 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        println!("(showing first {returned} of {matching} — pass --limit to change)\n");
+        println!(
+            "(showing {returned} of {matching}; JSON next_offset identifies any remaining page)\n"
+        );
     }
 
     // Group by file path, matching the direct path's BTreeMap ordering.
@@ -6855,12 +6881,12 @@ enum Commands {
         stats: bool,
     },
 
-    /// Detect potentially dead code via entry point reachability
+    /// Review statically unreachable symbols (never deletion approval)
     ///
     /// Walks forward from every entry point following CALLS, IMPORTS,
     /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
-    /// are reported as potentially dead, with confidence scoring based
-    /// on visibility.
+    /// are reported as review candidates, ranked by how unaddressable a
+    /// symbol is from outside its file — never by how sure the walk is.
     ///
     /// Known limitation: a symbol is reported when no entry point REACHES it,
     /// which is not the same as "nothing references it" — a reference the
@@ -6876,14 +6902,14 @@ enum Commands {
     /// is one-directional and points at deleting live code. Re-index the repos
     /// it names with `nestweaver index --repo <path> --force` and re-run.
     #[command(
-        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  a list was produced\n  2  REFUSED — the graph's edges predate the running resolver; re-index with\n     `nestweaver index --repo <path> --force` (each stale repo is named on stderr)"
+        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  review results produced (high has no validated population)\n  2  REFUSED — stale resolver or invalid/changed result page; follow the response note"
     )]
     DeadCode {
         #[arg(
             long,
             default_value = "low",
             value_parser = ["low", "medium", "high"],
-            help = "Minimum confidence to report (low, medium, high)"
+            help = "Review tier (low, medium, high); high has no validated output population"
         )]
         min_confidence: String,
         #[arg(long, help = "Output as JSON")]
@@ -6897,9 +6923,30 @@ enum Commands {
             // to get every row silently got 50 and a `truncated: true` they had
             // been told could not happen. Help text is a claim a user acts on:
             // this is nw-334's class in help rather than in an error message.
-            help = "Max unreachable symbols to report (1-1000; default 50, or [limits].default_result_limit from config; matches the MCP dead_code schema). Pass an explicit --limit to widen it — there is no 'all'."
+            help = "Max unreachable symbols to report (1-1000; default 50, or [limits].default_result_limit from config; matches the MCP dead_code schema). Use next_offset, graph_generation and page_token to retrieve subsequent bounded pages."
         )]
         limit: Option<usize>,
+        #[arg(
+            long = "repo",
+            visible_alias = "repos",
+            value_delimiter = ',',
+            help = "Restrict result population to repository names or UIDs (repeatable)"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long,
+            default_value_t = 0,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000_000),
+            help = "Skip this many rows before the page (default 0). Use --generation and --page-token from the first page when offset > 0"
+        )]
+        offset: usize,
+        #[arg(
+            long,
+            help = "Graph generation from the first page; required when offset > 0"
+        )]
+        generation: Option<u64>,
+        #[arg(long, help = "Prior page token; required when offset > 0")]
+        page_token: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -7567,6 +7614,11 @@ enum DaemonAction {
     Gc,
     /// Run daemon in foreground (used by launchd)
     Run {
+        /// Internal single-use owned-daemon fixture activation.
+        #[cfg(feature = "release-fixture-hooks")]
+        #[arg(long, hide = true)]
+        release_fixture_control: Option<PathBuf>,
+
         /// Enable server mode (TCP listener alongside UDS)
         #[arg(long)]
         server: bool,
@@ -9663,6 +9715,11 @@ fn vault_registrations_for_root(
     config: Option<&Path>,
     root: &Path,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    // This is a CREATE preflight, not a read query: an uncreated local DB
+    // cannot contain registrations. Do not dial or discover remote vaults.
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
     let root_str = root.to_string_lossy().to_string();
     let matches_root = |candidate: &str| candidate == root_str;
 
@@ -9695,10 +9752,7 @@ fn vault_registrations_for_root(
             .unwrap_or_default());
     }
 
-    // Direct fallback. A missing database is not an error here.
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
+    // Explicit CI direct branch only; normal RPC failures already returned.
     Ok(match open_store(Some(db_path)) {
         Ok(store) => store
             .list_vaults(None)
@@ -14118,62 +14172,57 @@ mod impact_floor_clause_tests {
     }
 }
 
-/// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
-/// without mutating process-global environment variables (which race under
-/// parallel `cargo test`). The daemon bypass is permitted when an explicit
-/// local opt-in is set, or when we are running under a CI system.
-fn no_daemon_allowed_from(allow_optin: bool, _github_actions: bool, _ci: Option<&str>) -> bool {
-    // `CI` and `GITHUB_ACTIONS` confer NOTHING. They used to permit the bypass,
-    // which meant an ambient variable set by dozens of unrelated tools decided
-    // whether this database could have two writers.
-    //
-    // `CI` is not ours. Every CI provider sets it, so do many Docker images,
-    // shell profiles and wrapper scripts, and developers set it locally to
-    // reproduce CI failures. The canonical incident is Netlify beginning to set
-    // `CI=true` in 2020, which broke thousands of Create React App builds
-    // overnight — for a COSMETIC setting. This one decided writer exclusivity.
-    //
-    // The closest analogue in Rust is `RUSTC_BOOTSTRAP`, which leaked so far
-    // beyond its intended use that the compiler team proposed renaming it to
-    // force a conscious decision. An inherited, invisible, ambiently-settable
-    // channel is exactly wrong for a mode nobody should enter by accident.
-    //
-    // Correctness no longer depends on this answer in any case:
-    // `require_exclusive_store_access` takes the lock at the moment of the
-    // write, so a wrong answer here costs a confusing refusal, never a second
-    // writer.
-    //
-    // An earlier version of this comment claimed "in CI no daemon is running,
-    // so the lock is free and everything works with no gate at all". CI
-    // disproved it: with the bypass no longer conferred, `--no-daemon` was
-    // IGNORED, so the step's index command autostarted a daemon that took the
-    // lease, and the embed command that followed refused. Removing an implicit
-    // permission does not make a job daemon-free — it makes it daemon-ROUTED,
-    // which is a different thing. Jobs that want isolation now set
-    // NESTWEAVER_ALLOW_NO_DAEMON explicitly.
-    allow_optin
+/// CI-only direct-store policy, kept pure for exhaustive unit coverage.
+/// Standard artifacts cannot bypass, even with every runtime opt-in present.
+/// Honored only when the unpublished `ci-direct-tests` artifact, an explicit
+/// permit, and a GitHub Actions runner context are all present. `CI=true` is
+/// not a permit — including when set locally. Runner env values cannot prove
+/// origin; they match `scripts/ci-direct-cargo.sh::github_runner_context`.
+fn ci_direct_policy(
+    ci_build: bool,
+    allow_optin: bool,
+    github_actions: bool,
+    runner_temp: bool,
+    runner_os: bool,
+    github_run_id: bool,
+) -> bool {
+    ci_build && allow_optin && github_actions && runner_temp && runner_os && github_run_id
 }
 
-/// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
-/// is permitted in the current environment.
-///
-/// Honored by exactly ONE thing: `NESTWEAVER_ALLOW_NO_DAEMON`. `GITHUB_ACTIONS`
-/// and `CI` confer nothing — they are still read and passed in, but only so
-/// [`no_daemon_allowed_from`]'s tests can pin that they never grant permission.
-/// See that function for why an ambient, inherited variable is the wrong
-/// channel for this decision.
-///
-/// What the answer actually controls is narrow: whether a command may skip
-/// autostarting a daemon. It is NOT what protects the store from two writers —
-/// [`require_exclusive_store_access`] takes the write lease at the moment of
-/// the write and fails closed if anyone holds it, so a bypass against a
-/// daemon-owned database is refused rather than silently doubled. A wrong
-/// answer here costs a confusing refusal, not corruption.
+fn env_nonempty(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.is_empty())
+}
+
+fn no_daemon_allowed_from(
+    allow_optin: bool,
+    github_actions: bool,
+    runner_temp: bool,
+    runner_os: bool,
+    github_run_id: bool,
+) -> bool {
+    ci_direct_policy(
+        cfg!(feature = "ci-direct-tests"),
+        allow_optin,
+        github_actions,
+        runner_temp,
+        runner_os,
+        github_run_id,
+    )
+}
+
+/// Only the separate internal CI artifact can honor an explicit bypass permit.
+/// Runtime markers alone never authorize direct access. Setting CI locally is
+/// not a supported way to run database tests; local fixtures use the daemon.
 fn no_daemon_allowed() -> bool {
     no_daemon_allowed_from(
-        std::env::var_os("NESTWEAVER_ALLOW_NO_DAEMON").is_some(),
-        std::env::var_os("GITHUB_ACTIONS").is_some(),
-        std::env::var("CI").ok().as_deref(),
+        matches!(
+            std::env::var("NESTWEAVER_ALLOW_NO_DAEMON").as_deref(),
+            Ok("1" | "true")
+        ),
+        matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true")),
+        env_nonempty("RUNNER_TEMP"),
+        env_nonempty("RUNNER_OS"),
+        env_nonempty("GITHUB_RUN_ID"),
     )
 }
 
@@ -14550,7 +14599,7 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     }
     if warn {
         eprintln!(
-            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a test-harness-only escape \
+            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI-only escape \
              hatch and is not permitted here. Routing through the daemon, which is the \
              single writer for this database. If you are trying to stop a daemon that is \
              holding the write lease, use `nestweaver daemon --db <path> stop`."
@@ -15592,6 +15641,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload["status"].as_str() == Some("not_found") {
+                if json {
+                    print_json_payload(&payload)?;
+                }
+                eprintln!("Note '{target}' not found.");
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             if payload_is_ambiguous(&payload) {
                 return report_ambiguous_name_payload(&target, &payload, json);
             }
@@ -15654,38 +15710,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(limit) = limit {
                 tool_args["limit"] = serde_json::json!(limit);
             }
-            if repo_filter.is_some() {
-                let store = open_store(Some(&db_path))?;
-                match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
-                    ResolveResult::Found(uid) => {
-                        tool_args = serde_json::json!({ "uid": uid });
-                    }
-                    ResolveResult::NotFound => {
-                        if json {
-                            print_json_not_found("symbol", &name_or_uid);
-                        }
-                        eprintln!("Symbol '{name_or_uid}' not found.");
-                        return Ok((EXIT_NOT_FOUND, None));
-                    }
-                    ResolveResult::Ambiguous(candidates) => {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&candidates)?);
-                        } else {
-                            eprintln!(
-                                "Ambiguous: '{}' matches {} symbols:",
-                                name_or_uid,
-                                candidates.len()
-                            );
-                            for c in &candidates {
-                                eprintln!(
-                                    "  {} [{}] {}:{}",
-                                    c.uid, c.kind, c.file_path, c.start_line
-                                );
-                            }
-                        }
-                        return Ok((EXIT_AMBIGUOUS, None));
-                    }
-                }
+            if let Some(repo) = repo_filter {
+                tool_args["name_repo"] = serde_json::json!(repo);
             }
             // Same classification as `cross-repo-contracts`: dispatch errors
             // must not skip the "no symbol found" arm via `?`, or a missing
@@ -15723,6 +15749,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(error) => return Err(error),
             };
+            if payload_is_ambiguous(&payload) {
+                return report_ambiguous_name_payload(&name_or_uid, &payload, json);
+            }
             if json {
                 print_json_payload(&payload)?;
             } else if payload["returned"].as_u64().unwrap_or(0) == 0
@@ -16174,7 +16203,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // ── Local fallback (daemon unavailable) ──────────────────
+            // Honored CI direct route (`use_daemon == false`). Daemon
+            // unavailability never falls through; `try_hybrid_json_rpc_checked`
+            // refuses via `ensure_direct_store_fallback_allowed`.
             let built = match context_result {
                 Some(result) => Ok(result),
                 None => {
@@ -16818,7 +16849,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // nw-439: same wait+classify the daemon route gets, for the
-            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // honored CI direct route (`use_daemon == false`), so this
             // command reads identically regardless of which route answered.
             nestweaver_mcp::tools::wait_out_index_publication(&store, None);
 
@@ -17015,7 +17046,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // nw-439: same wait+classify the daemon route gets, for the
-            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // honored CI direct route (`use_daemon == false`), so this
             // command reads identically regardless of which route answered —
             // and, now that `find_bridge_nodes_bounded` fails closed on a
             // dirty publication (below), it produces the SAME disclosure
@@ -18157,183 +18188,131 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             min_confidence,
             json,
             limit,
+            repos,
+            offset,
+            generation,
+            page_token,
             db,
         } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
-                let mut args = serde_json::json!({ "min_confidence": min_confidence });
-                if let Some(n) = limit {
-                    args["limit"] = serde_json::json!(n);
-                }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
-                    // nw-372: the daemon PRINTS what it was sent. The refusal
-                    // is computed by the `dead_code` tool the daemon ran, from
-                    // `ResolverGenerations::stale_repos` — the sole
-                    // computation — so this route decides nothing and cannot
-                    // disagree with the tool about one database. That is the
-                    // same rule `ResolverStaleness::from_daemon_response`
-                    // follows, and the reason `hubs` had three answers before
-                    // nw-358 was that its daemon route re-derived instead.
-                    if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&value)?);
-                        }
-                        eprintln!("Error: {}", dead_code_refusal_note(&value));
-                        return Ok((EXIT_NEEDS_REINDEX, None));
-                    }
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        render_dead_code_text(&value);
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-
-            let min_conf = DeadCodeConfidence::from_str_loose(&min_confidence)
-                .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence: {min_confidence}"))?;
-            let store = open_store(db.as_deref())?;
-
+            use nestweaver_engine::dead_code::{
+                DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
+                serialize_dead_code_page,
+            };
             let db_path = db.clone().unwrap_or_else(default_db_path);
-
-            // nw-372: REFUSE before the walk. `DeadCodeRefusal::for_repos`
-            // wraps `ResolverGenerations::stale_repos` — the sole computation
-            // — and returns `None` only when every repo is provably current.
-            //
-            // The enumeration PROPAGATES rather than becoming a refusal. A
-            // store that cannot list repos cannot serve a reachability walk
-            // either, and the CLI's error classifier turns that failure into
-            // the diagnostic it earned: a zero-length database reports
-            // `nestweaver::db_no_schema` with its size and a runnable
-            // `nestweaver index`, which nw-285 built and which a refusal here
-            // would have replaced with a binder exception quoted inside a
-            // paragraph about resolver generations.
-            let repos = store.list_repos(None)?;
-            if let Some(refusal) =
-                nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos)
-            {
-                // stdout stays pure JSON for a `--json` gate; the paragraph
-                // goes to stderr on BOTH modes, the same split `stale-check`
-                // and every ranking surface already use.
-                if json {
-                    print_json_payload(&refusal.payload())?;
+            let mut args =
+                serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
+            if let Some(n) = limit {
+                args["limit"] = serde_json::json!(n);
+            }
+            if !repos.is_empty() {
+                args["repos"] = serde_json::json!(repos);
+            }
+            if let Some(value) = generation {
+                args["expected_generation"] = serde_json::json!(value);
+            }
+            if let Some(value) = &page_token {
+                args["page_token"] = serde_json::json!(value);
+            }
+            let payload = if use_daemon {
+                // A reproducible page belongs to the selected database. Never
+                // substitute or merge an upstream population for this route.
+                require_existing_db(&db_path)?;
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(async {
+                    let query = async {
+                        let mut client =
+                            nestweaver_client::DaemonClient::connect(&db_path, None).await?;
+                        let response = client
+                            .inner_mut()
+                            .dead_code(nestweaver_proto::JsonRequest {
+                                args_json: serde_json::to_string(&args)?,
+                            })
+                            .await?;
+                        Ok::<serde_json::Value, anyhow::Error>(serde_json::from_str(
+                            &response.into_inner().result_json,
+                        )?)
+                    };
+                    match daemon_rpc_timeout(&args) {
+                        Some(budget) => tokio::time::timeout(budget, query)
+                            .await
+                            .context("local daemon dead-code request timed out")?,
+                        None => query.await,
+                    }
+                })?
+            } else {
+                let store = open_store(db.as_deref())?;
+                let all_repos = store.list_repos(None)?;
+                if let Some(refusal) =
+                    nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
+                        &db_path, &all_repos,
+                    )
+                {
+                    let mut value = refusal.payload();
+                    value["review_only"] = serde_json::json!(true);
+                    value["high_confidence_available"] = serde_json::json!(false);
+                    if json {
+                        print_json_payload(&value)?;
+                    }
+                    eprintln!("Error: {}", refusal.message());
+                    return Ok((EXIT_NEEDS_REINDEX, None));
                 }
-                eprintln!("Error: {}", refusal.message());
+                let scope = if repos.is_empty() {
+                    None
+                } else {
+                    Some(resolve_repo_filter(&store, &repos)?)
+                };
+                let request = DeadCodePageRequest {
+                    min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
+                        .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence"))?,
+                    limit: limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT),
+                    offset,
+                    expected_generation: generation,
+                    page_token: page_token.as_deref(),
+                    concise: false,
+                };
+                let observed_generation = store.graph_generation();
+                if let Some(refusal) = dead_code_page_guard(&store, observed_generation, &request) {
+                    refusal
+                } else {
+                    let manifests =
+                        nestweaver_engine::load_manifests_for_dead_code(&store, &db_path);
+                    let result =
+                        nestweaver_engine::dead_code::detect_dead_code_in_repos_cancellable(
+                            &store,
+                            0.3,
+                            &manifests.manifests,
+                            scope.as_ref(),
+                            None,
+                        )?;
+                    let identity = dead_code_database_identity(&store)?;
+                    let page = serialize_dead_code_page(
+                        &result,
+                        manifests.load_error.as_deref(),
+                        &request,
+                        observed_generation,
+                        &identity,
+                    )?;
+                    dead_code_page_guard(&store, observed_generation, &request).unwrap_or(page)
+                }
+            };
+            if payload.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                if json {
+                    print_json_payload(&payload)?;
+                }
+                eprintln!("Error: {}", dead_code_refusal_note(&payload));
                 return Ok((EXIT_NEEDS_REINDEX, None));
             }
-
-            // Load manifest sidecar for manifest-driven entry points.
-            //
-            // nw-512/nw-500: through the shared loader the MCP `dead_code`
-            // tool also calls, so every route — the default daemon CLI above,
-            // MCP direct, MCP-via-daemon, and this bypass — seeds the walk
-            // from the same entry files. It also replaces a bare
-            // `.unwrap_or_default()`, which collapsed "no sidecar yet" and
-            // "sidecar is there and unreadable" into one silent empty map.
-            let manifests = nestweaver_engine::load_manifests_for_dead_code(&store, &db_path);
-
-            let result =
-                nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests.manifests)?;
-
-            // Filter by minimum confidence.
-            let filtered: Vec<_> = result
-                .unreachable_symbols
-                .iter()
-                .filter(|s| s.confidence >= min_conf)
-                .collect();
-            let filtered_count = filtered.len();
-            let (shown, truncated) = dead_code_cut(filtered, limit);
-
-            #[derive(serde::Serialize)]
-            struct DeadCodeJson<'a> {
-                total_symbols: usize,
-                reachable_symbols: usize,
-                unreachable_count: usize,
-                matching_count: usize,
-                returned: usize,
-                truncated: bool,
-                excluded_count: usize,
-                dead_percentage: f64,
-                /// "complete" | "degraded". Every count above is a claim over
-                /// the WHOLE symbol corpus, and the store's whole-corpus scan
-                /// tolerates a row it cannot decode (nw-335) instead of
-                /// failing — so a caller cannot tell an exact total from a
-                /// floor unless the scan says which it produced.
-                coverage: &'static str,
-                undecodable_symbols: usize,
-                /// How many symbols SEEDED the reachability walk. Zero means
-                /// the BFS never started, so "N of M unreachable" is the
-                /// absence of a finding rather than one (nw-351).
-                entry_points: usize,
-                /// nw-435, surfaced. `coverage_is_complete()` already reads
-                /// this field to decide "complete" vs "degraded" — it was
-                /// consulted but never serialized, so a polyglot repo (the
-                /// normal case, not the exception) degraded with
-                /// `undecodable_symbols: 0` and a healthy `entry_points`
-                /// count both looking fine, and no field naming which
-                /// language actually caused it.
-                languages_without_entry_points: Vec<String>,
-                /// nw-500. `Some` ONLY when the manifest sidecar exists and
-                /// could not be read, which silently drops every
-                /// manifest-declared entry file from the reachability seed
-                /// set and so moves live code onto this list. An absent
-                /// sidecar is the normal state for a graph with no code
-                /// repos and is NOT disclosed; `skip_serializing_if` keeps
-                /// the key out of a healthy payload entirely, so the JSON a
-                /// working graph emits is byte-for-byte its pre-nw-500
-                /// shape. Same key name and same rule as the `dead_code` MCP
-                /// tool, which is what lets `render_dead_code_text` surface
-                /// it from either route's payload.
-                #[serde(skip_serializing_if = "Option::is_none")]
-                manifest_load_error: Option<String>,
-                min_confidence: String,
-                unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
-            }
-            // Count contract (same as the dead_code MCP tool):
-            // `unreachable_count` is the UNFILTERED total, consistent with
-            // total_symbols/reachable_symbols/dead_percentage;
-            // `matching_count` is the post-min-confidence count.
-            //
-            // Built unconditionally so the text path renders from the SAME
-            // payload the JSON path prints, and from the same payload the
-            // daemon returns (nw-108).
-            let payload = serde_json::to_value(DeadCodeJson {
-                total_symbols: result.total_symbols,
-                reachable_symbols: result.reachable_symbols,
-                unreachable_count: result.unreachable_symbols.len(),
-                matching_count: filtered_count,
-                returned: shown.len(),
-                truncated,
-                excluded_count: result.excluded_count,
-                dead_percentage: result.dead_percentage,
-                // nw-500: a failed manifest load degrades coverage on the same
-                // field, and for the same reason, as an undecodable row or a
-                // seedless walk — see the `dead_code` tool's note. The CLI and
-                // the tool must agree here or the daemon and direct routes
-                // report different coverage for one database.
-                coverage: if result.coverage_is_complete() && manifests.load_error.is_none() {
-                    "complete"
-                } else {
-                    "degraded"
-                },
-                undecodable_symbols: result.undecodable_symbols,
-                entry_points: result.entry_points,
-                languages_without_entry_points: result.languages_without_entry_points.clone(),
-                manifest_load_error: manifests.load_error.clone(),
-                min_confidence: min_conf.to_string(),
-                unreachable_symbols: shown,
-            })?;
             if json {
                 print_json_payload(&payload)?;
             } else {
                 render_dead_code_text(&payload);
             }
-
             let stats = format!(
-                "{} unreachable of {} symbols in {}",
-                filtered_count,
-                result.total_symbols,
+                "{} review candidates in {}",
+                payload
+                    .get("matching_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -20800,40 +20779,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 load_instance_config_opt(config_opt.as_deref()).as_ref(),
                 nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
             );
-            // ── daemon guard ──────────────────────────────────────
-            // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
-            // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
-            // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
-            // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
-            // Likewise, --min-score has no daemon-side equivalent (the brain_impact schema is
-            // additionalProperties:false and the daemon envelope carries no truncation flags),
-            // so an explicit threshold also forces the direct path, where pruning is both
-            // honored and surfaced. Same for a non-default --confidence: the daemon tool
-            // hardcodes 0.0, so an explicit filter must take the direct path or it would be
-            // silently ignored.
-            // Keep the daemon eligibility guard separate from the RPC result:
-            // collapsing them would reindent this large response-rendering block
-            // and obscure the small database-resolution change in this patch.
+            // Resolve selectors and thresholds in the owning daemon.
+            let mut impact_args = serde_json::json!({
+                "symbol": name_or_uid, "depth": depth, "limit": limit,
+                "confidence": confidence,
+            });
+            if let Some(repo) = &repo_filter {
+                impact_args["repo"] = serde_json::json!(repo);
+            }
+            if let Some(score) = min_score {
+                impact_args["min_score"] = serde_json::json!(score);
+            }
             #[allow(clippy::collapsible_if)]
-            if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
+            if use_daemon {
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "brain_impact",
-                    // NOTE: do NOT send `min_confidence` here — that is a
-                    // `dead_code` arg, and the `brain_impact` schema is
-                    // additionalProperties:false, so the daemon path would
-                    // reject the call outright.
-                    serde_json::json!({
-                        // nw-357: `limit` was never sent, so the daemon fell
-                        // to the schema default of 50 while the direct route
-                        // capped nothing. Sending the effective limit is what
-                        // makes the cap a property of the contract.
-                        "symbol": name_or_uid,
-                        "depth": depth,
-                        "limit": limit,
-                    }),
+                    impact_args,
                 )? {
                     // nw-451: unwrap a two-tier envelope BEFORE anything reads
                     // this payload. `brain_impact` is TwoTier-routed, so with a
@@ -20879,11 +20843,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     "{}",
                                     serde_json::to_string_pretty(&impact_json_ambiguous(
                                         &name_or_uid,
-                                        // Always `None` here: `--repo` forces
-                                        // the direct path (see the routing
-                                        // condition on this arm). Passing it
-                                        // makes that explicit rather than
-                                        // implicit.
                                         repo_filter.as_deref(),
                                         cands
                                     ))?
@@ -23455,6 +23414,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Run {
+                    #[cfg(feature = "release-fixture-hooks")]
+                    release_fixture_control,
                     server,
                     bind,
                     tls_cert,
@@ -23471,6 +23432,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     acme_email,
                     acme_production,
                 } => {
+                    #[cfg(feature = "release-fixture-hooks")]
+                    if let Some(control) = release_fixture_control.as_deref() {
+                        anyhow::ensure!(
+                            !server && config.is_none() && snapshot.is_none(),
+                            "release fixture requires an unconfigured local foreground daemon"
+                        );
+                        nestweaver_engine::release_fixture::activate(control, &db_path)?;
+                    }
                     // A temporary macOS daemon is a fresh `daemon run` exec,
                     // so the process-local ownership marker from `daemon
                     // start` cannot cross the boundary. Accept ownership only
@@ -25445,10 +25414,8 @@ fn print_memory_related_text(uid: &str, payload: &serde_json::Value) {
 
 /// Dispatch a read-only brain command through the `HybridClient`, which
 /// queries the local daemon **and** any configured upstream servers.
-/// Returns `Some(json_value)` on success and `None` when a configless caller
-/// may use the legacy direct-disk fallback. With an explicit config, daemon
-/// connection or hybrid query failures are returned: falling through would
-/// silently discard configured provenance/upstreams while still exiting 0.
+/// Normal query failures always refuse a second direct store owner.
+/// The explicit CI direct route is selected before this fallback guard.
 fn ensure_direct_store_fallback_allowed(
     db_path: &std::path::Path,
     explicit_config: Option<&std::path::Path>,
@@ -25461,7 +25428,11 @@ fn ensure_direct_store_fallback_allowed(
     }
 
     match nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, None)? {
-        nestweaver_client::RestartConfig::CompiledDefaults => Ok(()),
+        nestweaver_client::RestartConfig::CompiledDefaults => anyhow::bail!(
+            "daemon unavailable for {}; refusing direct fallback. Retry `nestweaver daemon --db {} start`",
+            db_path.display(),
+            db_path.display()
+        ),
         nestweaver_client::RestartConfig::Configured(config) => anyhow::bail!(
             "persisted daemon config {} for {} cannot be honored by the direct store, which refuses to fall back. Retry the daemon or deliberately reset with `nestweaver daemon --db {} start --reset`",
             config.display(),
@@ -25755,6 +25726,63 @@ mod repo_filter_honesty_tests {
     }
 }
 
+/// Only initial transport failures may use configured remote reads. Identity,
+/// configuration, restart, and unknown startup failures must stay failures.
+fn initial_daemon_transport_unavailable(error: &anyhow::Error) -> bool {
+    let context = error.to_string();
+    let initial_transport = context.starts_with("failed to connect to daemon at ")
+        || context == "health check failed"
+        || context == "health check timed out — daemon connected but unresponsive";
+    if !initial_transport
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                || cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                    matches!(
+                        status.code(),
+                        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+                    )
+                })
+        })
+    {
+        return false;
+    }
+    // A transport wrapper can hide EACCES or a policy error. Only a known
+    // terminal connection failure/timeout grants remote fallback; opaque
+    // wrappers and unknown leaves remain failures.
+    let cause = error.root_cause();
+    cause
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+        || cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        })
+        || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+fn validated_upstream_fallback_config(
+    db_path: &Path,
+    config: Option<&Path>,
+    connect_error: &anyhow::Error,
+) -> anyhow::Result<Option<nestweaver_client::RestartConfig>> {
+    // Validate persisted intent even when the connection error is opaque;
+    // discovery intentionally tolerates unreadable files and is not a guard.
+    let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)?;
+    Ok(initial_daemon_transport_unavailable(connect_error).then_some(effective))
+}
+
 fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
@@ -25781,8 +25809,7 @@ fn try_hybrid_json_rpc_checked(
     // daemon that CREATES an empty store — that turns a typo'd `--db` path into a
     // silent "0 results / status: complete" success (false-green in CI). Skip the
     // local connect when the db file is absent; still try configured upstreams
-    // (federated read), else return None so the caller's direct path reports
-    // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
+    // (federated read), else report `db_not_found` without a direct store open. `index` creates dbs and does NOT route
     // through here, so it is unaffected.
     // nw-309: refuse an exists-but-not-a-database `--db` HERE, before the
     // dial. This is the one funnel every daemon-routed read passes through, so
@@ -25799,18 +25826,14 @@ fn try_hybrid_json_rpc_checked(
         }
     })?;
     if !db_path.exists() {
-        if let Some(config_path) = config {
-            nestweaver_engine::InstanceConfig::from_file(config_path).with_context(|| {
-                format!(
-                    "load explicit instance config {} before missing-DB upstream routing",
-                    config_path.display()
-                )
-            })?;
-        }
+        let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)
+            .context("load explicit instance config or persisted intent before missing-DB upstream routing")?;
+        let config = effective.as_path();
         let discovered =
             nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config);
         if discovered.is_empty() {
-            return Ok(None);
+            require_existing_db(db_path)?;
+            unreachable!("missing database must return its typed diagnostic");
         }
         return match rt.block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
             config, &start_dir, rpc_name, &args,
@@ -25821,7 +25844,9 @@ fn try_hybrid_json_rpc_checked(
                     "explicit-config upstream query {rpc_name} failed; refusing direct fallback"
                 )
             }),
-            Err(_) => Ok(None),
+            Err(error) => {
+                Err(error).context("configured upstream read failed; refusing direct fallback")
+            }
         };
     }
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
@@ -25860,20 +25885,25 @@ fn try_hybrid_json_rpc_checked(
             }
         },
         Err(e) => {
-            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
-                format!(
-                    "daemon configuration could not be safely honored for {rpc_name} ({e:#}); refusing direct fallback"
-                )
-            })?;
-            let upstream = rt
-                .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
-                    config, &start_dir, rpc_name, &args,
-                ))
-                .ok();
-            if upstream.is_none() {
-                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+            if let Some(effective) = validated_upstream_fallback_config(db_path, config, &e)? {
+                let config = effective.as_path();
+                if !nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config)
+                    .is_empty()
+                {
+                    return rt
+                        .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                            config, &start_dir, rpc_name, &args,
+                        ))
+                        .map(Some)
+                        .with_context(|| {
+                            format!("daemon unavailable ({e:#}); upstream query {rpc_name} failed")
+                        });
+                }
             }
-            Ok(upstream)
+            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                format!("daemon query {rpc_name} unavailable ({e:#}); refusing direct fallback")
+            })?;
+            unreachable!("normal reads cannot fall back to direct store")
         }
     }
 }
@@ -27914,13 +27944,14 @@ fn run_brain(
                         serde_json::from_value(unwrap_hybrid_payload(value))
                             .context("decode vault list from daemon")
                     } else {
-                        // The guard every other fallback site in this file
-                        // takes, and it matters more here now that this command
-                        // accepts `--config`: the direct store cannot honour a
-                        // pinned config, so falling back would silently target
-                        // a different instance than the one the caller named —
-                        // the precise failure `brain remove` is used to repair.
-                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())?;
+                        // Accidental daemon-unavailable fallback stays closed,
+                        // and `--config` still cannot be honored by the direct
+                        // store. The honored CI direct route (`use_daemon ==
+                        // false` without a pinned config) is selected before
+                        // that guard, matching list_projects.
+                        if use_daemon || config.is_some() {
+                            ensure_direct_store_fallback_allowed(&db_path, config.as_deref())?;
+                        }
                         let store = GraphStore::open_read_only(&db_path).with_context(|| {
                             format!("open {} to list vaults", db_path.display())
                         })?;
@@ -28198,9 +28229,10 @@ fn run_brain(
             // daemon owns the writer-mode Tantivy index and shares dispatch
             // with the MCP server (`tool_brain_search`), so daemon-routed
             // searches eliminate the "Database is locked" reader fallback
-            // and stay in sync with live re-indexing. Falls through to the
-            // direct-disk implementation below when `--no-daemon` is set,
-            // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
+            // and stay in sync with live re-indexing. The direct-disk
+            // implementation below is only the honored CI direct route
+            // (`use_daemon == false`). An unavailable daemon never falls
+            // through; `ensure_direct_store_fallback_allowed` refuses it.
             if use_daemon {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(runtime) => Some(runtime),
@@ -29908,6 +29940,7 @@ fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> 
 /// route, where the daemon reads its own — which is what the help's "or
 /// [limits].default_result_limit from config" clause names, and why a value is
 /// NOT synthesised here and sent, which would override it.
+#[cfg(test)]
 fn dead_code_cut<T>(rows: Vec<T>, limit: Option<usize>) -> (Vec<T>, bool) {
     let total = rows.len();
     let effective = limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT);
@@ -34083,41 +34116,25 @@ where
     // breaks the direct path with a confusing "could not set lock" error (and
     // leaks the daemon). Skip straight to the in-process path instead.
     if use_daemon && endpoint.is_none() && !local {
-        // The daemon embeds with the model recorded in the database (or the
-        // compiled-in default for a fresh DB) — it cannot honor a different
-        // --model-id, so bail early instead of silently embedding with the
-        // wrong model. Read the recorded model through a read-only open: the
-        // daemon may hold the write lock. A missing DB legitimately falls back
-        // to the default (that is what the daemon would load); a DB that
-        // exists but cannot be read gets a warning, because comparing against
-        // the default could then produce a spurious "cannot honor" error.
-        let recorded_model = if repair_identity {
-            None
-        } else {
-            match nestweaver_store::GraphStore::open_read_only(path) {
-                Ok(store) => store
-                    .get_embedding_metadata()
-                    .context("read the database embedding identity before daemon embedding")?,
-                Err(e) => {
-                    if path.exists() {
-                        eprintln!(
-                            "Warning: could not read the recorded embedding model ({e:#}); \
-                             assuming the default model"
-                        );
-                    }
-                    None
-                }
-            }
-        };
-        let recorded_model = recorded_model
-            .as_ref()
-            .map(|(model_id, _)| model_id.as_str());
-        if let Err(error) = daemon_route_model_override_is_honored(model_id, recorded_model) {
-            anyhow::bail!("{error}");
-        }
+        // The owning daemon validates semantic identity and selects its backend.
+        // Client-side metadata reads would open a second database runtime.
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
+                if model_id.is_some() {
+                    let status = rt
+                        .block_on(client.brain_status())
+                        .context("read the daemon's selected embedding model")?;
+                    let selected = status.embedding_status.as_ref()
+                        .map(|embedding| embedding.model_id.as_str())
+                        .filter(|model| !model.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "daemon did not report its selected embedding model; restart it before using --model-id"
+                        ))?;
+                    daemon_route_model_override_is_honored(model_id, Some(selected))
+                        .map_err(anyhow::Error::msg)?;
+                }
+
                 if !repair_identity {
                     match rt.block_on(client.plan_embed(scope, force)) {
                         Ok(plan) => {
@@ -34194,8 +34211,7 @@ where
                 return Err(error).with_context(|| {
                     format!(
                         "failed to connect to daemon for {}; start it with \
-                         'nestweaver daemon --db {} start' or use --no-daemon \
-                         (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
+                         'nestweaver daemon --db {} start'; direct fallback is refused",
                         path.display(),
                         path.display()
                     )
@@ -34209,8 +34225,7 @@ where
     // or when the daemon is explicitly disabled (--no-daemon / NESTWEAVER_NO_DAEMON=1).
     if use_daemon && endpoint.is_none() && !local {
         anyhow::bail!(
-            "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
-             or use --no-daemon (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
+            "daemon is not running. Start it with 'nestweaver daemon --db {} start'; direct fallback is refused",
             path.display()
         );
     }
@@ -35579,8 +35594,14 @@ mod refresh_instance_resolution_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.lbug");
         let root = dir.path().join("vault");
-        let found = vault_registrations_for_root(false, &missing, None, &root).unwrap();
-        assert!(found.is_empty(), "got: {found:?}");
+        for use_daemon in [true, false] {
+            let found = vault_registrations_for_root(use_daemon, &missing, None, &root).unwrap();
+            assert!(found.is_empty(), "got: {found:?}");
+            assert!(
+                !missing.exists(),
+                "registration preflight created a database"
+            );
+        }
     }
 }
 
@@ -38705,45 +38726,61 @@ mod exit_code_contract_tests {
 mod no_daemon_gate_tests {
     use super::*;
 
-    /// `CI` and `GITHUB_ACTIONS` must confer NOTHING.
-    ///
-    /// They used to permit the bypass, so an ambient variable set by dozens of
-    /// unrelated tools decided whether this database could have two writers.
-    /// `CI` is not ours: every provider sets it, so do many Docker images and
-    /// shell profiles, and developers set it locally to reproduce CI failures.
-    /// The canonical incident is Netlify beginning to set `CI=true` in 2020,
-    /// breaking thousands of Create React App builds overnight — for a
-    /// COSMETIC setting. This one decided writer exclusivity.
     #[test]
-    fn ci_environment_variables_confer_no_privileges() {
-        for ci in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("True"),
-            Some("1"),
-            Some("yes"),
-        ] {
-            assert!(
-                !no_daemon_allowed_from(false, false, ci),
-                "CI={ci:?} must not permit the bypass"
-            );
-            assert!(
-                !no_daemon_allowed_from(false, true, ci),
-                "GITHUB_ACTIONS must not permit the bypass either (CI={ci:?})"
-            );
+    fn ci_direct_policy_truth_table() {
+        for build in [false, true] {
+            for permit in [false, true] {
+                for github in [false, true] {
+                    for temp in [false, true] {
+                        for os in [false, true] {
+                            for run_id in [false, true] {
+                                let expected = build && permit && github && temp && os && run_id;
+                                assert_eq!(
+                                    ci_direct_policy(build, permit, github, temp, os, run_id),
+                                    expected
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// The explicit opt-in is the ONLY thing that still answers yes — and even
-    /// then it now means only "do not autostart a daemon". Correctness no
-    /// longer rests on this answer: `require_exclusive_store_access` takes the
-    /// lock at the moment of the write.
     #[test]
-    fn only_the_explicit_opt_in_permits_the_bypass() {
-        assert!(no_daemon_allowed_from(true, false, None));
-        assert!(no_daemon_allowed_from(true, true, Some("1")));
+    fn local_ci_marker_is_not_a_permit() {
+        // CI=true used to be an OR with GITHUB_ACTIONS. That let a local
+        // `CI=true` plus the permit honor bypass on a ci-direct-tests binary.
+        assert!(!ci_direct_policy(true, true, false, false, false, false));
+        assert!(!ci_direct_policy(true, true, true, false, false, false));
+        assert!(!ci_direct_policy(true, true, false, true, true, true));
+        assert!(ci_direct_policy(true, true, true, true, true, true));
+    }
+
+    #[test]
+    fn standard_artifact_cannot_authorize_bypass() {
+        for permit in [false, true] {
+            for github in [false, true] {
+                for temp in [false, true] {
+                    for os in [false, true] {
+                        for run_id in [false, true] {
+                            assert!(!ci_direct_policy(false, permit, github, temp, os, run_id));
+                            assert_eq!(
+                                no_daemon_allowed_from(permit, github, temp, os, run_id),
+                                ci_direct_policy(
+                                    cfg!(feature = "ci-direct-tests"),
+                                    permit,
+                                    github,
+                                    temp,
+                                    os,
+                                    run_id
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -40674,22 +40711,23 @@ credential_method = "ssh"
     }
 
     #[test]
-    fn missing_db_with_valid_local_only_config_preserves_direct_not_found_path() {
+    fn missing_db_with_valid_local_only_config_preserves_typed_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let missing_db = dir.path().join("missing.lbug");
         let config = dir.path().join("instance.toml");
         std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
 
-        let value = try_hybrid_json_rpc_checked(
+        let error = try_hybrid_json_rpc_checked(
             true,
             &missing_db,
             Some(&config),
             "list_repos",
             serde_json::json!({}),
         )
-        .expect("a valid local-only config is not an upstream failure");
+        .expect_err("a read must report the missing DB without a direct store attempt");
 
-        assert!(value.is_none());
+        assert!(format!("{error:#}").contains("database not found at"));
+        assert!(!missing_db.exists());
     }
 
     #[test]
@@ -40725,12 +40763,89 @@ timeout = "20ms"
     }
 
     #[test]
+    fn upstream_fallback_rejects_wrapped_io_denial_and_unknown_transport_leaf() {
+        #[derive(Debug)]
+        struct TransportWrapper(std::io::Error);
+        impl std::fmt::Display for TransportWrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "transport error")
+            }
+        }
+        impl std::error::Error for TransportWrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for (kind, allowed) in [
+            (std::io::ErrorKind::PermissionDenied, false),
+            (std::io::ErrorKind::Other, false),
+            (std::io::ErrorKind::ConnectionRefused, true),
+            (std::io::ErrorKind::TimedOut, true),
+        ] {
+            let wrapped = anyhow::Error::new(TransportWrapper(std::io::Error::from(kind)))
+                .context("failed to connect to daemon at /isolated/daemon.sock");
+            assert_eq!(
+                initial_daemon_transport_unavailable(&wrapped),
+                allowed,
+                "{wrapped:#}"
+            );
+        }
+        // Even a recognizable timeout leaf cannot override an earlier denial.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            TransportWrapper(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ))
+        .context("failed to connect to daemon at /isolated/daemon.sock");
+        assert!(!initial_daemon_transport_unavailable(&denied));
+    }
+
+    #[test]
+    fn upstream_fallback_requires_transport_and_preserves_persisted_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let unavailable =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("failed to connect to daemon at /isolated/daemon.sock");
+        assert!(initial_daemon_transport_unavailable(&unavailable));
+        let refusal = anyhow::anyhow!("effective configuration identity did not match");
+        assert!(!initial_daemon_transport_unavailable(&refusal));
+        let denied = anyhow::Error::new(tonic::Status::permission_denied("restricted"))
+            .context("health check failed");
+        assert!(!initial_daemon_transport_unavailable(&denied));
+        let restart_refusal = anyhow::Error::new(tonic::Status::unavailable("offline"))
+            .context("refusing automatic daemon restart: identity not verified");
+        assert!(!initial_daemon_transport_unavailable(&restart_refusal));
+        assert!(
+            validated_upstream_fallback_config(&db, None, &refusal)
+                .unwrap()
+                .is_none()
+        );
+
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
+        nestweaver_daemon::lifecycle::write_last_successful_config(&db, &config).unwrap();
+        let selected = validated_upstream_fallback_config(&db, None, &unavailable)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.as_path(),
+            Some(config.canonicalize().unwrap().as_path())
+        );
+        std::fs::write(&config, "instance_id = [broken").unwrap();
+        let corrupt = validated_upstream_fallback_config(&db, None, &unavailable).unwrap_err();
+        assert!(format!("{corrupt:#}").contains("persisted daemon config"));
+        std::fs::remove_file(&config).unwrap();
+        assert!(validated_upstream_fallback_config(&db, None, &unavailable).is_err());
+        nestweaver_daemon::lifecycle::remove_last_successful_config(&db).unwrap();
+    }
+
+    #[test]
     fn direct_fallback_policy_distinguishes_absent_and_configured_intent() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
-            ensure_direct_store_fallback_allowed(&db, None).is_ok(),
-            "record absence preserves ordinary daemon-unavailable fallback"
+            ensure_direct_store_fallback_allowed(&db, None).is_err(),
+            "record absence must not permit a second store owner"
         );
 
         let config = dir.path().join("instance.toml");
@@ -42967,6 +43082,31 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn release_fixture_activation_argument_matches_compiled_capability() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let parsed = Cli::try_parse_from([
+                    "nestweaver",
+                    "daemon",
+                    "--db",
+                    "/tmp/fixture.lbug",
+                    "run",
+                    "--release-fixture-control",
+                    "/tmp/control",
+                ]);
+                assert_eq!(parsed.is_ok(), cfg!(feature = "release-fixture-hooks"));
+                assert_eq!(
+                    CLI_VERSION.contains("+release-fixture-hooks"),
+                    cfg!(feature = "release-fixture-hooks")
+                );
             })
             .expect("spawn")
             .join()

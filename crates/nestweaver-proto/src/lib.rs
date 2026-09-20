@@ -4,6 +4,117 @@ pub mod nestweaver_daemon_v1 {
 
 pub use nestweaver_daemon_v1::*;
 
+/// Decode note outcomes identically for local MCP and federated clients.
+/// Old found-note responses remain readable; old blank responses cannot be
+/// mistaken for a successful note when their outcome was lost in transit.
+pub fn note_get_json(response: &NoteGetResponse) -> Result<serde_json::Value, String> {
+    use serde_json::{Value, json};
+    let value = if !response.result_json.is_empty() {
+        serde_json::from_str::<Value>(&response.result_json)
+            .map_err(|error| format!("invalid daemon note outcome: {error}"))?
+    } else {
+        let mut value = json!({
+            "uid": response.uid, "title": response.title, "path": response.path,
+            "note_kind": response.note_kind, "word_count": response.word_count,
+            "section_count": response.section_count,
+            "frontmatter": serde_json::from_str::<Value>(&response.frontmatter_json)
+                .unwrap_or_else(|_| json!({})),
+            "outline": response.outline.iter().map(|heading| json!({
+                "uid": heading.uid, "level": heading.level, "text": heading.text,
+                "slug": heading.slug, "line": heading.line,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(body) = &response.body {
+            value["body"] = json!(body);
+        }
+        value
+    };
+    let valid = match value.get("status").and_then(Value::as_str) {
+        Some("ambiguous") => {
+            value
+                .get("candidate_uids")
+                .and_then(Value::as_array)
+                .is_some_and(|uids| {
+                    uids.len() > 1
+                        && uids
+                            .iter()
+                            .all(|uid| uid.as_str().is_some_and(|s| !s.is_empty()))
+                })
+                && value
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|candidates| candidates.len() > 1)
+        }
+        Some("not_found") => true,
+        None | Some("ok" | "found") => ["uid", "path"].iter().all(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        }),
+        _ => false,
+    };
+    if !valid {
+        return Err("daemon returned an incomplete note outcome; upgrade/restart the daemon and retry instead of treating it as an empty note".into());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod note_outcome_tests {
+    use super::*;
+    use prost::Message;
+    use serde_json::json;
+
+    #[test]
+    fn release_note_outcome_round_trips_without_identity_defaults() {
+        for value in [
+            json!({"status":"ambiguous", "title":"Same", "candidate_uids":["note:a","note:b"],
+                "candidates":[{"uid":"note:a"},{"uid":"note:b"}], "note":"Use a note UID"}),
+            json!({"uid":"note:a", "path":"a.md", "body":"body", "extra":{"preserved":true}}),
+            json!({"status":"not_found", "title":"missing"}),
+        ] {
+            let response = NoteGetResponse {
+                result_json: value.to_string(),
+                ..Default::default()
+            };
+            let decoded = NoteGetResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(note_get_json(&decoded).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn release_legacy_note_wire_requires_real_identity() {
+        let mut bytes = Vec::new();
+        for (tag, value) in [(1u32, "note:a"), (2, "A"), (3, "a.md")] {
+            prost::encoding::encode_varint(u64::from(tag << 3 | 2), &mut bytes);
+            prost::encoding::encode_varint(value.len() as u64, &mut bytes);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        let decoded = NoteGetResponse::decode(bytes.as_slice()).unwrap();
+        assert!(decoded.result_json.is_empty());
+        assert_eq!(note_get_json(&decoded).unwrap()["uid"], "note:a");
+        assert!(note_get_json(&NoteGetResponse::default()).is_err());
+    }
+
+    #[test]
+    fn release_malformed_note_outcomes_fail_closed() {
+        for payload in [
+            "{",
+            "null",
+            "{}",
+            r#"{"status":"ambiguous"}"#,
+            r#"{"uid":"","path":"a.md"}"#,
+        ] {
+            let response = NoteGetResponse {
+                result_json: payload.into(),
+                ..Default::default()
+            };
+            assert!(note_get_json(&response).is_err(), "{payload}");
+        }
+    }
+}
+
 /// Exclusion counts describe Git-tracked inventory, never an estimate of
 /// unvisited descendants. Null means the Git inventory was unavailable.
 pub fn exclusion_inventory_json(value: &ExclusionInventory) -> serde_json::Value {

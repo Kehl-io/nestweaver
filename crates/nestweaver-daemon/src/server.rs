@@ -4,6 +4,11 @@
 //! existing MCP tool dispatch layer, avoiding any duplication of
 //! business logic.
 
+#[path = "manifest_recovery.rs"]
+mod manifest_recovery;
+#[path = "vault_derivation.rs"]
+mod vault_derivation;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1971,6 +1976,8 @@ pub struct DaemonState {
     /// write RPCs (index/add/remove/merge/watch) are rejected with
     /// `FAILED_PRECONDITION` and the write machinery (worker, scheduler,
     /// webhook) is never started.
+    pub(crate) manifest_recovery: Arc<nestweaver_engine::manifest::ManifestRecoveryRuntime>,
+    manifest_recovery_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub read_only: bool,
     /// Whether the server-side worker pool is currently indexing a repo.
     pub indexing_active: Arc<AtomicBool>,
@@ -3418,6 +3425,7 @@ impl DaemonService {
                 (runtime_status.state == "identity_unreadable")
                     .then(|| runtime_status.error.clone())
             });
+            vault_derivation::admit_tool(&state, &tool_name)?;
             tracing::debug!(
                 has_model = embed_ref.is_some(),
                 "dispatch_json_tool embed_model status"
@@ -3458,6 +3466,7 @@ impl DaemonService {
             if tool_name == "brain_status" {
                 refresh_status_eligibility(&state, &mut value)
                     .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+                vault_derivation::status_overlay(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -3611,6 +3620,8 @@ impl DaemonService {
                     .then(|| runtime_status.error.clone())
             });
 
+            vault_derivation::admit_tool(&state, &tool_name)?;
+
             let t_dispatch = std::time::Instant::now();
             let dispatch_tantivy = state.tantivy();
             let mut value = nestweaver_mcp::tools::dispatch_cancellable(
@@ -3634,6 +3645,7 @@ impl DaemonService {
             if tool_name == "brain_status" {
                 refresh_status_eligibility(&state, &mut value)
                     .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+                vault_derivation::status_overlay(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -6689,6 +6701,16 @@ impl NestWeaverDaemon for DaemonService {
             state.db_path.clone(),
         );
 
+        let _ = app_state
+            .manifest_recovery
+            .set(Arc::clone(&state.manifest_recovery));
+        let _ = app_state
+            .vault_derivation
+            .set(nestweaver_web::state::VaultDerivationHttp {
+                data_instance_id: state.data_instance_id.clone(),
+                read_only: state.read_only,
+                max_note_bytes: vault_derivation::http_max_note_bytes(&state),
+            });
         // nw-029: pre-warm PageRank so the first overview/impact query never pays
         // the lazy compute. Fire-and-forget; single-flight (nw-029 T1) makes a
         // concurrent first query wait on this instead of duplicating it. A DB
@@ -6816,6 +6838,8 @@ impl NestWeaverDaemon for DaemonService {
 
         // Build web UI router, mounting the admin API when available so the
         // admin dashboard SPA can reach its backend on the same origin.
+        let manifest_events = app_state.event_tx.clone();
+        let manifest_runtime = Arc::clone(&state.manifest_recovery);
         let mut web_router = nestweaver_web::create_router(app_state);
         if let Some(admin_state) = state.admin_state.get() {
             let device_router = nestweaver_web::create_device_flow_router(admin_state.clone());
@@ -6860,16 +6884,32 @@ impl NestWeaverDaemon for DaemonService {
         // is tracked so `stop_ui` can abort it and release the listen port
         // (LOW: ui port leak).
         let handle = tokio::spawn(async move {
-            match nestweaver_web::start_server_with_router(web_router, port, open_browser).await {
-                // No graceful shutdown is wired up here (stop_ui aborts the
-                // task), so a clean return means the listener is gone while
-                // the daemon looks healthy — never let that pass silently.
-                Ok(()) => tracing::error!(
-                    "UI server on port {port} exited without an error — the port is no longer bound"
-                ),
-                Err(e) => tracing::error!("UI server error: {e}"),
+            let serve = nestweaver_web::start_server_with_router(web_router, port, open_browser);
+            tokio::pin!(serve);
+            let mut changed = manifest_runtime.changed.subscribe();
+            loop {
+                tokio::select! {
+                    result = &mut serve => {
+                        match result {
+                            Ok(()) => tracing::error!("UI server on port {port} exited; the port is no longer bound"),
+                            Err(error) => tracing::error!(%error, "UI server error"),
+                        }
+                        break;
+                    }
+                    result = changed.changed() => {
+                        if result.is_err() { break; }
+                        let status = manifest_runtime.status();
+                        if status.state == "ready" {
+                            let _ = manifest_events.send(nestweaver_web::state::GraphEvent {
+                                event_type: "manifest:ready".into(),
+                                payload: serde_json::json!({ "revision": status.revision }),
+                            });
+                        }
+                    }
+                }
             }
         });
+
         {
             let mut guard = self
                 .state
@@ -7141,13 +7181,46 @@ impl NestWeaverDaemon for DaemonService {
             .excludes(&repo_excludes)
             .unskip(&repo_unskip);
 
-            match nestweaver_engine::index::index_directory_with_store_opts(
+            #[cfg(feature = "release-fixture-hooks")]
+            let fixture_scope = match nestweaver_engine::release_fixture::begin_index(
+                &state.store,
+                &repo_path,
+                &nestweaver_schema::uid::repo_uid(&effective_instance, &repo_url),
+                &indexed_sha,
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("release fixture incomplete before index: {error:#}"),
+                        ..Default::default()
+                    }));
+                    return;
+                }
+            };
+            let index_result = nestweaver_engine::index::index_directory_with_store_opts(
                 &state.store,
                 &repo_path,
                 &state.db_path,
                 &index_opts,
                 Some(&cancel_for_index),
-            ) {
+            );
+            #[cfg(feature = "release-fixture-hooks")]
+            if let Some(scope) = &fixture_scope {
+                let error = index_result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                if let Err(error) = scope.engine_completed(&state.store, error.as_deref()) {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("release fixture completion evidence failed: {error:#}"),
+                        ..Default::default()
+                    }));
+                    return;
+                }
+            }
+            match index_result {
                 Ok(result) => {
                     let exclusion_inventory = Some(nestweaver_proto::ExclusionInventory {
                         patterns: result.exclusion_inventory.patterns.clone(),
@@ -7164,8 +7237,16 @@ impl NestWeaverDaemon for DaemonService {
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Writing as i32,
                         message: format!(
-                            "Indexed {} files, {} symbols",
-                            result.files_count, result.symbols_count
+                            "Indexed {} files, {} symbols{}",
+                            result.files_count,
+                            result.symbols_count,
+                            if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                                .is_ok_and(|debt| debt.is_none())
+                            {
+                                ""
+                            } else {
+                                "; manifest suggestions await daemon reconciliation"
+                            }
                         ),
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
@@ -7506,6 +7587,30 @@ impl NestWeaverDaemon for DaemonService {
                         return;
                     }
 
+                    if let Err(error) = vault_derivation::stamp_index_success(
+                        &state,
+                        &vault_path,
+                        &extra_patterns,
+                        note_limits.max_note_bytes(),
+                        &result,
+                    ) {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Error as i32,
+                            message: format!(
+                                "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
+                            ),
+                            files_processed: result.index.notes_count as u64,
+                            files_total: result.index.notes_count as u64,
+                            symbols_found: result.index.headings_count as u64,
+                            skipped_count: skipped_count as u64,
+                            skipped_files,
+                            coverage_status,
+                            trigram_refresh: None,
+                            exclusion_inventory: None,
+                        }));
+                        return;
+                    }
+
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
@@ -7591,6 +7696,22 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
                 ..Default::default()
             }));
+
+            if let Err(error) = vault_derivation::ensure_current(
+                &state,
+                &vault_path,
+                &extra_patterns,
+                note_limits.max_note_bytes(),
+            ) {
+                let _ = tx.blocking_send(Ok(IndexProgress {
+                    phase: Phase::Error as i32,
+                    message: format!(
+                        "RefreshVaultSince refused because Markdown derivation is not current: {error:#}"
+                    ),
+                    ..Default::default()
+                }));
+                return;
+            }
 
             let indexed_before = indexed_search_rows_before(&state);
             let search_admission = match establish_search_reconciliation_debt(
@@ -8466,6 +8587,7 @@ impl NestWeaverDaemon for DaemonService {
             .await?;
 
         Ok(Response::new(NoteGetResponse {
+            result_json: value.to_string(),
             uid: value
                 .get("uid")
                 .and_then(|v| v.as_str())
@@ -9624,11 +9746,23 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
-            let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
-                    .unwrap_or_default();
+            let generation = state.store.graph_generation();
+            let unavailable = |error: nestweaver_engine::manifest::ManifestUnavailable| {
+                state.manifest_recovery.wake.notify_one();
+                let body = serde_json::json!({ "error": error, "rebuild": state.manifest_recovery.status() });
+                Status::unavailable(body.to_string())
+            };
+            let manifests = nestweaver_engine::manifest::current_manifest_snapshot(&state.store, &state.db_path)
+                .map_err(&unavailable)?;
             let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
+            nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation).map_err(&unavailable)?;
+            if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                .map_err(|e| Status::unavailable(e.to_string()))?.is_some() {
+                return Err(unavailable(nestweaver_engine::manifest::ManifestUnavailable::new(
+                    nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
+                    generation, "manifest source changed while computing suggestions")));
+            }
             serde_json::to_string(&suggestions)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
@@ -9902,7 +10036,13 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let request = request.into_inner();
         let store = self.state.store.clone();
+        let runtime_status = self.state.embedding_runtime.status();
         let response = tokio::task::spawn_blocking(move || {
+            require_verified_embedding_runtime_identity(
+                &store,
+                &runtime_status,
+                "embedding preflight",
+            )?;
             plan_embeddings(&store, &request.scope, request.force)
         })
         .await
@@ -12815,6 +12955,11 @@ pub async fn run_server(
     config_path: Option<&Path>,
     server_opts: Option<ServerOpts>,
 ) -> Result<(), anyhow::Error> {
+    #[cfg(feature = "release-fixture-hooks")]
+    nestweaver_engine::release_fixture::validate_daemon_start(
+        db_path,
+        config_path.is_some() || server_opts.is_some(),
+    )?;
     // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
     // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
     // so an idle timer would treat an actively-querying MCP client as idle and
@@ -13036,6 +13181,8 @@ pub async fn run_server(
         }
     };
     drop(publication_root_lock);
+    #[cfg(feature = "release-fixture-hooks")]
+    nestweaver_engine::release_fixture::bind_daemon_store(&store)?;
     if let Some(config) = instance_cfg.as_ref() {
         config.assert_expected_brain(&store).with_context(|| {
             format!(
@@ -13388,6 +13535,8 @@ pub async fn run_server(
         worker_handle: std::sync::Mutex::new(None),
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
+        manifest_recovery: Arc::new(Default::default()),
+        manifest_recovery_handle: std::sync::Mutex::new(None),
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
         watcher_lifecycle: std::sync::Mutex::new(()),
         ui_server: std::sync::Mutex::new(None),
@@ -13564,6 +13713,13 @@ pub async fn run_server(
 
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
     tokio::spawn(watch_sigterm(Arc::clone(&state)));
+
+    let manifest_handle = tokio::spawn(manifest_recovery::run(Arc::clone(&state)));
+    *state
+        .manifest_recovery_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(manifest_handle);
+    tokio::spawn(vault_derivation::run(Arc::clone(&state)));
 
     // The trigram reconcile loop. Spawned in EVERY writable daemon mode, not
     // just server mode: the local daemon is exactly where the vault refresh and
@@ -15025,6 +15181,17 @@ pub async fn run_server(
     if let Some(handle) = embedding_handle {
         tracing::info!("draining embedding reconcile loop before exit");
         let _ = handle.await;
+    }
+
+    let manifest_handle = state
+        .manifest_recovery_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(handle) = manifest_handle
+        && let Err(error) = handle.await
+    {
+        tracing::error!(%error, "manifest reconciliation task failed while draining");
     }
 
     // Watchers LAST, and before the socket/pidfile/instance-lock teardown
@@ -17424,16 +17591,14 @@ credential_method = "gh"
         nestweaver_engine::save_manifest_cache(&manifests, &legacy_path).unwrap();
         assert!(!canonical_path.exists());
 
-        let response = DaemonService::new(state)
+        let error = DaemonService::new(state)
             .suggest_links_json(Request::new(JsonRequest {
                 args_json: "{}".to_string(),
             }))
             .await
-            .unwrap()
-            .into_inner();
-
-        let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
-        assert!(suggestions["links"].as_array().unwrap().is_empty());
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("missing"));
         assert!(!canonical_path.exists());
         assert!(legacy_path.exists());
     }
@@ -21187,6 +21352,8 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            manifest_recovery: Arc::new(Default::default()),
+            manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
@@ -21198,6 +21365,187 @@ credential_method = "gh"
             artifact_seeder: Arc::new(fake_default_test_seeder),
         });
         (state, embedding_reload_rx)
+    }
+
+    fn manifest_recovery_fixture(state: &DaemonState) {
+        use nestweaver_engine::content_reader::ContentReader;
+        for (uid, package, dependencies) in [
+            ("repo:alpha", "alpha", r#"{"beta":"1"}"#),
+            ("repo:beta", "beta", "{}"),
+        ] {
+            let root = state.db_path.parent().unwrap().join(package);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("package.json"),
+                format!(r#"{{"name":"{package}","dependencies":{dependencies}}}"#),
+            )
+            .unwrap();
+            state
+                .store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.into(),
+                    url: format!("file://{}", root.display()),
+                    indexed_sha: "head".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".into(),
+                    name: None,
+                    root_path: Some(root.display().to_string()),
+                })
+                .unwrap();
+            let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+            state
+                .store
+                .set_repo_index_policy(uid, &reader.eligibility_fingerprint())
+                .unwrap();
+        }
+    }
+
+    // Direct-store setup belongs to the existing CI-only daemon library lane.
+    #[tokio::test]
+    async fn release_manifest_recovery_publishes_all_repositories_and_drains() {
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let task = tokio::spawn(super::manifest_recovery::run(Arc::clone(&state)));
+        for _ in 0..20 {
+            state.manifest_recovery.wake.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
+                .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let manifests =
+            nestweaver_engine::manifest::current_manifest_snapshot(&state.store, &state.db_path)
+                .unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests["repo:alpha"].dependencies, ["beta"]);
+        assert_eq!(manifests["repo:beta"].package_name.as_deref(), Some("beta"));
+        let generation = state.store.graph_generation();
+        std::fs::write(
+            state.db_path.parent().unwrap().join("alpha/package.json"),
+            r#"{"name":"alpha","dependencies":{}}"#,
+        )
+        .unwrap();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "unchanged-SHA working-tree manifest edit",
+        )
+        .unwrap();
+        state.manifest_recovery.wake.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
+                .is_ok_and(|map| map["repo:alpha"].dependencies.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.store.graph_generation(), generation);
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        state.shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.active_writes.load(Ordering::SeqCst), 0);
+        assert!(state.write_gate.holder_snapshot().is_none());
+        assert_eq!(state.manifest_recovery.status().state, "stopped");
+    }
+
+    #[tokio::test]
+    async fn release_manifest_recovery_rejects_changed_inputs_and_corrupt_predecessor() {
+        use nestweaver_engine::manifest;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let before =
+            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let alpha = state.db_path.parent().unwrap().join("alpha/package.json");
+        std::fs::write(&alpha, r#"{"name":"changed"}"#).unwrap();
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let lease = state.write_gate.lock("manifest_regression").await;
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        assert!(super::manifest_recovery::reconcile(&state, before).is_err());
+        assert!(!manifest::manifest_cache_path(&state.db_path).exists());
+        let before =
+            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        std::fs::write(
+            manifest::manifest_cache_path(&state.db_path),
+            b"corrupt evidence",
+        )
+        .unwrap();
+        assert!(super::manifest_recovery::reconcile(&state, before).is_err());
+        assert_eq!(
+            std::fs::read(manifest::manifest_cache_path(&state.db_path)).unwrap(),
+            b"corrupt evidence"
+        );
+        drop(owned);
+    }
+
+    #[test]
+    fn release_manifest_recovery_refuses_missing_or_malformed_authoritative_sources() {
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let path = state.db_path.parent().unwrap().join("alpha/package.json");
+        std::fs::write(&path, "{").unwrap();
+        let error = match super::manifest_recovery::capture(
+            &state,
+            Instant::now() + Duration::from_secs(60),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed source was accepted"),
+        };
+        assert!(error.to_string().contains("repo:alpha"));
+        std::fs::write(&path, r#"{"name":"alpha"}"#).unwrap();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "malformed non-JSON source fixture",
+        )
+        .unwrap();
+        let debt = nestweaver_engine::manifest::manifest_debt_revision(&state.db_path).unwrap();
+        for (name, content) in [
+            ("go.mod", "this is not a Go module"),
+            ("app.csproj", "<Project><PackageReference></Project>"),
+        ] {
+            let malformed = path.parent().unwrap().join(name);
+            std::fs::write(&malformed, content).unwrap();
+            assert!(super::manifest_recovery::capture(
+                &state,
+                Instant::now() + Duration::from_secs(60),
+            ).is_err());
+            assert_eq!(
+                nestweaver_engine::manifest::manifest_debt_revision(&state.db_path).unwrap(),
+                debt
+            );
+            assert!(!nestweaver_engine::manifest_cache_path(&state.db_path).exists());
+            std::fs::remove_file(malformed).unwrap();
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
+                .is_err()
+        );
     }
 
     fn write_provenance_test_config(path: &Path, root: &Path) {
@@ -21290,6 +21638,8 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            manifest_recovery: Arc::new(Default::default()),
+            manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
             watcher_lifecycle: std::sync::Mutex::new(()),
             ui_server: std::sync::Mutex::new(None),
@@ -23300,6 +23650,46 @@ external_model = "external-model"
         assert_eq!(degraded.get_embedding_pipeline().unwrap(), None);
         assert_eq!(degraded.embedding_count(), 0);
         assert!(!embedding_path.exists());
+    }
+
+    #[tokio::test]
+    async fn embed_plan_rejects_unreadable_identity_even_when_no_nodes_are_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed-plan-identity.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("recorded-model", 3).unwrap();
+        {
+            let conn = store.begin_transaction().unwrap();
+            conn.query("MATCH (m:Meta {key: 'embedding'}) SET m.value = '{not-json'")
+                .unwrap();
+            store.commit_transaction(&conn).unwrap();
+        }
+        drop(store);
+        let degraded = Arc::new(GraphStore::open(&db_path).unwrap());
+        assert!(degraded.embedding_identity_error().is_some());
+        assert_eq!(
+            plan_embeddings(&degraded, "all", false).unwrap().eligible,
+            0
+        );
+        let service = DaemonService::new(test_state_with_authz(
+            degraded,
+            build_daemon_permission_source(None),
+        ));
+
+        for force in [false, true] {
+            let status = service
+                .plan_embed(Request::new(EmbedRequest {
+                    scope: "all".to_string(),
+                    force,
+                    batch_size: 0,
+                    repair_identity: false,
+                }))
+                .await
+                .expect_err("an empty plan must not bypass identity validation");
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(status.message().contains("embedding preflight"));
+            assert!(status.message().contains("identity is unreadable"));
+        }
     }
 
     #[cfg(feature = "embed")]

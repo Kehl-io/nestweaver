@@ -19,10 +19,9 @@
 #   NW_RUNS  number of runs per file (default: 3; overridden by the 2nd arg)
 set -euo pipefail
 
-# This harness deliberately uses the daemon-bypass path (NESTWEAVER_NO_DAEMON=1)
-# for hermetic, single-process runs. That bypass is now refused outside CI unless
-# explicitly allowed, so opt in for the whole script.
-export NESTWEAVER_ALLOW_NO_DAEMON=1
+# Queries go through the daemon. Bypass is CI-test-only and is not a local
+# recovery or determinism option; refuse inherited hatch variables here.
+unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
 
 DB="${1:?usage: golden-check.sh <db-path> [runs] [files...]}"
 shift || true
@@ -100,11 +99,11 @@ for tool in affected-tests pr-impact; do
     for ((r = 1; r <= RUNS; r++)); do
       out="$tmp/$(echo "${tool}_${f}_${r}" | tr '/' '_')"
       if [[ "$tool" == "affected-tests" ]]; then
-        NESTWEAVER_NO_DAEMON=1 "$BIN" affected-tests --files "$f" --json --db "$DB" \
+        "$BIN" affected-tests --files "$f" --json --db "$DB" \
           >"$out" 2>/dev/null || true
       else
         # pr-impact prints progress on the first lines; keep only the JSON body.
-        NESTWEAVER_NO_DAEMON=1 "$BIN" pr-impact --files "$f" --json --db "$DB" 2>/dev/null \
+        "$BIN" pr-impact --files "$f" --json --db "$DB" 2>/dev/null \
           | sed -n '/^{/,$p' >"$out" || true
       fi
 

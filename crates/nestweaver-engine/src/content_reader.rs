@@ -300,6 +300,7 @@ fn path_in_configured_skip_dir(
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
 pub struct FilesystemReader {
     repo_path: PathBuf,
+    strict_enumeration: bool,
     limits: IndexLimits,
     /// Configured `[[repos]] exclude` globs, matched against repo-relative
     /// paths. `None` when the repo declares none — the common case.
@@ -451,6 +452,7 @@ impl FilesystemReader {
     pub fn new(repo_path: &Path) -> Self {
         Self {
             repo_path: repo_path.to_path_buf(),
+            strict_enumeration: false,
             limits: IndexLimits::default(),
             excludes: None,
             exclude_patterns: Vec::new(),
@@ -465,6 +467,7 @@ impl FilesystemReader {
     pub fn with_limits(repo_path: &Path, limits: IndexLimits) -> Self {
         Self {
             repo_path: repo_path.to_path_buf(),
+            strict_enumeration: false,
             limits,
             excludes: None,
             exclude_patterns: Vec::new(),
@@ -474,6 +477,12 @@ impl FilesystemReader {
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Derived snapshots require complete enumeration, including child errors.
+    pub fn strict_enumeration(mut self) -> Self {
+        self.strict_enumeration = true;
+        self
     }
 
     /// Override the directory blocklist this reader's walk prunes by.
@@ -878,10 +887,23 @@ impl ContentReader for FilesystemReader {
             })
             .build();
 
+        let scan_started = std::time::Instant::now();
+        let mut scanned = 0usize;
         for entry in walker {
+            scanned += 1;
+            if self.strict_enumeration
+                && (scanned > 200_000 || scan_started.elapsed() > Duration::from_secs(60))
+            {
+                anyhow::bail!(
+                    "manifest source inventory exceeded 200000 entries or its 60-second cooperative deadline"
+                );
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
+                    if self.strict_enumeration {
+                        return Err(anyhow::anyhow!("incomplete source inventory: {err}"));
+                    }
                     tracing::warn!("walk error: {err}");
                     continue;
                 }
@@ -934,7 +956,9 @@ impl ContentReader for FilesystemReader {
         // every `list_files` call, so both halves of the answer describe one
         // walk. Every existing drain site reads the recorder immediately after
         // `list_files` and therefore picks these rows up with no change.
-        self.record_tracked_but_ignored(&files);
+        if !self.strict_enumeration {
+            self.record_tracked_but_ignored(&files);
+        }
         Ok(files)
     }
 
@@ -1256,6 +1280,7 @@ impl Drop for CatFileBatch {
 /// checkout — the server only needs transient access to blobs.
 pub struct GitBareReader {
     bare_path: PathBuf,
+    local_objects_only: bool,
     sha: String,
     limits: IndexLimits,
     /// Lazily-spawned pooled `cat-file --batch` process. `None` until the first
@@ -1267,6 +1292,7 @@ impl GitBareReader {
     pub fn new(bare_path: &Path, sha: &str) -> Self {
         Self {
             bare_path: bare_path.to_path_buf(),
+            local_objects_only: false,
             sha: sha.to_string(),
             limits: IndexLimits::default(),
             batch: Mutex::new(None),
@@ -1276,10 +1302,17 @@ impl GitBareReader {
     pub fn with_limits(bare_path: &Path, sha: &str, limits: IndexLimits) -> Self {
         Self {
             bare_path: bare_path.to_path_buf(),
+            local_objects_only: false,
             sha: sha.to_string(),
             limits,
             batch: Mutex::new(None),
         }
+    }
+
+    /// Repair never fetches missing promisor blobs or unknown remotes.
+    pub fn local_objects_only(mut self) -> Self {
+        self.local_objects_only = true;
+        self
     }
 
     /// Resolve HEAD of the bare repo to a full SHA.
@@ -1316,6 +1349,9 @@ impl GitBareReader {
         // batch reader's cap would otherwise be bypassed whenever this fallback
         // fires — spawn failure, mid-stream death, or timeout).
         let mut size_cmd = Command::new("git");
+        if self.local_objects_only {
+            size_cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
         size_cmd.args([
             "-C",
             &self.bare_path.display().to_string(),
@@ -1350,6 +1386,9 @@ impl GitBareReader {
             .into());
         }
         let mut cmd = Command::new("git");
+        if self.local_objects_only {
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
         cmd.args(["-C", &self.bare_path.display().to_string(), "show", &spec]);
         let output = run_git_with_timeout(cmd, git_net_timeout())
             .with_context(|| format!("failed to run git show {spec}"))?;
@@ -1416,6 +1455,9 @@ impl ContentReader for GitBareReader {
     }
 
     fn read_file(&self, rel_path: &Path) -> Result<String> {
+        if self.local_objects_only {
+            return self.read_file_via_show(rel_path);
+        }
         let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
 
         // Lazily spawn the pooled batch process on the first read.
@@ -1482,6 +1524,9 @@ impl ContentReader for GitBareReader {
         // mirroring `FilesystemReader`'s `follow_links(false)`; otherwise a
         // symlink's target-path text would be indexed as file content.
         let mut cmd = Command::new("git");
+        if self.local_objects_only {
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
         cmd.args([
             "-C",
             &self.bare_path.display().to_string(),
@@ -1490,8 +1535,16 @@ impl ContentReader for GitBareReader {
             "-z",
             &self.sha,
         ]);
-        let output =
-            run_git_with_timeout(cmd, git_net_timeout()).context("failed to run git ls-tree")?;
+        let output = if self.local_objects_only {
+            crate::git_cmd::run_git_with_timeout_and_output_limit(
+                cmd,
+                git_net_timeout(),
+                32 * 1024 * 1024,
+            )
+        } else {
+            run_git_with_timeout(cmd, git_net_timeout())
+        }
+        .context("failed to run git ls-tree")?;
         if !output.status.success() {
             anyhow::bail!(
                 "git ls-tree failed: {}",
@@ -1500,11 +1553,16 @@ impl ContentReader for GitBareReader {
         }
         // Each NUL-terminated record is `<mode> <type> <object>\t<path>`.
         let mut files = Vec::new();
-        for record in output.stdout.split(|&b| b == 0) {
+        for (index, record) in output.stdout.split(|&b| b == 0).enumerate() {
             if record.is_empty() {
                 continue;
             }
+            anyhow::ensure!(
+                !self.local_objects_only || index < 200_000,
+                "bare manifest inventory exceeds 200000 entries"
+            );
             let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                anyhow::ensure!(!self.local_objects_only, "malformed bare inventory record");
                 continue;
             };
             let meta = &record[..tab];
@@ -1515,7 +1573,14 @@ impl ContentReader for GitBareReader {
                 // Skip symlinks and gitlinks/submodules — neither is file content.
                 continue;
             }
-            let path = PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned());
+            let path = if self.local_objects_only {
+                PathBuf::from(
+                    std::str::from_utf8(path_bytes)
+                        .context("non-UTF8 bare manifest inventory path")?,
+                )
+            } else {
+                PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned())
+            };
             if crate::index::path_in_skip_dir(&path) {
                 continue;
             }

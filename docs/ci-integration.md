@@ -247,11 +247,9 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }   # need the merge-base
       # ... install nestweaver and build/restore the index (nestweaver.lbug) ...
-      # Daemon note: `--no-daemon` / NESTWEAVER_NO_DAEMON no longer confer a
-      # bypass on their own, and `CI=true` / `GITHUB_ACTIONS` confer nothing.
-      # Set NESTWEAVER_ALLOW_NO_DAEMON=1 if you want daemon-free steps;
-      # otherwise the index step autostarts a daemon that holds the write
-      # lease for the rest of the job.
+      # Standard artifacts use the daemon even if a bypass is requested.
+      # Direct-store tests belong to a separate unpublished CI artifact;
+      # see docs/testing/release-daemon-fixtures.md for its required gates.
       # After upgrading NestWeaver, re-index once: `stale-check` does not
       # detect a resolver-generation bump. See "Index freshness gate".
       - name: Blast radius (SARIF)

@@ -56,7 +56,7 @@ fn map_context_engine_error(err: anyhow::Error) -> ApiError {
     if message.contains("Ambiguous") {
         return ApiError::bad_request("ambiguous context seed");
     }
-    ApiError::from(err)
+    ApiError::from_ranking(err)
 }
 
 pub async fn code_context(
@@ -67,6 +67,7 @@ pub async fn code_context(
         return Err(ApiError::bad_request("seeds must not be empty"));
     }
     reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+    state.admit_vault_derivation()?;
     let result = nestweaver_engine::build_context(&state.store, &body.seeds)
         .map_err(map_context_engine_error)?;
     let mut json = serde_json::to_value(&result)?;
@@ -92,31 +93,82 @@ pub async fn brain_context(
     if body.seeds.is_empty() {
         return Err(ApiError::bad_request("seeds must not be empty"));
     }
+    if body.seeds.len() > 100 {
+        return Err(ApiError::bad_request(
+            "at most 100 context seeds are supported",
+        ));
+    }
+    let generation = state.store.graph_generation();
+    nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
+        .map_err(ApiError::from_ranking)?;
     reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+    state.admit_vault_derivation()?;
     let workspace = workspaces::resolve_workspace(
         &state.store,
         workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
     )?;
     let config = nestweaver_engine::HybridSearchConfig::default();
-    let mut result = nestweaver_engine::build_brain_context_hybrid(
+    let mut result = match nestweaver_engine::build_brain_context_hybrid(
         &state.store,
         &body.seeds,
         state.tantivy.as_deref(),
         &config,
         None,
         None,
-    )
-    .map_err(map_context_engine_error)?;
+    ) {
+        Ok(result) => result,
+        // Vault workspaces do not admit code results. An unresolved `sym:`
+        // seed would 404 before the vault filter can return the documented
+        // empty no-match body.
+        Err(err)
+            if workspace.kind == WorkspaceKind::Vault
+                && err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("No seeds resolved")) =>
+        {
+            nestweaver_engine::BrainContextResult {
+                unresolved_seeds: body.seeds.clone(),
+                ..Default::default()
+            }
+        }
+        Err(err) => return Err(map_context_engine_error(err)),
+    };
     filter_brain_context_result(&state, &workspace, &mut result)?;
+    // This router is the existing trusted loopback UI, not a remote policy
+    // boundary. Remote callers must supply their own resolved VisibleRepos.
+    let graph = nestweaver_engine::context_graph::attach_context_graph(
+        &state.store,
+        &mut result,
+        &nestweaver_engine::authz::VisibleRepos::All,
+        generation,
+    )
+    .map_err(ApiError::from_ranking)?;
     let empty_result = result.seeds.is_empty() && result.connected.is_empty();
-    let meta = brain_context_meta(&workspace, body.token_budget, empty_result);
+    let mut meta = brain_context_meta(&workspace, body.token_budget, empty_result);
+    if graph.meta.truncated {
+        meta.trust.partial = true;
+        meta.trust.result = "partial".to_string();
+        meta.trust.message.push_str(" Context graph limits omitted nodes or relationships; graph_meta describes their populations.");
+        meta.truncation.truncated = true;
+        // Nodes and edges are different populations. Do not combine their
+        // counts or describe a lower-bound edge count as an exact total.
+        meta.truncation.limit = None;
+        meta.truncation.omitted_count = None;
+        meta.continuation.has_more = false;
+        meta.continuation.reason =
+            Some("Narrow the context seeds to inspect omitted relationships.".to_string());
+    }
     let mut json = serde_json::to_value(&result)?;
     // Scene-level bridge emphasis: seeds + connected form one scene, so
     // the top-12 cap and 0..=1 normalization span the whole response.
     crate::bridge::annotate_context_payload(&state, &mut json);
     if let serde_json::Value::Object(ref mut object) = json {
+        object.insert("edges".to_string(), serde_json::to_value(graph.edges)?);
+        object.insert("graph_meta".to_string(), serde_json::to_value(graph.meta)?);
         object.insert("_meta".to_string(), serde_json::to_value(meta)?);
     }
+    nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
+        .map_err(ApiError::from_ranking)?;
     Ok(Json(json).into_response())
 }
 

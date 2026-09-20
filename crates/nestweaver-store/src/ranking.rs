@@ -1621,14 +1621,19 @@ impl GraphStore {
                 Some(expected) => expected.to_string(),
                 None => envelope.algorithm_fingerprint.clone(),
             };
-            let scores: HashMap<String, f64> =
-                envelope.validate_and_decode(crate::artifact_envelope::ArtifactExpectation {
+            let scores: HashMap<String, f64> = envelope
+                .validate_and_decode(crate::artifact_envelope::ArtifactExpectation {
                     artifact_kind: PAGERANK_ARTIFACT_KIND,
                     artifact_schema_version: PAGERANK_ARTIFACT_SCHEMA_VERSION,
                     identity: &identity,
                     producer_version: env!("CARGO_PKG_VERSION"),
                     source_graph_generation: self.graph_generation(),
                     algorithm_fingerprint: &fingerprint,
+                })
+                .map_err(|error| {
+                    StoreError::Query(format!(
+                        "{error}; run `nestweaver index --repo <path> --force` to rebuild ranking"
+                    ))
                 })?;
             *self
                 .pagerank_cache

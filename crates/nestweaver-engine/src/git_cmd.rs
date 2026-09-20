@@ -126,7 +126,25 @@ fn kill_group_reap_drain(
 /// within `timeout`, the whole group is killed (SIGKILL), the direct child is
 /// reaped, and an error is returned — the call never blocks past `timeout` plus
 /// one poll interval, even against a blackholed remote.
-pub fn run_git_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
+pub fn run_git_with_timeout(cmd: Command, timeout: Duration) -> Result<Output> {
+    run_git_with_output_limit(cmd, timeout, None)
+}
+
+/// Bound each output pipe before allocation, failing rather than returning a
+/// truncated inventory. The process-group cleanup is identical to timeout.
+pub fn run_git_with_timeout_and_output_limit(
+    cmd: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<Output> {
+    run_git_with_output_limit(cmd, timeout, Some(max_output_bytes))
+}
+
+fn run_git_with_output_limit(
+    mut cmd: Command,
+    timeout: Duration,
+    max_output_bytes: Option<usize>,
+) -> Result<Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -153,23 +171,49 @@ pub fn run_git_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Outpu
     // deadlocking us against it — so the reads must run on their own threads.
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
+    let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_failed = read_failed.clone();
+    let stdout_exceeded = exceeded.clone();
     let stdout_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(ref mut s) = stdout_pipe {
-            let _ = s.read_to_end(&mut buf);
+            let limit = max_output_bytes.map_or(u64::MAX, |n| n.saturating_add(1) as u64);
+            if s.take(limit).read_to_end(&mut buf).is_err() && max_output_bytes.is_some() {
+                stdout_failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if max_output_bytes.is_some_and(|max| buf.len() > max) {
+                stdout_exceeded.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         buf
     });
+    let stderr_failed = read_failed.clone();
+    let stderr_exceeded = exceeded.clone();
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(ref mut s) = stderr_pipe {
-            let _ = s.read_to_end(&mut buf);
+            let limit = max_output_bytes.map_or(u64::MAX, |n| n.saturating_add(1) as u64);
+            if s.take(limit).read_to_end(&mut buf).is_err() && max_output_bytes.is_some() {
+                stderr_failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if max_output_bytes.is_some_and(|max| buf.len() > max) {
+                stderr_exceeded.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         buf
     });
 
     let start = Instant::now();
     let status = loop {
+        if read_failed.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = kill_group_reap_drain(pgid, child, stdout_reader, stderr_reader);
+            anyhow::bail!("failed to read bounded git output");
+        }
+        if exceeded.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = kill_group_reap_drain(pgid, child, stdout_reader, stderr_reader);
+            anyhow::bail!("git output exceeded its bounded capture limit");
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
@@ -192,6 +236,14 @@ pub fn run_git_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Outpu
 
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    anyhow::ensure!(
+        !exceeded.load(std::sync::atomic::Ordering::Acquire),
+        "git output exceeded its bounded capture limit"
+    );
+    anyhow::ensure!(
+        !read_failed.load(std::sync::atomic::Ordering::Acquire),
+        "failed to read bounded git output"
+    );
     Ok(Output {
         status,
         stdout,
@@ -202,6 +254,20 @@ pub fn run_git_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Outpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_git_output_fails_without_returning_truncated_success() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do printf 0123456789; done"]);
+        let error =
+            run_git_with_timeout_and_output_limit(cmd, Duration::from_secs(5), 1024).unwrap_err();
+        assert!(error.to_string().contains("output exceeded"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf exact"]);
+        let output = run_git_with_timeout_and_output_limit(cmd, Duration::from_secs(5), 5).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"exact");
+    }
 
     /// A command that would run for 30s, bounded to 500ms, must return an error
     /// near the timeout (not after the full 30s) — proving the child is killed

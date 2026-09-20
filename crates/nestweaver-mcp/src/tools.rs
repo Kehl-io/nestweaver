@@ -135,7 +135,7 @@ fn name_lookup_ambiguous_payload(
 }
 
 fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Value {
-    nestweaver_schema::responses::name_lookup_ambiguous(
+    let mut payload = nestweaver_schema::responses::name_lookup_ambiguous(
         title,
         None,
         json!(
@@ -149,20 +149,31 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
                 }))
                 .collect::<Vec<_>>()
         ),
-    )
+    );
+    payload["entity_kind"] = json!("note");
+    payload["title"] = json!(title);
+    payload["note"] = json!(
+        "Multiple notes share this title. Pass a candidate note UID or a vault-relative path to select the intended note."
+    );
+    for candidate in payload["candidates"].as_array_mut().into_iter().flatten() {
+        candidate["kind"] = json!("Note");
+    }
+    payload
 }
 
 fn filter_name_matches_by_repo(
     store: &GraphStore,
     matches: Vec<nestweaver_schema::Symbol>,
     repo_filter: Option<&str>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Vec<nestweaver_schema::Symbol>, anyhow::Error> {
     let Some(selector) = repo_filter.filter(|s| !s.is_empty()) else {
         return Ok(matches);
     };
-    let repos = store
+    let mut repos = store
         .list_repos(None)
         .map_err(|e| anyhow!("list_repos: {e}"))?;
+    repos.retain(|repo| repo_is_visible(&repo.uid, visible));
     match nestweaver_engine::resolve_repo_selector(&repos, selector) {
         Ok(repo) => Ok(matches
             .into_iter()
@@ -210,8 +221,12 @@ fn resolve_symbol_strict(
                     return Ok(StrictNameResolve::NotFound);
                 }
                 if let Some(selector) = repo_filter.filter(|s| !s.is_empty()) {
-                    let filtered =
-                        filter_name_matches_by_repo(store, vec![symbol.clone()], Some(selector))?;
+                    let filtered = filter_name_matches_by_repo(
+                        store,
+                        vec![symbol.clone()],
+                        Some(selector),
+                        visible,
+                    )?;
                     return Ok(classify_name_matches(filtered));
                 }
                 Ok(StrictNameResolve::Found(symbol.uid))
@@ -224,7 +239,7 @@ fn resolve_symbol_strict(
             .lookup_symbols_by_name(name_or_uid)
             .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
         matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
-        let matches = filter_name_matches_by_repo(store, matches, repo_filter)?;
+        let matches = filter_name_matches_by_repo(store, matches, repo_filter, visible)?;
         Ok(classify_name_matches(matches))
     }
 }
@@ -2284,6 +2299,12 @@ mod tool_schema_validation_tests {
         assert_eq!(high["matching_count"], 0);
         assert_eq!(high["returned"], 0);
         assert_eq!(high["truncated"], false);
+        assert_eq!(high["review_only"], true);
+        assert_eq!(high["high_confidence_available"], false);
+        assert_eq!(
+            high["confidence_filter_status"],
+            "unavailable_no_validated_population"
+        );
     }
 
     /// nw-316. `forwarded_bool(&args, "include_components", true)` guessed the
@@ -3369,6 +3390,8 @@ include!(concat!(env!("OUT_DIR"), "/response_shape_version.rs"));
 ///   A single call made from a wrong cwd (or a bare clone) would cache an EMPTY
 ///   body and then serve it for the correct args forever — a silent-wrong result
 ///   on a core retrieval tool. It's a cheap disk-span read, so leave it uncached.
+/// - `dead_code` — database-bound pages recheck publication and manifest state;
+///   manifest recovery can change coverage without advancing graph generation.
 /// - `query_extensions` — reads the extensions sidecar, which `set_extension`
 ///   mutates WITHOUT bumping the graph generation, so a cached result would serve
 ///   stale values after a write (nw-089). Cheap sidecar read; leave it uncached.
@@ -3383,7 +3406,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "clusters",
     "brain_diff",
     "project_context",
-    "dead_code",
     "hub_nodes",
     "bridge_nodes",
     "blast_radius",
@@ -9605,7 +9627,8 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
-                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or repo to pin one symbol." },
+                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or name_repo to pin one symbol." },
+                "name_repo": { "type": "string", "description": "Disambiguate duplicate visible symbol names by repo; ignored for UIDs and globally unique visible names. Does not filter result rows." },
                 "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
                     "Max contract links to return (1-1000, default 50). The total count is always reported.",
@@ -9629,7 +9652,7 @@ fn tool_cross_repo_contracts(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    let name_repo = args.get("repo").and_then(|v| v.as_str());
+    let name_repo = args.get("name_repo").and_then(|v| v.as_str());
     // `uid` is a handle, not a name. Restricted sessions still look the row
     // up by UID and fail closed if it is hidden; they must not route a
     // colon-less fixture UID (or any explicit UID) through name search.
@@ -9647,7 +9670,14 @@ fn tool_cross_repo_contracts(
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        match resolve_symbol_strict(store, name, visible, name_repo)? {
+        let initial = resolve_symbol_strict(store, name, visible, None)?;
+        let resolved = match initial {
+            StrictNameResolve::Ambiguous(candidates) => classify_name_matches(
+                filter_name_matches_by_repo(store, candidates, name_repo, visible)?,
+            ),
+            other => other,
+        };
+        match resolved {
             StrictNameResolve::Found(resolved) => resolved,
             StrictNameResolve::NotFound => {
                 return Err(anyhow!("no symbol found: '{name}'"));
@@ -9673,9 +9703,8 @@ fn tool_cross_repo_contracts(
 
     // nw-369(a). `--repo` here is a SELECTOR for the row filter below —
     // distinct from `cross-repo-refs --repo`, which disambiguates an
-    // ambiguous SYMBOL NAME before this tool is ever reached (that command
-    // bypasses this tool's RPC entirely once its own `--repo` is set, so
-    // there is no argument collision). Resolved with the same
+    // ambiguous SYMBOL NAME using the separate `name_repo` RPC argument.
+    // Resolved with the same
     // `resolve_repo_selector` every other `--repo` flag in this binary uses,
     // rather than a bespoke string-equality check that would drift from it.
     let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
@@ -9808,6 +9837,7 @@ fn tool_cross_repo_contracts(
         "repo_filter": repo_filter,
         "total": total,
         "returned": rows.len(),
+        "truncated": rows.len() < total,
         "note": note,
         "contracts_status": contracts_status,
         "degraded_repos": degraded_repos,
@@ -9860,7 +9890,10 @@ fn tool_schema_brain_impact() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Names are resolved via first-match lookup." },
+                "repo": { "type": "string", "description": "Scope the target symbol to this repository (UID or display name)." },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Minimum edge confidence." },
+                "min_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum traversal impact score; 0 disables pruning." },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Ambiguous names require a repo selector or UID." },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
@@ -9902,6 +9935,15 @@ fn tool_brain_impact(
         1,
         RESULT_LIMIT_MAX,
     )?;
+    let repo = args.get("repo").and_then(Value::as_str);
+    let confidence = args
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let threshold = args
+        .get("min_score")
+        .and_then(Value::as_f64)
+        .unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
     let concise = is_concise(&args);
     let owners = restricted_symbol_owners(store, visible)?;
     let uid_is_visible = |uid: &str| {
@@ -9935,58 +9977,19 @@ fn tool_brain_impact(
     // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
     // contract in daemon mode, instead of the daemon path silently returning the best of
     // several matches (which diverged from the direct path).
-    let uid = if symbol.contains(':') {
-        // Fail closed on unknown/garbage/cross-DB UIDs — verify the UID
-        // actually resolves in this store instead of trusting its shape. Keeps
-        // the same not_found contract as the name path; a legit zero-dependent
-        // symbol still resolves and returns status ok with an empty list.
-        match store.lookup_symbol(symbol) {
-            Ok(sym) if uid_is_visible(&sym.uid) => sym.uid,
-            Ok(_) | Err(nestweaver_store::StoreError::NotFound) => {
-                return Ok(nestweaver_schema::responses::impact(json!({
-                    "status": "not_found",
-                    "symbol": symbol,
-                    "impact_nodes": [],
-                    "total": 0,
-                    "returned": 0,
-                })));
-            }
-            Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
+    let uid = match resolve_symbol_strict(store, symbol, visible, repo)? {
+        StrictNameResolve::Found(uid) => uid,
+        StrictNameResolve::NotFound => {
+            return Ok(nestweaver_schema::responses::impact(json!({
+                "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
+            })));
         }
-    } else {
-        let mut matches = store
-            .lookup_symbols_by_name(symbol)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-        matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
-        match matches.len() {
-            0 => {
-                return Ok(nestweaver_schema::responses::impact(json!({
-                    "status": "not_found",
-                    "symbol": symbol,
-                    "impact_nodes": [],
-                    "total": 0,
-                    "returned": 0,
-                })));
-            }
-            1 => matches.into_iter().next().unwrap().uid,
-            _ => {
-                let candidates: Vec<Value> = matches
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "uid": s.uid,
-                            "name": s.name,
-                            "file_path": s.file_path,
-                            "start_line": s.start_line,
-                        })
-                    })
-                    .collect();
-                return Ok(nestweaver_schema::responses::impact_ambiguous(
-                    symbol,
-                    None,
-                    json!(candidates),
-                ));
-            }
+        StrictNameResolve::Ambiguous(candidates) => {
+            return Ok(nestweaver_schema::responses::impact_ambiguous(
+                symbol,
+                repo,
+                candidates_json(&candidates),
+            ));
         }
     };
 
@@ -9996,17 +9999,18 @@ fn tool_brain_impact(
             .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
             .map(|(uid, _)| uid.clone())
             .collect();
-        store.impact_with_flags_within(&uid, depth, 0.0, &allowed, cancel)?
+        store.impact_with_flags_and_threshold_within(
+            &uid, depth, confidence, threshold, &allowed, cancel,
+        )?
     } else {
-        store.impact_with_flags(&uid, depth, 0.0, cancel)?
+        store.impact_with_flags_and_threshold(&uid, depth, confidence, threshold, cancel)?
     };
     let truncated_by_threshold = result.truncated_by_threshold;
     let truncated_by_depth = result.truncated_by_depth;
     // nw-317 leg 1. Built by the SAME function the CLI's direct path calls,
     // so the default (daemon) route can no longer be the weaker disclosure.
-    // `impact_with_flags` prunes at `DEFAULT_IMPACT_THRESHOLD`, so that is the
-    // threshold this note reports.
-    let note = result.truncation_note(nestweaver_store::DEFAULT_IMPACT_THRESHOLD, depth);
+    // Report the same effective threshold used by the authorization-scoped walk.
+    let note = result.truncation_note(threshold, depth);
     let mut nodes = result.nodes;
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
@@ -10967,7 +10971,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11172,14 +11176,12 @@ fn tool_affected_tests(
             count_tests(&result.tier_2),
             count_tests(&result.tier_3),
         );
-        result.recommendation = if matches!(
+        let remaining_file_count = result.tier_1.len() + result.tier_2.len() + result.tier_3.len();
+        result.recommendation = nestweaver_engine::affected_tests::derive_recommendation(
             result.status,
-            nestweaver_engine::blast_radius::AnalysisStatus::Complete
-        ) {
-            "selection-usable"
-        } else {
-            "run-full-suite"
-        }
+            &result.changed_files,
+            remaining_file_count,
+        )
         .to_string();
     }
     Ok(serde_json::to_value(&result)?)
@@ -12832,7 +12834,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos` and a `remedies` array, and NO `unreachable_symbols` key at all — a missing edge can only fail to reach a LIVE symbol, so an under-resolved graph moves live code onto a deletion list. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required) and call again.\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- Rust `impl` blocks: a block is REACHABLE when ANY of its members is, and a DEAD block suppresses its own unreachable `Method` members from the list — you get the block once, not the block plus every method it defines. Associated `Constant`s still surface individually, matching how a dead class's already did\n- Row order is deterministic and total: confidence, then PageRank importance, then file path, then name, then `uid` as the final tie-break. That last key matters because `limit` keeps a PREFIX — without it, two same-named dead siblings in one file (duplicate overloads, `impl`-block twins) could swap position between runs on an unchanged graph and change which rows survive the cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- bash `trap` handler resolution is SAME-FILE ONLY. `trap cleanup EXIT` roots `cleanup` only when the same file also defines it; a handler defined in a `source`d file (`source lib.sh; trap cleanup EXIT`) is NOT resolved and the handler will appear unreachable\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding. A polyglot repo can degrade even with entry_points > 0 and undecodable_symbols == 0: `languages_without_entry_points` names each language that contributed analysed symbols but no entry point of its own — its reachability numbers are exactly as vacuous as the whole-corpus case, just scoped to that language",
+        "description": "Review statically unreachable symbols. Every tier is review-only, never deletion approval. High input remains accepted but returns an explicitly unavailable, unvalidated population; no High rows are emitted. Low includes all review candidates; Medium excludes explicitly public candidates. Check coverage, entry_points, undecodable_symbols, languages_without_entry_points and manifest_load_error before interpreting counts. Missing static references, dynamic dispatch and same-file-only bash trap resolution remain limitations. Resolver-stale graphs refuse with remedies. Optional repos scope uses a global reachability walk then filters results and totals. Pages are local to one database: use next_offset with expected_generation and page_token from the prior response. Changed publication, database, scope, filter or ordered population refuses continuation. Row order is confidence, PageRank, file, name, UID. Pages remain bounded to 1000 rows; traversal still examines the whole graph.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12840,13 +12842,13 @@ fn tool_schema_dead_code() -> Value {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "default": "low",
-                    "description": "Minimum confidence to include in results. Default 'low' (show all)."
+                    "description": "Compatibility review tier. High is accepted but has no validated output population; low shows all review candidates."
                 },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns name + confidence only; \"detailed\" (default) adds UIDs, file paths, kinds, and visibility."
+                    "description": "\"concise\" returns UID + name + confidence; \"detailed\" (default) adds UIDs, file paths, kinds, and visibility."
                 },
                 "limit": {
                     "type": "integer",
@@ -12854,6 +12856,10 @@ fn tool_schema_dead_code() -> Value {
                     "maximum": 1000,
                     "description": "Max unreachable symbols to return (defaults to the configured result limit). The response reports the true total in 'unreachable_count' and sets 'truncated' when the cap applied."
                 },
+                "repos": { "type": "array", "items": { "type": "string" }, "maxItems": 100, "description": "Repository names or UIDs; restrict the result population before paging." },
+                "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0 },
+                "expected_generation": { "type": "integer", "minimum": 0, "description": "Required with page_token for offset greater than zero." },
+                "page_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
@@ -12862,169 +12868,214 @@ fn tool_schema_dead_code() -> Value {
     })
 }
 
+/// Validate at the handler seam as well as JSON-schema dispatch: daemon RPCs
+/// can reach this path without the MCP gateway's schema validator.
+fn dead_code_page_arguments(
+    args: &Value,
+) -> anyhow::Result<(
+    nestweaver_engine::dead_code::DeadCodePageRequest<'_>,
+    Option<Vec<String>>,
+)> {
+    use nestweaver_engine::dead_code::DeadCodePageRequest;
+    anyhow::ensure!(args.is_object(), "dead_code arguments must be an object");
+    let min_confidence = match args.get("min_confidence") {
+        None => DeadCodeConfidence::Low,
+        Some(value) => DeadCodeConfidence::from_str_loose(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("min_confidence must be a string"))?,
+        )
+        .ok_or_else(|| anyhow!("invalid dead-code confidence"))?,
+    };
+    let selectors = match args.get("repos") {
+        None => None,
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .ok_or_else(|| anyhow!("repos must be an array of strings"))?;
+            anyhow::ensure!(entries.len() <= 100, "repos supports at most 100 selectors");
+            let values: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow!("each repos entry must be a string"))
+                })
+                .collect::<Result<_, _>>()?;
+            Some(bound_identifiers(values, "repos")?)
+        }
+    };
+    let expected_generation = match args.get("expected_generation") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("expected_generation must be an unsigned integer"))?,
+        ),
+    };
+    let page_token = match args.get("page_token") {
+        None => None,
+        Some(value) => {
+            let token = value
+                .as_str()
+                .ok_or_else(|| anyhow!("page_token must be a string"))?;
+            anyhow::ensure!(
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "page_token must contain exactly 64 lowercase hexadecimal characters"
+            );
+            Some(token)
+        }
+    };
+    anyhow::ensure!(
+        !args.get("offset").is_some_and(Value::is_null),
+        "offset must be an unsigned integer"
+    );
+    Ok((
+        DeadCodePageRequest {
+            min_confidence,
+            limit: read_limit(
+                args,
+                "limit",
+                configured_result_limit(),
+                1,
+                RESULT_LIMIT_MAX,
+            )?,
+            offset: read_limit(args, "offset", 0, 0, 1_000_000_000)?,
+            expected_generation,
+            page_token,
+            concise: is_concise(args),
+        },
+        selectors,
+    ))
+}
+
+#[cfg(test)]
+mod dead_code_argument_contract_tests {
+    use super::*;
+
+    #[test]
+    fn dead_code_pages_are_never_response_cache_eligible() {
+        assert!(!is_cacheable_tool("dead_code"));
+    }
+
+    #[test]
+    fn malformed_page_binding_inputs_are_rejected_without_store_access() {
+        for arguments in [
+            json!({"expected_generation": "42"}),
+            json!({"expected_generation": -1}),
+            json!({"expected_generation": 1.5}),
+            json!({"expected_generation": null}),
+            json!({"page_token": 42}),
+            json!({"page_token": null}),
+            json!({"page_token": "short"}),
+            json!({"page_token": "G".repeat(64)}),
+            json!({"repos": "repo:a"}),
+            json!({"repos": ["repo:a", 42]}),
+            json!({"repos": null}),
+            json!({"repos": vec!["repo:a"; 101]}),
+            json!({"offset": null}),
+            json!({"offset": "3"}),
+            json!({"offset": 1_000_000_001u64}),
+            json!({"min_confidence": null}),
+        ] {
+            assert!(dead_code_page_arguments(&arguments).is_err(), "{arguments}");
+        }
+    }
+
+    #[test]
+    fn valid_page_binding_inputs_are_preserved() {
+        let token = "a".repeat(64);
+        let arguments = json!({"expected_generation": 42, "page_token": token,
+                              "repos": ["repo:a"], "offset": 3, "min_confidence": "high"});
+        let (request, selectors) = dead_code_page_arguments(&arguments).unwrap();
+        assert_eq!(request.expected_generation, Some(42));
+        assert_eq!(request.page_token, Some(token.as_str()));
+        assert_eq!(request.offset, 3);
+        assert_eq!(request.min_confidence, DeadCodeConfidence::High);
+        assert_eq!(selectors, Some(vec!["repo:a".to_string()]));
+    }
+
+    #[test]
+    fn dead_code_missing_database_path_discloses_degraded_coverage() {
+        let previous = CURRENT_DB_PATH.with(|cell| cell.replace(None));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_DB_PATH.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(previous);
+        let store = GraphStore::in_memory().unwrap();
+        let payload = tool_dead_code(&store, json!({}), None, None).expect("dead_code");
+        assert_eq!(payload["coverage"], "degraded", "{payload}");
+        let error = payload["manifest_load_error"].as_str().unwrap_or("");
+        assert!(error.contains("database path not set on server"), "{error}");
+        assert!(error.contains("entry"), "{error}");
+    }
+}
+
+fn manifests_for_dead_code(store: &GraphStore) -> nestweaver_engine::DeadCodeManifests {
+    match current_db_path(store) {
+        Ok(db_path) => nestweaver_engine::load_manifests_for_dead_code(store, &db_path),
+        Err(error) => nestweaver_engine::DeadCodeManifests {
+            manifests: HashMap::new(),
+            load_error: Some(format!(
+                "{error:#}; manifest-declared entry files did NOT seed the \
+                 reachability walk, so code reachable only from a package \
+                 entry point may appear unreachable."
+            )),
+        },
+    }
+}
+
 fn tool_dead_code(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // nw-372: REFUSE before doing any work. Every other resolver-generation
-    // surface discloses and prints anyway; this one is a list of symbols to
-    // delete, and a missing edge can only move a LIVE symbol onto it. See
-    // `DeadCodeRefusal` for the full argument.
-    // nw-403 (review finding): the refusal payload is built from the STALE REPO
-    // SET, and `DeadCodeRefusal::payload()` emits `resolver_stale_repos` as a
-    // string array plus a `note` carrying one `index --repo <LOCAL PATH> --force`
-    // line per stale repo. Neither survives redaction — `row_allowed` only walks
-    // objects — so an unfiltered refusal hands a repo-scoped bearer token the
-    // UIDs *and the on-disk paths* of repos it may not see. `affected_tests` and
-    // `blast_radius` were given `visible` when nw-412 generalised this helper;
-    // `dead_code`, the ORIGINAL consumer, was left on `None`. Same bug, and the
-    // doc on `resolver_generation_refusal` already spells it out.
-    if let Some(refusal) = dead_code_refusal(store, visible)? {
-        return Ok(refusal.payload());
-    }
-
-    let min_conf_str = args
-        .get("min_confidence")
-        .and_then(|v| v.as_str())
-        .unwrap_or("low");
-    let min_conf =
-        DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
-    let concise = is_concise(&args);
-    // Cap the returned symbols so a large codebase can't return a multi-MB
-    // payload that blows an agent's context window (the HTTP boundary caps via
-    // add_limit_metadata, but the stdio path had no bound).
-    // Count contract: `unreachable_count` is the UNFILTERED total (consistent
-    // with `total_symbols`/`reachable_symbols`/`dead_percentage`, which are
-    // also unfiltered); `matching_count` is the post-`min_confidence` count;
-    // `returned`/`truncated` disclose the cap.
-    let limit = read_limit(
-        &args,
-        "limit",
-        configured_result_limit(),
-        1,
-        RESULT_LIMIT_MAX,
-    )?;
-
-    // nw-512: load the manifest sidecar so the reachability walk is seeded
-    // from manifest-declared entry files, through the ONE loader
-    // `src/main.rs`'s `Commands::DeadCode` also calls.
-    //
-    // THE MANIFEST SIDECAR NEVER REACHED THIS TOOL. It ran
-    // `detect_dead_code_cancellable`, which hard-codes an empty manifest map,
-    // so every route that ends up here — the default CLI (the daemon prints
-    // what this tool returns), MCP direct and MCP-via-daemon — walked with NO
-    // manifest-declared entry files at all. `main`/`bin`/`exports`/`browser`
-    // entries are reachability ROOTS, so their absence does not merely change
-    // the answer, it makes it WRONG in one direction: code reachable only
-    // from a package entry point was reported as dead.
-    //
-    // Reproduced on 10.0.3 against a fixture whose
-    // `packages/glue/package.json` declares `"main": "glue_entry.js"`: the
-    // default route reported `glueInit` unreachable, over a database whose
-    // sidecar named that file as an entry point.
-    //
-    // `current_db_path` failing is not a manifest failure: it is the
-    // in-process test configuration where no server ever set a path. There is
-    // no sidecar to read and nothing to disclose, so it degrades to the empty
-    // map silently — the same non-event as an absent sidecar (nw-500).
-    let manifests = match current_db_path(store) {
-        Ok(db_path) => nestweaver_engine::load_manifests_for_dead_code(store, &db_path),
-        Err(_) => nestweaver_engine::DeadCodeManifests::default(),
+    use nestweaver_engine::dead_code::{
+        dead_code_database_identity, dead_code_page_guard, serialize_dead_code_page,
     };
-    let result = nestweaver_engine::detect_dead_code_with_manifests_cancellable(
+    let (request, selectors) = dead_code_page_arguments(&args)?;
+    // Preserve the existing whole-walk resolver refusal and authorization gate.
+    if let Some(refusal) = dead_code_refusal(store, visible)? {
+        let mut payload = refusal.payload();
+        payload["review_only"] = json!(true);
+        payload["high_confidence_available"] = json!(false);
+        return Ok(payload);
+    }
+    let repo_scope = selectors
+        .as_ref()
+        .map(|selectors| resolve_repo_filter(store, selectors, visible))
+        .transpose()?;
+    let generation = store.graph_generation();
+    if let Some(refusal) = dead_code_page_guard(store, generation, &request) {
+        return Ok(refusal);
+    }
+    let manifests = manifests_for_dead_code(store);
+    let result = nestweaver_engine::dead_code::detect_dead_code_in_repos_cancellable(
         store,
+        0.3,
         &manifests.manifests,
+        repo_scope.as_ref(),
         cancel,
     )
     .context("detect_dead_code")?;
-
-    let total_unreachable = result.unreachable_symbols.len();
-    let all_matching: Vec<_> = result
-        .unreachable_symbols
-        .iter()
-        .filter(|s| s.confidence >= min_conf)
-        .collect();
-    let matching_count = all_matching.len();
-    let filtered: Vec<Value> = all_matching
-        .into_iter()
-        .take(limit)
-        .map(|s| {
-            if concise {
-                json!({
-                    "name": s.name,
-                    "confidence": s.confidence.to_string(),
-                })
-            } else {
-                json!({
-                    "uid": s.uid,
-                    "name": s.name,
-                    "kind": s.kind,
-                    "file_path": s.file_path,
-                    "visibility": s.visibility,
-                    "confidence": s.confidence.to_string(),
-                })
-            }
-        })
-        .collect();
-
-    let mut payload = json!({
-        "total_symbols": result.total_symbols,
-        "reachable_symbols": result.reachable_symbols,
-        "unreachable_count": total_unreachable,
-        "matching_count": matching_count,
-        "returned": filtered.len(),
-        "truncated": matching_count > filtered.len(),
-        "excluded_count": result.excluded_count,
-        "dead_percentage": result.dead_percentage,
-        // Coverage contract: the counts above are a completeness claim over the
-        // whole symbol corpus. The store's whole-corpus scan TOLERATES a row it
-        // cannot decode (nw-335) rather than losing the corpus, so `coverage`
-        // says whether it actually saw everything — without it, "N of M" over a
-        // silently-shortened corpus reads as exact.
-        //
-        // nw-500 folds a failed manifest load into the SAME field rather than
-        // inventing a parallel one. It is the same class of defect this field
-        // already exists for: the walk did not see everything it needed, and
-        // here what it lost is SEED points, so the error runs in the one
-        // direction that puts live code on a list of symbols to delete. Every
-        // consumer already branching on `coverage` therefore catches it with
-        // no new key to learn — and `manifest_load_error` below names WHICH
-        // degradation occurred, exactly as nw-435 added
-        // `languages_without_entry_points` beside `undecodable_symbols`
-        // because `coverage` alone cannot distinguish them.
-        "coverage": if result.coverage_is_complete() && manifests.load_error.is_none() {
-            "complete"
-        } else {
-            "degraded"
-        },
-        "undecodable_symbols": result.undecodable_symbols,
-        // nw-351: a reachability BFS with no seed visits nothing, so every
-        // symbol falls out unreachable and `dead_percentage` reads 100. That
-        // is the absence of a finding, not a finding — and `coverage` alone
-        // cannot say which of the two degradations happened, so the count is
-        // carried alongside `undecodable_symbols` exactly as that one is.
-        "entry_points": result.entry_points,
-        // nw-435, surfaced. `coverage_is_complete()` already reads this field
-        // to decide "complete" vs "degraded"; it was consulted but never
-        // serialized here, so a polyglot repo (the norm, not the exception)
-        // degraded with `undecodable_symbols: 0` and a healthy `entry_points`
-        // count both looking fine, and nothing naming which language caused
-        // it.
-        "languages_without_entry_points": result.languages_without_entry_points,
-        "min_confidence": min_conf_str,
-        "unreachable_symbols": filtered,
-    });
-    // nw-500: a manifest sidecar that EXISTS and cannot be read is a silent
-    // downgrade of this answer — entry files are reachability roots, so
-    // losing them moves live code onto a list of symbols to delete. Disclose
-    // it, and ONLY it: an absent sidecar (the normal state for a graph with
-    // no code repos) and a clean load both leave `load_error` at `None`, so
-    // this key never appears and a healthy response is byte-for-byte its
-    // pre-nw-500 shape.
-    if let Some(disclosure) = manifests.disclosure() {
-        payload["manifest_load_error"] = json!(disclosure);
+    let identity = dead_code_database_identity(store)?;
+    let payload = serialize_dead_code_page(
+        &result,
+        manifests.load_error.as_deref(),
+        &request,
+        generation,
+        &identity,
+    )?;
+    if let Some(refusal) = dead_code_page_guard(store, generation, &request) {
+        return Ok(refusal);
     }
     Ok(payload)
 }
@@ -15097,37 +15148,8 @@ fn dispatch_via_daemon_inner(
                     sections: str_array("sections"),
                 });
                 let resp = client.get_note(req).await.map_err(grpc_status_err)?;
-                let inner = resp.into_inner();
-                let mut value = serde_json::json!({
-                    "uid": inner.uid,
-                    "title": inner.title,
-                    "path": inner.path,
-                    "note_kind": inner.note_kind,
-                    "word_count": inner.word_count,
-                    "section_count": inner.section_count,
-                    // Parity with the local path: frontmatter and outline are
-                    // always present (local defaults to {} / []).
-                    "frontmatter": serde_json::from_str::<serde_json::Value>(
-                        &inner.frontmatter_json
-                    )
-                    .unwrap_or_else(|_| serde_json::json!({})),
-                    "outline": inner
-                        .outline
-                        .iter()
-                        .map(|h| {
-                            serde_json::json!({
-                                "uid": h.uid,
-                                "level": h.level,
-                                "text": h.text,
-                                "slug": h.slug,
-                                "line": h.line,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                });
-                if let Some(ref body) = inner.body {
-                    value["body"] = serde_json::json!(body);
-                }
+                let value = nestweaver_proto::note_get_json(&resp.into_inner())
+                    .map_err(anyhow::Error::msg)?;
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_status" => {
@@ -21258,6 +21280,24 @@ mod blast_radius_visibility_tests {
         store
     }
 
+    #[test]
+    fn release_name_repo_preserves_reference_limit_and_totals() {
+        let store = attributable_cross_repo_store();
+        for selector in [
+            json!({"name": "Handler"}),
+            json!({"uid": "sym:repo:inst:apiowner:filehash1:1"}),
+        ] {
+            let mut args = selector;
+            args["name_repo"] = json!("client-service");
+            args["limit"] = json!(1);
+            let limited = tool_cross_repo_contracts(&store, args, None).unwrap();
+            assert_eq!(limited["total"], 2);
+            assert_eq!(limited["returned"], 1);
+            assert_eq!(limited["contracts"].as_array().unwrap().len(), 1);
+            assert_eq!(limited["truncated"], true);
+        }
+    }
+
     /// nw-369(a). Every cross-repo-links row must carry `repo` — the OTHER
     /// symbol's repo, derived from its UID rather than a store lookup — and
     /// `--repo`/`repo` must scope rows to the requested repo without
@@ -22414,6 +22454,94 @@ mod blast_radius_visibility_tests {
         let serialized = serde_json::to_string(&sarif).unwrap();
         assert!(serialized.contains("LocalCaller"));
         assert!(serialized.contains("src/local.rs"));
+    }
+
+    #[test]
+    fn restricted_affected_tests_widens_when_visibility_empties_the_selection() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 8,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let mk_repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: uid.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        store.insert_repo(&mk_repo("repo:api")).unwrap();
+        store.insert_repo(&mk_repo("repo:client")).unwrap();
+        store
+            .insert_symbol(&mk("api", "Handler", "repo:api", "src/api.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "client-test",
+                "handles_request",
+                "repo:client",
+                "src/client.test.rs",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client-test".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let args = json!({ "changed_files": ["src/api.rs"] });
+        let unrestricted = tool_affected_tests(&store, args.clone(), None).unwrap();
+        assert_eq!(unrestricted["recommendation"], json!("selection-usable"));
+        assert!(
+            unrestricted["tier_1"]
+                .as_array()
+                .is_some_and(|tier| !tier.is_empty()),
+            "COUNTERWEIGHT: the hidden test is selected when the caller can see it: {unrestricted}"
+        );
+
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let restricted = tool_affected_tests(&store, args, Some(&visible)).unwrap();
+        assert_eq!(restricted["status"], json!("complete"), "{restricted}");
+        assert!(
+            restricted["tier_1"]
+                .as_array()
+                .is_some_and(|tier| tier.is_empty())
+                && restricted["tier_2"]
+                    .as_array()
+                    .is_some_and(|tier| tier.is_empty())
+                && restricted["tier_3"]
+                    .as_array()
+                    .is_some_and(|tier| tier.is_empty()),
+            "visibility must drop the hidden test file: {restricted}"
+        );
+        assert_eq!(
+            restricted["recommendation"],
+            json!("run-full-suite"),
+            "empty visible tiers on a source change must not report selection-usable: {restricted}"
+        );
     }
 }
 
@@ -26269,6 +26397,100 @@ mod ambiguous_name_contract_tests {
             payload.get("children").is_none() || payload["status"] == "ambiguous",
             "must not return a silent callee tree for an ambiguous root: {payload}"
         );
+    }
+
+    #[test]
+    fn release_hidden_exact_repo_cannot_change_visible_selector_resolution() {
+        let store = ambiguous_ping_store();
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:py-ping".to_string(), "repo:rs-ping".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let before = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(before["uid"], "sym:py-ping:ping");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:hidden-exact".into(),
+                url: "https://example.test/hidden".into(),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: Some("py".into()),
+                root_path: None,
+            })
+            .unwrap();
+        let after = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "hidden repo must not alter the visible result or diagnostics"
+        );
+        for symbol in ["ping", "sym:py-ping:ping"] {
+            match resolve_symbol_strict(&store, symbol, Some(&visible), Some("py")).unwrap() {
+                StrictNameResolve::Found(uid) => assert_eq!(uid, "sym:py-ping:ping"),
+                _ => panic!("hidden exact name stole visible substring resolution"),
+            }
+        }
+    }
+
+    #[test]
+    fn release_name_repo_disambiguates_without_scoping_unique_names_or_uids() {
+        let store = ambiguous_ping_store();
+        let pinned = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "py-ping", "limit": 1}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pinned["uid"], "sym:py-ping:ping");
+        let uid = tool_cross_repo_contracts(
+            &store,
+            json!({"uid": "sym:py-ping:ping", "name_repo": "unrelated"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(uid["uid"], "sym:py-ping:ping");
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:py-ping".to_string()].into_iter().collect(),
+        );
+        let unique = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "name_repo": "unrelated"}),
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(unique["uid"], "sym:py-ping:ping");
+        assert!(
+            tool_cross_repo_contracts(
+                &store,
+                json!({"name": "ping", "name_repo": "unrelated"}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:js-ping:ping"}), Some(&visible))
+                .is_err()
+        );
+        assert!(matches!(
+            resolve_symbol_strict(&store, "sym:py-ping:ping", None, Some("js-ping")).unwrap(),
+            StrictNameResolve::NotFound
+        ));
+        // Result repo filtering remains independent from target resolution.
+        let ambiguous =
+            tool_cross_repo_contracts(&store, json!({"name": "ping", "repo": "py-ping"}), None)
+                .unwrap();
+        assert_eq!(ambiguous["status"], "ambiguous");
     }
 
     #[test]

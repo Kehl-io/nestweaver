@@ -336,7 +336,10 @@ pub(crate) fn risk_if_unassessed(computed: RiskLevel, notifications: &[Notificat
     let unassessed = notifications.iter().any(|n| {
         matches!(
             n.descriptor.as_str(),
-            "changed-file-no-symbols" | "index-empty" | "changed-file-wrong-repo-scope"
+            "changed-file-no-symbols"
+                | "changed-file-unassessed"
+                | "index-empty"
+                | "changed-file-wrong-repo-scope"
         )
     });
     if unassessed {
@@ -538,11 +541,22 @@ pub fn analyze_blast_radius(
             }
         };
 
-        // A successful lookup that resolves 0 symbols is suspicious for any
-        // recognized source file: it may be new, the index may be stale, or the
-        // path may have drifted. Non-source files legitimately have no symbols.
+        let class = crate::changed_files::classify_changed_file(file);
+        // Retain the more specific wrong-repository diagnostic for missing
+        // source symbols; all other classifications use the shared disclosure.
+        if class != crate::changed_files::ChangedFileClass::Source || !syms.is_empty() {
+            crate::changed_files::disclose_changed_file(
+                file,
+                !syms.is_empty(),
+                &mut status,
+                &mut notifications,
+            );
+        }
+        if class == crate::changed_files::ChangedFileClass::DocumentationOnly {
+            continue;
+        }
         if syms.is_empty() {
-            if nestweaver_parser::detect_language(file).is_some() {
+            if class == crate::changed_files::ChangedFileClass::Source {
                 // nw-466. Before blaming drift, check whether the file simply
                 // lives in a DIFFERENT repo than the one requested. A repo name
                 // that exists in the graph but does not own the changed file
@@ -670,7 +684,10 @@ pub fn analyze_blast_radius(
     if changed_symbols.is_empty()
         && known_repo_uids.is_empty()
         && files_errored == 0
-        && !changed_files.is_empty()
+        && changed_files.iter().any(|file| {
+            crate::changed_files::classify_changed_file(file)
+                != crate::changed_files::ChangedFileClass::DocumentationOnly
+        })
     {
         notifications.push(Notification {
             level: NotificationLevel::Warning,
@@ -2385,7 +2402,58 @@ mod tests {
     }
 
     #[test]
-    fn zero_symbols_non_source_file_stays_complete() {
+    fn release_blast_unassessed_inputs_never_clear() {
+        let store = GraphStore::in_memory().expect("store");
+        for file in [
+            "Makefile",
+            "Cargo.toml",
+            ".github/workflows/ci.yml",
+            "unknown.input",
+            "src/計算.rs",
+        ] {
+            let result = analyze_blast_radius(
+                &store,
+                &[PathBuf::from(file)],
+                &opts(None, 3, false),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_ne!(result.status, AnalysisStatus::Complete, "{file}");
+            assert_eq!(result.risk_level, RiskLevel::Unknown, "{file}");
+            assert_eq!(result.gate_state, GateState::DegradedUnknown, "{file}");
+            assert!(
+                result
+                    .notifications
+                    .iter()
+                    .any(|n| n.descriptor == "index-empty")
+            );
+        }
+        let docs = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("README.md")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(docs.status, AnalysisStatus::Complete);
+        assert_eq!(docs.gate_state, GateState::Ok);
+        assert!(
+            docs.notifications
+                .iter()
+                .any(|n| n.descriptor == "docs-only-excluded")
+        );
+        assert!(
+            !docs
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "index-empty")
+        );
+    }
+
+    #[test]
+    fn zero_symbols_documentation_is_explicitly_excluded() {
         use nestweaver_schema::Repo;
 
         let store = GraphStore::in_memory().expect("in_memory store");
@@ -2401,9 +2469,8 @@ mod tests {
             })
             .unwrap();
 
-        // A docs/config file resolving to 0 symbols is expected, not drift, so
-        // it must NOT degrade the gate — otherwise most healthy PRs (which touch
-        // markdown/config/lockfiles) would gate as DegradedUnknown.
+        // Explicitly classified Markdown is excluded with a disclosure.
+        // Configuration and lockfiles must instead degrade coverage.
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("README.md")],

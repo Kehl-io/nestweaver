@@ -1,5 +1,6 @@
 pub mod artifact_envelope;
 pub mod cache;
+pub mod context_graph;
 pub mod db;
 pub mod durable_sidecar;
 pub mod error;

@@ -190,8 +190,8 @@ function GraphModeHooks() {
   useContextMode();
   useImpactMode();
   useReposMode();
-  useFeaturesMode();
-  const { hops, setHops } = useLocalMode();
+  const featuresState = useFeaturesMode();
+  const localState = useLocalMode();
 
   const graphMode = useStore((s) => s.graphMode);
   const representationMode = useStore((s) => s.representationMode);
@@ -203,6 +203,7 @@ function GraphModeHooks() {
     (s) => s.clearSemanticLayoutRequest,
   );
   const { applySemanticLayout } = useSemanticLayout();
+  const contextState = graphMode === "local" ? localState : featuresState;
 
   useEffect(() => {
     if ((graphMode === "local" || graphMode === "impact") && !selectedNodeId) {
@@ -227,21 +228,15 @@ function GraphModeHooks() {
           />
         </>
       )}
-      {graphMode === "local" && representationMode === "graph" && (
-        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded bg-[var(--color-surface-alt)] shadow text-xs text-[var(--color-text)]">
-          <label htmlFor="local-hops-slider" className="whitespace-nowrap">
-            Depth: {hops}
-          </label>
-          <input
-            id="local-hops-slider"
-            type="range"
-            min={1}
-            max={4}
-            value={hops}
-            onChange={(e) => setHops(Number(e.target.value))}
-            className="w-24 accent-[var(--color-graph-selection)]"
-          />
-        </div>
+      {(graphMode === "local" || graphMode === "features") && (
+        <section aria-label={`${graphMode === "local" ? "Local" : "Features"} result state`}
+          role="status"
+          className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 max-w-[90%] rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2 text-xs text-[var(--color-text)] shadow">
+          <p>{contextState.message}</p>
+          {contextState.status === "error" && (
+            <button className="mt-2 underline" onClick={contextState.retry}>Retry</button>
+          )}
+        </section>
       )}
     </>
   );

@@ -62,6 +62,28 @@ export interface BrainContextResult {
   seeds: BrainNode[];
   connected: BrainNode[];
   unresolved_seeds: string[];
+  edges?: ContextEdge[];
+  graph_meta?: ContextGraphMeta;
+  _meta?: import("./p1Types").SceneMetadata;
+}
+
+export interface ContextEdge {
+  source: string;
+  target: string;
+  edge_type: string;
+  confidence: number | null;
+  evidence: string | null;
+}
+
+export interface ContextGraphMeta {
+  generation: number;
+  node_limit: number;
+  edge_limit: number;
+  omitted_nodes: number;
+  omitted_edges: number;
+  edge_count_relation: "eq" | "gte";
+  truncated: boolean;
+  edge_scope: "returned_nodes";
 }
 
 export interface OverviewCounts {

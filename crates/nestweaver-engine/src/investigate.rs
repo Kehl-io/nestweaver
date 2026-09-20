@@ -3914,6 +3914,10 @@ mod tests {
             !result.entries.is_empty(),
             "a {MEMBER_COUNT}-member project must still return an architectural map"
         );
+        // Debug CI hydrates this 5k-member fixture far more slowly than the
+        // release bound (observed ~82s). Keep the functional asserts on every
+        // profile; pin the 10s performance contract to release builds.
+        #[cfg(not(debug_assertions))]
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "investigate --scope project: took {elapsed:?} for a {MEMBER_COUNT}-member \
