@@ -109,6 +109,51 @@ impl std::fmt::Display for CorruptionKind {
 /// truncated file or an engine assertion reported in the same error chain.
 pub const LIVE_WRITER_DISCLOSURE: &str = "another process holds the write lease";
 
+/// Replace any absolute path into a Rust build tree with the crate it points
+/// at, so a message the storage engine wrote with `__FILE__` cannot ship a
+/// developer's home directory to a user.
+///
+/// nw-285: a mid-file corruption surfaced as
+/// `Assertion failed in file "/Users/<name>/.cargo/registry/src/index.crates.io-<hash>/lbug-0.19.1/lbug-src/src/storage/table/column.cpp" on line 289: ...`.
+/// lbug is built from source in the cargo registry and `ASSERT` interpolates
+/// `__FILE__`, so the absolute build path is baked into the binary and printed
+/// verbatim. The username in it is the part that must never leave the machine.
+///
+/// This is the single implementation. The CLI's `into_diagnostic` runs it on
+/// every classified error; call sites that interpolate a [`StoreError`] onto
+/// stderr or tracing without going through that funnel must call this too —
+/// otherwise a warning can leak the path the diagnostic later redacts (the
+/// ranking-sidecar refusal on a corrupt graph is that hole).
+pub fn redact_build_paths(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find("/.cargo/registry/") {
+        // Walk back to the start of the absolute path so the home prefix goes
+        // with it, not just the registry tail.
+        let head = &rest[..at];
+        let start = head
+            .rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .map_or(0, |i| i + 1);
+        out.push_str(&head[..start]);
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '"')
+            .unwrap_or(tail.len());
+        // Keep the crate-relative remainder: it is the only diagnostic part.
+        let path = &tail[..end];
+        let short = path
+            .split("/index.crates.io-")
+            .nth(1)
+            .and_then(|s| s.split_once('/'))
+            .map_or("<dependency source>", |(_, rel)| rel);
+        out.push_str("<dep>/");
+        out.push_str(short);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Path of the write-lease file for `db_path` — `<db>.write.lock`.
 ///
 /// nw-404. The canonical candidate delegates to the authoritative store-level
@@ -1207,6 +1252,34 @@ mod corruption_classification_tests {
         assert!(
             error.to_string().contains(ENGINE),
             "the rendered error must still carry the engine's sentence: {error}"
+        );
+    }
+
+    /// nw-285. The registry path and the username in it must not survive a
+    /// user-facing render. Linux CI (`/home/runner/...`) and a developer
+    /// laptop (`/Users/<name>/...`) share the `/.cargo/registry/` marker.
+    #[test]
+    fn redact_build_paths_strips_home_and_registry_prefix() {
+        let raw = "query error: Assertion failed in file \
+                   \"/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
+lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
+                   index != nullptr";
+        let redacted = super::redact_build_paths(raw);
+        assert!(
+            !redacted.contains(".cargo/registry"),
+            "the registry path survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("/home/runner"),
+            "the runner home survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("<dep>/lbug-0.20.4/"),
+            "the crate-relative remainder must survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("index != nullptr"),
+            "the assertion text is the diagnostic part: {redacted}"
         );
     }
 }

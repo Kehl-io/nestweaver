@@ -129,17 +129,25 @@ pub fn warm_pagerank_from_sidecar(store: &GraphStore, db_path: &Path) -> Option<
     let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
     match store.load_pagerank_cache(&pr_path) {
         Ok(()) => None,
-        // The loader's own sentence is carried verbatim rather than
-        // paraphrased. It already names the field that did not match and ends
-        // in a runnable `nestweaver index --repo <path> --force`, and a
-        // paraphrase here is how three front ends start describing the same
-        // file three different ways again.
-        Err(error) => Some(format!(
-            "ranking sidecar {} was not loaded, so ranks are recomputed from \
-             the graph and the sidecar stays stale: {error}",
-            pr_path.display()
-        )),
+        // The loader's own sentence is carried rather than paraphrased. It
+        // already names the field that did not match and ends in a runnable
+        // `nestweaver index --repo <path> --force`, and a paraphrase here is
+        // how three front ends start describing the same file three different
+        // ways again. Build-tree paths inside that sentence are redacted
+        // (nw-285): a corrupt graph can trip an lbug `__FILE__` assertion
+        // while loading the sidecar, and that warning is printed before
+        // `into_diagnostic` ever runs.
+        Err(error) => Some(ranking_sidecar_refusal(&pr_path, &error)),
     }
+}
+
+fn ranking_sidecar_refusal(pr_path: &Path, error: &impl std::fmt::Display) -> String {
+    format!(
+        "ranking sidecar {} was not loaded, so ranks are recomputed from \
+         the graph and the sidecar stays stale: {}",
+        pr_path.display(),
+        nestweaver_store::redact_build_paths(&error.to_string()),
+    )
 }
 
 /// Run the brain server on stdio until the client closes stdin or sends
@@ -1541,7 +1549,7 @@ mod pagerank_sidecar_disclosure_tests {
     use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
     use nestweaver_store::{GraphScope, GraphStore};
 
-    use super::warm_pagerank_from_sidecar;
+    use super::{ranking_sidecar_refusal, warm_pagerank_from_sidecar};
 
     fn symbol(uid: &str, name: &str) -> Symbol {
         Symbol {
@@ -1704,5 +1712,37 @@ mod pagerank_sidecar_disclosure_tests {
                 "a mismatched `{field}` collapsed ranking to uniform 1/N"
             );
         }
+    }
+
+    /// nw-285. The ranking-sidecar disclosure is printed on stderr *before*
+    /// `into_diagnostic` classifies the later query failure, so it is the
+    /// message that must redact a cargo-registry `__FILE__` itself.
+    #[test]
+    fn ranking_sidecar_disclosure_redacts_engine_build_paths() {
+        let error = nestweaver_store::StoreError::Query(
+            "read publication identity: Query execution failed: Assertion failed in file \
+             \"/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
+lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
+             index != nullptr"
+                .to_string(),
+        );
+        let disclosure =
+            ranking_sidecar_refusal(std::path::Path::new("/tmp/code.lbug.pagerank.json"), &error);
+        assert!(
+            !disclosure.contains(".cargo/registry"),
+            "a dependency's build path reached the user: {disclosure}"
+        );
+        assert!(
+            !disclosure.contains("/home/runner"),
+            "the runner home reached the user: {disclosure}"
+        );
+        assert!(
+            !disclosure.contains("Assertion failed in file \"/"),
+            "a raw C++ assertion with an absolute path reached the user: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("<dep>/lbug-0.20.4/"),
+            "the crate-relative remainder must survive: {disclosure}"
+        );
     }
 }
