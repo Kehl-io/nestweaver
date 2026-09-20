@@ -13,7 +13,7 @@ pub(crate) const MANIFEST_ARTIFACT_KIND: &str = "repo_manifest";
 pub(crate) const MANIFEST_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub(crate) const MANIFEST_ALGORITHM_FINGERPRINT: &str = "nestweaver-repo-manifest-v2";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestInfo {
     pub package_name: Option<String>,
     pub dependencies: Vec<String>,
@@ -482,6 +482,26 @@ pub fn capture_manifest_inputs(
     })
 }
 
+/// True when this repo's working-tree manifests differ from the published
+/// cache, so an unchanged-SHA index must still queue recovery. A matching
+/// cache is left alone so a second `nestweaver index` on an up-to-date tree
+/// does not 503 suggestions until the daemon rebuilds them.
+pub(crate) fn working_tree_manifest_requires_reconciliation(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+    r_uid: &str,
+    reader: &dyn ContentReader,
+) -> anyhow::Result<bool> {
+    let mut budget = 32 * 1024 * 1024;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let inputs = capture_manifest_inputs(reader, &mut budget, deadline)?;
+    let current = parse_manifest(&inputs);
+    match load_manifest_cache_for_db(store, db_path) {
+        Ok(cache) => Ok(cache.get(r_uid) != Some(&current)),
+        Err(_) => Ok(true),
+    }
+}
+
 /// A dead-code run must disclose any loss of current manifest entry roots.
 /// Absence is legitimately empty only when the graph has no repositories.
 /// Pending source debt, incomplete coverage, dirty publication and envelope
@@ -725,8 +745,9 @@ impl GraphMutationPublicationOutcome {
 /// A confirmed no-op leaves every generation and derived artifact untouched.
 /// A change invalidates both live and durable PageRank, advances generation
 /// exactly once, persists it, and rebinds a valid repository-manifest cache to
-/// the successor generation. Post-commit failures are accumulated instead of
-/// being returned as rollback-looking errors.
+/// the successor generation unless source debt is pending. Post-commit
+/// failures are accumulated instead of being returned as rollback-looking
+/// errors.
 pub fn finalize_committed_graph_mutation(
     store: &nestweaver_store::GraphStore,
     changed: bool,
@@ -846,16 +867,26 @@ pub fn finalize_committed_graph_mutation(
         true
     };
 
-    if generation_persisted
-        && let (Some(db_path), Some(manifests)) = (&db_path, carried_manifests)
-        && let Err(error) = save_manifest_cache_for_db(&manifests, store, db_path)
+    if generation_persisted && let (Some(db_path), Some(manifests)) = (&db_path, carried_manifests)
     {
-        outcome.record_warning(
-            "rebind-manifest-cache",
-            format!(
-                "could not rebind the repository manifest cache to generation {generation_after}: {error:#}"
-            ),
-        );
+        match manifest_debt_revision(db_path) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = save_manifest_cache_for_db(&manifests, store, db_path) {
+                    outcome.record_warning(
+                        "rebind-manifest-cache",
+                        format!(
+                            "could not rebind the repository manifest cache to generation {generation_after}: {error:#}"
+                        ),
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not inspect manifest debt before mutation rebind: {error:#}; skipping the republish rather than rewriting over unknown source debt"
+                );
+            }
+        }
     }
 
     for warning in &outcome.warnings {
@@ -2772,6 +2803,28 @@ mod release_manifest_tests {
             "generation rebind must not rewrite the sidecar while source debt is pending"
         );
         assert!(manifest_debt_revision(&db).unwrap().is_some());
+    }
+
+    #[test]
+    fn mutation_publication_skips_rebind_when_manifest_debt_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        mark_manifest_reconciliation_pending(&db, "repository index").unwrap();
+        let before = std::fs::read(manifest_cache_path(&db)).unwrap();
+        let outcome = finalize_committed_graph_mutation(&store, true);
+        assert_eq!(
+            std::fs::read(manifest_cache_path(&db)).unwrap(),
+            before,
+            "mutation rebind must not rewrite the sidecar while source debt is pending"
+        );
+        assert!(manifest_debt_revision(&db).unwrap().is_some());
+        assert_eq!(
+            outcome.disposition,
+            GraphMutationPublicationDisposition::CommittedComplete
+        );
     }
 
     #[test]

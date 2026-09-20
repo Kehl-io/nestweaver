@@ -139,7 +139,7 @@ measure your own recall with `nestweaver rts-eval report` rather than assuming."
 /// Fail-safe widening includes complete graph analyses that found no test
 /// files for a non-documentation change. File count (not test-symbol count)
 /// preserves newly changed tests without extracted symbols and proven empty diffs.
-pub(crate) fn derive_recommendation(
+pub fn derive_recommendation(
     status: AnalysisStatus,
     changed_files: &[String],
     selected_files: usize,

@@ -604,10 +604,7 @@ impl CodeWatcher {
             let Ok(relative) = path.strip_prefix(&self.repo_root) else {
                 continue;
             };
-            let manifest_or_directory = crate::manifest::is_manifest_input(relative)
-                || path.is_dir()
-                || (!path.exists() && path.extension().is_none());
-            if manifest_or_directory
+            if crate::manifest::is_manifest_input(relative)
                 && reader.accepts_path(relative)
                 && !path_has_symlink(&self.repo_root, relative)?
                 && manifest_path_not_gitignored(&self.repo_root, relative)?
@@ -1496,6 +1493,23 @@ mod tests {
         assert_eq!(
             store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
             "sha1"
+        );
+    }
+
+    #[test]
+    fn directory_event_does_not_mark_manifest_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, uid, root) = index_fixture_repo(&dir);
+        let db = dir.path().join("graph.lbug");
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let src = root.join("src");
+        assert!(src.is_dir());
+        process_fixture_batch(&watcher, &store, &uid, &root, &[src]);
+        assert!(
+            crate::manifest::manifest_debt_revision(&db)
+                .unwrap()
+                .is_none(),
+            "a source-directory event is not a package-manifest edit"
         );
     }
 

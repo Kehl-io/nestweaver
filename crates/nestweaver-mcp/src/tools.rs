@@ -11176,14 +11176,12 @@ fn tool_affected_tests(
             count_tests(&result.tier_2),
             count_tests(&result.tier_3),
         );
-        result.recommendation = if matches!(
+        let remaining_file_count = result.tier_1.len() + result.tier_2.len() + result.tier_3.len();
+        result.recommendation = nestweaver_engine::affected_tests::derive_recommendation(
             result.status,
-            nestweaver_engine::blast_radius::AnalysisStatus::Complete
-        ) {
-            "selection-usable"
-        } else {
-            "run-full-suite"
-        }
+            &result.changed_files,
+            remaining_file_count,
+        )
         .to_string();
     }
     Ok(serde_json::to_value(&result)?)
@@ -22427,6 +22425,94 @@ mod blast_radius_visibility_tests {
         let serialized = serde_json::to_string(&sarif).unwrap();
         assert!(serialized.contains("LocalCaller"));
         assert!(serialized.contains("src/local.rs"));
+    }
+
+    #[test]
+    fn restricted_affected_tests_widens_when_visibility_empties_the_selection() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 8,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let mk_repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: uid.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        store.insert_repo(&mk_repo("repo:api")).unwrap();
+        store.insert_repo(&mk_repo("repo:client")).unwrap();
+        store
+            .insert_symbol(&mk("api", "Handler", "repo:api", "src/api.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "client-test",
+                "handles_request",
+                "repo:client",
+                "src/client.test.rs",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client-test".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let args = json!({ "changed_files": ["src/api.rs"] });
+        let unrestricted = tool_affected_tests(&store, args.clone(), None).unwrap();
+        assert_eq!(unrestricted["recommendation"], json!("selection-usable"));
+        assert!(
+            unrestricted["tier_1"]
+                .as_array()
+                .is_some_and(|tier| !tier.is_empty()),
+            "COUNTERWEIGHT: the hidden test is selected when the caller can see it: {unrestricted}"
+        );
+
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let restricted = tool_affected_tests(&store, args, Some(&visible)).unwrap();
+        assert_eq!(restricted["status"], json!("complete"), "{restricted}");
+        assert!(
+            restricted["tier_1"]
+                .as_array()
+                .is_some_and(|tier| tier.is_empty())
+                && restricted["tier_2"]
+                    .as_array()
+                    .is_some_and(|tier| tier.is_empty())
+                && restricted["tier_3"]
+                    .as_array()
+                    .is_some_and(|tier| tier.is_empty()),
+            "visibility must drop the hidden test file: {restricted}"
+        );
+        assert_eq!(
+            restricted["recommendation"],
+            json!("run-full-suite"),
+            "empty visible tiers on a source change must not report selection-usable: {restricted}"
+        );
     }
 }
 

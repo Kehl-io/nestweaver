@@ -6083,13 +6083,33 @@ fn incremental_index_with_name_and_io_and_authority(
     // 4. Nothing changed.
     if old_sha == new_sha {
         // Working-tree manifests can change without a commit. This shortcut
-        // does not publish a new graph generation, so explicitly invalidate
-        // derived suggestions for the daemon's complete-map reconciler.
-        crate::manifest::mark_manifest_reconciliation_pending(
-            db_path,
-            "unchanged-SHA local index requires working-tree manifest reconciliation",
-        )?;
-        tracing::info!("manifest suggestions await daemon reconciliation");
+        // does not publish a new graph generation, so invalidate derived
+        // suggestions only when captured package inputs actually differ from
+        // the published cache. A second index of an up-to-date tree must not
+        // 503 suggestions until daemon recovery.
+        let needs_reconciliation =
+            match crate::manifest::working_tree_manifest_requires_reconciliation(
+                &store,
+                db_path,
+                &r_uid,
+                &policy_reader,
+            ) {
+                Ok(needed) => needed,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not compare working-tree manifests on an unchanged SHA; queuing reconciliation"
+                    );
+                    true
+                }
+            };
+        if needs_reconciliation {
+            crate::manifest::mark_manifest_reconciliation_pending(
+                db_path,
+                "unchanged-SHA local index requires working-tree manifest reconciliation",
+            )?;
+            tracing::info!("manifest suggestions await daemon reconciliation");
+        }
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
         // nw-387 RESIDUAL: THE DISCLOSURE HAS TO BE DURABLE, AND THIS IS THE
         // BRANCH THAT BROKE IT. On the item's own fixture (`canary.py` plus a
@@ -14476,6 +14496,36 @@ function hello(name) { return "Hello " + name; }
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
         );
+    }
+
+    #[test]
+    fn unchanged_sha_without_manifest_edit_does_not_queue_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "export function live() { return 1; }").unwrap();
+        fs::write(repo.join("package.json"), r#"{"name":"stable"}"#).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/manifest-steady";
+        index_directory(&repo, &db_path, "test", url, &head).unwrap();
+        let uid = nestweaver_schema::repo_uid("test", url);
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+            assert_eq!(snapshot[&uid].package_name.as_deref(), Some("stable"));
+        }
+        incremental_index(&repo, &db_path, "test", url).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            crate::manifest::manifest_debt_revision(&db_path)
+                .unwrap()
+                .is_none(),
+            "a second index of an unchanged tree must not 503 current suggestions"
+        );
+        let snapshot = crate::manifest::current_manifest_snapshot(&store, &db_path).unwrap();
+        assert_eq!(snapshot[&uid].package_name.as_deref(), Some("stable"));
     }
 
     #[test]
