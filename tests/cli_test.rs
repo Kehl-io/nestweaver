@@ -3559,7 +3559,9 @@ fn cli_limit_help_states_the_default_the_code_actually_applies() {
         .assert()
         .success()
         .stdout(contains("default 50"))
-        .stdout(contains("default: all").not());
+        .stdout(contains("default: all").not())
+        .stdout(contains("confidence scoring based on visibility").not())
+        .stdout(contains("review candidates"));
 
     // … and "there is no 'all'" must be true: the cap has no off switch.
     nestweaver_cmd()

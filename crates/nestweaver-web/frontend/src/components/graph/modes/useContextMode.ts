@@ -136,7 +136,9 @@ export function useContextMode() {
           const detail = await api.symbol(seed.uid);
           if (!isCurrentRequest()) return;
 
-          for (const caller of detail.callers) {
+          const callers = Array.isArray(detail.callers) ? detail.callers : [];
+          const callees = Array.isArray(detail.callees) ? detail.callees : [];
+          for (const caller of callers) {
             if (
               graph.hasNode(caller.uid) &&
               !graph.hasEdge(caller.uid, seed.uid)
@@ -149,7 +151,7 @@ export function useContextMode() {
               });
             }
           }
-          for (const callee of detail.callees) {
+          for (const callee of callees) {
             if (
               graph.hasNode(callee.uid) &&
               !graph.hasEdge(seed.uid, callee.uid)

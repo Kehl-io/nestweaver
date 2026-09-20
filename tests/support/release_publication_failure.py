@@ -293,6 +293,7 @@ def case_two(fixture):
     assert completed["indexed_sha"] == head
     repos = list_repos(fixture)
     assert len(repos) == 1 and repos[0]["uid"] == uid and repos[0]["indexed_sha"] == head, repos
+    assert after_error["index_publication"]["dirty"] is True, after_error
     fixture.record(kind="generation_save_error_observed", receipts=receipts,
                    target_head=head, repo_uid=uid, status=after_error)
 

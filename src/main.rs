@@ -6885,8 +6885,8 @@ enum Commands {
     ///
     /// Walks forward from every entry point following CALLS, IMPORTS,
     /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
-    /// are reported as potentially dead, with confidence scoring based
-    /// on visibility.
+    /// are reported as review candidates, ranked by how unaddressable a
+    /// symbol is from outside its file — never by how sure the walk is.
     ///
     /// Known limitation: a symbol is reported when no entry point REACHES it,
     /// which is not the same as "nothing references it" — a reference the

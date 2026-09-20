@@ -21,6 +21,8 @@ import { ForceControls } from "./ForceControls";
 import { NodeFilterBar } from "./NodeFilterBar";
 import { StyleRules } from "./StyleRules";
 
+let latestDockCompareActionId = 0;
+
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
 }
@@ -73,6 +75,8 @@ export function ControlDock() {
   const setGraphMode = useStore((s) => s.setGraphMode);
   const seeds = useStore((s) => s.seeds);
   const startDiff = useStore((s) => s.startDiff);
+  const setActiveLens = useStore((s) => s.setActiveLens);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const startPathfinding = useStore((s) => s.startPathfinding);
   const setGapItems = useStore((s) => s.setGapItems);
   const gapActive = useStore((s) => s.gapActive);
@@ -96,14 +100,36 @@ export function ControlDock() {
   const compareContext = async () => {
     const compareSeeds = seeds.length > 0 ? seeds : selectedNodeId ? [selectedNodeId] : [];
     if (compareSeeds.length === 0) return;
+    const compareActionId = ++latestDockCompareActionId;
+    const workspaceId = activeWorkspaceId || "all";
+    const compareTarget = compareSeeds[0];
+    setActiveLens({
+      lens: "context",
+      label: `Compare ${compareTarget}`,
+      targetUid: compareTarget,
+      workspaceId,
+    });
+    startDiff(null, compareSeeds);
+    const current = () => {
+      const state = useStore.getState();
+      return (
+        compareActionId === latestDockCompareActionId &&
+        state.diffActive &&
+        state.activeWorkspaceId === workspaceId &&
+        state.activeLens.label.toLowerCase().startsWith("compare") &&
+        state.activeLens.targetUid === compareTarget
+      );
+    };
     try {
-      const result = await api.brainContext(compareSeeds, 2000, "all");
-      startDiff(result, compareSeeds);
+      const result = await api.brainContext(compareSeeds, null, "all", workspaceId);
+      if (current()) startDiff(result, compareSeeds);
     } catch (error) {
+      if (!current()) return;
+      useStore.getState().clearDiff();
       notify({
         kind: "error",
         title: "Compare failed",
-        message: getErrorMessage(error, "Context comparison request failed"),
+        message: getErrorMessage(error, "The first context could not be loaded."),
       });
     }
   };

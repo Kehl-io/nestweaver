@@ -906,6 +906,12 @@ pub fn finalize_committed_graph_mutation(
 /// simply skip the republish. A WRITE failure is logged rather than returned,
 /// because the graph mutation is already committed and the caller cannot undo
 /// it; the artifact is left stale, which is the pre-existing behaviour.
+///
+/// Pending source debt also skips the republish. Index marks
+/// `.manifest-debt.json` before graph publication; a rebind save here would
+/// rewrite the old payload against the new generation and consume the one-shot
+/// save hook, so post-index `publish_manifest_after_local_index` never sees
+/// the failure the daemon recovery path is supposed to heal.
 pub(crate) fn advancing_generation_rebinding_manifests<T>(
     store: &nestweaver_store::GraphStore,
     advance: impl FnOnce() -> T,
@@ -917,12 +923,22 @@ pub(crate) fn advancing_generation_rebinding_manifests<T>(
             .map(|manifests| (db_path.to_path_buf(), manifests))
     });
     let outcome = advance();
-    if let Some((db_path, manifests)) = carried
-        && let Err(error) = save_manifest_cache_for_db(&manifests, store, &db_path)
-    {
-        tracing::warn!(
-            "could not rebind the manifest cache to the published generation: {error:#};              it stays bound to the previous one and a code re-index will restore it"
-        );
+    if let Some((db_path, manifests)) = carried {
+        match manifest_debt_revision(&db_path) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = save_manifest_cache_for_db(&manifests, store, &db_path) {
+                    tracing::warn!(
+                        "could not rebind the manifest cache to the published generation: {error:#};              it stays bound to the previous one and a code re-index will restore it"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not inspect manifest debt before rebind: {error:#}; skipping the republish rather than rewriting over unknown source debt"
+                );
+            }
+        }
     }
     outcome
 }
@@ -2738,5 +2754,40 @@ mod release_manifest_tests {
         assert_eq!(error.reason, ManifestUnavailableReason::StaleGeneration);
         assert_eq!(error.expected_generation, store.graph_generation());
         assert_eq!(std::fs::read(manifest_cache_path(&db)).unwrap(), before);
+    }
+
+    #[test]
+    fn advancing_generation_skips_rebind_when_manifest_debt_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        mark_manifest_reconciliation_pending(&db, "repository index").unwrap();
+        let before = std::fs::read(manifest_cache_path(&db)).unwrap();
+        advancing_generation_rebinding_manifests(&store, || store.bump_graph_generation());
+        assert_eq!(
+            std::fs::read(manifest_cache_path(&db)).unwrap(),
+            before,
+            "generation rebind must not rewrite the sidecar while source debt is pending"
+        );
+        assert!(manifest_debt_revision(&db).unwrap().is_some());
+    }
+
+    #[test]
+    fn advancing_generation_rebinds_when_manifest_debt_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        let before = std::fs::read(manifest_cache_path(&db)).unwrap();
+        advancing_generation_rebinding_manifests(&store, || store.bump_graph_generation());
+        assert_ne!(std::fs::read(manifest_cache_path(&db)).unwrap(), before);
+        assert!(
+            load_manifest_cache_for_db(&store, &db)
+                .unwrap()
+                .contains_key("repo:a")
+        );
     }
 }

@@ -174,7 +174,13 @@ pub(super) fn stamp_index_success(
     )
 }
 
-fn migrate_vault(state: &DaemonState, vault: &Vault) -> anyhow::Result<()> {
+fn migrate_vault(
+    state: &DaemonState,
+    vault: &Vault,
+    extra: &[String],
+    max_note_bytes: u64,
+    default_scope: CoverageScope,
+) -> anyhow::Result<()> {
     if cancelled(state) {
         anyhow::bail!("vault derivation cancelled");
     }
@@ -183,18 +189,18 @@ fn migrate_vault(state: &DaemonState, vault: &Vault) -> anyhow::Result<()> {
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
     let source = filesystem_source(Path::new(&vault.root_path))?;
-    let max_note_bytes = note_limits(state).max_note_bytes();
-    let extra = extra_ignore(state);
-    let coverage = coverage_identity(
-        Path::new(&source.canonical_root),
-        &extra,
-        max_note_bytes,
-        CoverageScope::LegacyIndexedInventory,
-    )?;
     if nestweaver_schema::vault_uid(&vault.instance_id, &source.canonical_root) != vault.uid {
         anyhow::bail!("vault source identity does not match its UID");
     }
     let mut records = load_or_empty(state, &identity)?;
+    let coverage = coverage_for_vault(
+        vault,
+        &source,
+        extra,
+        max_note_bytes,
+        Some(&records),
+        default_scope,
+    )?;
     let mut record = records
         .vaults
         .remove(&vault.uid)
@@ -241,14 +247,7 @@ fn migrate_vault(state: &DaemonState, vault: &Vault) -> anyhow::Result<()> {
         IndexedSearchMutationScope::MayIncludeVaultFiles,
     );
     finish_search_reconciliation(state, mutation, "vault_derivation", admission)?;
-    stamp_from_refresh(
-        state,
-        vault,
-        &extra,
-        max_note_bytes,
-        CoverageScope::LegacyIndexedInventory,
-        &result,
-    )
+    stamp_from_refresh(state, vault, extra, max_note_bytes, coverage.scope, &result)
 }
 
 pub(super) fn ensure_current(
@@ -287,7 +286,14 @@ pub(super) fn ensure_current(
         false,
     ) {
         Ok(()) => Ok(()),
-        Err(_) => migrate_vault(state, &vault),
+        Err(error) if error.retryable => migrate_vault(
+            state,
+            &vault,
+            extra,
+            max_note_bytes,
+            CoverageScope::FullRegisteredPolicy,
+        ),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -413,7 +419,7 @@ fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>> {
             &coverage,
             false,
         )
-        .is_err()
+        .is_err_and(|error| error.retryable)
         {
             return Ok(Some(vault.uid));
         }
@@ -428,9 +434,84 @@ fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
         .into_iter()
         .find(|vault| vault.uid == vault_uid)
         .ok_or_else(|| anyhow::anyhow!("vault disappeared before derivation"))?;
-    migrate_vault(state, &vault)
+    let identity = state
+        .store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
+    let source = filesystem_source(Path::new(&vault.root_path))?;
+    let extra = extra_ignore(state);
+    let max_note_bytes = note_limits(state).max_note_bytes();
+    let records = load_or_empty(state, &identity)?;
+    let coverage = coverage_for_vault(
+        &vault,
+        &source,
+        &extra,
+        max_note_bytes,
+        Some(&records),
+        CoverageScope::LegacyIndexedInventory,
+    )?;
+    match markdown_derivation::admit_vault(
+        Some(&records),
+        &expectation(&identity, &state.data_instance_id),
+        &vault,
+        &source,
+        &coverage,
+        false,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error.retryable => migrate_vault(
+            state,
+            &vault,
+            &extra,
+            max_note_bytes,
+            CoverageScope::LegacyIndexedInventory,
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(super) fn http_max_note_bytes(state: &DaemonState) -> u64 {
     note_limits(state).max_note_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nestweaver_schema::vault_uid;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn coverage_for_vault_does_not_downgrade_recorded_full_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vault = Vault {
+            uid: vault_uid("brain", root.to_str().unwrap()),
+            name: "vault".into(),
+            root_path: root.display().to_string(),
+            instance_id: "brain".into(),
+        };
+        let source = markdown_derivation::SourceIdentity {
+            provider: markdown_derivation::SourceProvider::Filesystem,
+            canonical_root: root.display().to_string(),
+            provider_repo_uid: None,
+        };
+        let full = coverage_identity(root, &[], 1024, CoverageScope::FullRegisteredPolicy).unwrap();
+        let records = DerivationRecords {
+            vaults: BTreeMap::from([(
+                vault.uid.clone(),
+                VaultDerivationRecord::pending(&vault, source.clone(), full.clone()),
+            )]),
+        };
+        let coverage = coverage_for_vault(
+            &vault,
+            &source,
+            &[],
+            1024,
+            Some(&records),
+            CoverageScope::LegacyIndexedInventory,
+        )
+        .unwrap();
+        assert_eq!(coverage.scope, CoverageScope::FullRegisteredPolicy);
+        assert_eq!(coverage.policy_digest, full.policy_digest);
+    }
 }
