@@ -173,8 +173,12 @@ test.describe("Graph Explorer", () => {
     await expect(
       contextSurface.getByRole("heading", { name: firstItem.label }),
     ).toBeVisible();
+    // Kind and label can share the same token (fixture repo named "repo").
+    // Bound the kind to a paragraph so it cannot collide with the heading.
     await expect(
-      contextSurface.getByText(firstItem.kind, { exact: true }),
+      contextSurface
+        .getByRole("paragraph")
+        .filter({ hasText: new RegExp(`^${escapeRegExp(firstItem.kind)}$`) }),
     ).toBeVisible();
     await expect(
       contextSurface.getByText(firstItem.reason, { exact: true }),

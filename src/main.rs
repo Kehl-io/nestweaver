@@ -6933,7 +6933,12 @@ enum Commands {
             help = "Restrict result population to repository names or UIDs (repeatable)"
         )]
         repos: Vec<String>,
-        #[arg(long, default_value_t = 0, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000_000))]
+        #[arg(
+            long,
+            default_value_t = 0,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000_000),
+            help = "Skip this many rows before the page (default 0). Use --generation and --page-token from the first page when offset > 0"
+        )]
         offset: usize,
         #[arg(
             long,
@@ -27917,13 +27922,14 @@ fn run_brain(
                         serde_json::from_value(unwrap_hybrid_payload(value))
                             .context("decode vault list from daemon")
                     } else {
-                        // The guard every other fallback site in this file
-                        // takes, and it matters more here now that this command
-                        // accepts `--config`: the direct store cannot honour a
-                        // pinned config, so falling back would silently target
-                        // a different instance than the one the caller named —
-                        // the precise failure `brain remove` is used to repair.
-                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())?;
+                        // Accidental daemon-unavailable fallback stays closed,
+                        // and `--config` still cannot be honored by the direct
+                        // store. The honored CI direct route (`use_daemon ==
+                        // false` without a pinned config) is selected before
+                        // that guard, matching list_projects.
+                        if use_daemon || config.is_some() {
+                            ensure_direct_store_fallback_allowed(&db_path, config.as_deref())?;
+                        }
                         let store = GraphStore::open_read_only(&db_path).with_context(|| {
                             format!("open {} to list vaults", db_path.display())
                         })?;

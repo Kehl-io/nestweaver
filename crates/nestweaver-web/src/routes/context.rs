@@ -108,15 +108,31 @@ pub async fn brain_context(
         workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
     )?;
     let config = nestweaver_engine::HybridSearchConfig::default();
-    let mut result = nestweaver_engine::build_brain_context_hybrid(
+    let mut result = match nestweaver_engine::build_brain_context_hybrid(
         &state.store,
         &body.seeds,
         state.tantivy.as_deref(),
         &config,
         None,
         None,
-    )
-    .map_err(map_context_engine_error)?;
+    ) {
+        Ok(result) => result,
+        // Vault workspaces do not admit code results. An unresolved `sym:`
+        // seed would 404 before the vault filter can return the documented
+        // empty no-match body.
+        Err(err)
+            if workspace.kind == WorkspaceKind::Vault
+                && err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("No seeds resolved")) =>
+        {
+            nestweaver_engine::BrainContextResult {
+                unresolved_seeds: body.seeds.clone(),
+                ..Default::default()
+            }
+        }
+        Err(err) => return Err(map_context_engine_error(err)),
+    };
     filter_brain_context_result(&state, &workspace, &mut result)?;
     // This router is the existing trusted loopback UI, not a remote policy
     // boundary. Remote callers must supply their own resolved VisibleRepos.
