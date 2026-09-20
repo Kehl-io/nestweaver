@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.0.8](https://github.com/Kehl-io/nestweaver/compare/v10.0.7...v10.0.8) (2026-09-20)
+
+
+### Bug Fixes
+
+* redact lbug build paths in ranking-sidecar warnings ([892e5fe](https://github.com/Kehl-io/nestweaver/commit/892e5fe6f2be9632cee2c8c55af6f02b5b4dcb26))
+* redact lbug build paths in ranking-sidecar warnings ([d444fb2](https://github.com/Kehl-io/nestweaver/commit/d444fb299b0e703f807295ff2537c437c075854b))
+
 ## [10.0.7](https://github.com/Kehl-io/nestweaver/compare/v10.0.6...v10.0.7) (2026-09-20)
 
 
