@@ -2973,8 +2973,8 @@ fn infer_cross_repo_call_edges(
             // nw-127: this is one store round-trip PER CALL SITE, and call names
             // repeat heavily across a repo, so the same name was looked up
             // thousands of times per run. The store is not mutated inside this
-            // loop (symbol writes happen earlier in the phase), so memoising the
-            // lookup for the duration of the call is a pure win.
+            // loop (symbol writes happen after resolution is prepared), so
+            // memoising the lookup for the duration of the call is a pure win.
             let by_name = match name_lookup_cache.get(reference.name.as_str()) {
                 Some(hits) => hits,
                 None => {
@@ -3066,6 +3066,20 @@ struct IndexResolution {
     member_of_edges: Vec<nestweaver_schema::ResolvedEdge>,
 }
 
+#[derive(Clone, Copy)]
+struct PrepareIndexResolution<'a> {
+    store: &'a GraphStore,
+    reader: &'a dyn crate::content_reader::ContentReader,
+    r_uid: &'a str,
+    parsed_files_for_resolver: &'a [ParsedFileEntry],
+    detected_languages: &'a [Language],
+    ast_bindings_by_file: &'a HashMap<String, Vec<AstTypeBinding>>,
+    actually_changed_files: &'a std::collections::HashSet<String>,
+    files_unchanged: usize,
+    resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
+    cpu_throttle: &'a crate::cpu_throttle::CpuThrottle,
+}
+
 impl IndexResolution {
     fn all_edges(&self) -> Vec<nestweaver_schema::ResolvedEdge> {
         let mut edges = Vec::with_capacity(self.edges_count());
@@ -3088,19 +3102,23 @@ impl IndexResolution {
 /// readers never observe a published graph that has `releaseTarget` and zero
 /// callers.
 fn prepare_index_resolution(
-    store: &GraphStore,
-    reader: &dyn crate::content_reader::ContentReader,
-    r_uid: &str,
-    parsed_files_for_resolver: &[ParsedFileEntry],
-    detected_languages: &[Language],
-    ast_bindings_by_file: &HashMap<String, Vec<AstTypeBinding>>,
-    actually_changed_files: &std::collections::HashSet<String>,
-    files_unchanged: usize,
-    resolution_deps: Option<&crate::resolution_cache::ResolutionDeps>,
-    cpu_throttle: &crate::cpu_throttle::CpuThrottle,
+    prep: PrepareIndexResolution<'_>,
 ) -> Result<IndexResolution, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
     use rayon::prelude::*;
+
+    let PrepareIndexResolution {
+        store,
+        reader,
+        r_uid,
+        parsed_files_for_resolver,
+        detected_languages,
+        ast_bindings_by_file,
+        actually_changed_files,
+        files_unchanged,
+        resolution_deps,
+        cpu_throttle,
+    } = prep;
 
     let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
     let resolve_pb = ProgressBar::new_spinner();
@@ -4299,18 +4317,18 @@ where
             .map(|(s, sym)| (s.as_str(), sym.as_str()))
             .collect();
 
-        let resolution = prepare_index_resolution(
+        let resolution = prepare_index_resolution(PrepareIndexResolution {
             store,
             reader,
-            &r_uid,
-            &parsed_files_for_resolver,
-            &detected_languages,
-            &ast_bindings_by_file,
-            &actually_changed_files,
+            r_uid: &r_uid,
+            parsed_files_for_resolver: &parsed_files_for_resolver,
+            detected_languages: &detected_languages,
+            ast_bindings_by_file: &ast_bindings_by_file,
+            actually_changed_files: &actually_changed_files,
             files_unchanged,
-            resolution_deps.as_deref(),
-            &cpu_throttle,
-        )?;
+            resolution_deps: resolution_deps.as_deref(),
+            cpu_throttle: &cpu_throttle,
+        })?;
         let publication_edges = resolution.all_edges();
 
         if force_reindex {
