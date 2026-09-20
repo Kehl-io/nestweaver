@@ -149,7 +149,20 @@ def during_index(fixture):
             time.sleep(0.1)
         else:
             raise AssertionError("writer never reported indexing_active; overlap was not established")
-        cases(fixture)
+        # Overlap is established. A force re-index can still be mid-publication
+        # when the first read lands, so an empty `ok` is not the current graph.
+        # Keep using the daemon until a current selector result is observed.
+        deadline = time.monotonic() + fixture.timeout
+        while True:
+            try:
+                cases(fixture)
+                break
+            except AssertionError:
+                if errors:
+                    raise errors[0]
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.25)
         fixture.record(kind="release_selectors_use_daemon_during_index", passed=True,
                        daemon_pid=fixture.child.pid)
     finally:
