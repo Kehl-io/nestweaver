@@ -31,6 +31,7 @@ export function ForceControls({ open }: Props) {
           max={5.0}
           step={0.1}
           value={forceParams.repulsion}
+          aria-label="Force Scale"
           onChange={(e) => setForceParams({ repulsion: parseFloat(e.target.value) })}
           className="w-full h-1.5 cursor-pointer"
           style={{ accentColor: "var(--color-accent, #3b82f6)" }}
@@ -49,6 +50,7 @@ export function ForceControls({ open }: Props) {
           max={3.0}
           step={0.1}
           value={forceParams.gravity}
+          aria-label="Gravity"
           onChange={(e) => setForceParams({ gravity: parseFloat(e.target.value) })}
           className="w-full h-1.5 cursor-pointer"
           style={{ accentColor: "var(--color-accent, #3b82f6)" }}
@@ -67,6 +69,7 @@ export function ForceControls({ open }: Props) {
           max={20}
           step={1}
           value={forceParams.settling}
+          aria-label="Damping"
           onChange={(e) => setForceParams({ settling: parseInt(e.target.value, 10) })}
           className="w-full h-1.5 cursor-pointer"
           style={{ accentColor: "var(--color-accent, #3b82f6)" }}

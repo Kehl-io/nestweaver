@@ -9,6 +9,11 @@ export interface ContextGraphState {
   message: string;
 }
 
+function compareOwnsLens(): boolean {
+  const state = useStore.getState();
+  return state.diffActive || state.activeLens.label.toLowerCase().startsWith("compare");
+}
+
 export function useContextGraphMode(mode: "local" | "features", seeds: string[]) {
   const graphMode = useStore((s) => s.graphMode);
   const workspaceId = useStore((s) => s.activeWorkspaceId);
@@ -21,6 +26,9 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
 
   useEffect(() => {
     if (graphMode !== mode) return;
+    // Compare owns the lens. Reloading Local/Features (including a force-param
+    // `start` identity change) must not select this mode and clear that analysis.
+    if (compareOwnsLens()) return;
     const requestId = ++requestIdRef.current;
     const controller = new AbortController();
     let stopTimer: ReturnType<typeof setTimeout> | undefined;
@@ -38,11 +46,16 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
     store.setSceneMetadata(null);
     store.setActiveLens({ lens: "context", label, targetUid: selectedSeeds[0] ?? null, workspaceId });
     if (selectedSeeds.length === 0) {
-      setState({ status: "empty", message: "Select a node and add it as a context seed to explore its stored relationships." });
+      setState({
+        status: "empty",
+        message: mode === "local"
+          ? "Select a node to explore its stored relationships."
+          : "Add a context seed to explore its stored relationships.",
+      });
     } else {
       setState({ status: "loading", message: `Loading ${label.toLowerCase()} relationships…` });
       void api.brainContext(selectedSeeds, null, "all", workspaceId, controller.signal).then((result) => {
-        if (!current()) return;
+        if (!current() || compareOwnsLens()) return;
         if (!Array.isArray(result.edges) || !result.graph_meta) {
           throw new Error("Relationship data is unavailable from this server. Update the daemon and retry.");
         }
@@ -72,7 +85,7 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
           stopTimer = setTimeout(stop, 10_000);
         }
       }).catch((error: unknown) => {
-        if (!current()) return;
+        if (!current() || compareOwnsLens()) return;
         useStore.getState().clearGraphData();
         useStore.getState().setSceneMetadata(null);
         setState({ status: "error", message: error instanceof Error ? error.message : "Context relationships could not be loaded." });

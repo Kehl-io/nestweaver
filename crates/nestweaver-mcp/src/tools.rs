@@ -12998,6 +12998,38 @@ mod dead_code_argument_contract_tests {
         assert_eq!(request.min_confidence, DeadCodeConfidence::High);
         assert_eq!(selectors, Some(vec!["repo:a".to_string()]));
     }
+
+    #[test]
+    fn dead_code_missing_database_path_discloses_degraded_coverage() {
+        let previous = CURRENT_DB_PATH.with(|cell| cell.replace(None));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_DB_PATH.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(previous);
+        let store = GraphStore::in_memory().unwrap();
+        let payload = tool_dead_code(&store, json!({}), None, None).expect("dead_code");
+        assert_eq!(payload["coverage"], "degraded", "{payload}");
+        let error = payload["manifest_load_error"].as_str().unwrap_or("");
+        assert!(error.contains("database path not set on server"), "{error}");
+        assert!(error.contains("entry"), "{error}");
+    }
+}
+
+fn manifests_for_dead_code(store: &GraphStore) -> nestweaver_engine::DeadCodeManifests {
+    match current_db_path(store) {
+        Ok(db_path) => nestweaver_engine::load_manifests_for_dead_code(store, &db_path),
+        Err(error) => nestweaver_engine::DeadCodeManifests {
+            manifests: HashMap::new(),
+            load_error: Some(format!(
+                "{error:#}; manifest-declared entry files did NOT seed the \
+                 reachability walk, so code reachable only from a package \
+                 entry point may appear unreachable."
+            )),
+        },
+    }
 }
 
 fn tool_dead_code(
@@ -13025,10 +13057,7 @@ fn tool_dead_code(
     if let Some(refusal) = dead_code_page_guard(store, generation, &request) {
         return Ok(refusal);
     }
-    let manifests = match current_db_path(store) {
-        Ok(db_path) => nestweaver_engine::load_manifests_for_dead_code(store, &db_path),
-        Err(_) => nestweaver_engine::DeadCodeManifests::default(),
-    };
+    let manifests = manifests_for_dead_code(store);
     let result = nestweaver_engine::dead_code::detect_dead_code_in_repos_cancellable(
         store,
         0.3,

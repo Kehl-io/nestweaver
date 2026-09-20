@@ -71,7 +71,7 @@ test("release Features has honest empty, loaded and failed states without stale 
   await page.goto("/");
   const modes = page.getByRole("group", { name: "Graph mode" });
   await modes.getByRole("button", { name: "Features", exact: true }).click();
-  await expect(page.getByRole("status", { name: "Features result state" })).toContainText("Select a node");
+  await expect(page.getByRole("status", { name: "Features result state" })).toContainText("Add a context seed");
   await select(page, "releaseA");
   await modes.getByRole("button", { name: "Features", exact: true }).click();
   await expect(page.getByRole("status", { name: "Features result state" })).toContainText("stored relationships");
@@ -87,3 +87,21 @@ test("release Features has honest empty, loaded and failed states without stale 
   await page.getByRole("status", { name: "Features result state" }).getByRole("button", { name: "Retry" }).click();
   await expect(page.getByRole("status", { name: "Features result state" })).toContainText("stored relationships");
 });
+
+for (const mode of ["Local", "Features"] as const) {
+  test(`release ${mode} Compare survives a force-control change`, async ({ page }) => {
+    await page.goto("/");
+    await select(page, "releaseA");
+    await page.getByRole("group", { name: "Graph mode" }).getByRole("button", { name: mode, exact: true }).click();
+    await expect(page.getByRole("status", { name: `${mode} result state` })).toContainText("stored relationships");
+    await page.getByRole("button", { name: "Compare", exact: true }).first().click();
+    const dialog = page.getByRole("dialog", { name: "Compare context" });
+    await expect(dialog).toBeVisible();
+    await page.getByRole("button", { name: "Settings" }).click();
+    const slider = page.getByRole("slider", { name: "Force Scale" });
+    await expect(slider).toBeVisible();
+    await slider.fill("4.5");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("textbox", { name: "Second context seeds" })).toBeEnabled();
+  });
+}
