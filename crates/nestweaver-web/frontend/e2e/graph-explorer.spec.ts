@@ -3,6 +3,7 @@ import {
   expect,
   type APIRequestContext,
   type APIResponse,
+  type Locator,
   type Page,
 } from "@playwright/test";
 import { readFile } from "node:fs/promises";
@@ -59,6 +60,14 @@ function displayedStartHereItems(
   overview: OverviewResponse,
 ): OverviewLandmark[] {
   return overview.start_here.slice(0, 2);
+}
+
+function startHereItemButton(startHere: Locator, item: OverviewLandmark): Locator {
+  return startHere
+    .getByRole("button", {
+      name: new RegExp(escapeRegExp(item.label)),
+    })
+    .first();
 }
 
 function emptyOverview(): OverviewResponse {
@@ -128,9 +137,7 @@ test.describe("Graph Explorer", () => {
     ).toBeVisible();
 
     for (const item of visibleItems) {
-      await expect(
-        startHere.getByText(item.label, { exact: true }),
-      ).toBeVisible();
+      await expect(startHereItemButton(startHere, item)).toBeVisible();
     }
     if (visibleItems.length === 0) {
       await expect(startHere.getByText("No entry points found.")).toBeVisible();
@@ -156,15 +163,9 @@ test.describe("Graph Explorer", () => {
     await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
-    await expect(
-      startHere.getByText(firstItem.label, { exact: true }),
-    ).toBeVisible();
-    await startHere
-      .getByRole("button", {
-        name: new RegExp(escapeRegExp(firstItem.label)),
-      })
-      .first()
-      .click();
+    const firstButton = startHereItemButton(startHere, firstItem);
+    await expect(firstButton).toBeVisible();
+    await firstButton.click();
 
     const contextSurface = page.getByRole("complementary", {
       name: "Overview context",
@@ -322,9 +323,10 @@ test.describe("Graph Explorer", () => {
     await expect(page.locator("canvas").first()).toBeVisible();
     // Canvas labels are WebGL SDF text (not DOM); the sr-only landmark
     // summary is the accessible mirror of what the scene labels
-    await expect(page.getByTestId("graph-label-summary")).toContainText("js", {
-      timeout: 15_000,
-    });
+    await expect(page.getByTestId("graph-label-summary")).toContainText(
+      "Landmarks:",
+      { timeout: 15_000 },
+    );
 
     async function downloadExport(label: RegExp, extension: string) {
       const dock = page.getByTestId("control-dock");

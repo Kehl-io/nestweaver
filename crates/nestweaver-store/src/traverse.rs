@@ -2468,7 +2468,7 @@ mod tests {
 
     #[test]
     fn release_scoped_threshold_preserves_authz_and_pruning() {
-        use nestweaver_schema::ResolvedEdge;
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
         let store = GraphStore::in_memory().unwrap();
         for uid in ["target", "allowed", "hidden", "behind-hidden"] {
             store.insert_symbol(&make_symbol(uid, uid)).unwrap();
