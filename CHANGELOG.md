@@ -1,5 +1,35 @@
 # Changelog
 
+## [10.0.7](https://github.com/Kehl-io/nestweaver/compare/v10.0.6...v10.0.7) (2026-09-20)
+
+
+### Bug Fixes
+
+* address PR 411 review callouts for F, E3, G, and D ([bc73f7f](https://github.com/Kehl-io/nestweaver/commit/bc73f7fe3c673e9c0b72a55b2b3d33de76c76dc5))
+* **analysis:** fail closed on unassessed changes and empty test selection ([1f8a0eb](https://github.com/Kehl-io/nestweaver/commit/1f8a0eba517db368e7f02a96bc67f5f3212157a6))
+* avoid unused assignment in vault derivation wait helper ([80f2bf6](https://github.com/Kehl-io/nestweaver/commit/80f2bf66c2cb3ddbba4012eab37bd7bef657244d))
+* **ci:** reject incomplete mutation runs and add bounded canaries ([716ba05](https://github.com/Kehl-io/nestweaver/commit/716ba05d26a59db761f8b67db032a24a5f960ae3))
+* **ci:** separate shipping daemon acceptance from CI bypass suites ([0e0958d](https://github.com/Kehl-io/nestweaver/commit/0e0958dd9553c211494f901d894a082b69cead47))
+* commit CALLS with force-reindex symbol replacement ([0d927c1](https://github.com/Kehl-io/nestweaver/commit/0d927c13db235574eb76a9208b0e738d5595bf92))
+* **context:** require resolved seeds and preserve missing heading links ([eae3ace](https://github.com/Kehl-io/nestweaver/commit/eae3ace5ba21834988b389a934dd1013e12237f7))
+* **daemon:** route scoped selectors through authorized daemon reads ([87a81e3](https://github.com/Kehl-io/nestweaver/commit/87a81e37f8ec42b2b9997b1f806a3c217b3b309d))
+* **daemon:** validate embedding identity within the owning daemon ([2848a01](https://github.com/Kehl-io/nestweaver/commit/2848a01a96a817ee0ccce78cb704e2184c0ad12a))
+* fold prepare_index_resolution args for clippy ([494790f](https://github.com/Kehl-io/nestweaver/commit/494790f1d181a26a865153e3206e3fce7a1fa507))
+* keep blocked source errors ahead of stale --force advice ([ec2fd33](https://github.com/Kehl-io/nestweaver/commit/ec2fd33d7fc67bd24b86be2edff43866330f66de))
+* keep Local/Features Compare and disclose missing dead-code db path ([c7b8f1b](https://github.com/Kehl-io/nestweaver/commit/c7b8f1becb80e66df6e5a79dfafd50efdbeb7218))
+* keep review-critical suggestion and test-selection gates honest ([c963f3d](https://github.com/Kehl-io/nestweaver/commit/c963f3d14f4b17e453525f656495f2a21378767e))
+* land remaining solid-release D, F, G, and E3 source ([ef23fe6](https://github.com/Kehl-io/nestweaver/commit/ef23fe69eeb2cdfbc2ecb8f2b668f5f16c018276))
+* **notes:** preserve lookup outcomes across daemon transports ([ceda634](https://github.com/Kehl-io/nestweaver/commit/ceda63427ff1d875a154d19396d82cc08b1dd397))
+* omit --force from watching stale-generation suggestions ([a504e54](https://github.com/Kehl-io/nestweaver/commit/a504e546ddbb3ec67056a462823e7b95b0c2517a))
+* refuse daemon bypass outside GitHub Actions CI ([99f473d](https://github.com/Kehl-io/nestweaver/commit/99f473d62d09a677c288cc34a798081886542e6b))
+* **release:** gate on required checks and bound immutable registry retries ([b4a999b](https://github.com/Kehl-io/nestweaver/commit/b4a999b2bf617ce4b8fc09e3d7680752f3f7a9d7))
+* restore CI compile and Graph Explorer locators ([b51d76a](https://github.com/Kehl-io/nestweaver/commit/b51d76af6d6074e2e0b180128d670f26d137962d))
+* restore Required CI contracts for fallback, derivation, and E2E ([6aaa1ac](https://github.com/Kehl-io/nestweaver/commit/6aaa1acf8cce642c57fa93331523cc350a331935))
+* restore sidecar error remedies and in-memory derivation admit ([71a8b8f](https://github.com/Kehl-io/nestweaver/commit/71a8b8f16fda63b6f2cfa35adbc3088bae6652f9))
+* **runtime:** restrict explicit daemon bypass to CI test builds ([8bf5e3c](https://github.com/Kehl-io/nestweaver/commit/8bf5e3c3f7ca64bcb58dc2c8df019fab3231a2d3))
+* solid-release remaining D/F/G/E3 (crash still gathering evidence) ([029883a](https://github.com/Kehl-io/nestweaver/commit/029883aa4481e86534a796c11365f36d936eb4a8))
+* wait for current selector results during force-index overlap ([14e9fff](https://github.com/Kehl-io/nestweaver/commit/14e9ffff2991ff04d6f55524d719ddbdab315366))
+
 ## [10.0.6](https://github.com/Kehl-io/nestweaver/compare/v10.0.5...v10.0.6) (2026-09-19)
 
 
