@@ -217,16 +217,17 @@ behind). It is a different population from the top-level `stale_repos` on
 
 ### Daemon bypass is CI-only
 
-Standard development and distributed binaries cannot honor bypass requests from
-`--no-daemon`, `NESTWEAVER_NO_DAEMON`, or an explicit permit is present. Refused
-requests print a warning and keep the normal daemon route.
+Standard development and distributed binaries cannot honor `--no-daemon`,
+`NESTWEAVER_NO_DAEMON`, or an explicit permit. Refused requests print a warning
+and keep the normal daemon route.
 
 Only a separate internal CI test artifact may enable direct-store tests. It
 requires the `ci-direct-tests` build feature, `NESTWEAVER_ALLOW_NO_DAEMON=1`,
-and a truthful `CI=true`/`CI=1` or `GITHUB_ACTIONS=true`/`GITHUB_ACTIONS=1` marker.
-Ambient CI markers alone never grant access. This artifact must never be
-published. Local development, fixtures, debugging, and recovery use the daemon;
-setting CI locally is not an exception. See [release fixture instructions](docs/testing/release-daemon-fixtures.md).
+and a GitHub Actions runner context (`GITHUB_ACTIONS=true` plus nonempty
+`RUNNER_TEMP`, `RUNNER_OS`, and `GITHUB_RUN_ID`). Ambient `CI=true` never grants
+access, including when set locally. This artifact must never be published.
+Local development, fixtures, debugging, and recovery use the daemon; setting CI
+locally is not an exception. See [release fixture instructions](docs/testing/release-daemon-fixtures.md).
 
 Note that `hubs --json` carries two different `stale_repos`: the **top-level**
 one is resolver-generation staleness, and `_meta.stale_repos` is federation
@@ -242,7 +243,7 @@ Also changing behaviour in this release, in ways a script may notice:
 | `project-context` without `--include-components` now **includes** component sub-projects | Pass `--include-components false` to keep the old behaviour |
 | `_meta` moved from the MCP envelope into the payload and lost its `nestweaver.io/` prefix | Raw HTTP MCP clients must read `payload._meta`, not `envelope["nestweaver.io/sources"]` |
 | `hubs --json` / `bridges --json` are objects, not bare arrays | Read `.hubs` / `.bridges`, not `.[0]` |
-| `NESTWEAVER_NO_DAEMON` alone no longer permits a daemon bypass | Standard artifacts always use the daemon; direct tests require a separate CI-only artifact |
+| `NESTWEAVER_NO_DAEMON` alone no longer permits a daemon bypass | Standard artifacts always use the daemon; even the unpublished CI artifact requires a GitHub Actions runner context, not a local `CI=true` |
 
 ## Server Mode
 

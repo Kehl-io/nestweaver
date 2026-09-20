@@ -1737,11 +1737,11 @@ struct Cli {
     /// scripts and agents. Requests that this command skip autostarting a
     /// daemon and open the database directly.
     ///
-    /// CI-only: requires the internal CI build, a truthful CI marker, and
-    /// `NESTWEAVER_ALLOW_NO_DAEMON=1`. `NESTWEAVER_NO_DAEMON` requests access —
-    /// the latter is a second way to REQUEST the bypass, not to permit it.
-    /// Without the gate this flag is ignored and the command routes through
-    /// the daemon.
+    /// CI-only: requires the unpublished `ci-direct-tests` build, a GitHub
+    /// Actions runner context, and `NESTWEAVER_ALLOW_NO_DAEMON=1`.
+    /// `NESTWEAVER_NO_DAEMON` requests access — it does not permit it.
+    /// Setting `CI=true` locally is not a permit. Without the gate this flag
+    /// is ignored and the command routes through the daemon.
     ///
     /// This is not what keeps the store single-writer: the write lease is
     /// taken at the moment of the write and fails closed, so a bypass against
@@ -14173,22 +14173,40 @@ mod impact_floor_clause_tests {
 }
 
 /// CI-only direct-store policy, kept pure for exhaustive unit coverage.
-/// Standard artifacts cannot bypass, even with both runtime opt-ins present.
+/// Standard artifacts cannot bypass, even with every runtime opt-in present.
+/// Honored only when the unpublished `ci-direct-tests` artifact, an explicit
+/// permit, and a GitHub Actions runner context are all present. `CI=true` is
+/// not a permit — including when set locally. Runner env values cannot prove
+/// origin; they match `scripts/ci-direct-cargo.sh::github_runner_context`.
 fn ci_direct_policy(
     ci_build: bool,
     allow_optin: bool,
     github_actions: bool,
-    ci: Option<&str>,
+    runner_temp: bool,
+    runner_os: bool,
+    github_run_id: bool,
 ) -> bool {
-    ci_build && allow_optin && (github_actions || matches!(ci, Some("true" | "1")))
+    ci_build && allow_optin && github_actions && runner_temp && runner_os && github_run_id
 }
 
-fn no_daemon_allowed_from(allow_optin: bool, github_actions: bool, ci: Option<&str>) -> bool {
+fn env_nonempty(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.is_empty())
+}
+
+fn no_daemon_allowed_from(
+    allow_optin: bool,
+    github_actions: bool,
+    runner_temp: bool,
+    runner_os: bool,
+    github_run_id: bool,
+) -> bool {
     ci_direct_policy(
         cfg!(feature = "ci-direct-tests"),
         allow_optin,
         github_actions,
-        ci,
+        runner_temp,
+        runner_os,
+        github_run_id,
     )
 }
 
@@ -14201,8 +14219,10 @@ fn no_daemon_allowed() -> bool {
             std::env::var("NESTWEAVER_ALLOW_NO_DAEMON").as_deref(),
             Ok("1" | "true")
         ),
-        matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("1" | "true")),
-        std::env::var("CI").ok().as_deref(),
+        matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true")),
+        env_nonempty("RUNNER_TEMP"),
+        env_nonempty("RUNNER_OS"),
+        env_nonempty("GITHUB_RUN_ID"),
     )
 }
 
@@ -16183,7 +16203,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // ── Local fallback (daemon unavailable) ──────────────────
+            // Honored CI direct route (`use_daemon == false`). Daemon
+            // unavailability never falls through; `try_hybrid_json_rpc_checked`
+            // refuses via `ensure_direct_store_fallback_allowed`.
             let built = match context_result {
                 Some(result) => Ok(result),
                 None => {
@@ -16827,7 +16849,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // nw-439: same wait+classify the daemon route gets, for the
-            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // honored CI direct route (`use_daemon == false`), so this
             // command reads identically regardless of which route answered.
             nestweaver_mcp::tools::wait_out_index_publication(&store, None);
 
@@ -17024,7 +17046,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // nw-439: same wait+classify the daemon route gets, for the
-            // direct (`--no-daemon`/daemon-unreachable) fallback, so this
+            // honored CI direct route (`use_daemon == false`), so this
             // command reads identically regardless of which route answered —
             // and, now that `find_bridge_nodes_bounded` fails closed on a
             // dirty publication (below), it produces the SAME disclosure
@@ -28207,9 +28229,10 @@ fn run_brain(
             // daemon owns the writer-mode Tantivy index and shares dispatch
             // with the MCP server (`tool_brain_search`), so daemon-routed
             // searches eliminate the "Database is locked" reader fallback
-            // and stay in sync with live re-indexing. Falls through to the
-            // direct-disk implementation below when `--no-daemon` is set,
-            // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
+            // and stay in sync with live re-indexing. The direct-disk
+            // implementation below is only the honored CI direct route
+            // (`use_daemon == false`). An unavailable daemon never falls
+            // through; `ensure_direct_store_fallback_allowed` refuses it.
             if use_daemon {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(runtime) => Some(runtime),
@@ -38708,19 +38731,16 @@ mod no_daemon_gate_tests {
         for build in [false, true] {
             for permit in [false, true] {
                 for github in [false, true] {
-                    for ci in [
-                        None,
-                        Some(""),
-                        Some("0"),
-                        Some("false"),
-                        Some("True"),
-                        Some("yes"),
-                        Some("true"),
-                        Some("1"),
-                    ] {
-                        let expected =
-                            build && permit && (github || matches!(ci, Some("true" | "1")));
-                        assert_eq!(ci_direct_policy(build, permit, github, ci), expected);
+                    for temp in [false, true] {
+                        for os in [false, true] {
+                            for run_id in [false, true] {
+                                let expected = build && permit && github && temp && os && run_id;
+                                assert_eq!(
+                                    ci_direct_policy(build, permit, github, temp, os, run_id),
+                                    expected
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -38728,15 +38748,36 @@ mod no_daemon_gate_tests {
     }
 
     #[test]
+    fn local_ci_marker_is_not_a_permit() {
+        // CI=true used to be an OR with GITHUB_ACTIONS. That let a local
+        // `CI=true` plus the permit honor bypass on a ci-direct-tests binary.
+        assert!(!ci_direct_policy(true, true, false, false, false, false));
+        assert!(!ci_direct_policy(true, true, true, false, false, false));
+        assert!(!ci_direct_policy(true, true, false, true, true, true));
+        assert!(ci_direct_policy(true, true, true, true, true, true));
+    }
+
+    #[test]
     fn standard_artifact_cannot_authorize_bypass() {
         for permit in [false, true] {
             for github in [false, true] {
-                for ci in [None, Some("true"), Some("1")] {
-                    assert!(!ci_direct_policy(false, permit, github, ci));
-                    assert_eq!(
-                        no_daemon_allowed_from(permit, github, ci),
-                        ci_direct_policy(cfg!(feature = "ci-direct-tests"), permit, github, ci)
-                    );
+                for temp in [false, true] {
+                    for os in [false, true] {
+                        for run_id in [false, true] {
+                            assert!(!ci_direct_policy(false, permit, github, temp, os, run_id));
+                            assert_eq!(
+                                no_daemon_allowed_from(permit, github, temp, os, run_id),
+                                ci_direct_policy(
+                                    cfg!(feature = "ci-direct-tests"),
+                                    permit,
+                                    github,
+                                    temp,
+                                    os,
+                                    run_id
+                                )
+                            );
+                        }
+                    }
                 }
             }
         }

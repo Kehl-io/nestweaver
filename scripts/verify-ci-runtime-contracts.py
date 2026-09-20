@@ -173,6 +173,23 @@ class RuntimeContracts(unittest.TestCase):
         for source in (CI, RELEASE):
             self.assertNotRegex(source, r'(?m)^\s+(CI|GITHUB_ACTIONS):\s*["\']?(true|1)')
 
+    def test_direct_bypass_requires_github_runner_context(self):
+        source = (ROOT / 'src/main.rs').read_text()
+        policy = source.split('fn ci_direct_policy(', 1)[1].split('\n}\n', 1)[0]
+        for required in ('runner_temp', 'runner_os', 'github_run_id'):
+            self.assertIn(required, policy)
+        self.assertNotIn('matches!(ci, Some("true" | "1"))', policy)
+        allowed = source.split('fn no_daemon_allowed() -> bool {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('GITHUB_ACTIONS', allowed)
+        self.assertIn('RUNNER_TEMP', allowed)
+        self.assertIn('RUNNER_OS', allowed)
+        self.assertIn('GITHUB_RUN_ID', allowed)
+        self.assertNotIn('var("CI")', allowed)
+        golden = (ROOT / 'scripts/golden-check.sh').read_text()
+        self.assertIn('unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON', golden)
+        self.assertNotIn('NESTWEAVER_NO_DAEMON=1', golden)
+        self.assertNotIn('export NESTWEAVER_ALLOW_NO_DAEMON', golden)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

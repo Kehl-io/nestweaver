@@ -358,8 +358,9 @@ fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
     let _guard = helpers::server_guard::ServerGuard::start(&db_path);
     // The preflight is a daemon RPC, so this must exercise the daemon route.
     // CI exports NESTWEAVER_NO_DAEMON=1 for the whole test job, which
-    // `resolve_use_daemon` honors under GITHUB_ACTIONS — the CLI would then take
-    // the direct path and collide with the write lock the guard's daemon holds.
+    // `resolve_use_daemon` honors under GitHub Actions runner context — the
+    // CLI would then take the direct path and collide with the write lock the
+    // guard's daemon holds.
     // Clear the bypass for this child so the route is the same everywhere
     // (same idiom as `daemon_cmd` in tests/parity_test.rs).
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
@@ -2376,7 +2377,7 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
             .current_dir(dir.path())
             // This probe exercises the DAEMON + hybrid routing path. CI's
             // test job exports NESTWEAVER_NO_DAEMON=1, which (with Actions'
-            // ambient CI=true) activates the no-daemon bypass — and the
+            // runner context) activates the no-daemon bypass — and the
             // direct path never federates, so the probe would see local-only
             // results forever. Strip the bypass for this subprocess.
             .env_remove("NESTWEAVER_NO_DAEMON")

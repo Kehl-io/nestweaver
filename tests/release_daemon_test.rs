@@ -30,10 +30,11 @@ fn release_daemon_fixture_bootstrap() {
 #[test]
 #[ignore = "CI-only forbidden-request probe"]
 fn release_standard_artifact_cannot_bypass() {
-    if !["CI", "GITHUB_ACTIONS"]
-        .iter()
-        .any(|key| matches!(std::env::var(key).as_deref(), Ok("1" | "true")))
-    {
+    let runner = matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"))
+        && std::env::var("RUNNER_TEMP").is_ok_and(|v| !v.is_empty())
+        && std::env::var("RUNNER_OS").is_ok_and(|v| !v.is_empty())
+        && std::env::var("GITHUB_RUN_ID").is_ok_and(|v| !v.is_empty());
+    if !runner {
         panic!("CI-only rejection probe; local coverage is no_daemon_gate_tests");
     }
     run_fixture(&["--ci-policy-test"]);

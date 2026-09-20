@@ -259,8 +259,9 @@ reconnected or diagnosed; bypassing it is not a recovery option.
 
 Internal CI direct-store suites use a separately built, unpublished
 `ci-direct-tests` artifact, an explicit `NESTWEAVER_ALLOW_NO_DAEMON=1` permit,
-and a truthful CI runtime marker. CI must also test the standard artifact
-through a real isolated daemon with bypass variables absent.
+and a GitHub Actions runner context. Ambient `CI=true` is not a permit. CI must
+also test the standard artifact through a real isolated daemon with bypass
+variables absent.
 
 ## Optional: Git history analysis
 

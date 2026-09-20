@@ -11,10 +11,26 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from isolated_daemon import IsolatedDaemon
+from isolated_daemon import IsolatedDaemon, github_runner_context
 
 
 class FixtureSafetyTests(unittest.TestCase):
+    def test_github_runner_context_matches_cargo_shim(self):
+        complete = dict(GITHUB_ACTIONS="true", RUNNER_TEMP="/runner/temp",
+                        RUNNER_OS="Linux", GITHUB_RUN_ID="123")
+        cases = [
+            ({}, False),
+            ({"CI": "true"}, False),
+            ({"GITHUB_ACTIONS": "true"}, False),
+            ({"GITHUB_ACTIONS": "1", "RUNNER_TEMP": "t", "RUNNER_OS": "Linux",
+              "GITHUB_RUN_ID": "1"}, False),
+            (complete, True),
+            (dict(complete, GITHUB_ACTIONS="1"), False),
+        ]
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(github_runner_context(environment), expected)
+
     def make_fixture(self):
         fixture = IsolatedDaemon(sys.executable)
         self.addCleanup(shutil.rmtree, fixture.root)

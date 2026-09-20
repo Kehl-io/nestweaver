@@ -17,6 +17,14 @@ import tempfile
 import time
 
 
+def github_runner_context(environment=None):
+    """Same predicate as scripts/ci-direct-cargo.sh. Env values cannot prove origin."""
+    environment = os.environ if environment is None else environment
+    return environment.get("GITHUB_ACTIONS") == "true" and all(
+        environment.get(key) for key in ("RUNNER_TEMP", "RUNNER_OS", "GITHUB_RUN_ID")
+    )
+
+
 class IsolatedDaemon:
     def __init__(self, binary, timeout=120):
         self.binary = Path(binary).resolve(strict=True)
@@ -194,7 +202,7 @@ class IsolatedDaemon:
                     daemon_pid=self.child.pid)
 
     def check_standard_artifact_policy_in_ci(self):
-        if not any(os.environ.get(key) in ("true", "1") for key in ("CI", "GITHUB_ACTIONS")):
+        if not github_runner_context():
             raise RuntimeError("actual bypass rejection probes are CI-only")
         version = self.run("--version").stdout
         if "+release-fixture-hooks" in version:

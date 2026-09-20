@@ -8386,8 +8386,8 @@ fn the_autostart_guard_only_refuses_a_log_no_open_can_replay() {
 ///
 /// The item's stated trigger was wrong and is corrected here. Bare
 /// `NESTWEAVER_NO_DAEMON=1` routing through the daemon is CORRECT by policy:
-/// The internal CI feature, `NESTWEAVER_ALLOW_NO_DAEMON`, and a truthful CI
-/// runtime marker must all be present to grant a bypass. The case that
+/// The internal CI feature, `NESTWEAVER_ALLOW_NO_DAEMON`, and a GitHub
+/// Actions runner context must all be present to grant a bypass. The case that
 /// matters is the one where the bypass IS granted.
 ///
 /// The cost is concrete and is already recorded elsewhere in this repo:

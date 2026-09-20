@@ -118,7 +118,7 @@ exactly like the rest.
 |----------|---------|-------------|
 | `NESTWEAVER_DB` | `./nestweaver.lbug` | Path to the NestWeaver database |
 | `NESTWEAVER_NO_DAEMON` | unset | *Requests* a daemon bypass. CI-only; standard artifacts ignore the request and use the daemon |
-| `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Explicit CI-only permit; also requires the internal CI test artifact and a truthful CI runtime marker |
+| `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Explicit CI-only permit; also requires the internal CI test artifact and a GitHub Actions runner context |
 
 The daemon's idle timeout is a `daemon run --idle-timeout <secs>` flag (3600 by
 default when autostarted), **not** an environment variable. See CLAUDE.md for the
@@ -138,4 +138,4 @@ Daemon logs are written to `~/.local/state/nestweaver/<instance>/daemon.log`.
 Daemon bypass is CI-only. Local MCP sessions, fixtures, and recovery must use
 the daemon. Standard development and release artifacts cannot honor bypass
 requests. An internal unpublished CI artifact additionally requires an explicit
-permit and a truthful CI runtime marker; setting CI locally is not an exception.
+permit and a GitHub Actions runner context; setting CI locally is not an exception.

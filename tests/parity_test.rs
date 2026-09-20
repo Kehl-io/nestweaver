@@ -122,13 +122,13 @@ fn wait_for_vault_derivation_current(db_path: &Path) {
     loop {
         let output = run_via_daemon(db_path, &["brain", "status", "--json"]);
         last = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&last) {
-                let vault_count = status_vault_count(&value);
-                let pending = derivation_pending_count(&value);
-                if vault_count == 0 || pending == Some(0) {
-                    return;
-                }
+        if output.status.success()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&last)
+        {
+            let vault_count = status_vault_count(&value);
+            let pending = derivation_pending_count(&value);
+            if vault_count == 0 || pending == Some(0) {
+                return;
             }
         }
         if std::time::Instant::now() >= deadline {

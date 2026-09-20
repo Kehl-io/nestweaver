@@ -57,8 +57,9 @@ CI must maintain separate artifacts and required lanes:
   in CI. It adds forbidden requests in its child process only and refuses a
   non-CI runner.
 - Internal direct-test artifact: separate target/artifact directory, enable
-  `ci-direct-tests`, supply `NESTWEAVER_ALLOW_NO_DAEMON=1`, and a truthful
-  `CI=true`/`CI=1` or `GITHUB_ACTIONS=true`/`GITHUB_ACTIONS=1` runtime marker.
+  `ci-direct-tests`, supply `NESTWEAVER_ALLOW_NO_DAEMON=1`, and a GitHub Actions
+  runner context (`GITHUB_ACTIONS=true` plus nonempty `RUNNER_TEMP`,
+  `RUNNER_OS`, and `GITHUB_RUN_ID`). Ambient `CI=true` is not a permit.
   The request (`--no-daemon` or `NESTWEAVER_NO_DAEMON`) remains necessary.
   Never publish this artifact. `daemon_test` and `parity_test` are gated here
   because their legacy bootstrap still requests direct stores.
