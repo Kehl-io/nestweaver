@@ -715,33 +715,7 @@ enum CliDiagnostic {
 /// reasoning already governs the committed `.wasm` artifact, which is built
 /// with `--remap-path-prefix` for exactly this leak.
 fn redact_build_paths(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(at) = rest.find("/.cargo/registry/") {
-        // Walk back to the start of the absolute path so the home prefix goes
-        // with it, not just the registry tail.
-        let head = &rest[..at];
-        let start = head
-            .rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-            .map_or(0, |i| i + 1);
-        out.push_str(&head[..start]);
-        let tail = &rest[at..];
-        let end = tail
-            .find(|c: char| c.is_whitespace() || c == '"')
-            .unwrap_or(tail.len());
-        // Keep the crate-relative remainder: it is the only diagnostic part.
-        let path = &tail[..end];
-        let short = path
-            .split("/index.crates.io-")
-            .nth(1)
-            .and_then(|s| s.split_once('/'))
-            .map_or("<dependency source>", |(_, rel)| rel);
-        out.push_str("<dep>/");
-        out.push_str(short);
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    out
+    nestweaver_store::redact_build_paths(message)
 }
 
 /// Remove the storage engine's own guess at a transient cause from a message
