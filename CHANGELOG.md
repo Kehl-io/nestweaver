@@ -1,5 +1,15 @@
 # Changelog
 
+## [10.0.9](https://github.com/Kehl-io/nestweaver/compare/v10.0.8...v10.0.9) (2026-09-21)
+
+
+### Bug Fixes
+
+* expire leftover watcher-batch ranking exception ([966b1d1](https://github.com/Kehl-io/nestweaver/commit/966b1d1861903f1c91ed1b6221267618ca987f05))
+* serve ranked HTTP context during watcher-batch publication ([21635c0](https://github.com/Kehl-io/nestweaver/commit/21635c0fd0bac04a3c912760dbad000abd0bbad2))
+* serve ranked HTTP context during watcher-batch publication ([5213f64](https://github.com/Kehl-io/nestweaver/commit/5213f64e4406998bb7f3a737d0d9e6743dff6392))
+* yield write gate when publication lease is held ([f26d10a](https://github.com/Kehl-io/nestweaver/commit/f26d10a950a009563a762075b965a89be55eed6d))
+
 ## [10.0.8](https://github.com/Kehl-io/nestweaver/compare/v10.0.7...v10.0.8) (2026-09-20)
 
 
