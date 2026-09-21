@@ -16268,8 +16268,90 @@ credential_method = "gh"
         vault_derivation::admit_tool(&state, "backlinks").unwrap();
 
         // RefreshVaultSince / watcher path.
+        block_vault_derivation(&state, now + 3_600);
+        vault_derivation::ensure_current(&state, &root, &[], 1024 * 1024)
+            .expect_err("RefreshVaultSince must wait out the backoff too");
         block_vault_derivation(&state, now.saturating_sub(1));
         vault_derivation::ensure_current(&state, &root, &[], 1024 * 1024).unwrap();
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+    }
+
+    /// A failed migration must wait out its backoff even when the record is
+    /// on an older derivation version. OlderVersion admission is retryable
+    /// and is checked before the phase, so a Blocked record that kept its old
+    /// version was re-migrated by the background loop every few seconds.
+    #[tokio::test]
+    async fn failed_derivation_migration_of_an_older_version_waits_out_its_backoff() {
+        use nestweaver_engine::markdown_derivation::{DERIVATION_VERSION, DerivationPhase};
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+
+        let mut record = vault_derivation_record(&state);
+        record.derivation_version = DERIVATION_VERSION - 1;
+        record.phase = DerivationPhase::Pending;
+        record.witness = None;
+        record.pending_generation = None;
+        record.completed_generation = None;
+        save_vault_derivation_record(&state, record);
+        // The indexed inventory still lists B.md, so the migration's source
+        // capture fails.
+        std::fs::remove_file(root.join("B.md")).unwrap();
+
+        let due = vault_derivation::inspect_next(&state).unwrap().unwrap();
+        vault_derivation::migrate_named(&state, &due).unwrap_err();
+        let blocked = vault_derivation_record(&state);
+        assert_eq!(blocked.phase, DerivationPhase::Blocked);
+        assert_eq!(blocked.attempts, 1);
+        assert_eq!(blocked.derivation_version, DERIVATION_VERSION);
+        assert_eq!(
+            vault_derivation::inspect_next(&state).unwrap(),
+            None,
+            "a failed migration must not be retried before its backoff"
+        );
+
+        // Once due it is retried, and a repeat failure doubles the backoff.
+        let mut due_record = blocked;
+        due_record.retry_after_unix_seconds = Some(0);
+        save_vault_derivation_record(&state, due_record);
+        let due = vault_derivation::inspect_next(&state).unwrap().unwrap();
+        vault_derivation::migrate_named(&state, &due).unwrap_err();
+        let reblocked = vault_derivation_record(&state);
+        assert_eq!(reblocked.attempts, 2);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let delay = reblocked.retry_after_unix_seconds.unwrap() - now;
+        assert!(
+            (55..=60).contains(&delay),
+            "second failure backs off ~60s: {delay}"
+        );
+    }
+
+    /// A NUL byte in a note's leading 8 KiB is the same policy skip the code
+    /// indexer already records (nw-355). The vault indexer reported it as a
+    /// read failure, which blocked derivation for good.
+    #[tokio::test]
+    async fn index_vault_stamps_derivation_past_a_binary_note() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::write(root.join("nul.md"), b"# N\0\n").unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.skipped_count, 1, "{last:?}");
         assert_eq!(
             vault_derivation_record(&state).phase,
             DerivationPhase::Current

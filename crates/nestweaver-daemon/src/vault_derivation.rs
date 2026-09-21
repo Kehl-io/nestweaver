@@ -241,6 +241,10 @@ fn migrate_vault(
         .unwrap_or_else(|| VaultDerivationRecord::pending(vault, source.clone(), coverage.clone()));
     record.source = source.clone();
     record.coverage = coverage.clone();
+    // This attempt targets the current version. Keeping the old one would
+    // let OlderVersion (retryable, checked before the phase) bypass the
+    // Blocked backoff if the attempt fails.
+    record.derivation_version = markdown_derivation::DERIVATION_VERSION;
     record.phase = DerivationPhase::Pending;
     record.witness = None;
     record.pending_generation = None;
