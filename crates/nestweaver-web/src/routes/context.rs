@@ -72,6 +72,7 @@ pub async fn code_context(
         .map_err(map_context_engine_error)?;
     let mut json = serde_json::to_value(&result)?;
     crate::bridge::annotate_context_payload(&state, &mut json);
+    stamp_http_watcher_batch_disclosure(&state, &mut json);
     Ok(Json(json).into_response())
 }
 
@@ -169,7 +170,16 @@ pub async fn brain_context(
     }
     nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
         .map_err(ApiError::from_ranking)?;
+    stamp_http_watcher_batch_disclosure(&state, &mut json);
     Ok(Json(json).into_response())
+}
+
+fn stamp_http_watcher_batch_disclosure(state: &AppState, json: &mut serde_json::Value) {
+    // Prefer the store's own path so in-memory test stores (dummy
+    // `AppState.db_path`) cannot pick up a leftover marker on disk.
+    if let Some(db_path) = state.store.db_path() {
+        nestweaver_engine::index_publication::stamp_watcher_batch_disclosure(db_path, json);
+    }
 }
 
 fn filter_brain_context_result(

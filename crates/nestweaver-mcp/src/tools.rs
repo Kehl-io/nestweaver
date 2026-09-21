@@ -2999,35 +2999,15 @@ pub fn dispatch_cancellable(
         // second, differently-shaped disclosure at the top level would be
         // redundant at best and conflicting at worst.
         //
-        // KNOWN GAP (pending shared-file follow-up, main.rs is held by
-        // another task): these keys reach every MCP route (stdio and the
-        // daemon's tools/call) today, since both call this function. Several
-        // CLI `--json` verbs do NOT see them, because `src/main.rs`
-        // reshapes this same dispatch value into a typed struct before
-        // printing it — e.g. `hubs` (`Commands::Hubs`) builds `Vec<HubNode>`
-        // from `value.get("hubs")` and reprints via `print_ranking_json`,
-        // which has no field for this disclosure, so it is silently
-        // dropped. Until that CLI-side plumbing lands, an agent calling the
-        // `hub_nodes`/`brain_context`/etc. MCP tools sees the disclosure;
-        // the `nestweaver hubs --json` CLI verb (and any sibling verb with
-        // the same reshape-then-reprint shape) does not.
+        // CLI `--json` reshape used to drop these keys (nw-503). The
+        // hubs/bridges/context printers now copy them from the wire or
+        // stamp the local marker, so MCP and CLI share one honesty shape.
         if name != "brain_status"
             && let Some(db_path) = store.db_path()
         {
-            let status = nestweaver_engine::index_publication::status(db_path);
-            if status.dirty
-                && status.is_watcher_batch()
-                && !status.is_wedged()
-                && let Value::Object(map) = &mut value
-            {
-                map.insert("publication_in_progress".to_string(), json!(true));
-                map.insert("marker_age_s".to_string(), json!(status.marker_age_s));
-                map.insert("in_flight_note_paths".to_string(), json!(status.note_paths));
-                map.insert(
-                    "in_flight_note_paths_truncated".to_string(),
-                    json!(status.note_paths_truncated),
-                );
-            }
+            nestweaver_engine::index_publication::stamp_watcher_batch_disclosure(
+                db_path, &mut value,
+            );
         }
         provenance_seam::stamp(Unstamped::new(value))
     });

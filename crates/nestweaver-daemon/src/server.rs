@@ -7111,10 +7111,11 @@ impl NestWeaverDaemon for DaemonService {
         let cancel_for_index = cancel;
 
         tokio::task::spawn_blocking(move || {
-            let _ownership = MutationWorkerOwnership {
-                _write_lease: write_lock.blocking_lock("index_repo"),
-                _connection_guard: guard,
-            };
+            // Drain accounting stays on for the whole RPC. The write gate is
+            // acquired only at the graph-write boundary (IndexOptions) so a
+            // multi-hour parse cannot invert write-gate vs publication-lease
+            // with a watcher that already holds publication (nw-380 / nw-475).
+            let _connection_guard = guard;
             let _activity = RpcIndexActivity::start(
                 Arc::clone(&state.rpc_indexing_repo),
                 repo_path.display().to_string(),
@@ -7179,7 +7180,8 @@ impl NestWeaverDaemon for DaemonService {
             .name(name.as_deref())
             .limits(index_limits)
             .excludes(&repo_excludes)
-            .unskip(&repo_unskip);
+            .unskip(&repo_unskip)
+            .write_gate(write_lock, "index_repo");
 
             #[cfg(feature = "release-fixture-hooks")]
             let fixture_scope = match nestweaver_engine::release_fixture::begin_index(
