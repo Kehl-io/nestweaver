@@ -938,6 +938,89 @@ mod tests {
     }
 
     #[test]
+    fn complete_graph_accepts_policy_skips_and_refuses_failure_skips() {
+        use crate::index_md::{MarkdownIndexResult, MarkdownRefreshResult};
+        use crate::manifest::{
+            GraphMutationPublicationDisposition, GraphMutationPublicationOutcome,
+        };
+        use nestweaver_parser::{SkipReasonCode, SkippedFile};
+        let id = identity();
+        let vault = Vault {
+            uid: vault_uid("brain", "/tmp/vault"),
+            name: "vault".into(),
+            root_path: "/tmp/vault".into(),
+            instance_id: "brain".into(),
+        };
+        let source = SourceIdentity {
+            provider: SourceProvider::Filesystem,
+            canonical_root: "/tmp/vault".into(),
+            provider_repo_uid: None,
+        };
+        let coverage = CoverageIdentity {
+            scope: CoverageScope::FullRegisteredPolicy,
+            policy_digest: "a".repeat(64),
+            max_note_bytes: 1024,
+            extra_ignore_patterns: Vec::new(),
+        };
+        let result = |skipped: Vec<SkippedFile>| MarkdownRefreshResult {
+            index: MarkdownIndexResult {
+                vault_uid: vault.uid.clone(),
+                vault_name: "vault".into(),
+                notes_count: 2,
+                headings_count: 2,
+                sections_count: 2,
+                tags_count: 0,
+                resolved_link_edges: 1,
+                unresolved_link_occurrences: 0,
+                unresolved_link_section_targets: 0,
+                unresolved_link_targets: 0,
+                skipped,
+            },
+            notes_deleted: 0,
+            publication: GraphMutationPublicationOutcome {
+                disposition: GraphMutationPublicationDisposition::CommittedComplete,
+                generation_before: 1,
+                generation_after: 2,
+                warnings: Vec::new(),
+            },
+            notes_near_size_limit: Vec::new(),
+        };
+
+        let mut record = VaultDerivationRecord::pending(&vault, source.clone(), coverage.clone());
+        record
+            .record_complete_graph(
+                &result(vec![SkippedFile::new(
+                    "secret.md",
+                    SkipReasonCode::Ignored,
+                    "matched .brainignore pattern",
+                )]),
+                2,
+                "b".repeat(64),
+                &id,
+            )
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            DerivationPhase::GraphCommittedAwaitingReconciliation
+        );
+        assert_eq!(record.pending_generation, Some(2));
+
+        let mut record = VaultDerivationRecord::pending(&vault, source, coverage);
+        let refused = record.record_complete_graph(
+            &result(vec![SkippedFile::new(
+                "B.md",
+                SkipReasonCode::ReadError,
+                "read error",
+            )]),
+            2,
+            "b".repeat(64),
+            &id,
+        );
+        assert_eq!(refused, Err(RecordError::IncompletePublication));
+        assert_eq!(record.phase, DerivationPhase::Pending);
+    }
+
+    #[test]
     fn blocked_record_is_retry_due_only_after_its_backoff() {
         let vault = Vault {
             uid: vault_uid("brain", "/tmp/vault"),

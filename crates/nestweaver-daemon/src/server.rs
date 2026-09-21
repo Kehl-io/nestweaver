@@ -16255,6 +16255,14 @@ credential_method = "gh"
             None,
             "a blocked vault must wait out its backoff"
         );
+        // migrate_named re-admits under the write lease, so it must refuse a
+        // vault that is not due even when asked for it by name.
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        vault_derivation::migrate_named(&state, &vault_uid)
+            .expect_err("a blocked vault inside its backoff is not migrated");
+        let still_blocked = vault_derivation_record(&state);
+        assert_eq!(still_blocked.phase, DerivationPhase::Blocked);
+        assert_eq!(still_blocked.attempts, 1);
 
         // Background loop path.
         block_vault_derivation(&state, now.saturating_sub(1));
