@@ -38,6 +38,90 @@ fn cli_shows_version() {
 }
 
 #[test]
+fn generate_guide_output_creates_marked_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("guide.lbug");
+    nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    let output = dir.path().join("AGENTS.md");
+
+    nestweaver_cmd()
+        .args([
+            "generate-guide",
+            "--db",
+            db.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(contains("Guide written to"));
+
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(text.starts_with("<!-- nestweaver:begin -->\n"), "{text}");
+    assert!(text.contains("rules_version:"), "{text}");
+    assert!(
+        text.trim_end().ends_with("<!-- nestweaver:end -->"),
+        "{text}"
+    );
+}
+
+#[test]
+fn generate_guide_output_updates_only_the_marked_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("guide.lbug");
+    nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    let output = dir.path().join("AGENTS.md");
+    std::fs::write(
+        &output,
+        "KEEP-ABOVE\n<!-- nestweaver:begin -->\nOLD\n<!-- nestweaver:end -->\nKEEP-BELOW\n",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "generate-guide",
+            "--db",
+            db.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(contains("Updated NestWeaver section"));
+
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(text.starts_with("KEEP-ABOVE\n"), "{text}");
+    assert!(text.contains("\nKEEP-BELOW\n"), "{text}");
+    assert!(!text.contains("OLD"));
+    assert!(text.contains("rules_version:"), "{text}");
+}
+
+#[test]
+fn generate_guide_output_refuses_an_unmarked_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("guide.lbug");
+    nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    let output = dir.path().join("AGENTS.md");
+    let original = "# Hand written\n";
+    std::fs::write(&output, original).unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "generate-guide",
+            "--db",
+            db.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("no NestWeaver section markers"))
+        .stderr(contains("left unchanged"));
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), original);
+}
+
+#[test]
 fn cli_help_lists_commands() {
     nestweaver_cmd()
         .arg("--help")
