@@ -46,6 +46,25 @@ pub const MARKER_REASON_CANCELLED: &str = "cancelled";
 /// `nestweaver_mcp::tools::dispatch_cancellable`.
 pub const MARKER_REASON_WATCHER_BATCH: &str = "brain watcher batch";
 
+/// How long a watcher-batch marker may keep the Q7 ranking exception.
+///
+/// The exception is for a debounce window (normally well under a second).
+/// A leftover `brain watcher batch` reason while a multi-hour `index_repo`
+/// holds the write lease is not that window — live kory-brain sat at
+/// ~5.8h, `write_holder=index_repo`, `wedged=false`. After this age,
+/// ranking fail-closes even when the write lease is still held. Unknown
+/// age is fail-closed too: "cannot tell" is not "still a debounce".
+pub const WATCHER_BATCH_EXCEPTION_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// True when this record is a *young* watcher-batch publication that ranked
+/// reads may answer through (lease liveness is checked by the caller).
+pub fn watcher_batch_ranking_exception_applies(record: &MarkerRecord) -> bool {
+    if record.reason.as_deref() != Some(MARKER_REASON_WATCHER_BATCH) {
+        return false;
+    }
+    matches!(record.age(), Some(age) if age <= WATCHER_BATCH_EXCEPTION_MAX_AGE)
+}
+
 /// Path of the durable publication marker for `db_path`.
 ///
 /// Kept as a free function so callers that only have a path (the `repair`
@@ -353,6 +372,33 @@ mod tests {
             Some(MARKER_REASON_WATCHER_BATCH),
         );
         assert_eq!(with_empty, plain);
+    }
+
+    #[test]
+    fn watcher_batch_exception_requires_a_young_timestamp() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let young = parse_marker_payload(&format_marker_payload(
+            9,
+            now,
+            Some(MARKER_REASON_WATCHER_BATCH),
+        ));
+        assert!(watcher_batch_ranking_exception_applies(&young));
+
+        let ancient = parse_marker_payload(&format_marker_payload(
+            9,
+            1,
+            Some(MARKER_REASON_WATCHER_BATCH),
+        ));
+        assert!(
+            !watcher_batch_ranking_exception_applies(&ancient),
+            "a leftover watcher-batch reason from hours ago is not a debounce window"
+        );
+
+        let untimestamped = parse_marker_payload("9\n");
+        assert!(!watcher_batch_ranking_exception_applies(&untimestamped));
     }
 
     /// nw-475: backward compatibility — a marker written by a binary before

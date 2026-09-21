@@ -176,11 +176,19 @@ impl IndexPublicationStatus {
             == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
     }
 
-    /// nw-475 honesty half: a non-wedged watcher-batch marker is dirty but
-    /// ranked reads may answer through it. Callers must stamp these fields
-    /// rather than silently looking fresh.
+    /// nw-475 honesty half: a non-wedged *young* watcher-batch marker is
+    /// dirty but ranked reads may answer through it. An aged-out marker
+    /// (leftover reason during a long `index_repo`) does not disclose as a
+    /// debounce window — ranking fail-closes instead.
     pub fn watcher_batch_disclosure(&self) -> Option<WatcherBatchDisclosure> {
-        if self.dirty && self.is_watcher_batch() && !self.is_wedged() {
+        if self.dirty
+            && self.is_watcher_batch()
+            && !self.is_wedged()
+            && self.marker_age_s.is_some_and(|age| {
+                age <= nestweaver_store::index_publication::WATCHER_BATCH_EXCEPTION_MAX_AGE
+                    .as_secs()
+            })
+        {
             Some(WatcherBatchDisclosure {
                 marker_age_s: self.marker_age_s,
                 note_paths: self.note_paths.clone(),
@@ -638,15 +646,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
-
-        let watcher = status_from(
-            &db_path,
-            present(
-                Some(std::process::id() as i32),
+        std::fs::write(
+            marker_path(&db_path),
+            format_marker_payload(
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
                 Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
             ),
-        );
-        let disclosure = watcher
+        )
+        .unwrap();
+        let disclosure = status(&db_path)
             .watcher_batch_disclosure()
             .expect("a live watcher batch must disclose");
         assert_eq!(disclosure.note_paths, Vec::<String>::new());
@@ -656,6 +668,30 @@ mod tests {
         assert!(
             index_run.watcher_batch_disclosure().is_none(),
             "an ordinary index-run marker must not look like a disclosed watcher batch"
+        );
+    }
+
+    #[test]
+    fn an_aged_out_held_watcher_batch_does_not_disclose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        std::fs::write(
+            marker_path(&db_path),
+            format_marker_payload(
+                std::process::id(),
+                1,
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        let status = status(&db_path);
+        assert!(status.dirty);
+        assert!(status.is_watcher_batch());
+        assert!(!status.is_wedged(), "a live writer is not wedged");
+        assert!(
+            status.watcher_batch_disclosure().is_none(),
+            "hours-old leftover watcher-batch reason must not disclose as a debounce window"
         );
     }
 

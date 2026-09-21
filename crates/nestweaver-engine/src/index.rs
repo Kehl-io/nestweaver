@@ -724,6 +724,28 @@ fn finalize_code_graph_deletion_with_io(
     }
 }
 
+/// If a leftover watcher-batch marker is still on disk when a real `index`
+/// starts, drop the Q7 debounce reason so ranking fail-closes for the parse.
+fn reclassify_leftover_watcher_batch_marker(db_path: &Path) {
+    match nestweaver_store::index_publication::read_marker(db_path) {
+        nestweaver_store::index_publication::MarkerState::Present(record)
+            if record.reason.as_deref()
+                == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH) =>
+        {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            if let Err(error) = FileSystemIndexEpilogueIo.establish_marker(&marker_path) {
+                tracing::warn!(
+                    path = %marker_path.display(),
+                    error = %error,
+                    "could not reclassify leftover watcher-batch publication marker; \
+                     ranking will still fail closed once the marker ages out"
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Mandatory cache/generation publication after a committed indexing graph
 /// mutation. This runs before any later sidecar persistence or PageRank
 /// recomputation so a subsequent error cannot leave the previous ranks or
@@ -2622,6 +2644,11 @@ fn index_directory_with_store_inner(
     let force = opts.force;
     let name = opts.name.as_deref();
     let limits = opts.limits;
+    // A leftover `brain watcher batch` marker must not keep the Q7 ranking
+    // exception for the whole parse of a full `index` (hours, live). Rewrite
+    // it as an ordinary dirty publication as soon as this run owns the work.
+    // Does not reserve a generation — that still happens at the write boundary.
+    reclassify_leftover_watcher_batch_marker(db_path);
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
@@ -8709,6 +8736,36 @@ mod tests {
             nestweaver_store::index_publication::format_marker_payload(pid as u32, nanos, reason),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn leftover_watcher_batch_marker_is_reclassified_when_index_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        write_marker_with_pid(
+            &marker_path,
+            std::process::id() as i32,
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        );
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            !store.index_publication_blocks_ranking(),
+            "a young leftover watcher batch still has the Q7 exception"
+        );
+        reclassify_leftover_watcher_batch_marker(&db_path);
+        assert!(
+            store.index_publication_blocks_ranking(),
+            "index start must drop the debounce reason so ranking fail-closes"
+        );
+        assert_ne!(
+            nestweaver_store::index_publication::read_marker(&db_path)
+                .record()
+                .and_then(|record| record.reason.clone())
+                .as_deref(),
+            Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
+        );
     }
 
     /// Insert a small NOTE-side graph alongside the code graph, so a recovery

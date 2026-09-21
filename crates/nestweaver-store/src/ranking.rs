@@ -2222,6 +2222,24 @@ mod tests {
              not only an already-warm cache",
         );
         assert!(
+            !store.index_publication_blocks_ranking(),
+            "a young held watcher batch must not block ranking"
+        );
+
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                1,
+                Some(crate::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        assert!(
+            store.index_publication_blocks_ranking(),
+            "an aged-out leftover watcher-batch marker must fail closed even with a held lease"
+        );
+        assert!(
             scores.contains_key("A"),
             "the lazily computed scores must actually be returned, not discarded \
              by the mid-compute re-check: {scores:?}"

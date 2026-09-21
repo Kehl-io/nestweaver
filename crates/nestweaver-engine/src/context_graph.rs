@@ -297,13 +297,38 @@ mod tests {
             nestweaver_store::index_publication::marker_path(&db_path),
             nestweaver_store::index_publication::format_marker_payload(
                 std::process::id(),
-                1,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
                 Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
             ),
         )
         .unwrap();
         ensure_context_generation(&store, generation)
             .expect("a live watcher batch must not fail HTTP context closed");
+    }
+
+    #[test]
+    fn aged_out_watcher_batch_publication_refuses_context_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        std::fs::write(
+            nestweaver_store::index_publication::marker_path(&db_path),
+            nestweaver_store::index_publication::format_marker_payload(
+                std::process::id(),
+                1,
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ensure_context_generation(&store, generation).is_err(),
+            "a leftover watcher-batch marker older than the debounce window must fail closed"
+        );
     }
 
     #[test]
