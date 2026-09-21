@@ -81,6 +81,7 @@ macro_rules! println {
     }};
 }
 
+mod guide_section;
 mod setup;
 mod setup_probe;
 
@@ -6305,7 +6306,10 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
-        #[arg(long, help = "Write to file instead of stdout")]
+        #[arg(
+            long,
+            help = "Write into this file. Creates it with <!-- nestweaver:begin --> / <!-- nestweaver:end --> markers when missing. When the file exists, replaces only the span between those markers. Refuses, and leaves the file unchanged, when the markers are absent or not a single pair."
+        )]
         output: Option<PathBuf>,
         #[arg(
             long,
@@ -16603,8 +16607,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     };
                     match &output {
                         Some(path) => {
-                            std::fs::write(path, &text)?;
-                            out.status(&format!("Guide written to {}", path.display()));
+                            let wrote = guide_section::write_marked_section(path, &text)?;
+                            out.status(&guide_section::write_status(path, wrote));
                         }
                         None => print!("{text}"),
                     }
@@ -16657,8 +16661,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             match output {
                 Some(path) => {
-                    std::fs::write(&path, &output_str)?;
-                    out.status(&format!("Guide written to {}", path.display()));
+                    let wrote = guide_section::write_marked_section(&path, &output_str)?;
+                    out.status(&guide_section::write_status(&path, wrote));
                 }
                 None => print!("{output_str}"),
             }

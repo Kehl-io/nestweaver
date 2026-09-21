@@ -603,11 +603,11 @@ fn setup_codex(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let merged = merge_codex_mcp(&config_path, &toml_section)?;
 
     let agents_path = base.join("AGENTS.md");
-    let agents_status = if agents_path.exists() {
-        "already exists (not overwritten)"
-    } else {
-        std::fs::write(&agents_path, generate_agents_md_content())?;
-        "codebase guide written"
+    let wrote =
+        crate::guide_section::write_marked_section(&agents_path, &generate_agents_md_content())?;
+    let agents_status = match wrote {
+        crate::guide_section::GuideSectionWrite::Created => "codebase guide written",
+        crate::guide_section::GuideSectionWrite::Updated => "generated section updated",
     };
 
     print_result(
@@ -1502,6 +1502,66 @@ mod setup_base_dir_tests {
             "config must land under base"
         );
         assert!(base.join(".cursor/rules/nestweaver.mdc").exists());
+    }
+
+    #[test]
+    fn setup_codex_creates_agents_md_inside_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let db = tmp.path().join("t.lbug");
+
+        setup_codex(&db, &base).unwrap();
+
+        let text = std::fs::read_to_string(base.join("AGENTS.md")).unwrap();
+        assert!(text.starts_with("<!-- nestweaver:begin -->\n"), "{text}");
+        assert!(text.contains("# AGENTS.md — Codebase Intelligence Guide"));
+        assert!(
+            text.trim_end().ends_with("<!-- nestweaver:end -->"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn setup_codex_updates_only_the_marked_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let agents = base.join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            "KEEP-ABOVE\n<!-- nestweaver:begin -->\nOLD\n<!-- nestweaver:end -->\nKEEP-BELOW\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("t.lbug");
+
+        setup_codex(&db, &base).unwrap();
+
+        let text = std::fs::read_to_string(&agents).unwrap();
+        assert!(text.starts_with("KEEP-ABOVE\n"), "{text}");
+        assert!(text.contains("\nKEEP-BELOW\n"), "{text}");
+        assert!(!text.contains("OLD"));
+        assert!(text.contains("# AGENTS.md — Codebase Intelligence Guide"));
+    }
+
+    #[test]
+    fn setup_codex_refuses_an_unmarked_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let agents = base.join("AGENTS.md");
+        let original = "# Hand written\n";
+        std::fs::write(&agents, original).unwrap();
+        let db = tmp.path().join("t.lbug");
+
+        let error = setup_codex(&db, &base).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no NestWeaver section markers"),
+            "{message}"
+        );
+        assert!(message.contains("left unchanged"), "{message}");
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), original);
     }
 
     #[test]
