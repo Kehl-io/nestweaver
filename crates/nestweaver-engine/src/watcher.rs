@@ -716,7 +716,9 @@ impl BrainWatcher {
         // than inheriting one held since before this batch began — there is
         // no reason to hold the gate across the symbol-index/title-map
         // rebuild below, which touches no shared derived state the gate
-        // protects.
+        // protects. Index write-boundary acquire then YIELDS the write gate
+        // if this publication lease is still held, so finalize's later
+        // write-gate re-acquire cannot AB-BA deadlock with `index_repo`.
         let publication = if graph_batch {
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_batch")?;
             // Establish the fail-closed marker before the prepared batch can

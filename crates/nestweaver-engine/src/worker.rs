@@ -630,7 +630,7 @@ fn commit_prepared_job_with_write_gate<G, F>(
     acquire_write_guard: F,
 ) -> Result<(), anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     commit_prepared_job_with_reindex_tracker(
         prepared,
@@ -650,7 +650,7 @@ fn commit_prepared_job_with_reindex_tracker<G, F>(
     acquire_write_guard: F,
 ) -> Result<(), anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let force_full_reindex = should_force_full_reindex(
         reindex_tracker.as_deref(),
@@ -776,7 +776,7 @@ fn commit_prepared_job_with_reindex_decision<G, F>(
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     commit_prepared_job_with_reindex_decision_and_limits(
         prepared,
@@ -799,7 +799,7 @@ fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let r_uid = nestweaver_schema::repo_uid(instance_id, &prepared.repo_url);
     let existing_repo = store.lookup_repo(&r_uid).ok().flatten();

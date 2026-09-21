@@ -944,6 +944,50 @@ pub(crate) fn establish_index_publication_marker_with_io<'a>(
     establish_index_publication_marker_on_lease(lease, db_path, operation, io)
 }
 
+/// After the write gate is held, take the publication lease without AB-BA.
+///
+/// Lock order is write → publication. The watcher (nw-380) holds publication
+/// across a batch and re-acquires the write gate only at finalize. Blocking
+/// `acquire_index_publication_lease` while we hold write is the hang that
+/// left a leftover watcher-batch marker in front of a multi-hour `index_repo`
+/// parse. If the lease is owned, drop the write gate, wait until it is free,
+/// re-acquire write, then retry.
+fn acquire_index_publication_after_write_gate<'a, G, F>(
+    store: &'a GraphStore,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+    write_guard: &mut Option<G>,
+    mut reacquire_write: F,
+) -> Result<nestweaver_store::IndexPublicationLease<'a>, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
+    let lease = loop {
+        match store.try_acquire_index_publication_lease() {
+            Ok(Some(lease)) => break lease,
+            Ok(None) => {
+                tracing::info!(
+                    operation,
+                    "yielding write gate so an in-flight publisher can finalize"
+                );
+                drop(write_guard.take());
+                store.wait_until_index_publication_unowned();
+                *write_guard = Some(reacquire_write().with_context(|| {
+                    format!("{operation}: re-acquire write gate after publication yield")
+                })?);
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "{operation}: acquire exclusive index publication lease: {error:#}"
+                ));
+            }
+        }
+    };
+    establish_index_publication_marker_on_lease(lease, db_path, operation, io)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 /// The marker-establishment half of [`establish_index_publication_marker_with_io`],
 /// for callers that already hold the lease.
 ///
@@ -2368,6 +2412,13 @@ pub struct IndexOptions {
     /// be handed the SAME set (see `incremental_index_with_excludes_and_unskip`)
     /// and the two routes cannot disagree about what the repo contains.
     pub unskip: Vec<String>,
+    /// Process-local write gate acquired only at the graph-write boundary
+    /// (scan/parse stay off-lock, nw-006). `None` for CLI/tests that already
+    /// hold a database write lease and do not share a `WriteGate` with a
+    /// watcher.
+    pub write_gate: Option<crate::WriteGate>,
+    /// Holder label stamped on [`Self::write_gate`] (`index_repo`, …).
+    pub write_label: &'static str,
 }
 
 impl IndexOptions {
@@ -2381,6 +2432,8 @@ impl IndexOptions {
             limits: crate::index_limits::IndexLimits::default(),
             excludes: Vec::new(),
             unskip: Vec::new(),
+            write_gate: None,
+            write_label: "index_graph_write",
         }
     }
 
@@ -2407,6 +2460,14 @@ impl IndexOptions {
     /// nw-418: `[[repos]] unskip` names for this repo.
     pub fn unskip(mut self, unskip: &[String]) -> Self {
         self.unskip = unskip.to_vec();
+        self
+    }
+
+    /// Acquire `gate` only at the graph-write boundary so a long parse cannot
+    /// invert the write-gate / publication-lease lock order.
+    pub fn write_gate(mut self, gate: crate::WriteGate, label: &'static str) -> Self {
+        self.write_gate = Some(gate);
+        self.write_label = label;
         self
     }
 }
@@ -2678,6 +2739,13 @@ fn index_directory_with_store_inner(
     // origin remote, the old uid's filemeta slice must be dropped from the
     // sidecar alongside the graph prune.
     let mut reidentified_old_uid: Option<String> = None;
+    let write_gate = opts.write_gate.clone();
+    let write_label = opts.write_label;
+    let acquire_write = || -> Result<Option<crate::WriteLease>, anyhow::Error> {
+        Ok(write_gate
+            .as_ref()
+            .map(|gate| gate.blocking_lock(write_label)))
+    };
     let result = if force {
         index_into_store_with_write_gate(
             &reader,
@@ -2695,7 +2763,7 @@ fn index_directory_with_store_inner(
             true,
             &FileSystemIndexEpilogueIo,
             cancel,
-            || Ok::<(), anyhow::Error>(()),
+            acquire_write,
         )?
     } else {
         // Only this repo's slice of the sidecar feeds change detection —
@@ -2717,7 +2785,7 @@ fn index_directory_with_store_inner(
             true,
             &FileSystemIndexEpilogueIo,
             cancel,
-            || Ok::<(), anyhow::Error>(()),
+            acquire_write,
         )?
     };
 
@@ -2866,7 +2934,7 @@ pub fn index_with_reader_and_write_gate<G, F>(
     acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     index_with_reader_and_write_gate_and_io(
         ReaderIndexRequest {
@@ -2899,7 +2967,7 @@ fn index_with_reader_and_write_gate_and_io<G, F>(
     acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let ReaderIndexRequest {
         reader,
@@ -3446,10 +3514,10 @@ fn index_into_store_with_write_gate<G, F>(
     bump_generation_after_write: bool,
     epilogue_io: &dyn IndexEpilogueIo,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    acquire_write_guard: F,
+    mut acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let started = Instant::now();
 
@@ -4137,7 +4205,7 @@ where
         prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
     };
 
-    let _write_guard = acquire_write_guard()?;
+    let mut write_guard = Some(acquire_write_guard()?);
 
     // nw-246/nw-277: minted INSIDE the write guard, not ~600 lines earlier.
     //
@@ -4184,12 +4252,15 @@ where
         anyhow::bail!("index cancelled");
     }
 
-    let publication = establish_index_publication_marker_with_io(
+    let publication = acquire_index_publication_after_write_gate(
         store,
         store.db_path(),
         "index graph write",
         epilogue_io,
+        &mut write_guard,
+        acquire_write_guard,
     )?;
+    let _write_guard = write_guard;
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
         // Re-identify prune: when a local repo previously indexed under a
@@ -6517,10 +6588,10 @@ pub(crate) fn incremental_index_with_reader_and_write_gate<G, F>(
     instance_id: &str,
     repo_url: &str,
     new_sha: &str,
-    acquire_write_guard: F,
+    mut acquire_write_guard: F,
 ) -> Result<IncrementalResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
     let old_sha = store
@@ -6620,7 +6691,7 @@ where
     let prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
 
-    let _write_guard = acquire_write_guard()?;
+    let mut write_guard = Some(acquire_write_guard()?);
     let contract_plan = match contract_plan_result {
         Ok(plan) => plan,
         Err(error) => {
@@ -6632,12 +6703,15 @@ where
             return Err(error).context("prepare server incremental contract derivation");
         }
     };
-    let publication = establish_index_publication_marker_with_io(
+    let publication = acquire_index_publication_after_write_gate(
         store,
         store.db_path(),
         "server incremental index",
         &FileSystemIndexEpilogueIo,
+        &mut write_guard,
+        acquire_write_guard,
     )?;
+    let _write_guard = write_guard;
     let txn = store
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
@@ -8766,6 +8840,49 @@ mod tests {
                 .as_deref(),
             Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
         );
+    }
+
+    #[test]
+    fn write_then_publication_yields_to_break_ab_ba_deadlock() {
+        let store = std::sync::Arc::new(GraphStore::in_memory().unwrap());
+        let gate = crate::WriteGate::new();
+        let (pub_held_tx, pub_held_rx) = std::sync::mpsc::channel();
+        let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+        let watcher_store = std::sync::Arc::clone(&store);
+        let watcher_gate = gate.clone();
+        let watcher = std::thread::spawn(move || {
+            let publication = watcher_store.acquire_index_publication_lease().unwrap();
+            pub_held_tx.send(()).expect("announce publication hold");
+            finalize_rx.recv().expect("index asked us to finalize");
+            let _write = watcher_gate.blocking_lock("watch_vault_batch");
+            drop(publication);
+        });
+        pub_held_rx.recv().expect("watcher holds publication");
+
+        let mut write_guard = Some(gate.blocking_lock("index_repo"));
+        finalize_tx.send(()).expect("ask watcher to finalize");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        let reacquire = {
+            let gate = gate.clone();
+            move || Ok::<_, anyhow::Error>(gate.blocking_lock("index_repo"))
+        };
+        let lease = acquire_index_publication_after_write_gate(
+            store.as_ref(),
+            None,
+            "deadlock yield",
+            &FileSystemIndexEpilogueIo,
+            &mut write_guard,
+            reacquire,
+        )
+        .expect("yield must break the deadlock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "AB-BA would hang well past this bound"
+        );
+        drop(lease);
+        watcher.join().expect("watcher finalize");
     }
 
     /// Insert a small NOTE-side graph alongside the code graph, so a recovery

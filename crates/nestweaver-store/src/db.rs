@@ -1951,6 +1951,41 @@ impl GraphStore {
             .is_none()
     }
 
+    /// Block until no in-process publisher owns the lease. Does not take it.
+    ///
+    /// Write-gate holders that must acquire publication next call this after
+    /// dropping the write gate so a publisher that already owns the lease
+    /// (and needs the write gate to finalize) can finish. Taking the lease
+    /// here would invert the lock order: write-then-publication is required.
+    /// Registers as a waiter so [`Self::wait_for_index_publication_waiters`]
+    /// can observe the yield.
+    pub fn wait_until_index_publication_unowned(&self) {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner.is_none() {
+            return;
+        }
+        let mut registered_waiter = false;
+        if let Some(count) = state.waiters.checked_add(1) {
+            state.waiters = count;
+            registered_waiter = true;
+            self.index_publication_lease.available.notify_all();
+        }
+        while state.owner.is_some() {
+            state = self
+                .index_publication_lease
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        if registered_waiter {
+            state.waiters -= 1;
+        }
+    }
+
     fn release_index_publication_lease(&self, token: u64) -> Result<(), StoreError> {
         let mut state = self
             .index_publication_lease
@@ -5163,6 +5198,32 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn wait_until_index_publication_unowned_is_immediate_when_free() {
+        let store = GraphStore::in_memory().unwrap();
+        store.wait_until_index_publication_unowned();
+        assert!(store.index_publication_lease_is_unowned());
+    }
+
+    #[test]
+    fn wait_until_index_publication_unowned_unblocks_when_the_owner_releases() {
+        let store = std::sync::Arc::new(GraphStore::in_memory().unwrap());
+        let held = store.acquire_index_publication_lease().unwrap();
+        let waiter = {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.wait_until_index_publication_unowned();
+            })
+        };
+        assert!(
+            store.wait_for_index_publication_waiters(1, std::time::Duration::from_secs(5)),
+            "a yield waiter must register on the publication condvar"
+        );
+        drop(held);
+        waiter.join().expect("yield waiter must unblock");
+        assert!(store.index_publication_lease_is_unowned());
     }
 
     #[test]
