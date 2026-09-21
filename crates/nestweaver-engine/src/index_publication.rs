@@ -175,6 +175,59 @@ impl IndexPublicationStatus {
         self.writer_reason.as_deref()
             == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
     }
+
+    /// nw-475 honesty half: a non-wedged watcher-batch marker is dirty but
+    /// ranked reads may answer through it. Callers must stamp these fields
+    /// rather than silently looking fresh.
+    pub fn watcher_batch_disclosure(&self) -> Option<WatcherBatchDisclosure> {
+        if self.dirty && self.is_watcher_batch() && !self.is_wedged() {
+            Some(WatcherBatchDisclosure {
+                marker_age_s: self.marker_age_s,
+                note_paths: self.note_paths.clone(),
+                note_paths_truncated: self.note_paths_truncated,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Fields stamped on a successful ranked response served during a watcher batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherBatchDisclosure {
+    pub marker_age_s: Option<u64>,
+    pub note_paths: Vec<String>,
+    pub note_paths_truncated: bool,
+}
+
+impl WatcherBatchDisclosure {
+    pub fn stamp_into(&self, value: &mut serde_json::Value) {
+        if let serde_json::Value::Object(map) = value {
+            map.insert(
+                "publication_in_progress".to_string(),
+                serde_json::json!(true),
+            );
+            map.insert(
+                "marker_age_s".to_string(),
+                serde_json::json!(self.marker_age_s),
+            );
+            map.insert(
+                "in_flight_note_paths".to_string(),
+                serde_json::json!(self.note_paths),
+            );
+            map.insert(
+                "in_flight_note_paths_truncated".to_string(),
+                serde_json::json!(self.note_paths_truncated),
+            );
+        }
+    }
+}
+
+/// Stamp watcher-batch disclosure onto a successful JSON payload, if any.
+pub fn stamp_watcher_batch_disclosure(db_path: &Path, value: &mut serde_json::Value) {
+    if let Some(disclosure) = status(db_path).watcher_batch_disclosure() {
+        disclosure.stamp_into(value);
+    }
 }
 
 /// Read the marker for `db_path` and decorate it with writer liveness.
@@ -556,5 +609,69 @@ mod tests {
             status(&db_path).writer_reason.as_deref(),
             Some(MARKER_REASON_CANCELLED)
         );
+    }
+
+    #[test]
+    fn watcher_batch_disclosure_stamps_honesty_keys() {
+        let disclosure = WatcherBatchDisclosure {
+            marker_age_s: Some(12),
+            note_paths: vec!["Alpha.md".into()],
+            note_paths_truncated: false,
+        };
+        let mut value = serde_json::json!({"ok": true});
+        disclosure.stamp_into(&mut value);
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(value["publication_in_progress"], serde_json::json!(true));
+        assert_eq!(value["marker_age_s"], serde_json::json!(12));
+        assert_eq!(
+            value["in_flight_note_paths"],
+            serde_json::json!(["Alpha.md"])
+        );
+        assert_eq!(
+            value["in_flight_note_paths_truncated"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn a_held_watcher_batch_discloses_and_an_index_run_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+
+        let watcher = status_from(
+            &db_path,
+            present(
+                Some(std::process::id() as i32),
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        );
+        let disclosure = watcher
+            .watcher_batch_disclosure()
+            .expect("a live watcher batch must disclose");
+        assert_eq!(disclosure.note_paths, Vec::<String>::new());
+        assert!(!disclosure.note_paths_truncated);
+
+        let index_run = status_from(&db_path, present(Some(std::process::id() as i32), None));
+        assert!(
+            index_run.watcher_batch_disclosure().is_none(),
+            "an ordinary index-run marker must not look like a disclosed watcher batch"
+        );
+    }
+
+    #[test]
+    fn a_wedged_watcher_batch_does_not_disclose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        // No writer authority: free lease makes the marker wedged.
+        let wedged = status_from(
+            &db_path,
+            present(
+                Some(std::process::id() as i32),
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        );
+        assert!(wedged.is_wedged());
+        assert!(wedged.watcher_batch_disclosure().is_none());
     }
 }

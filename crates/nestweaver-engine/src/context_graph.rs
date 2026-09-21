@@ -28,8 +28,16 @@ pub struct ContextGraph {
 
 /// The route captures `generation` before selecting its context and calls this
 /// after workspace filtering. Never publish a mix of old nodes and new edges.
+///
+/// Publication uses the same Q7 predicate as ranked MCP/CLI reads
+/// ([`GraphStore::index_publication_blocks_ranking`]): a non-wedged
+/// `brain watcher batch` marker does **not** fail closed. A full `index`
+/// publication, an unattributed marker, or a generation change still
+/// refuses — HTTP used to call [`GraphStore::is_index_publication_dirty`]
+/// here, which 503'd the UI for the entire watcher-batch window while
+/// `brain_context` over MCP/CLI answered.
 pub fn ensure_context_generation(store: &GraphStore, generation: u64) -> anyhow::Result<()> {
-    if store.is_index_publication_dirty() || store.graph_generation() != generation {
+    if store.index_publication_blocks_ranking() || store.graph_generation() != generation {
         return Err(StoreError::RankingUnavailable.into());
     }
     Ok(())
@@ -275,6 +283,44 @@ mod tests {
         store.bump_graph_generation();
         assert!(
             attach_context_graph(&store, &mut context(), &VisibleRepos::All, generation).is_err()
+        );
+    }
+
+    #[test]
+    fn watcher_batch_publication_does_not_refuse_context_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        std::fs::write(
+            nestweaver_store::index_publication::marker_path(&db_path),
+            nestweaver_store::index_publication::format_marker_payload(
+                std::process::id(),
+                1,
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        ensure_context_generation(&store, generation)
+            .expect("a live watcher batch must not fail HTTP context closed");
+    }
+
+    #[test]
+    fn ordinary_index_publication_still_refuses_context_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        std::fs::write(
+            nestweaver_store::index_publication::marker_path(&db_path),
+            nestweaver_store::index_publication::format_marker_payload(std::process::id(), 1, None),
+        )
+        .unwrap();
+        assert!(
+            ensure_context_generation(&store, generation).is_err(),
+            "a full index publication must still refuse ranked HTTP context"
         );
     }
 

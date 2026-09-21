@@ -412,6 +412,118 @@ async fn brain_context_valid_seed_still_200() {
         post_json(&app, "/api/v1/brain/context", json!({ "seeds": ["greet"] })).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert!(json.get("seeds").is_some(), "response should have 'seeds'");
+    assert!(
+        json.get("publication_in_progress").is_none(),
+        "an in-memory store must not inherit a leftover on-disk marker: {json}"
+    );
+}
+
+fn populate_on_disk_store(store: &GraphStore) {
+    store
+        .insert_repo(&Repo {
+            uid: "repo:test".to_string(),
+            url: "https://example.com/test.git".to_string(),
+            indexed_sha: "abc123".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: None,
+            root_path: None,
+        })
+        .unwrap();
+    store
+        .insert_symbol(&Symbol {
+            uid: "sym:test:greet".to_string(),
+            name: "greet".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/main.js".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "function greet(name)".to_string(),
+            summary: None,
+            content_hash: "hash123".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.85),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        })
+        .unwrap();
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+}
+
+fn write_publication_marker(
+    db_path: &std::path::Path,
+    reason: Option<&str>,
+    note_paths: &[String],
+) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        nestweaver_store::index_publication::marker_path(db_path),
+        nestweaver_store::index_publication::format_marker_payload_with_note_paths(
+            std::process::id(),
+            nanos,
+            reason,
+            note_paths,
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn brain_context_during_watcher_batch_is_200_with_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let store = GraphStore::open_or_create(&db_path).unwrap();
+    populate_on_disk_store(&store);
+    let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+    let note_paths = vec!["Workspaces/Alpha.md".to_string()];
+    write_publication_marker(
+        &db_path,
+        Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+        &note_paths,
+    );
+    let app = create_router(AppState::new(store, None, db_path));
+    let (status, json) =
+        post_json(&app, "/api/v1/brain/context", json!({ "seeds": ["greet"] })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("seeds").is_some(), "{json}");
+    assert!(
+        json.get("edges").is_some(),
+        "HTTP context must keep edges: {json}"
+    );
+    assert_eq!(json["publication_in_progress"], json!(true));
+    assert!(json["marker_age_s"].is_number(), "{json}");
+    assert_eq!(json["in_flight_note_paths"], json!(note_paths));
+    assert_eq!(json["in_flight_note_paths_truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn brain_context_during_index_publication_is_still_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let store = GraphStore::open_or_create(&db_path).unwrap();
+    populate_on_disk_store(&store);
+    let _authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+    write_publication_marker(&db_path, None, &[]);
+    let app = create_router(AppState::new(store, None, db_path));
+    let (status, json) =
+        post_json(&app, "/api/v1/brain/context", json!({ "seeds": ["greet"] })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("index publication")),
+        "{json}"
+    );
 }
 
 fn make_app_with_ellipsis_and_angle_seeds() -> axum::Router {

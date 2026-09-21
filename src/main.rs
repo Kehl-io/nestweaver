@@ -2598,13 +2598,65 @@ fn print_ranking_json<T: serde::Serialize>(
     staleness: &ResolverStaleness,
     daemon_meta: Option<serde_json::Value>,
     bounds: &RankingBounds,
+    publication_wire: Option<&serde_json::Value>,
+    db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    print_json_payload(&ranking_json_payload(
-        key,
-        rows,
-        staleness,
-        daemon_meta,
-        bounds,
+    let mut payload = ranking_json_payload(key, rows, staleness, daemon_meta, bounds);
+    apply_cli_publication_disclosure(&mut payload, publication_wire, db_path);
+    print_json_payload(&payload)
+}
+
+/// nw-503: CLI `--json` reshape used to drop watcher-batch honesty keys
+/// that MCP already stamped. Prefer the wire (daemon already answered),
+/// then fall back to the local marker so the direct route discloses too.
+fn apply_cli_publication_disclosure(
+    payload: &mut serde_json::Value,
+    publication_wire: Option<&serde_json::Value>,
+    db_path: Option<&std::path::Path>,
+) {
+    if let Some(wire) = publication_wire
+        && wire
+            .get("publication_in_progress")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        for key in [
+            "publication_in_progress",
+            "marker_age_s",
+            "in_flight_note_paths",
+            "in_flight_note_paths_truncated",
+        ] {
+            if let Some(value) = wire.get(key) {
+                payload[key] = value.clone();
+            }
+        }
+        return;
+    }
+    if let Some(path) = db_path {
+        nestweaver_engine::index_publication::stamp_watcher_batch_disclosure(path, payload);
+    }
+}
+
+fn publication_text_note(
+    publication: Option<&nestweaver_engine::index_publication::WatcherBatchDisclosure>,
+) -> Option<String> {
+    let disclosure = publication?;
+    let age = disclosure
+        .marker_age_s
+        .map(|seconds| format!("{seconds}s"))
+        .unwrap_or_else(|| "age unknown".to_string());
+    let paths = if disclosure.note_paths.is_empty() {
+        "none listed".to_string()
+    } else {
+        let joined = disclosure.note_paths.join(", ");
+        if disclosure.note_paths_truncated {
+            format!("{joined} (truncated)")
+        } else {
+            joined
+        }
+    };
+    Some(format!(
+        "Note: index publication in progress (watcher batch, {age}); in-flight notes: {paths}"
     ))
 }
 
@@ -15977,7 +16029,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // Same drop as `brain context`'s daemon arm: this
                             // route calls the SAME `brain_context` tool and
                             // narrowed away the `total` it answered with.
-                            let upstream = UpstreamContextDisclosure::from_wire(&result_json);
+                            let upstream = UpstreamContextDisclosure::from_wire(&result_json)
+                                .with_local_publication(&db_path);
                             let result: nestweaver_engine::BrainContextResult =
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
@@ -16773,10 +16826,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // nw-308: the daemon route is the DEFAULT route, so the
                         // payload disclosure has to be here as well as on the
                         // direct path below.
-                        print_ranking_json("hubs", &hubs, &staleness, daemon_meta, &bounds)?;
+                        print_ranking_json(
+                            "hubs",
+                            &hubs,
+                            &staleness,
+                            daemon_meta,
+                            &bounds,
+                            Some(&value),
+                            None,
+                        )?;
                     } else if hubs.is_empty() {
                         println!("No hub nodes found (graph may be empty).");
                     } else {
+                        if let Some(note) =
+                            publication_text_note(publication_from_wire(&value).as_ref())
+                        {
+                            println!("{note}\n");
+                        }
                         println!(
                             "Top {} hub nodes (by total degree):\n",
                             bounds.header_count(hubs.len())
@@ -16876,10 +16942,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &ResolverStaleness::from_store(&store, &db_path),
                     None,
                     &bounds,
+                    None,
+                    Some(&db_path),
                 )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
             } else {
+                if let Some(note) = publication_text_note(
+                    nestweaver_engine::index_publication::status(&db_path)
+                        .watcher_batch_disclosure()
+                        .as_ref(),
+                ) {
+                    println!("{note}\n");
+                }
                 println!(
                     "Top {} hub nodes (by total degree):\n",
                     bounds.header_count(hubs.len())
@@ -16956,6 +17031,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // the payload says `null`, which is the honest "this route
                         // was not told" rather than a fabricated `false`.
                         let bounds = RankingBounds::from_daemon_response(&value);
+                        let publication_wire = value.clone();
                         let bridges: Vec<nestweaver_engine::BridgeNode> =
                             match strip_hybrid_meta(value).get("bridges").cloned() {
                                 Some(serde_json::Value::Null) | None => Vec::new(),
@@ -16971,10 +17047,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &staleness,
                                 daemon_meta,
                                 &bounds,
+                                Some(&publication_wire),
+                                None,
                             )?;
                         } else if bridges.is_empty() {
                             println!("No bridge nodes found (graph may be empty).");
                         } else {
+                            if let Some(note) = publication_text_note(
+                                publication_from_wire(&publication_wire).as_ref(),
+                            ) {
+                                println!("{note}\n");
+                            }
                             println!(
                                 "Top {} bridge nodes (by betweenness centrality):\n",
                                 bounds.header_count(bridges.len())
@@ -17069,10 +17152,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &ResolverStaleness::from_store(&store, &db_path),
                     None,
                     &bounds,
+                    None,
+                    Some(&db_path),
                 )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
             } else {
+                if let Some(note) = publication_text_note(
+                    nestweaver_engine::index_publication::status(&db_path)
+                        .watcher_batch_disclosure()
+                        .as_ref(),
+                ) {
+                    println!("{note}\n");
+                }
                 println!(
                     "Top {} bridge nodes (by betweenness centrality):\n",
                     bounds.header_count(bridges.len())
@@ -28504,7 +28596,8 @@ fn run_brain(
                     // `total`, `truncated`, `truncated_by` and `_meta` are not
                     // among them, and dropping them here is what made a capped
                     // answer on this route indistinguishable from a complete one.
-                    let upstream = UpstreamContextDisclosure::from_wire(&result_json);
+                    let upstream = UpstreamContextDisclosure::from_wire(&result_json)
+                        .with_local_publication(&db_path);
                     let result: nestweaver_engine::BrainContextResult =
                         serde_json::from_value(result_json)?;
                     let cut = match token_budget {
@@ -28844,7 +28937,8 @@ fn run_brain(
                     // Direct route: `result.connected` is the pre-cut list this
                     // process built, so there is no upstream to defer to and the
                     // local length IS the honest total.
-                    let upstream = UpstreamContextDisclosure::default();
+                    let upstream =
+                        UpstreamContextDisclosure::default().with_local_publication(&db_path);
                     if json {
                         print_brain_context_json(&result, cut, token_budget, &upstream)?;
                     } else {
@@ -30042,6 +30136,9 @@ fn print_brain_context_text(
     token_budget: Option<usize>,
     upstream: &UpstreamContextDisclosure,
 ) {
+    if let Some(note) = publication_text_note(upstream.publication.as_ref()) {
+        println!("{note}");
+    }
     if let Some(detail) = &result.semantic_unavailable {
         println!(
             "Warning: semantic retrieval unavailable ({}). {}",
@@ -33556,6 +33653,10 @@ struct UpstreamContextDisclosure {
     /// sources answered, and whether any repo was stale. Dropping it told the
     /// caller a merged multi-repo answer was a local one.
     meta: Option<serde_json::Value>,
+    /// nw-503: watcher-batch honesty keys. Captured from the wire before
+    /// `BrainContextResult` decode drops them, or from the local marker on
+    /// the direct route.
+    publication: Option<nestweaver_engine::index_publication::WatcherBatchDisclosure>,
 }
 
 impl UpstreamContextDisclosure {
@@ -33572,7 +33673,16 @@ impl UpstreamContextDisclosure {
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize),
             meta: value.get("_meta").cloned(),
+            publication: publication_from_wire(value),
         }
+    }
+
+    fn with_local_publication(mut self, db_path: &std::path::Path) -> Self {
+        if self.publication.is_none() {
+            self.publication =
+                nestweaver_engine::index_publication::status(db_path).watcher_batch_disclosure();
+        }
+        self
     }
 
     /// The pre-cut total, preferring the upstream's when it supplied one.
@@ -33683,7 +33793,37 @@ fn brain_context_json_value(
         .meta
         .clone()
         .unwrap_or_else(|| nestweaver_schema::provenance::provenance("direct", &["direct"], &[]));
+    if let Some(disclosure) = &upstream.publication {
+        disclosure.stamp_into(&mut resp);
+    }
     resp
+}
+
+fn publication_from_wire(
+    value: &serde_json::Value,
+) -> Option<nestweaver_engine::index_publication::WatcherBatchDisclosure> {
+    if value
+        .get("publication_in_progress")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    Some(
+        nestweaver_engine::index_publication::WatcherBatchDisclosure {
+            marker_age_s: value
+                .get("marker_age_s")
+                .and_then(serde_json::Value::as_u64),
+            note_paths: value
+                .get("in_flight_note_paths")
+                .and_then(|paths| serde_json::from_value(paths.clone()).ok())
+                .unwrap_or_default(),
+            note_paths_truncated: value
+                .get("in_flight_note_paths_truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -33767,6 +33907,40 @@ mod context_json_renderer_tests {
             serde_json::json!(["semantic"])
         );
         assert_eq!(value["unresolved_seeds"], serde_json::json!(["missing"]));
+    }
+
+    #[test]
+    fn brain_context_json_keeps_watcher_batch_disclosure() {
+        let mut result = degraded_context();
+        result.connected = vec![nestweaver_engine::BrainNode {
+            uid: "note:1".into(),
+            kind: "Note".into(),
+            title: "Fixture".into(),
+            location: "fixture.md".into(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }];
+        let upstream = UpstreamContextDisclosure {
+            publication: Some(
+                nestweaver_engine::index_publication::WatcherBatchDisclosure {
+                    marker_age_s: Some(9),
+                    note_paths: vec!["Alpha.md".into()],
+                    note_paths_truncated: false,
+                },
+            ),
+            ..Default::default()
+        };
+        let value = brain_context_json_value(&result, 30, None, &upstream);
+        assert_eq!(value["publication_in_progress"], serde_json::json!(true));
+        assert_eq!(value["marker_age_s"], serde_json::json!(9));
+        assert_eq!(
+            value["in_flight_note_paths"],
+            serde_json::json!(["Alpha.md"])
+        );
+        let clean =
+            brain_context_json_value(&result, 30, None, &UpstreamContextDisclosure::default());
+        assert!(clean.get("publication_in_progress").is_none());
     }
 }
 
@@ -45360,6 +45534,47 @@ mod cli_honesty_sweep_tests {
         assert_eq!(bounds.sampled, Some(true));
         assert_eq!(bounds.sources_sampled, Some(500));
         assert_eq!(bounds.header_count(3), "3 of 4182");
+    }
+
+    #[test]
+    fn ranking_json_keeps_watcher_batch_disclosure_from_the_wire() {
+        let rows: Vec<&str> = vec![];
+        let mut payload = ranking_json_payload(
+            "hubs",
+            &rows,
+            &staleness_fixture(),
+            None,
+            &RankingBounds::default(),
+        );
+        apply_cli_publication_disclosure(
+            &mut payload,
+            Some(&serde_json::json!({
+                "publication_in_progress": true,
+                "marker_age_s": 4,
+                "in_flight_note_paths": ["Alpha.md"],
+                "in_flight_note_paths_truncated": false
+            })),
+            None,
+        );
+        assert_eq!(payload["publication_in_progress"], serde_json::json!(true));
+        assert_eq!(payload["marker_age_s"], serde_json::json!(4));
+        assert_eq!(
+            payload["in_flight_note_paths"],
+            serde_json::json!(["Alpha.md"])
+        );
+        let mut clean = ranking_json_payload(
+            "hubs",
+            &rows,
+            &staleness_fixture(),
+            None,
+            &RankingBounds::default(),
+        );
+        apply_cli_publication_disclosure(&mut clean, Some(&serde_json::json!({})), None);
+        assert!(clean.get("publication_in_progress").is_none());
+        assert!(
+            publication_text_note(None).is_none(),
+            "an ordinary read must print no publication note"
+        );
     }
 
     // ── nw-399 ───────────────────────────────────────────────────────────
