@@ -1,5 +1,18 @@
 # Changelog
 
+## [10.1.0](https://github.com/Kehl-io/nestweaver/compare/v10.0.9...v10.1.0) (2026-09-22)
+
+
+### Features
+
+* **guide:** update only the marked section of AGENTS.md ([de0a51b](https://github.com/Kehl-io/nestweaver/commit/de0a51b1397d77e8de01ca970f9ad74342f527e3))
+* **guide:** update only the marked section of AGENTS.md ([22af422](https://github.com/Kehl-io/nestweaver/commit/22af422087632195b7b23abf8ac2f7fa3f62591a))
+
+
+### Bug Fixes
+
+* **daemon:** recover blocked vault derivation and stamp past policy skips ([#418](https://github.com/Kehl-io/nestweaver/issues/418)) ([c748ea6](https://github.com/Kehl-io/nestweaver/commit/c748ea6baeffd406125e8418f975764b0ed76fbb))
+
 ## [10.0.9](https://github.com/Kehl-io/nestweaver/compare/v10.0.8...v10.0.9) (2026-09-21)
 
 
