@@ -605,7 +605,7 @@ impl VaultDerivationRecord {
         if self.derivation_version != DERIVATION_VERSION
             || result.index.vault_uid != self.vault_uid
             || result.index.notes_count != expected_notes
-            || !result.index.skipped.is_empty()
+            || result.index.skipped.iter().any(is_coverage_gap)
             || result.publication.disposition
                 != crate::manifest::GraphMutationPublicationDisposition::CommittedComplete
             || !result.publication.warnings.is_empty()
@@ -660,6 +660,35 @@ impl VaultDerivationRecord {
         *self = next;
         Ok(())
     }
+}
+
+/// Whether a skipped file leaves a vault's Markdown derivation incomplete.
+///
+/// `Ignored` (a `.brainignore` match or a default-pruned directory),
+/// `Unsupported`, `Oversized` and `Binary` skips are decided by the coverage
+/// policy the record already binds, so re-running derivation can never change
+/// them. Counting them as gaps made every vault with an ignore rule impossible
+/// to stamp. Read and parse failures, cancellation and unknown causes are real
+/// gaps.
+pub fn is_coverage_gap(skip: &nestweaver_parser::SkippedFile) -> bool {
+    use nestweaver_parser::SkipReasonCode;
+    !matches!(
+        skip.reason_code,
+        SkipReasonCode::Ignored
+            | SkipReasonCode::Unsupported
+            | SkipReasonCode::Oversized
+            | SkipReasonCode::Binary
+    )
+}
+
+/// Blocked admission is not retryable, so the writer retries a Blocked record
+/// on its own backoff schedule instead. A Blocked record with no schedule is
+/// due at once rather than stranded.
+pub fn blocked_retry_due(record: &VaultDerivationRecord, now_unix_seconds: u64) -> bool {
+    record.phase == DerivationPhase::Blocked
+        && record
+            .retry_after_unix_seconds
+            .is_none_or(|retry_after| now_unix_seconds >= retry_after)
 }
 
 /// Tools whose answers depend on current Markdown link derivation.
@@ -879,5 +908,151 @@ mod tests {
         let reused =
             admit_vault(Some(&records), &expected, &vault, &source, &legacy, false).unwrap_err();
         assert_eq!(reused.reason, AdmissionReason::MigrationPending);
+    }
+
+    #[test]
+    fn only_failure_skips_are_coverage_gaps() {
+        use nestweaver_parser::{SkipReasonCode, SkippedFile};
+        for code in [
+            SkipReasonCode::Ignored,
+            SkipReasonCode::Unsupported,
+            SkipReasonCode::Oversized,
+            SkipReasonCode::Binary,
+        ] {
+            assert!(
+                !is_coverage_gap(&SkippedFile::new("a.md", code, "policy")),
+                "{code:?} is decided by coverage policy; retrying cannot change it"
+            );
+        }
+        for code in [
+            SkipReasonCode::ReadError,
+            SkipReasonCode::ParseError,
+            SkipReasonCode::Cancelled,
+            SkipReasonCode::Other,
+        ] {
+            assert!(
+                is_coverage_gap(&SkippedFile::new("a.md", code, "failure")),
+                "{code:?} is a failure and must keep derivation incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_graph_accepts_policy_skips_and_refuses_failure_skips() {
+        use crate::index_md::{MarkdownIndexResult, MarkdownRefreshResult};
+        use crate::manifest::{
+            GraphMutationPublicationDisposition, GraphMutationPublicationOutcome,
+        };
+        use nestweaver_parser::{SkipReasonCode, SkippedFile};
+        let id = identity();
+        let vault = Vault {
+            uid: vault_uid("brain", "/tmp/vault"),
+            name: "vault".into(),
+            root_path: "/tmp/vault".into(),
+            instance_id: "brain".into(),
+        };
+        let source = SourceIdentity {
+            provider: SourceProvider::Filesystem,
+            canonical_root: "/tmp/vault".into(),
+            provider_repo_uid: None,
+        };
+        let coverage = CoverageIdentity {
+            scope: CoverageScope::FullRegisteredPolicy,
+            policy_digest: "a".repeat(64),
+            max_note_bytes: 1024,
+            extra_ignore_patterns: Vec::new(),
+        };
+        let result = |skipped: Vec<SkippedFile>| MarkdownRefreshResult {
+            index: MarkdownIndexResult {
+                vault_uid: vault.uid.clone(),
+                vault_name: "vault".into(),
+                notes_count: 2,
+                headings_count: 2,
+                sections_count: 2,
+                tags_count: 0,
+                resolved_link_edges: 1,
+                unresolved_link_occurrences: 0,
+                unresolved_link_section_targets: 0,
+                unresolved_link_targets: 0,
+                skipped,
+            },
+            notes_deleted: 0,
+            publication: GraphMutationPublicationOutcome {
+                disposition: GraphMutationPublicationDisposition::CommittedComplete,
+                generation_before: 1,
+                generation_after: 2,
+                warnings: Vec::new(),
+            },
+            notes_near_size_limit: Vec::new(),
+        };
+
+        let mut record = VaultDerivationRecord::pending(&vault, source.clone(), coverage.clone());
+        record
+            .record_complete_graph(
+                &result(vec![SkippedFile::new(
+                    "secret.md",
+                    SkipReasonCode::Ignored,
+                    "matched .brainignore pattern",
+                )]),
+                2,
+                "b".repeat(64),
+                &id,
+            )
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            DerivationPhase::GraphCommittedAwaitingReconciliation
+        );
+        assert_eq!(record.pending_generation, Some(2));
+
+        let mut record = VaultDerivationRecord::pending(&vault, source, coverage);
+        let refused = record.record_complete_graph(
+            &result(vec![SkippedFile::new(
+                "B.md",
+                SkipReasonCode::ReadError,
+                "read error",
+            )]),
+            2,
+            "b".repeat(64),
+            &id,
+        );
+        assert_eq!(refused, Err(RecordError::IncompletePublication));
+        assert_eq!(record.phase, DerivationPhase::Pending);
+    }
+
+    #[test]
+    fn blocked_record_is_retry_due_only_after_its_backoff() {
+        let vault = Vault {
+            uid: vault_uid("brain", "/tmp/vault"),
+            name: "vault".into(),
+            root_path: "/tmp/vault".into(),
+            instance_id: "brain".into(),
+        };
+        let source = SourceIdentity {
+            provider: SourceProvider::Filesystem,
+            canonical_root: "/tmp/vault".into(),
+            provider_repo_uid: None,
+        };
+        let coverage = CoverageIdentity {
+            scope: CoverageScope::LegacyIndexedInventory,
+            policy_digest: "a".repeat(64),
+            max_note_bytes: 1024,
+            extra_ignore_patterns: Vec::new(),
+        };
+        let mut record = VaultDerivationRecord::pending(&vault, source, coverage);
+        assert!(
+            !blocked_retry_due(&record, 1_000),
+            "a pending record is migrated through admission, not the blocked retry"
+        );
+        record.phase = DerivationPhase::Blocked;
+        record.last_error = Some(BlockedReason::SourceUnavailable);
+        record.retry_after_unix_seconds = Some(1_000);
+        assert!(!blocked_retry_due(&record, 999));
+        assert!(blocked_retry_due(&record, 1_000));
+        record.retry_after_unix_seconds = None;
+        assert!(
+            blocked_retry_due(&record, 0),
+            "a blocked record with no schedule must not be stranded"
+        );
     }
 }

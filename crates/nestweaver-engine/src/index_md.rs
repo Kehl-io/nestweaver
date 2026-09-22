@@ -2489,6 +2489,14 @@ where
                         note_limit_bytes,
                     ));
                 }
+                // nw-355, as on the code index path: a NUL byte in the
+                // leading 8 KiB is a policy skip, not a read failure.
+                if err
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some()
+                {
+                    return NoteOutcome::Skipped(SkippedFile::binary(rel_path));
+                }
                 return NoteOutcome::Skipped(SkippedFile::new(
                     rel_path,
                     SkipReasonCode::ReadError,

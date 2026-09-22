@@ -16091,6 +16091,281 @@ credential_method = "gh"
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
     }
 
+    async fn index_vault_via_rpc(state: &Arc<DaemonState>, root: &Path) -> Vec<IndexProgress> {
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(IndexVaultRequest {
+            vault_path: root.display().to_string(),
+            vault_name: "vault".to_string(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut rx = service
+            .index_vault(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .into_inner();
+        let mut progress = Vec::new();
+        while let Some(event) = rx.recv().await {
+            progress.push(event.unwrap());
+        }
+        progress
+    }
+
+    fn vault_derivation_record(
+        state: &DaemonState,
+    ) -> nestweaver_engine::markdown_derivation::VaultDerivationRecord {
+        let identity = state.store.publication_identity().unwrap().unwrap();
+        let records = nestweaver_engine::markdown_derivation::load_records(
+            &state.db_path,
+            &nestweaver_engine::markdown_derivation::expectation(
+                &identity,
+                &state.data_instance_id,
+            ),
+        )
+        .unwrap()
+        .expect("derivation records persisted");
+        assert_eq!(records.vaults.len(), 1, "{records:?}");
+        records.vaults.into_values().next().unwrap()
+    }
+
+    fn save_vault_derivation_record(
+        state: &DaemonState,
+        record: nestweaver_engine::markdown_derivation::VaultDerivationRecord,
+    ) {
+        let identity = state.store.publication_identity().unwrap().unwrap();
+        let records = nestweaver_engine::markdown_derivation::DerivationRecords {
+            vaults: std::collections::BTreeMap::from([(record.vault_uid.clone(), record)]),
+        };
+        nestweaver_engine::markdown_derivation::save_records(
+            &state.db_path,
+            &records,
+            &nestweaver_engine::markdown_derivation::expectation(
+                &identity,
+                &state.data_instance_id,
+            ),
+        )
+        .unwrap();
+    }
+
+    fn block_vault_derivation(state: &DaemonState, retry_after_unix_seconds: u64) {
+        use nestweaver_engine::markdown_derivation::{BlockedReason, DerivationPhase};
+        let mut record = vault_derivation_record(state);
+        record.phase = DerivationPhase::Blocked;
+        record.last_error = Some(BlockedReason::SourceUnavailable);
+        record.attempts = 1;
+        record.retry_after_unix_seconds = Some(retry_after_unix_seconds);
+        record.witness = None;
+        record.pending_generation = None;
+        record.completed_generation = None;
+        save_vault_derivation_record(state, record);
+    }
+
+    /// A `.brainignore` match and a default-pruned directory are coverage
+    /// POLICY, not coverage failures. Before the fix every vault with either
+    /// failed `brain add` with "vault derivation requires complete publication
+    /// coverage", which also left `brain add` unable to clear a Blocked record.
+    #[tokio::test]
+    async fn index_vault_stamps_derivation_when_only_policy_skips() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+        std::fs::write(root.join("secret.md"), "# Secret\n").unwrap();
+        std::fs::create_dir(root.join("__pycache__")).unwrap();
+        std::fs::write(root.join("__pycache__/cached.md"), "# Cached\n").unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(
+            last.phase,
+            Phase::Done as i32,
+            "IndexVault must succeed: {}",
+            last.message
+        );
+        assert!(
+            last.skipped_count >= 2,
+            "the fixture must actually exercise policy skips: {last:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+    }
+
+    /// Counterweight to the policy-skip test: a note the reader cannot read is
+    /// a genuine coverage gap and must still keep derivation from stamping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_refuses_derivation_when_a_note_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::set_permissions(root.join("B.md"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::read(root.join("B.md")).is_ok() {
+            // Running as root: permissions cannot make the note unreadable.
+            return;
+        }
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        std::fs::set_permissions(root.join("B.md"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(last.phase, Phase::Error as i32, "{last:?}");
+        assert!(
+            last.message
+                .contains("vault derivation requires complete publication coverage"),
+            "{}",
+            last.message
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// Blocked used to be terminal: admission reported it non-retryable, so
+    /// neither the background loop nor RefreshVaultSince ever migrated it
+    /// again, even after the source recovered.
+    #[tokio::test]
+    async fn blocked_derivation_recovers_once_its_retry_is_due() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        block_vault_derivation(&state, now + 3_600);
+        let refused = vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+        assert!(refused.message().contains("SourceBlocked"), "{refused:?}");
+        assert_eq!(
+            vault_derivation::inspect_next(&state).unwrap(),
+            None,
+            "a blocked vault must wait out its backoff"
+        );
+        // migrate_named re-admits under the write lease, so it must refuse a
+        // vault that is not due even when asked for it by name.
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        vault_derivation::migrate_named(&state, &vault_uid)
+            .expect_err("a blocked vault inside its backoff is not migrated");
+        let still_blocked = vault_derivation_record(&state);
+        assert_eq!(still_blocked.phase, DerivationPhase::Blocked);
+        assert_eq!(still_blocked.attempts, 1);
+
+        // Background loop path.
+        block_vault_derivation(&state, now.saturating_sub(1));
+        let due = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a due blocked vault is picked up for migration");
+        vault_derivation::migrate_named(&state, &due).unwrap();
+        let healed = vault_derivation_record(&state);
+        assert_eq!(healed.phase, DerivationPhase::Current);
+        assert_eq!(healed.attempts, 0, "success resets the backoff");
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+
+        // RefreshVaultSince / watcher path.
+        block_vault_derivation(&state, now + 3_600);
+        vault_derivation::ensure_current(&state, &root, &[], 1024 * 1024)
+            .expect_err("RefreshVaultSince must wait out the backoff too");
+        block_vault_derivation(&state, now.saturating_sub(1));
+        vault_derivation::ensure_current(&state, &root, &[], 1024 * 1024).unwrap();
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+    }
+
+    /// A failed migration must wait out its backoff even when the record is
+    /// on an older derivation version. OlderVersion admission is retryable
+    /// and is checked before the phase, so a Blocked record that kept its old
+    /// version was re-migrated by the background loop every few seconds.
+    #[tokio::test]
+    async fn failed_derivation_migration_of_an_older_version_waits_out_its_backoff() {
+        use nestweaver_engine::markdown_derivation::{DERIVATION_VERSION, DerivationPhase};
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+
+        let mut record = vault_derivation_record(&state);
+        record.derivation_version = DERIVATION_VERSION - 1;
+        record.phase = DerivationPhase::Pending;
+        record.witness = None;
+        record.pending_generation = None;
+        record.completed_generation = None;
+        save_vault_derivation_record(&state, record);
+        // The indexed inventory still lists B.md, so the migration's source
+        // capture fails.
+        std::fs::remove_file(root.join("B.md")).unwrap();
+
+        let due = vault_derivation::inspect_next(&state).unwrap().unwrap();
+        vault_derivation::migrate_named(&state, &due).unwrap_err();
+        let blocked = vault_derivation_record(&state);
+        assert_eq!(blocked.phase, DerivationPhase::Blocked);
+        assert_eq!(blocked.attempts, 1);
+        assert_eq!(blocked.derivation_version, DERIVATION_VERSION);
+        assert_eq!(
+            vault_derivation::inspect_next(&state).unwrap(),
+            None,
+            "a failed migration must not be retried before its backoff"
+        );
+
+        // Once due it is retried, and a repeat failure doubles the backoff.
+        let mut due_record = blocked;
+        due_record.retry_after_unix_seconds = Some(0);
+        save_vault_derivation_record(&state, due_record);
+        let due = vault_derivation::inspect_next(&state).unwrap().unwrap();
+        vault_derivation::migrate_named(&state, &due).unwrap_err();
+        let reblocked = vault_derivation_record(&state);
+        assert_eq!(reblocked.attempts, 2);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let delay = reblocked.retry_after_unix_seconds.unwrap() - now;
+        assert!(
+            (55..=60).contains(&delay),
+            "second failure backs off ~60s: {delay}"
+        );
+    }
+
+    /// A NUL byte in a note's leading 8 KiB is the same policy skip the code
+    /// indexer already records (nw-355). The vault indexer reported it as a
+    /// read failure, which blocked derivation for good.
+    #[tokio::test]
+    async fn index_vault_stamps_derivation_past_a_binary_note() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::write(root.join("nul.md"), b"# N\0\n").unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.skipped_count, 1, "{last:?}");
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+    }
+
     #[test]
     fn remove_vault_targeted_extension_cleanup_preserves_unrelated_note_keys() {
         use nestweaver_schema::{Note, NoteKind, Vault};

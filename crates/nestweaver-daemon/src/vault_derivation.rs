@@ -89,16 +89,45 @@ fn lookup_vault(state: &DaemonState, vault_path: &Path) -> anyhow::Result<Vault>
         .ok_or_else(|| anyhow::anyhow!("indexed vault is not present in the graph"))
 }
 
+const BLOCKED_RETRY_BASE_SECS: u64 = 30;
+const BLOCKED_RETRY_MAX_SECS: u64 = 60 * 60;
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Every retry of a Blocked vault is a full derivation refresh under the
+/// writer, so the schedule doubles per consecutive failure up to an hour.
+fn blocked_retry_delay(attempts: u32) -> u64 {
+    let doublings = attempts.saturating_sub(1).min(16);
+    BLOCKED_RETRY_BASE_SECS
+        .saturating_mul(1 << doublings)
+        .min(BLOCKED_RETRY_MAX_SECS)
+}
+
+fn blocked_retry_due(records: Option<&DerivationRecords>, vault_uid: &str) -> bool {
+    records
+        .and_then(|records| records.vaults.get(vault_uid))
+        .is_some_and(|record| markdown_derivation::blocked_retry_due(record, now_unix_seconds()))
+}
+
 fn block_record(record: &mut VaultDerivationRecord, reason: markdown_derivation::BlockedReason) {
+    block_record_at(record, reason, now_unix_seconds());
+}
+
+fn block_record_at(
+    record: &mut VaultDerivationRecord,
+    reason: markdown_derivation::BlockedReason,
+    now_unix_seconds: u64,
+) {
     record.phase = DerivationPhase::Blocked;
     record.last_error = Some(reason);
     record.attempts = record.attempts.saturating_add(1);
-    record.retry_after_unix_seconds = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() + 30)
-            .unwrap_or(30),
-    );
+    record.retry_after_unix_seconds =
+        Some(now_unix_seconds.saturating_add(blocked_retry_delay(record.attempts)));
     record.witness = None;
     record.pending_generation = None;
     record.completed_generation = None;
@@ -112,7 +141,11 @@ fn stamp_from_refresh(
     scope: CoverageScope,
     result: &MarkdownRefreshResult,
 ) -> anyhow::Result<()> {
-    if !result.index.skipped.is_empty()
+    if result
+        .index
+        .skipped
+        .iter()
+        .any(markdown_derivation::is_coverage_gap)
         || result.publication.disposition
             != nestweaver_engine::manifest::GraphMutationPublicationDisposition::CommittedComplete
     {
@@ -144,6 +177,7 @@ fn stamp_from_refresh(
     record.completed_generation = None;
     record.last_error = None;
     record.retry_after_unix_seconds = None;
+    record.attempts = 0;
     record.record_complete_graph(
         result,
         result.index.notes_count,
@@ -207,6 +241,10 @@ fn migrate_vault(
         .unwrap_or_else(|| VaultDerivationRecord::pending(vault, source.clone(), coverage.clone()));
     record.source = source.clone();
     record.coverage = coverage.clone();
+    // This attempt targets the current version. Keeping the old one would
+    // let OlderVersion (retryable, checked before the phase) bypass the
+    // Blocked backoff if the attempt fails.
+    record.derivation_version = markdown_derivation::DERIVATION_VERSION;
     record.phase = DerivationPhase::Pending;
     record.witness = None;
     record.pending_generation = None;
@@ -247,7 +285,23 @@ fn migrate_vault(
         IndexedSearchMutationScope::MayIncludeVaultFiles,
     );
     finish_search_reconciliation(state, mutation, "vault_derivation", admission)?;
-    stamp_from_refresh(state, vault, extra, max_note_bytes, coverage.scope, &result)
+    if let Err(error) =
+        stamp_from_refresh(state, vault, extra, max_note_bytes, coverage.scope, &result)
+    {
+        // Left Pending, the record would be admitted as retryable again at
+        // once and the background loop would rerun a full refresh every few
+        // seconds. Blocked retries on the backoff schedule instead.
+        let mut records = load_or_empty(state, &identity)?;
+        if let Some(record) = records.vaults.get_mut(&vault.uid) {
+            block_record(
+                record,
+                markdown_derivation::BlockedReason::PublicationIncomplete,
+            );
+        }
+        persist(state, &identity, &records)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_current(
@@ -286,13 +340,15 @@ pub(super) fn ensure_current(
         false,
     ) {
         Ok(()) => Ok(()),
-        Err(error) if error.retryable => migrate_vault(
-            state,
-            &vault,
-            extra,
-            max_note_bytes,
-            CoverageScope::FullRegisteredPolicy,
-        ),
+        Err(error) if error.retryable || blocked_retry_due(records.as_ref(), &vault.uid) => {
+            migrate_vault(
+                state,
+                &vault,
+                extra,
+                max_note_bytes,
+                CoverageScope::FullRegisteredPolicy,
+            )
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -393,7 +449,7 @@ pub(super) async fn run(state: Arc<DaemonState>) {
     }
 }
 
-fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>> {
+pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>> {
     let identity = match state.store.publication_identity()? {
         Some(identity) => identity,
         None => return Ok(None),
@@ -423,7 +479,7 @@ fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>> {
             &coverage,
             false,
         )
-        .is_err_and(|error| error.retryable)
+        .is_err_and(|error| error.retryable || blocked_retry_due(Some(&records), &vault.uid))
         {
             return Ok(Some(vault.uid));
         }
@@ -431,7 +487,7 @@ fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
+pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
     let vault = state
         .store
         .list_vaults(None)?
@@ -463,13 +519,15 @@ fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
         false,
     ) {
         Ok(()) => Ok(()),
-        Err(error) if error.retryable => migrate_vault(
-            state,
-            &vault,
-            &extra,
-            max_note_bytes,
-            CoverageScope::LegacyIndexedInventory,
-        ),
+        Err(error) if error.retryable || blocked_retry_due(Some(&records), &vault.uid) => {
+            migrate_vault(
+                state,
+                &vault,
+                &extra,
+                max_note_bytes,
+                CoverageScope::LegacyIndexedInventory,
+            )
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -517,5 +575,38 @@ mod tests {
         .unwrap();
         assert_eq!(coverage.scope, CoverageScope::FullRegisteredPolicy);
         assert_eq!(coverage.policy_digest, full.policy_digest);
+    }
+
+    #[test]
+    fn block_record_backs_off_exponentially_to_a_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vault = Vault {
+            uid: vault_uid("brain", root.to_str().unwrap()),
+            name: "vault".into(),
+            root_path: root.display().to_string(),
+            instance_id: "brain".into(),
+        };
+        let source = markdown_derivation::SourceIdentity {
+            provider: markdown_derivation::SourceProvider::Filesystem,
+            canonical_root: root.display().to_string(),
+            provider_repo_uid: None,
+        };
+        let coverage =
+            coverage_identity(root, &[], 1024, CoverageScope::LegacyIndexedInventory).unwrap();
+        let mut record = VaultDerivationRecord::pending(&vault, source, coverage);
+        let delays: Vec<u64> = (0..10)
+            .map(|_| {
+                block_record_at(
+                    &mut record,
+                    markdown_derivation::BlockedReason::SourceUnavailable,
+                    1_000,
+                );
+                record.retry_after_unix_seconds.unwrap() - 1_000
+            })
+            .collect();
+        assert_eq!(delays, [30, 60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]);
+        assert_eq!(record.attempts, 10);
+        assert_eq!(record.phase, DerivationPhase::Blocked);
     }
 }
