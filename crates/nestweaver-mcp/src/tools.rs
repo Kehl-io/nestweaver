@@ -931,6 +931,22 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
         "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
             Some("conflicting arguments: pass only one of 'pattern' or 'query'")
         }
+        // nw-630: `symbol` is an alias of `name`. Unlike `pattern`/`query`,
+        // which reject the pair unconditionally, this only rejects a
+        // genuine conflict — an agent that copy-pasted an argument object
+        // between tools and happens to carry both keys with the SAME value
+        // should not be punished for it.
+        "cross_repo_contracts"
+            if args.get("name").and_then(|v| v.as_str()).is_some_and(|n| {
+                args.get("symbol")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s != n)
+            }) =>
+        {
+            Some(
+                "conflicting arguments: 'name' and 'symbol' are aliases — pass only one, or the same value in both",
+            )
+        }
         _ => None,
     }
 }
@@ -1499,7 +1515,7 @@ mod tool_schema_validation_tests {
         ("detect_changes", &["changed_files", "files"]),
         ("note_get", &["uid", "title"]),
         ("backlinks", &["uid", "title"]),
-        ("cross_repo_contracts", &["uid", "name"]),
+        ("cross_repo_contracts", &["uid", "name", "symbol"]),
         ("affected_tests", &["changed_files", "base_ref"]),
         ("query_extensions", &["uid", "key", "value"]),
     ];
@@ -1525,6 +1541,7 @@ mod tool_schema_validation_tests {
             ("backlinks", json!({ "title": "Home" })),
             ("cross_repo_contracts", json!({ "uid": "sym:x" })),
             ("cross_repo_contracts", json!({ "name": "UserService" })),
+            ("cross_repo_contracts", json!({ "symbol": "UserService" })),
             ("affected_tests", json!({ "changed_files": ["src/a.rs"] })),
             ("affected_tests", json!({ "base_ref": "main" })),
             ("query_extensions", json!({ "uid": "sym:x" })),
@@ -9608,6 +9625,14 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or name_repo to pin one symbol." },
+                // nw-630: `symbol` is an alias of `name`, accepted so an agent
+                // that just called `brain_impact`/`flow_trace` (both take
+                // `symbol`) does not get an `additionalProperties` rejection
+                // for reusing the same argument name here. Passing both
+                // `name` and `symbol` with different values is rejected by
+                // `conflicting_alias_error` before schema validation runs;
+                // passing them with the same value is fine.
+                "symbol": { "type": "string", "description": "Alias of 'name' — accepted for consistency with brain_impact/flow_trace, which take 'symbol'. Symbol name (e.g. \"UserService\"); ambiguous names fail the same way 'name' does." },
                 "name_repo": { "type": "string", "description": "Disambiguate duplicate visible symbol names by repo; ignored for UIDs and globally unique visible names. Does not filter result rows." },
                 "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
@@ -9619,9 +9644,15 @@ fn tool_schema_cross_repo_contracts() -> Value {
             // Hand-coded beside the schema it was invisible to the guide,
             // which published "Key parameters: —" for this tool and WROTE
             // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            //
+            // nw-630 added the third `symbol` branch — `either_or_detail`
+            // renders three branches as "provide one of 'uid', 'name',
+            // 'symbol'" rather than assuming exactly two, so this did not
+            // need a change there.
             "anyOf": [
                 { "required": ["uid"] },
-                { "required": ["name"] }
+                { "required": ["name"] },
+                { "required": ["symbol"] }
             ]
         }
     })
@@ -9649,7 +9680,15 @@ fn tool_cross_repo_contracts(
             }
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
-    } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+    } else if let Some(name) = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        // nw-630: `symbol` is an alias of `name` — `conflicting_alias_error`
+        // already rejected the request before this runs if both were given
+        // with different values, so by the time we get here they either
+        // agree or only one is present.
+        .or_else(|| args.get("symbol").and_then(|v| v.as_str()))
+    {
         let initial = resolve_symbol_strict(store, name, visible, None)?;
         let resolved = match initial {
             StrictNameResolve::Ambiguous(candidates) => classify_name_matches(
@@ -9667,7 +9706,7 @@ fn tool_cross_repo_contracts(
             }
         }
     } else {
-        return Err(anyhow!("provide either 'uid' or 'name'"));
+        return Err(anyhow!("provide either 'uid', 'name', or 'symbol'"));
     };
     let limit = read_limit(
         &args,
@@ -26471,6 +26510,69 @@ mod ambiguous_name_contract_tests {
             tool_cross_repo_contracts(&store, json!({"name": "ping", "repo": "py-ping"}), None)
                 .unwrap();
         assert_eq!(ambiguous["status"], "ambiguous");
+    }
+
+    /// nw-630: `symbol` is an alias of `name` at the HANDLER level — sibling
+    /// tools `brain_impact`/`flow_trace` take `symbol`, and an agent that just
+    /// called one of those was getting `additionalProperties` rejected here
+    /// for reusing the same argument name. Resolving through `symbol` must
+    /// behave identically to resolving through `name`.
+    #[test]
+    fn symbol_argument_resolves_the_same_as_name() {
+        let store = ambiguous_ping_store();
+        let via_name =
+            tool_cross_repo_contracts(&store, json!({"name": "ping", "name_repo": "py"}), None)
+                .unwrap();
+        let via_symbol =
+            tool_cross_repo_contracts(&store, json!({"symbol": "ping", "name_repo": "py"}), None)
+                .unwrap();
+        assert_eq!(via_name, via_symbol);
+        assert_eq!(via_symbol["uid"], "sym:py-ping:ping");
+    }
+
+    /// Counterweight for nw-630: `uid` keeps its own, unaliased behaviour —
+    /// adding `symbol` as a `name` alias must not change how a `uid` lookup
+    /// resolves or errors.
+    #[test]
+    fn uid_argument_is_unaffected_by_the_symbol_alias() {
+        let store = ambiguous_ping_store();
+        let by_uid =
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:py-ping:ping"}), None).unwrap();
+        assert_eq!(by_uid["uid"], "sym:py-ping:ping");
+        // An unknown uid still fails closed rather than silently falling
+        // back to a `symbol`/`name` search.
+        assert!(
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:does-not-exist"}), None).is_err()
+        );
+    }
+
+    /// nw-630: `name` and `symbol` disagreeing is a caller mistake, not a
+    /// silent pick-one — reject at the schema-validation layer before the
+    /// handler ever runs.
+    #[test]
+    fn conflicting_name_and_symbol_are_rejected() {
+        let args = json!({ "name": "ping", "symbol": "pong" });
+        let error = validate_tool_arguments("cross_repo_contracts", &args)
+            .expect_err("conflicting name/symbol must be rejected");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("'name'") && error.contains("'symbol'"),
+            "expected a conflicting-alias error naming both fields: {error}"
+        );
+    }
+
+    /// Counterweight for the conflict check above: the SAME value in both
+    /// `name` and `symbol` is not a conflict.
+    #[test]
+    fn matching_name_and_symbol_are_not_a_conflict() {
+        let store = ambiguous_ping_store();
+        let result = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "symbol": "ping", "name_repo": "py"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["uid"], "sym:py-ping:ping");
     }
 
     #[test]
