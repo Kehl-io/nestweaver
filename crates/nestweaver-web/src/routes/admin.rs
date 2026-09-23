@@ -1926,6 +1926,17 @@ mod tests {
         assert_eq!(gate.waiting(), 0);
     }
 
+    /// nw-654 follow-up: a hermetic stand-in for `state::system_resolver()`,
+    /// used as every test helper's DEFAULT so a future `add_repo` test built
+    /// on `admin_state_with_auth` can't reintroduce the real-DNS flake by
+    /// omission. Resolves every hostname to a fixed, non-internal address —
+    /// tests that need a specific resolution (e.g. an internal address, to
+    /// exercise the SSRF guard) build their own `AdminState` with an
+    /// explicit `resolver` instead of going through this helper.
+    fn test_resolver() -> crate::state::HostResolver {
+        std::sync::Arc::new(|_host: &str| Ok(vec!["93.184.216.34".parse().unwrap()]))
+    }
+
     fn admin_state_with_auth(auth_token: Option<String>) -> Arc<AdminState> {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db_path = dir.path().join("test.lbug");
@@ -1955,7 +1966,7 @@ mod tests {
             webhook_repo_branches: None,
             write_gate: None,
             job_queue: None,
-            resolver: crate::state::system_resolver(),
+            resolver: test_resolver(),
         })
     }
 
@@ -2215,13 +2226,10 @@ url = "https://github.com/example/existing"
             webhook_repo_branches: None,
             write_gate: None,
             job_queue: None,
-            // nw-654: a synthetic resolver rather than `state::system_resolver()`
+            // nw-654: `test_resolver()` rather than `state::system_resolver()`
             // — this test asserts on config persistence, not on DNS behaviour,
-            // and the real resolver made it depend on live network access. It
-            // resolves every hostname to a routable external address so the
-            // SSRF guard's "no internal address" branch passes, same as it
-            // would for a real, successfully-resolving public hostname.
-            resolver: std::sync::Arc::new(|_host: &str| Ok(vec!["93.184.216.34".parse().unwrap()])),
+            // and the real resolver made it depend on live network access.
+            resolver: test_resolver(),
         });
 
         let app = Router::new()
@@ -2326,6 +2334,20 @@ credential_method = "ssh"
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // nw-654 follow-up: assert on the BODY, not just the status code. A
+        // 400 alone doesn't prove the SSRF guard fired for the right reason —
+        // a real-DNS failure (unrelated to the injected internal-IP resolver)
+        // also produces a 400 with "rejected hostname: DNS resolution
+        // failed...", which would satisfy a status-only assertion without
+        // actually exercising the internal-address branch this test targets.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("resolves to an internal address"),
+            "expected the internal-address rejection reason, got: {body}"
+        );
         // The guard must reject BEFORE persisting — an internal-resolving
         // hostname never makes it into the config.
         let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
