@@ -1558,6 +1558,21 @@ mod tool_schema_validation_tests {
         assert!(error.contains("value"), "{error}");
     }
 
+    /// nw-630: schema-level (not handler-level) coverage for the `symbol`
+    /// alias on `cross_repo_contracts` — `symbol` alone satisfies the
+    /// `anyOf`, and `name` + `symbol` together (agreeing) is not rejected by
+    /// JSON Schema validation itself (the semantic "must agree" check is
+    /// `conflicting_alias_error`, exercised separately in
+    /// `ambiguous_name_contract_tests`).
+    #[test]
+    fn cross_repo_contracts_symbol_alias_passes_schema_validation() {
+        assert_valid("cross_repo_contracts", json!({ "symbol": "ping" }));
+        assert_valid(
+            "cross_repo_contracts",
+            json!({ "name": "ping", "symbol": "ping" }),
+        );
+    }
+
     /// nw-410's acceptance criterion, asserted over the REGISTRY so tool 43
     /// cannot be added with a silent cell — the same rule
     /// `every_registered_schema_rejects_unknown_arguments` enforces for
@@ -9618,7 +9633,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n- Each row carries `repo` (the OTHER symbol's repo UID); optionally pass `repo` (a UID or display name) to scope rows to one repo\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n- `link_type: \"contract\"` rows always carry `repo: null` — contract UIDs carry no repo component, so they cannot be attributed and are EXCLUDED (not guessed) whenever a `repo` filter is set\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires one of 'uid', 'name', or 'symbol' (at least one must be provided; 'symbol' is an alias of 'name', accepted for consistency with brain_impact/flow_trace).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid, name, or symbol; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n- Each row carries `repo` (the OTHER symbol's repo UID); optionally pass `repo` (a UID or display name) to scope rows to one repo\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n- `link_type: \"contract\"` rows always carry `repo: null` — contract UIDs carry no repo component, so they cannot be attributed and are EXCLUDED (not guessed) whenever a `repo` filter is set\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
