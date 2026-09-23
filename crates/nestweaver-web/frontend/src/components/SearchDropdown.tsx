@@ -32,6 +32,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const selectNode = useStore((s) => s.selectNode);
   const setDetailFocus = useStore((s) => s.setDetailFocus);
   const setActiveLens = useStore((s) => s.setActiveLens);
+  const setSearchOpen = useStore((s) => s.setSearchOpen);
   const addSeed = useStore((s) => s.addSeed);
   const setGapItems = useStore((s) => s.setGapItems);
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
@@ -128,6 +129,12 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
       targetUid: uid,
       workspaceId: activeWorkspaceId,
     });
+    // Detail is a terminal action on this dropdown (nw-532): leaving it open
+    // afterward left it floating over the Graph/Table/Matrix/JSON views,
+    // intercepting their clicks (nw-564) until a separate Escape closed it.
+    // Close the dropdown, but keep the typed query so refocusing the search
+    // box reopens the same results.
+    setSearchOpen(false);
   }
 
   function addResultToScene(uid: string, kind: string) {

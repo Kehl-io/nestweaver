@@ -22,6 +22,7 @@ export function useKeyboardShortcuts() {
   const toggleMinimap = useStore((s) => s.toggleMinimap);
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
+  const searchOpen = useStore((s) => s.searchOpen);
   const toggleViewMode = useStore((s) => s.toggleViewMode);
   const seedReducedEffectsFromSystem = useStore((s) => s.seedReducedEffectsFromSystem);
   const { undo, redo } = useNavigationHistory();
@@ -51,7 +52,18 @@ export function useKeyboardShortcuts() {
   useHotkeys("m", () => toggleMinimap(), globalHotkeyOptions);
   useHotkeys("t", () => toggleTags(), globalHotkeyOptions);
 
-  useHotkeys("escape", () => selectNode(null), globalHotkeyOptions);
+  // Escape deselects the current node — but only once nothing else owns it.
+  // While the search dropdown is open, TopBar's own Escape handler closes
+  // that overlay; letting this global handler also fire on the same keypress
+  // (e.g. focus resting on a "Detail" button, a non-form element) silently
+  // dropped the selection underneath the overlay it was meant to close
+  // (nw-532). Gating on searchOpen keeps the overlay-close and
+  // selection-clear behaviors from racing on the same keypress.
+  useHotkeys(
+    "escape",
+    () => selectNode(null),
+    { ...globalHotkeyOptions, enabled: globalHotkeyOptions.enabled && !searchOpen },
+  );
 
   // mod+z — undo navigation. Not enabled on form tags: inside inputs the
   // browser's native text undo must win over scene-history undo.
