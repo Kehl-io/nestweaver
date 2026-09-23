@@ -11221,7 +11221,20 @@ fn impact_substring_not_found_carries_did_you_mean_and_text_goes_to_stderr() {
         "impact's not-found text must not be on stdout: {:?}",
         String::from_utf8_lossy(&text.stdout)
     );
-    assert!(String::from_utf8_lossy(&text.stderr).contains("helper"));
+    let text_stderr = String::from_utf8_lossy(&text.stderr);
+    // Tightened rather than a bare `.contains("helper")`: pins the exact
+    // not-found sentence AND that the did_you_mean suggestions render in
+    // text mode too, not just under --json (review follow-up).
+    assert!(
+        text_stderr.contains("Symbol 'helper' not found."),
+        "unexpected not-found text: {text_stderr:?}"
+    );
+    assert!(
+        text_stderr.contains("Did you mean:")
+            && text_stderr.contains("helperB")
+            && text_stderr.contains("helperC"),
+        "text mode must surface the same did_you_mean suggestions --json does: {text_stderr:?}"
+    );
 
     // Counterweight: a UID query (contains ':') carries no did_you_mean key
     // at all -- `did_you_mean_candidates` refuses to substring-search symbol

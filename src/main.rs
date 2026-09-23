@@ -2821,6 +2821,21 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
     })))
 }
 
+/// `impact`'s text-mode not-found rendering, shared by the direct and daemon
+/// routes so the message and the `did_you_mean` formatting cannot drift
+/// between them (nw-481 review follow-up: the two routes used to print two
+/// DIFFERENT sentences here -- "Symbol '…' not found." on the direct route,
+/// "No symbol found: '…'." on the daemon route -- and only the daemon route
+/// stayed silent about any suggestions found). Always stderr: `--json` is
+/// the parseable contract, and clig.dev's "send messaging to stderr" is the
+/// standing convention every other not-found text line in this file follows.
+fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
+    eprintln!("Symbol '{name_or_uid}' not found.");
+    if !candidates.is_empty() {
+        eprintln!("Did you mean: {}?", candidates.join(", "));
+    }
+}
+
 /// Render a `dead-code` result as text from its JSON payload.
 ///
 /// BOTH the direct and daemon paths render through this, so the two cannot
@@ -5644,6 +5659,12 @@ enum Commands {
     )]
     Impact {
         /// Symbol name or UID to analyze
+        ///
+        /// A bare name resolves by EXACT match only (not substring/fuzzy) --
+        /// a name `search` finds hits for can still be not_found here. When
+        /// it is, the not_found response (JSON and text) carries
+        /// `did_you_mean` suggestions from the closest substring matches,
+        /// when any exist.
         name_or_uid: String,
         #[arg(
             long,
@@ -20922,8 +20943,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // text -- only this call site was still on
                                 // stdout, and no test/doc pins that stream, so
                                 // scripts scraping `impact`'s text stdout were
-                                // already told to use `--json` instead.
-                                eprintln!("No symbol found: '{name_or_uid}'.");
+                                // already told to use `--json` instead. Shared
+                                // renderer with the direct route below, so the
+                                // message and the did_you_mean formatting
+                                // cannot drift between the two routes. The
+                                // daemon already attached `did_you_mean` to
+                                // this payload server-side (`tool_brain_impact`),
+                                // so it is read here rather than looked up a
+                                // second time.
+                                let candidates: Vec<String> = value
+                                    .get("did_you_mean")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|c| c.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                eprint_impact_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -21193,28 +21230,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
+                    // nw-481: same `did_you_mean_candidates` builder the
+                    // daemon-served `tool_brain_impact` not_found path calls,
+                    // so the direct route's suggestions cannot drift from the
+                    // daemon's on ranking, scoping, or limit. Computed ONCE,
+                    // ahead of the `if json` split, so both the JSON envelope
+                    // and the text rendering below read the same list rather
+                    // than each doing its own lookup.
+                    let repo_uid = match repo_filter.as_deref().filter(|s| !s.is_empty()) {
+                        Some(selector) => {
+                            let repos = store.list_repos(None).unwrap_or_default();
+                            nestweaver_engine::resolve_repo_selector(&repos, selector)
+                                .ok()
+                                .map(|r| r.uid.clone())
+                        }
+                        None => None,
+                    };
+                    // did_you_mean_candidates' own contract says a lookup
+                    // failure must be LOGGED, not silently dropped, even
+                    // though it is best-effort and must not fail the command.
+                    let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
+                        &store,
+                        &name_or_uid,
+                        |s| repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid),
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(
+                            "impact: did_you_mean_candidates lookup failed for \
+                             '{name_or_uid}': {error:#}"
+                        );
+                        Vec::new()
+                    });
                     // nw-086: under --json, emit a JSON object instead of only a
                     // plain-text stderr line a --json consumer can't parse.
                     if json {
-                        // nw-481: same `did_you_mean_candidates` builder the
-                        // daemon-served `tool_brain_impact` not_found path now
-                        // calls, so the direct route's suggestions cannot drift
-                        // from the daemon's on ranking, scoping, or limit.
-                        let repo_uid = match repo_filter.as_deref().filter(|s| !s.is_empty()) {
-                            Some(selector) => {
-                                let repos = store.list_repos(None).unwrap_or_default();
-                                nestweaver_engine::resolve_repo_selector(&repos, selector)
-                                    .ok()
-                                    .map(|r| r.uid.clone())
-                            }
-                            None => None,
-                        };
-                        let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
-                            &store,
-                            &name_or_uid,
-                            |s| repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid),
-                        )
-                        .unwrap_or_default();
                         println!(
                             "{}",
                             serde_json::to_string_pretty(
@@ -21225,7 +21274,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             )?
                         );
                     } else {
-                        eprintln!("Symbol '{name_or_uid}' not found.");
+                        eprint_impact_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }

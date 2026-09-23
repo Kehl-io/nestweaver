@@ -2973,11 +2973,17 @@ fn parity_memory_related_missing_uid_direct_vs_daemon() {
 #[test]
 fn parity_impact_substring_not_found_direct_vs_daemon() {
     let fixture = setup_fixture();
+    // "not found" rather than the looser "found": the direct and daemon
+    // routes used to print genuinely different sentences here ("Symbol '…'
+    // not found." vs. "No symbol found: '…'.", which shares only "found"),
+    // and are now unified onto one message
+    // (`parity_impact_substring_not_found_text_is_on_stderr_via_daemon`
+    // pins the exact text and did_you_mean suggestions on both routes).
     check_parity_of_refusal(
         &fixture.db_path,
         "impact <substring>",
         &["impact", "helper"],
-        "found",
+        "not found",
     );
 }
 
@@ -3028,6 +3034,64 @@ fn parity_impact_substring_not_found_did_you_mean_payload_matches() {
         sorted(&daemon_json),
         "did_you_mean diverged between direct and daemon routes\ndirect: {direct_json}\n\
          daemon: {daemon_json}"
+    );
+}
+
+/// nw-481 review follow-up: the CLI-level not-found stderr assertion for
+/// `impact` was hollow on the DAEMON route -- the direct route already
+/// printed to stderr before this batch, so a test only proves something on
+/// the route that changed. This exercises `run_via_daemon` directly (not
+/// `check_parity_of_refusal`, which only asserts a shared substring) and
+/// pins: stdout is EMPTY, the not-found sentence and the did_you_mean
+/// suggestions are on stderr, and the message matches the direct route's
+/// (the two used to differ: "No symbol found: '…'." on the daemon route vs.
+/// "Symbol '…' not found." on the direct route -- now unified, since nothing
+/// pinned either spelling).
+#[test]
+fn parity_impact_substring_not_found_text_is_on_stderr_via_daemon() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // DIRECT run happens BEFORE the daemon starts, matching this file's
+    // documented ordering invariant -- calling `run_direct` after the
+    // daemon is up makes the direct route print an "escape hatch" warning
+    // banner ahead of the same text, which would fail the byte-comparison
+    // below for a reason that has nothing to do with the not-found message.
+    let direct = run_direct(db, &["impact", "helper"]);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &["impact", "helper"]);
+
+    assert_eq!(
+        daemon.status.code(),
+        Some(2),
+        "impact <substring> (daemon, text) must be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&daemon.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&daemon.stdout).trim().is_empty(),
+        "impact's not-found text must not be on stdout via the daemon route: {:?}",
+        String::from_utf8_lossy(&daemon.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&daemon.stderr);
+    assert!(
+        stderr.contains("Symbol 'helper' not found."),
+        "unexpected not-found text on the daemon route: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Did you mean:")
+            && stderr.contains("helperB")
+            && stderr.contains("helperC"),
+        "the daemon route's text mode must surface did_you_mean suggestions too: {stderr:?}"
+    );
+
+    // Same message, same suggestions as the direct route -- the two routes
+    // used to print genuinely different sentences here.
+    assert_eq!(
+        String::from_utf8_lossy(&daemon.stderr),
+        String::from_utf8_lossy(&direct.stderr),
+        "the daemon and direct routes must render identical not-found text"
     );
 }
 

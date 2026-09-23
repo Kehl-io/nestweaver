@@ -9945,14 +9945,14 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": { "type": "string", "description": "Scope the target symbol to this repository (UID or display name)." },
                 "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Minimum edge confidence." },
                 "min_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum traversal impact score; 0 disables pruning." },
-                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Ambiguous names require a repo selector or UID." },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). A bare name is resolved by EXACT match only (not substring); ambiguous names require a repo selector or UID. An exact-match miss returns status \"not_found\" with a bounded `did_you_mean` array of the closest substring matches, when any exist." },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
@@ -10045,9 +10045,11 @@ fn tool_brain_impact(
             // sites in 44b640e7) is the consumer half -- called here instead
             // of a second substring lookup, so this path and any other tool
             // that ever needs the same suggestion cannot drift on ranking or
-            // scoping. A suggestion-lookup failure is swallowed (best-effort
-            // per that function's own contract) rather than failing the whole
-            // `not_found` response over it.
+            // scoping. A suggestion-lookup failure does not fail the whole
+            // `not_found` response (best-effort per that function's own
+            // contract), but that contract also says a caller MUST log the
+            // error rather than silently drop it -- `unwrap_or_default` alone
+            // did not.
             let repo_uid = match repo.filter(|s| !s.is_empty()) {
                 Some(selector) => {
                     let mut repos = store.list_repos(None).unwrap_or_default();
@@ -10058,12 +10060,20 @@ fn tool_brain_impact(
                 }
                 None => None,
             };
-            let candidates =
-                nestweaver_engine::did_you_mean::did_you_mean_candidates(store, symbol, |s| {
+            let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
+                store,
+                symbol,
+                |s| {
                     repo_is_visible(&s.repo_uid, visible)
                         && repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid)
-                })
-                .unwrap_or_default();
+                },
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "brain_impact: did_you_mean_candidates lookup failed for '{symbol}': {error:#}"
+                );
+                Vec::new()
+            });
             return Ok(nestweaver_schema::responses::with_did_you_mean(
                 nestweaver_schema::responses::impact(json!({
                     "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
