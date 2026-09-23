@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.1.1](https://github.com/Kehl-io/nestweaver/compare/v10.1.0...v10.1.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **engine:** skip target only where a build tool put it ([#422](https://github.com/Kehl-io/nestweaver/issues/422)) ([bd6e352](https://github.com/Kehl-io/nestweaver/commit/bd6e3527c5bf64ec753f98805c0191a4fe0fee80))
+
 ## [10.1.0](https://github.com/Kehl-io/nestweaver/compare/v10.0.9...v10.1.0) (2026-09-22)
 
 
