@@ -11033,11 +11033,27 @@ fn brain_diff_unknown_repo_is_a_named_not_found() {
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("test.lbug");
     std::fs::create_dir_all(&repo_dir).unwrap();
+    // A real git repo (not just a directory), so the counterweight below can
+    // assert an actual SUCCESS from `brain diff` rather than merely "not the
+    // exit-2 refusal" -- `brain diff` needs git history to answer at all.
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
     std::fs::write(
         repo_dir.join("main.js"),
         "function greet(n) { return n; }\n",
     )
     .unwrap();
+    git(&["add", "main.js"]);
+    git(&["commit", "-m", "initial"]);
     nestweaver_cmd()
         .args(["index", "--repo"])
         .arg(&repo_dir)
@@ -11066,21 +11082,29 @@ fn brain_diff_unknown_repo_is_a_named_not_found() {
     });
     assert_eq!(payload["status"], "not_found");
 
-    // Counterweight: `brain diff` on the real repo still runs (it may fail
-    // for the unrelated reason that the fixture repo has no git history —
-    // that is not an unresolved-repo-filter refusal, so it must not be
-    // exit 2).
+    // Counterweight: `brain diff` on the real (now genuinely git-backed)
+    // repo actually SUCCEEDS -- not merely "isn't exit 2 for some other
+    // reason", which would also pass on an unrelated crash.
     let real = nestweaver_cmd()
         .args(["brain", "diff", "repo", "--json", "--db"])
         .arg(&db_path)
         .output()
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         real.status.code(),
-        Some(2),
-        "a real repo name must not be classified as an unresolved repo filter: {}",
+        Some(0),
+        "a real repo name must diff successfully, not be classified as an unresolved \
+         repo filter or fail for any other reason: {}",
         String::from_utf8_lossy(&real.stderr)
     );
+    let real_payload: serde_json::Value =
+        serde_json::from_slice(&real.stdout).unwrap_or_else(|e| {
+            panic!(
+                "brain diff repo --json must produce valid JSON on success, got {e}: {:?}",
+                String::from_utf8_lossy(&real.stdout)
+            )
+        });
+    assert_eq!(real_payload["repo"], "repo");
 }
 
 /// nw-524: `memory related` with a missing/typo'd uid used to exit 0 with an
