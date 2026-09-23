@@ -2951,6 +2951,19 @@ fn parity_brain_diff_unknown_repo_direct_vs_daemon() {
     );
 }
 
+/// nw-524 direct-vs-daemon: a uid absent from the graph must refuse
+/// identically on both routes.
+#[test]
+fn parity_memory_related_missing_uid_direct_vs_daemon() {
+    let fixture = setup_fixture_with_vault_note();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "memory related <missing uid>",
+        &["memory", "related", "note:does-not-exist"],
+        "not found",
+    );
+}
+
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this
 /// file — only the provenance-only sweep above (`_meta.sources`/`scope`/
 /// `stale_repos` presence) and a separate KEY-SET schema test in

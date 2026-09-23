@@ -25267,6 +25267,16 @@ fn run_memory(
                 "brain_memory_related",
                 args,
             )?;
+            // nw-524: mirrors `note get` -- a `not_found` uid is a named
+            // refusal at exit 2, not the same `related: []` shape a present
+            // note with zero typed relations gets at exit 0.
+            if payload["status"].as_str() == Some("not_found") {
+                if json {
+                    print_json_not_found("uid", &uid);
+                }
+                eprintln!("Note '{uid}' not found.");
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {

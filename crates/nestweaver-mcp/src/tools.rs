@@ -5031,6 +5031,31 @@ fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, a
         .get("uid")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'uid' (string) is required"))?;
+    // nw-524: `memory_related` (below) returns an empty Vec for BOTH "no
+    // typed edges from a real note" and "no such note" -- the two were the
+    // same shape (`related: []`, exit 0), so a script branching on exit 2 for
+    // a missing/typo'd uid instead treated it as "no relations". Existence is
+    // checked FIRST via `lookup_note`, the same not-found signal `note_get`
+    // already treats as its not-found envelope, so this tool cannot grow a
+    // second notion of "missing". Counterweight: a real note with zero typed
+    // relations still reaches `memory_related` below and still answers
+    // `related: []` at exit 0 -- only an ABSENT uid now short-circuits here.
+    match store.lookup_note(uid) {
+        Ok(_) => {}
+        Err(nestweaver_store::StoreError::NotFound) => {
+            return Ok(json!({
+                "status": "not_found",
+                "error": "not found",
+                "uid": uid,
+                "depth": 0,
+                "related": [],
+                "total": 0,
+                "returned": 0,
+                "truncated": false,
+            }));
+        }
+        Err(e) => return Err(anyhow!("lookup_note: {e}")),
+    }
     let edge_types = parse_string_array(&args, "edge_types").unwrap_or_default();
     // nw-411: `read_limit`, not `as_u64()`. `as_u64` collapses "absent",
     // "negative" and "not an integer" into one `None`, so `depth: -1` fell
@@ -5072,7 +5097,7 @@ const MEMORY_RELATED_DEFAULT_DEPTH: usize = 2;
 fn tool_schema_brain_memory_related() -> Value {
     json!({
         "name": "brain_memory_related",
-        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to `depth` (1-15, default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Bounded: `total` is the pre-cap match count, `returned` the page, `truncated` says whether `limit` cut it — raise `limit` to see the rest\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
+        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to `depth` (1-15, default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Bounded: `total` is the pre-cap match count, `returned` the page, `truncated` says whether `limit` cut it — raise `limit` to see the rest\n- A uid absent from the graph is `status: \"not_found\"`; a present note with zero typed relations still answers `related: []` at `status` absent\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -23883,6 +23908,38 @@ mod memory_related_bound_tests {
         // mandatory one.
         let defaulted = tool_brain_memory_related(&store, json!({ "uid": uid })).unwrap();
         assert_eq!(defaulted["depth"], json!(MEMORY_RELATED_DEFAULT_DEPTH));
+    }
+
+    /// nw-524: a uid absent from the graph used to answer `related: []` at
+    /// exit 0 -- the identical shape a REAL note with zero typed relations
+    /// gets, which made "no such note" and "no relations" indistinguishable
+    /// to a caller that only checks the exit code.
+    #[test]
+    fn a_missing_uid_is_reported_not_found_rather_than_an_empty_related_list() {
+        let (_dir, store) = depends_on_chain(3);
+
+        let missing =
+            tool_brain_memory_related(&store, json!({ "uid": "note:does-not-exist" })).unwrap();
+        assert_eq!(missing["status"], json!("not_found"), "{missing}");
+        assert_eq!(missing["related"], json!([]));
+
+        // COUNTERWEIGHT: the LAST note in the chain is real and has no
+        // outgoing DependsOn edge (nothing depends on it), so it must still
+        // answer an honest empty list at exit 0 (no `status` key) rather than
+        // being swept into the not-found branch above.
+        let leaf_uid = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.title == "n3")
+            .expect("leaf note")
+            .uid;
+        let leaf = tool_brain_memory_related(&store, json!({ "uid": leaf_uid })).unwrap();
+        assert!(
+            leaf.get("status").is_none(),
+            "a present note with zero relations must not carry a not_found status: {leaf}"
+        );
+        assert_eq!(leaf["related"], json!([]));
     }
 }
 

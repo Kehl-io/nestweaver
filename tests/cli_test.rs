@@ -11082,3 +11082,85 @@ fn brain_diff_unknown_repo_is_a_named_not_found() {
         String::from_utf8_lossy(&real.stderr)
     );
 }
+
+/// nw-524: `memory related` with a missing/typo'd uid used to exit 0 with an
+/// empty `related: []`, the same shape as a present note with zero typed
+/// relations -- a script branching on exit 2 could not tell "no relations"
+/// from "no such note". Existence is now checked first via `lookup_note`,
+/// the same not-found signal `note_get` already uses.
+#[test]
+fn memory_related_missing_uid_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("mem.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    // Alpha SUPERSEDES Beta: Beta is a REAL note with no OUTGOING typed
+    // relation, which is the counterweight case (present, zero neighbours).
+    std::fs::write(
+        vault_dir.join("Alpha.md"),
+        "---\nsupersedes: [Beta]\n---\n# Alpha\n\nSee [[Beta]] for details.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault_dir.join("Beta.md"),
+        "# Beta\n\nSome content about beta.\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let missing = nestweaver_cmd()
+        .args(["memory", "related", "note:does-not-exist", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "a uid absent from the graph must be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap_or_else(|e| {
+        panic!(
+            "memory related <missing uid> --json must write a not-found JSON envelope, \
+                 got {e}: {:?}",
+            String::from_utf8_lossy(&missing.stdout)
+        )
+    });
+    assert_eq!(payload["error"], "not found");
+
+    // Counterweight: a REAL note (Beta) with zero typed relations still
+    // exits 0 with an honest empty list -- missing vs. empty stays
+    // distinguishable by exit code alone.
+    let search = nestweaver_cmd()
+        .args(["brain", "search", "Beta", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let beta_uid = search_json["results"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["title"] == "Beta"))
+        .and_then(|r| r["uid"].as_str())
+        .expect("Beta must be indexed")
+        .to_string();
+
+    let present = nestweaver_cmd()
+        .args(["memory", "related", &beta_uid, "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        present.status.code(),
+        Some(0),
+        "a present note with zero typed relations must still exit 0: {}",
+        String::from_utf8_lossy(&present.stderr)
+    );
+    let present_json: serde_json::Value = serde_json::from_slice(&present.stdout).unwrap();
+    assert_eq!(present_json["related"], serde_json::json!([]));
+}
