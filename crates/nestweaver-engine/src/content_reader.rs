@@ -2481,6 +2481,49 @@ mod tests {
     }
 
     #[test]
+    fn the_default_has_file_gates_target_for_readers_without_a_filesystem() {
+        // nw-652: readers that override neither `has_file` nor `skips_path`
+        // (in-memory and captured readers) answer the manifest gate by READING
+        // the probe. A default that said "yes" to every probe would prune a
+        // source `target/`; one that said "no" would admit Cargo output.
+        struct InMemory(std::collections::BTreeMap<PathBuf, String>);
+        impl ContentReader for InMemory {
+            fn read_file(&self, rel_path: &Path) -> Result<String> {
+                self.0
+                    .get(rel_path)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("absent"))
+            }
+            fn list_files(&self) -> Result<Vec<PathBuf>> {
+                Ok(self.0.keys().cloned().collect())
+            }
+            fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                Path::new("/in-memory")
+            }
+            fn version_id(&self) -> &str {
+                "memory"
+            }
+        }
+        let reader = InMemory(
+            [
+                ("Cargo.toml", "[package]\n"),
+                ("target/debug/gen.rs", "fn g() {}"),
+                ("src/screens/target/Edit.ts", "export {}"),
+            ]
+            .into_iter()
+            .map(|(path, body)| (PathBuf::from(path), body.to_string()))
+            .collect(),
+        );
+        assert!(reader.has_file(Path::new("Cargo.toml")));
+        assert!(!reader.has_file(Path::new("src/screens/Cargo.toml")));
+        assert!(reader.skips_path(Path::new("target/debug/gen.rs")));
+        assert!(!reader.skips_path(Path::new("src/screens/target/Edit.ts")));
+    }
+
+    #[test]
     fn filesystem_reader_walks_a_source_target_dir_and_prunes_a_cargo_one() {
         // nw-652: the walk, `accepts_path` (the watcher's filter) and
         // `skips_path` (the incremental loop's) must give one answer.
