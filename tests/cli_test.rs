@@ -11158,6 +11158,32 @@ fn memory_related_missing_uid_is_a_named_not_found() {
     });
     assert_eq!(payload["error"], "not found");
 
+    // Text mode (no --json): exit 2 with the not-found message on stderr,
+    // stdout empty. Only --json was previously asserted.
+    let missing_text = nestweaver_cmd()
+        .args(["memory", "related", "note:does-not-exist", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing_text.status.code(),
+        Some(2),
+        "text mode must also be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&missing_text.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_text.stdout)
+            .trim()
+            .is_empty(),
+        "memory related's not-found text must not be on stdout: {:?}",
+        String::from_utf8_lossy(&missing_text.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_text.stderr).contains("not found"),
+        "expected a not-found message on stderr: {:?}",
+        String::from_utf8_lossy(&missing_text.stderr)
+    );
+
     // Counterweight: a REAL note (Beta) with zero typed relations still
     // exits 0 with an honest empty list -- missing vs. empty stays
     // distinguishable by exit code alone.
