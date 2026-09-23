@@ -251,6 +251,8 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
         symbols,
         references,
         type_bindings: Vec::new(),
+        // Regex-based parser: no syntax tree, so no error signal (nw-601).
+        has_syntax_errors: false,
     }
 }
 

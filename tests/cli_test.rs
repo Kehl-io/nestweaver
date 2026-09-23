@@ -4419,6 +4419,49 @@ fn index_json_reports_degraded_source_coverage_and_fail_on_skip_is_strict() {
     assert_eq!(strict_payload["skipped_count"], 1);
 }
 
+/// nw-601: an unparsable `broken.js` was indexed as an empty file, so
+/// `--fail-on-skip` was a no-op (`skipped_count: 0`, exit 0). Counterweight: a
+/// repo of parseable files (one with a recoverable syntax error) still reads
+/// `complete` and passes the strict gate.
+#[test]
+fn fail_on_skip_rejects_an_unparsable_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("good.js"), "function good() { return 1; }\n").unwrap();
+    std::fs::write(
+        repo.join("partial.js"),
+        "function partial() { return 1; }\nconst x = (;\n",
+    )
+    .unwrap();
+
+    let run = |db: &std::path::Path| {
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(db)
+            .args(["--force", "--json", "--fail-on-skip"])
+            .output()
+            .unwrap()
+    };
+
+    let healthy = run(&dir.path().join("healthy.lbug"));
+    assert!(healthy.status.success(), "{healthy:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "complete");
+    assert_eq!(payload["skipped_count"], 0);
+
+    std::fs::write(repo.join("broken.js"), "}}} ((( @@@ %%% ;;\n").unwrap();
+    let strict = run(&dir.path().join("strict.lbug"));
+    assert!(!strict.status.success(), "{strict:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "degraded");
+    assert_eq!(payload["skipped_count"], 1);
+    assert_eq!(payload["skipped_files"][0]["path"], "broken.js");
+    assert_eq!(payload["skipped_files"][0]["reason_code"], "parse_error");
+}
+
 #[test]
 fn invalid_source_limit_fails_before_database_creation() {
     let dir = tempfile::tempdir().unwrap();

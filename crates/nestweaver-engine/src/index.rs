@@ -3836,6 +3836,10 @@ where
         match parse_source(path, &source) {
             Ok(parsed) => {
                 parse_pb.inc(1);
+                // nw-601: disclosed, not published as an empty file.
+                if let Some(skipped) = parsed.unparsable_skip(display_name.clone()) {
+                    return ParseOutcome::Skipped(skipped);
+                }
                 // Retain source for all languages up to 2 MB so Phase 3
                 // (type env build) can skip redundant disk re-reads.
                 // TS/JS must clone because `source` is still needed below
@@ -7077,6 +7081,13 @@ fn prepare_incremental_file(
     };
     let parsed = nestweaver_parser::parse_source(&abs_path, &source)
         .with_context(|| format!("parse {}", abs_path.display()))?;
+    // nw-601, the incremental half of the full-index check above: the same
+    // predicate, so the two routes cannot disagree. A Modified file that
+    // becomes unparsable loses its stale incumbent coverage through the
+    // existing PolicySkipped arm, exactly like one that became binary.
+    if let Some(skipped) = parsed.unparsable_skip(rel_str.clone()) {
+        return Ok(PreparedIncrementalOutcome::PolicySkipped(skipped));
+    }
     Ok(PreparedIncrementalOutcome::Ready(PreparedIncrementalFile {
         abs_path,
         rel_str,
@@ -15426,6 +15437,109 @@ function hello(name) { return "Hello " + name; }
             store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
             new_sha,
             "the batch committed, so the SHA advances"
+        );
+    }
+
+    /// nw-601 fixture: one clean file, one file with a RECOVERABLE syntax
+    /// error that still yields a symbol, and one file tree-sitter cannot make
+    /// anything of.
+    const NW601_CLEAN_JS: &str = "function alpha() { return 1; }\n";
+    const NW601_PARTIAL_JS: &str = "function partial() { return 1; }\nconst x = (;\n";
+    const NW601_BROKEN_JS: &str = "}}} ((( @@@ %%% ;;\n";
+
+    /// nw-601: an unparsable eligible file was "indexed" with zero symbols
+    /// and `skipped_count: 0`, so `--fail-on-skip` exited 0 and coverage read
+    /// complete. It must be disclosed on the skip channel instead.
+    /// Counterweight: a file whose syntax error tree-sitter recovers from, and
+    /// that still yields a symbol, is indexed normally and NOT disclosed.
+    #[test]
+    fn unparsable_source_is_disclosed_as_parse_error_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean.js"), NW601_CLEAN_JS).unwrap();
+        fs::write(repo.join("partial.js"), NW601_PARTIAL_JS).unwrap();
+        fs::write(repo.join("broken.js"), NW601_BROKEN_JS).unwrap();
+
+        let result = index_directory(&repo, &db, "test", "https://example.com/nw601", "sha")
+            .expect("an unparsable file must not abort publication");
+
+        let skipped: Vec<(&str, SkipReasonCode)> = result
+            .skipped_files
+            .iter()
+            .map(|file| (file.path.as_str(), file.reason_code))
+            .collect();
+        assert_eq!(skipped, vec![("broken.js", SkipReasonCode::ParseError)]);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let names: Vec<String> = store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.contains(&"alpha".to_string()) && names.contains(&"partial".to_string()),
+            "clean and recoverable files still index: {names:?}"
+        );
+    }
+
+    /// nw-601, the incremental route (the nw-387/nw-418 lesson: the skip
+    /// channel has more than one assembly site).
+    #[test]
+    fn incremental_unparsable_source_is_disclosed_as_parse_error_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean.js"), NW601_CLEAN_JS).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "clean.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/incremental-nw601";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::write(repo.join("partial.js"), NW601_PARTIAL_JS).unwrap();
+        fs::write(repo.join("broken.js"), NW601_BROKEN_JS).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one broken, one recoverable"]);
+
+        let result = incremental_index_with_name_and_limits(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .expect("an unparsable file must not kill the batch");
+
+        let skipped: Vec<(&str, SkipReasonCode)> = result
+            .skipped_files
+            .iter()
+            .map(|file| (file.path.as_str(), file.reason_code))
+            .collect();
+        assert_eq!(skipped, vec![("broken.js", SkipReasonCode::ParseError)]);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store
+                .symbols_in_file("partial.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "partial"),
+            "the recoverable file in the same batch must be indexed"
         );
     }
 

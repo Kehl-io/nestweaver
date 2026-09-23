@@ -79,6 +79,7 @@ mod tests {
                 symbols: Vec::new(),
                 references: Vec::new(),
                 type_bindings: Vec::new(),
+                has_syntax_errors: false,
             })
         }
     }

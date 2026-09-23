@@ -177,6 +177,37 @@ pub struct ParsedFile {
     pub references: Vec<RawReference>,
     #[serde(default)]
     pub type_bindings: Vec<AstTypeBinding>,
+    /// The tree-sitter tree contained ERROR/MISSING nodes. Error recovery is
+    /// normal and a partially broken file routinely still yields symbols, so
+    /// this alone is not a skip — see [`ParsedFile::unparsable_skip`].
+    #[serde(default)]
+    pub has_syntax_errors: bool,
+}
+
+impl ParsedFile {
+    /// nw-601. A file whose parse tree has errors AND contributes no symbols
+    /// was indexed as an empty file: `skipped_count: 0`, coverage `complete`,
+    /// `index --fail-on-skip` exit 0, while `search` could never find it.
+    /// Such a file is disclosed on the skip channel as `ParseError` instead.
+    ///
+    /// Both conditions are required on purpose. Tree-sitter recovers from a
+    /// stray token and still extracts the file's functions; treating every
+    /// `has_error()` tree as a skip would flip coverage to degraded on
+    /// ordinary half-typed code whose symbols ARE indexed. And a clean file
+    /// with no symbols (a bare script, a re-export stub) is simply empty.
+    ///
+    /// This is the ONE predicate every code-index route calls (full index,
+    /// incremental index, `parse_batch`), so the routes cannot disagree about
+    /// what "unparsable" means.
+    pub fn unparsable_skip(&self, display_path: impl Into<String>) -> Option<SkippedFile> {
+        (self.has_syntax_errors && self.symbols.is_empty()).then(|| {
+            SkippedFile::new(
+                display_path,
+                SkipReasonCode::ParseError,
+                "syntax errors and no extractable symbols",
+            )
+        })
+    }
 }
 
 /// Remove raw NUL bytes from decoded source text.
@@ -1932,6 +1963,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         symbols,
         references,
         type_bindings,
+        has_syntax_errors: tree.root_node().has_error(),
     })
 }
 
@@ -2736,7 +2768,10 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 
     for (path, source) in files {
         match parse_source(path, source) {
-            Ok(parsed) => result.files.push(parsed),
+            Ok(parsed) => match parsed.unparsable_skip(path.to_string_lossy()) {
+                Some(skipped) => result.skipped.push(skipped),
+                None => result.files.push(parsed),
+            },
             Err(e) => {
                 let path_str = path.to_string_lossy().into_owned();
                 tracing::warn!(path = %path_str, error = %e, "skipping file due to parse error");
@@ -2758,6 +2793,30 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// nw-601: the predicate every code-index route calls. The partial case is
+    /// the counterweight, and it asserts `has_syntax_errors` is TRUE so the
+    /// fixture provably exercises error recovery rather than being clean.
+    #[test]
+    fn unparsable_skip_requires_errors_and_no_symbols() {
+        let broken = parse_source(Path::new("broken.js"), "}}} ((( @@@ %%% ;;\n").unwrap();
+        assert!(broken.has_syntax_errors && broken.symbols.is_empty());
+        let skipped = broken.unparsable_skip("broken.js").expect("disclosed");
+        assert_eq!(skipped.reason_code, SkipReasonCode::ParseError);
+
+        let partial = parse_source(
+            Path::new("partial.js"),
+            "function partial() { return 1; }\nconst x = (;\n",
+        )
+        .unwrap();
+        assert!(partial.has_syntax_errors, "fixture must contain an error");
+        assert!(partial.symbols.iter().any(|s| s.name == "partial"));
+        assert!(partial.unparsable_skip("partial.js").is_none());
+
+        let clean = parse_source(Path::new("clean.js"), "let a = 1;\n").unwrap();
+        assert!(!clean.has_syntax_errors);
+        assert!(clean.unparsable_skip("clean.js").is_none());
+    }
 
     fn fixture(rel: &str) -> String {
         let workspace = env!("CARGO_MANIFEST_DIR");
