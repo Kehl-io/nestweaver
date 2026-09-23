@@ -7052,6 +7052,142 @@ fn daemon_autostart_does_not_claim_stale_cleanup_after_pidfile_inode_replacement
     let _ = stop.ok();
 }
 
+/// nw-528 regression test: alternating queries across TWO isolated temp
+/// `--db` fixtures must keep BOTH daemons alive. Autostart must not treat one
+/// database's live daemon as "unowned/stale" merely because the CLI's most
+/// recent invocation targeted a DIFFERENT database — the fix (owner-proof
+/// unlink 53ffb3eb, live-daemon adoption 66c895f9) already landed; this adds
+/// the DONE WHEN coverage that was missing (see nw-528).
+#[test]
+fn daemon_autostart_keeps_both_daemons_alive_when_alternating_temp_dbs() {
+    let scratch = pidfile_reap_scratch();
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let repo_a = scratch.path().join("repo-a");
+    let repo_b = scratch.path().join("repo-b");
+    write_test_repo(&repo_a);
+    write_test_repo(&repo_b);
+
+    let db_a = scratch.path().join("a.lbug");
+    let db_b = scratch.path().join("b.lbug");
+    create_db(&repo_a, &db_a);
+    create_db(&repo_b, &db_b);
+
+    let _guard_a = IsolatedDaemonGuard::new(&db_a, &home);
+    let _guard_b = IsolatedDaemonGuard::new(&db_b, &home);
+
+    let pidfile_a = isolated_pidfile(&home, &db_a);
+    let pidfile_b = isolated_pidfile(&home, &db_b);
+
+    let mut pid_a: Option<String> = None;
+    let mut pid_b: Option<String> = None;
+    let mut warned = false;
+
+    for round in 0..4 {
+        for (db_path, pidfile, remembered) in [
+            (&db_a, &pidfile_a, &mut pid_a),
+            (&db_b, &pidfile_b, &mut pid_b),
+        ] {
+            let mut search = daemon_cmd();
+            isolate_nestweaver_cmd(&mut search, &home);
+            let output = search
+                .args(["search", "fn", "--db", &db_path.display().to_string()])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "round {round} search against {db_path:?} must succeed: {stderr}"
+            );
+            if stderr.contains("unowned daemon pidfile is stale — cleaning up") {
+                warned = true;
+            }
+            let pid = std::fs::read_to_string(pidfile)
+                .unwrap_or_else(|e| panic!("{db_path:?} must own a pidfile after search: {e}"))
+                .trim()
+                .to_string();
+            match remembered {
+                Some(prev) => assert_eq!(
+                    &pid, prev,
+                    "{db_path:?}'s daemon PID must stay stable across alternation \
+                     (round {round}) — a PID change means the other DB's autostart \
+                     reaped and respawned it"
+                ),
+                None => *remembered = Some(pid),
+            }
+        }
+    }
+
+    assert!(
+        !warned,
+        "alternating search across two isolated temp DBs must not log \
+         stale-pidfile cleanup for either daemon"
+    );
+
+    // ── COUNTERWEIGHT: a genuinely dead daemon is still reaped for real, and
+    // the OTHER database's daemon is unaffected by that reap.
+    let killed_pid: i32 = pid_a
+        .as_ref()
+        .unwrap()
+        .parse()
+        .expect("recorded pid must be numeric");
+    assert_eq!(
+        unsafe { libc::kill(killed_pid, libc::SIGKILL) },
+        0,
+        "kill db_a's daemon"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::kill(killed_pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut revive = daemon_cmd();
+    isolate_nestweaver_cmd(&mut revive, &home);
+    let revive_output = revive
+        .args(["search", "fn", "--db", &db_a.display().to_string()])
+        .output()
+        .unwrap();
+    let revive_stderr = String::from_utf8_lossy(&revive_output.stderr);
+    assert!(
+        revive_output.status.success(),
+        "autostart must respawn db_a's daemon after a real kill: {revive_stderr}"
+    );
+    assert!(
+        revive_stderr.contains("unowned daemon pidfile is stale — cleaning up"),
+        "a genuinely dead daemon's pidfile must still be reaped and logged: {revive_stderr}"
+    );
+    let revived_pid = std::fs::read_to_string(&pidfile_a)
+        .expect("db_a must have a fresh pidfile after respawn")
+        .trim()
+        .to_string();
+    assert_ne!(
+        revived_pid,
+        pid_a.unwrap(),
+        "the respawned daemon must have a NEW pid, not the killed one"
+    );
+
+    let mut check_b = daemon_cmd();
+    isolate_nestweaver_cmd(&mut check_b, &home);
+    let check_b_output = check_b
+        .args(["search", "fn", "--db", &db_b.display().to_string()])
+        .output()
+        .unwrap();
+    assert!(check_b_output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&pidfile_b).unwrap().trim(),
+        pid_b.unwrap(),
+        "db_b's daemon must be unaffected by db_a's kill+respawn"
+    );
+
+    let mut stop_a = daemon_action_cmd(&db_a, "stop");
+    isolate_nestweaver_cmd(&mut stop_a, &home);
+    let _ = stop_a.ok();
+    let mut stop_b = daemon_action_cmd(&db_b, "stop");
+    isolate_nestweaver_cmd(&mut stop_b, &home);
+    let _ = stop_b.ok();
+}
+
 /// A pidfile naming a dead process must be reaped for real (or the log must
 /// not claim cleanup), and a healthy *copy* database must not go WAL-corrupt.
 #[test]
