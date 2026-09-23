@@ -195,6 +195,14 @@ pub struct FeatureConfig {
     pub name: String,
     pub description: Option<String>,
     pub repos: Vec<String>,
+    /// nw-599: absent `entry_points` used to fail TOML deserialization for
+    /// the whole `InstanceConfig`, taking every other section (repos, links,
+    /// ...) down with it and killing MCP/CLI boot before either could report
+    /// anything useful. It defaults to empty instead; the load-time warning
+    /// loop in `InstanceConfig::from_toml_str` below already flags an empty
+    /// `entry_points` per feature ("context will be empty"), so the gap is
+    /// still surfaced — just as a warning, not a hard parse failure.
+    #[serde(default)]
     pub entry_points: Vec<String>,
 }
 
@@ -2073,6 +2081,101 @@ entry_points = ["syncData", "fetchRecords"]
         assert_eq!(features[0].name, "data-sync");
         assert_eq!(features[0].repos, vec!["app", "service"]);
         assert_eq!(features[0].entry_points, vec!["syncData", "fetchRecords"]);
+    }
+
+    // nw-599: a `[[features]]` block written without `entry_points` used to
+    // fail TOML deserialization for the ENTIRE InstanceConfig (`missing field
+    // entry_points`), taking down `[[repos]]`/`[[links]]`/everything else in
+    // the same file along with it, and killing MCP boot before it could even
+    // reach JSON-RPC. `entry_points` now defaults to empty like `repos`
+    // already effectively does (via the existing empty-repos warning path),
+    // and the pre-existing "context will be empty" warning at load time
+    // (see the loop over `config.features` above `validate_and_normalize_
+    // seed_resolution`) is what surfaces the gap instead of a hard failure.
+    #[test]
+    fn feature_without_entry_points_still_parses_instance_config() {
+        let toml = r#"
+instance_id = "missing-entry-points-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+repos = ["app"]
+"#;
+        let cfg =
+            InstanceConfig::from_toml_str(toml).expect("should parse despite missing entry_points");
+
+        // Counterweight: other sections still loaded — the missing field in
+        // `[[features]]` did not take the whole file down with it.
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.repos[0].url, "https://github.com/example/app");
+
+        let features = cfg.features.expect("should have features");
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name, "data-sync");
+        assert!(
+            features[0].entry_points.is_empty(),
+            "entry_points should default to empty, not fail parsing"
+        );
+    }
+
+    // Counterweight for nw-599: an unrecognized key inside `[[features]]`
+    // must still be rejected — `deny_unknown_fields` on `FeatureConfig`
+    // itself is untouched by defaulting `entry_points`.
+    #[test]
+    fn feature_with_unknown_field_still_rejected() {
+        let toml = r#"
+instance_id = "unknown-feature-field-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+repos = ["app"]
+entry_points = ["syncData"]
+bogus_field = "nope"
+"#;
+        let err = InstanceConfig::from_toml_str(toml)
+            .expect_err("unknown field inside [[features]] should still fail");
+        assert!(
+            err.to_string().contains("bogus_field") || err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
     }
 
     // Feature F6: `[ranking]` parses into dampen/boost lists and multipliers
