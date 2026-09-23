@@ -46,7 +46,7 @@ pub use read::{
 };
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
-    TrigramRefreshStats,
+    TrigramRefreshStats, deferred_scopes_note,
 };
 pub use regex_index::{
     REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardMetadata,

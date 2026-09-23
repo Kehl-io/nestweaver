@@ -51,7 +51,32 @@ export function useKeyboardShortcuts() {
   useHotkeys("m", () => toggleMinimap(), globalHotkeyOptions);
   useHotkeys("t", () => toggleTags(), globalHotkeyOptions);
 
-  useHotkeys("escape", () => selectNode(null), globalHotkeyOptions);
+  // Escape deselects the current node — but only once nothing else owns it.
+  // react-hotkeys-hook gives every useHotkeys("escape", ...) call its own
+  // document keydown listener, so an overlay's Escape handler (TopBar's
+  // search-close, PerspectiveSelector's popover-close) and this global
+  // deselect handler both run synchronously on the *same* keypress whenever
+  // focus rests on a non-form element inside that overlay (e.g. a "Detail" or
+  // "Add" button). A store-flag gate read through this hook's own `enabled`
+  // prop is a closure captured at the last render, so it can't see a flag an
+  // earlier listener in this same dispatch just flipped (nw-532) — Zustand
+  // writes are synchronous, but this hotkey's own re-render is not.
+  // `ignoreEventWhen` re-checks the *same event object* live at dispatch
+  // time, so an overlay's handler marking it via `e.preventDefault()` is
+  // reliably visible here, in listener-registration order (children mount —
+  // and so register their keydown listener — before their parents).
+  //
+  // CONVENTION for any new overlay that closes on Escape: register its
+  // useHotkeys("escape", ...) UNCONDITIONALLY at mount, return early inside
+  // the callback when it is not open, and call `e.preventDefault()` when it
+  // does close. Gating it with `enabled: open` instead attaches its listener
+  // only when first opened — AFTER this one — so this handler runs first and
+  // silently clears the selection.
+  useHotkeys(
+    "escape",
+    () => selectNode(null),
+    { ...globalHotkeyOptions, ignoreEventWhen: (e) => e.defaultPrevented },
+  );
 
   // mod+z — undo navigation. Not enabled on form tags: inside inputs the
   // browser's native text undo must win over scene-history undo.

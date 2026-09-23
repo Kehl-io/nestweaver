@@ -4419,6 +4419,62 @@ fn index_json_reports_degraded_source_coverage_and_fail_on_skip_is_strict() {
     assert_eq!(strict_payload["skipped_count"], 1);
 }
 
+/// nw-601: an unparsable `broken.js` was indexed as an empty file, so
+/// `--fail-on-skip` was a no-op (`skipped_count: 0`, exit 0). Counterweights:
+/// a repo of parseable files (one with a recoverable syntax error) still reads
+/// `complete` and passes the strict gate, and a gitignored `ignored.js` —
+/// unparsable on purpose — stays out entirely: not indexed, not reported.
+#[test]
+fn fail_on_skip_rejects_an_unparsable_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_init.status.success(), "{git_init:?}");
+    std::fs::write(repo.join(".gitignore"), "ignored.js\n").unwrap();
+    std::fs::write(repo.join("ignored.js"), "}}} ((( @@@ %%% ;;\n").unwrap();
+    std::fs::write(repo.join("good.js"), "function good() { return 1; }\n").unwrap();
+    std::fs::write(
+        repo.join("partial.js"),
+        "function partial() { return 1; }\nconst x = (;\n",
+    )
+    .unwrap();
+
+    let run = |db: &std::path::Path| {
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(db)
+            .args(["--force", "--json", "--fail-on-skip"])
+            .output()
+            .unwrap()
+    };
+
+    let healthy = run(&dir.path().join("healthy.lbug"));
+    assert!(healthy.status.success(), "{healthy:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "complete", "{payload:#}");
+    assert_eq!(payload["skipped_count"], 0, "{payload:#}");
+    assert_eq!(
+        payload["files_processed"], 2,
+        "only good.js and partial.js are indexed; ignored.js stays out: {payload:#}"
+    );
+
+    std::fs::write(repo.join("broken.js"), "}}} ((( @@@ %%% ;;\n").unwrap();
+    let strict = run(&dir.path().join("strict.lbug"));
+    assert!(!strict.status.success(), "{strict:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "degraded");
+    assert_eq!(payload["skipped_count"], 1, "{payload:#}");
+    assert_eq!(payload["skipped_files"][0]["path"], "broken.js");
+    assert_eq!(payload["skipped_files"][0]["reason_code"], "parse_error");
+}
+
 #[test]
 fn invalid_source_limit_fails_before_database_creation() {
     let dir = tempfile::tempdir().unwrap();
@@ -10941,5 +10997,362 @@ fn mcp_wal_corrupt_boot_emits_jsonrpc_error_on_stdout() {
             || message.contains("write-ahead log"),
         "stdout error.message must identify WAL corruption, not merely stderr:\n\
          message={message:?}\nstderr={stderr}"
+    );
+}
+
+// ─── nw-548 / nw-553 / nw-524 / nw-481: CLI not-found honesty quick wins ────
+//
+// Four sibling defects, all the same shape: a miss that should be a NAMED
+// not-found (exit 2, a JSON envelope) instead fell through to a generic
+// Internal-error path (exit 1, empty stdout) or a confident empty success
+// (exit 0). Each test below reproduces the item's exact repro and pins the
+// fix; each has a counterweight proving the surrounding success path is
+// untouched.
+
+/// nw-548: `blast-radius --repo <unknown> --json` used to exit 1 with empty
+/// stdout and an Internal-error stderr wrap (the daemon RPC bubbled straight
+/// through the handler's bare `?`). `hubs`/`bridges` already special-case
+/// this via `error_is_unresolved_repo_filter`/`report_unresolved_repo_filter`;
+/// this arm now calls the same two functions.
+#[test]
+fn blast_radius_unknown_repo_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(n) { return n; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args([
+            "blast-radius",
+            "--files",
+            "main.js",
+            "--repo",
+            "no-such-repo",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown --repo must be exit 2 (not_found), not a generic Internal error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "blast-radius --repo <unknown> --json must still write a JSON envelope to stdout \
+             (was previously empty), got {e}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(payload["status"], "not_found");
+
+    // Counterweight: a real --repo still works.
+    nestweaver_cmd()
+        .args([
+            "blast-radius",
+            "--files",
+            "main.js",
+            "--repo",
+            "repo",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .assert()
+        .success();
+}
+
+/// nw-553: `brain diff <unknown> --json` used to exit 1 with empty stdout,
+/// wrapping the underlying not-found as an Internal error. The tool now
+/// resolves `repo` via the shared `resolve_repo_filter` (the same typed
+/// `RepoFilterUnresolved` `blast_radius`/`hubs`/`bridges` raise) instead of
+/// the untyped `resolve_repo_selector`, and the CLI arm catches it the same
+/// way those commands do.
+#[test]
+fn brain_diff_unknown_repo_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    // A real git repo (not just a directory), so the counterweight below can
+    // assert an actual SUCCESS from `brain diff` rather than merely "not the
+    // exit-2 refusal" -- `brain diff` needs git history to answer at all.
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(n) { return n; }\n",
+    )
+    .unwrap();
+    git(&["add", "main.js"]);
+    git(&["commit", "-m", "initial"]);
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "diff", "nosuchrepo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown repo must be exit 2 (not_found), not a generic Internal error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "brain diff <unknown> --json must still write a JSON envelope to stdout \
+             (was previously empty), got {e}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(payload["status"], "not_found");
+
+    // Counterweight: `brain diff` on the real (now genuinely git-backed)
+    // repo actually SUCCEEDS -- not merely "isn't exit 2 for some other
+    // reason", which would also pass on an unrelated crash.
+    let real = nestweaver_cmd()
+        .args(["brain", "diff", "repo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        real.status.code(),
+        Some(0),
+        "a real repo name must diff successfully, not be classified as an unresolved \
+         repo filter or fail for any other reason: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    let real_payload: serde_json::Value =
+        serde_json::from_slice(&real.stdout).unwrap_or_else(|e| {
+            panic!(
+                "brain diff repo --json must produce valid JSON on success, got {e}: {:?}",
+                String::from_utf8_lossy(&real.stdout)
+            )
+        });
+    assert_eq!(real_payload["repo"], "repo");
+}
+
+/// nw-524: `memory related` with a missing/typo'd uid used to exit 0 with an
+/// empty `related: []`, the same shape as a present note with zero typed
+/// relations -- a script branching on exit 2 could not tell "no relations"
+/// from "no such note". Existence is now checked first via `lookup_note`,
+/// the same not-found signal `note_get` already uses.
+#[test]
+fn memory_related_missing_uid_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("mem.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    // Alpha SUPERSEDES Beta: Beta is a REAL note with no OUTGOING typed
+    // relation, which is the counterweight case (present, zero neighbours).
+    std::fs::write(
+        vault_dir.join("Alpha.md"),
+        "---\nsupersedes: [Beta]\n---\n# Alpha\n\nSee [[Beta]] for details.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault_dir.join("Beta.md"),
+        "# Beta\n\nSome content about beta.\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let missing = nestweaver_cmd()
+        .args(["memory", "related", "note:does-not-exist", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "a uid absent from the graph must be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap_or_else(|e| {
+        panic!(
+            "memory related <missing uid> --json must write a not-found JSON envelope, \
+                 got {e}: {:?}",
+            String::from_utf8_lossy(&missing.stdout)
+        )
+    });
+    assert_eq!(payload["error"], "not found");
+
+    // Text mode (no --json): exit 2 with the not-found message on stderr,
+    // stdout empty. Only --json was previously asserted.
+    let missing_text = nestweaver_cmd()
+        .args(["memory", "related", "note:does-not-exist", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing_text.status.code(),
+        Some(2),
+        "text mode must also be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&missing_text.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_text.stdout)
+            .trim()
+            .is_empty(),
+        "memory related's not-found text must not be on stdout: {:?}",
+        String::from_utf8_lossy(&missing_text.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_text.stderr).contains("not found"),
+        "expected a not-found message on stderr: {:?}",
+        String::from_utf8_lossy(&missing_text.stderr)
+    );
+
+    // Counterweight: a REAL note (Beta) with zero typed relations still
+    // exits 0 with an honest empty list -- missing vs. empty stays
+    // distinguishable by exit code alone.
+    let search = nestweaver_cmd()
+        .args(["brain", "search", "Beta", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let beta_uid = search_json["results"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["title"] == "Beta"))
+        .and_then(|r| r["uid"].as_str())
+        .expect("Beta must be indexed")
+        .to_string();
+
+    let present = nestweaver_cmd()
+        .args(["memory", "related", &beta_uid, "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        present.status.code(),
+        Some(0),
+        "a present note with zero typed relations must still exit 0: {}",
+        String::from_utf8_lossy(&present.stderr)
+    );
+    let present_json: serde_json::Value = serde_json::from_slice(&present.stdout).unwrap();
+    assert_eq!(present_json["related"], serde_json::json!([]));
+}
+
+/// nw-481: `impact <substring>` used to be a bare `not_found` even when
+/// `search` finds many hits for the same string, and the daemon route's text
+/// "No symbol found" line printed on stdout instead of stderr. The shared
+/// `did_you_mean_candidates` builder (landed with zero call sites) is now
+/// wired into `tool_brain_impact`'s not-found response, and the text goes to
+/// stderr on both CLI routes.
+#[test]
+fn impact_substring_not_found_carries_did_you_mean_and_text_goes_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "export function helperB(n) { return n + 1; }\n\
+         export function helperC(n) { return n * 3; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // "helper" matches no symbol EXACTLY, but is a substring of both
+    // helperB and helperC.
+    let output = nestweaver_cmd()
+        .args(["impact", "helper", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["status"], "not_found");
+    let candidates = payload["did_you_mean"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a did_you_mean array, got: {payload}"));
+    assert!(
+        candidates.iter().any(|c| c == "helperB") && candidates.iter().any(|c| c == "helperC"),
+        "did_you_mean must surface the substring matches search finds: {candidates:?}"
+    );
+
+    // Text mode: the not-found line must be on stderr, not stdout.
+    let text = nestweaver_cmd()
+        .args(["impact", "helper", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(text.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&text.stdout).trim().is_empty(),
+        "impact's not-found text must not be on stdout: {:?}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    let text_stderr = String::from_utf8_lossy(&text.stderr);
+    // Tightened rather than a bare `.contains("helper")`: pins the exact
+    // not-found sentence AND that the did_you_mean suggestions render in
+    // text mode too, not just under --json (review follow-up).
+    assert!(
+        text_stderr.contains("Symbol 'helper' not found."),
+        "unexpected not-found text: {text_stderr:?}"
+    );
+    assert!(
+        text_stderr.contains("Did you mean:")
+            && text_stderr.contains("helperB")
+            && text_stderr.contains("helperC"),
+        "text mode must surface the same did_you_mean suggestions --json does: {text_stderr:?}"
+    );
+
+    // Counterweight: a UID query (contains ':') carries no did_you_mean key
+    // at all -- `did_you_mean_candidates` refuses to substring-search symbol
+    // names against a UID.
+    let uid_miss = nestweaver_cmd()
+        .args(["impact", "sym:repo:bogus:deadbeef:1", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let uid_payload: serde_json::Value = serde_json::from_slice(&uid_miss.stdout).unwrap();
+    assert!(
+        uid_payload.get("did_you_mean").is_none(),
+        "a UID miss must carry no did_you_mean key: {uid_payload}"
     );
 }

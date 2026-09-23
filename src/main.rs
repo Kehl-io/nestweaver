@@ -2821,6 +2821,21 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
     })))
 }
 
+/// `impact`'s text-mode not-found rendering, shared by the direct and daemon
+/// routes so the message and the `did_you_mean` formatting cannot drift
+/// between them (nw-481 review follow-up: the two routes used to print two
+/// DIFFERENT sentences here -- "Symbol '…' not found." on the direct route,
+/// "No symbol found: '…'." on the daemon route -- and only the daemon route
+/// stayed silent about any suggestions found). Always stderr: `--json` is
+/// the parseable contract, and clig.dev's "send messaging to stderr" is the
+/// standing convention every other not-found text line in this file follows.
+fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
+    eprintln!("Symbol '{name_or_uid}' not found.");
+    if !candidates.is_empty() {
+        eprintln!("Did you mean: {}?", candidates.join(", "));
+    }
+}
+
 /// Render a `dead-code` result as text from its JSON payload.
 ///
 /// BOTH the direct and daemon paths render through this, so the two cannot
@@ -5644,6 +5659,12 @@ enum Commands {
     )]
     Impact {
         /// Symbol name or UID to analyze
+        ///
+        /// A bare name resolves by EXACT match only (not substring/fuzzy) --
+        /// a name `search` finds hits for can still be not_found here. When
+        /// it is, the not_found response (JSON and text) carries
+        /// `did_you_mean` suggestions from the closest substring matches,
+        /// when any exist.
         name_or_uid: String,
         #[arg(
             long,
@@ -13357,14 +13378,35 @@ fn run_repair_index_publication(
     };
 
     if json {
+        // nw-614. `dirty` describes the publication MARKER, and on a database
+        // whose write-ahead log is unreadable the marker is usually clean — so
+        // the payload said `dirty: false` over a database no open can replay,
+        // and every consumer keying on `dirty` read that as "clean". Name the
+        // state and WITHHOLD the verdict (null, not false): repair never
+        // established anything about this database. Text mode needs no twin of
+        // this; it already returns `open_error` through `db_wal_corrupt`.
+        //
+        // Classified from the typed `StoreError` both open routes above wrap
+        // (`repair_open_failure` and `repair_probe_failure`), so a dirty marker
+        // and a clean one cannot disagree. `needs_forced_repair` stays as
+        // computed: `--force` cannot help here, so `false` is the true answer.
+        let wal_unreadable = open_error
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<nestweaver_store::StoreError>())
+            .and_then(nestweaver_store::StoreError::corruption_kind)
+            == Some(nestweaver_store::CorruptionKind::WalUnreadable);
+        let marker_dirty = |dirty: bool| (!wal_unreadable).then_some(dirty);
         let payload = serde_json::json!({
             "db": db_path.display().to_string(),
             "marker_path": status.marker_path,
             "dry_run": dry_run,
             "force": force,
+            "wal_unreadable": wal_unreadable,
+            "remedy": wal_unreadable
+                .then(|| wal_corruption_runbook(&db_path.display().to_string())),
             "needs_forced_repair": after.needs_forced_repair(),
             "before": {
-                "dirty": status.dirty,
+                "dirty": marker_dirty(status.dirty),
                 "determinable": status.determinable,
                 "writer_pid": status.writer_pid,
                 "writer_alive": status.writer_alive,
@@ -13374,7 +13416,7 @@ fn run_repair_index_publication(
                 "writer_reason": status.writer_reason,
                 "wedged": status.is_wedged(),
             },
-            "after": { "dirty": after.dirty },
+            "after": { "dirty": marker_dirty(after.dirty) },
             "recovered": recovered,
             "outcome": outcome.as_ref().map(repair_outcome_name),
             "message": outcome.as_ref().map(|o| o.describe()),
@@ -18051,22 +18093,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // paths therefore produce one payload and render through one
             // function, so the output format follows --json rather than whether
             // a daemon happens to be running (nw-108).
+            //
+            // nw-548: an unresolvable `--repo` used to fall straight through the
+            // `?` below to the generic Internal-error handler at exit 1 with
+            // empty stdout -- `hubs`/`bridges` already special-case this via
+            // `error_is_unresolved_repo_filter`/`report_unresolved_repo_filter`;
+            // this arm now calls the SAME two functions rather than growing a
+            // second copy of the classification.
             let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "blast_radius",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                Err(error) => return Err(error),
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     // The MCP server sets this before dispatching; without it the
                     // tool cannot locate the co-change sidecar and silently drops
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?
+                    match nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)
+                    {
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                        Ok(value) => value,
+                    }
                 }
             };
 
@@ -20899,7 +20959,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     ))?
                                 );
                             } else if !out.quiet {
-                                println!("No symbol found: '{name_or_uid}'.");
+                                // nw-481: messaging goes to stderr, matching
+                                // `context`/`brain context`'s existing not-found
+                                // text -- only this call site was still on
+                                // stdout, and no test/doc pins that stream, so
+                                // scripts scraping `impact`'s text stdout were
+                                // already told to use `--json` instead. Shared
+                                // renderer with the direct route below, so the
+                                // message and the did_you_mean formatting
+                                // cannot drift between the two routes. The
+                                // daemon already attached `did_you_mean` to
+                                // this payload server-side (`tool_brain_impact`),
+                                // so it is read here rather than looked up a
+                                // second time.
+                                let candidates: Vec<String> = value
+                                    .get("did_you_mean")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|c| c.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                eprint_impact_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -21169,15 +21251,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
+                    // nw-481: same `did_you_mean_candidates` builder the
+                    // daemon-served `tool_brain_impact` not_found path calls,
+                    // so the direct route's suggestions cannot drift from the
+                    // daemon's on ranking, scoping, or limit. Computed ONCE,
+                    // ahead of the `if json` split, so both the JSON envelope
+                    // and the text rendering below read the same list rather
+                    // than each doing its own lookup.
+                    let repo_uid = match repo_filter.as_deref().filter(|s| !s.is_empty()) {
+                        Some(selector) => {
+                            let repos = store.list_repos(None).unwrap_or_default();
+                            nestweaver_engine::resolve_repo_selector(&repos, selector)
+                                .ok()
+                                .map(|r| r.uid.clone())
+                        }
+                        None => None,
+                    };
+                    // did_you_mean_candidates' own contract says a lookup
+                    // failure must be LOGGED, not silently dropped, even
+                    // though it is best-effort and must not fail the command.
+                    let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
+                        &store,
+                        &name_or_uid,
+                        |s| repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid),
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(
+                            "impact: did_you_mean_candidates lookup failed for \
+                             '{name_or_uid}': {error:#}"
+                        );
+                        Vec::new()
+                    });
                     // nw-086: under --json, emit a JSON object instead of only a
                     // plain-text stderr line a --json consumer can't parse.
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_not_found(&name_or_uid))?
+                            serde_json::to_string_pretty(
+                                &nestweaver_schema::responses::with_did_you_mean(
+                                    impact_json_not_found(&name_or_uid),
+                                    &candidates,
+                                )
+                            )?
                         );
                     } else {
-                        eprintln!("Symbol '{name_or_uid}' not found.");
+                        eprint_impact_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }
@@ -22127,6 +22245,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "postings_added": stats.postings_added,
                             "postings_deleted": stats.postings_deleted,
                             "posting_deltas_unavailable": stats.posting_deltas_unavailable,
+                            "scopes_deferred": stats.scopes_deferred,
                             "migrated_legacy_index": stats.migrated_legacy_index,
                             "elapsed_ms": stats.elapsed_ms,
                         })
@@ -22434,7 +22553,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 .with_context(|| "refresh_trigram_index")?;
                 out.status(&format!(
-                    "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) added, {} changed, {} deleted; {} posting(s) added, {} deleted in {} ms{}.",
+                    "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) added, {} changed, {} deleted; {} posting(s) added, {} deleted in {} ms{}{}.",
                     stats.scopes_refreshed,
                     stats.scopes_unchanged,
                     stats.nodes_added,
@@ -22444,6 +22563,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     stats.postings_deleted,
                     stats.elapsed_ms,
                     if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
+                    nestweaver_store::deferred_scopes_note(&stats),
                 ));
                 if !stats.posting_deltas_unavailable.is_empty() {
                     out.status(&format!(
@@ -25249,6 +25369,16 @@ fn run_memory(
                 "brain_memory_related",
                 args,
             )?;
+            // nw-524: mirrors `note get` -- a `not_found` uid is a named
+            // refusal at exit 2, not the same `related: []` shape a present
+            // note with zero typed relations gets at exit 0.
+            if payload["status"].as_str() == Some("not_found") {
+                if json {
+                    print_json_not_found("uid", &uid);
+                }
+                eprintln!("Note '{uid}' not found.");
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -29525,17 +29655,32 @@ fn run_brain(
             // shared JSON-RPC dispatch, falling back to the same
             // `nestweaver_mcp::tools::dispatch` the daemon and MCP routes
             // call, so all three surfaces answer from one implementation.
+            //
+            // nw-553: an unresolvable `repo` used to fall through the bare `?`
+            // to the generic Internal-error path (exit 1, empty stdout). Same
+            // catch `blast-radius`/`hubs`/`bridges` use, calling the shared
+            // classifier/reporter rather than re-deriving the not-found shape.
             let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_diff",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                Err(error) => return Err(error),
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None)?
+                    match nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None) {
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                        Ok(value) => value,
+                    }
                 }
             };
             if json {

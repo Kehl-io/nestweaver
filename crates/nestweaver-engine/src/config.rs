@@ -194,7 +194,23 @@ pub struct LinkConfig {
 pub struct FeatureConfig {
     pub name: String,
     pub description: Option<String>,
+    /// nw-599 follow-up: had the identical defect `entry_points` had below —
+    /// absent (not merely empty) `repos` in a `[[features]]` block failed
+    /// TOML deserialization for the whole `InstanceConfig` before this field
+    /// ever reached the load-time "it will match nothing" warning loop in
+    /// `InstanceConfig::from_toml_str`, which assumes deserialization already
+    /// succeeded. Defaults to empty instead so that warning can actually
+    /// fire on an empty/absent `repos` rather than never being reached.
+    #[serde(default)]
     pub repos: Vec<String>,
+    /// nw-599: absent `entry_points` used to fail TOML deserialization for
+    /// the whole `InstanceConfig`, taking every other section (repos, links,
+    /// ...) down with it and killing MCP/CLI boot before either could report
+    /// anything useful. It defaults to empty instead; the load-time warning
+    /// loop in `InstanceConfig::from_toml_str` below already flags an empty
+    /// `entry_points` per feature ("context will be empty"), so the gap is
+    /// still surfaced — just as a warning, not a hard parse failure.
+    #[serde(default)]
     pub entry_points: Vec<String>,
 }
 
@@ -2073,6 +2089,152 @@ entry_points = ["syncData", "fetchRecords"]
         assert_eq!(features[0].name, "data-sync");
         assert_eq!(features[0].repos, vec!["app", "service"]);
         assert_eq!(features[0].entry_points, vec!["syncData", "fetchRecords"]);
+    }
+
+    // nw-599: a `[[features]]` block written without `entry_points` used to
+    // fail TOML deserialization for the ENTIRE InstanceConfig (`missing field
+    // entry_points`), taking down `[[repos]]`/`[[links]]`/everything else in
+    // the same file along with it, and killing MCP boot before it could even
+    // reach JSON-RPC. `entry_points` now defaults to empty (`repos` got the
+    // same `#[serde(default)]` treatment in the nw-599 follow-up, see
+    // `feature_without_repos_still_parses_instance_config` below), and the
+    // pre-existing "context will be empty" warning at load time (see the
+    // loop over `config.features` above `validate_and_normalize_
+    // seed_resolution`) is what surfaces the gap instead of a hard failure.
+    #[test]
+    fn feature_without_entry_points_still_parses_instance_config() {
+        let toml = r#"
+instance_id = "missing-entry-points-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+repos = ["app"]
+"#;
+        let cfg =
+            InstanceConfig::from_toml_str(toml).expect("should parse despite missing entry_points");
+
+        // Counterweight: other sections still loaded — the missing field in
+        // `[[features]]` did not take the whole file down with it.
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.repos[0].url, "https://github.com/example/app");
+
+        let features = cfg.features.expect("should have features");
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name, "data-sync");
+        assert!(
+            features[0].entry_points.is_empty(),
+            "entry_points should default to empty, not fail parsing"
+        );
+    }
+
+    // nw-599 follow-up: `repos` had the identical defect as `entry_points` —
+    // absent from `[[features]]` (as opposed to present-but-empty), it fails
+    // TOML deserialization for the whole `InstanceConfig` because it carried
+    // no `#[serde(default)]`. The empty-repos warning loop above (config.rs
+    // "it will match nothing") can only fire if deserialization SUCCEEDED
+    // with an empty vec in the first place — an absent field never reached
+    // it, it failed earlier, at parse time.
+    #[test]
+    fn feature_without_repos_still_parses_instance_config() {
+        let toml = r#"
+instance_id = "missing-repos-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+"#;
+        let cfg = InstanceConfig::from_toml_str(toml).expect("should parse despite missing repos");
+
+        // Counterweight: other sections still loaded.
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.repos[0].url, "https://github.com/example/app");
+
+        let features = cfg.features.expect("should have features");
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name, "data-sync");
+        assert!(
+            features[0].repos.is_empty(),
+            "repos should default to empty, not fail parsing"
+        );
+        assert!(features[0].entry_points.is_empty());
+    }
+
+    // Counterweight for nw-599: an unrecognized key inside `[[features]]`
+    // must still be rejected — `deny_unknown_fields` on `FeatureConfig`
+    // itself is untouched by defaulting `entry_points`.
+    #[test]
+    fn feature_with_unknown_field_still_rejected() {
+        let toml = r#"
+instance_id = "unknown-feature-field-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+repos = ["app"]
+entry_points = ["syncData"]
+bogus_field = "nope"
+"#;
+        let err = InstanceConfig::from_toml_str(toml)
+            .expect_err("unknown field inside [[features]] should still fail");
+        assert!(
+            err.to_string().contains("bogus_field") || err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
     }
 
     // Feature F6: `[ranking]` parses into dampen/boost lists and multipliers

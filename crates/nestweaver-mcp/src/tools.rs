@@ -931,6 +931,22 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
         "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
             Some("conflicting arguments: pass only one of 'pattern' or 'query'")
         }
+        // nw-630: `symbol` is an alias of `name`. Unlike `pattern`/`query`,
+        // which reject the pair unconditionally, this only rejects a
+        // genuine conflict — an agent that copy-pasted an argument object
+        // between tools and happens to carry both keys with the SAME value
+        // should not be punished for it.
+        "cross_repo_contracts"
+            if args.get("name").and_then(|v| v.as_str()).is_some_and(|n| {
+                args.get("symbol")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s != n)
+            }) =>
+        {
+            Some(
+                "conflicting arguments: 'name' and 'symbol' are aliases — pass only one, or the same value in both",
+            )
+        }
         _ => None,
     }
 }
@@ -1499,7 +1515,7 @@ mod tool_schema_validation_tests {
         ("detect_changes", &["changed_files", "files"]),
         ("note_get", &["uid", "title"]),
         ("backlinks", &["uid", "title"]),
-        ("cross_repo_contracts", &["uid", "name"]),
+        ("cross_repo_contracts", &["uid", "name", "symbol"]),
         ("affected_tests", &["changed_files", "base_ref"]),
         ("query_extensions", &["uid", "key", "value"]),
     ];
@@ -1525,6 +1541,7 @@ mod tool_schema_validation_tests {
             ("backlinks", json!({ "title": "Home" })),
             ("cross_repo_contracts", json!({ "uid": "sym:x" })),
             ("cross_repo_contracts", json!({ "name": "UserService" })),
+            ("cross_repo_contracts", json!({ "symbol": "UserService" })),
             ("affected_tests", json!({ "changed_files": ["src/a.rs"] })),
             ("affected_tests", json!({ "base_ref": "main" })),
             ("query_extensions", json!({ "uid": "sym:x" })),
@@ -1539,6 +1556,21 @@ mod tool_schema_validation_tests {
         // ...and a branch that needs two keys is not satisfied by one of them.
         let error = assert_invalid("query_extensions", json!({ "key": "team" }));
         assert!(error.contains("value"), "{error}");
+    }
+
+    /// nw-630: schema-level (not handler-level) coverage for the `symbol`
+    /// alias on `cross_repo_contracts` — `symbol` alone satisfies the
+    /// `anyOf`, and `name` + `symbol` together (agreeing) is not rejected by
+    /// JSON Schema validation itself (the semantic "must agree" check is
+    /// `conflicting_alias_error`, exercised separately in
+    /// `ambiguous_name_contract_tests`).
+    #[test]
+    fn cross_repo_contracts_symbol_alias_passes_schema_validation() {
+        assert_valid("cross_repo_contracts", json!({ "symbol": "ping" }));
+        assert_valid(
+            "cross_repo_contracts",
+            json!({ "name": "ping", "symbol": "ping" }),
+        );
     }
 
     /// nw-410's acceptance criterion, asserted over the REGISTRY so tool 43
@@ -4999,6 +5031,31 @@ fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, a
         .get("uid")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'uid' (string) is required"))?;
+    // nw-524: `memory_related` (below) returns an empty Vec for BOTH "no
+    // typed edges from a real note" and "no such note" -- the two were the
+    // same shape (`related: []`, exit 0), so a script branching on exit 2 for
+    // a missing/typo'd uid instead treated it as "no relations". Existence is
+    // checked FIRST via `lookup_note`, the same not-found signal `note_get`
+    // already treats as its not-found envelope, so this tool cannot grow a
+    // second notion of "missing". Counterweight: a real note with zero typed
+    // relations still reaches `memory_related` below and still answers
+    // `related: []` at exit 0 -- only an ABSENT uid now short-circuits here.
+    match store.lookup_note(uid) {
+        Ok(_) => {}
+        Err(nestweaver_store::StoreError::NotFound) => {
+            return Ok(json!({
+                "status": "not_found",
+                "error": "not found",
+                "uid": uid,
+                "depth": 0,
+                "related": [],
+                "total": 0,
+                "returned": 0,
+                "truncated": false,
+            }));
+        }
+        Err(e) => return Err(anyhow!("lookup_note: {e}")),
+    }
     let edge_types = parse_string_array(&args, "edge_types").unwrap_or_default();
     // nw-411: `read_limit`, not `as_u64()`. `as_u64` collapses "absent",
     // "negative" and "not an integer" into one `None`, so `depth: -1` fell
@@ -5040,7 +5097,7 @@ const MEMORY_RELATED_DEFAULT_DEPTH: usize = 2;
 fn tool_schema_brain_memory_related() -> Value {
     json!({
         "name": "brain_memory_related",
-        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to `depth` (1-15, default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Bounded: `total` is the pre-cap match count, `returned` the page, `truncated` says whether `limit` cut it — raise `limit` to see the rest\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
+        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to `depth` (1-15, default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Bounded: `total` is the pre-cap match count, `returned` the page, `truncated` says whether `limit` cut it — raise `limit` to see the rest\n- A uid absent from the graph is `status: \"not_found\"`; a present note with zero typed relations still answers `related: []` at `status` absent\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -9601,13 +9658,21 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n- Each row carries `repo` (the OTHER symbol's repo UID); optionally pass `repo` (a UID or display name) to scope rows to one repo\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n- `link_type: \"contract\"` rows always carry `repo: null` — contract UIDs carry no repo component, so they cannot be attributed and are EXCLUDED (not guessed) whenever a `repo` filter is set\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires one of 'uid', 'name', or 'symbol' (at least one must be provided; 'symbol' is an alias of 'name', accepted for consistency with brain_impact/flow_trace).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid, name, or symbol; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n- Each row carries `repo` (the OTHER symbol's repo UID); optionally pass `repo` (a UID or display name) to scope rows to one repo\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n- `link_type: \"contract\"` rows always carry `repo: null` — contract UIDs carry no repo component, so they cannot be attributed and are EXCLUDED (not guessed) whenever a `repo` filter is set\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Ambiguous names fail (same as flow_trace / context); pass uid or name_repo to pin one symbol." },
+                // nw-630: `symbol` is an alias of `name`, accepted so an agent
+                // that just called `brain_impact`/`flow_trace` (both take
+                // `symbol`) does not get an `additionalProperties` rejection
+                // for reusing the same argument name here. Passing both
+                // `name` and `symbol` with different values is rejected by
+                // `conflicting_alias_error` before schema validation runs;
+                // passing them with the same value is fine.
+                "symbol": { "type": "string", "description": "Alias of 'name' — accepted for consistency with brain_impact/flow_trace, which take 'symbol'. Symbol name (e.g. \"UserService\"); ambiguous names fail the same way 'name' does." },
                 "name_repo": { "type": "string", "description": "Disambiguate duplicate visible symbol names by repo; ignored for UIDs and globally unique visible names. Does not filter result rows." },
                 "repo": { "type": "string", "description": "Optional repo selector (UID or display name) scoping rows to links whose OTHER symbol lives in this repo. `link_type: \"contract\"` rows are always excluded when this is set, because contract UIDs carry no repo component and cannot be matched against it." },
                 "limit": limit_schema(
@@ -9619,9 +9684,15 @@ fn tool_schema_cross_repo_contracts() -> Value {
             // Hand-coded beside the schema it was invisible to the guide,
             // which published "Key parameters: —" for this tool and WROTE
             // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            //
+            // nw-630 added the third `symbol` branch — `either_or_detail`
+            // renders three branches as "provide one of 'uid', 'name',
+            // 'symbol'" rather than assuming exactly two, so this did not
+            // need a change there.
             "anyOf": [
                 { "required": ["uid"] },
-                { "required": ["name"] }
+                { "required": ["name"] },
+                { "required": ["symbol"] }
             ]
         }
     })
@@ -9649,7 +9720,15 @@ fn tool_cross_repo_contracts(
             }
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
-    } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+    } else if let Some(name) = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        // nw-630: `symbol` is an alias of `name` — `conflicting_alias_error`
+        // already rejected the request before this runs if both were given
+        // with different values, so by the time we get here they either
+        // agree or only one is present.
+        .or_else(|| args.get("symbol").and_then(|v| v.as_str()))
+    {
         let initial = resolve_symbol_strict(store, name, visible, None)?;
         let resolved = match initial {
             StrictNameResolve::Ambiguous(candidates) => classify_name_matches(
@@ -9667,7 +9746,7 @@ fn tool_cross_repo_contracts(
             }
         }
     } else {
-        return Err(anyhow!("provide either 'uid' or 'name'"));
+        return Err(anyhow!("provide either 'uid', 'name', or 'symbol'"));
     };
     let limit = read_limit(
         &args,
@@ -9866,14 +9945,14 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": { "type": "string", "description": "Scope the target symbol to this repository (UID or display name)." },
                 "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Minimum edge confidence." },
                 "min_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum traversal impact score; 0 disables pruning." },
-                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Ambiguous names require a repo selector or UID." },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). A bare name is resolved by EXACT match only (not substring); ambiguous names require a repo selector or UID. An exact-match miss returns status \"not_found\" with a bounded `did_you_mean` array of the closest substring matches, when any exist." },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
@@ -9960,9 +10039,47 @@ fn tool_brain_impact(
     let uid = match resolve_symbol_strict(store, symbol, visible, repo)? {
         StrictNameResolve::Found(uid) => uid,
         StrictNameResolve::NotFound => {
-            return Ok(nestweaver_schema::responses::impact(json!({
-                "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
-            })));
+            // nw-481: `impact` resolves a bare name by EXACT match only, so a
+            // name `search` finds many hits for can still land here. The
+            // shared `did_you_mean_candidates` builder (landed with zero call
+            // sites in 44b640e7) is the consumer half -- called here instead
+            // of a second substring lookup, so this path and any other tool
+            // that ever needs the same suggestion cannot drift on ranking or
+            // scoping. A suggestion-lookup failure does not fail the whole
+            // `not_found` response (best-effort per that function's own
+            // contract), but that contract also says a caller MUST log the
+            // error rather than silently drop it -- `unwrap_or_default` alone
+            // did not.
+            let repo_uid = match repo.filter(|s| !s.is_empty()) {
+                Some(selector) => {
+                    let mut repos = store.list_repos(None).unwrap_or_default();
+                    repos.retain(|r| repo_is_visible(&r.uid, visible));
+                    nestweaver_engine::resolve_repo_selector(&repos, selector)
+                        .ok()
+                        .map(|r| r.uid.clone())
+                }
+                None => None,
+            };
+            let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
+                store,
+                symbol,
+                |s| {
+                    repo_is_visible(&s.repo_uid, visible)
+                        && repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid)
+                },
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "brain_impact: did_you_mean_candidates lookup failed for '{symbol}': {error:#}"
+                );
+                Vec::new()
+            });
+            return Ok(nestweaver_schema::responses::with_did_you_mean(
+                nestweaver_schema::responses::impact(json!({
+                    "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
+                })),
+                &candidates,
+            ));
         }
         StrictNameResolve::Ambiguous(candidates) => {
             return Ok(nestweaver_schema::responses::impact_ambiguous(
@@ -11894,7 +12011,26 @@ fn tool_brain_diff(
         .into_iter()
         .filter(|repo| visible.is_none_or(|scope| scope.allows(&repo.uid)))
         .collect::<Vec<_>>();
-    let repo = nestweaver_engine::resolve_repo_selector(&repos, repo_name)?;
+    // nw-553: was `resolve_repo_selector` directly, whose plain `anyhow!` on a
+    // miss has no typed marker, so the daemon's generic status mapper treated
+    // it as Internal (exit 1, empty stdout) instead of the `not_found` exit 2
+    // envelope `blast_radius`/`hubs`/`bridges` already get. `resolve_repo_filter`
+    // wraps the identical resolver in `RepoFilterUnresolved`, which is the ONE
+    // type `classify_daemon_error`/`error_is_unresolved_repo_filter` on the
+    // daemon and CLI sides already recognize -- reused here rather than taught
+    // a second not-found shape for this one tool.
+    let resolved_uid = nestweaver_engine::node_scope::resolve_repo_filter(
+        store,
+        std::slice::from_ref(&repo_name.to_string()),
+        visible,
+    )?
+    .into_iter()
+    .next()
+    .context("resolve_repo_filter returned no uid for a single selector")?;
+    let repo = repos
+        .iter()
+        .find(|repo| repo.uid == resolved_uid)
+        .context("resolved repo uid is missing from the visible repo list")?;
 
     let Some(repo_path) = repo.local_root() else {
         anyhow::bail!(
@@ -21829,6 +21965,43 @@ mod blast_radius_visibility_tests {
         );
     }
 
+    /// nw-553: `brain_diff` resolved `repo` via `resolve_repo_selector`
+    /// directly, whose plain `anyhow!` on a miss has no typed marker, so the
+    /// daemon's generic status mapper answered Internal (exit 1, empty
+    /// stdout) rather than the `not_found`/exit-2 contract `blast_radius`
+    /// gets from `RepoFilterUnresolved` (asserted just above, same store).
+    /// `tool_brain_diff` now goes through the shared `resolve_repo_filter`
+    /// too, so this is the SAME typed error on the SAME store.
+    #[test]
+    fn tool_brain_diff_unresolvable_repo_is_a_typed_not_a_generic_error() {
+        let store = named_repo_store();
+        let error = tool_brain_diff(&store, json!({ "repo": "this-repo-does-not-exist" }), None)
+            .expect_err("an unresolvable repo must refuse rather than diff nothing");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>()),
+            "the error must be the TYPED RepoFilterUnresolved the daemon's status mapper \
+             and `error_is_unresolved_repo_filter` (src/main.rs) both recognize, not a bare \
+             anyhow string: {error:#}"
+        );
+
+        // COUNTERWEIGHT: a real repo name resolves PAST the not-found stage.
+        // `named_repo_store`'s repos carry no `root_path`, so the next
+        // failure is the (unrelated) "not a local repo" refusal -- proof
+        // resolution itself succeeded rather than every repo name refusing.
+        let real_repo_error =
+            tool_brain_diff(&store, json!({ "repo": "bx-react-native-client" }), None)
+                .expect_err("the fixture repo has no local root, so this must still fail");
+        assert!(
+            !real_repo_error
+                .chain()
+                .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>()),
+            "a real repo name must not be classified as an unresolved repo filter: \
+             {real_repo_error:#}"
+        );
+    }
+
     #[test]
     fn restricted_symbol_topology_tools_never_cross_a_two_repo_boundary() {
         let store = cross_repo_store();
@@ -22684,6 +22857,79 @@ mod brain_impact_uid_resolution_tests {
         assert_eq!(result["status"], "ok", "{result}");
         assert_eq!(result["total"], 0);
         assert!(result["impact_nodes"].as_array().unwrap().is_empty());
+    }
+
+    /// nw-481: a bare NAME `impact` resolves by EXACT match only
+    /// (`lookup_symbols_by_name`), so a name `search` finds substring hits
+    /// for can still be `not_found` here. The shared `did_you_mean_candidates`
+    /// builder (landed with zero call sites in 44b640e7) is now the consumer:
+    /// this not_found response must carry the substring matches.
+    #[test]
+    fn brain_impact_not_found_name_carries_did_you_mean_substring_matches() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:api:project_context_tool:1",
+                "tool_project_context",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:api:project_context_hlp:1",
+                "project_context_helper",
+            ))
+            .unwrap();
+
+        let result = tool_brain_impact(&store, json!({ "symbol": "project_context" }), None, None)
+            .expect("impact call");
+        assert_eq!(result["status"], "not_found", "{result}");
+        let candidates = result["did_you_mean"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a did_you_mean array: {result}"));
+        let names: Vec<&str> = candidates.iter().filter_map(|c| c.as_str()).collect();
+        assert!(
+            names.contains(&"tool_project_context") && names.contains(&"project_context_helper"),
+            "did_you_mean must surface search's substring matches: {names:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT (nw-481): a UID-shaped query carries no `did_you_mean`
+    /// key at all -- `did_you_mean_candidates` refuses to substring-search
+    /// symbol NAMES against a UID, and a not_found response for a genuinely
+    /// unknown symbol NAME with zero substring hits must not fabricate an
+    /// empty placeholder array either.
+    #[test]
+    fn brain_impact_not_found_carries_no_did_you_mean_for_a_uid_or_a_true_miss() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol("sym:repo:api:target:1", "Target"))
+            .unwrap();
+
+        let uid_miss = tool_brain_impact(
+            &store,
+            json!({ "symbol": "sym:repo:api:nonexistent:99" }),
+            None,
+            None,
+        )
+        .expect("impact call");
+        assert_eq!(uid_miss["status"], "not_found", "{uid_miss}");
+        assert!(
+            uid_miss.get("did_you_mean").is_none(),
+            "a UID miss must carry no did_you_mean key: {uid_miss}"
+        );
+
+        let true_miss = tool_brain_impact(
+            &store,
+            json!({ "symbol": "totally_bogus_name_xyz" }),
+            None,
+            None,
+        )
+        .expect("impact call");
+        assert_eq!(true_miss["status"], "not_found", "{true_miss}");
+        assert!(
+            true_miss.get("did_you_mean").is_none(),
+            "zero substring hits must leave did_you_mean absent, not an empty array: {true_miss}"
+        );
     }
 }
 
@@ -23773,6 +24019,38 @@ mod memory_related_bound_tests {
         // mandatory one.
         let defaulted = tool_brain_memory_related(&store, json!({ "uid": uid })).unwrap();
         assert_eq!(defaulted["depth"], json!(MEMORY_RELATED_DEFAULT_DEPTH));
+    }
+
+    /// nw-524: a uid absent from the graph used to answer `related: []` at
+    /// exit 0 -- the identical shape a REAL note with zero typed relations
+    /// gets, which made "no such note" and "no relations" indistinguishable
+    /// to a caller that only checks the exit code.
+    #[test]
+    fn a_missing_uid_is_reported_not_found_rather_than_an_empty_related_list() {
+        let (_dir, store) = depends_on_chain(3);
+
+        let missing =
+            tool_brain_memory_related(&store, json!({ "uid": "note:does-not-exist" })).unwrap();
+        assert_eq!(missing["status"], json!("not_found"), "{missing}");
+        assert_eq!(missing["related"], json!([]));
+
+        // COUNTERWEIGHT: the LAST note in the chain is real and has no
+        // outgoing DependsOn edge (nothing depends on it), so it must still
+        // answer an honest empty list at exit 0 (no `status` key) rather than
+        // being swept into the not-found branch above.
+        let leaf_uid = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.title == "n3")
+            .expect("leaf note")
+            .uid;
+        let leaf = tool_brain_memory_related(&store, json!({ "uid": leaf_uid })).unwrap();
+        assert!(
+            leaf.get("status").is_none(),
+            "a present note with zero relations must not carry a not_found status: {leaf}"
+        );
+        assert_eq!(leaf["related"], json!([]));
     }
 }
 
@@ -26471,6 +26749,69 @@ mod ambiguous_name_contract_tests {
             tool_cross_repo_contracts(&store, json!({"name": "ping", "repo": "py-ping"}), None)
                 .unwrap();
         assert_eq!(ambiguous["status"], "ambiguous");
+    }
+
+    /// nw-630: `symbol` is an alias of `name` at the HANDLER level — sibling
+    /// tools `brain_impact`/`flow_trace` take `symbol`, and an agent that just
+    /// called one of those was getting `additionalProperties` rejected here
+    /// for reusing the same argument name. Resolving through `symbol` must
+    /// behave identically to resolving through `name`.
+    #[test]
+    fn symbol_argument_resolves_the_same_as_name() {
+        let store = ambiguous_ping_store();
+        let via_name =
+            tool_cross_repo_contracts(&store, json!({"name": "ping", "name_repo": "py"}), None)
+                .unwrap();
+        let via_symbol =
+            tool_cross_repo_contracts(&store, json!({"symbol": "ping", "name_repo": "py"}), None)
+                .unwrap();
+        assert_eq!(via_name, via_symbol);
+        assert_eq!(via_symbol["uid"], "sym:py-ping:ping");
+    }
+
+    /// Counterweight for nw-630: `uid` keeps its own, unaliased behaviour —
+    /// adding `symbol` as a `name` alias must not change how a `uid` lookup
+    /// resolves or errors.
+    #[test]
+    fn uid_argument_is_unaffected_by_the_symbol_alias() {
+        let store = ambiguous_ping_store();
+        let by_uid =
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:py-ping:ping"}), None).unwrap();
+        assert_eq!(by_uid["uid"], "sym:py-ping:ping");
+        // An unknown uid still fails closed rather than silently falling
+        // back to a `symbol`/`name` search.
+        assert!(
+            tool_cross_repo_contracts(&store, json!({"uid": "sym:does-not-exist"}), None).is_err()
+        );
+    }
+
+    /// nw-630: `name` and `symbol` disagreeing is a caller mistake, not a
+    /// silent pick-one — reject at the schema-validation layer before the
+    /// handler ever runs.
+    #[test]
+    fn conflicting_name_and_symbol_are_rejected() {
+        let args = json!({ "name": "ping", "symbol": "pong" });
+        let error = validate_tool_arguments("cross_repo_contracts", &args)
+            .expect_err("conflicting name/symbol must be rejected");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("'name'") && error.contains("'symbol'"),
+            "expected a conflicting-alias error naming both fields: {error}"
+        );
+    }
+
+    /// Counterweight for the conflict check above: the SAME value in both
+    /// `name` and `symbol` is not a conflict.
+    #[test]
+    fn matching_name_and_symbol_are_not_a_conflict() {
+        let store = ambiguous_ping_store();
+        let result = tool_cross_repo_contracts(
+            &store,
+            json!({"name": "ping", "symbol": "ping", "name_repo": "py"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["uid"], "sym:py-ping:ping");
     }
 
     #[test]

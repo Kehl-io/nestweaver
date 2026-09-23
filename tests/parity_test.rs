@@ -2916,6 +2916,185 @@ fn parity_brain_diff_direct_vs_daemon() {
     check_parity_json_semantic(&fixture.db_path, "brain diff", &["brain", "diff", "repo"]);
 }
 
+/// nw-548 direct-vs-daemon: an unknown `--repo` must refuse identically
+/// (same exit code, same "not found" naming) whether or not a daemon owns
+/// the database. `check_parity_json_semantic` cannot be used here — it
+/// requires BOTH routes to succeed — so this uses `check_parity_of_refusal`,
+/// the sibling helper for a refusal that must match across routes.
+#[test]
+fn parity_blast_radius_unknown_repo_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "blast-radius --repo <unknown>",
+        &[
+            "blast-radius",
+            "--files",
+            "src/a.js",
+            "--repo",
+            "no-such-repo",
+        ],
+        "not found in graph",
+    );
+}
+
+/// nw-553 direct-vs-daemon: same shape as the blast-radius row above, for
+/// `brain diff <unknown repo>`.
+#[test]
+fn parity_brain_diff_unknown_repo_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "brain diff <unknown repo>",
+        &["brain", "diff", "nosuchrepo"],
+        "not found in graph",
+    );
+}
+
+/// nw-524 direct-vs-daemon: a uid absent from the graph must refuse
+/// identically on both routes.
+#[test]
+fn parity_memory_related_missing_uid_direct_vs_daemon() {
+    let fixture = setup_fixture_with_vault_note();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "memory related <missing uid>",
+        &["memory", "related", "note:does-not-exist"],
+        "not found",
+    );
+}
+
+/// nw-481 direct-vs-daemon: `impact <substring>` must land at the same
+/// not_found/exit-2 refusal on both routes. `check_parity_of_refusal` only
+/// asserts the exit code and a shared stderr substring, not the `did_you_mean`
+/// JSON payload itself -- the direct-vs-daemon `did_you_mean` VALUE parity is
+/// covered separately below, since `check_parity_json_semantic` cannot be
+/// used on a non-zero exit.
+#[test]
+fn parity_impact_substring_not_found_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    // "not found" rather than the looser "found": the direct and daemon
+    // routes used to print genuinely different sentences here ("Symbol '…'
+    // not found." vs. "No symbol found: '…'.", which shares only "found"),
+    // and are now unified onto one message
+    // (`parity_impact_substring_not_found_text_is_on_stderr_via_daemon`
+    // pins the exact text and did_you_mean suggestions on both routes).
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "impact <substring>",
+        &["impact", "helper"],
+        "not found",
+    );
+}
+
+/// nw-481: the `did_you_mean` JSON payload itself, compared value-for-value
+/// between the direct and daemon routes (not just exit code / stderr
+/// substring, which `parity_impact_substring_not_found_direct_vs_daemon`
+/// already covers).
+#[test]
+fn parity_impact_substring_not_found_did_you_mean_payload_matches() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let direct = run_direct(db, &["impact", "helper", "--json"]);
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &["impact", "helper", "--json"]);
+
+    for (route, output) in [("direct", &direct), ("daemon", &daemon)] {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "impact <substring> ({route}) must be exit 2 (not_found): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let parse = |raw: &Output| -> serde_json::Value {
+        serde_json::from_slice(&raw.stdout).unwrap_or_else(|e| {
+            panic!(
+                "impact --json stdout must be valid JSON even on not_found: {e}\n{}",
+                String::from_utf8_lossy(&raw.stdout)
+            )
+        })
+    };
+    let direct_json = parse(&direct);
+    let daemon_json = parse(&daemon);
+    let sorted = |value: &serde_json::Value| -> Vec<String> {
+        let mut names: Vec<String> = value["did_you_mean"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected did_you_mean array: {value}"))
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        sorted(&direct_json),
+        sorted(&daemon_json),
+        "did_you_mean diverged between direct and daemon routes\ndirect: {direct_json}\n\
+         daemon: {daemon_json}"
+    );
+}
+
+/// nw-481 review follow-up: the CLI-level not-found stderr assertion for
+/// `impact` was hollow on the DAEMON route -- the direct route already
+/// printed to stderr before this batch, so a test only proves something on
+/// the route that changed. This exercises `run_via_daemon` directly (not
+/// `check_parity_of_refusal`, which only asserts a shared substring) and
+/// pins: stdout is EMPTY, the not-found sentence and the did_you_mean
+/// suggestions are on stderr, and the message matches the direct route's
+/// (the two used to differ: "No symbol found: '…'." on the daemon route vs.
+/// "Symbol '…' not found." on the direct route -- now unified, since nothing
+/// pinned either spelling).
+#[test]
+fn parity_impact_substring_not_found_text_is_on_stderr_via_daemon() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // DIRECT run happens BEFORE the daemon starts, matching this file's
+    // documented ordering invariant -- calling `run_direct` after the
+    // daemon is up makes the direct route print an "escape hatch" warning
+    // banner ahead of the same text, which would fail the byte-comparison
+    // below for a reason that has nothing to do with the not-found message.
+    let direct = run_direct(db, &["impact", "helper"]);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &["impact", "helper"]);
+
+    assert_eq!(
+        daemon.status.code(),
+        Some(2),
+        "impact <substring> (daemon, text) must be exit 2 (not_found): {}",
+        String::from_utf8_lossy(&daemon.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&daemon.stdout).trim().is_empty(),
+        "impact's not-found text must not be on stdout via the daemon route: {:?}",
+        String::from_utf8_lossy(&daemon.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&daemon.stderr);
+    assert!(
+        stderr.contains("Symbol 'helper' not found."),
+        "unexpected not-found text on the daemon route: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Did you mean:")
+            && stderr.contains("helperB")
+            && stderr.contains("helperC"),
+        "the daemon route's text mode must surface did_you_mean suggestions too: {stderr:?}"
+    );
+
+    // Same message, same suggestions as the direct route -- the two routes
+    // used to print genuinely different sentences here.
+    assert_eq!(
+        String::from_utf8_lossy(&daemon.stderr),
+        String::from_utf8_lossy(&direct.stderr),
+        "the daemon and direct routes must render identical not-found text"
+    );
+}
+
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this
 /// file — only the provenance-only sweep above (`_meta.sources`/`scope`/
 /// `stale_repos` presence) and a separate KEY-SET schema test in

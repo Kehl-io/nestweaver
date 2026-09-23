@@ -60,6 +60,11 @@ when it has no replacement symbols to insert. Measuring a changed scope streams 
 once; it does not retain a second corpus-sized posting set. If the prior shard
 cannot be read, refresh still repairs it, but excludes that scope from posting
 totals and names it in `posting_deltas_unavailable` (JSON and gRPC).
+A scope that a concurrent writer (for example the vault watcher) advances
+while the refresh is publishing it is deferred, not failed: it stays queued for
+the background trigram reconciler and is named in `scopes_deferred` (JSON and
+gRPC), so `index --with-trigrams` no longer exits 1 after committing because an
+unrelated scope moved. Any other refresh failure still fails the command.
 
 `ui --port 0` selects the default port, currently 3000. Successful daemon
 responses must contain a nonzero, in-range port; the CLI uses that returned

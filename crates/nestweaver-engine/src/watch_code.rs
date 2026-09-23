@@ -704,7 +704,8 @@ impl CodeWatcher {
                         Err(reason)
                             if reason
                                 .downcast_ref::<crate::content_reader::SourceTooLarge>()
-                                .is_some() =>
+                                .is_some()
+                                || reason.downcast_ref::<UnparsableSource>().is_some() =>
                         {
                             tracing::warn!(
                                 path = %rel_path.display(),
@@ -1062,6 +1063,13 @@ fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<
     }
 }
 
+/// nw-601. A watched source whose parse tree has errors and yields no
+/// symbols ([`nestweaver_parser::ParsedFile::unparsable_skip`]). Typed so the
+/// batch can treat it as a policy skip, exactly like `SourceTooLarge`.
+#[derive(Debug, thiserror::Error)]
+#[error("unparsable source {}: {}", .0.path, .0.reason)]
+struct UnparsableSource(nestweaver_parser::SkippedFile);
+
 struct PreparedCodeFile {
     rel_path: String,
     file: nestweaver_schema::File,
@@ -1094,6 +1102,12 @@ fn prepare_code_file(
         .with_context(|| format!("read watched source {}", abs_path.display()))?;
     let parsed = parse_source(&abs_path, &source)
         .with_context(|| format!("parse watched source {}", abs_path.display()))?;
+    // nw-601: the same predicate the full and incremental index routes call,
+    // routed through the batch's policy-skip arm so the stale coverage is
+    // dropped rather than republished as an empty File node.
+    if let Some(skipped) = parsed.unparsable_skip(rel_str.clone()) {
+        return Err(UnparsableSource(skipped).into());
+    }
 
     let content_hash = crate::hash::blake3_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
@@ -1496,6 +1510,61 @@ mod tests {
         assert_eq!(
             store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
             "sha1"
+        );
+    }
+
+    /// nw-601, the watcher route. A source saved into an unparsable state
+    /// (syntax errors, no symbols) was republished as an empty File node,
+    /// while the full and incremental index routes disclose it as a
+    /// `ParseError` skip. All three must agree: the watcher drops the file's
+    /// stale coverage through its existing policy-skip arm. Counterweight: a
+    /// recoverable partial-error save that still yields a symbol is published.
+    #[test]
+    fn watcher_drops_a_source_saved_into_an_unparsable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, uid, root) = index_fixture_repo(&dir);
+        let db = dir.path().join("graph.lbug");
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let file_paths = |store: &GraphStore| -> Vec<String> {
+            store
+                .list_files_by_repo(&uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
+        assert!(file_paths(&store).contains(&"src/a.js".to_string()));
+
+        let broken = root.join("src/a.js");
+        std::fs::write(&broken, "}}} ((( @@@ %%% ;;\n").unwrap();
+        process_fixture_batch(&watcher, &store, &uid, &root, std::slice::from_ref(&broken));
+        assert!(
+            !file_paths(&store).contains(&"src/a.js".to_string()),
+            "an unparsable save must drop the File node, not keep it empty: {:?}",
+            file_paths(&store)
+        );
+        assert!(store.symbols_in_file("src/a.js").unwrap().is_empty());
+
+        let partial = root.join("src/b.js");
+        std::fs::write(
+            &partial,
+            "export function partial() { return 1; }\nconst x = (;\n",
+        )
+        .unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &uid,
+            &root,
+            std::slice::from_ref(&partial),
+        );
+        assert!(
+            store
+                .symbols_in_file("src/b.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "partial"),
+            "a recoverable partial-error save is still published"
         );
     }
 

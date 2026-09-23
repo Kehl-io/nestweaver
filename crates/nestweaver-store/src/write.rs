@@ -10,6 +10,47 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// nw-655. What a regex scope acknowledgement established.
+///
+/// A publication whose scope was advanced by a concurrent writer is NOT an
+/// error: the writer's `mark_regex_scope_dirty_on` re-queued the scope in the
+/// same transaction that advanced it, so the newer epoch is already owned by
+/// the next refresh pass. It used to be a `StoreError::Query`, which made
+/// `index --with-trigrams` exit 1 after committing whenever the vault watcher
+/// published mid-refresh — for a scope the index never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegexAck {
+    Acknowledged,
+    /// The scope's desired epoch moved past the one just published.
+    Superseded {
+        desired: u64,
+    },
+}
+
+/// Commit an acknowledgement, or roll back one that was superseded or failed.
+/// A superseded acknowledgement wrote nothing, and rolling back keeps the
+/// concurrent writer's outbox row exactly as it left it.
+fn finish_regex_ack(
+    store: &GraphStore,
+    conn: &lbug::Connection<'_>,
+    result: Result<RegexAck, StoreError>,
+) -> Result<RegexAck, StoreError> {
+    match result {
+        Ok(RegexAck::Acknowledged) => {
+            store.commit_transaction(conn)?;
+            Ok(RegexAck::Acknowledged)
+        }
+        Ok(superseded @ RegexAck::Superseded { .. }) => {
+            let _ = store.rollback_transaction(conn);
+            Ok(superseded)
+        }
+        Err(error) => {
+            let _ = store.rollback_transaction(conn);
+            Err(error)
+        }
+    }
+}
+
 /// CSV options pinned on every `COPY … FROM` in this module.
 ///
 /// lbug defaults to CSV dialect auto-detection, and its detector samples only
@@ -1480,7 +1521,7 @@ impl GraphStore {
         epoch: u64,
         candidate_count: usize,
         candidate_digest: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<RegexAck, StoreError> {
         let conn = self.begin_transaction()?;
         let result = (|| {
             let mut read = conn
@@ -1506,6 +1547,13 @@ impl GraphStore {
                 _ => 0,
             };
             let tombstone = matches!(row.get(1), Some(lbug::Value::Bool(true)));
+            if desired > epoch {
+                // nw-655. Every advance of `desired_epoch` (including the
+                // one that sets `tombstone`) is `mark_regex_scope_dirty_on`,
+                // which re-queues the scope in the outbox in the same
+                // transaction. So a newer epoch is queued work, not damage.
+                return Ok(RegexAck::Superseded { desired });
+            }
             if desired != epoch || tombstone {
                 return Err(StoreError::Query(format!(
                     "regex scope {scope_uid} advanced while publishing epoch {epoch} (desired {desired})"
@@ -1539,22 +1587,16 @@ impl GraphStore {
                 "MATCH (o:RegexScopeOutbox {uid: $uid}) DETACH DELETE o",
                 vec![("uid", lbug::Value::String(scope_uid.to_string()))],
             )?;
-            Ok(())
+            Ok(RegexAck::Acknowledged)
         })();
-        match result {
-            Ok(()) => self.commit_transaction(&conn),
-            Err(error) => {
-                let _ = self.rollback_transaction(&conn);
-                Err(error)
-            }
-        }
+        finish_regex_ack(self, &conn, result)
     }
 
     pub(crate) fn acknowledge_regex_tombstone(
         &self,
         scope_uid: &str,
         epoch: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<RegexAck, StoreError> {
         let conn = self.begin_transaction()?;
         let result = (|| {
             let mut read = conn
@@ -1580,6 +1622,11 @@ impl GraphStore {
                 _ => 0,
             };
             let tombstone = matches!(row.get(1), Some(lbug::Value::Bool(true)));
+            if desired > epoch {
+                // nw-655, same reasoning as `acknowledge_regex_scope`: a
+                // re-activation re-queued the scope; the next pass owns it.
+                return Ok(RegexAck::Superseded { desired });
+            }
             if desired != epoch || !tombstone {
                 return Err(StoreError::Query(format!(
                     "regex tombstone {scope_uid} advanced while retiring epoch {epoch} (desired {desired}, tombstone {tombstone})"
@@ -1608,15 +1655,9 @@ impl GraphStore {
                 "MATCH (o:RegexScopeOutbox {uid: $uid}) DETACH DELETE o",
                 vec![("uid", lbug::Value::String(scope_uid.to_string()))],
             )?;
-            Ok(())
+            Ok(RegexAck::Acknowledged)
         })();
-        match result {
-            Ok(()) => self.commit_transaction(&conn),
-            Err(error) => {
-                let _ = self.rollback_transaction(&conn);
-                Err(error)
-            }
-        }
+        finish_regex_ack(self, &conn, result)
     }
 
     /// Atomically delete old repo data and insert the replacement in a single

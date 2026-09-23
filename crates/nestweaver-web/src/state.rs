@@ -1,5 +1,6 @@
 use nestweaver_store::{GraphStore, TantivyIndex};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7,6 +8,28 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 
 use crate::gaps_cache::GapsCache;
+
+/// Injectable DNS resolver for the SSRF add-time hostname check in
+/// `routes::admin::add_repo`.
+///
+/// nw-654: `add_repo` used to call `nestweaver_engine::ssrf::resolve_host`
+/// directly, which performs a real, blocking DNS lookup. That made
+/// `add_repo_persists_instance_config` depend on live network access —
+/// a transient DNS failure on the CI runner turned into a 400 and flaked the
+/// Required CI gate (it blocked v10.1.1 publication). The resolver is now a
+/// field on `AdminState` instead: production wires up [`system_resolver`]
+/// (real DNS, unchanged behaviour), and tests inject a synthetic function so
+/// the unit test is hermetic even with networking disabled.
+pub type HostResolver = Arc<dyn Fn(&str) -> Result<Vec<IpAddr>, String> + Send + Sync>;
+
+/// The resolver every production `AdminState` must use — real DNS via
+/// `nestweaver_engine::ssrf::resolve_host`. Centralized here (rather than
+/// each call site writing `Arc::new(resolve_host)`) so the production
+/// behaviour is declared once and every constructor CALLS it instead of
+/// re-stating it.
+pub fn system_resolver() -> HostResolver {
+    Arc::new(nestweaver_engine::ssrf::resolve_host)
+}
 
 #[derive(Clone)]
 pub struct GraphEvent {
@@ -180,4 +203,8 @@ pub struct AdminState {
     /// `indexing_active` nor `queue_depth`, so before this it was a writer that
     /// nothing in `brain status` could see.
     pub write_gate: Option<nestweaver_engine::WriteGate>,
+    /// DNS resolver used by `add_repo`'s SSRF add-time hostname check. See
+    /// [`HostResolver`] / [`system_resolver`] — production wires the real
+    /// resolver, tests inject a synthetic one.
+    pub resolver: HostResolver,
 }

@@ -165,4 +165,151 @@ test.describe("Search Flow", () => {
       "Second",
     );
   });
+
+  test("clicking Detail dismisses the search dropdown (nw-532)", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    await searchInput.fill("greet");
+    const dropdown = page.getByRole("listbox");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.getByRole("button", { name: "Detail" }).click();
+
+    // Detail should dismiss the dropdown immediately, not leave it open
+    // intercepting clicks on the Graph/Table/Matrix/JSON views underneath.
+    await expect(dropdown).toBeHidden();
+  });
+
+  test("Escape closes the search overlay without clearing the selection; a second Escape then clears it (nw-532)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    const dropdown = page.getByRole("listbox");
+    const evidencePanel = page.getByRole("complementary", { name: "Source and note evidence" });
+
+    // Select a node via search (this closes the dropdown, same as clicking
+    // "Explore" or a result row does today).
+    await searchInput.fill("greet");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.click();
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get("node"))
+      .not.toBeNull();
+    const selectedUid = new URL(page.url()).searchParams.get("node");
+    await expect(evidencePanel).not.toContainText("No selection");
+
+    // Reopen the search dropdown (e.g. looking something else up) without
+    // picking a result from it — a node stays selected underneath an open
+    // search overlay, the exact state the bug report reproduced from.
+    await searchInput.fill("greet");
+    await expect(dropdown).toBeVisible({ timeout: 10_000 });
+
+    // Escape must close the overlay, not the selection underneath it.
+    await page.keyboard.press("Escape");
+    await expect(dropdown).toBeHidden();
+    await expect(evidencePanel).not.toContainText("No selection");
+    expect(new URL(page.url()).searchParams.get("node")).toBe(selectedUid);
+
+    // Counterweight: Escape still clears the selection once nothing else
+    // (search, perspectives, etc.) is open to consume it.
+    await page.keyboard.press("Escape");
+    await expect(evidencePanel).toContainText("No selection");
+  });
+
+  test("Escape closes the dropdown left open by Add without clearing the selection it made (nw-532)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    const dropdown = page.getByRole("listbox");
+    const evidencePanel = page.getByRole("complementary", { name: "Source and note evidence" });
+
+    // "Add" (unlike "Detail") selects the result and deliberately leaves the
+    // dropdown open — the exact repro from the bug report: focus lands on a
+    // non-form "Add" button while the dropdown, and the selection it just
+    // made, both stay live.
+    await searchInput.fill("greet");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.getByRole("button", { name: "Add" }).click();
+
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get("node"))
+      .not.toBeNull();
+    const selectedUid = new URL(page.url()).searchParams.get("node");
+    await expect(evidencePanel).not.toContainText("No selection");
+    await expect(dropdown).toBeVisible();
+
+    // Escape must close the dropdown left open by Add without dropping the
+    // selection Add just made — this is the path a render-cycle-later state
+    // gate cannot reliably cover, because both the overlay-close handler and
+    // the global deselect handler fire on this same keypress.
+    await page.keyboard.press("Escape");
+    await expect(dropdown).toBeHidden();
+    await expect(evidencePanel).not.toContainText("No selection");
+    expect(new URL(page.url()).searchParams.get("node")).toBe(selectedUid);
+  });
+
+  test("Escape with nothing selected still closes the search dropdown (nw-532 counterweight)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    await searchInput.fill("greet");
+    const dropdown = page.getByRole("listbox");
+    await expect(dropdown).toBeVisible({ timeout: 10_000 });
+
+    await page.keyboard.press("Escape");
+    await expect(dropdown).toBeHidden();
+  });
+
+  test("Escape closes the Perspectives popover without clearing the selection (nw-532)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    const dropdown = page.getByRole("listbox");
+    const evidencePanel = page.getByRole("complementary", { name: "Source and note evidence" });
+
+    // Select a node first (search closes itself on Explore).
+    await searchInput.fill("greet");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.click();
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get("node"))
+      .not.toBeNull();
+    const selectedUid = new URL(page.url()).searchParams.get("node");
+    await expect(evidencePanel).not.toContainText("No selection");
+
+    // Open the Perspectives popover — focus lands on its toggle button, a
+    // non-form element, the same shape of repro the bug report described
+    // ("Same when dismissing Perspectives").
+    const perspectivesButton = page.getByRole("button", { name: "Perspectives" });
+    await perspectivesButton.click();
+    const saveCurrentView = page.getByRole("button", { name: "Save current view" });
+    await expect(saveCurrentView).toBeVisible();
+
+    // Escape must close the popover, not the selection underneath it.
+    await page.keyboard.press("Escape");
+    await expect(saveCurrentView).toBeHidden();
+    await expect(evidencePanel).not.toContainText("No selection");
+    expect(new URL(page.url()).searchParams.get("node")).toBe(selectedUid);
+
+    // Counterweight: with no overlay open, Escape still clears the selection.
+    await page.keyboard.press("Escape");
+    await expect(evidencePanel).toContainText("No selection");
+  });
 });
