@@ -24,8 +24,6 @@ use notify::{Event, RecursiveMode, Watcher};
 
 use crate::content_reader::ContentReader;
 use crate::index::is_minified_or_bundled;
-#[cfg(test)]
-use crate::index::path_in_skip_dir;
 use crate::watcher::{
     RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
     WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
@@ -1364,12 +1362,17 @@ mod tests {
 
     #[test]
     fn skip_dir_detection() {
-        let p = Path::new("/repo/node_modules/foo/bar.js");
-        assert!(path_in_skip_dir(p));
-        let p = Path::new("/repo/.git/HEAD");
-        assert!(path_in_skip_dir(p));
-        let p = Path::new("/repo/src/main.rs");
-        assert!(!path_in_skip_dir(p));
+        let skipped = |p: &str| {
+            crate::index::path_in_skip_dirs(
+                Path::new(p),
+                crate::index::SKIP_DIRS,
+                crate::index::nothing_unskipped(),
+                &|_| false,
+            )
+        };
+        assert!(skipped("/repo/node_modules/foo/bar.js"));
+        assert!(skipped("/repo/.git/HEAD"));
+        assert!(!skipped("/repo/src/main.rs"));
     }
 
     #[test]
@@ -1674,6 +1677,14 @@ mod tests {
         let (store, r_uid, root) = index_fixture_repo(&dir);
         let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
         std::fs::create_dir(root.join("target")).unwrap();
+        // nw-652: what cargo actually leaves in every build directory. Without
+        // a marker or a manifest beside it, `target/` is source and SHOULD
+        // publish — see `source_target_dir_events_publish_without_a_manifest`.
+        std::fs::write(
+            root.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
         std::fs::write(root.join("target/generated.rs"), "fn generated() {}").unwrap();
         assert!(matches!(
             process_fixture_batch(
@@ -1685,6 +1696,62 @@ mod tests {
             ),
             WatchBatchOutcome::Unchanged
         ));
+    }
+
+    /// nw-652: the watcher's per-file route filters with `accepts_path`, which
+    /// never consults gitignore — so it, not the walk, is where a name-only
+    /// `target` rule did its damage on every save. A ballistics app's
+    /// `src/screens/target/` has no build manifest beside it and must publish;
+    /// the same edit beside a `Cargo.toml` is build output and must not.
+    #[test]
+    fn source_target_dir_events_publish_without_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        std::fs::create_dir_all(root.join("src/screens/target")).unwrap();
+        let screen = root.join("src/screens/target/TargetEditMode.js");
+        std::fs::write(&screen, "export function TargetEditMode() { return 1; }\n").unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[screen]),
+            WatchBatchOutcome::Published { .. }
+        ));
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|(_, path)| path == "src/screens/target/TargetEditMode.js"),
+            "a source `target/` must reach the graph through the watcher: {files:?}"
+        );
+
+        std::fs::write(
+            root.join("src/screens/Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/screens/target/built.js"),
+            "export const built = 1;\n",
+        )
+        .unwrap();
+        let outcome = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("src/screens/target/built.js")],
+        );
+        assert!(
+            matches!(outcome, WatchBatchOutcome::Unchanged),
+            "an excluded build file must not publish a batch: {outcome:?}"
+        );
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        assert!(
+            !files
+                .iter()
+                .any(|(_, path)| path == "src/screens/target/built.js"),
+            "a `target/` beside a Cargo.toml is build output and must stay out: \
+             {outcome:?} {files:?}"
+        );
     }
 
     #[test]

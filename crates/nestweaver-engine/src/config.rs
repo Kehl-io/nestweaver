@@ -807,6 +807,10 @@ pub struct RepoConfig {
     ///
     /// Names, not globs, because `SKIP_DIRS` matches a single path COMPONENT at
     /// any depth — `unskip = ["public"]` re-admits every `public/` in the repo.
+    /// `target` needs no entry here unless it is REAL build output you want
+    /// indexed: since nw-652 it is pruned only beside a `Cargo.toml`/`pom.xml`/
+    /// `build.sbt` or when it holds Cargo's `CACHEDIR.TAG`, so a source
+    /// `src/screens/target/` is indexed by default.
     /// Use `exclude` for the opposite direction; the two are not
     /// interchangeable and each disclosure names only its own.
     #[serde(default)]

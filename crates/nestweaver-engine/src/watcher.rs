@@ -1287,12 +1287,17 @@ fn log_outcome(outcome: &UpdateOutcome) {
     }
 }
 
+/// nw-652: this list stays the vault's own (see [`SKIP_DIRS`]), but the MATCH
+/// is the shared one, so a `target/` notes folder with no build manifest beside
+/// it is watched exactly as the vault walk now indexes it. `path` is the
+/// absolute event path, so the manifest probe is a plain stat.
 fn path_in_skip_dir(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| SKIP_DIRS.contains(&name))
-    })
+    crate::index::path_in_skip_dirs(
+        path,
+        SKIP_DIRS,
+        crate::index::nothing_unskipped(),
+        &|probe| probe.is_file(),
+    )
 }
 
 fn ensure_vault(
@@ -2214,6 +2219,10 @@ mod tests {
         let p = Path::new("/x/vault/.git/HEAD");
         assert!(path_in_skip_dir(p));
         let p = Path::new("/x/vault/notes/regular.md");
+        assert!(!path_in_skip_dir(p));
+        // nw-652: a `target/` notes folder with no build manifest beside it is
+        // an ordinary folder name for notes, and is watched.
+        let p = Path::new("/x/vault/target/Range Day.md");
         assert!(!path_in_skip_dir(p));
     }
 

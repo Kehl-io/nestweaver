@@ -213,20 +213,20 @@ const SKIP_DIRS: &[&str] = &[
     "storybook-static",
 ];
 
-/// Returns true if any component of `rel_path` matches one of the vault
-/// `SKIP_DIRS`. Used to post-filter results from `ContentReader::list_files()`
-/// which may not know about vault-specific skip directories (e.g. `.obsidian`,
-/// `.trash`).
-fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
-    for component in rel_path.components() {
-        if let std::path::Component::Normal(name) = component
-            && let Some(s) = name.to_str()
-            && SKIP_DIRS.contains(&s)
-        {
-            return true;
-        }
-    }
-    false
+/// Returns true if `rel_path` lies under one of the vault `SKIP_DIRS`. Used to
+/// post-filter results from `ContentReader::list_files()` which may not know
+/// about vault-specific skip directories (e.g. `.obsidian`, `.trash`).
+///
+/// nw-652: through the shared predicate, with `has_file` answering its
+/// manifest gate. A bare name match here would silently drop a `target/` note
+/// folder that the walk — which applies the gate — deliberately admitted.
+fn path_has_vault_skip_dir(rel_path: &Path, has_file: &dyn Fn(&Path) -> bool) -> bool {
+    crate::index::path_in_skip_dirs(
+        rel_path,
+        SKIP_DIRS,
+        crate::index::nothing_unskipped(),
+        has_file,
+    )
 }
 
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
@@ -1209,7 +1209,7 @@ fn index_markdown_since_with_reader_mode(
             continue;
         }
         // Skip vault-specific directories.
-        if path_has_vault_skip_dir(&rel_path) {
+        if path_has_vault_skip_dir(&rel_path, &|probe| reader.has_file(probe)) {
             continue;
         }
         // Apply .brainignore patterns.
@@ -2396,7 +2396,7 @@ where
             continue;
         }
         // Skip vault-specific directories (e.g. .obsidian, .trash).
-        if path_has_vault_skip_dir(&rel_path) {
+        if path_has_vault_skip_dir(&rel_path, &|probe| reader.has_file(probe)) {
             continue;
         }
 
@@ -5157,6 +5157,63 @@ sub b body
                 result.skipped
             );
         }
+    }
+
+    #[test]
+    fn a_target_notes_folder_is_indexed_unless_it_is_cargo_build_output() {
+        // nw-652, vault side. The vault walk and the `path_has_vault_skip_dir`
+        // post-filter share one gated predicate; if the post-filter kept the
+        // name-only rule it would SILENTLY drop what the walk admitted (the
+        // walk records no prune for it, so nothing would be disclosed).
+        //
+        // `.brainignore` is a SEPARATE, operator-edited layer whose built-in
+        // default also lists `**/target/**`; that stays (it is disclosed as a
+        // `.brainignore` match and the operator can edit it). This vault ships
+        // its own `.brainignore` without it, so what is measured here is the
+        // skip-dir layer alone.
+        let (_dir, root) = make_vault(&[
+            (".brainignore", "**/.obsidian/**\n"),
+            ("target/Range Day.md", "# Range Day\n"),
+            ("tool/Cargo.toml", "[package]\nname = \"tool\"\n"),
+            ("tool/target/doc/README.md", "# Should not count\n"),
+        ]);
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let titles: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.title)
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Range Day".to_string()],
+            "{:?}",
+            result.skipped
+        );
+        assert!(
+            result.skipped.iter().any(|sf| sf.path == "tool/target"),
+            "cargo output beside a manifest is still pruned and disclosed: {:?}",
+            result.skipped
+        );
+    }
+
+    #[test]
+    fn the_default_brainignore_still_excludes_a_target_notes_folder_and_says_so() {
+        // COUNTERWEIGHT to the test above: nw-652 changed the skip-dir layer,
+        // not `.brainignore`. With no `.brainignore` the default pattern still
+        // excludes `target/**` — visibly, as a `.brainignore` match.
+        let (_dir, root) = make_vault(&[("target/Range Day.md", "# Range Day\n")]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.notes_count, 0);
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|sf| sf.path == "target/Range Day.md" && sf.reason.contains(".brainignore")),
+            "{:?}",
+            result.skipped
+        );
     }
 
     #[test]
