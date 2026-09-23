@@ -239,11 +239,16 @@ fn hash_repo_tree(
         .git_exclude(true)
         .require_git(false)
         .filter_entry(|entry| {
+            // nw-652: the indexer's own gate, so a source `target/` is hashed
+            // exactly when it is indexed.
             !entry.file_type().is_some_and(|kind| kind.is_dir())
-                || !entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| crate::index::SKIP_DIRS.contains(&name) || name == ".git")
+                || !entry.file_name().to_str().is_some_and(|name| {
+                    name == ".git"
+                        || (crate::index::SKIP_DIRS.contains(&name)
+                            && crate::index::skip_dir_applies(entry.path(), name, &|probe| {
+                                probe.is_file()
+                            }))
+                })
         })
         .build();
     let paths = walker
@@ -473,6 +478,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        // nw-652: `target/` is build output only beside a manifest, so the
+        // fixture is the Rust crate `src/lib.rs` always implied. A source
+        // `target/` elsewhere is hashed, exactly as the index admits it.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src/screens/target")).unwrap();
+        std::fs::write(dir.path().join("src/screens/target/Edit.ts"), "export {}\n").unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "fn live() {}\n").unwrap();
         std::fs::write(dir.path().join("ignored.log"), "large generated log").unwrap();
         std::fs::write(dir.path().join("target/bundle.js"), "generated").unwrap();
@@ -486,6 +497,7 @@ mod tests {
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.contains(&"ignored.log"));
         assert!(!paths.contains(&"target/bundle.js"));
+        assert!(paths.contains(&"src/screens/target/Edit.ts"));
 
         HASHED_SOURCE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
         let unchanged = hash_repo_tree(dir.path(), Some(&first.2)).unwrap();

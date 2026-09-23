@@ -2096,9 +2096,14 @@ fn tiered_change_check(
 ///     honours gitignore.
 ///
 /// The remaining ambiguous entries (`build`, `dist`, `out`, `public`, `env`,
-/// `vendor`, `target`) are kept because removing them trades a false-negative
-/// class for a false-positive one — a JS monorepo's `dist/` is genuinely
-/// megabytes of minified output. They are now visible and overridable instead.
+/// `vendor`) are kept because removing them trades a false-negative class for a
+/// false-positive one — a JS monorepo's `dist/` is genuinely megabytes of
+/// minified output. They are now visible and overridable instead.
+///
+/// `target` is kept but GATED (nw-652): it is pruned only where a build tool
+/// put it — see [`MANIFEST_GATED_SKIP_DIRS`]. Every consumer of this list must
+/// go through [`path_in_skip_dirs`] or [`skip_dir_applies`], never a bare
+/// `SKIP_DIRS.contains(name)`, or it will disagree with the walk about `target`.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -5646,56 +5651,99 @@ pub(crate) fn is_minified_or_bundled(path: &Path) -> bool {
     false
 }
 
-/// Returns true if any component of `path` is in [`SKIP_DIRS`] and has NOT been
-/// re-admitted by this repo's `[[repos]] unskip` set.
+/// `SKIP_DIRS` entries that name build output ONLY where a build tool put
+/// them, paired with the manifests whose presence beside the directory says so.
 ///
-/// nw-418 GAVE THIS FUNCTION THE `unskip` SET, and that is the whole fix.
-/// `FilesystemReader::list_files` honoured `unskip` in its `filter_entry`
-/// closure; this predicate — the one the INCREMENTAL change loop uses — did
-/// not take the set and so could not. The two routes therefore disagreed about
-/// what the repo contained: a repo with `unskip = ["public"]` got `public/`
-/// indexed by `nestweaver index --force` and dropped, one file at a time, by
-/// every plain `nestweaver index`, with `coverage_status: "complete"` on both.
+/// nw-652. `target` was matched by NAME, at any depth, in every repo, and a
+/// ballistics app's `src/screens/target/` is hand-written source that git
+/// tracks and does not ignore. It was pruned in two shipping apps, so
+/// `TargetEditMode` was absent from the graph and `impact` stopped at it — the
+/// prune was disclosed, but only to someone reading a skip list, and the owner
+/// of a TypeScript app has no reason to suspect a Rust convention ate it.
 ///
-/// AND NOTHING COULD SEE IT. nw-387's disclosure channel reports directories
-/// the walk PRUNED, and on the incremental route `public/` is not pruned —
-/// `unskip` re-admitted it — so there was no `SkippedDir` row to drain and the
-/// loss happened below the level any disclosure watches.
+/// WHY NOT DROP `target` AND LEAN ON GITIGNORE, as nw-325 did for `ios` and
+/// `android`: only the WALK honours gitignore. The code watcher filters a
+/// changed file with [`crate::content_reader::ContentReader::accepts_path`],
+/// which is this list plus configured excludes — so without the entry, every
+/// `cargo build` would stream `target/*/build/*/out/*.rs` (prost, cxxbridge)
+/// into the graph, including in repos that gitignore `/target`. The name is
+/// kept; it just has to be the build tool's directory to count.
 ///
-/// Per nw-217 ("a guard present in one implementation and absent in its twin"),
-/// the fix is ONE predicate that both routes call with the same set, not a
-/// second copy of the rule taught to the incremental loop. The set reaches
-/// every caller through `ContentReader::unskipped_skip_dirs`, so it cannot
-/// drift from the set the walk itself used.
-pub(crate) fn path_in_skip_dir_with_unskip(
+/// The manifests are every tool that writes a `target/`: Cargo, Maven, sbt
+/// (`build.sbt`, and `build.properties` for the meta-build's `project/target/`,
+/// which has no `build.sbt` beside it), Leiningen (`project.clj`) and the
+/// Clojure CLI / tools.build (`deps.edn`).
+const MANIFEST_GATED_SKIP_DIRS: &[(&str, &[&str])] = &[(
+    "target",
+    &[
+        "Cargo.toml",
+        "pom.xml",
+        "build.sbt",
+        "build.properties",
+        "project.clj",
+        "deps.edn",
+    ],
+)];
+
+/// The Cache Directory Tagging marker (<https://bford.info/cachedir/>). Cargo
+/// writes one into every build directory it creates, so it identifies a Cargo
+/// `target/` that has no manifest beside it — a relocated `CARGO_TARGET_DIR`,
+/// or a crate that was deleted while its build output was not.
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// Whether directory `dir`, whose last component is the `SKIP_DIRS` entry
+/// `name`, really is what that entry exists to skip.
+///
+/// `has_file` answers "is this a file?" for a path built from `dir`, so `dir`
+/// may be repo-relative or absolute as long as the probe agrees. Entries not in
+/// [`MANIFEST_GATED_SKIP_DIRS`] apply unconditionally, exactly as before.
+pub(crate) fn skip_dir_applies(dir: &Path, name: &str, has_file: &dyn Fn(&Path) -> bool) -> bool {
+    let Some((_, manifests)) = MANIFEST_GATED_SKIP_DIRS
+        .iter()
+        .find(|(gated, _)| *gated == name)
+    else {
+        return true;
+    };
+    let parent = dir.parent().unwrap_or_else(|| Path::new(""));
+    has_file(&dir.join(CACHEDIR_TAG))
+        || manifests
+            .iter()
+            .any(|manifest| has_file(&parent.join(manifest)))
+}
+
+/// Returns true if any directory on `path` is one of `skip_dirs`, has NOT been
+/// re-admitted by `unskip`, and [`skip_dir_applies`] at that position.
+///
+/// THE ONE SKIP PREDICATE. nw-418 found the walk and the incremental loop
+/// disagreeing about `unskip` because each carried its own copy of this rule;
+/// nw-652 adds context to it, which would have been a third copy per site. So
+/// every route calls this — the walk (per entry), `accepts_path`, the
+/// incremental change loop (through
+/// [`crate::content_reader::ContentReader::skips_path`]), the bare reader, the
+/// vault post-filters and the vault watcher — and differs only in the list it
+/// passes and how it answers `has_file`.
+pub(crate) fn path_in_skip_dirs(
     path: &Path,
+    skip_dirs: &[&str],
     unskip: &std::collections::HashSet<String>,
+    has_file: &dyn Fn(&Path) -> bool,
 ) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| SKIP_DIRS.contains(&name) && !unskip.contains(name))
+    let mut dir = PathBuf::new();
+    path.components().any(|component| {
+        dir.push(component);
+        component.as_os_str().to_str().is_some_and(|name| {
+            skip_dirs.contains(&name)
+                && !unskip.contains(name)
+                && skip_dir_applies(&dir, name, has_file)
+        })
     })
 }
 
-/// [`path_in_skip_dir_with_unskip`] for the callers that carry no per-repo
-/// config and therefore re-admit nothing: the filesystem watchers
-/// (`watch_code.rs`) and [`crate::content_reader::GitBareReader`].
-///
-/// A THIN DELEGATION, NOT A SECOND RULE. It exists so those call sites keep
-/// compiling unchanged, and it must stay a one-liner: the moment it grows its
-/// own matching logic it becomes the drifted twin nw-217 describes. Those
-/// callers not honouring `unskip` is a real, smaller gap — a watcher will not
-/// pick up edits under a re-admitted `public/` — and it is stated here rather
-/// than hidden, because closing it needs the per-repo config plumbed into the
-/// watcher, which is a different change in different files.
-pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
-    static NONE_RE_ADMITTED: std::sync::OnceLock<std::collections::HashSet<String>> =
+/// The `unskip` set of a caller with no per-repo config: nothing re-admitted.
+pub(crate) fn nothing_unskipped() -> &'static std::collections::HashSet<String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
-    path_in_skip_dir_with_unskip(
-        path,
-        NONE_RE_ADMITTED.get_or_init(std::collections::HashSet::new),
-    )
+    EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
 /// nw-204: tombstone the embeddings of symbols an index run actually removed.
@@ -6288,19 +6336,19 @@ fn incremental_index_with_name_and_io_and_authority(
     let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
         .unskipping(unskip)
         .excluding(excludes)?;
-    // nw-418: read the re-admitted set BACK OFF THE READER rather than
-    // re-deriving it from `unskip` here. `unskipping` normalises the names
-    // (it trims them), and a second normalisation at this call site is exactly
-    // the drifting twin nw-217 describes — the loop below would then be able to
-    // disagree with the walk about whether `" public"` re-admits `public`.
+    // nw-418/nw-652: ask the READER whether a path is skipped rather than
+    // re-deriving the rule here. `unskipping` normalises the names (it trims
+    // them) and the reader alone can answer the manifest probe `target` needs,
+    // so a second copy at this call site is exactly the drifting twin nw-217
+    // describes — the loop below could then disagree with the walk.
     // Fully qualified because this module deliberately does not import the
     // `ContentReader` trait and `reader` here is the concrete type.
-    let unskip_dirs = crate::content_reader::ContentReader::unskipped_skip_dirs(&reader);
+    let skip_reader: &dyn crate::content_reader::ContentReader = &reader;
     let mut result = IncrementalResult::default();
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
-    let (changed_files, removed_files) = partition_changed_removed(&changes, unskip_dirs);
+    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
     let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
         Ok(plan) => plan,
@@ -6321,7 +6369,7 @@ fn incremental_index_with_name_and_io_and_authority(
     // Free here — `prepare_incremental_contract_derivation` has just walked the
     // tree via `list_files`, so the recorder is populated and current.
     //
-    // This is also what covers the per-file `path_in_skip_dir(rel_path)`
+    // This is also what covers the per-file `skips_path(rel_path)`
     // `continue`s in the change loop below, which are silent by construction: a
     // file added under `vendor/` is dropped there with no row, and the pruned
     // DIRECTORY reported here is the same artefact the full scan reports for
@@ -6349,7 +6397,7 @@ fn incremental_index_with_name_and_io_and_authority(
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
-                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
+                if skip_reader.skips_path(rel_path) || !is_parseable(rel_path) {
                     continue;
                 }
                 match prepared_files
@@ -6374,7 +6422,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
-                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
+                if skip_reader.skips_path(rel_path) || !is_parseable(rel_path) {
                     continue;
                 }
                 let prepared = prepared_files
@@ -6471,7 +6519,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
                     .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
 
-                if is_parseable(to) && !path_in_skip_dir_with_unskip(to, unskip_dirs) {
+                if is_parseable(to) && !skip_reader.skips_path(to) {
                     // Re-read from disk and re-insert the file + symbols under the new path.
                     let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                         &txn, &r_uid, &to_str,
@@ -6676,16 +6724,16 @@ where
         "processing server incremental changes"
     );
 
-    // nw-418: same one predicate, same one set, on the daemon's route. The
+    // nw-418: same one predicate, same one reader, on the daemon's route. The
     // reader is supplied by the caller here, so whatever `unskip` it was built
     // with is what this loop honours — the server twin cannot drift from the
     // CLI's by construction.
-    let unskip_dirs = reader.unskipped_skip_dirs();
+    let skip_reader = reader;
 
     // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
-    let (changed_files, removed_files) = partition_changed_removed(&changes, unskip_dirs);
+    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
     let prepared_files = prepare_incremental_files(reader, &changes)
@@ -6737,7 +6785,7 @@ where
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
-                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
+                if skip_reader.skips_path(rel_path) || !is_parseable(rel_path) {
                     continue;
                 }
                 match prepared_files
@@ -6762,7 +6810,7 @@ where
                 }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
-                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
+                if skip_reader.skips_path(rel_path) || !is_parseable(rel_path) {
                     continue;
                 }
                 let prepared = prepared_files
@@ -6857,7 +6905,7 @@ where
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
                     .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
 
-                if is_parseable(to) && !path_in_skip_dir_with_unskip(to, unskip_dirs) {
+                if is_parseable(to) && !skip_reader.skips_path(to) {
                     let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                         &txn, &r_uid, &to_str,
                     )
@@ -7046,7 +7094,6 @@ fn prepare_incremental_files(
     // cannot disagree about which files exist. They used to: the loop's
     // `expect("parseable added file was prepared")` is only sound because both
     // sides apply the identical predicate.
-    let unskip_dirs = reader.unskipped_skip_dirs();
     let mut prepared = HashMap::new();
     for change in changes {
         let path = match change {
@@ -7056,7 +7103,7 @@ fn prepare_incremental_files(
             crate::git_diff::FileChange::Deleted(_) => None,
         };
         let Some(path) = path else { continue };
-        if path_in_skip_dir_with_unskip(path, unskip_dirs) || !is_parseable(path) {
+        if reader.skips_path(path) || !is_parseable(path) {
             continue;
         }
         prepared.insert(
@@ -7188,13 +7235,13 @@ fn write_prepared_incremental_file_txn(
 /// longer exist (`removed`: Deleted / Renamed.from). Used to seed the
 /// transitive re-resolution pass (nw-008).
 ///
-/// nw-418: takes the repo's `unskip` set for the same reason the change loop
-/// does. This seeds the reverse-dependency walk, so a re-admitted file dropped
+/// nw-418: takes the repo's reader, and so its `unskip` set and nw-652 manifest
+/// probe, for the same reason the change loop does. This seeds the reverse-dependency walk, so a re-admitted file dropped
 /// HERE would leave the edges INTO it unrebuilt even once the loop indexed it —
 /// a subtler version of the same divergence, and one no disclosure would show.
 fn partition_changed_removed(
     changes: &[crate::git_diff::FileChange],
-    unskip_dirs: &std::collections::HashSet<String>,
+    reader: &dyn crate::content_reader::ContentReader,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -7205,7 +7252,7 @@ fn partition_changed_removed(
     for change in changes {
         match change {
             FileChange::Added(p) | FileChange::Modified(p) => {
-                if !path_in_skip_dir_with_unskip(p, unskip_dirs) && is_parseable(p) {
+                if !reader.skips_path(p) && is_parseable(p) {
                     changed.insert(p.to_string_lossy().into_owned());
                 }
             }
@@ -7214,7 +7261,7 @@ fn partition_changed_removed(
             }
             FileChange::Renamed { from, to } => {
                 removed.insert(from.to_string_lossy().into_owned());
-                if !path_in_skip_dir_with_unskip(to, unskip_dirs) && is_parseable(to) {
+                if !reader.skips_path(to) && is_parseable(to) {
                     changed.insert(to.to_string_lossy().into_owned());
                 }
             }
@@ -8557,6 +8604,179 @@ mod tests {
             vec!["app_main".to_string()],
             "without `unskip`, SKIP_DIRS must still prune `public/` on the \
              incremental route too: {names:?}"
+        );
+    }
+
+    #[test]
+    fn target_is_skipped_only_beside_a_build_manifest_or_inside_a_cargo_cache_dir() {
+        // nw-652. The gate in isolation, every branch named so a mutant that
+        // drops one (manifest list, CACHEDIR.TAG, sibling-not-ancestor) dies.
+        let skipped = |path: &str, files: &[&str]| {
+            path_in_skip_dirs(Path::new(path), SKIP_DIRS, nothing_unskipped(), &|probe| {
+                files.iter().any(|file| Path::new(file) == probe)
+            })
+        };
+        // A ballistics app's screen: no manifest anywhere near it.
+        assert!(!skipped("src/screens/target/TargetEditMode.tsx", &[]));
+        // A ROOT Cargo.toml does not make a nested source `target/` build
+        // output — only a manifest BESIDE the directory does.
+        assert!(!skipped(
+            "src/screens/target/TargetEditMode.tsx",
+            &["Cargo.toml"]
+        ));
+        for manifest in [
+            "Cargo.toml",
+            "pom.xml",
+            "build.sbt",
+            "build.properties",
+            "project.clj",
+            "deps.edn",
+        ] {
+            assert!(skipped("target/debug/gen.rs", &[manifest]), "{manifest}");
+            assert!(
+                skipped(
+                    "crates/a/target/debug/gen.rs",
+                    &[&format!("crates/a/{manifest}")]
+                ),
+                "{manifest}"
+            );
+        }
+        // Cargo's own marker, with no manifest beside it (CARGO_TARGET_DIR).
+        assert!(skipped(
+            "out-dir/target/debug/gen.rs",
+            &["out-dir/target/CACHEDIR.TAG"]
+        ));
+        // An unrelated file beside it is not a manifest.
+        assert!(!skipped("target/debug/gen.rs", &["package.json"]));
+        // Ungated entries are unchanged: still a pure name match.
+        assert!(skipped("src/node_modules/x.js", &[]));
+        assert!(skipped("a/dist/b.js", &[]));
+        // `unskip` still re-admits a gated entry that WOULD apply.
+        let readmitted: std::collections::HashSet<String> = ["target".to_string()].into();
+        assert!(!path_in_skip_dirs(
+            Path::new("target/debug/gen.rs"),
+            SKIP_DIRS,
+            &readmitted,
+            &|probe| probe == Path::new("Cargo.toml"),
+        ));
+    }
+
+    #[test]
+    fn a_source_target_dir_is_indexed_on_both_routes_while_cargo_output_is_not() {
+        // nw-652, run the way nw-418 taught: BOTH routes over one repo. The
+        // walk and the incremental change loop each carry the gate, and a
+        // route that kept the name-only rule would drop `target_added` from the
+        // incremental graph while `--force` kept it.
+        //
+        // COUNTERWEIGHT in the same fixture: the root `target/` sits beside a
+        // `Cargo.toml` and is committed, so the change loop SEES `gen_two.py`
+        // arrive — a gate that admitted everything would index it and fail
+        // the exact-set assertion.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("app/screens/target")).unwrap();
+        fs::create_dir_all(repo.join("target/debug/out")).unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("app/main.py"), "def app_main():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("app/screens/target/edit_mode.py"),
+            "def target_edit_mode():\n    return 2\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("target/debug/out/gen_one.py"),
+            "def generated_one():\n    return 3\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let first_sha = git(&["rev-parse", "HEAD"]);
+
+        let repo_url = "https://example.test/target-gate-both-routes";
+        let r_uid = repo_uid("test", repo_url);
+        let incremental_db = dir.path().join("incremental.lbug");
+        let forced_db = dir.path().join("forced.lbug");
+        let seeded = index_directory_with_opts(
+            &repo,
+            &incremental_db,
+            &IndexOptions::new("test", repo_url, &first_sha).force(true),
+        )
+        .unwrap();
+        let disclosed: Vec<&str> = seeded
+            .skipped_files
+            .iter()
+            .map(|skipped| skipped.path.as_str())
+            .collect();
+        assert!(
+            disclosed.contains(&"target"),
+            "the Cargo `target/` is still pruned AND disclosed: {disclosed:?}"
+        );
+        assert!(
+            !disclosed.iter().any(|path| path.contains("screens")),
+            "the source `target/` is not pruned, so nothing about it is disclosed: \
+             {disclosed:?}"
+        );
+
+        fs::write(
+            repo.join("app/screens/target/added.py"),
+            "def target_added():\n    return 4\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("target/debug/out/gen_two.py"),
+            "def generated_two():\n    return 5\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "add a source screen and more build output",
+        ]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+
+        let incremental = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(
+            !incremental.fell_back_to_full,
+            "precondition: this must exercise the incremental change loop"
+        );
+        index_directory_with_opts(
+            &repo,
+            &forced_db,
+            &IndexOptions::new("test", repo_url, &second_sha).force(true),
+        )
+        .unwrap();
+
+        let symbol_names = |db: &Path| {
+            let store = GraphStore::open_or_create(db).unwrap();
+            let mut names: Vec<String> = store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .filter(|name| !name.is_empty())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        let from_incremental = symbol_names(&incremental_db);
+        assert_eq!(from_incremental, symbol_names(&forced_db));
+        for expected in ["app_main", "target_added", "target_edit_mode"] {
+            assert!(
+                from_incremental.iter().any(|name| name == expected),
+                "{expected} missing: {from_incremental:?}"
+            );
+        }
+        assert!(
+            !from_incremental
+                .iter()
+                .any(|name| name.starts_with("generated_")),
+            "build output beside a Cargo.toml must stay out: {from_incremental:?}"
         );
     }
 

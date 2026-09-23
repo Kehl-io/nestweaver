@@ -75,7 +75,7 @@ impl ContentReader for CapturedNotes {
     }
 }
 
-fn checked_relative(path: &str) -> anyhow::Result<PathBuf> {
+fn checked_relative(path: &str, has_file: &dyn Fn(&Path) -> bool) -> anyhow::Result<PathBuf> {
     let path = PathBuf::from(path);
     anyhow::ensure!(
         !path.as_os_str().is_empty()
@@ -85,7 +85,7 @@ fn checked_relative(path: &str) -> anyhow::Result<PathBuf> {
         "legacy note path is not a canonical relative path"
     );
     anyhow::ensure!(
-        is_markdown(&path) && !path_has_vault_skip_dir(&path),
+        is_markdown(&path) && !path_has_vault_skip_dir(&path, has_file),
         "indexed note is excluded by the current vault policy"
     );
     Ok(path)
@@ -109,7 +109,7 @@ fn capture_notes(
     let mut total = 0usize;
     for path in paths {
         check()?;
-        let relative = checked_relative(path)?;
+        let relative = checked_relative(path, &|probe| reader.has_file(probe))?;
         anyhow::ensure!(
             eligible.contains(&relative)
                 && reader.accepts_path(&relative)
@@ -225,10 +225,10 @@ mod tests {
             ".obsidian/a.md",
             "code.rs",
         ] {
-            assert!(checked_relative(path).is_err(), "{path}");
+            assert!(checked_relative(path, &|_| false).is_err(), "{path}");
         }
         assert_eq!(
-            checked_relative("notes/a.md").unwrap(),
+            checked_relative("notes/a.md", &|_| false).unwrap(),
             Path::new("notes/a.md")
         );
     }

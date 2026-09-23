@@ -175,7 +175,7 @@ pub trait ContentReader: Send + Sync {
     /// Default is empty, i.e. "this reader prunes nothing it has not already
     /// reported". That is honest for the mock readers in the test suites, and
     /// KNOWINGLY INCOMPLETE for [`GitBareReader`], which drops `SKIP_DIRS`
-    /// paths per-entry via `crate::index::path_in_skip_dir` and records
+    /// paths per-entry via `crate::index::path_in_skip_dirs` and records
     /// nothing. Its prune is therefore still silent; the filesystem path —
     /// which is what every local `index`/`--fail-on-skip` run uses, and what
     /// nw-387 measured — is covered. Closing the bare-clone half needs a
@@ -220,9 +220,35 @@ pub trait ContentReader: Send + Sync {
     /// which is exactly the pre-nw-418 behaviour for [`GitBareReader`] and the
     /// mock readers.
     fn unskipped_skip_dirs(&self) -> &std::collections::HashSet<String> {
-        static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
-            std::sync::OnceLock::new();
-        EMPTY.get_or_init(std::collections::HashSet::new)
+        crate::index::nothing_unskipped()
+    }
+
+    /// Whether `rel` is a file in this reader's content — the probe nw-652's
+    /// manifest-gated `SKIP_DIRS` entries ask ("is there a `Cargo.toml` beside
+    /// this `target/`?").
+    ///
+    /// Defaults to a successful read, which is correct for any reader and only
+    /// ever runs for a path under a gated name, so its cost is not on a hot
+    /// path. [`FilesystemReader`] overrides it with a stat.
+    fn has_file(&self, rel_path: &Path) -> bool {
+        self.read_file(rel_path).is_ok()
+    }
+
+    /// Whether `rel_path` lies under a directory this reader's skip policy
+    /// prunes: `SKIP_DIRS`, minus [`Self::unskipped_skip_dirs`], with nw-652's
+    /// manifest gate answered by [`Self::has_file`].
+    ///
+    /// The incremental change loop asks THIS rather than a free function, for
+    /// the reason nw-418 moved `unskipped_skip_dirs` onto the trait: the reader
+    /// is the only thing that holds both the set and the content the gate
+    /// probes, so no call site can pair one with the wrong other.
+    fn skips_path(&self, rel_path: &Path) -> bool {
+        crate::index::path_in_skip_dirs(
+            rel_path,
+            crate::index::SKIP_DIRS,
+            self.unskipped_skip_dirs(),
+            &|probe| self.has_file(probe),
+        )
     }
 }
 
@@ -272,29 +298,6 @@ fn normalize_lone_cr(source: &str) -> std::borrow::Cow<'_, str> {
 /// be `'static` and therefore cannot borrow the reader.
 fn dir_is_excluded(dir_excludes: Option<&GlobSet>, rel: &Path) -> bool {
     dir_excludes.is_some_and(|gs| gs.is_match(rel))
-}
-
-/// Whether any component of `path` is one of `skip_dirs` and has NOT been
-/// re-admitted by `unskip`.
-///
-/// nw-436: a reader-local twin of [`crate::index::path_in_skip_dir_with_unskip`]
-/// that takes the blocklist as a parameter instead of hardcoding
-/// `crate::index::SKIP_DIRS`, so [`FilesystemReader::record_tracked_but_ignored`]
-/// stays consistent with WHATEVER list this particular reader's walk was
-/// configured with ([`FilesystemReader::skip_dirs`]). `crate::index`'s version
-/// is left untouched and still governs its own callers (the incremental code
-/// route, `watch_code.rs`, `GitBareReader`) — none of which vary their
-/// blocklist per-reader today, so they have no need of this parameter.
-fn path_in_configured_skip_dir(
-    path: &Path,
-    skip_dirs: &'static [&'static str],
-    unskip: &HashSet<String>,
-) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| skip_dirs.contains(&name) && !unskip.contains(name))
-    })
 }
 
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
@@ -546,7 +549,7 @@ impl FilesystemReader {
     /// The compiled repository policy for watcher events, including deleted
     /// paths that cannot be rediscovered by a filesystem walk.
     pub fn accepts_path(&self, rel: &Path) -> bool {
-        !path_in_configured_skip_dir(rel, self.skip_dirs, &self.unskip)
+        !ContentReader::skips_path(self, rel)
             && !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel))
             && !rel.ancestors().skip(1).any(|dir| {
                 !dir.as_os_str().is_empty() && dir_is_excluded(self.dir_excludes.as_ref(), dir)
@@ -615,7 +618,7 @@ impl FilesystemReader {
             // suppress its nw-394 disclosure here, on the theory that it was
             // "already disclosed at directory granularity", when for this
             // reader it was never pruned at all.
-            .filter(|rel| !path_in_configured_skip_dir(rel, self.skip_dirs, &self.unskip))
+            .filter(|rel| !ContentReader::skips_path(self, rel))
             .filter(|rel| !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel)))
             .filter(|rel| {
                 !rel.ancestors().skip(1).any(|dir| {
@@ -694,14 +697,30 @@ impl ContentReader for FilesystemReader {
         excludes.dedup();
         let mut unskip: Vec<_> = self.unskip.iter().collect();
         unskip.sort();
+        // Version 2 (nw-652): `target` stopped being pruned by name alone, so
+        // a graph built under version 1 is missing every non-build `target/`.
+        // A changed fingerprint makes the next incremental run fall back to a
+        // full index, which is what restores them without a manual `--force`.
         crate::hash::blake3_hex(&serde_json::json!({
-            "version": 1, "excludes": excludes, "unskip": unskip,
+            "version": 2, "excludes": excludes, "unskip": unskip,
             "skip_dirs": self.skip_dirs, "max_source_file_bytes": self.limits.max_source_file_bytes(),
         }).to_string())
     }
 
     fn accepts_path(&self, rel: &Path) -> bool {
         FilesystemReader::accepts_path(self, rel)
+    }
+
+    fn has_file(&self, rel_path: &Path) -> bool {
+        self.repo_path.join(rel_path).is_file()
+    }
+
+    /// This reader's OWN blocklist (nw-436: it may be the vault list), not
+    /// `crate::index::SKIP_DIRS` — the same list its walk prunes with.
+    fn skips_path(&self, rel_path: &Path) -> bool {
+        crate::index::path_in_skip_dirs(rel_path, self.skip_dirs, &self.unskip, &|probe| {
+            self.has_file(probe)
+        })
     }
 
     fn read_file(&self, rel_path: &Path) -> Result<String> {
@@ -868,9 +887,13 @@ impl ContentReader for FilesystemReader {
                             });
                         }
                     };
+                    // nw-652: the same gate `skips_path` applies, probed on
+                    // the absolute entry path, so a `src/screens/target/` with
+                    // no build manifest beside it is walked, not pruned.
                     if let Some(name) = e.file_name().to_str()
                         && skip_dirs.contains(&name)
                         && !unskip.contains(name)
+                        && crate::index::skip_dir_applies(e.path(), name, &|probe| probe.is_file())
                     {
                         note(name);
                         return false;
@@ -1444,10 +1467,40 @@ fn decode_git_blob(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
 }
 
 impl ContentReader for GitBareReader {
+    /// nw-652: "is there a regular file here?" answered from the TREE, the
+    /// question `list_files` answers for the same gate. The trait default reads
+    /// the blob, which disagreed with the tree for a manifest over
+    /// `max_source_file_bytes`, a non-UTF-8 one, or a symlinked one — so a full
+    /// index pruned a `target/` the incremental loop admitted. A failed lookup
+    /// answers `false`: the directory is indexed, never silently dropped.
+    fn has_file(&self, rel_path: &Path) -> bool {
+        let mut cmd = Command::new("git");
+        if self.local_objects_only {
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
+        cmd.args([
+            "-C",
+            &self.bare_path.display().to_string(),
+            "ls-tree",
+            "-z",
+            &self.sha,
+            "--",
+        ])
+        .arg(rel_path);
+        run_git_with_timeout(cmd, git_net_timeout()).is_ok_and(|output| {
+            output.status.success()
+                && output.stdout.split(|&b| b == 0).any(|record| {
+                    let mode = record.split(|&b| b == b' ').next().unwrap_or(&[]);
+                    mode == b"100644" || mode == b"100755"
+                })
+        })
+    }
+
     fn eligibility_fingerprint(&self) -> String {
         crate::hash::blake3_hex(
             &serde_json::json!({
-                "reader": "git-bare-v1",
+                // v2 (nw-652): `target` is gated on a build manifest.
+                "reader": "git-bare-v2",
                 "max_source_file_bytes": self.limits.max_source_file_bytes(),
             })
             .to_string(),
@@ -1581,11 +1634,20 @@ impl ContentReader for GitBareReader {
             } else {
                 PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned())
             };
-            if crate::index::path_in_skip_dir(&path) {
-                continue;
-            }
             files.push(path);
         }
+        // nw-652: the manifest gate is answered from the tree itself — a
+        // committed `target/` is pruned only when the tree also holds a
+        // `Cargo.toml` (or `CACHEDIR.TAG`) where the gate looks for one.
+        let tree: HashSet<PathBuf> = files.iter().cloned().collect();
+        files.retain(|path| {
+            !crate::index::path_in_skip_dirs(
+                path,
+                crate::index::SKIP_DIRS,
+                crate::index::nothing_unskipped(),
+                &|probe| tree.contains(probe),
+            )
+        });
         Ok(files)
     }
 
@@ -2352,7 +2414,10 @@ mod tests {
 
     #[test]
     fn git_bare_reader_list_files_skips_skip_dirs() {
+        // nw-652: `target/` counts as build output only beside a manifest, so
+        // the fixture is the Rust crate it always implied.
         let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
             ("src/lib.rs", ""),
             ("node_modules/foo/bar.js", "junk"),
             ("target/debug/x.rs", "junk"),
@@ -2366,6 +2431,160 @@ mod tests {
         assert!(names.contains(&"src/lib.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
         assert!(!names.iter().any(|n| n.contains("target")));
+    }
+
+    #[test]
+    fn git_bare_reader_keeps_a_source_target_dir_and_gates_on_the_tree() {
+        // nw-652: the bare route has no working tree to stat, so the manifest
+        // gate is answered from the committed tree itself. A root `Cargo.toml`
+        // gates the ROOT `target/` only — never a nested source one.
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            ("target/debug/gen.rs", "junk"),
+            ("src/screens/target/TargetEditMode.tsx", "export {}"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let files = reader.list_files().unwrap();
+        assert!(
+            files.contains(&PathBuf::from("src/screens/target/TargetEditMode.tsx")),
+            "{files:?}"
+        );
+        assert!(
+            !files.contains(&PathBuf::from("target/debug/gen.rs")),
+            "{files:?}"
+        );
+        // The incremental route asks the same question through the trait.
+        assert!(!reader.skips_path(Path::new("src/screens/target/TargetEditMode.tsx")));
+        assert!(reader.skips_path(Path::new("target/debug/gen.rs")));
+        assert!(!reader.has_file(Path::new("src")), "a tree is not a file");
+
+        // A manifest larger than the configured source ceiling is still a
+        // manifest: the tree answers, not a read that the limit refuses.
+        let big = format!("[package]\nname = \"x\"\n#{}\n", "x".repeat(20_000));
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("Cargo.toml", big.as_str()),
+            ("target/debug/gen.rs", "junk"),
+        ]);
+        let small =
+            crate::index_limits::IndexLimits::new(crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES)
+                .unwrap();
+        assert!(big.len() as u64 > small.max_source_file_bytes());
+        let reader = GitBareReader::with_limits(&bare, &sha, small);
+        assert!(reader.skips_path(Path::new("target/debug/gen.rs")));
+        assert!(
+            !reader
+                .list_files()
+                .unwrap()
+                .iter()
+                .any(|f| f.starts_with("target"))
+        );
+    }
+
+    #[test]
+    fn filesystem_reader_walks_a_source_target_dir_and_prunes_a_cargo_one() {
+        // nw-652: the walk, `accepts_path` (the watcher's filter) and
+        // `skips_path` (the incremental loop's) must give one answer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/screens/target")).unwrap();
+        std::fs::create_dir_all(root.join("crates/a/target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("relocated/target/debug")).unwrap();
+        std::fs::write(root.join("src/screens/target/Edit.ts"), "export {}").unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/a/target/debug/gen.rs"), "fn g() {}").unwrap();
+        std::fs::write(
+            root.join("relocated/target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(root.join("relocated/target/debug/out.rs"), "fn o() {}").unwrap();
+        let reader = FilesystemReader::new(root);
+        let files = reader.list_files().unwrap();
+        assert!(
+            files.contains(&PathBuf::from("src/screens/target/Edit.ts")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("crates/a/target")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("relocated/target")),
+            "{files:?}"
+        );
+        let pruned: Vec<String> = reader.skipped_dirs().into_iter().map(|d| d.path).collect();
+        assert!(
+            pruned.contains(&"crates/a/target".to_string()),
+            "{pruned:?}"
+        );
+        assert!(
+            pruned.contains(&"relocated/target".to_string()),
+            "{pruned:?}"
+        );
+        assert!(!pruned.iter().any(|p| p.contains("screens")), "{pruned:?}");
+        for (rel, skipped) in [
+            ("src/screens/target/Edit.ts", false),
+            ("crates/a/target/debug/gen.rs", true),
+            ("relocated/target/debug/out.rs", true),
+        ] {
+            assert_eq!(reader.skips_path(Path::new(rel)), skipped, "{rel}");
+            assert_eq!(reader.accepts_path(Path::new(rel)), !skipped, "{rel}");
+        }
+    }
+
+    #[test]
+    fn eligibility_fingerprint_moved_off_the_name_only_target_rule() {
+        // nw-652: a graph indexed under the name-only rule is missing every
+        // source `target/`, and only a changed fingerprint makes the next
+        // incremental run fall back to the full index that restores them.
+        // This is the version-1 payload, verbatim; if it ever matches again,
+        // existing graphs silently keep the loss.
+        let dir = tempfile::tempdir().unwrap();
+        let reader = FilesystemReader::new(dir.path());
+        let excludes: Vec<String> = Vec::new();
+        let unskip: Vec<&String> = Vec::new();
+        let version_one = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "version": 1, "excludes": excludes, "unskip": unskip,
+                "skip_dirs": crate::index::SKIP_DIRS,
+                "max_source_file_bytes": reader.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        assert_ne!(reader.eligibility_fingerprint(), version_one);
+        // COUNTERWEIGHT: the rebuilt payload must be faithful, or the
+        // inequality above holds for a reason unrelated to the version.
+        let version_two = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "version": 2, "excludes": excludes, "unskip": unskip,
+                "skip_dirs": crate::index::SKIP_DIRS,
+                "max_source_file_bytes": reader.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        assert_eq!(reader.eligibility_fingerprint(), version_two);
+        let bare_v1 = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v1",
+                "max_source_file_bytes": reader.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.rs", "")]);
+        let bare_reader = GitBareReader::new(&bare, &sha);
+        assert_ne!(bare_reader.eligibility_fingerprint(), bare_v1);
+        let bare_v2 = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v2",
+                "max_source_file_bytes": bare_reader.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        assert_eq!(bare_reader.eligibility_fingerprint(), bare_v2);
     }
 
     #[test]
