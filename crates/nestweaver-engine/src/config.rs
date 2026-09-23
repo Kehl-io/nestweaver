@@ -194,6 +194,14 @@ pub struct LinkConfig {
 pub struct FeatureConfig {
     pub name: String,
     pub description: Option<String>,
+    /// nw-599 follow-up: had the identical defect `entry_points` had below —
+    /// absent (not merely empty) `repos` in a `[[features]]` block failed
+    /// TOML deserialization for the whole `InstanceConfig` before this field
+    /// ever reached the load-time "it will match nothing" warning loop in
+    /// `InstanceConfig::from_toml_str`, which assumes deserialization already
+    /// succeeded. Defaults to empty instead so that warning can actually
+    /// fire on an empty/absent `repos` rather than never being reached.
+    #[serde(default)]
     pub repos: Vec<String>,
     /// nw-599: absent `entry_points` used to fail TOML deserialization for
     /// the whole `InstanceConfig`, taking every other section (repos, links,
@@ -2087,10 +2095,11 @@ entry_points = ["syncData", "fetchRecords"]
     // fail TOML deserialization for the ENTIRE InstanceConfig (`missing field
     // entry_points`), taking down `[[repos]]`/`[[links]]`/everything else in
     // the same file along with it, and killing MCP boot before it could even
-    // reach JSON-RPC. `entry_points` now defaults to empty like `repos`
-    // already effectively does (via the existing empty-repos warning path),
-    // and the pre-existing "context will be empty" warning at load time
-    // (see the loop over `config.features` above `validate_and_normalize_
+    // reach JSON-RPC. `entry_points` now defaults to empty (`repos` got the
+    // same `#[serde(default)]` treatment in the nw-599 follow-up, see
+    // `feature_without_repos_still_parses_instance_config` below), and the
+    // pre-existing "context will be empty" warning at load time (see the
+    // loop over `config.features` above `validate_and_normalize_
     // seed_resolution`) is what surfaces the gap instead of a hard failure.
     #[test]
     fn feature_without_entry_points_still_parses_instance_config() {
@@ -2135,6 +2144,56 @@ repos = ["app"]
             features[0].entry_points.is_empty(),
             "entry_points should default to empty, not fail parsing"
         );
+    }
+
+    // nw-599 follow-up: `repos` had the identical defect as `entry_points` —
+    // absent from `[[features]]` (as opposed to present-but-empty), it fails
+    // TOML deserialization for the whole `InstanceConfig` because it carried
+    // no `#[serde(default)]`. The empty-repos warning loop above (config.rs
+    // "it will match nothing") can only fire if deserialization SUCCEEDED
+    // with an empty vec in the first place — an absent field never reached
+    // it, it failed earlier, at parse time.
+    #[test]
+    fn feature_without_repos_still_parses_instance_config() {
+        let toml = r#"
+instance_id = "missing-repos-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/app"
+
+[[features]]
+name = "data-sync"
+"#;
+        let cfg = InstanceConfig::from_toml_str(toml).expect("should parse despite missing repos");
+
+        // Counterweight: other sections still loaded.
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.repos[0].url, "https://github.com/example/app");
+
+        let features = cfg.features.expect("should have features");
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name, "data-sync");
+        assert!(
+            features[0].repos.is_empty(),
+            "repos should default to empty, not fail parsing"
+        );
+        assert!(features[0].entry_points.is_empty());
     }
 
     // Counterweight for nw-599: an unrecognized key inside `[[features]]`
