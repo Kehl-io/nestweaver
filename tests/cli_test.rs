@@ -10563,6 +10563,167 @@ fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
     );
 }
 
+/// nw-657: a MALFORMED `--page-token` (right type, wrong shape — not 64
+/// lowercase-hex characters) used to bail through `anyhow::ensure!` inside
+/// the MCP handler `dead_code_page_arguments`, which the daemon route
+/// surfaced as exit 1 "Internal error" — indistinguishable from a real bug,
+/// and inconsistent with the documented exit-2 contract a well-formed-but-
+/// WRONG token already gets (`page_population_or_database_changed`). This
+/// exercises the real CLI, direct (non-daemon) route.
+#[test]
+fn dead_code_malformed_page_token_is_a_usage_error_not_an_internal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args([
+            "dead-code",
+            "--json",
+            "--page-token",
+            "not-a-valid-token",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a malformed page_token must refuse with the documented exit 2, not \
+         exit 1 Internal error: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not-a-valid-token"),
+        "the refusal must name the bad token: {stderr}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["refused"], serde_json::json!(true));
+    assert_eq!(payload["reason"], serde_json::json!("page_token_malformed"));
+
+    // ── COUNTERWEIGHT: a well-formed 64-char lowercase-hex token that simply
+    // does not match this population must be unaffected — still exit 2, but
+    // the pre-existing value-mismatch reason, not the new shape reason.
+    let wrong_but_well_formed = "a".repeat(64);
+    let mismatch = nestweaver_cmd()
+        .args(["dead-code", "--json", "--page-token"])
+        .arg(&wrong_but_well_formed)
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2));
+    let mismatch_payload: serde_json::Value = serde_json::from_slice(&mismatch.stdout).unwrap();
+    assert_eq!(
+        mismatch_payload["reason"],
+        serde_json::json!("page_population_or_database_changed"),
+        "a well-formed-but-wrong token must keep its existing reason: {mismatch_payload}"
+    );
+
+    // ── COUNTERWEIGHT: valid paging (no page_token, first page) is unaffected.
+    let valid = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "ordinary first-page paging must be unaffected: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+}
+
+/// nw-657 daemon-route parity: the direct (non-daemon) CLI route above never
+/// actually exhibited the exit-1 "Internal error" symptom the item describes
+/// — its own `DeadCodePageRequest` construction never called the MCP
+/// handler's `dead_code_page_arguments`, so a malformed token there just fell
+/// through to the hash-mismatch refusal (exit 2, generic reason) even before
+/// this fix. The DAEMON route is the one that actually broke: it dispatches
+/// through `tool_dead_code`, which called `dead_code_page_arguments` and used
+/// to bail with `anyhow::ensure!` on a malformed shape, surfacing as exit 1.
+/// Isolated XDG dirs (same pattern as
+/// `a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_database`)
+/// so this spawns its own throwaway daemon rather than touching a real one.
+#[test]
+fn dead_code_malformed_page_token_daemon_route_matches_direct_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(repo_dir.join("main.rs"), "fn helper() {}\nfn main() { helper(); }\n").unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "dead-code",
+            "--json",
+            "--page-token",
+            "not-a-valid-token",
+            "--db",
+        ])
+        .arg(&db_path)
+        // The route this whole test exists to exercise — pinned explicitly
+        // per `every_cli_invocation_pins_its_daemon_routing`.
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the daemon route must refuse a malformed page_token with exit 2, \
+         not exit 1 'Internal error' — this is the route that actually \
+         exhibited nw-657: stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("not-a-valid-token"),
+        "the daemon route's refusal must also name the bad token: {stderr}"
+    );
+
+    let _ = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db_path)
+        .arg("stop")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .output();
+}
+
 /// nw-435 leg 2 (precision), end to end. `detect_python`/`detect_bash` only
 /// ever recognised a function literally named `main`, so a Python module or
 /// bash script whose top level was bare statements had NO entry point at all

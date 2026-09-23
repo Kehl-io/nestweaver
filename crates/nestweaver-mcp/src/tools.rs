@@ -12975,7 +12975,20 @@ fn tool_schema_dead_code() -> Value {
                 "repos": { "type": "array", "items": { "type": "string" }, "maxItems": 100, "description": "Repository names or UIDs; restrict the result population before paging." },
                 "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0 },
                 "expected_generation": { "type": "integer", "minimum": 0, "description": "Required with page_token for offset greater than zero." },
-                "page_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
+                // nw-657: NOT `minLength`/`maxLength: 64` + `pattern` anymore.
+                // Those made a malformed token fail JSON-schema validation
+                // (`validate_tool_arguments`, ahead of `dispatch_cancellable`)
+                // on EVERY route this schema gates — the MCP stdio gateway,
+                // and the daemon's json_rpc! dispatch (`dispatch_json_tool` ->
+                // `dispatch_cancellable` -> `validate_tool_arguments`), which
+                // this tool's `dead_code` RPC also goes through. That surfaced
+                // as an opaque schema-validation error (Internal error / exit
+                // 1 on the CLI) instead of the structured, token-naming
+                // `page_token_malformed` refusal `dead_code_page_guard`
+                // (dead_code.rs) now produces. `maxLength` stays as a coarse
+                // DoS bound; the exact shape is the guard's job now, uniformly
+                // on every route.
+                "page_token": { "type": "string", "maxLength": 4096, "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
@@ -13030,21 +13043,21 @@ fn dead_code_page_arguments(
                 .ok_or_else(|| anyhow!("expected_generation must be an unsigned integer"))?,
         ),
     };
+    // nw-657: a bad TYPE (not a string at all) is still a hard parse error —
+    // the caller sent something `dead_code_page_guard` cannot even name as a
+    // token. A bad SHAPE (a string, wrong length/characters) is deliberately
+    // NOT validated here; it is left to reach `DeadCodePageRequest` and the
+    // shared `dead_code_page_guard` shape check, which both this route and
+    // the direct CLI route call before ever hashing a population, so a
+    // malformed token refuses with `page_token_malformed` (exit 2, naming the
+    // bad token) instead of bailing here as an opaque internal error.
     let page_token = match args.get("page_token") {
         None => None,
-        Some(value) => {
-            let token = value
+        Some(value) => Some(
+            value
                 .as_str()
-                .ok_or_else(|| anyhow!("page_token must be a string"))?;
-            anyhow::ensure!(
-                token.len() == 64
-                    && token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "page_token must contain exactly 64 lowercase hexadecimal characters"
-            );
-            Some(token)
-        }
+                .ok_or_else(|| anyhow!("page_token must be a string"))?,
+        ),
     };
     anyhow::ensure!(
         !args.get("offset").is_some_and(Value::is_null),
@@ -13085,10 +13098,10 @@ mod dead_code_argument_contract_tests {
             json!({"expected_generation": -1}),
             json!({"expected_generation": 1.5}),
             json!({"expected_generation": null}),
+            // A bad TYPE for page_token is still a parse-time error here —
+            // there is no string to hand to the shape check.
             json!({"page_token": 42}),
             json!({"page_token": null}),
-            json!({"page_token": "short"}),
-            json!({"page_token": "G".repeat(64)}),
             json!({"repos": "repo:a"}),
             json!({"repos": ["repo:a", 42]}),
             json!({"repos": null}),
@@ -13099,6 +13112,22 @@ mod dead_code_argument_contract_tests {
             json!({"min_confidence": null}),
         ] {
             assert!(dead_code_page_arguments(&arguments).is_err(), "{arguments}");
+        }
+    }
+
+    /// nw-657: a page_token that IS a string but the wrong shape ("short",
+    /// wrong case) must NOT fail parsing here — this is the seam that used to
+    /// bail with `anyhow::ensure!`, which `tool_dead_code` had no choice but
+    /// to propagate as a raw internal error. It now parses through cleanly;
+    /// `dead_code_page_guard`'s shape check (dead_code.rs) is what refuses it,
+    /// as a structured `page_token_malformed` payload instead.
+    #[test]
+    fn malformed_shape_page_tokens_parse_through_for_the_shared_guard_to_refuse() {
+        for token in ["short", "G".repeat(64).as_str(), ""] {
+            let arguments = json!({"page_token": token});
+            let (request, _selectors) = dead_code_page_arguments(&arguments)
+                .unwrap_or_else(|e| panic!("page_token {token:?} must parse: {e}"));
+            assert_eq!(request.page_token, Some(token));
         }
     }
 
@@ -13113,6 +13142,27 @@ mod dead_code_argument_contract_tests {
         assert_eq!(request.offset, 3);
         assert_eq!(request.min_confidence, DeadCodeConfidence::High);
         assert_eq!(selectors, Some(vec!["repo:a".to_string()]));
+    }
+
+    /// nw-657 end-to-end: through the actual `tool_dead_code` handler (the
+    /// seam the daemon's `dead_code` RPC calls, bypassing the MCP gateway's
+    /// JSON-schema `pattern` gate), a malformed page_token must come back as
+    /// an `Ok` refusal payload — never an `Err` that the CLI can only render
+    /// as exit 1 "Internal error".
+    #[test]
+    fn tool_dead_code_refuses_malformed_page_token_instead_of_erroring() {
+        let store = GraphStore::in_memory().unwrap();
+        let payload = tool_dead_code(&store, json!({ "page_token": "not-hex" }), None, None)
+            .expect("a malformed page_token must be a structured refusal, not an Err");
+        assert_eq!(payload["refused"], true);
+        assert_eq!(payload["reason"], "page_token_malformed");
+        assert!(
+            payload["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not-hex"),
+            "{payload}"
+        );
     }
 
     #[test]
