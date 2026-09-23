@@ -66,7 +66,7 @@ fn manifest_unavailable(
     state: &AppState,
     mut error: nestweaver_engine::manifest::ManifestUnavailable,
 ) -> Response {
-    let rebuild = state.manifest_recovery.get().map(|runtime| {
+    let mut rebuild = state.manifest_recovery.get().map(|runtime| {
         runtime.wake.notify_one();
         runtime.status()
     });
@@ -87,6 +87,18 @@ fn manifest_unavailable(
         // `--force` while recovery is installed tells the operator to smash a
         // generation the watcher is already going to rebuild.
         error.message = without_force_index_advice(&error.message);
+    }
+    // nw-637: the embedded `rebuild` status carries its OWN `error.message`
+    // (the runtime's last recorded attempt), a sibling of the top-level
+    // `error.message` stripped above but not the same field — stripping the
+    // top level left this nested one untouched, so a live 503 still named
+    // `--force` one level down. Same helper, same rationale: recovery, not
+    // the operator, owns retrying this.
+    if let Some(status) = &mut rebuild
+        && let Some(rebuild_error) = &mut status.error
+        && rebuild_error.retryable
+    {
+        rebuild_error.message = without_force_index_advice(&rebuild_error.message);
     }
     let retryable = error.retryable
         && rebuild.as_ref().is_some_and(|s| {
@@ -259,6 +271,67 @@ mod tests {
         assert!(
             message.contains("stale artifact generation"),
             "the operator still needs the stale generation numbers: {payload}"
+        );
+    }
+
+    /// nw-637: the top-level message has `--force` stripped, but the runtime
+    /// status embedded as `rebuild` in the same 503 body carries its OWN
+    /// `error.message` (the last attempt the watching recovery loop
+    /// recorded) which was not passed through the same stripper. Live
+    /// evidence 2026-09-23: nested `rebuild.error.message` still read
+    /// "...; re-index with `nestweaver index --repo <path> --force`" 2/2
+    /// runs even though the top-level message was already clean.
+    #[tokio::test]
+    async fn nested_rebuild_error_does_not_prescribe_force_for_stale_generation() {
+        use nestweaver_engine::manifest::{
+            ManifestRecoveryRuntime, ManifestUnavailable, ManifestUnavailableReason,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let state = AppState::new(store, None, db_path);
+        let runtime = Arc::new(ManifestRecoveryRuntime::default());
+        // The runtime's own last-attempt error is the same retryable stale
+        // generation shape, and still carries the raw --force template —
+        // this is what the daemon-side recovery loop actually publishes.
+        runtime.publish(
+            "retry_scheduled",
+            1,
+            Some(2),
+            Some(ManifestUnavailable::new(
+                ManifestUnavailableReason::StaleGeneration,
+                generation + 1,
+                "repo_manifest stale artifact generation 16, expected 17; re-index with `nestweaver index --repo <path> --force`",
+            )),
+        );
+        assert!(state.manifest_recovery.set(runtime).is_ok());
+        let mut stale = ManifestUnavailable::new(
+            ManifestUnavailableReason::StaleGeneration,
+            generation + 1,
+            "repo_manifest stale artifact generation 16, expected 17; re-index with `nestweaver index --repo <path> --force`",
+        );
+        stale.actual_generation = Some(generation);
+        let response = manifest_unavailable(&state, stale);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let top_message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            !top_message.to_ascii_lowercase().contains("force"),
+            "top-level message must stay clean: {payload}"
+        );
+        let nested_message = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !nested_message.to_ascii_lowercase().contains("force"),
+            "nested rebuild.error.message must not prescribe --force either: {payload}"
+        );
+        assert!(
+            nested_message.contains("stale artifact generation"),
+            "the operator still needs the stale generation numbers in the nested error: {payload}"
         );
     }
 
