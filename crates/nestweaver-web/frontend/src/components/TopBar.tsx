@@ -209,7 +209,20 @@ export function TopBar() {
 
   useHotkeys(
     "escape",
-    () => {
+    (e) => {
+      // Only claim the keypress when there was actually a search overlay to
+      // close. `useStore.getState()` is a live read, not the `enabled` prop's
+      // closure captured at last render, which matters here: react-hotkeys-hook
+      // gives every useHotkeys("escape", ...) its own document keydown
+      // listener, so this handler and useKeyboardShortcuts' global
+      // escape-deselect handler both run synchronously on the same keypress.
+      // Marking the event via preventDefault() (checked downstream through
+      // ignoreEventWhen) is what lets the global handler reliably skip a
+      // keypress this one already handled — a render-cycle-later state flag
+      // would still be stale when the global handler's turn comes (nw-532).
+      if (useStore.getState().searchOpen) {
+        e.preventDefault();
+      }
       clearSearch();
       inputRef.current?.blur();
     },

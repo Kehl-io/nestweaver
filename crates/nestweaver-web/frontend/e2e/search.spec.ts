@@ -222,6 +222,42 @@ test.describe("Search Flow", () => {
     await expect(evidencePanel).toContainText("No selection");
   });
 
+  test("Escape closes the dropdown left open by Add without clearing the selection it made (nw-532)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    const dropdown = page.getByRole("listbox");
+    const evidencePanel = page.getByRole("complementary", { name: "Source and note evidence" });
+
+    // "Add" (unlike "Detail") selects the result and deliberately leaves the
+    // dropdown open — the exact repro from the bug report: focus lands on a
+    // non-form "Add" button while the dropdown, and the selection it just
+    // made, both stay live.
+    await searchInput.fill("greet");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.getByRole("button", { name: "Add" }).click();
+
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get("node"))
+      .not.toBeNull();
+    const selectedUid = new URL(page.url()).searchParams.get("node");
+    await expect(evidencePanel).not.toContainText("No selection");
+    await expect(dropdown).toBeVisible();
+
+    // Escape must close the dropdown left open by Add without dropping the
+    // selection Add just made — this is the path a render-cycle-later state
+    // gate cannot reliably cover, because both the overlay-close handler and
+    // the global deselect handler fire on this same keypress.
+    await page.keyboard.press("Escape");
+    await expect(dropdown).toBeHidden();
+    await expect(evidencePanel).not.toContainText("No selection");
+    expect(new URL(page.url()).searchParams.get("node")).toBe(selectedUid);
+  });
+
   test("Escape with nothing selected still closes the search dropdown (nw-532 counterweight)", async ({
     page,
   }) => {
@@ -235,5 +271,45 @@ test.describe("Search Flow", () => {
 
     await page.keyboard.press("Escape");
     await expect(dropdown).toBeHidden();
+  });
+
+  test("Escape closes the Perspectives popover without clearing the selection (nw-532)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("control-dock")).toBeVisible({ timeout: 15_000 });
+
+    const searchInput = page.getByTestId("search-input");
+    const dropdown = page.getByRole("listbox");
+    const evidencePanel = page.getByRole("complementary", { name: "Source and note evidence" });
+
+    // Select a node first (search closes itself on Explore).
+    await searchInput.fill("greet");
+    const firstOption = dropdown.getByRole("option").first();
+    await expect(firstOption).toBeVisible({ timeout: 10_000 });
+    await firstOption.click();
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get("node"))
+      .not.toBeNull();
+    const selectedUid = new URL(page.url()).searchParams.get("node");
+    await expect(evidencePanel).not.toContainText("No selection");
+
+    // Open the Perspectives popover — focus lands on its toggle button, a
+    // non-form element, the same shape of repro the bug report described
+    // ("Same when dismissing Perspectives").
+    const perspectivesButton = page.getByRole("button", { name: "Perspectives" });
+    await perspectivesButton.click();
+    const saveCurrentView = page.getByRole("button", { name: "Save current view" });
+    await expect(saveCurrentView).toBeVisible();
+
+    // Escape must close the popover, not the selection underneath it.
+    await page.keyboard.press("Escape");
+    await expect(saveCurrentView).toBeHidden();
+    await expect(evidencePanel).not.toContainText("No selection");
+    expect(new URL(page.url()).searchParams.get("node")).toBe(selectedUid);
+
+    // Counterweight: with no overlay open, Escape still clears the selection.
+    await page.keyboard.press("Escape");
+    await expect(evidencePanel).toContainText("No selection");
   });
 });

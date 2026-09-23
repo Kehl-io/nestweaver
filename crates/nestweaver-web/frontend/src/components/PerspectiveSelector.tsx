@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useHotkeys } from "react-hotkeys-hook";
 import { api } from "../api/client";
 import type { Perspective } from "../api/types";
 import { useStore } from "../stores";
@@ -52,6 +53,32 @@ export function PerspectiveSelector() {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
+
+  // Escape closes the popover without falling through to the global
+  // escape-deselect hotkey (nw-532): focus commonly rests on a non-form
+  // element in here (the toggle button, a perspective row), which the
+  // global handler doesn't exclude, so it used to clear the selected node
+  // whenever someone pressed Escape to back out of this popover.
+  // preventDefault() marks the event so the global handler's
+  // ignoreEventWhen skips it — but that only works if this listener runs
+  // before the global one, and react-hotkeys-hook only attaches a hotkey's
+  // document listener while `enabled` is true. Gating registration itself
+  // on `enabled: open` meant this listener didn't exist yet at mount time
+  // and only got attached (at the *end* of the browser's listener list,
+  // after Escape had already been pressed to open the popover once) the
+  // first time the popover opened — so on that very keypress the global
+  // handler, registered at mount, still ran unopposed. Stay registered
+  // unconditionally (same as TopBar's own Escape handler) and gate the
+  // actual close behavior inside the callback instead, so this listener's
+  // position in the dispatch order — before the global one, since it
+  // mounts as a descendant of it — is fixed from the start.
+  useHotkeys("escape", (e) => {
+    if (!open) return;
+    e.preventDefault();
+    setOpen(false);
+    setSaving(false);
+    setNewName("");
+  });
 
   const activePerspective = perspectives.find(
     (p) => p.id === activePerspectiveId,
