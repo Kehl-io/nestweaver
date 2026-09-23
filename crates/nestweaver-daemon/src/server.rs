@@ -14073,6 +14073,7 @@ pub async fn run_server(
                 // second connection from admin routes races the worker's WAL
                 // checkpoint and crashes with SIGBUS on macOS.
                 job_queue: shared_job_queue_opt.clone(),
+                resolver: nestweaver_web::state::system_resolver(),
             });
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).

@@ -330,9 +330,7 @@ pub use nestweaver_engine::ssrf::config_repo_url_allowed;
 /// (pure refactor — see nw-007). Re-export `config_repo_url_allowed` so existing
 /// callers (`server.rs` config-repo enqueue) keep using
 /// `nestweaver_web::routes::admin::config_repo_url_allowed`.
-use nestweaver_engine::ssrf::{
-    any_resolved_ip_is_internal, host_to_resolve, resolve_host, validate_repo_url,
-};
+use nestweaver_engine::ssrf::{any_resolved_ip_is_internal, host_to_resolve, validate_repo_url};
 
 /// POST /admin/api/repos — add a new repo.
 pub async fn add_repo(
@@ -363,7 +361,12 @@ async fn add_repo_owned(
     // (validating the connected IP when the indexer clones) is out of scope and
     // tracked separately.
     if let Some(host) = host_to_resolve(&req.url) {
-        let resolved = tokio::task::spawn_blocking(move || resolve_host(&host))
+        // nw-654: `state.resolver` rather than calling
+        // `nestweaver_engine::ssrf::resolve_host` directly — production gets
+        // the same real DNS lookup via `state::system_resolver()`, but a test
+        // can inject a synthetic resolver instead of depending on live DNS.
+        let resolver = state.resolver.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolver(&host))
             .await
             .map_err(|e| {
                 (
@@ -1952,6 +1955,7 @@ mod tests {
             webhook_repo_branches: None,
             write_gate: None,
             job_queue: None,
+            resolver: crate::state::system_resolver(),
         })
     }
 
@@ -2211,6 +2215,13 @@ url = "https://github.com/example/existing"
             webhook_repo_branches: None,
             write_gate: None,
             job_queue: None,
+            // nw-654: a synthetic resolver rather than `state::system_resolver()`
+            // — this test asserts on config persistence, not on DNS behaviour,
+            // and the real resolver made it depend on live network access. It
+            // resolves every hostname to a routable external address so the
+            // SSRF guard's "no internal address" branch passes, same as it
+            // would for a real, successfully-resolving public hostname.
+            resolver: std::sync::Arc::new(|_host: &str| Ok(vec!["93.184.216.34".parse().unwrap()])),
         });
 
         let app = Router::new()
@@ -2236,6 +2247,94 @@ url = "https://github.com/example/existing"
         assert!(cfg.repos.iter().any(|repo| {
             repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
         }));
+    }
+
+    /// Counterweight for nw-654: injecting a resolver must not weaken the
+    /// SSRF guard. A hostname that resolves to an internal address (here,
+    /// `10.0.0.1`, via the injected resolver rather than real DNS) is still
+    /// rejected with 400.
+    #[tokio::test]
+    async fn add_repo_rejects_hostname_resolving_to_an_internal_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#,
+        )
+        .unwrap();
+        let store =
+            nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
+        let state = Arc::new(AdminState {
+            admin_token: "test-admin-token".to_string(),
+            auth_token: Some("test-query-token".to_string()),
+            device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            daemon_store: Arc::new(store),
+            tantivy: None,
+            instance_id: "test".to_string(),
+            start_time: std::time::Instant::now(),
+            active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            db_path,
+            config_path: Some(config_path.clone()),
+            scheduler_tx: None,
+            webhook_allowed_repos: None,
+            webhook_repo_branches: None,
+            write_gate: None,
+            job_queue: None,
+            resolver: std::sync::Arc::new(|_host: &str| Ok(vec!["10.0.0.1".parse().unwrap()])),
+        });
+
+        let app = Router::new()
+            .route("/admin/api/repos", post(add_repo))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/repos")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://github.com/example/internal","branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // The guard must reject BEFORE persisting — an internal-resolving
+        // hostname never makes it into the config.
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
+        assert!(
+            !cfg.repos
+                .iter()
+                .any(|repo| repo.url == "https://github.com/example/internal"),
+            "a hostname resolving to an internal address must not be persisted"
+        );
     }
 
     #[tokio::test]
@@ -2346,6 +2445,7 @@ url = "https://github.com/example/existing"
             webhook_repo_branches: None,
             write_gate: None,
             job_queue: None,
+            resolver: crate::state::system_resolver(),
         });
         let app = Router::new()
             .route("/admin/api/repos/{id}", delete(remove_repo))
