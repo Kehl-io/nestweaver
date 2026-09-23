@@ -65,6 +65,13 @@ export function useKeyboardShortcuts() {
   // time, so an overlay's handler marking it via `e.preventDefault()` is
   // reliably visible here, in listener-registration order (children mount —
   // and so register their keydown listener — before their parents).
+  //
+  // CONVENTION for any new overlay that closes on Escape: register its
+  // useHotkeys("escape", ...) UNCONDITIONALLY at mount, return early inside
+  // the callback when it is not open, and call `e.preventDefault()` when it
+  // does close. Gating it with `enabled: open` instead attaches its listener
+  // only when first opened — AFTER this one — so this handler runs first and
+  // silently clears the selection.
   useHotkeys(
     "escape",
     () => selectNode(null),
