@@ -615,14 +615,22 @@ impl GraphStore {
                     _ => self.mark_regex_scope_dirty(&scope_uid, true)?,
                 };
                 let delta = index.posting_delta(&scope_uid, &[]);
-                if index.retire_scope(&scope_uid)? {
-                    stats.scopes_refreshed += 1;
-                }
+                let retired = index.retire_scope(&scope_uid)?;
                 record_posting_delta(&mut stats, &scope_uid, delta);
-                if let crate::write::RegexAck::Superseded { desired } =
-                    self.acknowledge_regex_tombstone(&scope_uid, epoch)?
-                {
-                    defer_superseded_scope(&mut stats, &scope_uid, epoch, desired);
+                #[cfg(test)]
+                run_before_regex_ack_hook(self, &scope_uid);
+                // Counted as refreshed only once acknowledged, like the
+                // active-scope branch below: a deferred retirement is not
+                // also a refreshed one (nw-655).
+                match self.acknowledge_regex_tombstone(&scope_uid, epoch)? {
+                    crate::write::RegexAck::Acknowledged => {
+                        if retired {
+                            stats.scopes_refreshed += 1;
+                        }
+                    }
+                    crate::write::RegexAck::Superseded { desired } => {
+                        defer_superseded_scope(&mut stats, &scope_uid, epoch, desired);
+                    }
                 }
                 continue;
             }
@@ -2494,6 +2502,39 @@ mod tests {
             .regex_search("authenticateUser", None, None, None, None)
             .unwrap();
         assert!(!hit.scanned_fallback, "every scope is acknowledged again");
+    }
+
+    /// nw-655 review. A tombstone retirement that a concurrent writer
+    /// supersedes is deferred exactly like an active scope — and, like one, is
+    /// NOT also counted as refreshed. It used to be counted before its
+    /// acknowledgement, so one scope read as both refreshed and deferred.
+    #[test]
+    fn a_superseded_tombstone_is_deferred_and_not_counted_refreshed() {
+        let store = store_with_text();
+        store.rebuild_trigram_index().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("MATCH (s:Symbol {uid: 'sym:1'}) DETACH DELETE s")
+            .unwrap();
+        store.mark_regex_scope_dirty("repo:1", true).unwrap();
+        let stats = with_regex_ack_hook(
+            |store, scope| {
+                if scope == "repo:1" {
+                    store.mark_regex_scope_dirty("repo:1", true).unwrap();
+                }
+            },
+            || store.refresh_trigram_index(false),
+        )
+        .expect("a superseded tombstone must not fail the refresh");
+        assert_eq!(stats.scopes_deferred, vec!["repo:1".to_string()]);
+        assert_eq!(stats.scopes_refreshed, 0, "{stats:?}");
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 1);
+
+        // The reconciler's next pass acknowledges the newer tombstone.
+        let next = store.refresh_trigram_index(false).unwrap();
+        assert!(next.scopes_deferred.is_empty(), "{next:?}");
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 0);
     }
 
     /// nw-655 counterweight. Only a SUPERSEDED (newer) epoch is deferred; any
