@@ -777,6 +777,70 @@ fn repair_does_not_blame_a_lock_nobody_holds() {
     drop(dir);
 }
 
+/// nw-614. `repair --json` on a database whose write-ahead log is unreadable
+/// reported `before.dirty: false` / `after.dirty: false` — true of the
+/// publication MARKER, and read by every consumer keying on `dirty` as "this
+/// database is clean". The JSON must fail closed: name the state, withhold the
+/// `dirty` verdict it never established, and carry the move-aside remedy.
+///
+/// Both routes into the open failure are covered: a CLEAN marker reaches the
+/// read-only health probe, a DIRTY one reaches the read-write open.
+#[test]
+fn repair_json_reports_an_unreadable_wal_instead_of_clean() {
+    for marker_dirty in [false, true] {
+        let (dir, db) = indexed_fixture();
+        if marker_dirty {
+            let marker = std::path::PathBuf::from(format!("{}.index-dirty", db.display()));
+            std::fs::write(&marker, r#"{"writer_pid":999999,"reason":"index"}"#).unwrap();
+        }
+        corrupt_the_wal(&db);
+
+        let output = direct()
+            .args(["repair", "--json", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "marker_dirty={marker_dirty}: {output:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("marker_dirty={marker_dirty}: {e}: {output:?}"));
+        assert_eq!(payload["wal_unreadable"], true, "{payload:#}");
+        assert!(
+            payload["before"]["dirty"].is_null() && payload["after"]["dirty"].is_null(),
+            "a dirty verdict on a database repair could not open must be withheld, \
+             not reported as false: {payload:#}"
+        );
+        assert!(
+            payload["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("MOVE ASIDE")),
+            "the remedy must be the move-aside runbook: {payload:#}"
+        );
+        drop(dir);
+    }
+}
+
+/// nw-614 counterweight: a healthy database with a clean marker is still
+/// reported `dirty: false`, `wal_unreadable: false`, exit 0.
+#[test]
+fn repair_json_on_a_healthy_database_is_still_clean() {
+    let (dir, db) = indexed_fixture();
+    let output = direct()
+        .args(["repair", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["wal_unreadable"], false, "{payload:#}");
+    assert_eq!(payload["before"]["dirty"], false, "{payload:#}");
+    assert_eq!(payload["after"]["dirty"], false, "{payload:#}");
+    assert!(payload["remedy"].is_null(), "{payload:#}");
+    drop(dir);
+}
+
 /// The other half, and what keeps the first from over-correcting: a repair
 /// blocked by a REAL lock must still say so. Without this, "delete the
 /// sentence" passes.

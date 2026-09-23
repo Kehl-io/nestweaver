@@ -13378,14 +13378,35 @@ fn run_repair_index_publication(
     };
 
     if json {
+        // nw-614. `dirty` describes the publication MARKER, and on a database
+        // whose write-ahead log is unreadable the marker is usually clean — so
+        // the payload said `dirty: false` over a database no open can replay,
+        // and every consumer keying on `dirty` read that as "clean". Name the
+        // state and WITHHOLD the verdict (null, not false): repair never
+        // established anything about this database. Text mode needs no twin of
+        // this; it already returns `open_error` through `db_wal_corrupt`.
+        //
+        // Classified from the typed `StoreError` both open routes above wrap
+        // (`repair_open_failure` and `repair_probe_failure`), so a dirty marker
+        // and a clean one cannot disagree. `needs_forced_repair` stays as
+        // computed: `--force` cannot help here, so `false` is the true answer.
+        let wal_unreadable = open_error
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<nestweaver_store::StoreError>())
+            .and_then(nestweaver_store::StoreError::corruption_kind)
+            == Some(nestweaver_store::CorruptionKind::WalUnreadable);
+        let marker_dirty = |dirty: bool| (!wal_unreadable).then_some(dirty);
         let payload = serde_json::json!({
             "db": db_path.display().to_string(),
             "marker_path": status.marker_path,
             "dry_run": dry_run,
             "force": force,
+            "wal_unreadable": wal_unreadable,
+            "remedy": wal_unreadable
+                .then(|| wal_corruption_runbook(&db_path.display().to_string())),
             "needs_forced_repair": after.needs_forced_repair(),
             "before": {
-                "dirty": status.dirty,
+                "dirty": marker_dirty(status.dirty),
                 "determinable": status.determinable,
                 "writer_pid": status.writer_pid,
                 "writer_alive": status.writer_alive,
@@ -13395,7 +13416,7 @@ fn run_repair_index_publication(
                 "writer_reason": status.writer_reason,
                 "wedged": status.is_wedged(),
             },
-            "after": { "dirty": after.dirty },
+            "after": { "dirty": marker_dirty(after.dirty) },
             "recovered": recovered,
             "outcome": outcome.as_ref().map(repair_outcome_name),
             "message": outcome.as_ref().map(|o| o.describe()),
