@@ -1,5 +1,30 @@
 # Changelog
 
+## [10.1.2](https://github.com/Kehl-io/nestweaver/compare/v10.1.1...v10.1.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* **ci:** inject add_repo's DNS resolver so its test is hermetic ([0356f7b](https://github.com/Kehl-io/nestweaver/commit/0356f7b4282c7541bba7a8f1cd98adf2ccfedb5a))
+* cli honesty and quick-win cleanup batch ([16853e1](https://github.com/Kehl-io/nestweaver/commit/16853e15b66fb700fd2ce48a3099a0499e527f2a))
+* cli honesty and quick-win cleanup batch ([#425](https://github.com/Kehl-io/nestweaver/issues/425)) ([16853e1](https://github.com/Kehl-io/nestweaver/commit/16853e15b66fb700fd2ce48a3099a0499e527f2a))
+* **cli:** print impact did-you-mean suggestions to stderr, log lookup failures ([31d2cec](https://github.com/Kehl-io/nestweaver/commit/31d2cec00bdc8cf4f7597818df94f7822f0565e4))
+* **cli:** report an unreadable wal in repair --json instead of clean ([eba29b5](https://github.com/Kehl-io/nestweaver/commit/eba29b5cc1c1d853c3e2553e7d29bb66af10ce7c))
+* **cli:** report unresolved blast-radius --repo as not_found ([1612ed5](https://github.com/Kehl-io/nestweaver/commit/1612ed5298600b5fe7e61d2fef5fef7342616996))
+* **cli:** report unresolved brain diff repo as not_found ([dcf9ad2](https://github.com/Kehl-io/nestweaver/commit/dcf9ad2c5daf7dd592cf743133b050375dad1a53))
+* **engine:** default entry_points so a feature row can't invalidate config ([8637eb3](https://github.com/Kehl-io/nestweaver/commit/8637eb38b7d239a55024e7b5b930c0e47fe762e9))
+* **engine:** default FeatureConfig.repos so it can't invalidate config either ([0ffc28f](https://github.com/Kehl-io/nestweaver/commit/0ffc28fe4b6b7e09de46f66f3646e509b5be6656))
+* **engine:** disclose unparsable source files as parse_error skips ([e56c51e](https://github.com/Kehl-io/nestweaver/commit/e56c51e55474d74fb7bfba4e8d066a81d7df80a0))
+* **engine:** drop unparsable sources on the code watcher route too ([f26831b](https://github.com/Kehl-io/nestweaver/commit/f26831b5dd356656e0b093ce9ee61f3b630384e4))
+* keep ui selection when escape closes search (nw-532) ([c517e89](https://github.com/Kehl-io/nestweaver/commit/c517e8952a45f1ebf9646d3a059031288a291e39))
+* make ui escape-deselect skip overlays it did not close (nw-532) ([273f490](https://github.com/Kehl-io/nestweaver/commit/273f4902e0d78f092c9f5ba25dbe6d6fef418c5f))
+* **mcp:** accept symbol as an alias of name in cross_repo_contracts ([7bfc8d1](https://github.com/Kehl-io/nestweaver/commit/7bfc8d1a27690d298e57470ef2e6facfd8511761))
+* **mcp:** document symbol alias in cross_repo_contracts description ([b6286e0](https://github.com/Kehl-io/nestweaver/commit/b6286e0948071b4217678bd65411c6aaf6ca5687))
+* **mcp:** report a missing memory related uid as not_found ([3cf53d6](https://github.com/Kehl-io/nestweaver/commit/3cf53d6aa7414524e80482e1ce28c4ccb598af60))
+* **mcp:** surface did-you-mean candidates on impact not_found ([0d658aa](https://github.com/Kehl-io/nestweaver/commit/0d658aa4a513d326f406c75d3ea18bfe0c73c84c))
+* **store:** count a retired trigram scope only once acknowledged ([56886cc](https://github.com/Kehl-io/nestweaver/commit/56886cc47ccfcf3fdd1d111ebf046c7393844bb4))
+* **store:** defer a trigram scope advanced mid-refresh instead of failing ([e4d63af](https://github.com/Kehl-io/nestweaver/commit/e4d63af69c4e5f6716f7e446d1d1324361da5b5c))
+
 ## [10.1.1](https://github.com/Kehl-io/nestweaver/compare/v10.1.0...v10.1.1) (2026-09-23)
 
 
