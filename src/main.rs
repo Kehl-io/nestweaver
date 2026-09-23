@@ -18051,22 +18051,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // paths therefore produce one payload and render through one
             // function, so the output format follows --json rather than whether
             // a daemon happens to be running (nw-108).
+            //
+            // nw-548: an unresolvable `--repo` used to fall straight through the
+            // `?` below to the generic Internal-error handler at exit 1 with
+            // empty stdout -- `hubs`/`bridges` already special-case this via
+            // `error_is_unresolved_repo_filter`/`report_unresolved_repo_filter`;
+            // this arm now calls the SAME two functions rather than growing a
+            // second copy of the classification.
             let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "blast_radius",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                Err(error) => return Err(error),
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     // The MCP server sets this before dispatching; without it the
                     // tool cannot locate the co-change sidecar and silently drops
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?
+                    match nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)
+                    {
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                        Ok(value) => value,
+                    }
                 }
             };
 

@@ -2916,6 +2916,28 @@ fn parity_brain_diff_direct_vs_daemon() {
     check_parity_json_semantic(&fixture.db_path, "brain diff", &["brain", "diff", "repo"]);
 }
 
+/// nw-548 direct-vs-daemon: an unknown `--repo` must refuse identically
+/// (same exit code, same "not found" naming) whether or not a daemon owns
+/// the database. `check_parity_json_semantic` cannot be used here — it
+/// requires BOTH routes to succeed — so this uses `check_parity_of_refusal`,
+/// the sibling helper for a refusal that must match across routes.
+#[test]
+fn parity_blast_radius_unknown_repo_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "blast-radius --repo <unknown>",
+        &[
+            "blast-radius",
+            "--files",
+            "src/a.js",
+            "--repo",
+            "no-such-repo",
+        ],
+        "not found in graph",
+    );
+}
+
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this
 /// file — only the provenance-only sweep above (`_meta.sources`/`scope`/
 /// `stale_repos` presence) and a separate KEY-SET schema test in

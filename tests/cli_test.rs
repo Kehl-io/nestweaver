@@ -10943,3 +10943,80 @@ fn mcp_wal_corrupt_boot_emits_jsonrpc_error_on_stdout() {
          message={message:?}\nstderr={stderr}"
     );
 }
+
+// ─── nw-548 / nw-553 / nw-524 / nw-481: CLI not-found honesty quick wins ────
+//
+// Four sibling defects, all the same shape: a miss that should be a NAMED
+// not-found (exit 2, a JSON envelope) instead fell through to a generic
+// Internal-error path (exit 1, empty stdout) or a confident empty success
+// (exit 0). Each test below reproduces the item's exact repro and pins the
+// fix; each has a counterweight proving the surrounding success path is
+// untouched.
+
+/// nw-548: `blast-radius --repo <unknown> --json` used to exit 1 with empty
+/// stdout and an Internal-error stderr wrap (the daemon RPC bubbled straight
+/// through the handler's bare `?`). `hubs`/`bridges` already special-case
+/// this via `error_is_unresolved_repo_filter`/`report_unresolved_repo_filter`;
+/// this arm now calls the same two functions.
+#[test]
+fn blast_radius_unknown_repo_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(n) { return n; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args([
+            "blast-radius",
+            "--files",
+            "main.js",
+            "--repo",
+            "no-such-repo",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown --repo must be exit 2 (not_found), not a generic Internal error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "blast-radius --repo <unknown> --json must still write a JSON envelope to stdout \
+             (was previously empty), got {e}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(payload["status"], "not_found");
+
+    // Counterweight: a real --repo still works.
+    nestweaver_cmd()
+        .args([
+            "blast-radius",
+            "--files",
+            "main.js",
+            "--repo",
+            "repo",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .assert()
+        .success();
+}
