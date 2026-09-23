@@ -2415,6 +2415,7 @@ fn trigram_refresh_detail(stats: &nestweaver_store::TrigramRefreshStats) -> Trig
         postings_added: stats.postings_added as u64,
         postings_deleted: stats.postings_deleted as u64,
         posting_deltas_unavailable: stats.posting_deltas_unavailable.clone(),
+        scopes_deferred: stats.scopes_deferred.clone(),
         migrated_legacy_index: stats.migrated_legacy_index,
         elapsed_ms: stats.elapsed_ms,
     }
@@ -7388,7 +7389,7 @@ impl NestWeaverDaemon for DaemonService {
                                 trigram_refresh = Some(trigram_refresh_detail(&stats));
                                 let _ = tx.blocking_send(Ok(IndexProgress {
                                     message: format!(
-                                        "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) changed; {} posting(s) added, {} deleted in {} ms{}.",
+                                        "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) changed; {} posting(s) added, {} deleted in {} ms{}{}.",
                                         stats.scopes_refreshed,
                                         stats.scopes_unchanged,
                                         stats.nodes_added + stats.nodes_changed + stats.nodes_deleted,
@@ -7396,6 +7397,7 @@ impl NestWeaverDaemon for DaemonService {
                                         stats.postings_deleted,
                                         stats.elapsed_ms,
                                         if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
+                                        nestweaver_store::deferred_scopes_note(&stats),
                                     ),
                                     ..Default::default()
                                 }));

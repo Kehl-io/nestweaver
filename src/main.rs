@@ -22245,6 +22245,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "postings_added": stats.postings_added,
                             "postings_deleted": stats.postings_deleted,
                             "posting_deltas_unavailable": stats.posting_deltas_unavailable,
+                            "scopes_deferred": stats.scopes_deferred,
                             "migrated_legacy_index": stats.migrated_legacy_index,
                             "elapsed_ms": stats.elapsed_ms,
                         })
@@ -22552,7 +22553,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 .with_context(|| "refresh_trigram_index")?;
                 out.status(&format!(
-                    "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) added, {} changed, {} deleted; {} posting(s) added, {} deleted in {} ms{}.",
+                    "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) added, {} changed, {} deleted; {} posting(s) added, {} deleted in {} ms{}{}.",
                     stats.scopes_refreshed,
                     stats.scopes_unchanged,
                     stats.nodes_added,
@@ -22562,6 +22563,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     stats.postings_deleted,
                     stats.elapsed_ms,
                     if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
+                    nestweaver_store::deferred_scopes_note(&stats),
                 ));
                 if !stats.posting_deltas_unavailable.is_empty() {
                     out.status(&format!(

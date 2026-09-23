@@ -214,6 +214,9 @@ message TrigramRefreshDetail {
   bool migrated_legacy_index = 8;
   uint64 elapsed_ms = 9;
   repeated string posting_deltas_unavailable = 10;
+  // nw-655. Scopes a concurrent writer advanced mid-refresh; still queued for
+  // the background reconciler, not a failure.
+  repeated string scopes_deferred = 11;
 }
 
 // ─── Write RPCs ─────────────────────────────────────────────────────

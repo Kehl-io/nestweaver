@@ -280,9 +280,69 @@ pub struct TrigramRefreshStats {
     /// unknown and excluded from the totals, without preventing repair.
     #[serde(default)]
     pub posting_deltas_unavailable: Vec<String>,
+    /// nw-655. Scopes a concurrent writer advanced while this refresh was
+    /// publishing them. Not a failure: the writer's own mark left each one
+    /// queued, and the next pass (the background reconciler) publishes the
+    /// newer epoch. Named so the deferral is disclosed rather than silent.
+    #[serde(default)]
+    pub scopes_deferred: Vec<String>,
     pub migrated_legacy_index: bool,
     #[serde(default)]
     pub elapsed_ms: u64,
+}
+
+/// nw-655 test seam. Runs between a scope's shard publication and its graph
+/// acknowledgement — the exact window in which a concurrent writer (the vault
+/// watcher, in the incident) advances a scope's desired epoch. Injecting that
+/// advance here makes the race deterministic instead of timing-dependent.
+#[cfg(test)]
+type RegexAckHook = Box<dyn FnMut(&GraphStore, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REGEX_ACK: std::cell::RefCell<Option<RegexAckHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_regex_ack_hook(store: &GraphStore, scope_uid: &str) {
+    // Taken out for the call so the hook may itself use the store freely.
+    let hook = BEFORE_REGEX_ACK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(store, scope_uid);
+        BEFORE_REGEX_ACK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
+
+/// nw-655. The one sentence every trigram-refresh status line appends for
+/// deferred scopes (daemon and direct `index` routes), empty when none were.
+pub fn deferred_scopes_note(stats: &TrigramRefreshStats) -> String {
+    if stats.scopes_deferred.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {} scope(s) advanced concurrently and were deferred to the background \
+         trigram reconciler: {}",
+        stats.scopes_deferred.len(),
+        stats.scopes_deferred.join(", ")
+    )
+}
+
+/// nw-655. Record a scope whose acknowledgement a concurrent writer
+/// superseded. It stays queued; the next refresh pass publishes it.
+fn defer_superseded_scope(
+    stats: &mut TrigramRefreshStats,
+    scope_uid: &str,
+    epoch: u64,
+    desired: u64,
+) {
+    tracing::info!(
+        scope_uid,
+        epoch,
+        desired,
+        "regex scope advanced by a concurrent writer while publishing; deferred to the next refresh"
+    );
+    stats.scopes_deferred.push(scope_uid.to_string());
 }
 
 fn record_posting_delta(
@@ -559,7 +619,11 @@ impl GraphStore {
                     stats.scopes_refreshed += 1;
                 }
                 record_posting_delta(&mut stats, &scope_uid, delta);
-                self.acknowledge_regex_tombstone(&scope_uid, epoch)?;
+                if let crate::write::RegexAck::Superseded { desired } =
+                    self.acknowledge_regex_tombstone(&scope_uid, epoch)?
+                {
+                    defer_superseded_scope(&mut stats, &scope_uid, epoch, desired);
+                }
                 continue;
             }
 
@@ -694,10 +758,17 @@ impl GraphStore {
             } else {
                 index.replace_scope(metadata, &documents)?;
             }
-            self.acknowledge_regex_scope(&scope_uid, epoch, candidates.len(), &digest)?;
-
-            stats.scopes_refreshed += 1;
+            #[cfg(test)]
+            run_before_regex_ack_hook(self, &scope_uid);
+            // The shard's postings were written either way, so its delta is
+            // real; only the acknowledgement is deferred (nw-655).
             record_posting_delta(&mut stats, &scope_uid, posting_delta);
+            match self.acknowledge_regex_scope(&scope_uid, epoch, candidates.len(), &digest)? {
+                crate::write::RegexAck::Acknowledged => stats.scopes_refreshed += 1,
+                crate::write::RegexAck::Superseded { desired } => {
+                    defer_superseded_scope(&mut stats, &scope_uid, epoch, desired);
+                }
+            }
         }
         stats.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         match index.garbage_collect() {
@@ -2374,6 +2445,80 @@ mod tests {
                 canonical_id: None,
             })
             .unwrap();
+    }
+
+    /// Install a [`BEFORE_REGEX_ACK`] hook for the duration of `body`.
+    fn with_regex_ack_hook<T>(
+        hook: impl FnMut(&GraphStore, &str) + 'static,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        BEFORE_REGEX_ACK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = body();
+        BEFORE_REGEX_ACK.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    /// nw-655. `index --with-trigrams` exited 1 AFTER committing because the
+    /// refresh met "regex scope vlt:... advanced while publishing": the vault
+    /// watcher advanced a scope the index never touched, mid-publication. That
+    /// advance is not a failure — the concurrent writer's mark left the scope
+    /// in the outbox, so the next pass (the background reconciler) publishes
+    /// the newer epoch. The refresh must defer it, disclose it, and succeed.
+    #[test]
+    fn a_scope_advanced_mid_publication_is_deferred_not_fatal() {
+        let store = store_with_text();
+        store.mark_regex_scope_dirty("repo:1", false).unwrap();
+        store.mark_regex_scope_dirty("vlt:v", false).unwrap();
+        let stats = with_regex_ack_hook(
+            |store, scope| {
+                if scope == "vlt:v" {
+                    store.mark_regex_scope_dirty("vlt:v", false).unwrap();
+                }
+            },
+            || store.refresh_trigram_index(false),
+        )
+        .expect("a concurrent advance of another scope must not fail the refresh");
+        assert_eq!(stats.scopes_deferred, vec!["vlt:v".to_string()]);
+        assert_eq!(stats.scopes_refreshed, 1, "repo:1 still published");
+        assert_eq!(
+            store.pending_regex_scope_count().unwrap(),
+            1,
+            "the deferred scope stays queued for the reconciler"
+        );
+
+        // The reconciler's next pass finishes it.
+        let next = store.refresh_trigram_index(false).unwrap();
+        assert!(next.scopes_deferred.is_empty());
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 0);
+        let hit = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!hit.scanned_fallback, "every scope is acknowledged again");
+    }
+
+    /// nw-655 counterweight. Only a SUPERSEDED (newer) epoch is deferred; any
+    /// other acknowledgement mismatch is still an error. Here the scope's
+    /// desired epoch moves BACKWARDS under the publication, which no
+    /// concurrent advance produces — a blanket "any mismatch defers" would
+    /// swallow it.
+    #[test]
+    fn a_genuine_acknowledgement_failure_still_fails_the_refresh() {
+        let store = store_with_text();
+        store.mark_regex_scope_dirty("repo:1", false).unwrap();
+        let error = with_regex_ack_hook(
+            |store, scope| {
+                if scope == "repo:1" {
+                    store
+                        .conn()
+                        .unwrap()
+                        .query("MATCH (s:RegexScopeState {uid: 'repo:1'}) SET s.desired_epoch = 0")
+                        .unwrap();
+                }
+            },
+            || store.refresh_trigram_index(false),
+        )
+        .expect_err("a regressed epoch is not a concurrent advance");
+        assert!(error.to_string().contains("repo:1"), "{error}");
     }
 
     #[test]
