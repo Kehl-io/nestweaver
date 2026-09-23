@@ -10666,7 +10666,11 @@ fn dead_code_malformed_page_token_daemon_route_matches_direct_route() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    std::fs::write(repo_dir.join("main.rs"), "fn helper() {}\nfn main() { helper(); }\n").unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }\n",
+    )
+    .unwrap();
     let db_path = dir.path().join("test.lbug");
 
     nestweaver_cmd()
