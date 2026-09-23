@@ -2964,6 +2964,73 @@ fn parity_memory_related_missing_uid_direct_vs_daemon() {
     );
 }
 
+/// nw-481 direct-vs-daemon: `impact <substring>` must land at the same
+/// not_found/exit-2 refusal on both routes. `check_parity_of_refusal` only
+/// asserts the exit code and a shared stderr substring, not the `did_you_mean`
+/// JSON payload itself -- the direct-vs-daemon `did_you_mean` VALUE parity is
+/// covered separately below, since `check_parity_json_semantic` cannot be
+/// used on a non-zero exit.
+#[test]
+fn parity_impact_substring_not_found_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "impact <substring>",
+        &["impact", "helper"],
+        "found",
+    );
+}
+
+/// nw-481: the `did_you_mean` JSON payload itself, compared value-for-value
+/// between the direct and daemon routes (not just exit code / stderr
+/// substring, which `parity_impact_substring_not_found_direct_vs_daemon`
+/// already covers).
+#[test]
+fn parity_impact_substring_not_found_did_you_mean_payload_matches() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let direct = run_direct(db, &["impact", "helper", "--json"]);
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &["impact", "helper", "--json"]);
+
+    for (route, output) in [("direct", &direct), ("daemon", &daemon)] {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "impact <substring> ({route}) must be exit 2 (not_found): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let parse = |raw: &Output| -> serde_json::Value {
+        serde_json::from_slice(&raw.stdout).unwrap_or_else(|e| {
+            panic!(
+                "impact --json stdout must be valid JSON even on not_found: {e}\n{}",
+                String::from_utf8_lossy(&raw.stdout)
+            )
+        })
+    };
+    let direct_json = parse(&direct);
+    let daemon_json = parse(&daemon);
+    let sorted = |value: &serde_json::Value| -> Vec<String> {
+        let mut names: Vec<String> = value["did_you_mean"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected did_you_mean array: {value}"))
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        sorted(&direct_json),
+        sorted(&daemon_json),
+        "did_you_mean diverged between direct and daemon routes\ndirect: {direct_json}\n\
+         daemon: {daemon_json}"
+    );
+}
+
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this
 /// file — only the provenance-only sweep above (`_meta.sources`/`scope`/
 /// `stale_repos` presence) and a separate KEY-SET schema test in

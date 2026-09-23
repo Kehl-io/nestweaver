@@ -11164,3 +11164,76 @@ fn memory_related_missing_uid_is_a_named_not_found() {
     let present_json: serde_json::Value = serde_json::from_slice(&present.stdout).unwrap();
     assert_eq!(present_json["related"], serde_json::json!([]));
 }
+
+/// nw-481: `impact <substring>` used to be a bare `not_found` even when
+/// `search` finds many hits for the same string, and the daemon route's text
+/// "No symbol found" line printed on stdout instead of stderr. The shared
+/// `did_you_mean_candidates` builder (landed with zero call sites) is now
+/// wired into `tool_brain_impact`'s not-found response, and the text goes to
+/// stderr on both CLI routes.
+#[test]
+fn impact_substring_not_found_carries_did_you_mean_and_text_goes_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "export function helperB(n) { return n + 1; }\n\
+         export function helperC(n) { return n * 3; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // "helper" matches no symbol EXACTLY, but is a substring of both
+    // helperB and helperC.
+    let output = nestweaver_cmd()
+        .args(["impact", "helper", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["status"], "not_found");
+    let candidates = payload["did_you_mean"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a did_you_mean array, got: {payload}"));
+    assert!(
+        candidates.iter().any(|c| c == "helperB") && candidates.iter().any(|c| c == "helperC"),
+        "did_you_mean must surface the substring matches search finds: {candidates:?}"
+    );
+
+    // Text mode: the not-found line must be on stderr, not stdout.
+    let text = nestweaver_cmd()
+        .args(["impact", "helper", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(text.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&text.stdout).trim().is_empty(),
+        "impact's not-found text must not be on stdout: {:?}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    assert!(String::from_utf8_lossy(&text.stderr).contains("helper"));
+
+    // Counterweight: a UID query (contains ':') carries no did_you_mean key
+    // at all -- `did_you_mean_candidates` refuses to substring-search symbol
+    // names against a UID.
+    let uid_miss = nestweaver_cmd()
+        .args(["impact", "sym:repo:bogus:deadbeef:1", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let uid_payload: serde_json::Value = serde_json::from_slice(&uid_miss.stdout).unwrap();
+    assert!(
+        uid_payload.get("did_you_mean").is_none(),
+        "a UID miss must carry no did_you_mean key: {uid_payload}"
+    );
+}

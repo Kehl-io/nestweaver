@@ -20917,7 +20917,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     ))?
                                 );
                             } else if !out.quiet {
-                                println!("No symbol found: '{name_or_uid}'.");
+                                // nw-481: messaging goes to stderr, matching
+                                // `context`/`brain context`'s existing not-found
+                                // text -- only this call site was still on
+                                // stdout, and no test/doc pins that stream, so
+                                // scripts scraping `impact`'s text stdout were
+                                // already told to use `--json` instead.
+                                eprintln!("No symbol found: '{name_or_uid}'.");
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -21190,9 +21196,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // nw-086: under --json, emit a JSON object instead of only a
                     // plain-text stderr line a --json consumer can't parse.
                     if json {
+                        // nw-481: same `did_you_mean_candidates` builder the
+                        // daemon-served `tool_brain_impact` not_found path now
+                        // calls, so the direct route's suggestions cannot drift
+                        // from the daemon's on ranking, scoping, or limit.
+                        let repo_uid = match repo_filter.as_deref().filter(|s| !s.is_empty()) {
+                            Some(selector) => {
+                                let repos = store.list_repos(None).unwrap_or_default();
+                                nestweaver_engine::resolve_repo_selector(&repos, selector)
+                                    .ok()
+                                    .map(|r| r.uid.clone())
+                            }
+                            None => None,
+                        };
+                        let candidates = nestweaver_engine::did_you_mean::did_you_mean_candidates(
+                            &store,
+                            &name_or_uid,
+                            |s| repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid),
+                        )
+                        .unwrap_or_default();
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_not_found(&name_or_uid))?
+                            serde_json::to_string_pretty(
+                                &nestweaver_schema::responses::with_did_you_mean(
+                                    impact_json_not_found(&name_or_uid),
+                                    &candidates,
+                                )
+                            )?
                         );
                     } else {
                         eprintln!("Symbol '{name_or_uid}' not found.");

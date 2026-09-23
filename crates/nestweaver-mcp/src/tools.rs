@@ -10039,9 +10039,37 @@ fn tool_brain_impact(
     let uid = match resolve_symbol_strict(store, symbol, visible, repo)? {
         StrictNameResolve::Found(uid) => uid,
         StrictNameResolve::NotFound => {
-            return Ok(nestweaver_schema::responses::impact(json!({
-                "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
-            })));
+            // nw-481: `impact` resolves a bare name by EXACT match only, so a
+            // name `search` finds many hits for can still land here. The
+            // shared `did_you_mean_candidates` builder (landed with zero call
+            // sites in 44b640e7) is the consumer half -- called here instead
+            // of a second substring lookup, so this path and any other tool
+            // that ever needs the same suggestion cannot drift on ranking or
+            // scoping. A suggestion-lookup failure is swallowed (best-effort
+            // per that function's own contract) rather than failing the whole
+            // `not_found` response over it.
+            let repo_uid = match repo.filter(|s| !s.is_empty()) {
+                Some(selector) => {
+                    let mut repos = store.list_repos(None).unwrap_or_default();
+                    repos.retain(|r| repo_is_visible(&r.uid, visible));
+                    nestweaver_engine::resolve_repo_selector(&repos, selector)
+                        .ok()
+                        .map(|r| r.uid.clone())
+                }
+                None => None,
+            };
+            let candidates =
+                nestweaver_engine::did_you_mean::did_you_mean_candidates(store, symbol, |s| {
+                    repo_is_visible(&s.repo_uid, visible)
+                        && repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid)
+                })
+                .unwrap_or_default();
+            return Ok(nestweaver_schema::responses::with_did_you_mean(
+                nestweaver_schema::responses::impact(json!({
+                    "status": "not_found", "symbol": symbol, "impact_nodes": [], "total": 0, "returned": 0,
+                })),
+                &candidates,
+            ));
         }
         StrictNameResolve::Ambiguous(candidates) => {
             return Ok(nestweaver_schema::responses::impact_ambiguous(
@@ -22819,6 +22847,79 @@ mod brain_impact_uid_resolution_tests {
         assert_eq!(result["status"], "ok", "{result}");
         assert_eq!(result["total"], 0);
         assert!(result["impact_nodes"].as_array().unwrap().is_empty());
+    }
+
+    /// nw-481: a bare NAME `impact` resolves by EXACT match only
+    /// (`lookup_symbols_by_name`), so a name `search` finds substring hits
+    /// for can still be `not_found` here. The shared `did_you_mean_candidates`
+    /// builder (landed with zero call sites in 44b640e7) is now the consumer:
+    /// this not_found response must carry the substring matches.
+    #[test]
+    fn brain_impact_not_found_name_carries_did_you_mean_substring_matches() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:api:project_context_tool:1",
+                "tool_project_context",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:api:project_context_hlp:1",
+                "project_context_helper",
+            ))
+            .unwrap();
+
+        let result = tool_brain_impact(&store, json!({ "symbol": "project_context" }), None, None)
+            .expect("impact call");
+        assert_eq!(result["status"], "not_found", "{result}");
+        let candidates = result["did_you_mean"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a did_you_mean array: {result}"));
+        let names: Vec<&str> = candidates.iter().filter_map(|c| c.as_str()).collect();
+        assert!(
+            names.contains(&"tool_project_context") && names.contains(&"project_context_helper"),
+            "did_you_mean must surface search's substring matches: {names:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT (nw-481): a UID-shaped query carries no `did_you_mean`
+    /// key at all -- `did_you_mean_candidates` refuses to substring-search
+    /// symbol NAMES against a UID, and a not_found response for a genuinely
+    /// unknown symbol NAME with zero substring hits must not fabricate an
+    /// empty placeholder array either.
+    #[test]
+    fn brain_impact_not_found_carries_no_did_you_mean_for_a_uid_or_a_true_miss() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol("sym:repo:api:target:1", "Target"))
+            .unwrap();
+
+        let uid_miss = tool_brain_impact(
+            &store,
+            json!({ "symbol": "sym:repo:api:nonexistent:99" }),
+            None,
+            None,
+        )
+        .expect("impact call");
+        assert_eq!(uid_miss["status"], "not_found", "{uid_miss}");
+        assert!(
+            uid_miss.get("did_you_mean").is_none(),
+            "a UID miss must carry no did_you_mean key: {uid_miss}"
+        );
+
+        let true_miss = tool_brain_impact(
+            &store,
+            json!({ "symbol": "totally_bogus_name_xyz" }),
+            None,
+            None,
+        )
+        .expect("impact call");
+        assert_eq!(true_miss["status"], "not_found", "{true_miss}");
+        assert!(
+            true_miss.get("did_you_mean").is_none(),
+            "zero substring hits must leave did_you_mean absent, not an empty array: {true_miss}"
+        );
     }
 }
 
