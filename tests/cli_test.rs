@@ -11020,3 +11020,65 @@ fn blast_radius_unknown_repo_is_a_named_not_found() {
         .assert()
         .success();
 }
+
+/// nw-553: `brain diff <unknown> --json` used to exit 1 with empty stdout,
+/// wrapping the underlying not-found as an Internal error. The tool now
+/// resolves `repo` via the shared `resolve_repo_filter` (the same typed
+/// `RepoFilterUnresolved` `blast_radius`/`hubs`/`bridges` raise) instead of
+/// the untyped `resolve_repo_selector`, and the CLI arm catches it the same
+/// way those commands do.
+#[test]
+fn brain_diff_unknown_repo_is_a_named_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(n) { return n; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "diff", "nosuchrepo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown repo must be exit 2 (not_found), not a generic Internal error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "brain diff <unknown> --json must still write a JSON envelope to stdout \
+             (was previously empty), got {e}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(payload["status"], "not_found");
+
+    // Counterweight: `brain diff` on the real repo still runs (it may fail
+    // for the unrelated reason that the fixture repo has no git history —
+    // that is not an unresolved-repo-filter refusal, so it must not be
+    // exit 2).
+    let real = nestweaver_cmd()
+        .args(["brain", "diff", "repo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_ne!(
+        real.status.code(),
+        Some(2),
+        "a real repo name must not be classified as an unresolved repo filter: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+}

@@ -2938,6 +2938,19 @@ fn parity_blast_radius_unknown_repo_direct_vs_daemon() {
     );
 }
 
+/// nw-553 direct-vs-daemon: same shape as the blast-radius row above, for
+/// `brain diff <unknown repo>`.
+#[test]
+fn parity_brain_diff_unknown_repo_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "brain diff <unknown repo>",
+        &["brain", "diff", "nosuchrepo"],
+        "not found in graph",
+    );
+}
+
 /// nw-218. `brain_status` had no direct-vs-daemon VALUE comparison in this
 /// file — only the provenance-only sweep above (`_meta.sources`/`scope`/
 /// `stale_repos` presence) and a separate KEY-SET schema test in

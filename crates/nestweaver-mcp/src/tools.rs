@@ -11948,7 +11948,26 @@ fn tool_brain_diff(
         .into_iter()
         .filter(|repo| visible.is_none_or(|scope| scope.allows(&repo.uid)))
         .collect::<Vec<_>>();
-    let repo = nestweaver_engine::resolve_repo_selector(&repos, repo_name)?;
+    // nw-553: was `resolve_repo_selector` directly, whose plain `anyhow!` on a
+    // miss has no typed marker, so the daemon's generic status mapper treated
+    // it as Internal (exit 1, empty stdout) instead of the `not_found` exit 2
+    // envelope `blast_radius`/`hubs`/`bridges` already get. `resolve_repo_filter`
+    // wraps the identical resolver in `RepoFilterUnresolved`, which is the ONE
+    // type `classify_daemon_error`/`error_is_unresolved_repo_filter` on the
+    // daemon and CLI sides already recognize -- reused here rather than taught
+    // a second not-found shape for this one tool.
+    let resolved_uid = nestweaver_engine::node_scope::resolve_repo_filter(
+        store,
+        std::slice::from_ref(&repo_name.to_string()),
+        visible,
+    )?
+    .into_iter()
+    .next()
+    .context("resolve_repo_filter returned no uid for a single selector")?;
+    let repo = repos
+        .iter()
+        .find(|repo| repo.uid == resolved_uid)
+        .context("resolved repo uid is missing from the visible repo list")?;
 
     let Some(repo_path) = repo.local_root() else {
         anyhow::bail!(
@@ -21880,6 +21899,43 @@ mod blast_radius_visibility_tests {
             error.contains("bx-react-native-client") && error.contains("unnamed"),
             "the refusal should help a caller pick the right key by naming what IS indexed; \
              got {error:?}"
+        );
+    }
+
+    /// nw-553: `brain_diff` resolved `repo` via `resolve_repo_selector`
+    /// directly, whose plain `anyhow!` on a miss has no typed marker, so the
+    /// daemon's generic status mapper answered Internal (exit 1, empty
+    /// stdout) rather than the `not_found`/exit-2 contract `blast_radius`
+    /// gets from `RepoFilterUnresolved` (asserted just above, same store).
+    /// `tool_brain_diff` now goes through the shared `resolve_repo_filter`
+    /// too, so this is the SAME typed error on the SAME store.
+    #[test]
+    fn tool_brain_diff_unresolvable_repo_is_a_typed_not_a_generic_error() {
+        let store = named_repo_store();
+        let error = tool_brain_diff(&store, json!({ "repo": "this-repo-does-not-exist" }), None)
+            .expect_err("an unresolvable repo must refuse rather than diff nothing");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>()),
+            "the error must be the TYPED RepoFilterUnresolved the daemon's status mapper \
+             and `error_is_unresolved_repo_filter` (src/main.rs) both recognize, not a bare \
+             anyhow string: {error:#}"
+        );
+
+        // COUNTERWEIGHT: a real repo name resolves PAST the not-found stage.
+        // `named_repo_store`'s repos carry no `root_path`, so the next
+        // failure is the (unrelated) "not a local repo" refusal -- proof
+        // resolution itself succeeded rather than every repo name refusing.
+        let real_repo_error =
+            tool_brain_diff(&store, json!({ "repo": "bx-react-native-client" }), None)
+                .expect_err("the fixture repo has no local root, so this must still fail");
+        assert!(
+            !real_repo_error
+                .chain()
+                .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>()),
+            "a real repo name must not be classified as an unresolved repo filter: \
+             {real_repo_error:#}"
         );
     }
 

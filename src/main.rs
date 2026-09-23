@@ -29543,17 +29543,32 @@ fn run_brain(
             // shared JSON-RPC dispatch, falling back to the same
             // `nestweaver_mcp::tools::dispatch` the daemon and MCP routes
             // call, so all three surfaces answer from one implementation.
+            //
+            // nw-553: an unresolvable `repo` used to fall through the bare `?`
+            // to the generic Internal-error path (exit 1, empty stdout). Same
+            // catch `blast-radius`/`hubs`/`bridges` use, calling the shared
+            // classifier/reporter rather than re-deriving the not-found shape.
             let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_diff",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                Err(error) => return Err(error),
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None)?
+                    match nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None) {
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                        Ok(value) => value,
+                    }
                 }
             };
             if json {
