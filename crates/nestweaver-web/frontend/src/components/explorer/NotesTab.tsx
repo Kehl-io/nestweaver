@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../../api/client";
+import { api, NOTES_MAX_REACHABLE } from "../../api/client";
 import type { Note, Tag, Vault } from "../../api/types";
 import { useStore } from "../../stores";
 import { Collapsible } from "../shared/Collapsible";
@@ -48,47 +48,111 @@ function KindBadge({ kind }: { kind: string }) {
   );
 }
 
+/** Loaded notes for one vault plus its true size (nw-648). */
+interface VaultNotes {
+  notes: Note[];
+  /** The vault's real note count: vault inventory first, page header second. */
+  total: number;
+  loadingMore: boolean;
+  error: string | null;
+}
+
 export function NotesTab() {
   const exploreNode = useStore((s) => s.exploreNode);
   const selectNode = useStore((s) => s.selectNode);
 
   const [vaults, setVaults] = useState<Vault[]>([]);
-  const [notes, setNotes] = useState<Note[]>([]);
+  const [byVault, setByVault] = useState<Record<string, VaultNotes>>({});
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
 
+  // nw-648: one unfiltered 1000-row page held only the first vault, so the
+  // explorer showed "BRAIN 991" while the brain had two vaults and ~1918
+  // notes. Every vault is now listed from the inventory with its TRUE count,
+  // and each loads its own notes through the vault filter.
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([api.brainVaults(), api.brainNotes(), api.brainTags()])
-      .then(([v, n, t]) => {
+    Promise.all([api.brainVaults(), api.brainTags()])
+      .then(async ([v, t]) => {
+        const pages = await Promise.all(
+          v.map((vault) => api.brainNotesPage(vault.uid)),
+        );
+        if (cancelled) return;
+        const loaded: Record<string, VaultNotes> = {};
+        v.forEach((vault, i) => {
+          const page = pages[i];
+          loaded[vault.uid] = {
+            notes: page.notes,
+            total: vault.note_count ?? page.total ?? page.notes.length,
+            loadingMore: false,
+            error: null,
+          };
+        });
         setVaults(v);
-        setNotes(n);
+        setByVault(loaded);
         setTags(t);
       })
-      .catch((e) => setError(e.message ?? "Failed to load notes"))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (!cancelled) setError(e.message ?? "Failed to load notes");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const filteredNotes = useMemo(() => {
-    const lc = filter.toLowerCase();
-    return notes.filter((n) => {
-      if (n.title.includes("{{") || n.file_path.includes("_templates/")) return false;
-      if (lc && !n.title.toLowerCase().includes(lc)) return false;
-      return true;
-    });
-  }, [notes, filter]);
+  const loadMore = (vaultUid: string) => {
+    const current = byVault[vaultUid];
+    if (!current || current.loadingMore) return;
+    setByVault((prev) => ({
+      ...prev,
+      [vaultUid]: { ...prev[vaultUid], loadingMore: true, error: null },
+    }));
+    api
+      .brainNotesPage(vaultUid, current.notes.length)
+      .then((page) =>
+        setByVault((prev) => ({
+          ...prev,
+          [vaultUid]: {
+            ...prev[vaultUid],
+            notes: [...prev[vaultUid].notes, ...page.notes],
+            loadingMore: false,
+          },
+        })),
+      )
+      .catch((e) =>
+        setByVault((prev) => ({
+          ...prev,
+          [vaultUid]: {
+            ...prev[vaultUid],
+            loadingMore: false,
+            error: e.message ?? "Failed to load more notes",
+          },
+        })),
+      );
+  };
 
   const notesByVault = useMemo(() => {
+    const lc = filter.toLowerCase();
     const map = new Map<string, Note[]>();
-    for (const n of filteredNotes) {
-      if (!map.has(n.vault_uid)) map.set(n.vault_uid, []);
-      map.get(n.vault_uid)!.push(n);
+    for (const [vaultUid, entry] of Object.entries(byVault)) {
+      map.set(
+        vaultUid,
+        entry.notes.filter((n) => {
+          if (n.title.includes("{{") || n.file_path.includes("_templates/")) return false;
+          if (lc && !n.title.toLowerCase().includes(lc)) return false;
+          return true;
+        }),
+      );
     }
     return map;
-  }, [filteredNotes]);
+  }, [byVault, filter]);
 
   const tagsByVault = useMemo(() => {
     const map = new Map<string, Tag[]>();
@@ -98,6 +162,8 @@ export function NotesTab() {
     }
     return map;
   }, [tags]);
+
+  const totalNotes = Object.values(byVault).reduce((sum, v) => sum + v.total, 0);
 
   if (loading) {
     return (
@@ -115,7 +181,7 @@ export function NotesTab() {
     );
   }
 
-  if (vaults.length === 0 || notes.length === 0) {
+  if (vaults.length === 0 || totalNotes === 0) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-[var(--color-text-muted)]">
         No notes indexed yet.
@@ -140,14 +206,20 @@ export function NotesTab() {
         {/* Notes grouped by vault */}
         {vaults.map((vault) => {
           const vaultNotes = notesByVault.get(vault.uid) ?? [];
+          const entry = byVault[vault.uid];
+          const loaded = entry?.notes.length ?? 0;
+          const total = entry?.total ?? loaded;
+          const unlisted = Math.max(0, total - loaded);
+          const canLoadMore =
+            unlisted > 0 && loaded > 0 && loaded < NOTES_MAX_REACHABLE;
           return (
             <Collapsible
               key={vault.uid}
               title={vault.name}
-              count={vaultNotes.length}
+              count={total}
               defaultOpen
             >
-              <div className="pb-1">
+              <div className="pb-1" data-testid={`notes-vault-${vault.name}`}>
                 {vaultNotes.length === 0 ? (
                   <div className="px-4 py-1 text-[10px] text-[var(--color-text-muted)]">
                     No matching notes.
@@ -181,6 +253,30 @@ export function NotesTab() {
                       </li>
                     ))}
                   </ul>
+                )}
+                {unlisted > 0 && (
+                  <div
+                    className="flex items-center gap-2 px-4 py-1 text-[10px] text-[var(--color-text-muted)]"
+                    data-testid="notes-vault-truncated"
+                  >
+                    <span>
+                      Showing {loaded} of {total} notes
+                      {canLoadMore ? "." : " — use search to reach the rest."}
+                    </span>
+                    {canLoadMore && (
+                      <button
+                        type="button"
+                        onClick={() => loadMore(vault.uid)}
+                        disabled={entry?.loadingMore}
+                        className="text-blue-600 hover:underline disabled:opacity-50"
+                      >
+                        {entry?.loadingMore ? "Loading..." : "Load more"}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {entry?.error && (
+                  <div className="px-4 py-1 text-[10px] text-red-500">{entry.error}</div>
                 )}
               </div>
             </Collapsible>

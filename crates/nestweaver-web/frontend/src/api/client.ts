@@ -18,12 +18,21 @@ import type {
   SymbolCandidate,
   SymbolDetail,
   Tag,
+  NotesPage,
   UnlinkedMention,
   Vault,
 } from "./types";
 import { loadImpactLens } from "./impactLens";
 import { appendWorkspaceParam } from "./workspaces";
 import { normalizeBrainContext } from "./context";
+
+/** Page size the notes route allows (`LIST_NOTES_LIMIT_MAX`). */
+export const NOTES_PAGE_SIZE = 1000;
+/**
+ * The notes route serves no offset past `LIST_NOTES_LIMIT_MAX`, so a vault's
+ * first `NOTES_MAX_REACHABLE` notes are listable; the rest must be disclosed.
+ */
+export const NOTES_MAX_REACHABLE = 2 * NOTES_PAGE_SIZE;
 
 export class ApiError extends Error {
   status: number;
@@ -140,11 +149,27 @@ export const api = {
     return get<Tag[]>("/api/v1/brain/tags");
   },
 
-  // NotesTab is a catalog, not a "top N" view, so request the API maximum
-  // (1000). Pagination is not wired; the handler still caps omitted `limit`
-  // at 20 so curl/MCP cannot dump the whole vault.
-  brainNotes(limit = 1000) {
-    return get<Note[]>(`/api/v1/brain/notes?limit=${limit}`);
+  // NotesTab is a catalog, not a "top N" view, so it requests the API maximum
+  // page (1000) PER VAULT (nw-648: one unfiltered page held only the first
+  // vault). The handler still caps omitted `limit` at 20 so curl/MCP cannot
+  // dump the whole vault; `total` comes from `X-Total-Count`.
+  async brainNotesPage(vaultUid: string, offset = 0, limit = NOTES_PAGE_SIZE): Promise<NotesPage> {
+    const params = new URLSearchParams({
+      vault: vaultUid,
+      limit: String(limit),
+      offset: String(offset),
+    });
+    const res = await fetch(`/api/v1/brain/notes?${params}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }));
+      throw new ApiError(res.status, body.error || res.statusText);
+    }
+    const header = res.headers.get("x-total-count");
+    const total = header === null ? null : Number.parseInt(header, 10);
+    return {
+      notes: (await res.json()) as Note[],
+      total: total === null || Number.isNaN(total) ? null : total,
+    };
   },
 
   brainNote(uid: string, init?: RequestInit) {
@@ -156,7 +181,7 @@ export const api = {
 
   // Envelope `{ backlinks, count, total, truncated, limit }` since the HTTP
   // handler gained a notes-list-style cap. Unwrap so UI callers still receive
-  // `BacklinkRow[]`. Default 1000 matches `brainNotes` (the UI needs the full
+  // `BacklinkRow[]`. Default 1000 matches `brainNotesPage` (the UI needs the full
   // page; omitted `limit` on the API is 20).
   async brainBacklinks(uid: string, limit = 1000, init?: RequestInit) {
     const payload = await get<BacklinkRow[] | { backlinks?: BacklinkRow[] }>(

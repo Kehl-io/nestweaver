@@ -49,10 +49,26 @@ pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response
     .into_response())
 }
 
+/// nw-648: each vault carries its TRUE `note_count` (one aggregate query), so
+/// the explorer can list every vault with its real size instead of counting
+/// the rows of whatever page it happened to load.
 pub async fn list_vaults(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let vaults = state.store.list_vaults(None)?;
-    let json = serde_json::to_value(&vaults)?;
-    Ok(Json(json).into_response())
+    let counts = state.store.note_counts_by_vault()?;
+    let rows = vaults
+        .iter()
+        .map(|vault| {
+            let mut row = serde_json::to_value(vault)?;
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "note_count".to_string(),
+                    json!(counts.get(&vault.uid).copied().unwrap_or(0)),
+                );
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    Ok(Json(rows).into_response())
 }
 
 pub async fn list_tags(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -68,10 +84,20 @@ pub const LIST_NOTES_DEFAULT_LIMIT: usize = 20;
 /// Hard cap on `limit` / effective page size for GET `/api/v1/brain/notes`.
 pub const LIST_NOTES_LIMIT_MAX: usize = 1000;
 
+/// Response header carrying how many notes match the request's filter, so a
+/// caller holding one page can disclose or fetch the rest (nw-648). The body
+/// stays a raw array, matching the sibling brain list routes.
+pub const LIST_NOTES_TOTAL_HEADER: &str = "x-total-count";
+
 #[derive(Deserialize)]
 pub struct ListNotesParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// nw-648: restrict to one vault uid. `vault_uid` is accepted too — both
+    /// spellings were tried against the live UI, and both were silently
+    /// ignored, returning the first vault's page.
+    #[serde(alias = "vault_uid")]
+    pub vault: Option<String>,
 }
 
 pub async fn list_notes(
@@ -82,13 +108,46 @@ pub async fn list_notes(
         .limit
         .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
         .min(LIST_NOTES_LIMIT_MAX);
-    let offset = params.offset.unwrap_or(0).min(LIST_NOTES_LIMIT_MAX);
+    let offset = params.offset.unwrap_or(0);
     // Raw JSON array, matching `/brain/vaults`, `/brain/tags`, and `/symbols/top`.
     // Offset is capped at LIST_NOTES_LIMIT_MAX so Cypher's LIMIT offset+limit
     // cannot reconstruct an unbounded scan via ?limit=1000&offset=N.
-    let notes = state.store.list_notes_page(None, limit, offset)?;
+    //
+    // nw-648: an offset PAST the cap is an empty page, not a clamp. Clamping
+    // made `offset=2000` silently return rows 1000..2000 a second time; a
+    // caller paging a large vault now sees the end, and the total header
+    // tells it how much it could not reach.
+    let limit = if offset > LIST_NOTES_LIMIT_MAX {
+        0
+    } else {
+        limit
+    };
+    let vault = params.vault.as_deref().filter(|uid| !uid.is_empty());
+    let total = match vault {
+        Some(uid) => {
+            // An unknown vault is a 404, not an empty page that reads as
+            // "this vault has no notes".
+            state
+                .store
+                .lookup_vault(uid)
+                .map_err(|_| ApiError::not_found(format!("vault '{uid}' not found")))?;
+            state
+                .store
+                .note_counts_by_vault()?
+                .get(uid)
+                .copied()
+                .unwrap_or(0)
+        }
+        None => state.store.count_notes()?,
+    };
+    let notes = state.store.list_notes_page(vault, limit, offset)?;
     let json = serde_json::to_value(&notes)?;
-    Ok(Json(json).into_response())
+    let mut response = Json(json).into_response();
+    response.headers_mut().insert(
+        LIST_NOTES_TOTAL_HEADER,
+        axum::http::HeaderValue::from(total),
+    );
+    Ok(response)
 }
 
 pub async fn note_by_uid(

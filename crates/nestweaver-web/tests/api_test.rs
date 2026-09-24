@@ -956,6 +956,161 @@ async fn brain_notes_huge_offset_is_capped() {
     );
 }
 
+/// GET returning status, JSON body and the `X-Total-Count` header.
+async fn get_json_with_total(app: &axum::Router, uri: &str) -> (StatusCode, Value, Option<usize>) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let total = response
+        .headers()
+        .get("x-total-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+        total,
+    )
+}
+
+fn insert_named_vault_notes(store: &GraphStore, vault_uid: &str, name: &str, count: usize) {
+    store
+        .insert_vault(&Vault {
+            uid: vault_uid.to_string(),
+            name: name.to_string(),
+            root_path: format!("/tmp/{name}"),
+            instance_id: "local".to_string(),
+        })
+        .unwrap();
+    for i in 0..count {
+        store
+            .insert_note(&Note {
+                uid: format!("note:{name}:{i:04}"),
+                vault_uid: vault_uid.to_string(),
+                file_path: format!("n{i:04}.md"),
+                title: format!("{name} {i:04}"),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: format!("h{name}{i:04}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+    }
+}
+
+/// nw-648: the live brain had 2 vaults / ~1918 notes, but the explorer showed
+/// only `BRAIN 991` — one unfiltered 1000-row page, all from the first vault —
+/// and `?vault=` was ignored. The first vault here is larger than one page.
+fn two_vault_app() -> axum::Router {
+    let store = setup_test_store();
+    let cap = nestweaver_web::routes::brain::LIST_NOTES_LIMIT_MAX;
+    insert_named_vault_notes(&store, "vlt:brain", "brain", cap + 3);
+    insert_named_vault_notes(&store, "vlt:docs", "kehl-craft-docs", 4);
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/test.lbug"));
+    create_router(state)
+}
+
+#[tokio::test]
+async fn brain_notes_vault_filter_selects_that_vault_and_discloses_its_total() {
+    let app = two_vault_app();
+    let cap = nestweaver_web::routes::brain::LIST_NOTES_LIMIT_MAX;
+    for param in ["vault", "vault_uid"] {
+        let (status, json, total) = get_json_with_total(
+            &app,
+            &format!("/api/v1/brain/notes?{param}=vlt:docs&limit=1000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{param}");
+        let rows = json.as_array().expect("still a raw array");
+        assert_eq!(rows.len(), 4, "?{param}= must select only that vault");
+        assert!(rows.iter().all(|row| row["vault_uid"] == "vlt:docs"));
+        assert_eq!(total, Some(4), "?{param}= must disclose the vault's total");
+    }
+
+    // The larger vault pages to completion with no duplicates.
+    let (_, first, total) =
+        get_json_with_total(&app, "/api/v1/brain/notes?vault=vlt:brain&limit=1000").await;
+    let (_, rest, _) = get_json_with_total(
+        &app,
+        "/api/v1/brain/notes?vault=vlt:brain&limit=1000&offset=1000",
+    )
+    .await;
+    assert_eq!(total, Some(cap + 3));
+    let uids: std::collections::HashSet<_> = first
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(rest.as_array().unwrap())
+        .map(|row| row["uid"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        uids.len(),
+        cap + 3,
+        "two pages must cover the vault exactly"
+    );
+
+    // Past the offset cap is an empty page, never a clamped repeat of rows
+    // 1000.. that a pager would append as duplicates.
+    let (status, beyond, total) = get_json_with_total(
+        &app,
+        &format!(
+            "/api/v1/brain/notes?vault=vlt:brain&limit=1000&offset={}",
+            cap + 1
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(beyond.as_array().map(Vec::len), Some(0));
+    assert_eq!(total, Some(cap + 3));
+
+    // An unknown vault is an error, not a silently empty (or unfiltered) page.
+    let (status, _, _) = get_json_with_total(&app, "/api/v1/brain/notes?vault=vlt:missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn brain_vaults_report_each_vaults_true_note_count() {
+    let app = two_vault_app();
+    let cap = nestweaver_web::routes::brain::LIST_NOTES_LIMIT_MAX;
+    let (status, json) = get_json(&app, "/api/v1/brain/vaults").await;
+    assert_eq!(status, StatusCode::OK);
+    let counts: std::collections::HashMap<_, _> = json
+        .as_array()
+        .expect("still a raw array")
+        .iter()
+        .map(|vault| {
+            (
+                vault["uid"].as_str().unwrap().to_string(),
+                vault["note_count"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(counts["vlt:brain"], json!(cap + 3));
+    assert_eq!(counts["vlt:docs"], json!(4));
+}
+
+/// Counterweight: an unfiltered request on a single small vault returns the
+/// same rows as before, now with the total beside them.
+#[tokio::test]
+async fn brain_notes_unfiltered_small_vault_is_unchanged_and_totalled() {
+    let app = notes_list_app(5);
+    let (status, json, total) = get_json_with_total(&app, "/api/v1/brain/notes?limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().unwrap().len(), 5);
+    assert_eq!(total, Some(5));
+}
+
 #[tokio::test]
 async fn brain_backlinks_omitted_limit_uses_notes_list_default() {
     const CORPUS: usize = 25;

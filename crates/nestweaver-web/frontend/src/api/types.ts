@@ -140,6 +140,15 @@ export interface Vault {
   name: string;
   root_path: string;
   instance_id: string;
+  /** True note count for the vault (nw-648); absent from older servers. */
+  note_count?: number;
+}
+
+/** One page of `/api/v1/brain/notes` plus the filter's total (nw-648). */
+export interface NotesPage {
+  notes: Note[];
+  /** Notes matching the filter, from `X-Total-Count`; null if not sent. */
+  total: number | null;
 }
 
 export interface Note {

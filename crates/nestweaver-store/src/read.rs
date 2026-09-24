@@ -1535,6 +1535,10 @@ impl GraphStore {
     /// bind LIMIT) so a catalog caller does not materialize the whole vault.
     /// `offset` is applied after the scan of `offset + limit` rows; SKIP is not
     /// assumed. Same corrupt-row policy as [`Self::list_notes`].
+    ///
+    /// nw-648: a paged scan is ordered by uid. Unordered, `LIMIT` returned
+    /// whichever rows the engine produced first, so page 2 of a vault was not
+    /// guaranteed to be the rows page 1 left out.
     pub fn list_notes_page(
         &self,
         vault_uid: Option<&str>,
@@ -1571,7 +1575,7 @@ impl GraphStore {
         // KuzuDB does not support LIMIT with a bound parameter — embed the
         // integer directly (safe: it's a usize from caller code, not user input).
         let limit_clause = match limit {
-            Some(n) => format!(" LIMIT {n}"),
+            Some(n) => format!(" ORDER BY n.uid LIMIT {n}"),
             None => String::new(),
         };
         let result = if let Some(vid) = vault_uid {
@@ -1656,6 +1660,25 @@ impl GraphStore {
             .query("MATCH (n:Note) RETURN n.uid")
             .map_err(|e| StoreError::Query(e.to_string()))?;
         Ok(result.count())
+    }
+
+    /// nw-648: note count per vault uid, in one aggregate query. The web
+    /// explorer used to count the rows of one 1000-note page per vault, so a
+    /// second vault (or anything past the page) was simply absent. A vault
+    /// with no notes has no entry.
+    pub fn note_counts_by_vault(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, StoreError> {
+        let conn = self.conn()?;
+        let result = conn
+            .query("MATCH (n:Note) RETURN n.vault_uid, count(n)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut counts = std::collections::HashMap::new();
+        for row in result {
+            let count = usize::try_from(extract_i64(&row, 1)?).unwrap_or(0);
+            counts.insert(extract_string(&row, 0)?, count);
+        }
+        Ok(counts)
     }
 
     /// Return all headings in a given note, in document order (by start_line).
