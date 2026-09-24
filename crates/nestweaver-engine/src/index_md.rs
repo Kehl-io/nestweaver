@@ -1013,6 +1013,54 @@ pub(crate) fn record_code_reconciliation_debt(
     replace_reconciliation_debt(db_path, code_watch_key(repo_root), owed);
 }
 
+/// Marks the code watcher's rows for directories its filesystem subscription
+/// could not cover (`watch_tree`), so they can be replaced on their own.
+pub(crate) const CODE_UNWATCHED_DIR_MARKER: &str = "code watcher cannot watch this directory";
+
+/// nw-651 on Linux: replace ONLY the code watcher's unwatched-directory rows
+/// (those carrying [`CODE_UNWATCHED_DIR_MARKER`]) for `repo_root` with `rows`,
+/// keeping every other debt row — the startup reconciliation re-derives
+/// those itself, and a subscription change must not wipe them first. No
+/// write when nothing changes.
+pub(crate) fn record_code_unwatched_dirs(
+    db_path: &Path,
+    repo_root: &Path,
+    mut rows: Vec<SkippedFile>,
+) {
+    let key = code_watch_key(repo_root);
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let existing = sidecar
+            .reconciliation_pending
+            .remove(&key)
+            .unwrap_or_default();
+        let (mut previous, mut kept): (Vec<SkippedFile>, Vec<SkippedFile>) = existing
+            .into_iter()
+            .partition(|file| file.reason.contains(CODE_UNWATCHED_DIR_MARKER));
+        previous.sort_by(|a, b| a.path.cmp(&b.path));
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        let unchanged = previous.len() == rows.len()
+            && previous
+                .iter()
+                .zip(&rows)
+                .all(|(a, b)| a.path == b.path && a.reason == b.reason);
+        if unchanged {
+            return None;
+        }
+        kept.extend(rows);
+        if !kept.is_empty() {
+            kept.sort_by(|a, b| a.path.cmp(&b.path));
+            sidecar.reconciliation_pending.insert(key, kept);
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+        ))
+    });
+}
+
 /// Replace one root's whole debt: every attempt describes it in full.
 fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<SkippedFile>) {
     update_skipped_notes_sidecar(db_path, |mut sidecar| {

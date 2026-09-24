@@ -423,9 +423,37 @@ impl BrainWatcher {
         }
     }
 
+    /// nw-651 on Linux: disclose the directories the subscription could not
+    /// cover as the vault walk's unreadable-directory rows, minus `SKIP_DIRS`
+    /// (never walked) — `.brainignore` is applied by the writer. A directory
+    /// that became watchable again needs no call: the batch that follows
+    /// walks the vault and re-derives every walk row.
+    fn disclose_unwatchable_dirs(&self, store: &GraphStore, dirs: &[(PathBuf, String)]) {
+        let dirs: Vec<(PathBuf, String)> = dirs
+            .iter()
+            .filter(|(dir, _)| !path_in_skip_dir(dir))
+            .cloned()
+            .collect();
+        for (dir, error) in &dirs {
+            tracing::warn!(
+                dir = %dir.display(),
+                %error,
+                "brain watcher cannot watch this directory; edits beneath it are not seen live"
+            );
+        }
+        crate::index_md::disclose_unwatchable_vault_dirs(
+            store.db_path(),
+            &self.vault_root,
+            &self.ignore_set,
+            &dirs,
+        );
+    }
+
     /// Test hook: make the recursive subscription fail the way Linux inotify
     /// does on an unreadable subdirectory (see `watch_tree`).
+    /// Linux tests use real inotify instead, so the hook is unused there.
     #[cfg(test)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn emulating_inotify_watch(mut self) -> Self {
         self.emulate_inotify_watch = true;
         self
@@ -659,12 +687,8 @@ impl BrainWatcher {
         #[cfg(not(test))]
         let tree = crate::watch_tree::TreeWatch::start(watcher, &self.vault_root);
         let mut tree = tree.with_context(|| format!("watch {}", self.vault_root.display()))?;
-        crate::index_md::disclose_unwatchable_vault_dirs(
-            store.db_path(),
-            &self.vault_root,
-            &self.ignore_set,
-            tree.unwatchable(),
-        );
+        self.disclose_unwatchable_dirs(&store, tree.unwatchable());
+        let mut subscribed_unwatchable = tree.unwatchable().to_vec();
         // Use external Tantivy if provided (daemon mode), otherwise open from path.
         let tantivy: Option<Arc<TantivyIndex>> = if let Some(ext) = self.external_tantivy.take() {
             Some(ext)
@@ -857,6 +881,10 @@ impl BrainWatcher {
             // watched one needs its own watch, and its notes may predate it.
             let adopted = tree.adopt_new_dirs(&batch);
             batch.extend(adopted);
+            if tree.unwatchable() != subscribed_unwatchable.as_slice() {
+                subscribed_unwatchable = tree.unwatchable().to_vec();
+                self.disclose_unwatchable_dirs(&store, &subscribed_unwatchable);
+            }
             match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
                 Ok(None) => {}
                 // nw-668: committed text, missing code links — owed, disclosed
@@ -2384,7 +2412,11 @@ mod tests {
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
         let locked = root.join("locked");
+        let ignored = root.join("node_modules");
+        fs::create_dir_all(&ignored).unwrap();
+        let fresh_locked = root.join("fresh_locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o000)).unwrap();
         let v_uid = vault_uid("default", &root.to_string_lossy());
         let has = |path: &str| {
             store
@@ -2395,12 +2427,14 @@ mod tests {
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
-                .emulating_inotify_watch()
-                .with_debounce_ms(100)
-                .with_ready_callback(move || {
-                    let _ = ready_tx.send(());
-                });
+            // On Linux this is REAL inotify failing on the unreadable
+            // directory; elsewhere the seam fails the way it does.
+            let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+            #[cfg(not(target_os = "linux"))]
+            let watcher = watcher.emulating_inotify_watch();
+            let watcher = watcher.with_debounce_ms(100).with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
             let stop = watcher.shutdown_handle();
             let running = store.clone();
             let handle = thread::spawn(move || watcher.run_with_store(running, None));
@@ -2421,6 +2455,10 @@ mod tests {
                         && row.reason_code == nestweaver_parser::SkipReasonCode::ReadError),
                     "the unwatchable directory must be disclosed: {rows:?}"
                 );
+                assert!(
+                    !rows.iter().any(|row| row.path == "node_modules"),
+                    "an ignored unreadable directory is not disclosed: {rows:?}"
+                );
 
                 let wait = |what: &str, path: &str| {
                     let deadline = Instant::now() + Duration::from_secs(30);
@@ -2438,6 +2476,38 @@ mod tests {
                 thread::sleep(Duration::from_millis(300));
                 fs::write(root.join("newdir/Later.md"), "# Later\n").unwrap();
                 wait("a later note in the new directory", "newdir/Later.md");
+
+                // Deleted and re-created within one debounce window: the new
+                // directory needs a watch of its own again.
+                fs::remove_dir_all(root.join("newdir")).unwrap();
+                fs::create_dir(root.join("newdir")).unwrap();
+                fs::write(root.join("newdir/Again.md"), "# Again\n").unwrap();
+                wait("a note in the re-created directory", "newdir/Again.md");
+                thread::sleep(Duration::from_millis(300));
+                fs::write(root.join("newdir/After.md"), "# After\n").unwrap();
+                wait(
+                    "a later note in the re-created directory",
+                    "newdir/After.md",
+                );
+
+                // Discovered live: disclosed when it appears unreadable.
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .mode(0o000)
+                    .create(&fresh_locked)
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !crate::index_md::load_skipped_notes_sidecar(&db_path)
+                    .skipped
+                    .iter()
+                    .any(|row| row.path == "fresh_locked")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a directory found unreadable live must be disclosed"
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
                 assert!(
                     has("locked/Hidden.md"),
                     "an unwatchable directory's notes are never deleted"
@@ -2450,7 +2520,9 @@ mod tests {
             }
             joined.unwrap();
         }));
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        for dir in [&locked, &ignored, &fresh_locked] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }

@@ -139,7 +139,9 @@ impl CodeWatcher {
 
     /// Test hook: make the recursive subscription fail the way Linux inotify
     /// does on an unreadable subdirectory (see `watch_tree`).
+    /// Linux tests use real inotify instead, so the hook is unused there.
     #[cfg(test)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn emulating_inotify_watch(mut self) -> Self {
         self.emulate_inotify_watch = true;
         self
@@ -295,10 +297,6 @@ impl CodeWatcher {
         #[cfg(not(test))]
         let tree = TreeWatch::start(watcher, &self.repo_root);
         let mut tree = tree.with_context(|| format!("watch {}", self.repo_root.display()))?;
-        if !tree.unwatchable().is_empty() {
-            self.unwatched_dirs = tree.unwatchable().to_vec();
-            self.record_debt(&[], &[], None);
-        }
         #[cfg(test)]
         if let Some(ready) = &self.ready_signal {
             let _ = ready.send(());
@@ -308,6 +306,10 @@ impl CodeWatcher {
         // `file://` graph rather than re-identifying+pruning, so a watch-first
         // start over a legacy DB never empties the graph.
         let (repo_url, r_uid) = resolve_watch_identity(&store, &self.instance_id, &self.repo_root)?;
+        // Always, so a previous run's rows for directories that are now
+        // watchable are cleared (no write when nothing changed).
+        self.sync_unwatched_dirs(&repo_url, tree.unwatchable(), true);
+        let mut subscribed_unwatchable = tree.unwatchable().to_vec();
 
         // A contract plan is a whole-repo view and must never point at
         // unchanged controllers that a minimal watch-first graph omitted.
@@ -485,8 +487,9 @@ impl CodeWatcher {
             // watched one needs its own watch, and its files may predate it.
             let adopted = tree.adopt_new_dirs(&batch);
             batch.extend(adopted);
-            if tree.unwatchable().len() != self.unwatched_dirs.len() {
-                self.unwatched_dirs = tree.unwatchable().to_vec();
+            if tree.unwatchable() != subscribed_unwatchable.as_slice() {
+                subscribed_unwatchable = tree.unwatchable().to_vec();
+                self.sync_unwatched_dirs(&repo_url, &subscribed_unwatchable, false);
             }
             let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
                 Ok(lease) => lease,
@@ -1420,13 +1423,62 @@ impl CodeWatcher {
             nestweaver_parser::SkippedFile::new(
                 dir.to_string_lossy().into_owned(),
                 nestweaver_parser::SkipReasonCode::ReadError,
-                format!(
-                    "{prefix}: code watcher cannot watch this directory ({error}); edits \
-                     beneath it are not picked up live, re-checked at the next watcher start"
-                ),
+                unwatched_dir_reason(error),
             )
         }));
         crate::index_md::record_code_reconciliation_debt(&self.db_path, &self.repo_root, entries);
+    }
+
+    /// nw-651 on Linux: adopt the subscription's current unwatchable
+    /// directories — minus those the index ignores anyway (`SKIP_DIRS`,
+    /// `[[repos]] exclude`, `.gitignore`: e.g. a container's database
+    /// directory), which are no loss — and persist their rows when the set
+    /// changed (or `force`), leaving the rest of the debt alone.
+    fn sync_unwatched_dirs(&mut self, repo_url: &str, dirs: &[(PathBuf, String)], force: bool) {
+        let reader = self.reader_for(repo_url).ok();
+        let disclosable: Vec<(PathBuf, String)> = dirs
+            .iter()
+            .filter(|(dir, _)| {
+                let Ok(rel) = dir.strip_prefix(&self.repo_root) else {
+                    return true;
+                };
+                let excluded = reader
+                    .as_ref()
+                    .is_some_and(|reader| !reader.accepts_path(&rel.join("nestweaver-probe")));
+                !excluded
+                    && !matches!(
+                        manifest_path_not_gitignored(&self.repo_root, rel),
+                        Ok(false)
+                    )
+            })
+            .cloned()
+            .collect();
+        if !force && disclosable == self.unwatched_dirs {
+            return;
+        }
+        for (dir, error) in disclosable
+            .iter()
+            .filter(|dir| !self.unwatched_dirs.contains(dir))
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                %error,
+                "code watcher cannot watch this directory; edits beneath it are not seen live"
+            );
+        }
+        self.unwatched_dirs = disclosable;
+        let rows = self
+            .unwatched_dirs
+            .iter()
+            .map(|(dir, error)| {
+                nestweaver_parser::SkippedFile::new(
+                    dir.to_string_lossy().into_owned(),
+                    nestweaver_parser::SkipReasonCode::ReadError,
+                    unwatched_dir_reason(error),
+                )
+            })
+            .collect();
+        crate::index_md::record_code_unwatched_dirs(&self.db_path, &self.repo_root, rows);
     }
 
     /// nw-664: after a successful replay, a replayed source that still exists
@@ -1601,6 +1653,16 @@ fn resolve_watch_identity(
 /// Returns true if the file is a supported source language.
 fn is_supported_source(path: &Path) -> bool {
     detect_language(path).is_some()
+}
+
+/// The debt row reason for a directory the code watcher cannot watch.
+fn unwatched_dir_reason(error: &str) -> String {
+    format!(
+        "{}: {} ({error}); edits beneath it are not picked up live until it can be \
+         watched again",
+        crate::index_md::WATCH_RECONCILIATION_PENDING_REASON,
+        crate::index_md::CODE_UNWATCHED_DIR_MARKER,
+    )
 }
 
 fn is_watcher_input(path: &Path) -> bool {
@@ -3691,10 +3753,25 @@ mod tests {
             )],
         );
         let locked = root.join("locked");
+        // An ignored unreadable directory (a container's data dir under a
+        // SKIP_DIRS name) is no loss, so it is not a debt row.
+        let ignored = root.join("node_modules");
+        std::fs::create_dir_all(&ignored).unwrap();
+        let fresh_locked = root.join("fresh_locked");
+        let restore = || {
+            for dir in [&locked, &ignored, &fresh_locked] {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+            }
+        };
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&ignored, std::fs::Permissions::from_mode(0o000)).unwrap();
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let watcher = CodeWatcher::new(&db_path, &root, "test").emulating_inotify_watch();
+            // On Linux this is REAL inotify failing on the unreadable
+            // directory; elsewhere the seam fails the way it does.
+            let watcher = CodeWatcher::new(&db_path, &root, "test");
+            #[cfg(not(target_os = "linux"))]
+            let watcher = watcher.emulating_inotify_watch();
             let (stop, handle) = spawn_live_code_watcher(watcher, store.clone());
             let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let locked_key = locked.to_string_lossy().into_owned();
@@ -3706,6 +3783,14 @@ mod tests {
                 assert!(
                     disclosed(),
                     "the unwatchable directory must be disclosed: {:?}",
+                    code_debt(&db_path)
+                );
+                let ignored_key = ignored.to_string_lossy().into_owned();
+                assert!(
+                    !code_debt(&db_path)
+                        .iter()
+                        .any(|(path, _)| *path == ignored_key),
+                    "an ignored unreadable directory is not a debt row: {:?}",
                     code_debt(&db_path)
                 );
 
@@ -3735,6 +3820,51 @@ mod tests {
                 wait_until("a later edit in the new directory to land", || {
                     repo_symbol_names(&store, &uid).contains("bornEdited")
                 });
+
+                // Deleted and re-created within one debounce window: the new
+                // directory needs a watch of its own again.
+                std::fs::remove_dir_all(root.join("fresh")).unwrap();
+                std::fs::create_dir(root.join("fresh")).unwrap();
+                std::fs::write(
+                    root.join("fresh/again.js"),
+                    "export function againLive() { return 3; }\n",
+                )
+                .unwrap();
+                wait_until("a source in the re-created directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("againLive")
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(
+                    root.join("fresh/again.js"),
+                    "export function againEdited() { return 4; }\n",
+                )
+                .unwrap();
+                wait_until("a later edit in the re-created directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("againEdited")
+                });
+
+                // Discovered live: disclosed when it appears unreadable, and
+                // retried (and cleared) once its permissions are fixed.
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o000)
+                    .create(&fresh_locked)
+                    .unwrap();
+                let fresh_key = fresh_locked.to_string_lossy().into_owned();
+                let fresh_disclosed = || {
+                    code_debt(&db_path)
+                        .iter()
+                        .any(|(path, _)| *path == fresh_key)
+                };
+                wait_until(
+                    "a directory found unreadable live to be disclosed",
+                    fresh_disclosed,
+                );
+                std::fs::set_permissions(&fresh_locked, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                wait_until("its row to clear once it is watchable", || {
+                    !fresh_disclosed()
+                });
                 assert!(
                     repo_symbol_names(&store, &uid).contains("hidden"),
                     "an unwatchable directory's sources are never deleted"
@@ -3751,10 +3881,48 @@ mod tests {
             }
             joined.unwrap();
         }));
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        restore();
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// Review of 8adb6a5c: a change in the subscription's unwatched
+    /// directories replaces only those rows — the rest of the repo's debt
+    /// (re-derived by the startup reconciliation) is never wiped first.
+    #[test]
+    fn unwatched_dir_rows_merge_into_the_code_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let root = dir.path().join("repo");
+        let owed = nestweaver_parser::SkippedFile::new(
+            root.join("src/a.js").to_string_lossy().into_owned(),
+            nestweaver_parser::SkipReasonCode::Other,
+            "owed".to_string(),
+        );
+        crate::index_md::record_code_reconciliation_debt(&db_path, &root, vec![owed]);
+        let row = |dir: &str| {
+            nestweaver_parser::SkippedFile::new(
+                root.join(dir).to_string_lossy().into_owned(),
+                nestweaver_parser::SkipReasonCode::ReadError,
+                unwatched_dir_reason("Permission denied"),
+            )
+        };
+        let paths = || {
+            code_debt(&db_path)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        };
+        let key = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        crate::index_md::record_code_unwatched_dirs(&db_path, &root, vec![row("locked")]);
+        assert_eq!(paths(), vec![key("locked"), key("src/a.js")]);
+        crate::index_md::record_code_unwatched_dirs(&db_path, &root, Vec::new());
+        assert_eq!(
+            paths(),
+            vec![key("src/a.js")],
+            "only the unwatched row goes"
+        );
     }
 
     /// nw-664 / nw-287: a scan that finds no files at all (unmounted, emptied)
