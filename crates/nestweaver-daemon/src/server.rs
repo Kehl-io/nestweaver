@@ -5713,6 +5713,7 @@ where
 /// pre-merge uid there) — so `brain status` / `brain list` do not report it as
 /// dropped. Shared by `remove_vault` and `prune_stale`. Best-effort: the graph
 /// delete already committed, and a failure only leaves a stale disclosure.
+/// Also clears the vault's skipped-notes sidecar debt when its root is known.
 fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Option<&str>) {
     let forgotten = match root_path {
         Some(root) => {
@@ -5722,6 +5723,12 @@ fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Op
     };
     if let Err(error) = forgotten {
         tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    }
+    // nw-653 review: and its owed reconciliation / unindexable-note entries
+    // in the shared skipped-notes sidecar, which only its (now gone) watcher
+    // would ever have cleared.
+    if let Some(root) = root_path {
+        nestweaver_engine::index_md::forget_vault_skipped_notes(&state.db_path, Path::new(root));
     }
 }
 
@@ -17059,6 +17066,91 @@ credential_method = "gh"
 
         let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// nw-653 review: a removed vault's owed startup reconciliation and its
+    /// unindexable-note mtimes lived on in the shared skipped-notes sidecar
+    /// forever — `brain status` kept reporting debt for a vault that no
+    /// longer exists. Removal clears them; another vault's entries stay.
+    fn seed_skipped_notes_debt(state: &DaemonState, roots: &[&str]) {
+        let mut sidecar = nestweaver_engine::index_md::SkippedNotesSidecar::default();
+        for root in roots {
+            let note = format!("{root}/owed.md");
+            sidecar.reconciliation_pending.insert(
+                (*root).to_string(),
+                vec![nestweaver_parser::SkippedFile::new(
+                    note.clone(),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar
+                .unindexable_mtimes
+                .insert(format!("{root}/broken.md"), "2026-09-24T00:00:00Z".into());
+        }
+        std::fs::write(
+            nestweaver_engine::sidecar_path(
+                &state.db_path,
+                nestweaver_engine::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX,
+            ),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_only_debt_left_for(state: &DaemonState, survivor: &str) {
+        let left = nestweaver_engine::index_md::load_skipped_notes_sidecar(&state.db_path);
+        let pending: Vec<&String> = left.reconciliation_pending.keys().collect();
+        assert_eq!(pending, vec![survivor], "{pending:?}");
+        assert!(
+            left.unindexable_mtimes
+                .keys()
+                .all(|path| path.starts_with(&format!("{survivor}/"))),
+            "{:?}",
+            left.unindexable_mtimes
+        );
+        assert_eq!(
+            left.unindexable_mtimes.len(),
+            1,
+            "{:?}",
+            left.unindexable_mtimes
+        );
+    }
+
+    #[test]
+    fn remove_vault_clears_its_skipped_notes_debt() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:debt:gone", "debt", &root_str);
+        seed_skipped_notes_debt(&state, &[&root_str, "/other/vault"]);
+
+        run_remove_vault_with_projection(&state, "vlt:debt:gone", None).unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    #[test]
+    fn prune_stale_clears_a_pruned_vaults_skipped_notes_debt() {
+        let state = test_state_with_writer();
+        let gone = "/definitely/missing/prune-debt";
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:debt", "prune", gone);
+        seed_skipped_notes_debt(&state, &[gone, "/other/vault"]);
+
+        run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
     }
 
     #[test]

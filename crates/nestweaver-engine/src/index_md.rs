@@ -779,6 +779,31 @@ pub(crate) fn record_watch_reconciliation_debt(
     });
 }
 
+/// nw-653 review: forget a REMOVED vault's entries in the shared sidecar —
+/// its owed startup reconciliation and its unindexable-note mtimes (both
+/// keyed by absolute path, so they are unambiguously this vault's). Without
+/// this, `brain status` reported debt for a vault that no longer exists,
+/// forever: only that vault's watcher clears it. Other vaults' entries are
+/// untouched. Called by the daemon's `remove_vault` and `prune_stale`.
+pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
+    update_skipped_notes_sidecar(db_path, |sidecar| {
+        let mut pending = sidecar.reconciliation_pending;
+        let mut unindexable = sidecar.unindexable_mtimes;
+        let (pending_before, unindexable_before) = (pending.len(), unindexable.len());
+        pending.retain(|root, _| Path::new(root) != vault_root);
+        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        if pending.len() == pending_before && unindexable.len() == unindexable_before {
+            return None;
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            unindexable,
+            pending,
+        ))
+    });
+}
+
 /// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty
 /// disclosure, not an error — status must not walk the vault as a fallback.
 pub fn load_skipped_notes_sidecar(db_path: &Path) -> SkippedNotesSidecar {
