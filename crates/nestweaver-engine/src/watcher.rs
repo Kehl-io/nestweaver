@@ -411,13 +411,14 @@ impl BrainWatcher {
                 || path.extension().is_some_and(|s| s == "csproj"))
     }
 
-    /// Set the debounce interval for filesystem events.
+    /// Test hook: shorten the startup-reconciliation retry backoff (nw-653).
     #[cfg(test)]
     fn with_reconcile_retry_base(mut self, base: Duration) -> Self {
         self.reconcile_retry_base = base;
         self
     }
 
+    /// Set the debounce interval for filesystem events.
     pub fn with_debounce_ms(mut self, ms: u64) -> Self {
         self.debounce_ms = ms;
         self
