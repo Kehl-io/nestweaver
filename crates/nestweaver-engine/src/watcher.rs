@@ -991,7 +991,7 @@ impl BrainWatcher {
                 // Nothing left to reconcile: settle any debt an earlier
                 // attempt disclosed (including an uncomputable drift), or
                 // status reports it pending forever.
-                crate::index_md::record_watch_reconciliation_debt(
+                crate::index_md::record_vault_reconciliation_debt(
                     store.db_path(),
                     &self.vault_root,
                     &[],
@@ -1007,7 +1007,7 @@ impl BrainWatcher {
                 );
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
                     Ok(()) => {
-                        crate::index_md::record_watch_reconciliation_debt(
+                        crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
                             &self.vault_root,
                             &paths,
@@ -1036,7 +1036,7 @@ impl BrainWatcher {
              refresh` also heals it)"
         );
         // An uncomputable drift is disclosed against the vault root itself.
-        crate::index_md::record_watch_reconciliation_debt(
+        crate::index_md::record_vault_reconciliation_debt(
             store.db_path(),
             &self.vault_root,
             paths
@@ -1875,7 +1875,7 @@ mod tests {
         let db_path = db_dir.path().join("brain.lbug");
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        crate::index_md::record_watch_reconciliation_debt(
+        crate::index_md::record_vault_reconciliation_debt(
             Some(&db_path),
             &root,
             std::slice::from_ref(&root),

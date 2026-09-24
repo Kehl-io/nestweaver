@@ -3150,6 +3150,27 @@ async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
     stopped
 }
 
+/// nw-664 review: after a repo is removed or pruned, stop the code watcher
+/// registered on its root (if the canonical slot holds one) and forget its
+/// code-watcher state. Left running, an owed startup-reconciliation retry or
+/// the next save would re-create the Repo node the removal just deleted and
+/// re-disclose debt for it. Roots compare canonically: the slot records the
+/// path as requested, the graph the canonical one.
+fn forget_removed_repo_watch(state: &DaemonState, root: &Path) {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let watcher_id = state.watcher_stop.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|w| w.kind == "code" && canonical(Path::new(&w.target)) == canonical(root))
+            .map(|w| w.id)
+    });
+    if let Some(id) = watcher_id {
+        stop_watcher_registration(state, id);
+    }
+    nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, root);
+}
+
 /// Signal `id` only if it still owns the canonical slot.
 fn stop_watcher_registration(state: &DaemonState, id: u64) -> bool {
     let Ok(mut guard) = state.watcher_stop.lock() else {
@@ -4976,7 +4997,7 @@ where
     if mutation.is_ok()
         && let Some(root) = &repo_root
     {
-        nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, root);
+        forget_removed_repo_watch(state, root);
     }
 
     let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
@@ -5144,7 +5165,7 @@ where
         delete_repo(store, repo)?;
         // nw-664: pruned on purpose; clear its code watcher's disclosure.
         if let Some(root) = repo.local_root() {
-            nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, Path::new(root));
+            forget_removed_repo_watch(state, Path::new(root));
         }
         Ok(())
     });
@@ -17174,11 +17195,67 @@ credential_method = "gh"
         assert_only_debt_left_for(&state, "/other/vault");
     }
 
-    /// nw-664: a removed repo's code-watcher debt (owed reconciliation keyed
-    /// by the repo root, unindexable-source mtimes under it) is cleared with
-    /// it, like a removed vault's; another root's entries stay.
+    /// nw-664: seed code-watcher debt (`code:`-namespaced) for each repo root,
+    /// plus vault debt at the SAME root to prove removal leaves it alone.
+    fn seed_code_watch_debt(state: &DaemonState, roots: &[&str]) {
+        use nestweaver_engine::index_md::code_watch_key;
+        let mut sidecar = nestweaver_engine::index_md::SkippedNotesSidecar::default();
+        for root in roots {
+            let root_path = Path::new(root);
+            sidecar.reconciliation_pending.insert(
+                code_watch_key(root_path),
+                vec![nestweaver_parser::SkippedFile::new(
+                    format!("{root}/src/a.js"),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar.reconciliation_pending.insert(
+                (*root).to_string(),
+                vec![nestweaver_parser::SkippedFile::new(
+                    format!("{root}/Owed.md"),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar.unindexable_mtimes.insert(
+                code_watch_key(&root_path.join("src/broken.js")),
+                "1:2".into(),
+            );
+        }
+        std::fs::write(
+            nestweaver_engine::sidecar_path(
+                &state.db_path,
+                nestweaver_engine::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX,
+            ),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_code_watch_debt_forgotten_for(state: &DaemonState, gone: &str, survivor: &str) {
+        use nestweaver_engine::index_md::code_watch_key;
+        let left = nestweaver_engine::index_md::load_skipped_notes_sidecar(&state.db_path);
+        let mut pending: Vec<String> = left.reconciliation_pending.keys().cloned().collect();
+        pending.sort();
+        let mut expected = vec![
+            gone.to_string(),
+            survivor.to_string(),
+            code_watch_key(Path::new(survivor)),
+        ];
+        expected.sort();
+        assert_eq!(pending, expected, "only the removed repo's code debt goes");
+        assert_eq!(
+            left.unindexable_mtimes.keys().collect::<Vec<_>>(),
+            vec![&code_watch_key(&Path::new(survivor).join("src/broken.js"))],
+        );
+    }
+
+    /// nw-664: a removed repo's code-watcher debt and unindexable memory are
+    /// cleared with it — never a vault's at the same root — and its running
+    /// code watcher is stopped, so an owed retry cannot resurrect the repo.
     #[test]
-    fn remove_repo_clears_its_code_watcher_debt() {
+    fn remove_repo_clears_its_code_watcher_debt_and_stops_its_watcher() {
         let state = test_state_with_writer();
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_string_lossy().into_owned();
@@ -17190,7 +17267,16 @@ credential_method = "gh"
                 Some(&root_str),
             ))
             .unwrap();
-        seed_skipped_notes_debt(&state, &[&root_str, "/other/vault"]);
+        seed_code_watch_debt(&state, &[&root_str, "/other/repo"]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", root.path());
 
         run_remove_repo_with(
             &state,
@@ -17208,7 +17294,53 @@ credential_method = "gh"
         )
         .unwrap();
 
-        assert_only_debt_left_for(&state, "/other/vault");
+        assert_code_watch_debt_forgotten_for(&state, &root_str, "/other/repo");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the removed repo's code watcher must be stopped"
+        );
+    }
+
+    /// Counterweight: removing a repo leaves a watcher on ANOTHER root alone.
+    #[test]
+    fn remove_repo_leaves_another_roots_watcher_running() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:other",
+                &format!("file://{root_str}"),
+                Some(&root_str),
+            ))
+            .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", other.path());
+        run_remove_repo_with(
+            &state,
+            "repo:test:other",
+            |store, uid| {
+                store
+                    .clear_repo_derived_nodes(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+            |store, uid| {
+                store
+                    .delete_repo_node(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+        )
+        .unwrap();
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -17223,7 +17355,16 @@ credential_method = "gh"
                 Some(gone),
             ))
             .unwrap();
-        seed_skipped_notes_debt(&state, &[gone, "/other/vault"]);
+        seed_code_watch_debt(&state, &[gone, "/other/repo"]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", Path::new(gone));
 
         run_prune_stale_with(
             &state,
@@ -17238,7 +17379,11 @@ credential_method = "gh"
         )
         .unwrap();
 
-        assert_only_debt_left_for(&state, "/other/vault");
+        assert_code_watch_debt_forgotten_for(&state, gone, "/other/repo");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the pruned repo's watcher stops"
+        );
     }
 
     #[test]

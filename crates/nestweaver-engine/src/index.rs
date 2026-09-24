@@ -5015,6 +5015,19 @@ impl ContractSet {
     }
 }
 
+/// Languages whose sources can contribute handler-derived contracts
+/// (Rust only when the repo has gRPC specs). nw-664 review: ONE gate for the
+/// contract plan and the watcher's contract snapshot, which had drifted.
+fn is_contract_handler_language(lang: nestweaver_schema::Language, has_grpc_specs: bool) -> bool {
+    matches!(
+        lang,
+        nestweaver_schema::Language::Java
+            | nestweaver_schema::Language::Kotlin
+            | nestweaver_schema::Language::JavaScript
+            | nestweaver_schema::Language::TypeScript
+    ) || (has_grpc_specs && lang == nestweaver_schema::Language::Rust)
+}
+
 /// Rebuild the whole-repo inputs consumed by contract derivation.
 ///
 /// Full indexing accumulates these while parsing every file. Incremental
@@ -5061,15 +5074,7 @@ fn collect_contract_derivation_inputs(
         // Filtering before metadata/read is important in strict mode: an
         // unreadable unrelated Python/Go/etc. file must not abort otherwise
         // valid contract publication.
-        let eligible_handler_language = matches!(
-            lang,
-            nestweaver_schema::Language::Java
-                | nestweaver_schema::Language::Kotlin
-                | nestweaver_schema::Language::JavaScript
-                | nestweaver_schema::Language::TypeScript
-        ) || (has_grpc_specs
-            && lang == nestweaver_schema::Language::Rust);
-        if !eligible_handler_language {
+        if !is_contract_handler_language(lang, has_grpc_specs) {
             continue;
         }
         if reader
@@ -5106,6 +5111,18 @@ fn collect_contract_derivation_inputs(
                     oversized.observed_bytes,
                     oversized.limit_bytes,
                 ));
+                continue;
+            }
+            // nw-664 review: binary content cannot be a controller, and the
+            // full index already skips it as policy (nw-355). Failing strict
+            // mode on it blocked EVERY watcher batch while one binary
+            // JS/TS/Java file existed anywhere in the repo.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+            {
+                skipped_files.push(SkippedFile::binary(rel_path.to_string_lossy().into_owned()));
                 continue;
             }
             Err(error) if strict => {
@@ -5297,7 +5314,14 @@ pub(crate) fn watcher_contract_input_snapshot(
         let abs_path = reader.root().join(&rel_path);
         let is_spec = crate::contracts::is_spec_file(&abs_path.to_string_lossy());
         let language = detect_language(&abs_path);
-        if !is_spec && language.is_none() {
+        // nw-664 review: the same language gate the plan's reader applies
+        // (`collect_contract_derivation_inputs`) BEFORE reading. This snapshot
+        // read every source language, so one unreadable Python/Go/etc. file —
+        // which cannot contribute a contract — failed every watcher batch,
+        // exactly what that gate exists to prevent.
+        if !is_spec
+            && !language.is_some_and(|lang| is_contract_handler_language(lang, has_grpc_specs))
+        {
             continue;
         }
         if !is_spec && is_minified_or_bundled(&abs_path) {
@@ -5310,9 +5334,22 @@ pub(crate) fn watcher_contract_input_snapshot(
         {
             continue;
         }
-        let source = reader
-            .read_file(&rel_path)
-            .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
+        let source = match reader.read_file(&rel_path) {
+            Ok(source) => source,
+            // Binary cannot be a contract input; the plan skips it too.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read watcher contract input {}", rel_path.display())
+                });
+            }
+        };
         if source.len() as u64 > reader.max_source_file_bytes() {
             continue;
         }

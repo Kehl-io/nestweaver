@@ -531,14 +531,17 @@ fn build_skipped_notes_sidecar(
 ) -> SkippedNotesSidecar {
     // nw-653: owed reconciliation entries go FIRST, so the cap never cuts
     // them; any stale mirror of them in `skipped` is replaced.
-    let owed: HashSet<&str> = reconciliation_pending
-        .values()
-        .flatten()
-        .map(|file| file.path.as_str())
-        .collect();
-    let skipped: Vec<SkippedFile> = reconciliation_pending
-        .values()
-        .flatten()
+    // nw-664 review: only VAULT debt is mirrored into the skipped-NOTES
+    // list; the code watcher's (source files, a repo root) is reported under
+    // `reconciliation_pending` alone rather than as "skipped notes".
+    let vault_owed = || {
+        reconciliation_pending
+            .iter()
+            .filter(|(key, _)| !is_code_watch_key(key))
+            .flat_map(|(_, files)| files)
+    };
+    let owed: HashSet<&str> = vault_owed().map(|file| file.path.as_str()).collect();
+    let skipped: Vec<SkippedFile> = vault_owed()
         .cloned()
         .chain(
             skipped
@@ -730,95 +733,128 @@ fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
 /// nw-653: reason prefix of the entries that disclose a watcher startup
 /// reconciliation still owed (see
 /// [`SkippedNotesSidecar::reconciliation_pending`]). nw-664: shared by the
-/// brain and code watchers; the full reason names which one failed
+/// brain and code watchers; the full reason names which one and why
 /// (`...: code watcher startup reconciliation failed; retrying (...)`).
 pub const WATCH_RECONCILIATION_PENDING_REASON: &str = "not yet reconciled into the graph";
+
+/// nw-664 review: key prefix of the CODE watcher's entries in the shared
+/// `reconciliation_pending` and `unindexable_mtimes` maps. A vault and a repo
+/// may share a root (or nest), and unprefixed keys let one watcher's success
+/// clear the other's debt and a repo removal wipe a nested vault's mtimes.
+/// Vault keys stay bare absolute paths, so sidecars written before this read
+/// unchanged; a `code:` key never equals, nor `Path::starts_with`, an
+/// absolute path, so no vault rule can match it by accident.
+const CODE_WATCH_KEY_PREFIX: &str = "code:";
+
+/// The shared-sidecar key of the code watcher's entry for `path` (a repo root
+/// in `reconciliation_pending`, a source in `unindexable_mtimes`).
+pub fn code_watch_key(path: &Path) -> String {
+    format!("{CODE_WATCH_KEY_PREFIX}{}", path.to_string_lossy())
+}
+
+fn is_code_watch_key(key: &str) -> bool {
+    key.starts_with(CODE_WATCH_KEY_PREFIX)
+}
 
 /// nw-653: set `vault_root`'s startup reconciliation debt to `paths`
 /// (absolute; the vault root itself for an uncomputable drift) when `error` is
 /// `Some`, or clear it when `None`. Every attempt describes the vault's whole
 /// debt, so it REPLACES the vault's previous entries; other vaults' entries
 /// are never touched.
-pub(crate) fn record_watch_reconciliation_debt(
+pub(crate) fn record_vault_reconciliation_debt(
     db_path: Option<&Path>,
     vault_root: &Path,
     paths: &[PathBuf],
     error: Option<&str>,
 ) {
-    record_watcher_reconciliation_debt(db_path, vault_root, paths, error, "brain watcher");
-}
-
-/// nw-664: [`record_watch_reconciliation_debt`] for any watcher. The code
-/// watcher discloses its owed startup reconciliation through this same
-/// channel, keyed by its REPO root, so `brain status` reports both kinds in
-/// one place and one watcher's success never clears another root's debt.
-pub(crate) fn record_watcher_reconciliation_debt(
-    db_path: Option<&Path>,
-    root: &Path,
-    paths: &[PathBuf],
-    error: Option<&str>,
-    watcher: &str,
-) {
     let Some(db_path) = db_path else {
         return;
     };
-    let key = root.to_string_lossy().into_owned();
-    update_skipped_notes_sidecar(db_path, |mut sidecar| {
-        match error {
-            Some(error) if !paths.is_empty() => {
-                let reason = format!(
-                    "{WATCH_RECONCILIATION_PENDING_REASON}: {watcher} startup reconciliation \
-                     failed; retrying ({error})"
-                );
-                let mut owed: Vec<SkippedFile> = paths
-                    .iter()
-                    .map(|path| {
-                        SkippedFile::new(
-                            path.to_string_lossy().into_owned(),
-                            SkipReasonCode::Other,
-                            reason.clone(),
-                        )
-                    })
-                    .collect();
-                owed.sort_by(|a, b| a.path.cmp(&b.path));
-                sidecar.reconciliation_pending.insert(key, owed);
-            }
-            _ => {
-                sidecar.reconciliation_pending.remove(&key)?;
-            }
+    let owed = match error {
+        Some(error) => {
+            let reason = format!(
+                "{WATCH_RECONCILIATION_PENDING_REASON}: brain watcher startup reconciliation \
+                 failed; retrying ({error})"
+            );
+            paths
+                .iter()
+                .map(|path| {
+                    SkippedFile::new(
+                        path.to_string_lossy().into_owned(),
+                        SkipReasonCode::Other,
+                        reason.clone(),
+                    )
+                })
+                .collect()
         }
-        let rebuilt = build_skipped_notes_sidecar(
+        None => Vec::new(),
+    };
+    replace_reconciliation_debt(db_path, vault_root.to_string_lossy().into_owned(), owed);
+}
+
+/// nw-664: set the CODE watcher's reconciliation debt for `repo_root` to
+/// `owed` (absolute paths, reasons built by the watcher; empty clears it).
+/// Namespaced apart from any vault at the same root.
+pub(crate) fn record_code_reconciliation_debt(
+    db_path: &Path,
+    repo_root: &Path,
+    owed: Vec<SkippedFile>,
+) {
+    replace_reconciliation_debt(db_path, code_watch_key(repo_root), owed);
+}
+
+/// Replace one root's whole debt: every attempt describes it in full.
+fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<SkippedFile>) {
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        if owed.is_empty() {
+            sidecar.reconciliation_pending.remove(&key)?;
+        } else {
+            owed.sort_by(|a, b| a.path.cmp(&b.path));
+            sidecar.reconciliation_pending.insert(key, owed);
+        }
+        Some(build_skipped_notes_sidecar(
             &sidecar.skipped,
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
-        );
-        Some(rebuilt)
+        ))
     });
 }
 
-/// nw-664: after a code watcher startup replay, remember which replayed
-/// sources the graph still does not hold although they exist (unparsable,
-/// say) with their current mtime, and forget every other replayed path. The
-/// code watcher's startup drift consults [`SkippedNotesSidecar::unindexable_mtimes`]
-/// exactly as the vault's does, so such a file is not replayed on every start
-/// until it changes. Same whole-second representation (`file_mtime_string`).
-pub(crate) fn record_watch_unindexable_sources(
+/// nw-664: the CODE watcher's unindexable-source memory: absolute path ->
+/// the `<mtime_nanos>:<size>` stamp at which no watcher batch could graph it
+/// (unparsable, binary). Nanoseconds plus size, not the vault's whole-second
+/// string, so a fixed file restored within the same second (`rsync -a`,
+/// `tar x`) is retried.
+pub(crate) fn load_code_unindexable_stamps(
     db_path: &Path,
-    replayed: &[PathBuf],
-    unindexable: &[PathBuf],
+) -> std::collections::HashMap<PathBuf, String> {
+    load_skipped_notes_sidecar(db_path)
+        .unindexable_mtimes
+        .into_iter()
+        .filter_map(|(key, stamp)| {
+            key.strip_prefix(CODE_WATCH_KEY_PREFIX)
+                .map(|path| (PathBuf::from(path), stamp))
+        })
+        .collect()
+}
+
+/// nw-664: forget the memory of every path in `forget`, then remember each
+/// `(path, stamp)` in `remember`. See [`load_code_unindexable_stamps`].
+pub(crate) fn record_code_unindexable_stamps(
+    db_path: &Path,
+    forget: &[PathBuf],
+    remember: &[(PathBuf, String)],
 ) {
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
         let before = sidecar.unindexable_mtimes.clone();
-        for path in replayed {
-            sidecar.unindexable_mtimes.remove(&*path.to_string_lossy());
+        for path in forget {
+            sidecar.unindexable_mtimes.remove(&code_watch_key(path));
         }
-        for path in unindexable {
-            if let Some(mtime) = file_mtime_string(path) {
-                sidecar
-                    .unindexable_mtimes
-                    .insert(path.to_string_lossy().into_owned(), mtime);
-            }
+        for (path, stamp) in remember {
+            sidecar
+                .unindexable_mtimes
+                .insert(code_watch_key(path), stamp.clone());
         }
         if sidecar.unindexable_mtimes == before {
             return None;
@@ -830,11 +866,6 @@ pub(crate) fn record_watch_unindexable_sources(
             sidecar.reconciliation_pending,
         ))
     });
-}
-
-/// nw-664: the whole-second mtime the unindexable map records for `path`.
-pub(crate) fn watch_mtime_string(path: &Path) -> Option<String> {
-    file_mtime_string(path)
 }
 
 /// nw-653 review: forget a REMOVED vault's entries in the shared sidecar —
@@ -863,11 +894,29 @@ pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
 }
 
 /// nw-664: forget a REMOVED repo's code-watcher entries in the shared
-/// sidecar — its owed startup reconciliation (keyed by the repo root) and
-/// the unindexable-source mtimes under it. The same rule as a removed vault,
-/// so it calls [`forget_vault_skipped_notes`] rather than restating it.
+/// sidecar — its owed startup reconciliation and its unindexable-source
+/// stamps, both under the `code:` namespace, so a vault at or under the same
+/// root keeps its own. Called by the daemon's `remove_repo` and `prune_stale`.
 pub fn forget_repo_watch_state(db_path: &Path, repo_root: &Path) {
-    forget_vault_skipped_notes(db_path, repo_root);
+    update_skipped_notes_sidecar(db_path, |sidecar| {
+        let mut pending = sidecar.reconciliation_pending;
+        let mut unindexable = sidecar.unindexable_mtimes;
+        let (pending_before, unindexable_before) = (pending.len(), unindexable.len());
+        pending.remove(&code_watch_key(repo_root));
+        unindexable.retain(|key, _| {
+            !key.strip_prefix(CODE_WATCH_KEY_PREFIX)
+                .is_some_and(|path| Path::new(path).starts_with(repo_root))
+        });
+        if pending.len() == pending_before && unindexable.len() == unindexable_before {
+            return None;
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            unindexable,
+            pending,
+        ))
+    });
 }
 
 /// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty
@@ -8390,7 +8439,7 @@ mod watch_reconciliation_disclosure_tests {
                     let root = dir.path().join(format!("vault-{i}"));
                     std::thread::spawn(move || {
                         barrier.wait();
-                        record_watch_reconciliation_debt(
+                        record_vault_reconciliation_debt(
                             Some(&db_path),
                             &root,
                             &[root.join("n.md")],
@@ -8416,7 +8465,7 @@ mod watch_reconciliation_disclosure_tests {
         let db_path = dir.path().join("brain.lbug");
         let (first, second) = (dir.path().join("first"), dir.path().join("second"));
         for root in [&first, &second] {
-            record_watch_reconciliation_debt(
+            record_vault_reconciliation_debt(
                 Some(&db_path),
                 root,
                 &[root.join("same.md")],
@@ -8424,13 +8473,13 @@ mod watch_reconciliation_disclosure_tests {
             );
         }
         // An uncomputable drift for the second vault (disclosed for the root).
-        record_watch_reconciliation_debt(
+        record_vault_reconciliation_debt(
             Some(&db_path),
             &second,
             std::slice::from_ref(&second),
             Some("injected"),
         );
-        record_watch_reconciliation_debt(Some(&db_path), &first, &[], None);
+        record_vault_reconciliation_debt(Some(&db_path), &first, &[], None);
 
         let (skipped, _) = skipped_notes_status_json(Some(&db_path));
         assert_eq!(
@@ -8467,7 +8516,7 @@ mod watch_reconciliation_disclosure_tests {
             })
             .collect();
         persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
-        record_watch_reconciliation_debt(
+        record_vault_reconciliation_debt(
             Some(&db_path),
             &vault_root,
             &[vault_root.join("z-owed.md")],
@@ -8508,7 +8557,7 @@ mod watch_reconciliation_disclosure_tests {
             "{skipped}"
         );
 
-        record_watch_reconciliation_debt(
+        record_vault_reconciliation_debt(
             Some(&db_path),
             &vault_root,
             &[vault_root.join("z-owed.md")],
@@ -8524,6 +8573,66 @@ mod watch_reconciliation_disclosure_tests {
             skipped["paths"][0],
             serde_json::json!(vault_root.join("z-owed.md").to_string_lossy()),
             "{skipped}"
+        );
+    }
+
+    /// nw-664 review: a vault and a repo at the SAME root keep separate debt
+    /// and memory. Unprefixed keys let the code watcher's success clear the
+    /// vault's owed notes, and a repo removal wipe the vault's mtimes. Code
+    /// debt is also never mirrored into the skipped-NOTES list.
+    #[test]
+    fn code_and_vault_watch_state_at_one_root_do_not_clobber_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let root = dir.path().join("shared");
+        let note = root.join("Owed.md");
+        record_vault_reconciliation_debt(
+            Some(&db_path),
+            &root,
+            std::slice::from_ref(&note),
+            Some("boom"),
+        );
+        update_skipped_notes_sidecar(&db_path, |mut sidecar| {
+            sidecar.unindexable_mtimes.insert(
+                root.join("Broken.md").to_string_lossy().into_owned(),
+                "t".into(),
+            );
+            Some(sidecar)
+        });
+        record_code_reconciliation_debt(
+            &db_path,
+            &root,
+            vec![SkippedFile::new(
+                root.join("src/a.js").to_string_lossy().into_owned(),
+                SkipReasonCode::Other,
+                format!("{WATCH_RECONCILIATION_PENDING_REASON}: code"),
+            )],
+        );
+        record_code_unindexable_stamps(&db_path, &[], &[(root.join("src/x.js"), "1:2".into())]);
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        assert_eq!(sidecar.reconciliation_pending.len(), 2, "{sidecar:?}");
+        assert_eq!(
+            sidecar
+                .skipped
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            vec![note.to_string_lossy().into_owned()],
+            "only vault debt is mirrored as a skipped note"
+        );
+
+        record_code_reconciliation_debt(&db_path, &root, Vec::new());
+        forget_repo_watch_state(&db_path, &root);
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        assert_eq!(
+            sidecar.reconciliation_pending.keys().collect::<Vec<_>>(),
+            vec![&root.to_string_lossy().into_owned()],
+            "the vault's debt survives the code watcher's clear and the repo's removal"
+        );
+        assert_eq!(
+            sidecar.unindexable_mtimes.keys().collect::<Vec<_>>(),
+            vec![&root.join("Broken.md").to_string_lossy().into_owned()],
+            "the vault's memory survives; the repo's is forgotten"
         );
     }
 }
