@@ -1215,7 +1215,7 @@ CLI surface (full inventory):
 
 | Command | Effect |
 |---|---|
-| `nestweaver brain add <path> [--name N] [--no-watch]` | Detect, register, index, start watching. |
+| `nestweaver brain add <path> [--name N] [--no-watch]` | Detect, register, index, start watching. The name must be unique in the database (ignoring case): registering it at a second root is refused, so two folders with the same directory name need `--name` (nw-608). |
 | `nestweaver brain list` | Pretty-printed source table with status. |
 | `nestweaver brain status [name]` | Detailed health: last index, file counts, watcher state, recent errors. |
 | `nestweaver brain remove <name> [--keep-data]` | Stop watching, unregister, optionally drop nodes/edges from graph. |

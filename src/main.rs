@@ -8072,6 +8072,13 @@ enum ExtensionCommands {
     },
 }
 
+/// nw-608: one help text for every `--name` that registers a vault. Names are
+/// unique per database (compared case-insensitively, like vault selectors), so
+/// two folders that share a directory name now need `--name` on the second.
+const VAULT_NAME_HELP: &str = "Friendly name for the vault (default: directory name). \
+Must be unique in the database, ignoring case: a second vault whose folder has the \
+same name needs its own --name";
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum BrainCommands {
@@ -8080,7 +8087,7 @@ enum BrainCommands {
     Add {
         /// Path to the vault directory.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
@@ -8176,7 +8183,7 @@ enum BrainCommands {
     Watch {
         /// Vault directory to watch.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID")]
         instance: Option<String>,
@@ -8208,7 +8215,7 @@ enum BrainCommands {
     Refresh {
         /// Vault directory to refresh.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,

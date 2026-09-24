@@ -195,6 +195,14 @@ pub fn resolve_repo_filter(
 /// selector and `--vault` is not. The precedence deliberately matches
 /// `resolve_repo_selector`'s (exact UID, then case-insensitive exact name,
 /// then exact root path), and it is exact-only — no substring leg.
+/// The form a vault name is compared in wherever it selects a vault. Shared by
+/// [`resolve_vault_filter`] and the duplicate-name guard
+/// (`vault_registration::refuse_duplicate_vault_name`, nw-608) so a name the
+/// guard admits can never be ambiguous to a selector.
+pub fn vault_name_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
 pub fn resolve_vault_filter(
     store: &GraphStore,
     selectors: &[String],
@@ -205,12 +213,12 @@ pub fn resolve_vault_filter(
     selectors
         .iter()
         .map(|selector| {
-            let needle = selector.to_lowercase();
+            let needle = vault_name_key(selector);
             let matches: Vec<&nestweaver_schema::Vault> = vaults
                 .iter()
                 .filter(|vault| {
                     vault.uid == *selector
-                        || vault.name.to_lowercase() == needle
+                        || vault_name_key(&vault.name) == needle
                         || vault.root_path == *selector
                 })
                 .collect();
