@@ -26693,6 +26693,59 @@ mod seed_cap_disclosure_tests {
     use nestweaver_engine::query::SEED_NAME_MATCH_LIMIT;
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
+    /// nw-609, MCP (and therefore daemon) route. The engine fix lives in the
+    /// shared seed resolution; this pins that the `brain_context` payload the
+    /// daemon serves carries it: a `vlt:` seed used to answer
+    /// `seeds_expanded: 0` with an empty `connected` and no error.
+    #[test]
+    fn a_vault_seed_expands_on_the_brain_context_payload() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:v".to_string(),
+                name: "v".to_string(),
+                root_path: "/tmp/v".to_string(),
+                instance_id: "local".to_string(),
+            })
+            .unwrap();
+        for i in 0..2 {
+            store
+                .insert_note(&Note {
+                    uid: format!("note:v:{i}"),
+                    vault_uid: "vlt:v".to_string(),
+                    file_path: format!("N{i}.md"),
+                    title: format!("N{i}"),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: format!("h{i}"),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        let payload = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["vlt:v"], "token_budget": 5000 }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(payload["seeds_expanded"], json!(2), "{payload}");
+        assert_eq!(payload["seeds_truncated"], json!(false), "{payload}");
+        let connected = payload["connected"].as_array().expect("connected array");
+        assert!(
+            connected.iter().any(|n| n["uid"] == json!("note:v:0")),
+            "the vault's notes reach the agent-visible list: {payload}"
+        );
+    }
+
     /// `count` distinct symbols whose names all contain `validate`, plus one
     /// control that does not — so a total that accidentally counted the whole
     /// symbol table is caught rather than passing by coincidence. Mirrors the

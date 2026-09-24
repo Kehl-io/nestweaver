@@ -8276,7 +8276,8 @@ enum BrainCommands {
     },
     /// Unified PPR context across code + notes. Seeds may be note titles,
     /// tag names (with or without #), symbol names, or any UID
-    /// (sym:/note:/head:/sec:/tag:/repo:/vlt:).
+    /// (sym:/note:/head:/sec:/tag:/repo:/vlt:). A vlt: or repo: UID expands
+    /// to its member notes/symbols; the most central few stay seeds.
     Context {
         /// Seed strings to anchor the PPR walk.
         #[arg(required = true)]

@@ -652,6 +652,20 @@ impl SeedNameMatchTally {
         self.matched += count;
     }
 
+    /// Fold one container-seed expansion (nw-609: a `vlt:` / `repo:` UID
+    /// that expanded to its members) into the tally. Same cap, same disclosure: a
+    /// vault is one more input that names many candidates, and a second cap
+    /// with its own fields is how two spellings of "the seed set was cut"
+    /// would come to disagree.
+    fn record_expansion(&mut self, matched: usize, kept: usize) {
+        self.applicable = true;
+        self.resolved += kept;
+        self.matched += matched;
+        if matched > kept {
+            self.truncated = true;
+        }
+    }
+
     /// The honest match total, or `None` when no bare-name input was resolved
     /// and there is therefore nothing to disclose.
     fn total(&self) -> Option<usize> {
@@ -1861,7 +1875,9 @@ pub struct BrainContextResult {
     ///
     /// `None` when no bare-name input reached symbol search — UID, tag, note
     /// title, project and semantic-only seeds are not capped by this bound and
-    /// must not be described as if they were.
+    /// must not be described as if they were. The one UID exception is a
+    /// container seed (`vlt:` / `repo:`, nw-609), which expands to its
+    /// members and IS cut by this same cap, so it counts its members here.
     ///
     /// [`SearchTotal`]: nestweaver_store::tantivy_index::SearchTotal
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2269,6 +2285,10 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // title and project seeds are exhaustive, so an inapplicable tally reports
     // nothing rather than a misleading `0 of 0`.
     let mut seed_name_tally = SeedNameMatchTally::default();
+    // nw-609: the member lists `vlt:` / `repo:` seeds expanded to, kept apart
+    // so the seed set can be cut to each container's most central members
+    // once PPR has scored them.
+    let mut container_expansions: Vec<Vec<String>> = Vec::new();
 
     for raw in inputs {
         let trimmed = raw.trim();
@@ -2286,12 +2306,32 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             || trimmed.starts_with("vlt:")
             || trimmed.starts_with("proj:")
         {
-            if brain_seed_uid_exists(store, trimmed)? {
-                seed_uids.push(trimmed.to_string());
-                resolved_inputs.push(trimmed.to_string());
-            } else {
+            if !brain_seed_uid_exists(store, trimmed)? {
                 unresolved.push(raw.clone());
+                continue;
             }
+            // nw-609. A `vlt:` (or `repo:`) seed used to pass the existence
+            // check above and then evaporate -- exit 0, `seeds_expanded: 0`,
+            // `connected: []` -- because the container node is in no PPR
+            // scope and renders as nothing. It now expands to its members
+            // (every one personalizes PPR; only the most central stay SEEDS
+            // -- see `container_expansions` below). A container with no
+            // members contributes nothing and is reported unresolved, so a
+            // lone empty-vault seed is the "No seeds resolved" error rather
+            // than an empty success.
+            if let Some(members) = container_seed_members(store, trimmed)? {
+                if members.is_empty() {
+                    unresolved.push(raw.clone());
+                } else {
+                    // Joined into `seed_uids` after the loop, so the loop's
+                    // own seeds can be told apart from container sweep-ins.
+                    container_expansions.push(members);
+                    resolved_inputs.push(trimmed.to_string());
+                }
+                continue;
+            }
+            seed_uids.push(trimmed.to_string());
+            resolved_inputs.push(trimmed.to_string());
             continue;
         }
 
@@ -2433,13 +2473,20 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         unresolved.push(raw.clone());
     }
 
+    // nw-609: everything pushed so far was named by an input directly; a
+    // node named that way stays a seed however its container's cut falls.
+    let directly_named: std::collections::HashSet<String> = seed_uids.iter().cloned().collect();
+    for members in &container_expansions {
+        seed_uids.extend(members.iter().cloned());
+    }
+
     // Dedupe seeds.
     let mut seen = std::collections::HashSet::new();
     seed_uids.retain(|u| seen.insert(u.clone()));
     // Snapshot BEFORE semantic blending. KNN extras must not occupy the
     // connected-list prefix the caller actually reads under a tight
     // `--token-budget` (nw-584).
-    let direct_seed_uids = seed_uids.clone();
+    let mut direct_seed_uids = seed_uids.clone();
 
     // ── Semantic seed blending ────────────────────────────────────────────
     // When an embedding model is available and the semantic weight is nonzero
@@ -2587,6 +2634,28 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             cancel.map(|flag| flag.as_ref()),
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // nw-609: bound each container expansion to its most central members.
+    // Every member personalized the walk above, so the PPR score of a member
+    // IS its centrality within its own container (notes the rest of the vault
+    // links to accumulate mass) -- a ranking no stored score provides for
+    // notes, since global PageRank is code-only. The cap is the one seed-resolution cap
+    // (`SEED_NAME_MATCH_LIMIT`) and the cut is disclosed through the same
+    // `seeds_truncated` / `seed_matches_total` fields a bare name uses.
+    // Demoted members are not dropped: they stay PPR candidates and surface
+    // in `connected` in score order, bounded by the caller's limit/budget.
+    if !container_expansions.is_empty() {
+        let demoted = cap_container_expansions(
+            &container_expansions,
+            &ppr,
+            &directly_named,
+            &mut seed_name_tally,
+        );
+        if !demoted.is_empty() {
+            seed_uids.retain(|uid| !demoted.contains(uid));
+            direct_seed_uids.retain(|uid| !demoted.contains(uid));
+        }
+    }
 
     // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
     //
@@ -2969,6 +3038,75 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
     }
     let tags = store.list_tags(None).map_err(|e| anyhow::anyhow!(e))?;
     Ok(tags.into_iter().find(|t| t.name == needle).map(|t| t.uid))
+}
+
+/// Member UIDs of a container seed, in stable UID order (nw-609): a vault's
+/// notes for `vlt:`, a repository's symbols for `repo:`. `None` for any other
+/// UID form, which seeds PPR as itself.
+///
+/// Both containers had the same defect: neither a Vault nor a Repo node is in
+/// any PPR scope, and `render_brain_node` renders neither, so the seed passed
+/// the existence check and then produced nothing. `proj:` is NOT a container
+/// here -- Project nodes and their membership edges are in
+/// `GraphScope::unified()`, so PPR already expands them.
+///
+/// `list_notes_with_integrity` rather than `list_notes_lite`, which swallows
+/// query errors into an empty list: an error here must surface, not
+/// masquerade as an empty vault and become a "No seeds resolved" answer
+/// about the wrong thing.
+fn container_seed_members(
+    store: &GraphStore,
+    uid: &str,
+) -> Result<Option<Vec<String>>, anyhow::Error> {
+    let mut uids: Vec<String> = if uid.starts_with("vlt:") {
+        let (notes, _integrity) = store
+            .list_notes_with_integrity(Some(uid))
+            .map_err(|e| anyhow::anyhow!(e))?;
+        notes.into_iter().map(|n| n.uid).collect()
+    } else if uid.starts_with("repo:") {
+        store
+            .symbol_lite_by_repo(uid)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .into_iter()
+            .map(|(uid, _, _)| uid)
+            .collect()
+    } else {
+        return Ok(None);
+    };
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(Some(uids))
+}
+
+/// Keep each container expansion's top [`SEED_NAME_MATCH_LIMIT`] members by PPR
+/// score (ties by UID, so the cut is deterministic) and return the members
+/// that must leave the seed set. Records each expansion in `tally`.
+fn cap_container_expansions(
+    container_expansions: &[Vec<String>],
+    ppr: &[(String, f64)],
+    directly_named: &std::collections::HashSet<String>,
+    tally: &mut SeedNameMatchTally,
+) -> std::collections::HashSet<String> {
+    let score: std::collections::HashMap<&str, f64> =
+        ppr.iter().map(|(uid, s)| (uid.as_str(), *s)).collect();
+    let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for members in container_expansions {
+        let mut ranked: Vec<&String> = members.iter().collect();
+        ranked.sort_by(|a, b| {
+            let sa = score.get(a.as_str()).copied().unwrap_or(0.0);
+            let sb = score.get(b.as_str()).copied().unwrap_or(0.0);
+            sb.total_cmp(&sa).then_with(|| a.cmp(b))
+        });
+        let take = ranked.len().min(SEED_NAME_MATCH_LIMIT);
+        tally.record_expansion(ranked.len(), take);
+        kept.extend(ranked[..take].iter().map(|uid| (*uid).clone()));
+        candidates.extend(ranked[take..].iter().map(|uid| (*uid).clone()));
+    }
+    candidates
+        .into_iter()
+        .filter(|uid| !kept.contains(uid) && !directly_named.contains(uid))
+        .collect()
 }
 
 /// Existence is an identity check, not rendering: rendering may supply
@@ -6286,5 +6424,280 @@ mod hardening_order_tests {
             0.0,
         );
         assert_eq!(got[0].0, "z");
+    }
+}
+
+#[cfg(test)]
+mod vault_seed_tests {
+    //! nw-609. `brain context vlt:<uid>` exited 0 with `seeds_expanded: 0` and
+    //! `connected: []`: the seed passed the existence check, but a Vault node
+    //! is in no PPR scope and `render_brain_node` renders no `vlt:` UID, so
+    //! the only seed evaporated between resolution and output.
+    use nestweaver_schema::{Note, NoteKind, Tag, Vault};
+    use nestweaver_store::GraphStore;
+
+    use super::{
+        HybridSearchConfig, SEED_NAME_MATCH_LIMIT, build_brain_context_hybrid_with_aliases,
+    };
+
+    fn note(uid: &str, vault: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: vault.to_string(),
+            file_path: format!("{title}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: uid.to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn vault(uid: &str) -> Vault {
+        Vault {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            root_path: format!("/tmp/{uid}"),
+            instance_id: "local".to_string(),
+        }
+    }
+
+    fn run(store: &GraphStore, seed: &str) -> anyhow::Result<super::BrainContextResult> {
+        build_brain_context_hybrid_with_aliases(
+            store,
+            &[seed.to_string()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn fixture() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault("vlt:a")).unwrap();
+        store.insert_vault(&vault("vlt:b")).unwrap();
+        store.insert_vault(&vault("vlt:empty")).unwrap();
+        for i in 0..3 {
+            store
+                .insert_note(&note(&format!("note:a:{i}"), "vlt:a", &format!("A{i}")))
+                .unwrap();
+        }
+        store.insert_note(&note("note:b:0", "vlt:b", "B0")).unwrap();
+        store
+            .insert_tag(&Tag {
+                uid: "tag:a:x".to_string(),
+                vault_uid: "vlt:a".to_string(),
+                name: "x".to_string(),
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn a_vault_seed_expands_to_its_member_notes() {
+        let store = fixture();
+        let result = run(&store, "vlt:a").expect("an existing vault must not be a no-op");
+        let mut seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
+        seeds.sort_unstable();
+        assert_eq!(
+            seeds,
+            ["note:a:0", "note:a:1", "note:a:2"],
+            "the vault's own notes, and only them (note:b:0 is another vault's)"
+        );
+        assert!(result.unresolved_seeds.is_empty());
+        // Nothing was cut: the disclosure says so rather than staying silent.
+        assert_eq!(result.seeds_truncated, Some(false));
+        assert_eq!(result.seed_matches_total, Some(3));
+    }
+
+    /// Eight notes; the five with the HIGHEST UIDs are wikilinked by every
+    /// other note. A UID-order cut would keep `00..04`; a centrality cut keeps
+    /// the hubs `03..07`, so this pins that the kept seeds are the vault's
+    /// most central members, not an arbitrary slice.
+    #[test]
+    fn a_vault_seed_is_bounded_and_discloses_the_cut() {
+        use nestweaver_schema::Section;
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault("vlt:big")).unwrap();
+        let members = SEED_NAME_MATCH_LIMIT + 3;
+        let uid = |i: usize| format!("note:big:{i:02}");
+        for i in 0..members {
+            store
+                .insert_note(&note(&uid(i), "vlt:big", &format!("N{i:02}")))
+                .unwrap();
+            store
+                .insert_section(&Section {
+                    uid: format!("sec:big:{i:02}"),
+                    note_uid: uid(i),
+                    heading_uid: None,
+                    start_line: 1,
+                    end_line: 2,
+                    text_hash: "t".to_string(),
+                    text_content: "body".to_string(),
+                    word_count: 1,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+        let section_edges: Vec<(String, String)> = (0..members)
+            .map(|i| (uid(i), format!("sec:big:{i:02}")))
+            .collect();
+        let section_edges: Vec<(&str, &str)> = section_edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        store
+            .batch_insert_note_section_edges(&section_edges)
+            .unwrap();
+        let hubs = (members - SEED_NAME_MATCH_LIMIT)..members;
+        let mut links: Vec<(String, String)> = Vec::new();
+        for from in 0..members {
+            for to in hubs.clone() {
+                if from != to {
+                    links.push((format!("sec:big:{from:02}"), uid(to)));
+                }
+            }
+        }
+        let links: Vec<(&str, &str, f32, &str, &str)> = links
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str(), 1.0, "N", "N"))
+            .collect();
+        store.batch_insert_wikilink_to_note_edges(&links).unwrap();
+
+        let result = run(&store, "vlt:big").unwrap();
+        let mut kept: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
+        kept.sort_unstable();
+        let expected: Vec<String> = hubs.clone().map(uid).collect();
+        assert_eq!(
+            kept, expected,
+            "the hubs are the vault's most central notes"
+        );
+        assert_eq!(result.seeds_truncated, Some(true));
+        assert_eq!(result.seed_matches_total, Some(members));
+        assert_eq!(result.seed_resolution_limit, Some(SEED_NAME_MATCH_LIMIT));
+        // The cut demotes, it does not drop: the rest are still reachable.
+        let connected: std::collections::HashSet<&str> =
+            result.connected.iter().map(|n| n.uid.as_str()).collect();
+        for i in 0..(members - SEED_NAME_MATCH_LIMIT) {
+            assert!(
+                connected.contains(uid(i).as_str()),
+                "{} demoted, not lost",
+                uid(i)
+            );
+        }
+    }
+
+    /// A note named directly stays a seed even when its vault's cut would
+    /// have demoted it.
+    #[test]
+    fn a_directly_named_note_survives_its_vaults_cut() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault("vlt:big")).unwrap();
+        for i in 0..(SEED_NAME_MATCH_LIMIT + 3) {
+            store
+                .insert_note(&note(
+                    &format!("note:big:{i:02}"),
+                    "vlt:big",
+                    &format!("N{i:02}"),
+                ))
+                .unwrap();
+        }
+        let last = format!("note:big:{:02}", SEED_NAME_MATCH_LIMIT + 2);
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["vlt:big".to_string(), last.clone()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.seeds.iter().any(|n| n.uid == last),
+            "{last} was named directly: {:?}",
+            result.seeds
+        );
+    }
+
+    #[test]
+    fn a_vault_with_no_notes_is_an_error_not_an_empty_success() {
+        let store = fixture();
+        let err = run(&store, "vlt:empty").expect_err("an empty vault expands to nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("No seeds resolved."), "{msg}");
+        assert!(msg.contains("vlt:empty"), "{msg}");
+    }
+
+    /// The same defect on the `repo:` twin: a Repo node is in no PPR scope
+    /// either, so `repo:<uid>` was the identical silent no-op.
+    #[test]
+    fn a_repo_seed_expands_to_its_member_symbols() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:r".to_string(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: Some("r".to_string()),
+                root_path: None,
+            })
+            .unwrap();
+        for (uid, repo) in [("sym:r:f", "repo:r"), ("sym:other:g", "repo:other")] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: uid.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: repo.to_string(),
+                    file_path: "src/f.rs".to_string(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: "fn f()".to_string(),
+                    summary: None,
+                    content_hash: "h".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        let result = run(&store, "repo:r").expect("an existing repo must not be a no-op");
+        let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(seeds, ["sym:r:f"]);
+        assert_eq!(result.seeds_truncated, Some(false));
+    }
+
+    /// COUNTERWEIGHT: `note:` and `tag:` UID seeds still expand exactly as
+    /// before, and are not routed through the vault expansion.
+    #[test]
+    fn note_and_tag_seeds_still_expand() {
+        let store = fixture();
+        let result = run(&store, "note:a:1").unwrap();
+        let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(seeds, ["note:a:1"]);
+        assert_eq!(result.seeds_truncated, None, "a UID seed is not capped");
+        let result = run(&store, "tag:a:x").unwrap();
+        let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(seeds, ["tag:a:x"]);
     }
 }
