@@ -7091,6 +7091,17 @@ fn daemon_autostart_keeps_both_daemons_alive_when_alternating_temp_dbs() {
         ] {
             let mut search = daemon_cmd();
             isolate_nestweaver_cmd(&mut search, &home);
+            // nw-528 flake fix: `isolate_nestweaver_cmd` sets a 5s ephemeral
+            // idle timeout, deliberately short for the tests it was written
+            // for. THIS test alternates between two DBs across several
+            // rounds plus a kill/respawn counterweight; on a loaded CI
+            // runner (e.g. booting the other DB's daemon) a >5s gap between
+            // uses of one DB would let it idle-exit, changing its PID and
+            // producing a false "PID must stay stable" failure that has
+            // nothing to do with the pidfile-reap regression this test
+            // guards. Override to a budget this test's own runtime can't
+            // plausibly exceed between touches of the same DB.
+            search.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "120");
             let output = search
                 .args(["search", "fn", "--db", &db_path.display().to_string()])
                 .output()
@@ -7144,6 +7155,7 @@ fn daemon_autostart_keeps_both_daemons_alive_when_alternating_temp_dbs() {
 
     let mut revive = daemon_cmd();
     isolate_nestweaver_cmd(&mut revive, &home);
+    revive.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "120");
     let revive_output = revive
         .args(["search", "fn", "--db", &db_a.display().to_string()])
         .output()
@@ -7169,6 +7181,7 @@ fn daemon_autostart_keeps_both_daemons_alive_when_alternating_temp_dbs() {
 
     let mut check_b = daemon_cmd();
     isolate_nestweaver_cmd(&mut check_b, &home);
+    check_b.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "120");
     let check_b_output = check_b
         .args(["search", "fn", "--db", &db_b.display().to_string()])
         .output()
@@ -7182,9 +7195,11 @@ fn daemon_autostart_keeps_both_daemons_alive_when_alternating_temp_dbs() {
 
     let mut stop_a = daemon_action_cmd(&db_a, "stop");
     isolate_nestweaver_cmd(&mut stop_a, &home);
+    stop_a.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "120");
     let _ = stop_a.ok();
     let mut stop_b = daemon_action_cmd(&db_b, "stop");
     isolate_nestweaver_cmd(&mut stop_b, &home);
+    stop_b.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "120");
     let _ = stop_b.ok();
 }
 
