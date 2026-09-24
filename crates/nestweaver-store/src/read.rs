@@ -3246,8 +3246,12 @@ impl GraphStore {
     /// seed is bounded BEFORE the walk, exactly as `project_context` bounds a
     /// project with [`Self::list_project_symbol_uids_by_pagerank`]; the total
     /// is returned so the caller can disclose the cut. Unlike that twin this
-    /// fails closed -- a query error or a dirty publication is an error, not
-    /// an empty repository.
+    /// fails closed -- a query error, or a publication that blocks ranking,
+    /// is an error, not an empty repository. The gate is PPR's own
+    /// [`Self::index_publication_blocks_ranking`], not the raw dirty marker:
+    /// a young brain-watcher batch (nw-475 Q7) is answered through, exactly
+    /// as it is for every other seed's walk. A never-ranked symbol (NULL
+    /// score) ranks as 0.0, so it cannot top the cut by sorting first.
     pub fn repo_symbol_seed_candidates(
         &self,
         repo_uid: &str,
@@ -3257,7 +3261,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -3282,7 +3286,7 @@ impl GraphStore {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Symbol) WHERE s.repo_uid = $repo \
-                 RETURN s.uid ORDER BY s.pagerank_score DESC, s.uid ASC LIMIT $limit",
+                 RETURN s.uid ORDER BY coalesce(s.pagerank_score, 0.0) DESC, s.uid ASC LIMIT $limit",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         let result = conn

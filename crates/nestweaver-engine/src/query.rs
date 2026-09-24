@@ -2652,6 +2652,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             &container_expansions,
             &ppr,
             &directly_named,
+            container_member_limit(),
             &mut seed_name_tally,
         );
         seed_uids.retain(|uid| !cut.demoted.contains(uid));
@@ -3043,13 +3044,39 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
     Ok(tags.into_iter().find(|t| t.name == needle).map(|t| t.uid))
 }
 
-/// How many members of one container seed (nw-609) may reach hydration, and
-/// how many symbols a `repo:` seed may put into the walk (its top symbols by
-/// stored PageRank) -- mirroring `project_context`'s
-/// `PROJECT_SYMBOL_SEED_LIMIT`. A repository can hold tens of thousands of
-/// symbols; nw-609's review found every one of them personalizing PPR and
-/// then hydrated, before any limit or budget (nw-322).
+/// Per container seed (nw-609), PER CONTAINER -- two `vlt:` seeds get this
+/// bound each:
+///
+/// - a `repo:` seed is pre-ranked by stored symbol PageRank and only its top
+///   `CONTAINER_MEMBER_LIMIT` symbols enter the walk at all (mirroring
+///   `project_context`'s `PROJECT_SYMBOL_SEED_LIMIT`);
+/// - of the members that entered the walk, at most `CONTAINER_MEMBER_LIMIT`
+///   stay in its result -- [`SEED_NAME_MATCH_LIMIT`] as seeds, the rest as
+///   non-seed candidates. Every member beyond that is dropped from BOTH
+///   `seeds` and `connected`, before hydration.
+///
+/// A repository can hold tens of thousands of symbols; nw-609's review found
+/// every one personalizing PPR and then hydrated, before any limit or budget
+/// (nw-322).
 pub const CONTAINER_MEMBER_LIMIT: usize = 100;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: lowers [`CONTAINER_MEMBER_LIMIT`] for this thread so an
+    /// end-to-end test can exercise the cut with a few dozen members instead
+    /// of thousands.
+    static CONTAINER_MEMBER_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`CONTAINER_MEMBER_LIMIT`], or the test override.
+fn container_member_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = CONTAINER_MEMBER_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    CONTAINER_MEMBER_LIMIT
+}
 
 /// A container seed's members as they enter the walk, and how many members
 /// the container holds in all (the disclosed `seed_matches_total`).
@@ -3060,7 +3087,7 @@ struct ContainerMembers {
 
 /// Members of a container seed (nw-609): a vault's notes for `vlt:`, a
 /// repository's top [`CONTAINER_MEMBER_LIMIT`] symbols by stored PageRank for
-/// `repo:`. `None` for any other UID form, which seeds PPR as itself.
+/// `repo:` (pre-ranked in the store, before the walk). `None` for any other UID form, which seeds PPR as itself.
 ///
 /// Both containers had the same defect: neither a Vault nor a Repo node is in
 /// any PPR scope, and `render_brain_node` renders neither, so the seed passed
@@ -3070,9 +3097,9 @@ struct ContainerMembers {
 ///
 /// Every vault note enters the walk: notes carry no stored centrality to
 /// pre-rank by (global PageRank is code-only), and the walk itself is what
-/// ranks them. What bounds the cost is the post-walk demotion in
-/// `build_brain_context_hybrid_with_aliases_capped`, which keeps demoted
-/// members out of fusion and hydration unless they score.
+/// ranks them. What bounds the cost is the post-walk cut in
+/// [`cap_container_expansions`], which drops every member beyond
+/// [`CONTAINER_MEMBER_LIMIT`] before fusion and hydration.
 ///
 /// `list_notes_with_integrity` rather than `list_notes_lite`, which swallows
 /// query errors into an empty list: an error here must surface, not
@@ -3089,7 +3116,7 @@ fn container_seed_members(
         notes.into_iter().map(|n| n.uid).collect()
     } else if uid.starts_with("repo:") {
         let (uids, total) = store
-            .repo_symbol_seed_candidates(uid, CONTAINER_MEMBER_LIMIT)
+            .repo_symbol_seed_candidates(uid, container_member_limit())
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(Some(ContainerMembers { uids, total }));
     } else {
@@ -3108,12 +3135,19 @@ struct ContainerCut {
     dropped: std::collections::HashSet<String>,
 }
 
-/// Keep each container expansion's top [`SEED_NAME_MATCH_LIMIT`] members by
-/// PPR score (ties by UID, so the cut is deterministic) as seeds. Of the
-/// rest, at most [`CONTAINER_MEMBER_LIMIT`] members in all stay in the result
-/// as non-seed candidates -- the best-scoring ones that clear
-/// `PPR_MIN_SCORE` -- and every other member is dropped from it. Records each
-/// expansion in `tally`.
+/// Per container: keep the top [`SEED_NAME_MATCH_LIMIT`] members by PPR
+/// score (ties by UID, so the cut is deterministic) as seeds; then, up to
+/// `member_limit` members in all, the best-scoring demoted members that
+/// clear `PPR_MIN_SCORE` stay in the result as non-seed candidates; every
+/// other member is dropped from the result -- from `seeds` AND `connected`.
+/// Records each expansion in `tally`.
+///
+/// A member some input named DIRECTLY is not ranked here at all: it is a
+/// seed regardless, and letting it take one of the container's slots made
+/// the result hold one seed fewer than the direct seed plus the container's
+/// disclosed count. The container's disclosed membership excludes it too.
+///
+/// Pure (no store), so the bound is unit-tested with a synthetic walk.
 ///
 /// nw-609 review: the non-seed bar alone does not bound this. Every member
 /// was a seed, so each still holds its own share of the personalization
@@ -3125,6 +3159,7 @@ fn cap_container_expansions(
     container_expansions: &[ContainerMembers],
     ppr: &[(String, f64)],
     directly_named: &std::collections::HashSet<String>,
+    member_limit: usize,
     tally: &mut SeedNameMatchTally,
 ) -> ContainerCut {
     let score: std::collections::HashMap<&str, f64> =
@@ -3134,25 +3169,41 @@ fn cap_container_expansions(
     let mut survivors: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
     for members in container_expansions {
-        let mut ranked: Vec<&String> = members.uids.iter().collect();
+        let named_members = members
+            .uids
+            .iter()
+            .filter(|uid| directly_named.contains(*uid))
+            .count();
+        let mut ranked: Vec<&String> = members
+            .uids
+            .iter()
+            .filter(|uid| !directly_named.contains(*uid))
+            .collect();
         ranked.sort_by(|a, b| score_of(b).total_cmp(&score_of(a)).then_with(|| a.cmp(b)));
         let take = ranked.len().min(SEED_NAME_MATCH_LIMIT);
-        // The container's full membership, not what entered the walk: a
-        // repo pre-ranked to its top symbols was cut there too.
-        tally.record_expansion(members.total.max(ranked.len()), take);
+        // The container's full membership (less the named members), not only
+        // what entered the walk: a repo pre-ranked to its top symbols was cut
+        // there too.
+        let matched = members
+            .total
+            .saturating_sub(named_members)
+            .max(ranked.len());
+        tally.record_expansion(matched, take);
         kept.extend(ranked[..take].iter().map(|uid| (*uid).clone()));
         survivors.extend(
             ranked[take..]
                 .iter()
                 .filter(|uid| score_of(uid) > nestweaver_store::PPR_MIN_SCORE)
-                .take(CONTAINER_MEMBER_LIMIT.saturating_sub(take))
+                .take(member_limit.saturating_sub(take))
                 .map(|uid| (*uid).clone()),
         );
         candidates.extend(ranked[take..].iter().map(|uid| (*uid).clone()));
     }
+    // `kept` wins over `candidates`: a member of two containers may be kept
+    // by one and cut by the other.
     let demoted: std::collections::HashSet<String> = candidates
         .into_iter()
-        .filter(|uid| !kept.contains(uid) && !directly_named.contains(uid))
+        .filter(|uid| !kept.contains(uid))
         .collect();
     let dropped = demoted
         .iter()
@@ -6719,6 +6770,50 @@ mod vault_seed_tests {
         );
     }
 
+    /// nw-609 review (e): a directly named note that is ALSO one of its
+    /// vault's most central members used to fill one of the vault's own seed
+    /// slots, so the result held one seed fewer than the direct seed plus the
+    /// vault's disclosed `seed_resolution` count. The container now ranks
+    /// only the members nobody named, so the two add up.
+    #[test]
+    fn a_directly_named_top_member_does_not_take_a_container_seed_slot() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault("vlt:big")).unwrap();
+        let members = SEED_NAME_MATCH_LIMIT + 3;
+        for i in 0..members {
+            store
+                .insert_note(&note(
+                    &format!("note:big:{i:02}"),
+                    "vlt:big",
+                    &format!("N{i:02}"),
+                ))
+                .unwrap();
+        }
+        // Scores tie, so UID order decides: `00` would be a container seed.
+        let first = "note:big:00".to_string();
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["vlt:big".to_string(), first.clone()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.seeds.iter().any(|n| n.uid == first));
+        assert_eq!(
+            result.seeds.len(),
+            1 + SEED_NAME_MATCH_LIMIT,
+            "the named note plus the vault's own {SEED_NAME_MATCH_LIMIT}: {:?}",
+            result.seeds
+        );
+        // The vault's disclosure counts what the VAULT contributed.
+        assert_eq!(result.seed_matches_total, Some(members - 1));
+    }
+
     #[test]
     fn a_vault_with_no_notes_is_an_error_not_an_empty_success() {
         let store = fixture();
@@ -6744,71 +6839,146 @@ mod vault_seed_tests {
         assert_eq!(result.seeds_truncated, Some(false));
     }
 
-    /// nw-609 review: every member personalizes PPR, and PPR returns every
-    /// seed regardless of score, so demoted members used to reach fusion and
-    /// hydration -- one `render_brain_node` lookup per member of a
-    /// 2000-note vault, before any limit or budget applied (the nw-322
-    /// hazard). A demoted member now survives only if it scores like any
-    /// other non-seed; everything hydrated is in `seeds` or `connected`.
+    fn members(uids: impl IntoIterator<Item = String>) -> super::ContainerMembers {
+        let uids: Vec<String> = uids.into_iter().collect();
+        super::ContainerMembers {
+            total: uids.len(),
+            uids,
+        }
+    }
+
+    /// nw-609 review: every member personalizes PPR and PPR returns every
+    /// seed regardless of score, so without the cut each member of a
+    /// 2000-note vault reached fusion and a `render_brain_node` lookup before
+    /// any limit or budget (nw-322). A synthetic walk where every member
+    /// clears the non-seed bar -- as each does, holding its own share of the
+    /// personalization mass -- keeps exactly `member_limit` of them.
     #[test]
-    fn a_large_vault_seed_hydrates_a_bounded_set() {
+    fn the_container_cut_keeps_member_limit_of_a_2000_member_walk() {
+        let uids: Vec<String> = (0..2000).map(|i| format!("note:v:{i:04}")).collect();
+        let ppr: Vec<(String, f64)> = uids.iter().map(|uid| (uid.clone(), 5e-4)).collect();
+        let mut tally = super::SeedNameMatchTally::default();
+        let cut = super::cap_container_expansions(
+            &[members(uids.clone())],
+            &ppr,
+            &std::collections::HashSet::new(),
+            100,
+            &mut tally,
+        );
+        assert_eq!(cut.demoted.len(), 2000 - SEED_NAME_MATCH_LIMIT);
+        assert_eq!(cut.dropped.len(), 2000 - 100, "only member_limit survive");
+        assert_eq!(tally.total(), Some(2000));
+        assert_eq!(tally.resolved(), Some(SEED_NAME_MATCH_LIMIT));
+        assert_eq!(tally.truncated(), Some(true));
+    }
+
+    /// nw-609 review (c): the demoted members that survive are the
+    /// best-scoring ones, not the first by UID; a member under the non-seed
+    /// bar never survives.
+    #[test]
+    fn surviving_demoted_members_are_chosen_by_score() {
+        // 12 members; score rises with the index, except `03` which is under
+        // the bar. Limit 8 = 5 seeds + 3 survivors.
+        let uids: Vec<String> = (0..12).map(|i| format!("note:v:{i:02}")).collect();
+        let ppr: Vec<(String, f64)> = uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| {
+                (
+                    uid.clone(),
+                    if i == 3 { 1e-6 } else { 0.01 * (i + 1) as f64 },
+                )
+            })
+            .collect();
+        let mut tally = super::SeedNameMatchTally::default();
+        let cut = super::cap_container_expansions(
+            &[members(uids.clone())],
+            &ppr,
+            &std::collections::HashSet::new(),
+            8,
+            &mut tally,
+        );
+        // Seeds: 11..07. Survivors: the next three by score, 06, 05, 04.
+        let kept: std::collections::BTreeSet<&str> = uids
+            .iter()
+            .map(String::as_str)
+            .filter(|uid| !cut.dropped.contains(*uid))
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            (4..12).map(|i| uids[i].as_str()).collect();
+        assert_eq!(kept, expected);
+        for uid in &uids[4..7] {
+            assert!(cut.demoted.contains(uid), "{uid} is a survivor, not a seed");
+        }
+    }
+
+    /// The one end-to-end check of the cut, through the real walk and store
+    /// with the limit lowered to 10 via the test seam: a 30-note vault keeps
+    /// at most 10 members in seeds + connected, and a 30-symbol repo lets
+    /// only its top 10 by stored PageRank into the walk at all.
+    #[test]
+    fn container_seeds_hydrate_at_most_the_member_limit() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::CONTAINER_MEMBER_LIMIT_OVERRIDE.with(|limit| limit.set(None));
+            }
+        }
+        super::CONTAINER_MEMBER_LIMIT_OVERRIDE.with(|limit| limit.set(Some(10)));
+        let _reset = Reset;
+
         let store = GraphStore::in_memory().unwrap();
-        store.insert_vault(&vault("vlt:huge")).unwrap();
-        for i in 0..2000 {
+        store.insert_vault(&vault("vlt:v")).unwrap();
+        for i in 0..30 {
             store
                 .insert_note(&note(
-                    &format!("note:huge:{i:04}"),
-                    "vlt:huge",
-                    &format!("H{i:04}"),
+                    &format!("note:v:{i:02}"),
+                    "vlt:v",
+                    &format!("V{i:02}"),
                 ))
                 .unwrap();
         }
-        let result = run(&store, "vlt:huge").unwrap();
-        assert_eq!(result.seeds.len(), SEED_NAME_MATCH_LIMIT);
-        assert_eq!(result.seed_matches_total, Some(2000));
-        assert_eq!(result.seeds_truncated, Some(true));
-        assert!(
-            result.connected.len() <= super::CONTAINER_MEMBER_LIMIT,
-            "hydrated {} demoted members: demotion must keep them out of \
-             fusion and hydration",
-            result.connected.len()
-        );
-    }
-
-    /// nw-609 review, `repo:` twin: a repository can hold tens of thousands
-    /// of symbols, so its members are pre-ranked by stored PageRank to a
-    /// bounded set BEFORE PPR (as `project_context` does), and the disclosure
-    /// still counts every member.
-    #[test]
-    fn a_large_repo_seed_is_pre_ranked_and_bounded() {
-        let store = GraphStore::in_memory().unwrap();
         store.insert_repo(&repo("repo:big")).unwrap();
-        for i in 0..2000 {
-            let mut sym = symbol(&format!("sym:big:{i:04}"), "repo:big");
+        for i in 0..30 {
+            let mut sym = symbol(&format!("sym:big:{i:02}"), "repo:big");
             // Highest stored PageRank on the HIGHEST uids, so a UID-order
             // cut and a PageRank cut disagree.
-            sym.pagerank_score = Some(i as f64);
+            sym.pagerank_score = Some(f64::from(i));
             store.insert_symbol(&sym).unwrap();
         }
+
+        let result = run(&store, "vlt:v").unwrap();
+        assert_eq!(result.seeds.len(), SEED_NAME_MATCH_LIMIT);
+        assert_eq!(result.seed_matches_total, Some(30));
+        let hydrated: std::collections::HashSet<&str> = result
+            .seeds
+            .iter()
+            .chain(&result.connected)
+            .map(|n| n.uid.as_str())
+            .collect();
+        assert!(
+            hydrated.len() <= 10,
+            "hydrated {}: {hydrated:?}",
+            hydrated.len()
+        );
+
+        // What enters the walk for a repo: only its top 10 by stored PageRank.
+        let walked = super::container_seed_members(&store, "repo:big")
+            .unwrap()
+            .expect("repo: is a container");
+        assert_eq!(walked.total, 30);
+        let mut walked_uids = walked.uids.clone();
+        walked_uids.sort_unstable();
+        let expected: Vec<String> = (20..30).map(|i| format!("sym:big:{i:02}")).collect();
+        assert_eq!(walked_uids, expected);
+
         let result = run(&store, "repo:big").unwrap();
         assert_eq!(result.seeds.len(), SEED_NAME_MATCH_LIMIT);
-        assert_eq!(result.seed_matches_total, Some(2000));
-        assert_eq!(result.seeds_truncated, Some(true));
-        // Nothing outside the stored-PageRank top 100 entered the walk, so
-        // nothing outside it is hydrated -- seed or connected.
+        assert_eq!(result.seed_matches_total, Some(30));
         for node in result.seeds.iter().chain(&result.connected) {
             let index: usize = node.uid.rsplit(':').next().unwrap().parse().unwrap();
-            assert!(
-                index >= 1900,
-                "{} is outside the PageRank top 100",
-                node.uid
-            );
+            assert!(index >= 20, "{} is outside the PageRank top 10", node.uid);
         }
-        assert!(
-            result.connected.len() <= super::CONTAINER_MEMBER_LIMIT,
-            "hydrated {} members",
-            result.connected.len()
-        );
     }
 
     /// COUNTERWEIGHT: `note:` and `tag:` UID seeds still expand exactly as

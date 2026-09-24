@@ -2252,6 +2252,101 @@ mod tests {
         );
     }
 
+    /// nw-609 review: the `repo:` context seed's candidate query returns the
+    /// repository's top symbols by stored PageRank (ties by UID) and its full
+    /// symbol count; another repository's symbols are not counted.
+    #[test]
+    fn repo_symbol_seed_candidates_ranks_by_pagerank_and_counts_every_member() {
+        let store = test_store();
+        for i in 0..10u32 {
+            let mut symbol = make_symbol(&format!("sym:r:{i}"), &format!("f{i}"));
+            symbol.repo_uid = "repo:r".to_string();
+            symbol.pagerank_score = Some(f64::from(i));
+            store.insert_symbol(&symbol).unwrap();
+        }
+        let mut other = make_symbol("sym:other", "g");
+        other.pagerank_score = Some(1000.0);
+        store.insert_symbol(&other).unwrap();
+        let (uids, total) = store.repo_symbol_seed_candidates("repo:r", 3).unwrap();
+        assert_eq!(uids, ["sym:r:9", "sym:r:8", "sym:r:7"]);
+        assert_eq!(total, 10);
+    }
+
+    /// nw-609 review: a symbol never ranked (NULL `pagerank_score`) must not
+    /// win the top of the cut by sorting first under DESC.
+    #[test]
+    fn repo_symbol_seed_candidates_ranks_unscored_symbols_last() {
+        let store = test_store();
+        for (uid, score) in [
+            ("sym:r:a", Some(0.5)),
+            ("sym:r:b", Some(0.9)),
+            ("sym:r:c", None),
+            ("sym:r:d", None),
+        ] {
+            let mut symbol = make_symbol(uid, uid);
+            symbol.repo_uid = "repo:r".to_string();
+            symbol.pagerank_score = score;
+            store.insert_symbol(&symbol).unwrap();
+        }
+        // `insert_symbol` stores an absent score as 0.0; make these truly NULL.
+        let conn = store.conn().unwrap();
+        conn.query(
+            "MATCH (s:Symbol) WHERE s.uid IN ['sym:r:c', 'sym:r:d'] SET s.pagerank_score = NULL",
+        )
+        .unwrap();
+        drop(conn);
+        let (uids, total) = store.repo_symbol_seed_candidates("repo:r", 2).unwrap();
+        assert_eq!(uids, ["sym:r:b", "sym:r:a"], "scored symbols first");
+        assert_eq!(total, 4);
+    }
+
+    /// nw-609 review: the candidate query takes PPR's gate, not the raw
+    /// dirty-marker one. A young brain-watcher batch (constant on a live
+    /// brain) must not fail a `repo:` seed while every other seed ranks
+    /// through it (nw-475 Q7); an aged-out leftover still fails closed.
+    #[test]
+    fn repo_symbol_seed_candidates_answers_through_a_young_watcher_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let mut symbol = make_symbol("sym:r:a", "a");
+        symbol.repo_uid = "repo:r".to_string();
+        store.insert_symbol(&symbol).unwrap();
+        let _writer_authority = crate::acquire_db_write_lease(&db_path).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                Some(crate::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        let (uids, _) = store
+            .repo_symbol_seed_candidates("repo:r", 5)
+            .expect("a young watcher batch must not block a repo: seed");
+        assert_eq!(uids, ["sym:r:a"]);
+
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                1,
+                Some(crate::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.repo_symbol_seed_candidates("repo:r", 5),
+            Err(StoreError::RankingUnavailable)
+        ));
+    }
+
     #[test]
     fn invalidate_pagerank_recomputes_after_code_deletion() {
         // nw-055 (P1b): a code-repo deletion changes the SURVIVING nodes' ranks,
