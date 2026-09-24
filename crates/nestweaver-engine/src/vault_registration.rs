@@ -256,7 +256,11 @@ pub fn forget_root(db_path: &Path, root: &Path) -> anyhow::Result<usize> {
     })
 }
 
-fn canonical(path: &Path) -> PathBuf {
+/// The form two watched roots are compared in: canonicalized when the path
+/// exists, as given when it does not (a removed root still has to match the
+/// registration that names it). Public so the daemon's watcher bookkeeping
+/// compares roots the same way instead of restating it.
+pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

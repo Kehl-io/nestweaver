@@ -187,14 +187,6 @@ pub fn resolve_repo_filter(
         .collect()
 }
 
-/// Resolve caller-supplied `vaults:` / `--vaults` entries to concrete vault
-/// UIDs.
-///
-/// The mirror of [`resolve_repo_filter`], written separately because there is
-/// no engine-side vault selector to reuse: `--repo` is a first-class CLI
-/// selector and `--vault` is not. The precedence deliberately matches
-/// `resolve_repo_selector`'s (exact UID, then case-insensitive exact name,
-/// then exact root path), and it is exact-only — no substring leg.
 /// The form a vault name is compared in wherever it selects a vault. Shared by
 /// [`resolve_vault_filter`] and the duplicate-name guard
 /// (`vault_registration::refuse_duplicate_vault_name`, nw-608) so a name the
@@ -203,6 +195,14 @@ pub fn vault_name_key(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// Resolve caller-supplied `vaults:` / `--vaults` entries to concrete vault
+/// UIDs.
+///
+/// The mirror of [`resolve_repo_filter`], written separately because there is
+/// no engine-side vault selector to reuse: `--repo` is a first-class CLI
+/// selector and `--vault` is not. The precedence deliberately matches
+/// `resolve_repo_selector`'s (exact UID, then case-insensitive exact name,
+/// then exact root path), and it is exact-only — no substring leg.
 pub fn resolve_vault_filter(
     store: &GraphStore,
     selectors: &[String],

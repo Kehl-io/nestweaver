@@ -3157,8 +3157,7 @@ async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
 /// re-disclose debt for it. Roots compare canonically: the slot records the
 /// path as requested, the graph the canonical one.
 fn forget_removed_repo_watch(state: &DaemonState, root: &Path) {
-    let canonical =
-        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    use nestweaver_engine::vault_registration::canonical;
     let watcher_id = state.watcher_stop.lock().ok().and_then(|guard| {
         guard
             .as_ref()
@@ -16550,7 +16549,7 @@ credential_method = "gh"
         assert_eq!(paths, ["Broken.md"], "{:?}", last.frontmatter_unparsed);
         assert!(
             last.message
-                .contains("Indexed without frontmatter (unparsable YAML): 1"),
+                .contains("Notes indexed without frontmatter (unparsable YAML): 1"),
             "{}",
             last.message
         );

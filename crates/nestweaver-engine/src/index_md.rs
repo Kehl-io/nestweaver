@@ -154,15 +154,16 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
 }
 
 /// nw-585: the per-run disclosure of notes indexed without their frontmatter,
-/// in the `  {path} - {reason}` shape the skip list uses, or `None` when there
-/// are none. ONE spelling for every vault route's output (the full-refresh
-/// summary, the `--since` messages, direct `brain add`).
+/// in the `  {path} - {reason}` shape the skip list beside it uses, or `None`
+/// when there are none. ONE spelling for every vault route's output (the
+/// full-refresh summary, the `--since` messages, direct `brain add`), and the
+/// same label `brain status` prints, so one grep finds both.
 pub fn frontmatter_unparsed_summary(rows: &[SkippedFile]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
     let mut summary = format!(
-        "Indexed without frontmatter (unparsable YAML): {}",
+        "Notes indexed without frontmatter (unparsable YAML): {}",
         rows.len()
     );
     for row in rows {
@@ -5939,7 +5940,7 @@ mod tests {
         assert_eq!(paths, ["Ok.md"], "per-run disclosure on --since");
         let summary = frontmatter_unparsed_summary(&since.frontmatter_unparsed).unwrap_or_default();
         assert!(
-            summary.contains("Indexed without frontmatter (unparsable YAML): 1")
+            summary.contains("Notes indexed without frontmatter (unparsable YAML): 1")
                 && summary.contains("Ok.md - frontmatter could not be parsed"),
             "{summary}"
         );
@@ -5995,7 +5996,7 @@ mod tests {
         .unwrap();
         let summary = format_markdown_refresh_summary(&result);
         assert!(
-            summary.contains("Indexed without frontmatter (unparsable YAML): 1")
+            summary.contains("Notes indexed without frontmatter (unparsable YAML): 1")
                 && summary.contains("Broken.md - frontmatter could not be parsed"),
             "{summary}"
         );

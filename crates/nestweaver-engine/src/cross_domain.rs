@@ -329,63 +329,6 @@ pub fn build_symbol_index_with_config(
     Ok(SymbolIndex::build_with_config(&symbols, config))
 }
 
-/// Rebuild cross-domain links for one note, using a pre-built SymbolIndex.
-/// Avoids the per-note DB query for symbols that `discover_cross_domain_links_for_note`
-/// performs. Returns the count of (note_edges, section_edges) emitted.
-pub fn discover_cross_domain_links_for_note_with_index(
-    store: &GraphStore,
-    note_uid: &str,
-    index: &SymbolIndex,
-) -> Result<(usize, usize), anyhow::Error> {
-    discover_cross_domain_links_for_note_with_index_and_readers(
-        store,
-        note_uid,
-        index,
-        &VaultReaders::new(),
-    )
-}
-
-/// Like [`discover_cross_domain_links_for_note_with_index`] but accepts
-/// [`VaultReaders`] for server-mode bare-clone support.
-///
-/// nw-668: one scan and one transactional flush, the same two steps the bulk
-/// pass runs, rather than a separate per-edge auto-commit path.
-pub fn discover_cross_domain_links_for_note_with_index_and_readers(
-    store: &GraphStore,
-    note_uid: &str,
-    index: &SymbolIndex,
-    vault_readers: &VaultReaders<'_>,
-) -> Result<(usize, usize), anyhow::Error> {
-    if index.is_empty() {
-        return Ok((0, 0));
-    }
-    let note = store.lookup_note(note_uid).context("lookup_note")?;
-    match scan_one_note(store, &note, index, vault_readers)? {
-        ScanOutcome::Scanned(scanned) => {
-            let mut result = CrossDomainResult::default();
-            flush_scanned_notes(store, std::slice::from_ref(&scanned), &mut result)?;
-            Ok((result.note_to_symbol_edges, result.section_to_symbol_edges))
-        }
-        ScanOutcome::Skipped => Ok((0, 0)),
-    }
-}
-
-/// Rebuild cross-domain links for one note only. Returns the count of
-/// edges emitted.
-pub fn discover_cross_domain_links_for_note(
-    store: &GraphStore,
-    note_uid: &str,
-) -> Result<(usize, usize), anyhow::Error> {
-    let symbols = store
-        .list_all_symbols_lite()
-        .context("list_all_symbols_lite")?;
-    if symbols.is_empty() {
-        return Ok((0, 0));
-    }
-    let index = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-    discover_cross_domain_links_for_note_with_index(store, note_uid, &index)
-}
-
 /// Read-only scan: load the note body, scan for symbol mentions, and
 /// return the edges in memory. Used by the bulk discovery path so the
 /// DB writes can be deferred into a batched transaction.
@@ -1099,6 +1042,22 @@ mod tests {
         assert_eq!(result.note_to_symbol_edges, 0);
     }
 
+    /// One note through the production scan + transactional flush — the two
+    /// steps the bulk pass and the vault watcher run. (The per-note public
+    /// wrappers were removed once nw-668 left only tests calling them.)
+    fn refresh_one_note(store: &GraphStore, note_uid: &str) -> anyhow::Result<(usize, usize)> {
+        let index = build_symbol_index(store)?;
+        let note = store.lookup_note(note_uid)?;
+        match scan_one_note(store, &note, &index, &VaultReaders::new())? {
+            ScanOutcome::Scanned(scanned) => {
+                let mut result = CrossDomainResult::default();
+                flush_scanned_notes(store, std::slice::from_ref(&scanned), &mut result)?;
+                Ok((result.note_to_symbol_edges, result.section_to_symbol_edges))
+            }
+            ScanOutcome::Skipped => Ok((0, 0)),
+        }
+    }
+
     /// nw-668: a single-note refresh deleted the note's edges in its own
     /// auto-committed statements and then inserted, so a failure between the
     /// two committed a partial set. It is one transaction now: a failure
@@ -1162,7 +1121,7 @@ mod tests {
         )
         .unwrap();
         FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(1));
-        let failed = discover_cross_domain_links_for_note(&store, &note.uid);
+        let failed = refresh_one_note(&store, &note.uid);
         FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
         assert!(failed.is_err(), "the injected failure must surface");
         assert_eq!(
@@ -1172,10 +1131,7 @@ mod tests {
         );
 
         // Counterweight: the same refresh without the failure replaces them.
-        assert_eq!(
-            discover_cross_domain_links_for_note(&store, &note.uid).unwrap(),
-            (2, 2)
-        );
+        assert_eq!(refresh_one_note(&store, &note.uid).unwrap(), (2, 2));
         assert_eq!(store.list_references_code_edges().unwrap().len(), 4);
     }
 }

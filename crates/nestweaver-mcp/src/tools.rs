@@ -15673,11 +15673,13 @@ fn vault_add_source_payload(
             "limit_bytes": file.limit_bytes,
         })).collect::<Vec<_>>()).unwrap_or_default(),
         // nw-585: indexed WITHOUT their frontmatter (unparsable YAML);
-        // not skipped, so not counted in `skipped_count`.
-        "frontmatter_unparsed": terminal.map(|progress| progress.frontmatter_unparsed.iter().map(|file| serde_json::json!({
+        // not skipped, so not counted in `skipped_count`. The same count +
+        // `{path, reason}` rows `brain_status` reports under `skipped_notes`,
+        // so one reader handles both payloads.
+        "frontmatter_unparsed": terminal.map_or(0, |progress| progress.frontmatter_unparsed.len()),
+        "frontmatter_unparsed_notes": terminal.map(|progress| progress.frontmatter_unparsed.iter().map(|file| serde_json::json!({
             "path": file.path,
-            "reason_code": file.reason_code,
-            "detail": file.detail,
+            "reason": file.detail,
         })).collect::<Vec<_>>()).unwrap_or_default(),
     })
 }
@@ -15953,12 +15955,13 @@ mod daemon_index_progress_tests {
         let payload = vault_add_source_payload("/v", "done".to_string(), Some(&terminal));
         assert_eq!(payload["coverage_status"], serde_json::json!("complete"));
         assert_eq!(payload["skipped_count"], serde_json::json!(0));
+        assert_eq!(payload["frontmatter_unparsed"], serde_json::json!(1));
         assert_eq!(
-            payload["frontmatter_unparsed"][0]["path"],
+            payload["frontmatter_unparsed_notes"][0]["path"],
             serde_json::json!("Broken.md")
         );
         assert!(
-            payload["frontmatter_unparsed"][0]["detail"]
+            payload["frontmatter_unparsed_notes"][0]["reason"]
                 .as_str()
                 .unwrap()
                 .starts_with("frontmatter could not be parsed"),

@@ -558,8 +558,6 @@ pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
     build_symbol_index_with_config, discover_cross_domain_links,
-    discover_cross_domain_links_for_note, discover_cross_domain_links_for_note_with_index,
-    discover_cross_domain_links_for_note_with_index_and_readers,
     discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
 };
 pub use dead_code::{
