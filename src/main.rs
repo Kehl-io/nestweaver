@@ -4912,6 +4912,18 @@ fn format_daemon_status_response(
                     lines.push(format!("  - {}: {}", note.path, note.reason));
                 }
             }
+            // nw-585: indexed, but without their frontmatter -- not skipped.
+            if let Some(skipped) = status.skipped_notes.as_ref()
+                && skipped.frontmatter_unparsed > 0
+            {
+                lines.push(format!(
+                    "Notes indexed without frontmatter (unparsable YAML): {}",
+                    skipped.frontmatter_unparsed
+                ));
+                for note in &skipped.frontmatter_unparsed_notes {
+                    lines.push(format!("  - {}: {}", note.path, note.reason));
+                }
+            }
             if let Some(near) = status.notes_near_size_limit.as_ref()
                 && near.count > 0
             {
@@ -5014,6 +5026,11 @@ mod daemon_status_renderer_tests {
                     path: "owed.md".to_string(),
                     reason: "not yet reconciled".to_string(),
                 }],
+                frontmatter_unparsed: 1,
+                frontmatter_unparsed_notes: vec![nestweaver_proto::PendingReconciliationNote {
+                    path: "/v/Broken.md".to_string(),
+                    reason: "frontmatter could not be parsed".to_string(),
+                }],
             }),
             notes_near_size_limit: Some(nestweaver_proto::NotesNearSizeLimit {
                 count: 1,
@@ -5038,6 +5055,15 @@ mod daemon_status_renderer_tests {
             "{output}"
         );
         assert!(output.contains("owed.md: not yet reconciled"), "{output}");
+        // nw-585.
+        assert!(
+            output.contains("Notes indexed without frontmatter (unparsable YAML): 1"),
+            "{output}"
+        );
+        assert!(
+            output.contains("/v/Broken.md: frontmatter could not be parsed"),
+            "{output}"
+        );
     }
 
     /// A3 acceptance: an operator looking at `brain status` during a long
@@ -27098,6 +27124,27 @@ fn run_brain(
                             println!("  Watcher reconciliation pending: {pending} file(s)");
                             for note in skipped
                                 .get("reconciliation_pending_notes")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                            {
+                                let field = |key: &str| {
+                                    note.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+                                };
+                                println!("    - {}: {}", field("path"), field("reason"));
+                            }
+                        }
+                        // nw-585: see the typed render above.
+                        let unparsed = skipped
+                            .get("frontmatter_unparsed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if unparsed > 0 {
+                            println!(
+                                "  Notes indexed without frontmatter (unparsable YAML): {unparsed}"
+                            );
+                            for note in skipped
+                                .get("frontmatter_unparsed_notes")
                                 .and_then(|v| v.as_array())
                                 .into_iter()
                                 .flatten()

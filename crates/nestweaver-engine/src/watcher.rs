@@ -2650,6 +2650,75 @@ mod tests {
         fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta]]\n").unwrap();
     }
 
+    /// nw-585 on the watcher's two routes: a live batch discloses a note
+    /// whose frontmatter broke (and clears it once fixed), and startup
+    /// reconciliation discloses one broken while no watcher ran.
+    #[test]
+    fn watcher_discloses_and_clears_unparsable_frontmatter() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Live.md", "---\ntags: [a]\n---\n# Live\n"),
+            ("Gap.md", "---\ntags: [b]\n---\n# Gap\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let unparsed = || -> Vec<String> {
+            crate::index_md::skipped_notes_status_json(Some(&db_path)).0
+                ["frontmatter_unparsed_notes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|row| row["path"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(unparsed().is_empty(), "precondition");
+
+        // Live batch.
+        fs::write(root.join("Live.md"), "---\ntags: [a\n---\n# Live\n").unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Live.md")], &None)
+            .unwrap();
+        let rows = unparsed();
+        assert!(
+            rows.len() == 1 && rows[0].ends_with("Live.md"),
+            "live batch: {rows:?}"
+        );
+        fs::write(root.join("Live.md"), "---\ntags: [a]\n---\n# Live\n").unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Live.md")], &None)
+            .unwrap();
+        assert!(
+            unparsed().is_empty(),
+            "fixed in a live batch: {:?}",
+            unparsed()
+        );
+
+        // Startup reconciliation: broken while nothing watched.
+        fs::write(root.join("Gap.md"), "---\ntags: [b\n---\n# Gap\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("Gap.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        let restarted = BrainWatcher::new(&db_path, &root, "default", "test");
+        let stop = restarted.shutdown_handle();
+        restarted
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        let rows = unparsed();
+        assert!(
+            rows.len() == 1 && rows[0].ends_with("Gap.md"),
+            "startup reconciliation: {rows:?}"
+        );
+    }
+
     #[test]
     fn watcher_records_new_oversized_note_as_skipped() {
         let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);

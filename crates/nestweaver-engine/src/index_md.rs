@@ -455,6 +455,16 @@ pub struct SkippedNotesSidecar {
     /// status reports the full count. Only the watcher adds or clears entries.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub reconciliation_pending: std::collections::BTreeMap<String, Vec<SkippedFile>>,
+    /// nw-585: ABSOLUTE path -> reason of every note indexed WITHOUT its
+    /// frontmatter because the YAML would not parse. The note is in the graph
+    /// (body, headings, H1 title), so this is deliberately not a `skipped`
+    /// row: those count toward vault coverage, and a coverage gap marks the
+    /// vault not current (nw-651). Absolute because the sidecar is shared by
+    /// every vault. Every vault route re-derives its own entries: a full
+    /// index replaces the vault's, a `--since` / watcher refresh replaces the
+    /// notes it re-parsed and drops entries whose file is gone.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub frontmatter_unparsed: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for SkippedNotesSidecar {
@@ -467,6 +477,7 @@ impl Default for SkippedNotesSidecar {
             near_limit_truncated: false,
             unindexable_mtimes: std::collections::BTreeMap::new(),
             reconciliation_pending: std::collections::BTreeMap::new(),
+            frontmatter_unparsed: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -528,6 +539,9 @@ fn build_skipped_notes_sidecar(
     near: &[NearLimitNote],
     unindexable_mtimes: std::collections::BTreeMap<String, String>,
     reconciliation_pending: std::collections::BTreeMap<String, Vec<SkippedFile>>,
+    // nw-585: a parameter rather than a default, so no writer of this shared
+    // sidecar can rebuild it and silently drop another route's disclosure.
+    frontmatter_unparsed: std::collections::BTreeMap<String, String>,
 ) -> SkippedNotesSidecar {
     // nw-653: owed reconciliation entries go FIRST, so the cap never cuts
     // them; any stale mirror of them in `skipped` is replaced.
@@ -563,6 +577,7 @@ fn build_skipped_notes_sidecar(
         near_limit_truncated,
         unindexable_mtimes,
         reconciliation_pending,
+        frontmatter_unparsed,
     }
 }
 
@@ -588,6 +603,34 @@ fn record_ingest_failures(
             map.insert(abs.to_string_lossy().into_owned(), mtime);
         }
     }
+}
+
+/// Record `rows` (vault-relative paths) in the absolute-path keyed
+/// [`SkippedNotesSidecar::frontmatter_unparsed`] map (nw-585).
+fn record_frontmatter_unparsed(
+    map: &mut std::collections::BTreeMap<String, String>,
+    vault_root: &Path,
+    rows: &[SkippedFile],
+) {
+    for row in rows {
+        map.insert(
+            vault_root.join(&row.path).to_string_lossy().into_owned(),
+            row.reason.clone(),
+        );
+    }
+}
+
+/// nw-585: the disclosure row for a note whose frontmatter would not parse,
+/// or `None`. ONE builder for both vault parse sites (the full index and the
+/// `--since` / watcher route), so the two cannot word or classify it apart.
+fn frontmatter_unparsed_row(rel_path: &str, parsed: &ParsedNote) -> Option<SkippedFile> {
+    let error = parsed.frontmatter_error.as_deref()?;
+    tracing::warn!("frontmatter parse warning for {rel_path}: {error}");
+    Some(SkippedFile::new(
+        rel_path,
+        SkipReasonCode::ParseError,
+        format!("{FRONTMATTER_UNPARSED_REASON} ({error})"),
+    ))
 }
 
 /// nw-651 review: serialises every load-modify-write of the skipped-notes
@@ -642,6 +685,7 @@ fn persist_skipped_notes_replace(
     vault_root: &Path,
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
+    frontmatter_unparsed: &[SkippedFile],
 ) {
     let Some(db_path) = db_path else {
         return;
@@ -653,11 +697,15 @@ fn persist_skipped_notes_replace(
         let mut unindexable = existing.unindexable_mtimes;
         unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
         record_ingest_failures(&mut unindexable, vault_root, skipped);
+        let mut frontmatter = existing.frontmatter_unparsed;
+        frontmatter.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        record_frontmatter_unparsed(&mut frontmatter, vault_root, frontmatter_unparsed);
         Some(build_skipped_notes_sidecar(
             skipped,
             near,
             unindexable,
             existing.reconciliation_pending,
+            frontmatter,
         ))
     });
 }
@@ -668,6 +716,7 @@ fn persist_skipped_notes_merge(
     touched_paths: &[String],
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
+    frontmatter_unparsed: &[SkippedFile],
 ) {
     let Some(db_path) = db_path else {
         return;
@@ -683,6 +732,22 @@ fn persist_skipped_notes_merge(
             !(Path::new(path).starts_with(vault_root) && Path::new(path).is_dir())
         });
         record_ingest_failures(&mut sidecar.unindexable_mtimes, vault_root, skipped);
+        // nw-585: a re-parsed note's entry is re-derived below (so a fixed
+        // note clears), and one whose file is gone leaves with it -- this
+        // route may not see a deletion as a touched path.
+        for path in touched_paths {
+            sidecar
+                .frontmatter_unparsed
+                .remove(&*vault_root.join(path).to_string_lossy());
+        }
+        sidecar
+            .frontmatter_unparsed
+            .retain(|path, _| !Path::new(path).starts_with(vault_root) || Path::new(path).exists());
+        record_frontmatter_unparsed(
+            &mut sidecar.frontmatter_unparsed,
+            vault_root,
+            frontmatter_unparsed,
+        );
         let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
         // nw-651 review: this route WALKS the whole vault too, and every row the
         // walk produces (an unreadable or pruned directory, an ignore file it
@@ -710,6 +775,7 @@ fn persist_skipped_notes_merge(
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
         );
         Some(rebuilt)
     });
@@ -736,6 +802,11 @@ fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
 /// brain and code watchers; the full reason names which one and why
 /// (`...: code watcher startup reconciliation failed; retrying (...)`).
 pub const WATCH_RECONCILIATION_PENDING_REASON: &str = "not yet reconciled into the graph";
+
+/// nw-585: reason of a note indexed WITHOUT its frontmatter because the YAML
+/// would not parse (see [`SkippedNotesSidecar::frontmatter_unparsed`]).
+pub const FRONTMATTER_UNPARSED_REASON: &str =
+    "frontmatter could not be parsed; indexed without frontmatter";
 
 /// nw-664 review: key prefix of the CODE watcher's entries in the shared
 /// `reconciliation_pending` and `unindexable_mtimes` maps. A vault and a repo
@@ -841,6 +912,7 @@ pub(crate) fn record_vault_link_debt(
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
         ))
     });
 }
@@ -870,6 +942,7 @@ fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<Skippe
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
         ))
     });
 }
@@ -919,6 +992,7 @@ fn clear_reconciliation_paths(db_path: &Path, key: String, paths: &[PathBuf]) {
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
         ))
     });
 }
@@ -982,6 +1056,7 @@ pub(crate) fn record_code_unindexable_stamps(
             &sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
         ))
     });
 }
@@ -996,10 +1071,12 @@ pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
     update_skipped_notes_sidecar(db_path, |sidecar| {
         let mut pending = sidecar.reconciliation_pending;
         let mut unindexable = sidecar.unindexable_mtimes;
-        let (pending_before, unindexable_before) = (pending.len(), unindexable.len());
+        let mut frontmatter = sidecar.frontmatter_unparsed;
+        let before = (pending.len(), unindexable.len(), frontmatter.len());
         pending.retain(|root, _| Path::new(root) != vault_root);
         unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
-        if pending.len() == pending_before && unindexable.len() == unindexable_before {
+        frontmatter.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        if (pending.len(), unindexable.len(), frontmatter.len()) == before {
             return None;
         }
         Some(build_skipped_notes_sidecar(
@@ -1007,6 +1084,7 @@ pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
             &sidecar.notes_near_size_limit,
             unindexable,
             pending,
+            frontmatter,
         ))
     });
 }
@@ -1033,6 +1111,7 @@ pub fn forget_repo_watch_state(db_path: &Path, repo_root: &Path) {
             &sidecar.notes_near_size_limit,
             unindexable,
             pending,
+            sidecar.frontmatter_unparsed,
         ))
     });
 }
@@ -1047,7 +1126,8 @@ pub fn load_skipped_notes_sidecar(db_path: &Path) -> SkippedNotesSidecar {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
-/// How many owed notes `brain status` lists with their reason.
+/// How many owed notes -- and, nw-585, notes indexed without their
+/// frontmatter -- `brain status` lists with their reason.
 pub const RECONCILIATION_PENDING_STATUS_NOTES: usize = 10;
 
 /// Shape consumed by `brain_status` / `brain_status_json`. Never walks the vault.
@@ -1063,6 +1143,14 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
         .take(RECONCILIATION_PENDING_STATUS_NOTES)
         .map(|file| serde_json::json!({ "path": file.path, "reason": file.reason }))
         .collect();
+    // nw-585: notes indexed without their frontmatter, with the reason, kept
+    // apart from `count`/`paths` -- those notes were NOT skipped.
+    let frontmatter_notes: Vec<serde_json::Value> = sidecar
+        .frontmatter_unparsed
+        .iter()
+        .take(RECONCILIATION_PENDING_STATUS_NOTES)
+        .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
+        .collect();
     let skipped = serde_json::json!({
         "count": sidecar.skipped.len(),
         "paths": sidecar.skipped.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
@@ -1073,6 +1161,8 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
             .map(Vec::len)
             .sum::<usize>(),
         "reconciliation_pending_notes": pending_notes,
+        "frontmatter_unparsed": sidecar.frontmatter_unparsed.len(),
+        "frontmatter_unparsed_notes": frontmatter_notes,
     });
     let near = serde_json::json!({
         "count": sidecar.notes_near_size_limit.len(),
@@ -1548,6 +1638,9 @@ pub struct MarkdownSinceResult {
     pub publication: crate::manifest::GraphMutationPublicationOutcome,
     pub skipped: Vec<SkippedFile>,
     pub notes_near_size_limit: Vec<NearLimitNote>,
+    /// nw-585: re-parsed notes indexed without their unparsable frontmatter
+    /// (vault-relative). Not in `skipped`: they were indexed.
+    pub frontmatter_unparsed: Vec<SkippedFile>,
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
@@ -2105,12 +2198,20 @@ fn index_markdown_since_with_reader_mode(
         .filter(|candidate| candidate.changed)
         .count();
     let notes_deleted = delete_note_uids.len();
+    // nw-585: from the notes this pass re-parsed. An unchanged note's entry,
+    // if any, is still true and is left alone by the merge.
+    let frontmatter_unparsed: Vec<SkippedFile> = candidates
+        .iter()
+        .filter(|candidate| candidate.changed)
+        .filter_map(|candidate| frontmatter_unparsed_row(&candidate.rel_path, &candidate.parsed))
+        .collect();
     persist_skipped_notes_merge(
         store.db_path(),
         vault_root,
         &touched_paths,
         &skipped,
         &notes_near_size_limit,
+        &frontmatter_unparsed,
     );
     if notes_updated == 0 && notes_deleted == 0 && vault_existed {
         // nw-587: register on the no-change path too (idempotent, no rewrite
@@ -2141,6 +2242,7 @@ fn index_markdown_since_with_reader_mode(
             publication: crate::manifest::finalize_committed_graph_mutation(store, false),
             skipped,
             notes_near_size_limit,
+            frontmatter_unparsed,
         });
     }
 
@@ -2546,6 +2648,7 @@ fn index_markdown_since_with_reader_mode(
         publication,
         skipped,
         notes_near_size_limit,
+        frontmatter_unparsed,
     })
 }
 
@@ -3222,6 +3325,7 @@ where
             vault_root,
             &since.skipped,
             &since.notes_near_size_limit,
+            &since.frontmatter_unparsed,
         );
         return Ok(MarkdownRefreshResult {
             index: MarkdownIndexResult {
@@ -3304,6 +3408,8 @@ where
         heading_section_edges: Vec<(String, String)>,
         heading_parent_edges: Vec<(String, String)>,
         note_context: NoteContext,
+        /// nw-585: indexed, but without its unparsable frontmatter.
+        frontmatter_unparsed: Option<SkippedFile>,
     }
 
     #[allow(clippy::large_enum_variant)]
@@ -3361,9 +3467,7 @@ where
             }
         };
 
-        if let Some(fm_err) = &parsed.frontmatter_error {
-            tracing::warn!("frontmatter parse warning for {rel_path}: {fm_err}");
-        }
+        let frontmatter_unparsed = frontmatter_unparsed_row(&rel_path, &parsed);
 
         let n_uid = note_uid(&v_uid, &rel_path);
         let frontmatter_json = if parsed
@@ -3513,6 +3617,7 @@ where
             heading_section_edges: h_s_edges,
             heading_parent_edges: h_parent_edges,
             note_context,
+            frontmatter_unparsed,
         })
     };
 
@@ -3532,6 +3637,7 @@ where
     let mut heading_section_edges: Vec<(String, String)> = Vec::new();
     let mut heading_parent_edges: Vec<(String, String)> = Vec::new();
     let mut note_contexts: Vec<NoteContext> = Vec::new();
+    let mut frontmatter_unparsed: Vec<SkippedFile> = Vec::new();
 
     for outcome in outcomes {
         match outcome {
@@ -3548,6 +3654,7 @@ where
                 heading_section_edges.extend(p.heading_section_edges);
                 heading_parent_edges.extend(p.heading_parent_edges);
                 note_contexts.push(p.note_context);
+                frontmatter_unparsed.extend(p.frontmatter_unparsed);
             }
         }
     }
@@ -3911,6 +4018,7 @@ where
         vault_root,
         &skipped,
         &notes_near_size_limit,
+        &frontmatter_unparsed,
     );
 
     Ok(MarkdownRefreshResult {
@@ -5679,6 +5787,157 @@ mod tests {
             "a directory is not an unindexable note: {:?}",
             sidecar.unindexable_mtimes
         );
+    }
+
+    /// nw-585: a note whose YAML frontmatter will not parse used to index as
+    /// `frontmatter: {}` with nothing but a tracing warning -- `brain add`
+    /// exit 0, `brain status` silent, its tags simply gone. The note BODY is
+    /// still indexed (content retained, the nw-651 direction), but the loss
+    /// is now disclosed in the sidecar and `brain status`, under its own
+    /// reason and outside the skipped-note count: the note was not skipped,
+    /// and counting it would mark the vault's coverage degraded.
+    #[test]
+    fn unparsable_frontmatter_is_indexed_and_disclosed_until_fixed() {
+        const BROKEN: &str = "---\ntags: [broken\n---\n# Broken\n\nbody words here\n";
+        let (_dir, root) = make_vault(&[
+            ("Broken.md", BROKEN),
+            ("Ok.md", "---\ntags: [ok]\n---\n# Ok\n\nfine\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        let result = index_markdown_directory(&root, &db, "default", "v").unwrap();
+        assert!(
+            result.skipped.is_empty(),
+            "the note was indexed, so vault coverage is not degraded: {:?}",
+            result.skipped
+        );
+        let status = || skipped_notes_status_json(Some(&db)).0;
+        let disclosed = status();
+        assert_eq!(
+            disclosed["frontmatter_unparsed"],
+            serde_json::json!(1),
+            "{disclosed}"
+        );
+        let row = &disclosed["frontmatter_unparsed_notes"][0];
+        assert!(
+            row["path"].as_str().unwrap().ends_with("Broken.md"),
+            "{disclosed}"
+        );
+        assert!(
+            row["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with(FRONTMATTER_UNPARSED_REASON),
+            "{disclosed}"
+        );
+        assert_eq!(
+            disclosed["count"],
+            serde_json::json!(0),
+            "not a skipped note"
+        );
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let titles: Vec<String> = store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .map(|note| note.title)
+                .collect();
+            assert!(
+                titles.iter().any(|t| t == "Broken"),
+                "body kept: {titles:?}"
+            );
+            // COUNTERWEIGHT: the sibling's valid frontmatter still indexes.
+            let tags: Vec<String> = store
+                .list_tags(None)
+                .unwrap()
+                .into_iter()
+                .map(|tag| tag.name)
+                .collect();
+            assert!(tags.iter().any(|t| t == "ok"), "{tags:?}");
+        }
+
+        // Fixed on the --since route: the row clears.
+        fs::write(
+            root.join("Broken.md"),
+            "---\ntags: [fixed]\n---\n# Broken\n",
+        )
+        .unwrap();
+        index_markdown_directory_since(
+            &root,
+            &db,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(
+            status()["frontmatter_unparsed"],
+            serde_json::json!(0),
+            "{}",
+            status()
+        );
+
+        // Broken on the --since route: disclosed there too.
+        fs::write(root.join("Ok.md"), BROKEN).unwrap();
+        index_markdown_directory_since(
+            &root,
+            &db,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let disclosed = status();
+        assert_eq!(
+            disclosed["frontmatter_unparsed"],
+            serde_json::json!(1),
+            "{disclosed}"
+        );
+        assert!(
+            disclosed["frontmatter_unparsed_notes"][0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("Ok.md"),
+            "{disclosed}"
+        );
+
+        // Deleted: the row goes with the note.
+        fs::remove_file(root.join("Ok.md")).unwrap();
+        index_markdown_directory_since(
+            &root,
+            &db,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(
+            status()["frontmatter_unparsed"],
+            serde_json::json!(0),
+            "{}",
+            status()
+        );
+    }
+
+    /// nw-585: the sidecar is rewritten by many writers (watcher debt, code
+    /// stamps, vault removal). One that rebuilt it without carrying the
+    /// frontmatter disclosure would silently drop it; removing the vault must
+    /// drop it.
+    #[test]
+    fn frontmatter_disclosure_survives_other_sidecar_writers_and_leaves_with_its_vault() {
+        let (_dir, root) = make_vault(&[("Broken.md", "---\ntags: [x\n---\n# Broken\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        let count = || skipped_notes_status_json(Some(&db)).0["frontmatter_unparsed"].clone();
+        assert_eq!(count(), serde_json::json!(1));
+        record_code_unindexable_stamps(&db, &[], &[(root.join("x.rs"), "1:1".to_string())]);
+        record_vault_link_debt(Some(&db), &root, &[root.join("Broken.md")], "boom", false);
+        assert_eq!(count(), serde_json::json!(1), "other writers keep it");
+        // Callers pass the registered (canonical) root, as the index keys it.
+        forget_vault_skipped_notes(&db, &std::fs::canonicalize(&root).unwrap());
+        assert_eq!(count(), serde_json::json!(0), "a removed vault's rows go");
     }
 
     /// nw-287, the case `list_files` alone cannot catch: an UNMOUNTED volume
@@ -8655,7 +8914,7 @@ mod watch_reconciliation_disclosure_tests {
                 )
             })
             .collect();
-        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[], &[]);
         record_vault_reconciliation_debt(
             Some(&db_path),
             &vault_root,
@@ -8689,7 +8948,7 @@ mod watch_reconciliation_disclosure_tests {
 
         // A later full index (replace) must not silently drop the debt the
         // watcher still owes; clearing it is the watcher's success path.
-        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[], &[]);
         let (skipped, _) = skipped_notes_status_json(Some(&db_path));
         assert_eq!(
             skipped["reconciliation_pending"],

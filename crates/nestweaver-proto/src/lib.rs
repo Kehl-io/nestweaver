@@ -134,6 +134,32 @@ pub fn prune_stale_json(response: &PruneStaleResponse) -> serde_json::Value {
     })
 }
 
+/// A `[{path, reason}]` array under `key`, or empty. One reader for every
+/// path + reason list in the status disclosure (nw-653, nw-585).
+fn path_reason_notes(value: &serde_json::Value, key: &str) -> Vec<PendingReconciliationNote> {
+    value
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|notes| {
+            notes
+                .iter()
+                .map(|note| PendingReconciliationNote {
+                    path: note
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    reason: note
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Map the JSON `brain_status` sidecar disclosure onto the typed status RPC.
 /// A live daemon always returns `Some`, including empty counts.
 pub fn skipped_notes_from_status_json(
@@ -161,27 +187,16 @@ pub fn skipped_notes_from_status_json(
                 .get("reconciliation_pending")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
-            reconciliation_pending_notes: skipped
-                .get("reconciliation_pending_notes")
-                .and_then(|v| v.as_array())
-                .map(|notes| {
-                    notes
-                        .iter()
-                        .map(|note| PendingReconciliationNote {
-                            path: note
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            reason: note
-                                .get("reason")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            reconciliation_pending_notes: path_reason_notes(
+                skipped,
+                "reconciliation_pending_notes",
+            ),
+            // nw-585.
+            frontmatter_unparsed: skipped
+                .get("frontmatter_unparsed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            frontmatter_unparsed_notes: path_reason_notes(skipped, "frontmatter_unparsed_notes"),
         });
     let near = value
         .get("notes_near_size_limit")
@@ -489,6 +504,32 @@ mod additive_status_contract_tests {
         assert_eq!(
             skipped.reconciliation_pending_notes[0].reason,
             "not yet reconciled"
+        );
+    }
+
+    /// nw-585: notes indexed without their frontmatter reach the typed
+    /// status with their reason, apart from the skipped count.
+    #[test]
+    fn frontmatter_unparsed_maps_onto_the_typed_status() {
+        let value = serde_json::json!({
+            "skipped_notes": {
+                "count": 0,
+                "paths": [],
+                "truncated": false,
+                "frontmatter_unparsed": 1,
+                "frontmatter_unparsed_notes": [
+                    {"path": "/v/Broken.md", "reason": "frontmatter could not be parsed"}
+                ]
+            }
+        });
+        let (skipped, _) = skipped_notes_from_status_json(&value);
+        let skipped = skipped.expect("skipped_notes");
+        assert_eq!(skipped.count, 0);
+        assert_eq!(skipped.frontmatter_unparsed, 1);
+        assert_eq!(skipped.frontmatter_unparsed_notes[0].path, "/v/Broken.md");
+        assert_eq!(
+            skipped.frontmatter_unparsed_notes[0].reason,
+            "frontmatter could not be parsed"
         );
     }
 
