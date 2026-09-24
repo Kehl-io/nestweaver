@@ -1,5 +1,36 @@
 # Changelog
 
+## [10.2.0](https://github.com/Kehl-io/nestweaver/compare/v10.1.2...v10.2.0) (2026-09-24)
+
+
+### Features
+
+* **cli:** scope clusters to a repo and gate its cache on generation ([354a52e](https://github.com/Kehl-io/nestweaver/commit/354a52ef0cc475181246073ee8c9ddc9fffe7366))
+
+
+### Bug Fixes
+
+* batch 2 — correctness and usability cleanup ([e921323](https://github.com/Kehl-io/nestweaver/commit/e921323cfb77e98d805f1548bb760dab31ac6c57))
+* batch 2 — correctness and usability cleanup ([#427](https://github.com/Kehl-io/nestweaver/issues/427)) ([e921323](https://github.com/Kehl-io/nestweaver/commit/e921323cfb77e98d805f1548bb760dab31ac6c57))
+* **brain:** keep vault registrations honest across merge, prune, corruption ([63903cd](https://github.com/Kehl-io/nestweaver/commit/63903cd7d7fe48009eb908b3690e670e10a8a98b))
+* **brain:** name vaults a wal move-aside dropped from the graph ([257bf82](https://github.com/Kehl-io/nestweaver/commit/257bf82e5c6cab6ba7ee825acef71893b4e2958f))
+* **cli:** disclose clusters cache identity in json (nw-646) ([bc35052](https://github.com/Kehl-io/nestweaver/commit/bc350527797b890ac42a744766873b6bc6339cc7))
+* **cli:** populate repo identity in list-repos/stale-check json ([b150028](https://github.com/Kehl-io/nestweaver/commit/b150028f10a3eb83d8ddc86d963d37f95fc998d9))
+* **cli:** print detect-changes notes at their real level ([2d53426](https://github.com/Kehl-io/nestweaver/commit/2d53426575de175dda989d00dad3589d2a5bb7ad))
+* **cli:** send omitted investigate-expand/hydrate root through as None ([efb7760](https://github.com/Kehl-io/nestweaver/commit/efb7760010eac8983f4221cc01c7c0f2d46b5082))
+* **cli:** treat a malformed dead-code page_token as exit-2 usage error ([cee44d8](https://github.com/Kehl-io/nestweaver/commit/cee44d88e20f5784ceccdb6f3d39ae36cfe515ea))
+* **cli:** validate dead-code page_token shape before choosing a route ([418da71](https://github.com/Kehl-io/nestweaver/commit/418da71bd21b6633cb666d3ecac8cf857d9313ef))
+* **daemon:** pin a 120s ephemeral idle timeout in the alternating-db test ([d99d5dc](https://github.com/Kehl-io/nestweaver/commit/d99d5dc99641c72c0f9c3b55a47a252e81308ffc))
+* **daemon:** strip --force advice in suggest_links_json too ([c1ad7a5](https://github.com/Kehl-io/nestweaver/commit/c1ad7a5f92a3d05e2ec4095a57762cf8bd968162))
+* **engine:** hydrate symbol pagerank_score from the ranking cache ([9173792](https://github.com/Kehl-io/nestweaver/commit/917379219c6a68e48856ca4fd661f971bbccb76c))
+* **engine:** rank repo-map skeleton files by callable pagerank ([d500481](https://github.com/Kehl-io/nestweaver/commit/d500481518c42a8b8739c1d52f578c280a1ca810))
+* **engine:** take detect-changes risk and gate from blast radius ([b782bb8](https://github.com/Kehl-io/nestweaver/commit/b782bb8bfca975bbd0f511fe36e0c4bd7cbd5247))
+* keep the ui home crumb legible when the breadcrumb row is tight (nw-658) ([8931a05](https://github.com/Kehl-io/nestweaver/commit/8931a05da789ed35fbd1db85409be74df945ce73))
+* **mcp:** resolve investigate_expand/hydrate root from repo local_root ([c8cab8b](https://github.com/Kehl-io/nestweaver/commit/c8cab8b57f7ec206f8b5ce219e1d218563b0f921))
+* stop ui breadcrumb segments overlapping (nw-658) ([7127464](https://github.com/Kehl-io/nestweaver/commit/7127464f57e2dc4881efeac528b1cc4ab25f97dd))
+* **store:** refresh every regex shard search distrusts ([dc72c28](https://github.com/Kehl-io/nestweaver/commit/dc72c28780263ecfbd3483e895586acd87cd08b9))
+* strip --force advice from nested rebuild error too ([77bf312](https://github.com/Kehl-io/nestweaver/commit/77bf312a3ee21cdf46e105e1213275c8330c1f5f))
+
 ## [10.1.2](https://github.com/Kehl-io/nestweaver/compare/v10.1.1...v10.1.2) (2026-09-23)
 
 
