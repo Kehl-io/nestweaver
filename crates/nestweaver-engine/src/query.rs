@@ -3631,9 +3631,25 @@ pub fn generate_repo_map_bounded(
     store: &GraphStore,
     token_budget: usize,
 ) -> Result<RepoMap, anyhow::Error> {
-    let symbols = store
+    let ranked = store
         .symbols_by_pagerank(None)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // nw-645: rank by CALLABLE PageRank. Raw order let a `require`-bound
+    // `Constant` (`const knex = require('knex')`) that the resolver credits
+    // with every `knex.select(...)` call outrank the real hubs, so the
+    // skeleton opened on freeplay's imgix.js/knex.js instead of GraphStore.
+    // This is the same kind filter `hubs` ranks by (`is_callable_kind`, whose
+    // doc carries the evidence), applied as a stable partition of the
+    // PageRank order: callables first, then Constants/Properties/Modules/…
+    // So a file is placed by its best callable symbol, a file with none sorts
+    // after every file that has one, and inside a file callables list first.
+    // Nothing is dropped: a graph with no callable symbol at all still gets a
+    // full skeleton in raw PageRank order, and `files_total` is unchanged.
+    let (mut symbols, bindings): (Vec<Symbol>, Vec<Symbol>) = ranked
+        .into_iter()
+        .partition(|sym| crate::hubs::is_callable_kind(&sym.kind.to_string()));
+    symbols.extend(bindings);
 
     // Group symbols by (repo_uid, file_path) — NOT file_path alone — while
     // preserving the PageRank order of files. The first occurrence of a key
@@ -3727,7 +3743,8 @@ pub fn generate_repo_map_bounded(
     })
 }
 
-/// Generate a structural repo-map skeleton, ordered by PageRank (highest first).
+/// Generate a structural repo-map skeleton, ordered by PageRank (highest first)
+/// over callable symbols — see [`generate_repo_map_bounded`] (nw-645).
 ///
 /// The output groups symbols by file path:
 /// ```text
@@ -4608,6 +4625,148 @@ mod repo_map_tests {
         );
         assert_eq!(whole.files_returned, whole.files_total);
         assert_eq!(whole.files_total, 2, "the fixture has exactly two files");
+    }
+
+    fn make_symbol_of_kind(uid: &str, name: &str, file_path: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            kind,
+            ..make_symbol(uid, name, "repo:a", file_path)
+        }
+    }
+
+    /// nw-645. The skeleton (repo-map, and generate-guide's AGENTS.md
+    /// "Architecture" block, which calls the same function) used to order
+    /// files by their single highest-PageRank symbol of ANY kind, so a
+    /// `require`-bound `Constant` that the resolver credits with every
+    /// member-access call (`const knex = require('knex')`) put `imgix.js` /
+    /// `knex.js` above `GraphStore`. Files must be ranked by their best
+    /// CALLABLE symbol (the `hubs` kind filter, `is_callable_kind`).
+    #[test]
+    fn skeleton_ranks_files_by_callable_pagerank_not_constants() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&make_repo("repo:a", "fixture")).unwrap();
+        let symbols = [
+            (
+                "sym:graphstore",
+                "GraphStore",
+                "src/store.rs",
+                SymbolKind::Class,
+            ),
+            ("sym:knex", "knex", "src/knex.js", SymbolKind::Constant),
+            (
+                "sym:add",
+                "addImageParams",
+                "src/knex.js",
+                SymbolKind::Function,
+            ),
+            (
+                "sym:themes",
+                "THEMES",
+                "src/themes.js",
+                SymbolKind::Constant,
+            ),
+            ("sym:size", "size", "src/themes.js", SymbolKind::Property),
+        ];
+        for (uid, name, file, kind) in symbols {
+            store
+                .insert_symbol(&make_symbol_of_kind(uid, name, file, kind))
+                .unwrap();
+        }
+        let edge = |source: &str, target: &str| ResolvedEdge {
+            source_uid: source.to_string(),
+            target_uid: target.to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: vec![],
+        };
+        // Twelve callers hammer the constants (mis-resolved receiver calls);
+        // eight of them genuinely call GraphStore.
+        for n in 0..12 {
+            let uid = format!("sym:caller{n}");
+            store
+                .insert_symbol(&make_symbol(
+                    &uid,
+                    &format!("caller{n}"),
+                    "repo:a",
+                    "src/callers.js",
+                ))
+                .unwrap();
+            for target in ["sym:knex", "sym:themes", "sym:size"] {
+                store.insert_edge(&edge(&uid, target)).unwrap();
+            }
+            if n < 8 {
+                store.insert_edge(&edge(&uid, "sym:graphstore")).unwrap();
+            }
+        }
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        // Precondition: the fixture really does reproduce the defect's shape —
+        // a Constant outranks the callable hub on raw PageRank.
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        assert_ne!(
+            ranked[0].name, "GraphStore",
+            "fixture must let a constant lead"
+        );
+
+        let result = generate_repo_map_bounded(&store, 16_000).unwrap();
+        let headers: Vec<&str> = result
+            .map
+            .lines()
+            .filter(|line| !line.starts_with(' '))
+            .collect();
+        assert_eq!(
+            headers.first(),
+            Some(&"src/store.rs"),
+            "the callable hub's file must lead: {}",
+            result.map
+        );
+        assert_eq!(
+            headers.last(),
+            Some(&"src/themes.js"),
+            "a file with no callable symbol must not lead — it ranks last: {}",
+            result.map
+        );
+        // Nothing is hidden: the constants-only file is still listed.
+        assert_eq!(result.files_total, 4, "{}", result.map);
+        assert!(result.map.contains("THEMES"), "{}", result.map);
+        // Within a file, callables are listed before bindings too.
+        let knex_block: Vec<&str> = result
+            .map
+            .split("src/knex.js\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .take_while(|line| line.starts_with(' '))
+            .collect();
+        assert!(knex_block[0].contains("addImageParams"), "{knex_block:?}");
+    }
+
+    /// nw-645 COUNTERWEIGHT: a graph with no callable symbol at all (nothing
+    /// for the callable ranking to use) still yields a skeleton, ordered by
+    /// raw PageRank, rather than an empty map.
+    #[test]
+    fn skeleton_without_callables_still_lists_files() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&make_repo("repo:a", "fixture")).unwrap();
+        store
+            .insert_symbol(&make_symbol_of_kind(
+                "sym:c",
+                "LIMIT",
+                "src/consts.js",
+                SymbolKind::Constant,
+            ))
+            .unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let result = generate_repo_map_bounded(&store, 16_000).unwrap();
+        assert_eq!(result.files_total, 1);
+        assert_eq!(result.files_returned, 1);
+        assert!(result.map.contains("src/consts.js"), "{}", result.map);
+        assert!(result.map.contains("LIMIT"), "{}", result.map);
     }
 
     /// nw-369(b). Two DIFFERENT repos that happen to share a bare file path

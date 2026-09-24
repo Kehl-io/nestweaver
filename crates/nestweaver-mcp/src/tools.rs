@@ -16283,7 +16283,7 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 /// is a gRPC handler in `nestweaver-daemon`, not an entry in either of this
 /// file's dispatch tables, so it could not reach this — and `repo-map`'s entire
 /// output ORDERING is PageRank order (`generate_repo_map` →
-/// `symbols_by_pagerank`), which makes it the sharpest ranking-derived surface
+/// `symbols_by_pagerank`, callable kinds first since nw-645), which makes it the sharpest ranking-derived surface
 /// there is. Exporting the one attacher is what stops the daemon growing a
 /// second, drifting spelling of the same disclosure.
 pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {

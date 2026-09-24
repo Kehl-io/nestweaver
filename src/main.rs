@@ -5837,7 +5837,9 @@ enum Commands {
     ///
     /// Outputs the highest-PageRank symbols organized by file, truncated
     /// to fit within the specified token budget. Designed for AI agent
-    /// context windows.
+    /// context windows. Files are ranked by their best CALLABLE symbol
+    /// (the `hubs` kind filter); Constants, Properties, Variables, Modules
+    /// and type aliases never lead and list after the callables.
     ///
     /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs — the
     /// same population as `hubs`/`bridges`, and a different one from
