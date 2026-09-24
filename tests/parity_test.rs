@@ -2526,6 +2526,48 @@ fn intent_vocabulary_agrees_across_all_three_routes() {
     );
 }
 
+/// nw-660. Every daemon-routed CLI call is schema-validated by the daemon,
+/// and `dispatch_err_to_status` mapped EVERY violation to `Status::internal`,
+/// so a user input mistake exited 1 as "Internal error" -- indistinguishable
+/// from a daemon bug. `read-symbols` with an over-long target is one clap
+/// does not bound (only the `read_symbols` schema's `maxLength` does), so it
+/// reaches the validator on the daemon route. It must be a usage error (64)
+/// that still names the violated constraint.
+#[test]
+fn a_schema_violation_on_the_daemon_route_is_a_usage_error() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+
+    let oversized = "x".repeat(513);
+    let rejected = run_via_daemon(db, &["read-symbols", &oversized, "--json"]);
+    let stderr = flatten_miette(&rejected.stderr);
+    assert_eq!(
+        rejected.status.code(),
+        Some(64),
+        "a schema-violating argument is a usage error, not exit 1; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("maxlength"),
+        "the message must name the violated constraint: {stderr}"
+    );
+    assert!(
+        !stderr.contains("internal error"),
+        "a user input mistake must not be reported as an internal error: {stderr}"
+    );
+
+    // COUNTERWEIGHT: the same command with a valid target on the same route
+    // is not a usage error.
+    let accepted = run_via_daemon(db, &["read-symbols", "mainA", "--json"]);
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "a valid read-symbols call must still succeed; stderr:\n{}",
+        flatten_miette(&accepted.stderr)
+    );
+}
+
 /// nw-217a. The containment guard, generalised from ONE tool to a table.
 ///
 /// nw-217 is the most recurrent defect class in this workspace — "a guard

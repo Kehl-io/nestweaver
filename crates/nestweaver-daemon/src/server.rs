@@ -50,8 +50,9 @@ impl Drop for RpcIndexActivity {
 
 /// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
 /// a cancelled query surfaces as `deadline_exceeded` rather than an opaque
-/// `internal`. Repository-scope refusals are `permission_denied`; other errors
-/// keep the `internal` mapping. This is
+/// `internal`. Repository-scope refusals are `permission_denied`; schema
+/// violations are `invalid_argument` (nw-660); other errors keep the
+/// `internal` mapping. This is
 /// defense-in-depth: on timeout the safeguard's `select!` already returns
 /// `deadline_exceeded` and drops this future, but a query that finishes with a
 /// cancel error just before that race is mapped consistently here too.
@@ -65,6 +66,24 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         .any(|cause| cause.is::<nestweaver_mcp::tools::RepositoryScopeRefused>())
     {
         return Status::permission_denied(format!("tool {tool_name} refused: {e}"));
+    }
+    // nw-660. Arguments that fail the tool's schema are the caller's mistake.
+    // Mapping them to `internal` made the CLI exit 1 with "Internal error" for
+    // every schema violation on every tool; `invalid_argument` plus a stamped
+    // code lets the CLI report a usage error without reading prose.
+    if e.chain()
+        .any(|cause| cause.is::<nestweaver_mcp::tools::ToolArgumentsInvalid>())
+    {
+        let mut status = Status::invalid_argument(format!("tool {tool_name} failed: {e}"));
+        if let Ok(value) =
+            nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE.parse::<MetadataValue<_>>()
+        {
+            status.metadata_mut().insert(
+                nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                value,
+            );
+        }
+        return status;
     }
     if let Some(reason) = e
         .downcast_ref::<nestweaver_store::StoreError>()
@@ -238,6 +257,43 @@ mod dispatch_err_to_status_tests {
                 .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
                 .is_none()
         );
+    }
+
+    /// nw-660: a schema violation from `validate_tool_arguments` is the
+    /// caller's input mistake. It used to map to `Internal`, which the CLI
+    /// reports as exit 1 "Internal error".
+    #[test]
+    fn a_schema_violation_is_invalid_argument_with_its_error_code() {
+        let error = nestweaver_mcp::tools::validate_tool_arguments(
+            "read_symbols",
+            &serde_json::json!({ "targets": ["x".repeat(513)] }),
+        )
+        .expect_err("an over-long target violates the read_symbols schema");
+        let status = dispatch_err_to_status("read_symbols", error);
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let code = status
+            .metadata()
+            .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+            .expect("a schema violation must carry a machine-readable code")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(code, nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE);
+        assert!(
+            status
+                .message()
+                .contains("schema keyword 'maxLength' failed"),
+            "the schema message is kept; got {:?}",
+            status.message()
+        );
+    }
+
+    /// COUNTERWEIGHT: a genuine internal failure stays `Internal`.
+    #[test]
+    fn a_genuine_failure_stays_internal() {
+        let status = dispatch_err_to_status("read_symbols", anyhow::anyhow!("disk I/O error"));
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 }
 
