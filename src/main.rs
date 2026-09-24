@@ -28384,8 +28384,18 @@ fn run_brain(
                 // Removing it on purpose means forgetting that too, or
                 // `brain status` reports it as lost forever. `brain status`
                 // prints this command as the way to say "dropped on purpose".
-                let forgotten =
-                    nestweaver_engine::vault_registration::forget_root(&db_path, &canonical)?;
+                // An unreadable sidecar must not turn a plain not-found into
+                // an error: log it and fall through (`brain status` keeps
+                // disclosing it until the next record rewrites the file).
+                let forgotten = match nestweaver_engine::vault_registration::forget_root(
+                    &db_path, &canonical,
+                ) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::warn!("nw-587: vault registrations not consulted: {error:#}");
+                        0
+                    }
+                };
                 if forgotten > 0 {
                     println!(
                         "No vault in the graph at {canon_str}; forgot {forgotten} registration(s) \

@@ -12480,3 +12480,38 @@ fn index_with_trigrams_leaves_regex_search_on_the_index() {
     assert_eq!(stale["scanned_fallback"], true, "{stale}");
     assert_eq!(stale["dirty_scopes"], 1, "{stale}");
 }
+
+/// nw-587 review: with an unreadable registrations sidecar, `brain remove`
+/// of a path the graph does not hold must still be the ordinary not-found
+/// (exit 2), not an error raised by the registration lookup.
+#[test]
+fn brain_remove_with_an_unreadable_registration_sidecar_is_plain_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let repo_dir = dir.path().join("repo");
+    let absent = dir.path().join("absent-vault");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&absent).unwrap();
+    std::fs::write(repo_dir.join("main.js"), "function f() {}\n").unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    std::fs::write(
+        sidecar_path(&db_path, ".vault-registrations.json"),
+        b"{not json",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["brain", "remove"])
+        .arg(&absent)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .code(2)
+        .stdout(contains("No vault found"));
+}

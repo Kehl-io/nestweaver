@@ -24,8 +24,9 @@
 //! reported as lost:
 //!
 //!   * `remove_vault` (every `brain remove` / `brain_remove_source` route ends
-//!     there) forgets the uid, and `brain remove <path>` forgets a registration
-//!     whose graph row is already gone.
+//!     there) and `prune_stale` forget the uid and every registration at its
+//!     root, and `brain remove <path>` forgets a registration whose graph row
+//!     is already gone.
 //!   * A registration also counts as present when a live vault has the same
 //!     ROOT PATH under another uid, which is what `instance merge` produces.
 //!   * A registration whose root directory no longer exists is not reported:
@@ -33,7 +34,8 @@
 //!     has no remedy to offer.
 //!
 //! A database indexed before this file existed has no registrations, so it
-//! reports nothing missing until its vaults are next added or refreshed.
+//! reports nothing missing until its vaults are next added or refreshed — a
+//! refresh that finds no changed notes registers too.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -96,18 +98,42 @@ pub fn registrations(db_path: &Path) -> anyhow::Result<Vec<VaultRegistration>> {
 
 /// Record (or refresh) a vault after its publication committed. Idempotent:
 /// an unchanged registration does not rewrite the file.
+///
+/// One root holds ONE registration: an entry at the same canonical root under
+/// another uid (what `instance merge` leaves) is replaced, not kept beside it.
+///
+/// An unreadable sidecar is REWRITTEN here rather than failing every record
+/// forever: the entries it held cannot be recovered by refusing, and until
+/// this rewrite `missing` keeps disclosing `vault_registrations_unreadable`.
+///
+/// Load-modify-save is not locked against a concurrent writer. Graph writers
+/// hold the write lease while publishing, which serialises records; a
+/// `forget` racing a record can lose one update, and the worst outcome is one
+/// stale or missing disclosure until the next add, refresh, or remove.
 pub fn record(db_path: &Path, vault: &nestweaver_schema::Vault) -> anyhow::Result<()> {
-    let mut registry = load(db_path)?;
+    let mut registry = load(db_path).unwrap_or_else(|error| {
+        tracing::warn!("nw-587: rewriting unreadable vault registrations: {error:#}");
+        Registry::default()
+    });
     let entry = VaultRegistration {
         uid: vault.uid.clone(),
         name: vault.name.clone(),
         root_path: vault.root_path.clone(),
         instance_id: vault.instance_id.clone(),
     };
-    if registry.vaults.contains(&entry) {
+    let root = canonical(Path::new(&entry.root_path));
+    let same_root =
+        |existing: &VaultRegistration| canonical(Path::new(&existing.root_path)) == root;
+    let mut at_root = registry
+        .vaults
+        .iter()
+        .filter(|existing| same_root(existing));
+    if at_root.next() == Some(&entry) && at_root.next().is_none() {
         return Ok(());
     }
-    registry.vaults.retain(|existing| existing.uid != entry.uid);
+    registry
+        .vaults
+        .retain(|existing| existing.uid != entry.uid && !same_root(existing));
     registry.vaults.push(entry);
     registry.version = REGISTRY_VERSION;
     save(db_path, &registry)
@@ -149,6 +175,16 @@ fn forget_where(
 /// Forget a deliberately removed vault by uid.
 pub fn forget_uid(db_path: &Path, uid: &str) -> anyhow::Result<usize> {
     forget_where(db_path, |entry| entry.uid == uid)
+}
+
+/// Forget a deliberately removed vault: its uid AND every registration at its
+/// root. After `instance merge` one root may carry a pre-merge uid too, and
+/// forgetting only the removed uid would report that root as lost.
+pub fn forget_vault(db_path: &Path, uid: &str, root_path: &str) -> anyhow::Result<usize> {
+    let root = canonical(Path::new(root_path));
+    forget_where(db_path, |entry| {
+        entry.uid == uid || canonical(Path::new(&entry.root_path)) == root
+    })
 }
 
 /// Forget every registration rooted at `root` (compared canonically).
@@ -279,6 +315,49 @@ mod tests {
         let merged_root = merged.to_string_lossy().into_owned();
         let missing = missing(&db, [("vlt:new:merged", merged_root.as_str())]).unwrap();
         assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// Review fix 1: after `instance merge` one root carried two uids — the
+    /// old one never forgotten — so removing the live uid left the old one
+    /// behind and reported the root as lost.
+    #[test]
+    fn one_root_holds_one_registration_and_removal_forgets_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let root = dir.path().join("merged");
+        std::fs::create_dir_all(&root).unwrap();
+        record(&db, &vault("vlt:old:merged", &root)).unwrap();
+        record(&db, &vault("vlt:new:merged", &root)).unwrap();
+        let entries = registrations(&db).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].uid, "vlt:new:merged");
+
+        // A sidecar written before this fix can still hold both.
+        let both = serde_json::json!({"version": 1, "vaults": [
+            {"uid": "vlt:old:merged", "name": "merged", "root_path": root, "instance_id": "old"},
+            {"uid": "vlt:new:merged", "name": "merged", "root_path": root, "instance_id": "new"},
+        ]});
+        std::fs::write(registrations_path(&db), both.to_string()).unwrap();
+        assert_eq!(
+            forget_vault(&db, "vlt:new:merged", &root.to_string_lossy()).unwrap(),
+            2
+        );
+        assert!(missing(&db, std::iter::empty()).unwrap().is_empty());
+    }
+
+    /// Review fix 2: an unreadable sidecar made every record/forget fail
+    /// forever. The next record rewrites it; until then `missing` says so.
+    #[test]
+    fn an_unreadable_sidecar_is_disclosed_until_the_next_record_rewrites_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let root = dir.path().join("v");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(registrations_path(&db), b"{not json").unwrap();
+        assert!(missing(&db, std::iter::empty()).is_err());
+        record(&db, &vault("vlt:default:v", &root)).unwrap();
+        assert_eq!(registrations(&db).unwrap().len(), 1);
+        assert!(missing(&db, std::iter::empty()).unwrap().len() == 1);
     }
 
     #[test]

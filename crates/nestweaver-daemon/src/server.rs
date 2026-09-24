@@ -5078,6 +5078,8 @@ where
                             error = Some(delete_error);
                             break;
                         }
+                        // nw-587: pruned on purpose, so not "lost".
+                        forget_vault_registration(state, &vault.uid, Some(&vault.root_path));
                         removed_vaults.push(vault.name.clone());
                         removed_vault_uids.push(vault.uid.clone());
                     }
@@ -5643,6 +5645,23 @@ where
     }
 }
 
+/// nw-587. Forget a deliberately deleted vault's registrations — its uid and,
+/// when known, every registration at its root (`instance merge` can leave a
+/// pre-merge uid there) — so `brain status` / `brain list` do not report it as
+/// dropped. Shared by `remove_vault` and `prune_stale`. Best-effort: the graph
+/// delete already committed, and a failure only leaves a stale disclosure.
+fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Option<&str>) {
+    let forgotten = match root_path {
+        Some(root) => {
+            nestweaver_engine::vault_registration::forget_vault(&state.db_path, vault_uid, root)
+        }
+        None => nestweaver_engine::vault_registration::forget_uid(&state.db_path, vault_uid),
+    };
+    if let Err(error) = forgotten {
+        tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    }
+}
+
 fn run_remove_vault_with_projection(
     state: &DaemonState,
     vault_uid: &str,
@@ -5650,19 +5669,22 @@ fn run_remove_vault_with_projection(
         Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
     >,
 ) -> Result<RemoveVaultResponse, Status> {
+    // nw-587: the root is read BEFORE the delete, so the removal can forget
+    // every registration at it (see `forget_vault_registration`).
+    let root_path = state
+        .store
+        .lookup_vault(vault_uid)
+        .ok()
+        .map(|vault| vault.root_path);
     let mutation = state
         .store
         .delete_vault_cascade_with_outcome(vault_uid)
         .map_err(|error| Status::internal(format!("delete_vault_cascade failed: {error:#}")));
     let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
-    // nw-587: a deliberate removal is not a loss. Forget the registration so
-    // `brain status` / `brain list` do not report this vault as dropped. Also
-    // on a confirmed no-op: the graph proves the uid absent either way.
-    if mutation.is_ok()
-        && let Err(error) =
-            nestweaver_engine::vault_registration::forget_uid(&state.db_path, vault_uid)
-    {
-        tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    // A deliberate removal is not a loss. Also on a confirmed no-op: the
+    // graph proves the uid absent either way.
+    if mutation.is_ok() {
+        forget_vault_registration(state, vault_uid, root_path.as_deref());
     }
     let mut failures = Vec::new();
     if !confirmed_noop {
@@ -16621,6 +16643,71 @@ credential_method = "gh"
         assert!(result.removed_repos.is_empty() && result.removed_vaults.is_empty());
         assert!(result.reconciliation_failures.is_empty());
         assert_eq!(generation, state.store.graph_generation());
+    }
+
+    /// nw-587 review: removal forgets every registration at the removed
+    /// vault's ROOT. An `instance merge` left the pre-merge uid registered at
+    /// the same root; forgetting only the removed uid reported that root as
+    /// a lost vault.
+    #[test]
+    fn remove_vault_forgets_every_registration_at_its_root() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:new:merged", "new", &root_str);
+        let sidecar = nestweaver_engine::vault_registration::registrations_path(&state.db_path);
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({"version": 1, "vaults": [
+                {"uid": "vlt:old:merged", "name": "m", "root_path": root_str, "instance_id": "old"},
+                {"uid": "vlt:new:merged", "name": "m", "root_path": root_str, "instance_id": "new"},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        run_remove_vault_with_projection(&state, "vlt:new:merged", None).unwrap();
+
+        let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn prune_stale_forgets_the_registration_of_a_pruned_vault() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:forget",
+            "prune",
+            "/definitely/missing/prune-forget",
+        );
+        nestweaver_engine::vault_registration::record(
+            &state.db_path,
+            &nestweaver_schema::Vault {
+                uid: "vlt:prune:forget".into(),
+                name: "forget".into(),
+                root_path: "/definitely/missing/prune-forget".into(),
+                instance_id: "prune".into(),
+            },
+        )
+        .unwrap();
+
+        let result = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.removed_vaults.len(), 1);
+        let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
