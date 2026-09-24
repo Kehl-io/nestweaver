@@ -661,6 +661,13 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
+        // nw-608: before publishing the Vault node below.
+        crate::vault_registration::refuse_duplicate_vault_name(
+            &store,
+            &v_uid,
+            &self.vault_name,
+            &self.vault_root,
+        )?;
         let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
             Ok(lease) => lease,
             Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -1970,6 +1977,47 @@ mod tests {
                 root_path: Some(root.to_string_lossy().into_owned()),
             })
             .unwrap();
+    }
+
+    /// nw-608: `brain watch --name r4-vault` on a new root, against a copied
+    /// database that already held `r4-vault` at its original root, published
+    /// a SECOND same-named vault; `brain search` then returned both notes.
+    /// The watcher must refuse at startup, before it publishes anything.
+    #[test]
+    fn watching_a_new_root_under_an_existing_vault_name_is_refused() {
+        let _guard = serial_watcher_test();
+        let (_original_dir, original) = make_vault(&[("Orphan.md", "# Orphan\n\noriginal\n")]);
+        let (_copy_dir, copy) = make_vault(&[("Orphan.md", "# Orphan\n\ncopy\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&original, &db_path, "default", "r4-vault")
+            .unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let run = |root: &Path, name: &str| {
+            let watcher = BrainWatcher::new(&db_path, root, "default", name);
+            let stop = watcher.shutdown_handle();
+            watcher
+                .with_ready_callback(move || stop.stop())
+                .run_with_store(store.clone(), None)
+        };
+
+        let message = format!("{:#}", run(&copy, "r4-vault").unwrap_err());
+        assert!(
+            message.contains("r4-vault")
+                && message.contains(&*original.to_string_lossy())
+                && message.contains("brain remove"),
+            "{message}"
+        );
+        assert_eq!(store.list_vaults(None).unwrap().len(), 1);
+
+        // Counterweight: re-watching the SAME root under its name still
+        // works, and a first watch under a unique name still indexes.
+        run(&original, "r4-vault").unwrap();
+        run(&copy, "r4-copy").unwrap();
+        let copy_uid = vault_uid("default", &copy.to_string_lossy());
+        let copied = store.list_notes(Some(&copy_uid)).unwrap();
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        assert_eq!(store.list_vaults(None).unwrap().len(), 2);
     }
 
     /// nw-653: notes created, edited or deleted while no watcher was

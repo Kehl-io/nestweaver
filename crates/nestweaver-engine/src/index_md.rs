@@ -2015,6 +2015,7 @@ fn index_markdown_since_with_reader_mode(
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    crate::vault_registration::refuse_duplicate_vault_name(store, &v_uid, vault_name, vault_root)?;
 
     let existing_notes = store
         .list_notes(Some(&v_uid))
@@ -3276,6 +3277,13 @@ where
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    // nw-608: before any scan work. The server-mode route names a vault by its
+    // repo URL and roots it at a bare clone, so it is not a local registration.
+    if record_repo_sha.is_none() {
+        crate::vault_registration::refuse_duplicate_vault_name(
+            store, &v_uid, vault_name, vault_root,
+        )?;
+    }
 
     // The Vault node is upserted later, under the write gate, alongside the
     // bulk commit (see "gated write region" below). Computing v_uid here is a
@@ -9108,5 +9116,72 @@ mod watch_reconciliation_disclosure_tests {
             vec![&root.join("Broken.md").to_string_lossy().into_owned()],
             "the vault's memory survives; the repo's is forgotten"
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_vault_name_tests {
+    use super::*;
+
+    fn vault_at(parent: &Path, body: &str) -> PathBuf {
+        let root = parent.join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Orphan.md"), format!("# Orphan\n\n{body}\n")).unwrap();
+        std::fs::canonicalize(root).unwrap()
+    }
+
+    /// nw-608: a copied database kept `r4-vault` at its original root, and
+    /// registering the same name at a NEW root forked it into two same-named
+    /// vaults — `brain search` returned both notes and `brain remove r4-vault`
+    /// became ambiguous. Both vault-publication routes (full and `--since`)
+    /// must refuse, name the existing root, and say how to move or remove it.
+    #[test]
+    fn a_second_root_under_an_existing_vault_name_is_refused_on_both_routes() {
+        let original_dir = tempfile::tempdir().unwrap();
+        let copy_dir = tempfile::tempdir().unwrap();
+        let original = vault_at(original_dir.path(), "original");
+        let copy = vault_at(copy_dir.path(), "copy");
+        let db = original_dir.path().join("brain.lbug");
+        index_markdown_directory(&original, &db, "default", "r4-vault").unwrap();
+
+        let full = index_markdown_directory(&copy, &db, "default", "r4-vault")
+            .err()
+            .expect("the full route must refuse a second root under the name");
+        let since = index_markdown_directory_since(
+            &copy,
+            &db,
+            "default",
+            "r4-vault",
+            std::time::UNIX_EPOCH,
+        )
+        .err()
+        .expect("the --since route must refuse a second root under the name");
+        for err in [full, since] {
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("r4-vault")
+                    && message.contains(&*original.to_string_lossy())
+                    && message.contains("brain remove"),
+                "{message}"
+            );
+        }
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1, "{vaults:?}");
+        drop(store);
+
+        // Counterweight: the SAME root under the same name still refreshes,
+        // and a unique name at the new root still indexes.
+        index_markdown_directory(&original, &db, "default", "r4-vault").unwrap();
+        index_markdown_directory_since(
+            &original,
+            &db,
+            "default",
+            "r4-vault",
+            std::time::UNIX_EPOCH,
+        )
+        .unwrap();
+        let unique = index_markdown_directory(&copy, &db, "default", "r4-copy").unwrap();
+        assert_eq!(unique.notes_count, 1);
     }
 }

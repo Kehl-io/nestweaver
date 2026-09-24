@@ -2761,6 +2761,64 @@ fn detect_changes_text_prints_notifications_at_their_real_level() {
     );
 }
 
+/// nw-608: registering an existing vault name at a NEW root (a copied DB
+/// watched from a new checkout) forked it into two same-named vaults. `brain
+/// add` and `brain watch` both refuse, naming the existing root; the graph
+/// keeps one vault. Counterweight: re-adding the same root still refreshes.
+#[test]
+fn a_vault_name_already_held_by_another_root_is_refused_by_add_and_watch() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("scratch").join("vault");
+    let copy = dir.path().join("scratch-watch").join("vault");
+    for (root, body) in [(&original, "original"), (&copy, "copy")] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Orphan.md"), format!("# Orphan\n\n{body}\n")).unwrap();
+    }
+    let db_path = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&original)
+        .args(["--name", "r4-vault", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    for verb in ["add", "watch"] {
+        let output = nestweaver_cmd()
+            .args(["brain", verb])
+            .arg(&copy)
+            .args(["--name", "r4-vault", "--db"])
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "brain {verb}: {stderr}");
+        assert!(
+            stderr.contains("a vault named 'r4-vault' is already indexed at")
+                && stderr.contains("brain remove"),
+            "brain {verb}: {stderr}"
+        );
+    }
+
+    // Counterweight: the same root under the same name still refreshes.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&original)
+        .args(["--name", "r4-vault", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+    let list = nestweaver_cmd()
+        .args(["brain", "list", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(stdout.matches("r4-vault").count(), 1, "{stdout}");
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])

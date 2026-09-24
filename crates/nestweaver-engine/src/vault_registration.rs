@@ -156,6 +156,59 @@ pub(crate) fn record_for_store(
     }
 }
 
+/// nw-608: refuse to register a NEW vault under a name another vault at a
+/// different root already holds.
+///
+/// A vault's uid is derived from its root path, so registering `r4-vault` at a
+/// new root (a copied database watched from a new checkout) did not move the
+/// existing vault — it created a second one with the same name. `brain search`
+/// then returned both vaults' notes, and every name selector (`brain remove
+/// <name>`, `brain_remove_source`) became ambiguous.
+///
+/// Refused rather than rehomed: a uid, and every note/heading/section/tag uid
+/// beneath it, is a hash of the root, so there is no primitive that moves a
+/// vault — "rehoming" would be a remove plus a full re-index, a destructive
+/// write the operator should choose, not one a watch should perform.
+///
+/// Scope, deliberately narrow so existing states keep working:
+///   * a vault whose uid is already in the graph refreshes in place, even in a
+///     database that was forked before this guard existed;
+///   * another vault at the SAME root (a different instance) is nw-098's case,
+///     guarded by the CLI and repaired by `instance merge`, not this one.
+///
+/// Every local vault publication calls this — the full and `--since` index
+/// routes and the watcher's startup — so `brain add`, `brain refresh`,
+/// `brain watch`, the daemon RPCs and MCP `brain_add_source` share one answer.
+pub fn refuse_duplicate_vault_name(
+    store: &nestweaver_store::GraphStore,
+    uid: &str,
+    name: &str,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let vaults = store.list_vaults(None)?;
+    if vaults.iter().any(|vault| vault.uid == uid) {
+        return Ok(());
+    }
+    let wanted = canonical(root);
+    let Some(existing) = vaults
+        .iter()
+        .find(|vault| vault.name == name && canonical(Path::new(&vault.root_path)) != wanted)
+    else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "a vault named '{name}' is already indexed at {} ({}); refusing to register a \
+         second vault with the same name at {} — both would answer searches and \
+         `brain remove {name}` would be ambiguous.\n\
+         help: pass a different --name, or if the vault moved, remove the old one first \
+         (`nestweaver brain remove {}`) and add it at the new path.",
+        existing.root_path,
+        existing.uid,
+        root.display(),
+        crate::shell_quote(&existing.root_path),
+    )
+}
+
 /// Forget registrations matching `predicate`. Returns how many were dropped.
 fn forget_where(
     db_path: &Path,
