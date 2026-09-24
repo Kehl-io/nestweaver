@@ -20,16 +20,35 @@
 //!
 //! Only EXPRESSION positions count: `{...}` (Svelte/Astro text, attributes and
 //! directives, Vue's `{{ ... }}`), and for Vue the values of `@x`, `:x`, `v-*`
-//! and `#slot` attributes. A word in static text such as `<p>total</p>` is not
-//! a use. A member access (`item.name`) is not a use of `name`.
+//! and `#slot` attributes. Svelte directives that NAME a function count too:
+//! `use:`, `transition:`, `in:`, `out:`, `animate:`, and the valueless
+//! `class:x`/`bind:x`/`style:x` shorthand. A word in static text such as
+//! `<p>total</p>` is not a use, nor is anything inside an HTML comment. A
+//! member access (`item.name`) is not a use of `name`.
 
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// `<script ...> ... </script>` and `<style ...> ... </style>` blocks.
+/// `<script ...> ... </script>` and `<style ...> ... </style>` blocks, and
+/// `<!-- ... -->` comments: a commented-out `{oldHelper()}` is not a use.
 static RE_SCRIPT_OR_STYLE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>").unwrap()
+    Regex::new(r"(?is)<!--.*?-->|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>")
+        .unwrap()
+});
+
+/// Svelte directives whose NAME is the reference, value or not:
+/// `use:tooltip`, `transition:fade`, `in:fly`, `out:fade`, `animate:flip`.
+static RE_SVELTE_NAMED_DIRECTIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)(?:use|transition|in|out|animate):([A-Za-z_$][\w$]*)").unwrap()
+});
+
+/// Svelte `class:`/`bind:`/`style:` directives. Only the VALUELESS shorthand
+/// (`class:active`, `bind:value`, `style:color`) names a script symbol; with a
+/// value the name is a CSS class, DOM property or CSS property, and the
+/// `{...}` value is scanned like any other expression. Group 2 is the `=`.
+static RE_SVELTE_SHORTHAND_DIRECTIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)(?:class|bind|style):([A-Za-z_$][\w$-]*)(\s*=)?").unwrap()
 });
 
 /// A Vue directive attribute with a quoted expression value:
@@ -59,6 +78,17 @@ pub(crate) enum Dialect {
 pub(crate) fn markup_identifiers(markup: &str, dialect: Dialect) -> HashSet<String> {
     let markup = RE_SCRIPT_OR_STYLE_BLOCK.replace_all(markup, "");
     let mut expressions = brace_expressions(&markup);
+    if dialect == Dialect::Braces {
+        for cap in RE_SVELTE_NAMED_DIRECTIVE.captures_iter(&markup) {
+            expressions.push(cap[1].to_string());
+        }
+        for cap in RE_SVELTE_SHORTHAND_DIRECTIVE.captures_iter(&markup) {
+            // A hyphenated name (`class:is-active`) cannot be shorthand.
+            if cap.get(2).is_none() && !cap[1].contains('-') {
+                expressions.push(cap[1].to_string());
+            }
+        }
+    }
     if dialect == Dialect::Vue {
         for cap in RE_VUE_DIRECTIVE_VALUE.captures_iter(&markup) {
             if let Some(value) = cap.get(1).or_else(|| cap.get(2)) {
@@ -160,6 +190,73 @@ mod tests {
         ] {
             assert!(used.contains(name), "{name} is used; got {used:?}");
         }
+    }
+
+    /// Svelte directives whose NAME is the reference, with no `{...}` value:
+    /// actions, transitions and animations always; `class:`/`bind:`/`style:`
+    /// in their valueless shorthand.
+    #[test]
+    fn svelte_use_directive_names_its_action() {
+        let used = markup_identifiers("<div use:tooltip>x</div>", Dialect::Braces);
+        assert!(used.contains("tooltip"), "{used:?}");
+    }
+
+    #[test]
+    fn svelte_transition_directives_name_their_function() {
+        let used = markup_identifiers(
+            "<div transition:fade in:fly={{ y: 20 }} out:slide|local animate:flip>x</div>",
+            Dialect::Braces,
+        );
+        for name in ["fade", "fly", "slide", "flip"] {
+            assert!(used.contains(name), "{name}; got {used:?}");
+        }
+    }
+
+    #[test]
+    fn svelte_valueless_class_shorthand_is_a_use() {
+        let used = markup_identifiers("<div class:active>x</div>", Dialect::Braces);
+        assert!(used.contains("active"), "{used:?}");
+    }
+
+    #[test]
+    fn svelte_valueless_bind_shorthand_is_a_use() {
+        let used = markup_identifiers("<input bind:value />", Dialect::Braces);
+        assert!(used.contains("value"), "{used:?}");
+    }
+
+    #[test]
+    fn svelte_valueless_style_shorthand_is_a_use() {
+        let used = markup_identifiers("<p style:color>x</p>", Dialect::Braces);
+        assert!(used.contains("color"), "{used:?}");
+    }
+
+    /// COUNTERWEIGHT. With a value, `class:`/`bind:`/`style:` name a CSS
+    /// class, a DOM property or a CSS property -- not a script symbol; the
+    /// `{...}` value is what is used.
+    #[test]
+    fn svelte_valued_class_bind_style_use_only_their_value() {
+        let used = markup_identifiers(
+            "<div class:selected={isOn} style:width={w} bind:checked={flag}>x</div>",
+            Dialect::Braces,
+        );
+        for name in ["isOn", "w", "flag"] {
+            assert!(used.contains(name), "{name}; got {used:?}");
+        }
+        for name in ["selected", "width", "checked"] {
+            assert!(!used.contains(name), "{name}; got {used:?}");
+        }
+    }
+
+    /// A commented-out expression is not a use.
+    #[test]
+    fn html_comments_are_not_uses() {
+        let used = markup_identifiers(
+            "<!-- <p>{oldHelper()}</p>\n<div use:oldAction> -->\n<p>{live}</p>",
+            Dialect::Braces,
+        );
+        assert!(!used.contains("oldHelper"), "{used:?}");
+        assert!(!used.contains("oldAction"), "{used:?}");
+        assert!(used.contains("live"), "{used:?}");
     }
 
     /// COUNTERWEIGHT. Static text, plain attribute values, member names and
