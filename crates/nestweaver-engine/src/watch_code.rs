@@ -481,10 +481,27 @@ impl CodeWatcher {
                 }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
                 WatchBatchOutcome::Skipped { reason } => {
+                    // nw-669: this used to be the whole handling — a warning,
+                    // then the batch was gone. Nothing retried it and nothing
+                    // disclosed it, so with one unreadable contract-language
+                    // source in the repo every live edit was silently lost.
+                    // Hand it to the startup reconciliation's retry instead:
+                    // an attempt recomputes disk-vs-graph drift (which holds
+                    // these paths, since the graph never took them), replays
+                    // it, and on failure discloses it as owed and retries on
+                    // the shared backoff until it lands. Due now, but keeping
+                    // the failure count, so a persistent fault still backs off.
                     tracing::warn!(
                         error = %reason,
-                        "skipping transient watcher batch before publication; previous graph preserved"
+                        "code watcher batch skipped before publication; previous graph \
+                         preserved; reconciling with retry"
                     );
+                    let failures = pending.as_ref().map_or(0, |owed| owed.failures);
+                    pending = Some(crate::watcher::PendingReconciliation {
+                        paths: None,
+                        failures,
+                        next_attempt: Instant::now(),
+                    });
                     continue;
                 }
             };
@@ -4037,6 +4054,61 @@ mod tests {
         wait_until("the stale disclosure to clear", || {
             code_debt(&db_path).is_empty()
         });
+        stop.stop();
+        handle.join().unwrap().unwrap();
+    }
+
+    /// nw-669: the LIVE path dropped a `Skipped` batch after a warning — no
+    /// retry, no disclosure. With one unreadable contract-language source in
+    /// the repo every live edit was silently lost. A skipped live batch is
+    /// now disclosed as owed and retried on the shared backoff until it lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_live_batch_is_disclosed_and_retried_until_it_lands() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let locked = root.join("src/locked.js");
+        std::fs::write(&locked, "export function locked() { return 1; }\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_reconcile_retry_base(Duration::from_millis(300));
+        let (stop, handle) = spawn_live_code_watcher(watcher, store.clone());
+
+        let edited = root.join("src/b.js");
+        std::fs::write(
+            &edited,
+            "import { helper } from './a.js';\nexport function alphaLive() { return helper(); }\n",
+        )
+        .unwrap();
+        let edited_key = edited.to_string_lossy().into_owned();
+        let owed = || {
+            code_debt(&db_path)
+                .into_iter()
+                .any(|(path, reason)| path == edited_key && reason.contains("retrying"))
+        };
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_until("the skipped live edit to be disclosed as owed", owed)
+        }));
+        let running = !handle.is_finished();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if let Err(panic) = waited {
+            stop.stop();
+            let _ = handle.join();
+            std::panic::resume_unwind(panic);
+        }
+        assert!(running, "the watcher keeps running while the edit is owed");
+        assert!(!repo_symbol_names(&store, &uid).contains("alphaLive"));
+
+        wait_until("the retried edit to land", || {
+            repo_symbol_names(&store, &uid).contains("alphaLive")
+        });
+        wait_until("the disclosure to clear", || code_debt(&db_path).is_empty());
         stop.stop();
         handle.join().unwrap().unwrap();
     }
