@@ -503,6 +503,7 @@ impl CodeWatcher {
                     if pending.is_none() {
                         pending = Some(crate::watcher::PendingReconciliation {
                             paths: None,
+                            also_replay: Vec::new(),
                             failures: 0,
                             next_attempt: Instant::now(),
                         });
@@ -1321,6 +1322,7 @@ impl CodeWatcher {
         );
         Ok(Some(crate::watcher::PendingReconciliation {
             paths,
+            also_replay: Vec::new(),
             failures,
             next_attempt: Instant::now() + delay,
         }))

@@ -150,11 +150,12 @@ pub struct CrossDomainFlushStats {
 
 #[cfg(test)]
 thread_local! {
-    /// Test failpoint (nw-668): fail the next flush after its deletes and
-    /// note-level inserts ran and before its section-level inserts — the
-    /// point where the old auto-commit path left a partial edge set.
-    pub(crate) static FAIL_NEXT_CROSS_DOMAIN_FLUSH: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// Test failpoint (nw-668): fail this many upcoming flushes after their
+    /// deletes and note-level inserts ran and before their section-level
+    /// inserts — the point where the old auto-commit path left a partial
+    /// edge set.
+    pub(crate) static FAIL_CROSS_DOMAIN_FLUSHES: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Full implementation accepting both config and vault readers.
@@ -287,7 +288,11 @@ fn flush_on(
     statements += GraphStore::batch_insert_note_to_symbol_edges_on(conn, &note_edges)
         .map_err(|e| anyhow::anyhow!("batch_insert_note_to_symbol_edges_on: {e}"))?;
     #[cfg(test)]
-    if FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.replace(false)) {
+    if FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| {
+        let armed = fail.get();
+        fail.set(armed.saturating_sub(1));
+        armed > 0
+    }) {
         anyhow::bail!("injected cross-domain flush failure");
     }
     let section_edges: Vec<_> = batch
@@ -1156,9 +1161,9 @@ mod tests {
             "# A\n\nuses AlphaWidget and BravoWidget\n",
         )
         .unwrap();
-        FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(true));
+        FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(1));
         let failed = discover_cross_domain_links_for_note(&store, &note.uid);
-        FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(false));
+        FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
         assert!(failed.is_err(), "the injected failure must surface");
         assert_eq!(
             store.list_references_code_edges().unwrap(),

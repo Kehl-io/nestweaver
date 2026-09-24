@@ -367,19 +367,6 @@ impl From<TantivyError> for StoreError {
     }
 }
 
-/// BM25 index over the brain's text content.
-///
-/// Two constructors:
-/// - `open_or_create` — opens both a reader and writer. Use this in
-///   processes that need to write (the brain watcher, `brain add`,
-///   `brain reindex-search`).
-/// - `open_reader_only` — opens only a reader. Use this in processes
-///   that only need to search (CLI search, MCP server, web UI). This
-///   avoids contending for the writer lock with a running watcher.
-///
-/// Write methods (`reindex_from_store`, `update_note`, `remove_note`)
-/// return `TantivyError::WriterUnavailable` when called on a
-/// reader-only instance.
 /// One note's documents for [`TantivyIndex::update_notes_batch`] /
 /// [`TantivyIndex::apply_note_batch`]:
 /// `(note_uid, title, vault_uid, body_chunks, headings, sections, tags)`, the
@@ -396,6 +383,19 @@ pub type NoteDocBatchEntry = (
     Vec<String>,
 );
 
+/// BM25 index over the brain's text content.
+///
+/// Two constructors:
+/// - `open_or_create` — opens both a reader and writer. Use this in
+///   processes that need to write (the brain watcher, `brain add`,
+///   `brain reindex-search`).
+/// - `open_reader_only` — opens only a reader. Use this in processes
+///   that only need to search (CLI search, MCP server, web UI). This
+///   avoids contending for the writer lock with a running watcher.
+///
+/// Write methods (`reindex_from_store`, `update_note`, `remove_note`)
+/// return `TantivyError::WriterUnavailable` when called on a
+/// reader-only instance.
 pub struct TantivyIndex {
     index: Index,
     reader: IndexReader,

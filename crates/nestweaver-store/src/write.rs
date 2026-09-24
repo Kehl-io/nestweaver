@@ -790,6 +790,26 @@ fn write_project_edge_csv(
     Ok(())
 }
 
+thread_local! {
+    static PARAMETERIZED_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Parameterized write statements executed ON THIS THREAD through the
+/// store's execute boundary (`exec_params` and the REFERENCES_CODE row
+/// inserter), since the thread started. nw-668: an observation independent of
+/// the counts a write path reports about itself, so a test can take the delta
+/// around a call and catch a regression to per-row statements even if that
+/// regression also misreports its own count. Thread-local, so concurrent
+/// tests do not perturb each other; costs one cell increment per statement.
+#[doc(hidden)]
+pub fn parameterized_writes_on_this_thread() -> u64 {
+    PARAMETERIZED_WRITES.with(std::cell::Cell::get)
+}
+
+fn count_parameterized_write() {
+    PARAMETERIZED_WRITES.with(|count| count.set(count.get() + 1));
+}
+
 fn exec_params(
     conn: &lbug::Connection<'_>,
     query: &str,
@@ -798,6 +818,7 @@ fn exec_params(
     let mut stmt = conn
         .prepare(query)
         .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+    count_parameterized_write();
     conn.execute(&mut stmt, params)
         .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
     Ok(())
@@ -807,7 +828,7 @@ fn exec_params(
 /// (nw-668). Bounds the size of a single parameter list for a note with an
 /// extreme match count; far above any normal note, so a typical flush is one
 /// statement per edge kind.
-pub const CROSS_DOMAIN_ROWS_PER_STATEMENT: usize = 10_000;
+pub(crate) const CROSS_DOMAIN_ROWS_PER_STATEMENT: usize = 10_000;
 
 /// Execute `UNWIND $rows AS r <tail>` for `edges` in chunks of
 /// [`CROSS_DOMAIN_ROWS_PER_STATEMENT`]; returns the statements executed.
@@ -847,6 +868,7 @@ fn insert_references_code_rows_on(
                 ])
             })
             .collect();
+        count_parameterized_write();
         conn.execute(
             &mut stmt,
             vec![("rows", lbug::Value::List(row_type.clone(), rows))],
@@ -3983,7 +4005,7 @@ impl GraphStore {
     /// and a note that mentions 100K symbol names is 100K statements — on a
     /// plain connection, 100K auto-commits, which is what held the vault
     /// watcher's write lease for 22 minutes. One `UNWIND $rows` statement per
-    /// [`CROSS_DOMAIN_ROWS_PER_STATEMENT`] edges keeps the statement count
+    /// `CROSS_DOMAIN_ROWS_PER_STATEMENT` (10K) edges keeps the statement count
     /// independent of how many symbols a note mentions. Semantics are the
     /// per-edge statement's: a row whose note or symbol no longer exists
     /// matches nothing and creates nothing, rather than failing the batch

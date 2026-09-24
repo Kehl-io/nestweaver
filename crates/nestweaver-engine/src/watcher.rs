@@ -157,12 +157,18 @@ struct BatchPhaseTimings {
     /// Write transactions and statements the cross-domain flush cost.
     sidecar_transactions: usize,
     sidecar_statements: usize,
-    /// Changed notes present in the graph whose text this batch did not
-    /// read (oversized): their cross-domain edges are left as they were,
-    /// matching the stored body they still carry.
+    /// Changed notes still in the graph whose text this batch did not read.
+    /// Reachable only for an edit that pushed a note over the size limit
+    /// (nw-469): the refresh skips it without replacing its nodes, so it
+    /// keeps its stored body AND the code links that body produced. (A read
+    /// or parse failure of an indexed note fails the refresh instead.)
     sidecar_scan_skipped: usize,
-    /// Flush chunks that failed and rolled back (non-fatal; logged).
+    /// Flush attempts that failed and rolled back (non-fatal; logged). A
+    /// chunk is retried once; one that fails twice is owed (`SidecarDebt`).
     sidecar_flush_failures: usize,
+    /// nw-668: parameterized statements the flushes executed, counted at the
+    /// store's execute boundary rather than taken from the flush's report.
+    sidecar_boundary_statements: u64,
 }
 
 /// nw-653: backoff for retrying a failed startup reconciliation. Shared with
@@ -184,8 +190,33 @@ pub(crate) fn reconcile_retry_delay(base: Duration, failures: u32) -> Duration {
 /// could not be computed, so the retry recomputes it.
 pub(crate) struct PendingReconciliation {
     pub(crate) paths: Option<Vec<PathBuf>>,
+    /// Vault watcher only (nw-668): notes whose text committed but whose
+    /// code links did not, replayed ON TOP of a recomputed drift — drift
+    /// compares disk with the graph's text and cannot see them. Always empty
+    /// when `paths` is `Some` (they are merged in) and for the code watcher.
+    pub(crate) also_replay: Vec<PathBuf>,
     pub(crate) failures: u32,
     pub(crate) next_attempt: Instant,
+}
+
+/// nw-668: notes a batch committed whose cross-domain links did not land —
+/// the flush failed, and so did its one immediate retry. The refresh already
+/// replaced these notes' nodes, so they carry NO code links; the watcher owes
+/// them a replay through the reconciliation retry.
+#[derive(Debug)]
+pub(crate) struct SidecarDebt {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) error: String,
+}
+
+/// Add `paths` to the batch's [`SidecarDebt`], keeping the first error.
+fn owe(debt: &mut Option<SidecarDebt>, paths: &[PathBuf], error: &str) {
+    debt.get_or_insert_with(|| SidecarDebt {
+        paths: Vec::new(),
+        error: error.to_string(),
+    })
+    .paths
+    .extend(paths.iter().cloned());
 }
 
 /// Live file-watcher for a single vault. Construct via `new`, then call
@@ -228,7 +259,9 @@ pub struct BrainWatcher {
     #[cfg(test)]
     last_batch_phase_timings: std::sync::Mutex<Option<BatchPhaseTimings>>,
     #[cfg(test)]
-    sidecar_scan_probe: Option<Box<dyn Fn() + Send + Sync>>,
+    /// nw-668 test probe, called before each note's cross-domain scan with
+    /// how many scanned-but-unflushed notes are held at that moment.
+    sidecar_scan_probe: Option<Box<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl BrainWatcher {
@@ -647,6 +680,7 @@ impl BrainWatcher {
             &v_uid,
             &on_change,
             None,
+            Vec::new(),
             0,
         ) {
             Ok(pending) => pending,
@@ -688,6 +722,7 @@ impl BrainWatcher {
                     &v_uid,
                     &on_change,
                     owed.paths,
+                    owed.also_replay,
                     owed.failures,
                 ) {
                     Ok(next) => pending = next,
@@ -743,7 +778,12 @@ impl BrainWatcher {
             };
 
             match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
-                Ok(()) => {}
+                Ok(None) => {}
+                // nw-668: committed text, missing code links — owed, disclosed
+                // and retried on the reconciliation backoff, not just logged.
+                Ok(Some(debt)) => {
+                    pending = Some(self.owe_sidecar_retry(&store, pending.take(), debt))
+                }
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                     return Ok(());
                 }
@@ -770,7 +810,7 @@ impl BrainWatcher {
         v_uid: &str,
         batch: Vec<PathBuf>,
         on_change: &Option<Box<dyn Fn() + Send>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Option<SidecarDebt>, anyhow::Error> {
         let mut unique_paths = batch;
         unique_paths.sort();
         unique_paths.dedup();
@@ -846,6 +886,7 @@ impl BrainWatcher {
             build_symbol_index_started.elapsed().as_millis() as u64;
 
         let mut batch_failures = Vec::new();
+        let mut sidecar_debt = None;
         if graph_batch {
             let embedding_candidates_started = Instant::now();
             let mut embedding_candidates = Vec::new();
@@ -878,7 +919,7 @@ impl BrainWatcher {
 
             let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
             let sidecars_started = Instant::now();
-            self.refresh_prepared_sidecars(
+            sidecar_debt = self.refresh_prepared_sidecars(
                 store,
                 tantivy,
                 v_uid,
@@ -988,13 +1029,14 @@ impl BrainWatcher {
                 batch_failures.join("; ")
             );
         }
-        Ok(())
+        Ok(sidecar_debt)
     }
 
     /// nw-653: one reconciliation attempt. `Ok(None)` means the graph now
     /// matches disk and any disclosed debt was cleared; `Ok(Some(_))` means it
     /// failed, was disclosed in the skipped-notes status, and is owed a retry.
     /// `Err` only for a shutdown refusal, which ends the watcher.
+    #[allow(clippy::too_many_arguments)]
     fn attempt_reconciliation(
         &self,
         store: &GraphStore,
@@ -1002,6 +1044,7 @@ impl BrainWatcher {
         v_uid: &str,
         on_change: &Option<Box<dyn Fn() + Send>>,
         known: Option<Vec<PathBuf>>,
+        also_replay: Vec<PathBuf>,
         failures: u32,
     ) -> Result<Option<PendingReconciliation>, anyhow::Error> {
         let drift = match known {
@@ -1013,7 +1056,13 @@ impl BrainWatcher {
                 &self.ignore_set,
                 self.note_limits,
             ),
-        };
+        }
+        .map(|mut paths| {
+            paths.extend(also_replay.iter().cloned());
+            paths.sort();
+            paths.dedup();
+            paths
+        });
         let (paths, error) = match drift {
             Ok(paths) if paths.is_empty() => {
                 // Nothing left to reconcile: settle any debt an earlier
@@ -1034,7 +1083,10 @@ impl BrainWatcher {
                     "BrainWatcher startup: reconciling notes changed while no watcher ran"
                 );
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
-                    Ok(()) => {
+                    // nw-668: the text landed but some notes' code links did
+                    // not; only those are still owed.
+                    Ok(Some(debt)) => (Some(debt.paths), anyhow::anyhow!(debt.error)),
+                    Ok(None) => {
                         crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
                             &self.vault_root,
@@ -1063,20 +1115,88 @@ impl BrainWatcher {
              ran are missing or stale until it succeeds (retrying; `nestweaver brain \
              refresh` also heals it)"
         );
-        // An uncomputable drift is disclosed against the vault root itself.
+        // An uncomputable drift is disclosed against the vault root itself,
+        // plus any owed links it must still replay on top (nw-668).
+        let also_replay = if paths.is_some() {
+            Vec::new()
+        } else {
+            also_replay
+        };
+        let mut disclosed = paths
+            .clone()
+            .unwrap_or_else(|| vec![self.vault_root.clone()]);
+        disclosed.extend(also_replay.iter().cloned());
         crate::index_md::record_vault_reconciliation_debt(
             store.db_path(),
             &self.vault_root,
-            paths
-                .as_deref()
-                .unwrap_or(std::slice::from_ref(&self.vault_root)),
+            &disclosed,
             Some(&message),
         );
         Ok(Some(PendingReconciliation {
             paths,
+            also_replay,
             failures,
             next_attempt: Instant::now() + delay,
         }))
+    }
+
+    /// nw-668: hand notes whose code links failed to land to the
+    /// reconciliation retry, the same seam nw-653 uses for a failed startup
+    /// replay: disclosed as owed in the skipped-notes status, replayed on the
+    /// shared backoff, disclosure cleared when the replay lands. Merged into
+    /// an already-owed retry, that retry keeps its schedule. A retry that
+    /// recomputes drift (`paths: None`) cannot see these notes — their text
+    /// matches disk — so they ride along in `also_replay`.
+    fn owe_sidecar_retry(
+        &self,
+        store: &GraphStore,
+        pending: Option<PendingReconciliation>,
+        debt: SidecarDebt,
+    ) -> PendingReconciliation {
+        let merge = |mut owed: Vec<PathBuf>| {
+            owed.extend(debt.paths.iter().cloned());
+            owed.sort();
+            owed.dedup();
+            owed
+        };
+        let next = match pending {
+            Some(owed) => match owed.paths {
+                Some(known) => PendingReconciliation {
+                    paths: Some(merge(known)),
+                    ..owed
+                },
+                None => PendingReconciliation {
+                    also_replay: merge(owed.also_replay),
+                    ..owed
+                },
+            },
+            None => PendingReconciliation {
+                paths: Some(merge(Vec::new())),
+                also_replay: Vec::new(),
+                failures: 1,
+                next_attempt: Instant::now() + reconcile_retry_delay(self.reconcile_retry_base, 1),
+            },
+        };
+        let mut disclosed = next
+            .paths
+            .clone()
+            .unwrap_or_else(|| vec![self.vault_root.clone()]);
+        disclosed.extend(next.also_replay.iter().cloned());
+        let message = format!("code links were not written: {}", debt.error);
+        tracing::error!(
+            vault = %self.vault_root.display(),
+            error = %message,
+            notes = debt.paths.len(),
+            "BrainWatcher could not write code links for committed notes; they have none \
+             until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
+        );
+        crate::index_md::record_vault_reconciliation_debt(
+            store.db_path(),
+            &self.vault_root,
+            &disclosed,
+            Some(&message),
+        );
+        next
     }
 
     /// nw-653: diff disk against the graph (`index_md::vault_startup_drift`)
@@ -1108,7 +1228,9 @@ impl BrainWatcher {
             notes = replayed,
             "BrainWatcher startup: reconciling notes changed while no watcher ran"
         );
-        self.process_batch(store, tantivy, v_uid, drift, on_change)?;
+        if let Some(debt) = self.process_batch(store, tantivy, v_uid, drift, on_change)? {
+            anyhow::bail!(debt.error);
+        }
         Ok(replayed)
     }
 
@@ -1121,26 +1243,26 @@ impl BrainWatcher {
     /// note and, under it, re-read the file from disk and write every
     /// note→symbol and section→symbol edge as its own auto-committed
     /// statement — 10K–100K commits for one edited note, holding the write
-    /// lease for up to 22 minutes while reconcilers queued behind it. Now:
+    /// lease for up to 22 minutes while reconcilers queued behind it. Now,
+    /// chunk by chunk of [`crate::cross_domain::NOTES_PER_TXN`] notes:
     ///
     /// 1. SCAN with no lease held: tokenise each changed note's committed
     ///    text (`sources`, from the refresh that just committed it) against
-    ///    the symbol index, and gather its Tantivy docs.
-    /// 2. FLUSH one [`crate::cross_domain::NOTES_PER_TXN`] chunk per lease:
-    ///    one transaction, set-based statements. Releasing between chunks
-    ///    keeps the gate FIFO-fair for a large replayed batch.
-    /// 3. One Tantivy commit for the whole batch, deletions included, under
-    ///    the last chunk's lease.
+    ///    the symbol index. Only one chunk's scanned edges are ever held, so
+    ///    a large startup replay of heavily linked notes stays bounded.
+    /// 2. FLUSH the chunk under its own lease: one transaction, set-based
+    ///    statements. Releasing between chunks keeps the gate FIFO-fair.
+    /// 3. Tantivy docs (text-sized) are gathered along the way and committed
+    ///    ONCE for the batch, deletions included, under the last lease.
     ///
-    /// A failed flush chunk rolls back whole and stays non-fatal to the
-    /// batch, exactly as the per-note path was. It cannot restore the notes'
-    /// PREVIOUS edges: the refresh that just committed them replaced each
-    /// changed Note and its Sections (`delete_note_cascade_on` DETACH-deletes
-    /// them, edges included). What the transaction guarantees is no PARTIAL
-    /// set — the notes carry no code links until their next edit or a
-    /// `brain refresh`, and the failure is counted and logged. Failing the
-    /// batch instead would heal nothing: the text is committed, so neither a
-    /// retry nor startup reconciliation would see drift to replay.
+    /// A failed flush rolls back whole — never a partial edge set — and is
+    /// retried once at once. It cannot fall back to the notes' PREVIOUS
+    /// edges: the refresh that just committed them replaced each changed
+    /// Note and its Sections (`delete_note_cascade_on` DETACH-deletes them,
+    /// edges included). So a chunk that fails twice leaves its notes with NO
+    /// code links, and they are returned as a [`SidecarDebt`] for the caller
+    /// to owe, disclose and replay. It stays non-fatal to the batch: the
+    /// notes' text is committed and still publishes.
     #[allow(clippy::too_many_arguments)]
     fn refresh_prepared_sidecars(
         &self,
@@ -1152,19 +1274,15 @@ impl BrainWatcher {
         note_tags: &HashMap<String, Vec<String>>,
         sources: &HashMap<PathBuf, String>,
         timings: &mut BatchPhaseTimings,
-    ) -> Result<(), anyhow::Error> {
-        let scan_started = Instant::now();
-        #[cfg(test)]
-        if let Some(probe) = &self.sidecar_scan_probe {
-            probe();
-        }
+    ) -> Result<Option<SidecarDebt>, anyhow::Error> {
+        let setup_started = Instant::now();
         let mut targets = Vec::with_capacity(paths.len());
         for path in paths {
             let relative = path.strip_prefix(&self.vault_root)?;
             let uid = note_uid(v_uid, &relative.to_string_lossy());
-            targets.push((relative.to_path_buf(), uid));
+            targets.push((path, relative.to_path_buf(), uid));
         }
-        let uids: Vec<String> = targets.iter().map(|(_, uid)| uid.clone()).collect();
+        let uids: Vec<String> = targets.iter().map(|(_, _, uid)| uid.clone()).collect();
         let notes: HashMap<String, nestweaver_schema::Note> = store
             .lookup_notes_by_uids(&uids)?
             .into_iter()
@@ -1187,25 +1305,57 @@ impl BrainWatcher {
         // No code indexed: nothing to bridge to, and existing edges are left
         // alone, as the per-note path did.
         .filter(|index| !index.is_empty());
+        timings.sidecar_scan_ms += setup_started.elapsed().as_millis() as u64;
 
-        let mut scanned = Vec::new();
+        let mut debt: Option<SidecarDebt> = None;
+        let mut chunk: Vec<crate::cross_domain::ScannedNote> = Vec::new();
+        let mut chunk_paths: Vec<PathBuf> = Vec::new();
         let mut removals = Vec::new();
         let mut docs: Vec<nestweaver_store::tantivy_index::NoteDocBatchEntry> = Vec::new();
-        for (relative, uid) in &targets {
+        for (path, relative, uid) in &targets {
+            // Flush a full chunk before scanning further, so at most one
+            // chunk of scanned edges is ever held.
+            if chunk.len() == crate::cross_domain::NOTES_PER_TXN {
+                let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
+                self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+                chunk.clear();
+                chunk_paths.clear();
+            }
+            let scan_started = Instant::now();
             let Some(note) = notes.get(uid) else {
                 removals.push(uid.clone());
                 continue;
             };
-            let sections = store.sections_in_note(uid)?;
-            if let Some(index) = index {
+            let sections = match store.sections_in_note(uid) {
+                Ok(sections) => Some(sections),
+                // Tantivy needs the sections; failing the batch here is what
+                // the per-note path did too.
+                Err(error) if tantivy.is_some() => return Err(error.into()),
+                // Without Tantivy only the cross-domain scan needs them, and
+                // its failures were non-fatal: owe the note rather than scan
+                // it with no sections (a silently partial edge set).
+                Err(error) => {
+                    tracing::warn!(%error, note = %uid, "watcher cross-domain refresh failed");
+                    owe(&mut debt, std::slice::from_ref(path), &error.to_string());
+                    None
+                }
+            };
+            #[cfg(test)]
+            if let Some(probe) = &self.sidecar_scan_probe {
+                probe(chunk.len());
+            }
+            if let (Some(index), Some(sections)) = (index, &sections) {
                 match sources.get(relative) {
-                    Some(source) => scanned.push(crate::cross_domain::scan_note_source(
-                        uid, source, &sections, index,
-                    )),
+                    Some(source) => {
+                        chunk.push(crate::cross_domain::scan_note_source(
+                            uid, source, sections, index,
+                        ));
+                        chunk_paths.push((*path).clone());
+                    }
                     None => timings.sidecar_scan_skipped += 1,
                 }
             }
-            if tantivy.is_some() {
+            if let (Some(_), Some(sections)) = (tantivy, sections) {
                 let headings = store.headings_in_note(uid)?;
                 let section_docs: Vec<_> = sections
                     .iter()
@@ -1235,47 +1385,70 @@ impl BrainWatcher {
                     note_tags.get(uid).cloned().unwrap_or_default(),
                 ));
             }
+            timings.sidecar_scan_ms += scan_started.elapsed().as_millis() as u64;
         }
-        timings.sidecar_edges = scanned
-            .iter()
-            .map(crate::cross_domain::ScannedNote::edge_count)
-            .sum();
-        timings.sidecar_scan_ms = scan_started.elapsed().as_millis() as u64;
 
-        let chunks: Vec<_> = scanned.chunks(crate::cross_domain::NOTES_PER_TXN).collect();
         let tantivy_work = tantivy.filter(|_| !docs.is_empty() || !removals.is_empty());
-        let rounds = chunks.len().max(usize::from(tantivy_work.is_some()));
-        for round in 0..rounds {
+        if !chunk.is_empty() || tantivy_work.is_some() {
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
-            if let Some(chunk) = chunks.get(round) {
-                let flush_started = Instant::now();
-                let mut result = crate::cross_domain::CrossDomainResult::default();
-                match crate::cross_domain::flush_scanned_notes(store, chunk, &mut result) {
-                    Ok(stats) => {
-                        timings.sidecar_transactions += stats.transactions;
-                        timings.sidecar_statements += stats.statements;
-                    }
-                    Err(error) => {
-                        timings.sidecar_flush_failures += 1;
-                        tracing::warn!(
-                            %error,
-                            notes = chunk.len(),
-                            "watcher cross-domain refresh failed; these notes keep their \
-                             previous code links until their next edit or `brain refresh`"
-                        );
-                    }
-                }
-                timings.sidecar_flush_ms += flush_started.elapsed().as_millis() as u64;
-            }
-            if round + 1 == rounds
-                && let Some(index) = tantivy_work
-            {
+            self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+            if let Some(index) = tantivy_work {
                 let tantivy_started = Instant::now();
                 index.apply_note_batch(&docs, &removals)?;
                 timings.sidecar_tantivy_ms = tantivy_started.elapsed().as_millis() as u64;
             }
         }
-        Ok(())
+        Ok(debt)
+    }
+
+    /// Flush one chunk of scanned notes (caller holds the lease), retrying
+    /// once on failure; a chunk that fails twice is added to `debt`.
+    fn flush_sidecar_chunk(
+        &self,
+        store: &GraphStore,
+        chunk: &[crate::cross_domain::ScannedNote],
+        chunk_paths: &[PathBuf],
+        timings: &mut BatchPhaseTimings,
+        debt: &mut Option<SidecarDebt>,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        timings.sidecar_edges += chunk
+            .iter()
+            .map(crate::cross_domain::ScannedNote::edge_count)
+            .sum::<usize>();
+        let flush_started = Instant::now();
+        let mut last_error = None;
+        for _attempt in 0..2 {
+            let mut result = crate::cross_domain::CrossDomainResult::default();
+            let boundary = nestweaver_store::write::parameterized_writes_on_this_thread();
+            let flushed = crate::cross_domain::flush_scanned_notes(store, chunk, &mut result);
+            timings.sidecar_boundary_statements +=
+                nestweaver_store::write::parameterized_writes_on_this_thread() - boundary;
+            match flushed {
+                Ok(stats) => {
+                    timings.sidecar_transactions += stats.transactions;
+                    timings.sidecar_statements += stats.statements;
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    timings.sidecar_flush_failures += 1;
+                    tracing::warn!(
+                        %error,
+                        notes = chunk.len(),
+                        "watcher cross-domain flush failed and rolled back; these notes \
+                         have no code links until it lands"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        timings.sidecar_flush_ms += flush_started.elapsed().as_millis() as u64;
+        if let Some(error) = last_error {
+            owe(debt, chunk_paths, &format!("{error:#}"));
+        }
     }
 
     /// Advance and persist the graph generation for a manifest edit (nw-498),
@@ -2012,7 +2185,7 @@ mod tests {
         let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
         let v_uid = vault_uid("default", &root.to_string_lossy());
         let next = watcher
-            .attempt_reconciliation(&store, None, &v_uid, &None, None, 1)
+            .attempt_reconciliation(&store, None, &v_uid, &None, None, Vec::new(), 1)
             .unwrap();
         assert!(next.is_none(), "nothing is left to reconcile");
         assert_eq!(pending(), serde_json::json!(0), "the debt must clear");
@@ -3366,6 +3539,17 @@ mod tests {
             "one delete per edge kind and one insert per edge kind: {large:?}"
         );
         assert_eq!(large.sidecar_edges, 2 * (500 + 500 + 1));
+        // The same property observed at the store's execute boundary, not
+        // taken from the flush's report about itself.
+        assert_eq!(
+            small.sidecar_boundary_statements, large.sidecar_boundary_statements,
+            "boundary-counted statements must not scale with matches per note"
+        );
+        assert!(large.sidecar_boundary_statements <= 4, "{large:?}");
+        assert!(
+            large.sidecar_boundary_statements > 0,
+            "the counter must see the flush"
+        );
     }
 
     /// nw-668: the lease was taken once PER NOTE and held across the scan.
@@ -3400,7 +3584,7 @@ mod tests {
         let (observed_p, live_p) = (Arc::clone(&observed), Arc::clone(&live));
         let mut watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
             .with_mutation_lease_factory(factory);
-        watcher.sidecar_scan_probe = Some(Box::new(move || {
+        watcher.sidecar_scan_probe = Some(Box::new(move |_held| {
             observed_p
                 .lock()
                 .unwrap()
@@ -3442,7 +3626,9 @@ mod tests {
     /// and a trailing empty section. Pinned twice: against the literal set
     /// the pre-nw-668 path produced (characterised on that code), and
     /// against the bulk `discover_cross_domain_links` pass over the same
-    /// files.
+    /// files. The `@b` rows (one name defined in two repos links to both)
+    /// were added after the characterisation run; they follow the index's
+    /// all-candidates rule and are pinned against the bulk pass.
     #[test]
     fn nw_668_watcher_edges_equal_the_pre_change_and_bulk_edge_sets() {
         let _guard = serial_watcher_test();
@@ -3460,6 +3646,8 @@ mod tests {
             "NeverMentioned",
         ];
         let fx = nw_668_fixture(&[], 2, &symbols);
+        // The same name in a second repo: a mention links to BOTH symbols.
+        nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
         fs::write(
             fx.root.join("n000.md"),
             "---\nrelated: FrontThing\n---\nPreambleThing intro\n\n\
@@ -3495,14 +3683,29 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|(from, to, confidence, source)| {
-                    let name = symbols
-                        .iter()
-                        .find(|name| {
-                            let line = symbols.iter().position(|n| n == *name).unwrap() as u32 + 1;
-                            nestweaver_schema::symbol_uid("repo:nw668", "src/lib.rs", name, line)
-                                == to
-                        })
-                        .unwrap();
+                    let name = if to
+                        == nestweaver_schema::symbol_uid(
+                            "repo:nw668b",
+                            "src/lib.rs",
+                            "BodyThing",
+                            1,
+                        ) {
+                        "BodyThing@b"
+                    } else {
+                        symbols
+                            .iter()
+                            .enumerate()
+                            .find(|(line, name)| {
+                                nestweaver_schema::symbol_uid(
+                                    "repo:nw668",
+                                    "src/lib.rs",
+                                    name,
+                                    *line as u32 + 1,
+                                ) == to
+                            })
+                            .map(|(_, name)| *name)
+                            .unwrap()
+                    };
                     format!(
                         "{} -> {name} ({confidence:.1}, {source})",
                         labels.get(&from).cloned().unwrap_or(from)
@@ -3515,6 +3718,7 @@ mod tests {
         let watched = render(&fx.store);
         let expected: Vec<String> = vec![
             "n000.md -> BodyThing (0.9, name-match)",
+            "n000.md -> BodyThing@b (0.9, name-match)",
             "n000.md -> FrontThing (0.9, name-match)",
             "n000.md -> HeadThing (0.9, name-match)",
             "n000.md -> LinkThing (0.9, name-match)",
@@ -3525,9 +3729,12 @@ mod tests {
             "n000.md:11 -> TwiceThing (0.9, name-match)",
             "n000.md:4 -> PreambleThing (0.9, name-match)",
             "n000.md:7 -> BodyThing (0.9, name-match)",
+            "n000.md:7 -> BodyThing@b (0.9, name-match)",
             "n000.md:7 -> TwiceThing (0.9, name-match)",
             "n001.md -> BodyThing (0.9, name-match)",
+            "n001.md -> BodyThing@b (0.9, name-match)",
             "n001.md:2 -> BodyThing (0.9, name-match)",
+            "n001.md:2 -> BodyThing@b (0.9, name-match)",
         ]
         .into_iter()
         .map(str::to_string)
@@ -3595,34 +3802,126 @@ mod tests {
         );
     }
 
-    /// nw-668: the old path inserted a note's edges in auto-committed
-    /// statements, so a failure part-way left a partial set (note-level edges
-    /// without their section-level twins). The flush is one transaction: a
-    /// failure leaves none of the chunk's new edges. It stays non-fatal to
-    /// the batch, as before — the note's text is still published — and is
-    /// counted so the batch-complete line discloses it.
-    #[test]
-    fn nw_668_failed_flush_is_all_or_nothing_and_non_fatal() {
-        let _guard = serial_watcher_test();
-        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
-        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
-        let batch = || vec![fx.root.join("n000.md")];
+    fn nw_668_owed_debt(db_path: &Path) -> Vec<String> {
+        crate::index_md::load_skipped_notes_sidecar(db_path)
+            .skipped
+            .into_iter()
+            .filter(|file| {
+                file.reason
+                    .starts_with(crate::index_md::WATCH_RECONCILIATION_PENDING_REASON)
+            })
+            .map(|file| file.path)
+            .collect()
+    }
 
-        fs::write(fx.root.join("n000.md"), "# A\n\nuses BravoWidget now\n").unwrap();
-        crate::cross_domain::FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(true));
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = Arc::clone(&calls);
-        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
+    fn nw_668_targets(store: &GraphStore) -> Vec<String> {
+        store
+            .list_references_code_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(_, to, _, _)| to)
+            .collect()
+    }
+
+    /// nw-668 review (I1): the whole batch was scanned into memory before the
+    /// first chunk flushed, so a startup replay of thousands of heavily
+    /// linked notes held every one of their edge lists at once. Scanning and
+    /// flushing interleave: at most one chunk of scanned notes is held while
+    /// the next note is scanned, each chunk takes its own lease and
+    /// transaction, and Tantivy still commits once for the batch.
+    #[test]
+    fn nw_668_a_large_batch_scans_and_flushes_one_chunk_at_a_time() {
+        let _guard = serial_watcher_test();
+        let notes = crate::cross_domain::NOTES_PER_TXN + 1;
+        let fx = nw_668_fixture(&[], notes, &["AlphaWidget", "BodyThing"]);
+        nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..notes {
+            let path = fx.root.join(format!("n{i:03}.md"));
+            fs::write(
+                &path,
+                format!("# N{i}\n\nuses AlphaWidget\n\n## B\n\nBodyThing\n"),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+
+        let labels = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let labels_f = Arc::clone(&labels);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            labels_f.lock().unwrap().push(label);
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let held = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let held_p = Arc::clone(&held);
+        let mut watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_mutation_lease_factory(factory);
+        watcher.sidecar_scan_probe = Some(Box::new(move |count| {
+            held_p.lock().unwrap().push(count);
         }));
-        let result = watcher.process_batch(&fx.store, None, &fx.v_uid, batch(), &callback);
-        crate::cross_domain::FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(false));
-        result.unwrap();
-        assert_eq!(
-            fx.store.list_references_code_edges().unwrap(),
-            Vec::new(),
-            "a failed flush must commit none of its edges, not the note-level half"
+        let commits = tantivy.commit_count();
+        let owed = watcher
+            .process_batch(&fx.store, Some(&tantivy), &fx.v_uid, paths, &None)
+            .unwrap();
+        assert!(owed.is_none());
+
+        let held = held.lock().unwrap().clone();
+        assert_eq!(held.len(), notes, "every note was scanned");
+        assert!(
+            held.iter()
+                .all(|count| *count < crate::cross_domain::NOTES_PER_TXN),
+            "a full chunk must be flushed before the next note is scanned: max held {:?}",
+            held.iter().max()
         );
+        let sidecar_leases = labels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|label| **label == "watch_vault_sidecars")
+            .count();
+        assert_eq!(sidecar_leases, 2);
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_transactions,
+            2
+        );
+        assert_eq!(tantivy.commit_count() - commits, 1);
+
+        // Equivalence at chunk scale, including a name defined in two repos.
+        let watched = fx.store.list_references_code_edges().unwrap();
+        assert_eq!(
+            watched.len(),
+            notes * 6,
+            "2 note + 1 section edge + 2 BodyThing each"
+        );
+        crate::cross_domain::discover_cross_domain_links(&fx.store).unwrap();
+        assert_eq!(fx.store.list_references_code_edges().unwrap(), watched);
+    }
+
+    /// nw-668 review (I2): a flush that failed was only logged, and nothing
+    /// ever rebuilt the notes' code links — the refresh had already replaced
+    /// their nodes, so they sat with none. One immediate retry absorbs a
+    /// transient failure inside the batch.
+    #[test]
+    fn nw_668_a_transient_flush_failure_is_retried_within_the_batch() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(1));
+        let owed = watcher.process_batch(
+            &fx.store,
+            None,
+            &fx.v_uid,
+            vec![fx.root.join("n000.md")],
+            &None,
+        );
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        assert!(owed.unwrap().is_none(), "the retry landed; nothing is owed");
+        assert_eq!(nw_668_targets(&fx.store).len(), 2);
         assert_eq!(
             watcher
                 .last_batch_phase_timings()
@@ -3630,24 +3929,185 @@ mod tests {
                 .sidecar_flush_failures,
             1
         );
+    }
+
+    /// nw-668 review (I2): when the immediate retry also fails, the chunk is
+    /// all-or-nothing (no partial edge set), the batch still publishes the
+    /// committed text, and the notes are OWED: disclosed in the skipped-notes
+    /// status and replayed through the reconciliation retry, which rebuilds
+    /// their links and clears the disclosure.
+    #[test]
+    fn nw_668_a_live_flush_failure_is_owed_disclosed_and_healed_by_the_retry() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let owed = watcher.process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &callback);
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("a twice-failed flush is owed");
+        assert_eq!(owed.paths, vec![path.clone()]);
+        assert_eq!(
+            nw_668_targets(&fx.store),
+            Vec::<String>::new(),
+            "no partial set"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "non-fatal: the committed text is still published"
+            "the committed text still publishes"
         );
 
-        // Counterweight: the next clean batch writes the full set.
-        watcher
-            .process_batch(&fx.store, None, &fx.v_uid, batch(), &None)
+        let pending = watcher.owe_sidecar_retry(&fx.store, None, owed);
+        assert_eq!(pending.paths.as_deref(), Some(&[path.clone()][..]));
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![path.to_string_lossy().into_owned()],
+            "the owed notes are disclosed"
+        );
+
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
             .unwrap();
-        let bravo = nestweaver_schema::symbol_uid("repo:nw668", "src/lib.rs", "BravoWidget", 2);
-        let now: Vec<_> = fx
-            .store
-            .list_references_code_edges()
+        assert!(next.is_none(), "the retry landed");
+        assert_eq!(nw_668_targets(&fx.store).len(), 2, "links rebuilt");
+        assert!(
+            nw_668_owed_debt(&fx.db_path).is_empty(),
+            "disclosure cleared"
+        );
+    }
+
+    /// nw-668 review (I2): the startup replay is the same seam. A replay
+    /// whose sidecar flush fails twice is not "reconciled": it stays owed
+    /// and disclosed, and the next attempt heals it.
+    #[test]
+    fn nw_668_a_startup_replay_with_a_failed_flush_stays_owed() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let first = watcher.attempt_reconciliation(
+            &fx.store,
+            None,
+            &fx.v_uid,
+            &None,
+            Some(vec![path.clone()]),
+            Vec::new(),
+            0,
+        );
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let pending = first
             .unwrap()
-            .into_iter()
-            .map(|(_, to, _, _)| to)
-            .collect();
-        assert_eq!(now, vec![bravo.clone(), bravo]);
+            .expect("a replay whose links failed is still owed");
+        assert_eq!(pending.paths.as_deref(), Some(&[path.clone()][..]));
+        assert_eq!(pending.failures, 1);
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![path.to_string_lossy().into_owned()]
+        );
+
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        assert_eq!(nw_668_targets(&fx.store).len(), 2);
+        assert!(nw_668_owed_debt(&fx.db_path).is_empty());
+    }
+
+    /// nw-668 review (I2): an owed retry whose drift could not be computed
+    /// (`paths: None`) recomputes drift from disk vs graph — which cannot see
+    /// notes whose text committed but whose links did not. Owing such notes
+    /// must carry them alongside, not drop them.
+    #[test]
+    fn nw_668_owed_links_survive_merging_into_an_uncomputed_drift_retry() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let existing = PendingReconciliation {
+            paths: None,
+            also_replay: Vec::new(),
+            failures: 3,
+            next_attempt: Instant::now() + Duration::from_secs(60),
+        };
+        let merged = watcher.owe_sidecar_retry(
+            &fx.store,
+            Some(existing),
+            SidecarDebt {
+                paths: vec![path.clone()],
+                error: "injected".to_string(),
+            },
+        );
+        assert!(merged.paths.is_none(), "still recomputes drift");
+        assert_eq!(merged.also_replay, vec![path.clone()]);
+        assert_eq!(merged.failures, 3, "an owed retry keeps its schedule");
+        let mut debt = nw_668_owed_debt(&fx.db_path);
+        debt.sort();
+        let mut expected = vec![
+            fx.root.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        expected.sort();
+        assert_eq!(debt, expected);
+    }
+
+    /// nw-668 review (M5): `sidecar_scan_skipped` is reachable — an edit that
+    /// pushes a note over the size limit is not read (nw-469), the note keeps
+    /// its stored body, and so it keeps the code links that body produced.
+    #[test]
+    fn nw_668_an_oversized_edit_keeps_its_previous_code_links() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
+        let path = fx.root.join("n000.md");
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
+            .unwrap();
+        let before = nw_668_targets(&fx.store);
+        assert_eq!(before.len(), 2);
+
+        let huge = format!(
+            "# A\n\nuses BravoWidget\n{}",
+            "x".repeat(crate::index_limits::DEFAULT_MAX_NOTE_BYTES as usize)
+        );
+        fs::write(&path, huge).unwrap();
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
+            .unwrap();
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_scan_skipped,
+            1
+        );
+        assert_eq!(nw_668_targets(&fx.store), before);
     }
 }
