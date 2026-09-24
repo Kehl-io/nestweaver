@@ -164,7 +164,9 @@ impl CodeWatcher {
     // `-D warnings`, they were DELETED in 01c585b8 — which broke the Linux
     // build outright. The platform gate has to match the test's, not the
     // platform the lint happened to run on.
-    #[cfg(all(test, target_os = "linux"))]
+    // nw-664 review: the live-disclosure tests use it on every unix too, so
+    // the gate follows theirs (a superset of the Linux test's).
+    #[cfg(all(test, unix))]
     fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
         self.debounce = Duration::from_millis(debounce_ms);
         self
@@ -467,7 +469,16 @@ impl CodeWatcher {
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
             )?;
             let files_processed = match outcome {
-                WatchBatchOutcome::Published { files_processed } => files_processed,
+                WatchBatchOutcome::Published { files_processed } => {
+                    // nw-664 review: these paths are now what the graph holds,
+                    // so any disclosure about them is stale.
+                    crate::index_md::clear_code_reconciliation_paths(
+                        &self.db_path,
+                        &self.repo_root,
+                        &batch,
+                    );
+                    files_processed
+                }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
                 WatchBatchOutcome::Skipped { reason } => {
                     tracing::warn!(
@@ -3954,5 +3965,79 @@ mod tests {
             .unwrap();
         assert!(code_startup_batches(&db_path, &root, &store) > 0);
         assert!(repo_symbol_names(&store, &uid).contains("mended"));
+    }
+
+    /// Run a code watcher on a thread until `stop`; returns once it is ready.
+    #[cfg(unix)]
+    fn spawn_live_code_watcher(
+        watcher: CodeWatcher,
+        store: Arc<GraphStore>,
+    ) -> (
+        ShutdownHandle,
+        std::thread::JoinHandle<Result<(), anyhow::Error>>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = watcher.with_debounce_ms(100).with_ready_callback(move || {
+            let _ = ready_tx.send(());
+        });
+        let stop = watcher.shutdown_handle();
+        let handle = std::thread::spawn(move || watcher.run_with_store(store, None));
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("code watcher should become ready");
+        // Let the filesystem subscription settle before the test edits.
+        std::thread::sleep(Duration::from_millis(300));
+        (stop, handle)
+    }
+
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// nw-664 review: a "could not read" disclosure must not outlive the
+    /// problem until the next restart. Once a live batch reads (or deletes)
+    /// the path and publishes, `brain status` stops showing it.
+    #[cfg(unix)]
+    #[test]
+    fn a_published_live_batch_clears_a_stale_unreadable_disclosure() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let util = root.join("tools/util.py");
+        std::fs::write(&util, "def util_gap():\n    return 2\n").unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let (stop, handle) =
+            spawn_live_code_watcher(CodeWatcher::new(&db_path, &root, "test"), store.clone());
+        let disclosed = code_debt(&db_path);
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            disclosed
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![util.to_string_lossy().into_owned()],
+            "precondition: startup disclosed the unreadable source"
+        );
+
+        std::fs::write(&util, "def util_live():\n    return 3\n").unwrap();
+        wait_until("the live edit to land", || {
+            repo_symbol_names(&store, &uid).contains("util_live")
+        });
+        wait_until("the stale disclosure to clear", || {
+            code_debt(&db_path).is_empty()
+        });
+        stop.stop();
+        handle.join().unwrap().unwrap();
     }
 }

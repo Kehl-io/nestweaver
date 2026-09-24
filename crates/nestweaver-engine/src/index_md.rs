@@ -821,6 +821,35 @@ fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<Skippe
     });
 }
 
+/// nw-664 review: drop the code watcher's debt entries for `paths` (and
+/// anything under them) once a live batch has published them — read or
+/// deleted — so a "could not read" or owed entry does not outlive the
+/// problem until the next restart. Other entries, and other roots, stay.
+pub(crate) fn clear_code_reconciliation_paths(db_path: &Path, repo_root: &Path, paths: &[PathBuf]) {
+    let key = code_watch_key(repo_root);
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let entries = sidecar.reconciliation_pending.get_mut(&key)?;
+        let before = entries.len();
+        entries.retain(|file| {
+            !paths
+                .iter()
+                .any(|path| Path::new(&file.path).starts_with(path))
+        });
+        if entries.len() == before {
+            return None;
+        }
+        if entries.is_empty() {
+            sidecar.reconciliation_pending.remove(&key);
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        ))
+    });
+}
+
 /// nw-664: the CODE watcher's unindexable-source memory: absolute path ->
 /// the `<mtime_nanos>:<size>` stamp at which no watcher batch could graph it
 /// (unparsable, binary). Nanoseconds plus size, not the vault's whole-second
