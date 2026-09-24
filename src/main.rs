@@ -4898,6 +4898,20 @@ fn format_daemon_status_response(
                     lines.push("  (list truncated)".to_string());
                 }
             }
+            // nw-653: owed watcher reconciliation, uncapped and with reasons,
+            // so it neither vanishes behind the truncated list above nor reads
+            // like a brainignored note.
+            if let Some(skipped) = status.skipped_notes.as_ref()
+                && skipped.reconciliation_pending > 0
+            {
+                lines.push(format!(
+                    "Watcher reconciliation pending: {} note(s)",
+                    skipped.reconciliation_pending
+                ));
+                for note in &skipped.reconciliation_pending_notes {
+                    lines.push(format!("  - {}: {}", note.path, note.reason));
+                }
+            }
             if let Some(near) = status.notes_near_size_limit.as_ref()
                 && near.count > 0
             {
@@ -4995,6 +5009,11 @@ mod daemon_status_renderer_tests {
                 count: 1,
                 paths: vec!["big.md".to_string()],
                 truncated: false,
+                reconciliation_pending: 2,
+                reconciliation_pending_notes: vec![nestweaver_proto::PendingReconciliationNote {
+                    path: "owed.md".to_string(),
+                    reason: "not yet reconciled".to_string(),
+                }],
             }),
             notes_near_size_limit: Some(nestweaver_proto::NotesNearSizeLimit {
                 count: 1,
@@ -5014,6 +5033,11 @@ mod daemon_status_renderer_tests {
             "{output}"
         );
         assert!(output.contains("near.md (600000 bytes)"), "{output}");
+        assert!(
+            output.contains("Watcher reconciliation pending: 2 note(s)"),
+            "{output}"
+        );
+        assert!(output.contains("owed.md: not yet reconciled"), "{output}");
     }
 
     /// A3 acceptance: an operator looking at `brain status` during a long
@@ -26988,6 +27012,25 @@ fn run_brain(
                                 .unwrap_or(false)
                             {
                                 println!("    (list truncated)");
+                            }
+                        }
+                        // nw-653: see the typed render above.
+                        let pending = skipped
+                            .get("reconciliation_pending")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if pending > 0 {
+                            println!("  Watcher reconciliation pending: {pending} note(s)");
+                            for note in skipped
+                                .get("reconciliation_pending_notes")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                            {
+                                let field = |key: &str| {
+                                    note.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+                                };
+                                println!("    - {}: {}", field("path"), field("reason"));
                             }
                         }
                     }

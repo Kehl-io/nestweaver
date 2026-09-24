@@ -1853,6 +1853,12 @@ mod tests {
     #[test]
     fn watcher_startup_drift_keeps_notes_in_an_unreadable_subdirectory() {
         use std::os::unix::fs::PermissionsExt;
+        // Root reads through 0o000, so the fixture cannot lock it out (the
+        // same guard as content_reader.rs's permission tests).
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let _guard = serial_watcher_test();
         let (_dir, root) = make_vault(&[
             ("Alpha.md", "# Alpha\n"),

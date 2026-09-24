@@ -445,6 +445,14 @@ pub struct SkippedNotesSidecar {
     /// number of broken notes, and truncating it would bring the replays back.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub unindexable_mtimes: std::collections::BTreeMap<String, String>,
+    /// nw-653: every note a failed brain-watcher startup reconciliation still
+    /// owes the graph (vault-relative; "." when the drift itself could not be
+    /// computed), with the failure as its reason. UNCAPPED and the source of
+    /// truth: the capped `skipped` list mirrors these entries first so they
+    /// are never the ones truncated, and status reports this list's full
+    /// count. Only the watcher adds or clears entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciliation_pending: Vec<SkippedFile>,
 }
 
 impl Default for SkippedNotesSidecar {
@@ -456,6 +464,7 @@ impl Default for SkippedNotesSidecar {
             skipped_truncated: false,
             near_limit_truncated: false,
             unindexable_mtimes: std::collections::BTreeMap::new(),
+            reconciliation_pending: Vec::new(),
         }
     }
 }
@@ -516,8 +525,28 @@ fn build_skipped_notes_sidecar(
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
     unindexable_mtimes: std::collections::BTreeMap<String, String>,
+    reconciliation_pending: Vec<SkippedFile>,
 ) -> SkippedNotesSidecar {
-    let (skipped, skipped_truncated) = cap_sidecar_list(skipped.to_vec());
+    // nw-653: owed reconciliation entries go FIRST, so the cap never cuts
+    // them; any stale mirror of them in `skipped` is replaced.
+    let owed: HashSet<&str> = reconciliation_pending
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    let skipped: Vec<SkippedFile> = reconciliation_pending
+        .iter()
+        .cloned()
+        .chain(
+            skipped
+                .iter()
+                .filter(|file| {
+                    !file.reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)
+                        && !owed.contains(file.path.as_str())
+                })
+                .cloned(),
+        )
+        .collect();
+    let (skipped, skipped_truncated) = cap_sidecar_list(skipped);
     let (notes_near_size_limit, near_limit_truncated) = cap_sidecar_list(near.to_vec());
     SkippedNotesSidecar {
         version: SKIPPED_NOTES_SIDECAR_VERSION,
@@ -526,6 +555,7 @@ fn build_skipped_notes_sidecar(
         skipped_truncated,
         near_limit_truncated,
         unindexable_mtimes,
+        reconciliation_pending,
     }
 }
 
@@ -573,13 +603,15 @@ fn persist_skipped_notes_replace(
         return;
     };
     // A full index re-derives this vault's failures; other vaults' entries
-    // are not its to drop.
-    let mut unindexable = load_skipped_notes_sidecar(db_path).unindexable_mtimes;
+    // are not its to drop, and owed watcher reconciliation is the watcher's
+    // to clear.
+    let existing = load_skipped_notes_sidecar(db_path);
+    let mut unindexable = existing.unindexable_mtimes;
     unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
     record_ingest_failures(&mut unindexable, vault_root, skipped);
     persist_skipped_notes_sidecar(
         db_path,
-        &build_skipped_notes_sidecar(skipped, near, unindexable),
+        &build_skipped_notes_sidecar(skipped, near, unindexable, existing.reconciliation_pending),
     );
 }
 
@@ -621,14 +653,14 @@ fn persist_skipped_notes_merge(
         &sidecar.skipped,
         &sidecar.notes_near_size_limit,
         sidecar.unindexable_mtimes,
+        sidecar.reconciliation_pending,
     );
     persist_skipped_notes_sidecar(db_path, &rebuilt);
 }
 
-/// nw-653: reason prefix of the skipped-notes entries that disclose a watcher
-/// startup reconciliation still owed. Reusing the skipped-notes channel puts
-/// the debt in every `brain status` shape (MCP, daemon, CLI) without a new
-/// field; the prefix lets the watcher clear exactly its own entries.
+/// nw-653: reason prefix of the entries that disclose a watcher startup
+/// reconciliation still owed (see
+/// [`SkippedNotesSidecar::reconciliation_pending`]).
 pub const WATCH_RECONCILIATION_PENDING_REASON: &str =
     "not yet reconciled into the graph: brain watcher startup reconciliation failed";
 
@@ -655,23 +687,25 @@ pub(crate) fn record_watch_reconciliation_debt(
     let owed: HashSet<&str> = relative.iter().map(String::as_str).collect();
     let mut sidecar = load_skipped_notes_sidecar(db_path);
     // Any attempt that got as far as a drift set supersedes a "." entry.
-    sidecar.skipped.retain(|file| {
-        !(file.reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)
-            && (owed.contains(file.path.as_str()) || file.path == "."))
-    });
+    sidecar
+        .reconciliation_pending
+        .retain(|file| !(owed.contains(file.path.as_str()) || file.path == "."));
     if let Some(error) = error {
         let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}; retrying ({error})");
-        sidecar.skipped.extend(
+        sidecar.reconciliation_pending.extend(
             relative
                 .iter()
                 .map(|path| SkippedFile::new(path.clone(), SkipReasonCode::Other, reason.clone())),
         );
     }
-    sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    sidecar
+        .reconciliation_pending
+        .sort_by(|a, b| a.path.cmp(&b.path));
     let rebuilt = build_skipped_notes_sidecar(
         &sidecar.skipped,
         &sidecar.notes_near_size_limit,
         sidecar.unindexable_mtimes,
+        sidecar.reconciliation_pending,
     );
     persist_skipped_notes_sidecar(db_path, &rebuilt);
 }
@@ -686,13 +720,27 @@ pub fn load_skipped_notes_sidecar(db_path: &Path) -> SkippedNotesSidecar {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
+/// How many owed notes `brain status` lists with their reason.
+pub const RECONCILIATION_PENDING_STATUS_NOTES: usize = 10;
+
 /// Shape consumed by `brain_status` / `brain_status_json`. Never walks the vault.
 pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, serde_json::Value) {
     let sidecar = db_path.map(load_skipped_notes_sidecar).unwrap_or_default();
+    // nw-653: `paths` carries no reasons, so an owed reconciliation would read
+    // like a brainignored note. The uncapped count and the first few owed
+    // notes WITH their reason are reported separately.
+    let pending_notes: Vec<serde_json::Value> = sidecar
+        .reconciliation_pending
+        .iter()
+        .take(RECONCILIATION_PENDING_STATUS_NOTES)
+        .map(|file| serde_json::json!({ "path": file.path, "reason": file.reason }))
+        .collect();
     let skipped = serde_json::json!({
         "count": sidecar.skipped.len(),
         "paths": sidecar.skipped.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
         "truncated": sidecar.skipped_truncated,
+        "reconciliation_pending": sidecar.reconciliation_pending.len(),
+        "reconciliation_pending_notes": pending_notes,
     });
     let near = serde_json::json!({
         "count": sidecar.notes_near_size_limit.len(),
@@ -7740,5 +7788,85 @@ mod vault_registration_refresh_tests {
         assert_eq!((result.notes_updated, result.notes_deleted), (0, 0));
         let registered = crate::vault_registration::registrations(&db).unwrap();
         assert_eq!(registered.len(), 1, "{registered:?}");
+    }
+}
+
+#[cfg(test)]
+mod watch_reconciliation_disclosure_tests {
+    use super::*;
+
+    /// nw-653 review: the skipped list is capped at 50 and was sorted by
+    /// path, so an owed reconciliation could be cut by brainignored entries
+    /// that sort ahead of it (the live brain already has 33), and status
+    /// showed bare paths, so an owed note read like an ignored one.
+    #[test]
+    fn owed_reconciliation_survives_the_skipped_list_cap_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let vault_root = dir.path().join("vault");
+        let ignored: Vec<SkippedFile> = (0..60)
+            .map(|index| {
+                SkippedFile::new(
+                    format!("a-ignored-{index:02}.md"),
+                    SkipReasonCode::Ignored,
+                    "matched .brainignore pattern",
+                )
+            })
+            .collect();
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        record_watch_reconciliation_debt(
+            Some(&db_path),
+            &vault_root,
+            &[vault_root.join("z-owed.md")],
+            Some("injected"),
+        );
+
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(1),
+            "{skipped}"
+        );
+        assert_eq!(
+            skipped["paths"][0],
+            serde_json::json!("z-owed.md"),
+            "{skipped}"
+        );
+        let owed = &skipped["reconciliation_pending_notes"][0];
+        assert_eq!(owed["path"], serde_json::json!("z-owed.md"), "{skipped}");
+        assert!(
+            owed["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)),
+            "{skipped}"
+        );
+
+        // A later full index (replace) must not silently drop the debt the
+        // watcher still owes; clearing it is the watcher's success path.
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(1),
+            "{skipped}"
+        );
+
+        record_watch_reconciliation_debt(
+            Some(&db_path),
+            &vault_root,
+            &[vault_root.join("z-owed.md")],
+            None,
+        );
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(0),
+            "{skipped}"
+        );
+        assert_ne!(
+            skipped["paths"][0],
+            serde_json::json!("z-owed.md"),
+            "{skipped}"
+        );
     }
 }
