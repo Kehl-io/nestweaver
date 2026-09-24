@@ -1130,13 +1130,25 @@ impl CodeWatcher {
                 continue;
             }
             let recorded = indexed.get(&rel_str);
-            if source_policy_exclusion(&reader, &self.repo_root, &abs_path)?.is_some() {
-                // The batch retracts an excluded file's stale coverage; one
-                // the graph does not hold has nothing to retract.
-                if recorded.is_some() {
-                    drift.replay.push(abs_path);
+            match source_policy_exclusion(&reader, &self.repo_root, &abs_path) {
+                Ok(Some(_)) => {
+                    // The batch retracts an excluded file's stale coverage;
+                    // one the graph does not hold has nothing to retract.
+                    if recorded.is_some() {
+                        drift.replay.push(abs_path);
+                    }
+                    continue;
                 }
-                continue;
+                Ok(None) => {}
+                // nw-664 final review: the policy check stats every path
+                // component, and an EACCES there used to fail the WHOLE
+                // drift — retried on backoff forever while the real lost
+                // edits beside it never landed. It is the unreadable case:
+                // disclosed, left as the graph has it, the rest reconciled.
+                Err(error) => {
+                    drift.unreadable.push((abs_path, format!("{error:#}")));
+                    continue;
+                }
             }
             // Vanished since the walk: its deletion is an event of its own.
             let Ok(Some((mtime_nanos, size_bytes))) = reader.file_meta_nanos(&rel_path) else {
@@ -3829,6 +3841,68 @@ mod tests {
             "{names:?}"
         );
         assert!(code_debt(&db_path).is_empty());
+    }
+
+    /// nw-664 final review (M6): the policy check that runs BEFORE the read
+    /// (`source_policy_exclusion` -> `path_has_symlink`) propagated its stat
+    /// error, so one listed source the watcher could not `lstat` (EACCES under
+    /// a read-only, non-searchable directory) failed the WHOLE drift — the
+    /// real lost edits beside it never landed and the attempt was retried on
+    /// backoff indefinitely. It is now the same case as an unreadable source:
+    /// disclosed, left as the graph has it, the rest reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn an_unstatable_source_does_not_fail_the_startup_drift() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        std::fs::write(
+            root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alphaEdited() { return helper() + 1; }\n",
+        )
+        .unwrap();
+        // Listable (r) but not searchable (no x): the walk sees `blind.py`,
+        // any stat beneath the directory is EACCES.
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        let blind = sealed.join("blind.py");
+        std::fs::write(&blind, "def blind():\n    return 1\n").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watcher.attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+        }));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let attempt = attempt.unwrap();
+        let owed = code_debt(&db_path);
+        let outcome = match &attempt {
+            Ok(None) => "reconciled".to_string(),
+            Ok(Some(_)) => "owed a retry".to_string(),
+            Err(error) => format!("refused: {error:#}"),
+        };
+        assert_eq!(
+            outcome, "reconciled",
+            "an unstatable source must not leave the reconciliation owed a retry: {owed:?}"
+        );
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("alphaEdited"),
+            "the real lost edit lands: {names:?}"
+        );
+        // Counterweight: it is disclosed, not silently dropped.
+        assert_eq!(
+            owed.iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![blind.to_string_lossy().into_owned()],
+            "{owed:?}"
+        );
     }
 
     /// nw-664 review, the deliberate limit: an unreadable JS/TS/Java source
