@@ -158,6 +158,27 @@ impl ManifestUnavailable {
     }
 }
 
+/// Strip the `--force` reindex instruction from a manifest-unavailable
+/// message when a watching recovery coordinator owns catch-up: telling the
+/// operator to smash a generation the watcher is already going to rebuild is
+/// an operator hazard, not guidance.
+///
+/// nw-637: shared by `nestweaver-web` (the HTTP `suggest-links` route) and
+/// `nestweaver-daemon` (the `suggest_links_json` RPC the CLI's daemon route
+/// calls) — both build a 503/unavailable body with a top-level `error` and a
+/// nested `rebuild.error`, and both must strip `--force` from EITHER message
+/// it appears in, gated on THAT message's own `retryable`. Living here in
+/// `nestweaver-engine`, which both crates already depend on, is the single
+/// source of truth instead of two copies drifting (the web crate carried its
+/// own copy and a matching fix for its top-level message, but the daemon's
+/// RPC had neither).
+pub fn without_force_index_advice(message: &str) -> String {
+    message.replace(
+        "; re-index with `nestweaver index --repo <path> --force`",
+        "",
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ManifestRecoveryStatus {
     pub state: &'static str,

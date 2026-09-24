@@ -5078,6 +5078,8 @@ where
                             error = Some(delete_error);
                             break;
                         }
+                        // nw-587: pruned on purpose, so not "lost".
+                        forget_vault_registration(state, &vault.uid, Some(&vault.root_path));
                         removed_vaults.push(vault.name.clone());
                         removed_vault_uids.push(vault.uid.clone());
                     }
@@ -5643,6 +5645,23 @@ where
     }
 }
 
+/// nw-587. Forget a deliberately deleted vault's registrations — its uid and,
+/// when known, every registration at its root (`instance merge` can leave a
+/// pre-merge uid there) — so `brain status` / `brain list` do not report it as
+/// dropped. Shared by `remove_vault` and `prune_stale`. Best-effort: the graph
+/// delete already committed, and a failure only leaves a stale disclosure.
+fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Option<&str>) {
+    let forgotten = match root_path {
+        Some(root) => {
+            nestweaver_engine::vault_registration::forget_vault(&state.db_path, vault_uid, root)
+        }
+        None => nestweaver_engine::vault_registration::forget_uid(&state.db_path, vault_uid),
+    };
+    if let Err(error) = forgotten {
+        tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    }
+}
+
 fn run_remove_vault_with_projection(
     state: &DaemonState,
     vault_uid: &str,
@@ -5650,11 +5669,23 @@ fn run_remove_vault_with_projection(
         Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
     >,
 ) -> Result<RemoveVaultResponse, Status> {
+    // nw-587: the root is read BEFORE the delete, so the removal can forget
+    // every registration at it (see `forget_vault_registration`).
+    let root_path = state
+        .store
+        .lookup_vault(vault_uid)
+        .ok()
+        .map(|vault| vault.root_path);
     let mutation = state
         .store
         .delete_vault_cascade_with_outcome(vault_uid)
         .map_err(|error| Status::internal(format!("delete_vault_cascade failed: {error:#}")));
     let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
+    // A deliberate removal is not a loss. Also on a confirmed no-op: the
+    // graph proves the uid absent either way.
+    if mutation.is_ok() {
+        forget_vault_registration(state, vault_uid, root_path.as_deref());
+    }
     let mut failures = Vec::new();
     if !confirmed_noop {
         failures = finalize_node_graph_deletion(state, "remove_vault");
@@ -9458,7 +9489,11 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .list_repos(instance)
                 .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
-            serde_json::to_string(&repos)
+            // nw-634: additive `display_name` per row, resolved by the same
+            // function `--repo` selectors and unknown-repo errors already
+            // call — see `repos_json_with_display_name`.
+            let value = nestweaver_engine::repos_json_with_display_name(&repos);
+            serde_json::to_string(&value)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
@@ -9749,29 +9784,59 @@ impl NestWeaverDaemon for DaemonService {
         let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
-        let result = tokio::task::spawn_blocking(move || {
-            let generation = state.store.graph_generation();
-            let unavailable = |error: nestweaver_engine::manifest::ManifestUnavailable| {
-                state.manifest_recovery.wake.notify_one();
-                let body = serde_json::json!({ "error": error, "rebuild": state.manifest_recovery.status() });
-                Status::unavailable(body.to_string())
-            };
-            let manifests = nestweaver_engine::manifest::current_manifest_snapshot(&state.store, &state.db_path)
+        let result =
+            tokio::task::spawn_blocking(move || {
+                let generation = state.store.graph_generation();
+                let unavailable = |mut error: nestweaver_engine::manifest::ManifestUnavailable| {
+                    state.manifest_recovery.wake.notify_one();
+                    let mut rebuild = state.manifest_recovery.status();
+                    // nw-637 sibling gap: the web crate's `suggest-links` HTTP
+                    // route strips the `--force` reindex instruction from BOTH
+                    // the top-level error and the nested `rebuild.error` (the
+                    // recovery runtime's own last-attempt error) when that
+                    // message's reason is retryable — recovery, not the
+                    // operator, owns retrying it. This RPC is the CLI's actual
+                    // daemon route for the same command and stripped neither.
+                    // The daemon always has a recovery runtime installed
+                    // (unlike the web crate's optional one), so both strips
+                    // apply unconditionally here.
+                    if error.retryable {
+                        error.message =
+                            nestweaver_engine::manifest::without_force_index_advice(&error.message);
+                    }
+                    if let Some(rebuild_error) = &mut rebuild.error
+                        && rebuild_error.retryable
+                    {
+                        rebuild_error.message =
+                            nestweaver_engine::manifest::without_force_index_advice(
+                                &rebuild_error.message,
+                            );
+                    }
+                    let body = serde_json::json!({ "error": error, "rebuild": rebuild });
+                    Status::unavailable(body.to_string())
+                };
+                let manifests = nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
                 .map_err(&unavailable)?;
-            let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
-                .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
-            nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation).map_err(&unavailable)?;
-            if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
-                .map_err(|e| Status::unavailable(e.to_string()))?.is_some() {
-                return Err(unavailable(nestweaver_engine::manifest::ManifestUnavailable::new(
+                let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
+                    .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
+                nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation)
+                    .map_err(&unavailable)?;
+                if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                    .map_err(|e| Status::unavailable(e.to_string()))?
+                    .is_some()
+                {
+                    return Err(unavailable(nestweaver_engine::manifest::ManifestUnavailable::new(
                     nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
                     generation, "manifest source changed while computing suggestions")));
-            }
-            serde_json::to_string(&suggestions)
-                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+                }
+                serde_json::to_string(&suggestions)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
@@ -16580,6 +16645,71 @@ credential_method = "gh"
         assert_eq!(generation, state.store.graph_generation());
     }
 
+    /// nw-587 review: removal forgets every registration at the removed
+    /// vault's ROOT. An `instance merge` left the pre-merge uid registered at
+    /// the same root; forgetting only the removed uid reported that root as
+    /// a lost vault.
+    #[test]
+    fn remove_vault_forgets_every_registration_at_its_root() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:new:merged", "new", &root_str);
+        let sidecar = nestweaver_engine::vault_registration::registrations_path(&state.db_path);
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({"version": 1, "vaults": [
+                {"uid": "vlt:old:merged", "name": "m", "root_path": root_str, "instance_id": "old"},
+                {"uid": "vlt:new:merged", "name": "m", "root_path": root_str, "instance_id": "new"},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        run_remove_vault_with_projection(&state, "vlt:new:merged", None).unwrap();
+
+        let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn prune_stale_forgets_the_registration_of_a_pruned_vault() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:forget",
+            "prune",
+            "/definitely/missing/prune-forget",
+        );
+        nestweaver_engine::vault_registration::record(
+            &state.db_path,
+            &nestweaver_schema::Vault {
+                uid: "vlt:prune:forget".into(),
+                name: "forget".into(),
+                root_path: "/definitely/missing/prune-forget".into(),
+                instance_id: "prune".into(),
+            },
+        )
+        .unwrap();
+
+        let result = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.removed_vaults.len(), 1);
+        let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     #[test]
     fn prune_stale_vault_prunes_note_and_heading_embeddings() {
         let state = test_state_with_writer();
@@ -17881,6 +18011,101 @@ credential_method = "gh"
         assert!(error.message().contains("missing"));
         assert!(!canonical_path.exists());
         assert!(legacy_path.exists());
+    }
+
+    /// nw-637 sibling gap: `suggest_links_json` is the CLI's actual daemon
+    /// route for `suggest-links` (see `dispatch_json_rpc_authed`'s
+    /// `"suggest_links" => client.suggest_links_json(...)` in
+    /// nestweaver-federation). Its `unavailable` closure built `{error,
+    /// rebuild}` with NEITHER message's `--force` advice stripped, even
+    /// though the web crate's HTTP route for the same underlying data
+    /// stripped both. Force a `PendingSourceChange` refusal (a retryable
+    /// top-level reason with no repos to walk, so the two earlier
+    /// `unavailable()` call sites in the RPC never fire) and pre-publish a
+    /// retryable nested rebuild error carrying the raw `--force` template —
+    /// the shape the recovery loop actually publishes — and confirm it comes
+    /// back stripped.
+    #[tokio::test]
+    async fn suggest_links_json_strips_force_advice_from_nested_rebuild_error() {
+        let state = test_state_with_writer();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "test forces a pending-source-change refusal",
+        )
+        .unwrap();
+        state.manifest_recovery.publish(
+            "retry_scheduled",
+            1,
+            Some(2),
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::StaleGeneration,
+                state.store.graph_generation() + 1,
+                "repo_manifest stale artifact generation 16, expected 17; re-index with \
+                 `nestweaver index --repo <path> --force`",
+            )),
+        );
+
+        let error = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        let payload: serde_json::Value = serde_json::from_str(error.message()).unwrap();
+        assert_eq!(payload["error"]["reason"], "pending_source_change");
+        let nested = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !nested.to_ascii_lowercase().contains("force"),
+            "suggest_links_json must strip --force from the nested rebuild error too: {payload}"
+        );
+        assert!(
+            nested.contains("stale artifact generation"),
+            "the operator still needs the stale generation numbers: {payload}"
+        );
+    }
+
+    /// nw-637 COUNTERWEIGHT: a non-retryable nested rebuild error must keep
+    /// its message intact through the daemon route too.
+    #[tokio::test]
+    async fn suggest_links_json_keeps_a_non_retryable_nested_message_intact() {
+        let state = test_state_with_writer();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "test forces a pending-source-change refusal",
+        )
+        .unwrap();
+        let nested_message = "repo:default:fixture: go.mod: unsupported directive; re-index \
+             with `nestweaver index --repo <path> --force` will not help until the module \
+             directive is fixed";
+        state.manifest_recovery.publish(
+            "blocked",
+            3,
+            None,
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::SourceUnavailable,
+                state.store.graph_generation(),
+                nested_message,
+            )),
+        );
+
+        let error = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        let payload: serde_json::Value = serde_json::from_str(error.message()).unwrap();
+        let nested = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            nested, nested_message,
+            "a non-retryable nested error must be left byte-for-byte intact, \
+             --force phrase and all: {payload}"
+        );
     }
 
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a

@@ -1222,7 +1222,7 @@ pub fn investigate(
 pub fn investigate_expand(
     store: &GraphStore,
     db_path: &Path,
-    root: &Path,
+    root: Option<&Path>,
     bundle_id: &str,
     targets: &[String],
 ) -> Result<ExpandResult, anyhow::Error> {
@@ -1313,7 +1313,7 @@ pub fn investigate_expand(
 pub fn investigate_hydrate(
     store: &GraphStore,
     db_path: &Path,
-    root: &Path,
+    root: Option<&Path>,
     bundle_id: &str,
     token_budget: Option<usize>,
 ) -> Result<HydrateResult, anyhow::Error> {
@@ -2037,11 +2037,24 @@ pub enum BodyUnavailable {
     /// The kind has no body by nature — a Tag is a name, not a document. This
     /// is a FACT, and stating it is different from the bug below it.
     NoBodyForKind(&'static str),
-    /// The kind has a body route but the source could not be read from the
-    /// caller-supplied root. Symbol file paths are stored repo-relative and
-    /// resolved by joining onto ONE root, so in a multi-repo graph at most one
-    /// repo's symbols can be read per call.
+    /// The kind has a body route but the source could not be read from a
+    /// root the caller actually supplied — either an explicit `root`
+    /// argument, or (nw-560) the symbol's owning repo's recorded
+    /// `local_root`. Symbol file paths are stored repo-relative and
+    /// resolved by joining onto that one root, so an EXPLICIT `root` still
+    /// means at most one repo's symbols can be read per call in a
+    /// multi-repo bundle; an omitted `root` no longer has that limitation,
+    /// since each symbol resolves its own repo's root independently.
     SourceUnreadable { path: String },
+    /// `root` was omitted AND the symbol's owning repo has no recorded
+    /// `local_root` (or that path no longer exists on disk), so the read
+    /// fell back to the server's own working directory — a directory the
+    /// caller never named and cannot fix by pointing `--root` at "their"
+    /// repo, because the graph itself has no repo root on file for this
+    /// symbol. Distinct from `SourceUnreadable`, which means a real root
+    /// (explicit or a genuinely recorded repo `local_root`) was tried and
+    /// still didn't contain the file.
+    NoRecordedLocalRoot { path: String },
     /// The node exists and its body is genuinely empty.
     Empty,
     /// No such node in the graph (a stale bundle, or a UID from another graph).
@@ -2060,10 +2073,73 @@ impl BodyUnavailable {
             BodyUnavailable::SourceUnreadable { path } => {
                 format!("source not readable from the supplied root: {path}")
             }
+            BodyUnavailable::NoRecordedLocalRoot { path } => {
+                format!(
+                    "no recorded local_root for this symbol's repo; tried the server's \
+                     working directory and could not read: {path}"
+                )
+            }
             BodyUnavailable::Empty => "the node's body is empty".to_string(),
             BodyUnavailable::NotFound => "not found in this graph".to_string(),
             BodyUnavailable::UnknownUid => "unrecognised uid".to_string(),
         }
+    }
+}
+
+/// Where [`resolve_symbol_body_root`] found the on-disk root to read from —
+/// tracked so [`fetch_full_body`] can report an honest [`BodyUnavailable`]
+/// reason instead of always claiming the caller "supplied" a root.
+enum SymbolRootSource {
+    /// The caller passed an explicit `root` argument.
+    Explicit(std::path::PathBuf),
+    /// `root` was omitted; resolved from the symbol's owning repo's
+    /// recorded `local_root`.
+    RepoLocalRoot(std::path::PathBuf),
+    /// `root` was omitted AND no repo `local_root` could be resolved (unknown
+    /// repo, no recorded root, or a root that no longer exists on disk), so
+    /// this fell back to the server's own working directory.
+    FallbackCwd(std::path::PathBuf),
+}
+
+impl SymbolRootSource {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            SymbolRootSource::Explicit(p)
+            | SymbolRootSource::RepoLocalRoot(p)
+            | SymbolRootSource::FallbackCwd(p) => p,
+        }
+    }
+}
+
+/// Resolve the on-disk root to read `uid`'s source from.
+///
+/// nw-560: an explicit `root` always wins (the counterweight this item
+/// names). When `root` is omitted, this mirrors `read_symbols`'
+/// `read_symbols_from_repo_roots` — resolve the SYMBOL's owning repo and use
+/// its recorded `local_root` (via the shared
+/// [`crate::read_symbols::repo_local_root`], so this and `read_symbols`
+/// cannot drift on what "the repo's root" means) — rather than defaulting
+/// straight to the server's working directory. A bare `nestweaver mcp --db
+/// …` launch has no reason to run from inside any particular repo's
+/// checkout, so that default silently emptied every body for a caller who
+/// omitted `root`. Only symbols have an owning repo to resolve this way;
+/// non-symbol UIDs never reach this function (see the match in
+/// [`fetch_full_body`]).
+fn resolve_symbol_body_root(
+    store: &GraphStore,
+    uid: &str,
+    root: Option<&Path>,
+) -> SymbolRootSource {
+    if let Some(explicit) = root {
+        return SymbolRootSource::Explicit(explicit.to_path_buf());
+    }
+    match store
+        .lookup_symbol(uid)
+        .ok()
+        .and_then(|symbol| crate::read_symbols::repo_local_root(store, &symbol.repo_uid))
+    {
+        Some(local_root) => SymbolRootSource::RepoLocalRoot(local_root),
+        None => SymbolRootSource::FallbackCwd(std::env::current_dir().unwrap_or_default()),
     }
 }
 
@@ -2075,7 +2151,14 @@ impl BodyUnavailable {
 /// the five kinds a bundle can contain: `head:` and `tag:` fell off the end into
 /// `None` and were unhydratable forever — no `--root`, no token budget and no
 /// retry could ever have filled them.
-fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Result<String, BodyUnavailable> {
+///
+/// `root: None` means "not supplied by the caller" — see
+/// [`resolve_symbol_body_root`] for what that resolves to for a symbol.
+fn fetch_full_body(
+    store: &GraphStore,
+    uid: &str,
+    root: Option<&Path>,
+) -> Result<String, BodyUnavailable> {
     use nestweaver_schema::UidKind;
 
     let non_empty = |text: String| {
@@ -2101,7 +2184,8 @@ fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Result<String,
 
     match UidKind::of(uid) {
         Some(UidKind::Symbol) => {
-            let reader = crate::content_reader::FilesystemReader::new(root);
+            let resolved_root = resolve_symbol_body_root(store, uid, root);
+            let reader = crate::content_reader::FilesystemReader::new(resolved_root.path());
             let res =
                 crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
             match res.symbols.into_iter().next() {
@@ -2109,9 +2193,21 @@ fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Result<String,
                 // computes and this function used to throw away by reading
                 // `.body` alone — an unreadable span became an empty string,
                 // indistinguishable from a symbol with no source.
-                Some(window) if !window.body_available => {
-                    Err(BodyUnavailable::SourceUnreadable { path: window.path })
-                }
+                //
+                // nw-560: which error to report depends on WHERE
+                // `resolved_root` came from — a caller-omitted root that fell
+                // back to the server's cwd (no repo `local_root` on file) is
+                // a different, more actionable fact than a real root (given
+                // explicitly, or resolved from a genuine repo `local_root`)
+                // simply not containing the file.
+                Some(window) if !window.body_available => Err(match resolved_root {
+                    SymbolRootSource::FallbackCwd(_) => {
+                        BodyUnavailable::NoRecordedLocalRoot { path: window.path }
+                    }
+                    SymbolRootSource::Explicit(_) | SymbolRootSource::RepoLocalRoot(_) => {
+                        BodyUnavailable::SourceUnreadable { path: window.path }
+                    }
+                }),
                 Some(window) => non_empty(window.body),
                 None => Err(BodyUnavailable::NotFound),
             }
@@ -3163,7 +3259,7 @@ mod tests {
         let expanded = investigate_expand(
             &store,
             &db_path,
-            &src,
+            Some(&src),
             &result.bundle_id,
             std::slice::from_ref(&target),
         )
@@ -3179,6 +3275,160 @@ mod tests {
         assert!(
             expanded.unresolved.is_empty(),
             "no unresolved targets expected"
+        );
+    }
+
+    /// nw-560: `root: None` (omitted, not merely blank) must resolve each
+    /// symbol from its OWNING REPO's recorded `local_root` — the same
+    /// resolution `read_symbols` already performs via
+    /// `read_symbols_from_repo_roots` — rather than the process's cwd. The
+    /// cargo-test working directory is the crate root, never the tempdir
+    /// `make_store` indexed, so this reproduces exactly what a bare
+    /// `nestweaver mcp --db …` launch hits: an MCP server whose cwd is not
+    /// any indexed repo.
+    #[test]
+    fn investigate_expand_resolves_repo_local_root_when_root_omitted() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let target = result
+            .entries
+            .iter()
+            .find(|e| e.uid.starts_with("sym:"))
+            .map(|e| e.asset_id.clone())
+            .expect("at least one symbol entry");
+
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            None,
+            &result.bundle_id,
+            std::slice::from_ref(&target),
+        )
+        .unwrap();
+
+        assert_eq!(expanded.expanded.len(), 1, "one entry expanded");
+        let e = &expanded.expanded[0];
+        assert!(
+            e.expanded,
+            "entry should be marked expanded even with root omitted: {e:?}"
+        );
+        assert!(
+            e.inline_body.as_deref().is_some_and(|b| !b.is_empty()),
+            "body must be read from the symbol's repo local_root when root \
+             is omitted, not left empty by defaulting to the server cwd: {e:?}"
+        );
+        assert!(
+            e.unavailable_reason.is_none(),
+            "no unavailable_reason expected once local_root resolution \
+             succeeds: {e:?}"
+        );
+    }
+
+    /// Counterweight to the test above: an EXPLICIT `root` must still win
+    /// outright, even when it points somewhere other than the symbol's
+    /// recorded repo `local_root`. `investigate_hydrate` is exercised here
+    /// (rather than `investigate_expand` again) so both entry points into
+    /// the shared `fetch_full_body` resolution are covered.
+    ///
+    /// `alt`'s file carries DIFFERENT source text at the same line range as
+    /// `src`'s (a distinguishing marker in place of the original body). A
+    /// prior version of this test wrote byte-identical content into both
+    /// directories, which could not distinguish "read from `alt` because
+    /// `root` was honoured" from "silently fell back to `src`'s repo
+    /// `local_root` and got the same bytes by coincidence" — this asserts
+    /// on the marker instead, so only reading from `alt` can pass.
+    ///
+    /// Uses a synthetic bundle with `inline_body: None` (the
+    /// `investigate_expand_unreadable_root_does_not_poison_entry` pattern
+    /// above) rather than a fresh `investigate()` call, because
+    /// `investigate_hydrate` SKIPS any entry that already has a body —
+    /// going through `investigate()` first would have the initial map's own
+    /// population fill the body from `src` before hydrate ever ran, making
+    /// hydrate's root argument untested no matter what it was.
+    #[test]
+    fn investigate_hydrate_honours_an_explicit_root_over_the_repo_local_root() {
+        // `src` is this symbol's recorded repo `local_root` — kept unbound
+        // (`_src`) since it must NOT be read once an explicit root is given;
+        // see the "must not be src's content" assertion below.
+        let (dir, _src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let alt = dir.path().join("alt-root");
+        std::fs::create_dir_all(alt.join("greet")).unwrap();
+        std::fs::write(
+            alt.join("greet").join("main.js"),
+            "function greet(name) { return \"ALT_ROOT_MARKER\"; }\n\
+             function hello(name) { return name; }",
+        )
+        .unwrap();
+
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_test".to_string(),
+            Bundle {
+                bundle_id: "bndl_test".to_string(),
+                created_at: now_epoch(),
+                query: "q".to_string(),
+                scope: "vault".to_string(),
+                entries: vec![BundleEntry {
+                    asset_id: "a_greet".to_string(),
+                    uid: greet_uid,
+                    kind: "Symbol".to_string(),
+                    title: "greet".to_string(),
+                    location: "greet/main.js:1".to_string(),
+                    summary: None,
+                    inline_body: None,
+                    body_complete: true,
+                    expanded: false,
+                    unavailable_reason: None,
+                    is_seed: false,
+                    matched_query: None,
+                    relevance: 1.0,
+                }],
+            },
+        );
+        save_bundle_store(&db_path, &bundle_store).unwrap();
+
+        let hydrated =
+            investigate_hydrate(&store, &db_path, Some(&alt), "bndl_test", Some(4000)).unwrap();
+
+        let symbol_entry = hydrated
+            .entries
+            .iter()
+            .find(|e| e.uid.starts_with("sym:"))
+            .expect("at least one symbol entry");
+        let body = symbol_entry
+            .inline_body
+            .as_deref()
+            .unwrap_or_else(|| panic!("explicit root must still resolve a body: {symbol_entry:?}"));
+        assert!(
+            body.contains("ALT_ROOT_MARKER"),
+            "explicit root must be the ACTUAL source of the body, not merely \
+             tolerated while the repo local_root is read instead: {body:?}"
+        );
+        assert!(
+            !body.contains("return hello(name)"),
+            "body must not be src's original (repo local_root) content: {body:?}"
         );
     }
 
@@ -3433,7 +3683,7 @@ mod tests {
         let bundle_id = bundle_of(&db_path, entries);
 
         let result =
-            investigate_hydrate(&store, &db_path, &vault, &bundle_id, Some(16000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&vault), &bundle_id, Some(16000)).unwrap();
 
         assert_eq!(
             result.hydrated + result.already_hydrated + result.skipped,
@@ -3495,7 +3745,7 @@ mod tests {
         let out = investigate_expand(
             &store,
             &db_path,
-            &bogus_root,
+            Some(&bogus_root),
             &bundle_id,
             std::slice::from_ref(&asset_id),
         )
@@ -3549,7 +3799,7 @@ mod tests {
         let out = investigate_expand(
             &store,
             &db_path,
-            &bogus_root,
+            Some(&bogus_root),
             &bundle_id,
             std::slice::from_ref(&asset_id),
         )
@@ -3606,7 +3856,8 @@ mod tests {
             .count();
 
         let hydrated =
-            investigate_hydrate(&store, &db_path, &src, &result.bundle_id, Some(4000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000))
+                .unwrap();
         assert!(
             hydrated.hydrated <= missing_before,
             "cannot hydrate more entries than were missing"
@@ -3663,7 +3914,8 @@ mod tests {
         .unwrap();
 
         let hydrated =
-            investigate_hydrate(&store, &db_path, &src, &result.bundle_id, Some(4000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000))
+                .unwrap();
         // Every hydrated entry must have an inline_body and a body_complete
         // value that reflects whether truncation actually happened (i.e. the
         // flag is `false` iff char count == the cap).
@@ -5418,7 +5670,7 @@ mod tests {
         let expanded = investigate_expand(
             &store,
             &db_path,
-            &src,
+            Some(&src),
             &result.bundle_id,
             std::slice::from_ref(&entry.asset_id),
         )
@@ -6037,7 +6289,7 @@ mod tests {
         let expanded = investigate_expand(
             &store,
             &db_path,
-            &src,
+            Some(&src),
             &result.bundle_id,
             &[aid.clone(), aid, uid],
         )
@@ -6071,7 +6323,7 @@ mod tests {
         let expanded = investigate_expand(
             &store,
             &db_path,
-            &src,
+            Some(&src),
             &result.bundle_id,
             &[
                 "nope-a".to_string(),
@@ -6135,7 +6387,7 @@ mod tests {
         let expanded = investigate_expand(
             &store,
             &db_path,
-            &missing_root,
+            Some(&missing_root),
             "bndl_test",
             &["a_greet".to_string()],
         )
@@ -6148,7 +6400,7 @@ mod tests {
 
         // A later hydrate against the real root still fills the body.
         let hydrated =
-            investigate_hydrate(&store, &db_path, &src, "bndl_test", Some(4000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&src), "bndl_test", Some(4000)).unwrap();
         let entry = hydrated
             .entries
             .iter()
@@ -6220,7 +6472,8 @@ mod tests {
 
         // A huge body truncates to INLINE_MAX_BODY_TOKENS (400) tokens; the
         // tiny body costs only a few. Budget 450 fits hugeA + tinyC.
-        let res = investigate_hydrate(&store, &db_path, &src, "bndl_test", Some(450)).unwrap();
+        let res =
+            investigate_hydrate(&store, &db_path, Some(&src), "bndl_test", Some(450)).unwrap();
         assert_eq!(
             res.hydrated, 2,
             "the tiny entry after an over-budget body must still hydrate"

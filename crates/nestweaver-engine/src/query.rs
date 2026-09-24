@@ -256,13 +256,7 @@ pub fn lookup_symbol(
                 if !in_instance(&sym.repo_uid) {
                     return Ok(LookupResult::NotFound);
                 }
-                let callers = store.callers_of(&sym.uid).context("fetch callers")?;
-                let callees = store.callees_of(&sym.uid).context("fetch callees")?;
-                Ok(LookupResult::Found(Box::new(SymbolDetail {
-                    symbol: sym,
-                    callers,
-                    callees,
-                })))
+                found_symbol_detail(store, sym)
             }
             Err(nestweaver_store::StoreError::NotFound) => Ok(LookupResult::NotFound),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -280,13 +274,7 @@ pub fn lookup_symbol(
             0 => Ok(LookupResult::NotFound),
             1 => {
                 let sym = matches.into_iter().next().expect("checked len == 1");
-                let callers = store.callers_of(&sym.uid).context("fetch callers")?;
-                let callees = store.callees_of(&sym.uid).context("fetch callees")?;
-                Ok(LookupResult::Found(Box::new(SymbolDetail {
-                    symbol: sym,
-                    callers,
-                    callees,
-                })))
+                found_symbol_detail(store, sym)
             }
             _ => {
                 let candidates = matches.iter().map(SymbolCandidate::from).collect();
@@ -294,6 +282,45 @@ pub fn lookup_symbol(
             }
         }
     }
+}
+
+/// Build the `Found` result for a resolved symbol: fetch its call-graph
+/// neighbours and hydrate `pagerank_score` for the symbol AND its
+/// callers/callees from the store's PageRank cache. Shared by both
+/// `lookup_symbol` paths (UID and name) so they cannot drift from each
+/// other.
+///
+/// nw-547: the `pagerank_score` DB COLUMN `row_to_symbol` reads is never
+/// populated, so every `Symbol` this crate builds carries a confident
+/// `Some(0.0)` regardless of its real rank. The genuine per-UID scores live
+/// only in the store's PageRank cache — the same source `hubs` / `ranking
+/// rank` read, and the same accessor `export.rs` already uses for the graph
+/// export path. `pagerank_scores()` is called ONCE here rather than once per
+/// symbol so the symbol plus its callers/callees share a single cache read.
+///
+/// `None` on a symbol means genuinely unavailable: no computed score exists
+/// for that uid, or the cache itself is unavailable right now (e.g. mid a
+/// dirty index publication) — never a fabricated zero. A lookup failure here
+/// must not fail the whole symbol lookup, since pagerank is supplementary
+/// metadata on top of the symbol identity the caller actually asked for.
+fn found_symbol_detail(
+    store: &GraphStore,
+    mut symbol: Symbol,
+) -> Result<LookupResult, anyhow::Error> {
+    let mut callers = store.callers_of(&symbol.uid).context("fetch callers")?;
+    let mut callees = store.callees_of(&symbol.uid).context("fetch callees")?;
+    let scores = store.pagerank_scores().ok();
+    let hydrate = |sym: &mut Symbol| {
+        sym.pagerank_score = scores.as_ref().and_then(|m| m.get(&sym.uid).copied());
+    };
+    hydrate(&mut symbol);
+    callers.iter_mut().for_each(hydrate);
+    callees.iter_mut().for_each(hydrate);
+    Ok(LookupResult::Found(Box::new(SymbolDetail {
+        symbol,
+        callers,
+        callees,
+    })))
 }
 
 /// Search for symbols whose name contains `query` (substring match).
@@ -3604,9 +3631,25 @@ pub fn generate_repo_map_bounded(
     store: &GraphStore,
     token_budget: usize,
 ) -> Result<RepoMap, anyhow::Error> {
-    let symbols = store
+    let ranked = store
         .symbols_by_pagerank(None)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // nw-645: rank by CALLABLE PageRank. Raw order let a `require`-bound
+    // `Constant` (`const knex = require('knex')`) that the resolver credits
+    // with every `knex.select(...)` call outrank the real hubs, so the
+    // skeleton opened on freeplay's imgix.js/knex.js instead of GraphStore.
+    // This is the same kind filter `hubs` ranks by (`is_callable_kind`, whose
+    // doc carries the evidence), applied as a stable partition of the
+    // PageRank order: callables first, then Constants/Properties/Modules/…
+    // So a file is placed by its best callable symbol, a file with none sorts
+    // after every file that has one, and inside a file callables list first.
+    // Nothing is dropped: a graph with no callable symbol at all still gets a
+    // full skeleton in raw PageRank order, and `files_total` is unchanged.
+    let (mut symbols, bindings): (Vec<Symbol>, Vec<Symbol>) = ranked
+        .into_iter()
+        .partition(|sym| crate::hubs::is_callable_kind(&sym.kind.to_string()));
+    symbols.extend(bindings);
 
     // Group symbols by (repo_uid, file_path) — NOT file_path alone — while
     // preserving the PageRank order of files. The first occurrence of a key
@@ -3700,7 +3743,8 @@ pub fn generate_repo_map_bounded(
     })
 }
 
-/// Generate a structural repo-map skeleton, ordered by PageRank (highest first).
+/// Generate a structural repo-map skeleton, ordered by PageRank (highest first)
+/// over callable symbols — see [`generate_repo_map_bounded`] (nw-645).
 ///
 /// The output groups symbols by file path:
 /// ```text
@@ -4583,6 +4627,148 @@ mod repo_map_tests {
         assert_eq!(whole.files_total, 2, "the fixture has exactly two files");
     }
 
+    fn make_symbol_of_kind(uid: &str, name: &str, file_path: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            kind,
+            ..make_symbol(uid, name, "repo:a", file_path)
+        }
+    }
+
+    /// nw-645. The skeleton (repo-map, and generate-guide's AGENTS.md
+    /// "Architecture" block, which calls the same function) used to order
+    /// files by their single highest-PageRank symbol of ANY kind, so a
+    /// `require`-bound `Constant` that the resolver credits with every
+    /// member-access call (`const knex = require('knex')`) put `imgix.js` /
+    /// `knex.js` above `GraphStore`. Files must be ranked by their best
+    /// CALLABLE symbol (the `hubs` kind filter, `is_callable_kind`).
+    #[test]
+    fn skeleton_ranks_files_by_callable_pagerank_not_constants() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&make_repo("repo:a", "fixture")).unwrap();
+        let symbols = [
+            (
+                "sym:graphstore",
+                "GraphStore",
+                "src/store.rs",
+                SymbolKind::Class,
+            ),
+            ("sym:knex", "knex", "src/knex.js", SymbolKind::Constant),
+            (
+                "sym:add",
+                "addImageParams",
+                "src/knex.js",
+                SymbolKind::Function,
+            ),
+            (
+                "sym:themes",
+                "THEMES",
+                "src/themes.js",
+                SymbolKind::Constant,
+            ),
+            ("sym:size", "size", "src/themes.js", SymbolKind::Property),
+        ];
+        for (uid, name, file, kind) in symbols {
+            store
+                .insert_symbol(&make_symbol_of_kind(uid, name, file, kind))
+                .unwrap();
+        }
+        let edge = |source: &str, target: &str| ResolvedEdge {
+            source_uid: source.to_string(),
+            target_uid: target.to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: vec![],
+        };
+        // Twelve callers hammer the constants (mis-resolved receiver calls);
+        // eight of them genuinely call GraphStore.
+        for n in 0..12 {
+            let uid = format!("sym:caller{n}");
+            store
+                .insert_symbol(&make_symbol(
+                    &uid,
+                    &format!("caller{n}"),
+                    "repo:a",
+                    "src/callers.js",
+                ))
+                .unwrap();
+            for target in ["sym:knex", "sym:themes", "sym:size"] {
+                store.insert_edge(&edge(&uid, target)).unwrap();
+            }
+            if n < 8 {
+                store.insert_edge(&edge(&uid, "sym:graphstore")).unwrap();
+            }
+        }
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        // Precondition: the fixture really does reproduce the defect's shape —
+        // a Constant outranks the callable hub on raw PageRank.
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        assert_ne!(
+            ranked[0].name, "GraphStore",
+            "fixture must let a constant lead"
+        );
+
+        let result = generate_repo_map_bounded(&store, 16_000).unwrap();
+        let headers: Vec<&str> = result
+            .map
+            .lines()
+            .filter(|line| !line.starts_with(' '))
+            .collect();
+        assert_eq!(
+            headers.first(),
+            Some(&"src/store.rs"),
+            "the callable hub's file must lead: {}",
+            result.map
+        );
+        assert_eq!(
+            headers.last(),
+            Some(&"src/themes.js"),
+            "a file with no callable symbol must not lead — it ranks last: {}",
+            result.map
+        );
+        // Nothing is hidden: the constants-only file is still listed.
+        assert_eq!(result.files_total, 4, "{}", result.map);
+        assert!(result.map.contains("THEMES"), "{}", result.map);
+        // Within a file, callables are listed before bindings too.
+        let knex_block: Vec<&str> = result
+            .map
+            .split("src/knex.js\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .take_while(|line| line.starts_with(' '))
+            .collect();
+        assert!(knex_block[0].contains("addImageParams"), "{knex_block:?}");
+    }
+
+    /// nw-645 COUNTERWEIGHT: a graph with no callable symbol at all (nothing
+    /// for the callable ranking to use) still yields a skeleton, ordered by
+    /// raw PageRank, rather than an empty map.
+    #[test]
+    fn skeleton_without_callables_still_lists_files() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&make_repo("repo:a", "fixture")).unwrap();
+        store
+            .insert_symbol(&make_symbol_of_kind(
+                "sym:c",
+                "LIMIT",
+                "src/consts.js",
+                SymbolKind::Constant,
+            ))
+            .unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let result = generate_repo_map_bounded(&store, 16_000).unwrap();
+        assert_eq!(result.files_total, 1);
+        assert_eq!(result.files_returned, 1);
+        assert!(result.map.contains("src/consts.js"), "{}", result.map);
+        assert!(result.map.contains("LIMIT"), "{}", result.map);
+    }
+
     /// nw-369(b). Two DIFFERENT repos that happen to share a bare file path
     /// must not be merged under one header — that is a correctness bug, not
     /// just an attribution gap, since it would present the union of two
@@ -5122,6 +5308,126 @@ mod instance_validation_tests {
         assert!(
             msg.contains("instance merge --from c37ccf01 --to kory-brain"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pagerank_hydration_tests {
+    use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphScope, GraphStore};
+
+    use super::{LookupResult, lookup_symbol};
+
+    fn symbol(uid: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: "anything".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            signature: "fn anything()".to_string(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// nw-547: `symbol --json` (via `lookup_symbol`, the single implementation
+    /// shared by the daemon `symbol_lookup` RPC and the CLI's direct route)
+    /// must report the REAL pagerank score — the same value `ranking rank` /
+    /// `hubs` read from the store's PageRank cache — not the DB
+    /// `pagerank_score` COLUMN, which is never populated and always reads
+    /// back as `Some(0.0)`.
+    #[test]
+    fn lookup_symbol_reports_the_real_pagerank_score() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store.insert_symbol(&symbol("sym:1")).unwrap();
+
+        // Force a real PageRank compute (mirrors what `hubs`/`ranking rank`
+        // trigger) so this test compares against a genuinely computed score
+        // rather than an accidental default.
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let expected = *store
+            .pagerank_scores()
+            .unwrap()
+            .get("sym:1")
+            .expect("computed score");
+        assert!(
+            expected > 0.0,
+            "sanity: even a lone node gets a nonzero baseline PageRank score"
+        );
+
+        let detail = match lookup_symbol(&store, "sym:1", None).unwrap() {
+            LookupResult::Found(detail) => detail,
+            LookupResult::NotFound => panic!("symbol not found"),
+            LookupResult::Ambiguous(_) => panic!("unexpectedly ambiguous"),
+        };
+        assert_eq!(
+            detail.symbol.pagerank_score,
+            Some(expected),
+            "symbol --json's pagerank_score must match ranking rank / hubs for the same uid"
+        );
+    }
+
+    /// Counterweight: when the PageRank cache is genuinely unavailable (a
+    /// dirty index publication in flight — the same condition `hubs`/
+    /// `ranking rank` fail closed on), the field must be `None`/`null`, never
+    /// a fabricated `0.0` masquerading as a real answer.
+    #[test]
+    fn lookup_symbol_reports_no_score_when_ranking_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&symbol("sym:1")).unwrap();
+
+        let publication = store.acquire_index_publication_lease().unwrap();
+        store
+            .with_index_publication_rank_barrier(|| -> Result<u64, nestweaver_store::StoreError> {
+                std::fs::write(&marker_path, b"dirty")
+                    .map_err(|error| nestweaver_store::StoreError::Query(error.to_string()))?;
+                publication.reserve_generation()
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                store.pagerank_scores(),
+                Err(nestweaver_store::StoreError::RankingUnavailable)
+            ),
+            "sanity: the dirty publication must actually block ranking"
+        );
+
+        let detail = match lookup_symbol(&store, "sym:1", None).unwrap() {
+            LookupResult::Found(detail) => detail,
+            LookupResult::NotFound => panic!("symbol not found"),
+            LookupResult::Ambiguous(_) => panic!("unexpectedly ambiguous"),
+        };
+        assert_eq!(
+            detail.symbol.pagerank_score, None,
+            "genuinely unavailable ranking must surface as None, not a fabricated 0.0"
         );
     }
 }

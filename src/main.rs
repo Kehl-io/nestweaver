@@ -107,9 +107,9 @@ use nestweaver_engine::{
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_note_limits,
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
-    list_services, load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at,
-    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -815,11 +815,15 @@ fn wal_corruption_runbook(db: &str) -> String {
          {db}.wal\n       {db}.wal.checkpoint\n       {db}.shadow\n       \
          {db}.checkpoint.apply.lock\n       {db}.checkpoint.intent.lock\n  \
          3. Reopen the database. If it opens, the un-checkpointed tail of the \
-         log is lost; the graph already committed is not.\n  \
+         log is lost; the graph already committed is not. That tail can hold \
+         a whole vault publication while the code repos survive.\n  \
          4. Run a full re-index. REQUIRED, not optional: derived edges for \
          unchanged files are not rebuilt by the watcher, and nothing in \
-         `brain status` discloses the deficit.\n\
-         Moving only some of the five fails identically to moving none."
+         `brain status` discloses the deficit.\n  \
+         5. Run `nestweaver brain status --db {quoted}`: it names every vault \
+         the recovery dropped, with the `brain add` command that restores it.\n\
+         Moving only some of the five fails identically to moving none.",
+        quoted = shell_quote(db),
     )
 }
 
@@ -2985,6 +2989,36 @@ fn render_investigate_text(payload: &serde_json::Value) {
     );
 }
 
+/// Print a change-impact payload's `notifications` as `[level] message`, the
+/// one renderer shared by `blast-radius` and `detect-changes` (nw-544).
+///
+/// `show_notes: false` folds Note-level entries into a single count line
+/// instead of printing them. detect-changes carries blast radius's
+/// informational notes (`clusters-not-computed`, `cochange-unavailable`) on
+/// every run of a fresh install; printing them as warnings trained readers to
+/// skip the block. They are still disclosed — as a count with the flag that
+/// reveals them — so text never says less than JSON about what exists.
+fn print_change_notifications(payload: &serde_json::Value, indent: &str, show_notes: bool) {
+    let mut folded = 0usize;
+    for note in payload
+        .get("notifications")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
+        if level == "note" && !show_notes {
+            folded += 1;
+            continue;
+        }
+        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        println!("{indent}[{level}] {msg}");
+    }
+    if folded > 0 {
+        println!("{indent}({folded} informational note(s) hidden; rerun with --verbose or --json)");
+    }
+}
+
 /// Render a `blast-radius` result as text from its JSON payload.
 ///
 /// Both the direct and daemon paths render through this, so the two cannot
@@ -3051,16 +3085,7 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
     println!("  status:     {}", s("status"));
     println!("  gate_state: {}", s("gate_state"));
 
-    for note in payload
-        .get("notifications")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
-        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        println!("  [{level}] {msg}");
-    }
+    print_change_notifications(payload, "  ", true);
 
     let blind: Vec<&str> = payload
         .get("blind_spots")
@@ -5837,7 +5862,9 @@ enum Commands {
     ///
     /// Outputs the highest-PageRank symbols organized by file, truncated
     /// to fit within the specified token budget. Designed for AI agent
-    /// context windows.
+    /// context windows. Files are ranked by their best CALLABLE symbol
+    /// (the `hubs` kind filter); Constants, Properties, Variables, Modules
+    /// and type aliases never lead and list after the callables.
     ///
     /// `--json`'s `stale_repos` here is generation-mismatch repo UIDs — the
     /// same population as `hubs`/`bridges`, and a different one from
@@ -6468,7 +6495,8 @@ enum Commands {
     ///
     /// Runs community detection on the code graph and prints a summary of
     /// each cluster. Results are cached in a sidecar file alongside the
-    /// database so subsequent invocations are instant.
+    /// database and reused while the graph generation is unchanged, so
+    /// repeat invocations skip the recompute.
     #[command(
         after_help = "Examples:\n  nestweaver clusters\n  nestweaver clusters --resolution 0.5 --json"
     )]
@@ -6515,6 +6543,19 @@ enum Commands {
             help = "Maximum members listed per community (0-200; 0 = all, default 20; matches the MCP clusters schema)"
         )]
         members: usize,
+        // nw-479: sibling of `hubs --repo`/`bridges --repo`. Unlike those two
+        // (rank the global graph, then filter rows to the scope), a repo scope
+        // here runs Louvain on the repo-INDUCED SUBGRAPH, so cohesion/
+        // key_files/modularity describe only what was asked about. The result
+        // is a SEPARATE, uncached `repo_scoped` id space -- never written to
+        // the clusters sidecar `hub_nodes`/`bridge_nodes`/`blast_radius`/
+        // `cluster <id>` read.
+        #[arg(
+            long = "repo",
+            value_name = "REPO",
+            help = "Restrict to the repo-induced subgraph of this repo (name or UID; repeat for several). Computed fresh, never cached, and its community ids are NOT comparable to an unscoped run's. An unknown repo name is an error."
+        )]
+        repos: Vec<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -9388,21 +9429,10 @@ enum DbSource {
 /// target is not refused — that target is derived from the source rather than
 /// from the ambient environment.
 ///
-/// Single-quote an argument for a shell only when it needs it.
-///
-/// The refusals below print a command the user is meant to paste. A path with
-/// a space in it that comes back unquoted is an unexecutable remedy, which is
-/// the failure mode this repository has shipped five times.
+/// Single-quote an argument for a shell only when it needs it. Delegates to
+/// the engine's one definition ([`nestweaver_engine::shell_quote`]).
 fn shell_quote(arg: &str) -> String {
-    let safe = !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-,".contains(c));
-    if safe {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
-    }
+    nestweaver_engine::shell_quote(arg)
 }
 
 /// The exact `server init-tls` invocation that WOULD perform the replacement:
@@ -13890,6 +13920,38 @@ fn read_symbols_rpc_args(
     args
 }
 
+/// Build the daemon RPC args shared by `investigate-expand` and
+/// `investigate-hydrate` — `bundle_id` plus `root`, sent only when the
+/// caller passed `--root` explicitly. Same reasoning and same shape as
+/// [`read_symbols_rpc_args`]; extracted here (nw-560) because the two call
+/// sites' identical `if let Some(explicit_root) = root.as_deref() { .. }`
+/// block had already been hand-edited twice (nw-340, then nw-560) and
+/// re-diverging a third time was exactly the risk a shared function
+/// removes.
+///
+/// `targets` is `Some` for `investigate-expand` only; `token_budget` is
+/// `Some` for `investigate-hydrate` only. Each caller passes `None` for the
+/// field its own command does not have, rather than this function guessing
+/// which command it was called from.
+fn investigate_rpc_args(
+    bundle_id: &str,
+    targets: Option<&[String]>,
+    token_budget: Option<usize>,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({ "bundle_id": bundle_id });
+    if let Some(targets) = targets {
+        args["targets"] = serde_json::json!(targets);
+    }
+    if let Some(tb) = token_budget {
+        args["token_budget"] = serde_json::json!(tb);
+    }
+    if let Some(root) = root {
+        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+    }
+    args
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn run_with_stdout_boundary<T>(operation: impl FnOnce() -> T) -> Result<T, StdoutWriteFailure> {
@@ -14908,7 +14970,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repos = list_repos(&store, instance.as_deref())?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&repos)?);
+                // nw-634: additive `display_name` per row, the SAME resolver
+                // the daemon route (`list_repos_json`) already calls — see
+                // `repos_json_with_display_name`.
+                let value = nestweaver_engine::repos_json_with_display_name(&repos);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else if repos.is_empty() {
                 println!("No repositories found.");
             } else {
@@ -17554,10 +17620,54 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             limit,
             members,
             json,
+            repos,
             db,
             config: config_opt,
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+
+            // nw-479: a `--repo` scope takes a COMPLETELY separate path —
+            // computed on the repo-induced subgraph by the `clusters` tool
+            // itself (via the daemon when one is up, direct dispatch
+            // otherwise — ONE implementation either way, not a second copy
+            // here), never touching the clusters sidecar, and its community
+            // ids live in their own `repo_scoped` id space. This bypasses the
+            // unscoped cache/compute machinery below entirely.
+            if !repos.is_empty() {
+                let mut args = clusters_tool_args(limit, members, resolution);
+                args["repos"] = serde_json::json!(repos);
+                let payload = match try_hybrid_json_rpc_checked(
+                    use_daemon,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "clusters",
+                    args.clone(),
+                ) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                    Ok(Some(value)) => strip_hybrid_meta(value),
+                    Ok(None) => {
+                        let store = open_store(Some(&db_path))?;
+                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                        match nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)
+                        {
+                            Err(error) if error_is_unresolved_repo_filter(&error) => {
+                                return Ok((report_unresolved_repo_filter(&error, json), None));
+                            }
+                            Err(error) => return Err(error),
+                            Ok(value) => value,
+                        }
+                    }
+                };
+                if json {
+                    print_json_payload(&payload)?;
+                } else {
+                    print!("{}", render_scoped_clusters_text(&payload));
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
 
             // ── daemon guard ──────────────────────────────────────
             // The daemon `clusters` tool truncates each community's
@@ -17633,7 +17743,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // replaces was a copy of the text arm with the bounding
                     // removed, which is exactly how the two routes came to
                     // disagree about whether `--limit` means anything.
-                    print_clusters_output_with_total(&output, false, limit, members, total)?;
+                    print_clusters_output_with_total(
+                        &output, false, limit, members, total, None, false,
+                    )?;
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -17646,93 +17758,75 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // cache via the daemon. Two output modes disagreeing about whether a
             // cache exists, with the docs siding with the one that didn't.
             //
-            // Reuse is gated on the resolution MATCHING, because the sidecar
-            // holds whichever resolution was computed last: serving a cache
-            // built at a different resolution would answer a question the caller
-            // did not ask. With an explicit --resolution the check needs no
-            // store at all, which is the fully-instant case the help describes.
-            // nw-157: this gate used to require an EXPLICIT --resolution, so
-            // a bare `clusters` short-circuited the let-chain, missed its own
-            // cache, and recomputed plus rewrote a 65 MB sidecar on every run
-            // (1.89s vs 0.155s with --resolution 0.3 — the same answer, since
-            // the default IS 0.3 on this graph). The cache must be compared
-            // against the EFFECTIVE resolution, not the requested one.
-            //
-            // Deriving the default needs the symbol count, hence the store; an
-            // explicit --resolution still needs no store at all, preserving the
-            // fully-instant case `--help` describes.
-            let cached = load_clusters(&db_path).ok().flatten();
-            let mut opened: Option<std::mem::ManuallyDrop<_>> = None;
-            let mut symbol_count: Option<usize> = None;
-            let effective_resolution = match resolution {
-                Some(requested) => requested,
-                None => {
-                    let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-                    // F-DC-7: ONE rule, shared with the `clusters` tool and
-                    // `generate_cluster_summaries`. Community IDs are
-                    // ASSIGNMENT-dependent, so two runs at different
-                    // resolutions are two different ID SPACES, not two
-                    // orderings of one. Four copies of this 0.3/0.5 rule
-                    // existed and a fifth (`generate_cluster_summaries`, hard
-                    // coded to 1.0) drifted — which is why 26 of 50 IDs from
-                    // `summary --level cluster` did not resolve through
-                    // `cluster <id>`.
-                    let count = store.count_symbols().unwrap_or(0);
-                    let adaptive = nestweaver_engine::default_cluster_resolution(&store);
-                    symbol_count = Some(count);
-                    opened = Some(store);
-                    adaptive
-                }
-            };
+            // nw-646: reuse is gated on the resolution MATCHING *and* the
+            // sidecar's `graph_generation` matching the CURRENT graph's — a
+            // sidecar built before a reindex is stale even when its resolution
+            // happens to match, and the old resolution-only gate served it
+            // anyway (a cached response whose modularity no longer matched
+            // anything on disk). Checking the generation means opening the
+            // store on every call, including an explicit --resolution — this
+            // gives up the previous fully-instant case for that path
+            // (`load_graph_generation` needs a store open) in exchange for the
+            // cache never lying about what it holds. An older sidecar with no
+            // `graph_generation` field (written before this change) parses as
+            // `None`, which never equals `Some(current)` and so is always
+            // treated as stale rather than crashing or silently trusting it.
+            let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
+            let current_generation = store.graph_generation();
+            // F-DC-7: ONE rule, shared with the `clusters` tool and
+            // `generate_cluster_summaries`. Community IDs are
+            // ASSIGNMENT-dependent, so two runs at different
+            // resolutions are two different ID SPACES, not two
+            // orderings of one. Four copies of this 0.3/0.5 rule
+            // existed and a fifth (`generate_cluster_summaries`, hard
+            // coded to 1.0) drifted — which is why 26 of 50 IDs from
+            // `summary --level cluster` did not resolve through
+            // `cluster <id>`.
+            let effective_resolution =
+                resolution.unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(&store));
 
-            // Reuse is gated on the resolution MATCHING, because the sidecar
-            // holds whichever resolution was computed last: serving a cache
-            // built at a different resolution would answer a question the
-            // caller did not ask.
-            if let Some(cached) = cached
-                && (cached.resolution - effective_resolution).abs() < f64::EPSILON
-            {
+            let cached = load_clusters_with_generation(&db_path).ok().flatten();
+            let cache_is_fresh = cached.as_ref().is_some_and(|(cached_output, generation)| {
+                (cached_output.resolution - effective_resolution).abs() < f64::EPSILON
+                    && *generation == Some(current_generation)
+            });
+
+            if cache_is_fresh && let Some((cached_output, _)) = cached {
                 out.status(&format!(
-                    "Using cached clusters (resolution={effective_resolution}) from sidecar."
+                    "Using cached clusters (resolution={effective_resolution}, generation={current_generation}) from sidecar."
                 ));
-                print_clusters_output(&cached, json, limit, members)?;
+                print_clusters_output(
+                    &cached_output,
+                    json,
+                    limit,
+                    members,
+                    current_generation,
+                    true,
+                )?;
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Compute and save inside a block so the store is dropped
-            // before any output. LadybugDB's connection finaliser can
-            // trigger a panic during WAL checkpoint; wrapping in
-            // catch_unwind prevents the Drop panic from aborting the
-            // process (exit code 101).
-            let output = {
-                let store = match opened {
-                    Some(store) => store,
-                    None => std::mem::ManuallyDrop::new(open_store(Some(&db_path))?),
-                };
-                let sym_count = match symbol_count {
-                    Some(count) => count,
-                    None => store.count_symbols().unwrap_or(0),
-                };
+            // Compute and save. The store stays open (ManuallyDrop, leaked
+            // deliberately below) rather than reopened, since it is already
+            // open from the generation check above.
+            let sym_count = store.count_symbols().unwrap_or(0);
+            out.status(&format!(
+                "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
+            ));
+            let output = compute_clusters(&store, effective_resolution)?;
+            save_clusters(&db_path, &output, current_generation)?;
+            out.status(&format!(
+                "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
+                output.communities.len(),
+                output.modularity
+            ));
+            // Leak the store intentionally — LadybugDB's Drop can
+            // panic during WAL checkpoint on some platforms, and we
+            // are about to exit anyway.  process::exit (called by
+            // main) terminates without running destructors, so this
+            // is safe.
 
-                out.status(&format!(
-                    "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
-                ));
-                let o = compute_clusters(&store, effective_resolution)?;
-                save_clusters(&db_path, &o)?;
-                out.status(&format!(
-                    "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
-                    o.communities.len(),
-                    o.modularity
-                ));
-                // Leak the store intentionally — LadybugDB's Drop can
-                // panic during WAL checkpoint on some platforms, and we
-                // are about to exit anyway.  process::exit (called by
-                // main) terminates without running destructors, so this
-                // is safe.
-                o
-            };
-
-            print_clusters_output(&output, json, limit, members)?;
+            print_clusters_output(&output, json, limit, members, current_generation, false)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -17768,7 +17862,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         ));
                         let store = open_store(Some(&db_path))?;
                         let computed = compute_clusters(&store, pinned)?;
-                        save_clusters(&db_path, &computed)?;
+                        save_clusters(&db_path, &computed, store.graph_generation())?;
                         computed
                     }
                 }
@@ -17788,7 +17882,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // whether their output is addressable at all.
                         let default_res = nestweaver_engine::default_cluster_resolution(&store);
                         let computed = compute_clusters(&store, default_res)?;
-                        save_clusters(&db_path, &computed)?;
+                        save_clusters(&db_path, &computed, store.graph_generation())?;
                         computed
                     }
                 }
@@ -18176,6 +18270,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
+                    // nw-544: detect_changes now takes its risk/gate from blast
+                    // radius, which reads the cluster sidecar via this path. The
+                    // daemon sets it; without it here the direct route would drop
+                    // the cluster risk boost and disagree with `blast-radius`.
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
                     nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
                 }
             };
@@ -18194,16 +18293,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     payload["affected_process_count"].as_u64().unwrap_or(0),
                     payload["blast_radius"].as_u64().unwrap_or(0)
                 );
-                if let Some(notifications) = payload["notifications"].as_array() {
-                    for notification in notifications {
-                        println!(
-                            "Warning: {}",
-                            notification["message"]
-                                .as_str()
-                                .unwrap_or("analysis degraded")
-                        );
-                    }
-                }
+                // nw-544: real levels via the blast-radius renderer; notes
+                // (now contributed by blast radius) fold unless --verbose.
+                print_change_notifications(&payload, "", out.verbose);
             }
             let exit = if payload["resolver_stale_repos"]
                 .as_array()
@@ -18326,6 +18418,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             use nestweaver_engine::dead_code::{
                 DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
+                dead_code_page_malformed_token_refusal, is_well_formed_page_token,
                 serialize_dead_code_page,
             };
             let db_path = db.clone().unwrap_or_else(default_db_path);
@@ -18343,7 +18436,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(value) = &page_token {
                 args["page_token"] = serde_json::json!(value);
             }
-            let payload = if use_daemon {
+            // nw-657: check shape BEFORE picking a route. The daemon route
+            // sends `args` to the `dead_code` MCP tool, whose `page_token`
+            // schema is deliberately strict (`minLength`/`maxLength: 64` + a
+            // hex `pattern`) so raw MCP clients get a visible schema-shaped
+            // refusal — a malformed token sent there fails as a generic
+            // internal/protocol error, not the documented exit 2. Refusing
+            // here, before either branch, gives both CLI routes the same
+            // `page_token_malformed` exit 2 without ever routing a malformed
+            // token through that schema.
+            let payload = if let Some(token) = &page_token
+                && !is_well_formed_page_token(token)
+            {
+                dead_code_page_malformed_token_refusal(token)
+            } else if use_daemon {
                 // A reproducible page belongs to the selected database. Never
                 // substitute or merge an upstream population for this route.
                 require_existing_db(&db_path)?;
@@ -21725,14 +21831,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({
-                    "bundle_id": bundle_id,
-                    "targets": targets,
-                });
-                // nw-340: always send a root. An omitted `root` is filled by
-                // the DAEMON's cwd, not the caller's, so inline bodies come
-                // back empty from a response that otherwise looks fine.
-                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
+                // nw-560: `investigate_rpc_args` sends `root` only when the
+                // caller passed `--root`. Omitting it lets the daemon
+                // resolve each symbol from its own repo `local_root`;
+                // sending the client's cwd here (the old nw-340 fix)
+                // OVERRODE that per-symbol resolution with a single
+                // directory, so a caller running from outside every indexed
+                // repo got empty bodies again regardless of the daemon-side
+                // fix.
+                let args = investigate_rpc_args(&bundle_id, Some(&targets), None, root.as_deref());
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
@@ -21742,9 +21849,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let root = root.unwrap_or_else(detect_repo_root);
+            // nw-560: an omitted `--root` is passed through as `None` so the
+            // engine resolves each symbol's owning-repo `local_root`
+            // (`resolve_symbol_body_root`), rather than defaulting to
+            // `detect_repo_root()` here — a single directory-walk guess is
+            // no better than the daemon's old cwd default when the caller's
+            // cwd is outside every indexed repo.
             let result = nestweaver_engine::investigate_expand(
-                &store, &db_path, &root, &bundle_id, &targets,
+                &store,
+                &db_path,
+                root.as_deref(),
+                &bundle_id,
+                &targets,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -21797,14 +21913,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({
-                    "bundle_id": bundle_id,
-                    "token_budget": token_budget,
-                });
-                // nw-340: always send a root. An omitted `root` is filled by
-                // the DAEMON's cwd, not the caller's, so inline bodies come
-                // back empty from a response that otherwise looks fine.
-                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
+                // nw-560: same `investigate_rpc_args` helper as
+                // `investigate-expand` above — send `root` only when the
+                // caller explicitly passed `--root`, so an omission lets the
+                // daemon resolve per-symbol local_root instead of being
+                // overridden by the client's cwd.
+                let args =
+                    investigate_rpc_args(&bundle_id, None, Some(token_budget), root.as_deref());
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
@@ -21814,11 +21929,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let root = root.unwrap_or_else(detect_repo_root);
+            // nw-560: pass an omitted `--root` through as `None` — see the
+            // matching comment in `investigate-expand` above.
             let result = nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
-                &root,
+                root.as_deref(),
                 &bundle_id,
                 Some(token_budget),
             )?;
@@ -26705,6 +26821,28 @@ fn run_brain(
                     }
                 }
             }
+            // nw-587: a vault this database was asked to hold that the graph
+            // no longer has (a WAL move-aside drops whatever the log held) is
+            // NAMED, with the command that restores it. stderr in both modes,
+            // so the `--json` array keeps its shape. Same engine check
+            // `brain status` forwards as a `vault_registration_missing` warning.
+            let live = rows
+                .iter()
+                .filter_map(|row| Some((row["uid"].as_str()?, row["root_path"].as_str()?)));
+            match nestweaver_engine::vault_registration::missing(&db_path, live) {
+                Ok(missing) => {
+                    for entry in &missing {
+                        eprintln!(
+                            "Warning: {}\n  Run: {}",
+                            nestweaver_engine::vault_registration::missing_warning(entry),
+                            nestweaver_engine::vault_registration::readd_command(&db_path, entry),
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "Warning: cannot tell whether any registered vault is missing from the graph: {error:#}"
+                ),
+            }
             let unavailable = rows.iter().any(|r| r["notes"].is_null());
             Ok((
                 if unavailable {
@@ -27473,6 +27611,14 @@ fn run_brain(
                 }
 
                 results.push(serde_json::json!({
+                    // nw-634: `uid`/`root_path`/`name`/`display_name`,
+                    // matching `tool_stale_check` exactly — same fields, same
+                    // resolver (`nestweaver_engine::repo_display_name`), so a
+                    // caller cannot tell which route answered.
+                    "uid": repo.uid,
+                    "root_path": repo.root_path,
+                    "name": repo.name,
+                    "display_name": nestweaver_engine::repo_display_name(repo),
                     "url": repo.url,
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
@@ -28234,6 +28380,30 @@ fn run_brain(
             }
 
             if uids_to_remove.is_empty() {
+                // nw-587: no graph row, but the database may still remember
+                // registering a vault here (one a WAL move-aside dropped).
+                // Removing it on purpose means forgetting that too, or
+                // `brain status` reports it as lost forever. `brain status`
+                // prints this command as the way to say "dropped on purpose".
+                // An unreadable sidecar must not turn a plain not-found into
+                // an error: log it and fall through (`brain status` keeps
+                // disclosing it until the next record rewrites the file).
+                let forgotten = match nestweaver_engine::vault_registration::forget_root(
+                    &db_path, &canonical,
+                ) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::warn!("nw-587: vault registrations not consulted: {error:#}");
+                        0
+                    }
+                };
+                if forgotten > 0 {
+                    println!(
+                        "No vault in the graph at {canon_str}; forgot {forgotten} registration(s) \
+                         it had lost."
+                    );
+                    return Ok((EXIT_SUCCESS, None));
+                }
                 println!("No vault found at {canon_str}; 0 row(s) cleaned.");
                 return Ok((EXIT_NOT_FOUND, None));
             }
@@ -29943,10 +30113,19 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool) -> usize 
 /// `returned_communities`, and a per-community `returned_members`, so a caller
 /// can tell a small graph from a truncated view. `0` means unlimited for both
 /// bounds, so the previous full output is still reachable.
+/// `graph_generation`/`cached` are nw-646's cache-identity disclosure: before
+/// this, "was this cache hit or a fresh compute, and against which graph
+/// generation" was ONLY in the human-readable stderr status line
+/// ("Using cached clusters (resolution=…, generation=…)"), which `--json`
+/// callers (scripts, the MCP client) cannot read. `graph_generation` is
+/// `None` only for the daemon-routed text path, which never reaches `--json`
+/// (see the call site's comment) and so never serializes this payload.
 fn bounded_clusters_payload(
     output: &nestweaver_engine::ClusteringOutput,
     limit: usize,
     members: usize,
+    graph_generation: Option<u64>,
+    cached: bool,
 ) -> serde_json::Value {
     let total = output.communities.len();
     let take = if limit == 0 { total } else { limit.min(total) };
@@ -29978,6 +30157,8 @@ fn bounded_clusters_payload(
         "total_communities": total,
         "returned_communities": take,
         "truncated": take < total,
+        "graph_generation": graph_generation,
+        "cached": cached,
     })
 }
 
@@ -30027,6 +30208,75 @@ fn render_clusters_text(
             "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
             total - take
         );
+    }
+    out
+}
+
+/// Render a `clusters --repo` payload (the `clusters` tool's scoped branch)
+/// as text.
+///
+/// nw-479. Deliberately a separate renderer, not a patch onto
+/// [`render_clusters_text`]: the scoped payload's JSON shape (`size` rather
+/// than `member_count`, plus a `scope` object) is the tool's wire shape, not
+/// the direct-path `ClusteringOutput`/`CommunityInfo` structs, so there is no
+/// shared struct to render from without first reconstructing one — and the
+/// `scope` disclosure (repos, cross-repo edges cut, and the `repo_scoped` id
+/// space warning) has nothing to share with the unscoped renderer anyway.
+fn render_scoped_clusters_text(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    let modularity = payload
+        .get("modularity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let total = payload.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let scope = payload.get("scope");
+    let scope_repos: Vec<String> = scope
+        .and_then(|s| s.get("repos"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let excluded = scope
+        .and_then(|s| s.get("cross_repo_edges_excluded"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Clusters scoped to [{}] ({total}, modularity={modularity:.4}); {excluded} cross-repo edge(s) excluded by the induced subgraph.",
+        scope_repos.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "Community ids are in a SEPARATE 'repo_scoped' id space — not comparable to an unscoped run or another scope.\n"
+    );
+    if let Some(clusters) = payload.get("clusters").and_then(|v| v.as_array()) {
+        if clusters.is_empty() {
+            let _ = writeln!(
+                out,
+                "No communities detected (scope may be empty or fully disconnected)."
+            );
+        }
+        for c in clusters {
+            let id = c.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let size = c.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cohesion = c.get("cohesion").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let _ = writeln!(
+                out,
+                "  [{id:>3}] {name} ({size} members, cohesion={cohesion:.2})"
+            );
+            if let Some(key_files) = c.get("key_files").and_then(|v| v.as_array()) {
+                for f in key_files.iter().filter_map(|v| v.as_str()) {
+                    let _ = writeln!(out, "        {f}");
+                }
+            }
+        }
     }
     out
 }
@@ -30093,10 +30343,20 @@ fn print_clusters_output(
     json: bool,
     limit: usize,
     members: usize,
+    graph_generation: u64,
+    cached: bool,
 ) -> anyhow::Result<()> {
     // The direct path holds the whole population, so the total IS the length.
     let total = output.communities.len();
-    print_clusters_output_with_total(output, json, limit, members, total)
+    print_clusters_output_with_total(
+        output,
+        json,
+        limit,
+        members,
+        total,
+        Some(graph_generation),
+        cached,
+    )
 }
 
 /// [`print_clusters_output`] with the pre-cap total supplied by the caller, for
@@ -30197,11 +30457,19 @@ fn print_clusters_output_with_total(
     limit: usize,
     members: usize,
     total: usize,
+    graph_generation: Option<u64>,
+    cached: bool,
 ) -> anyhow::Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&bounded_clusters_payload(output, limit, members))?
+            serde_json::to_string_pretty(&bounded_clusters_payload(
+                output,
+                limit,
+                members,
+                graph_generation,
+                cached
+            ))?
         );
         return Ok(());
     }
@@ -32252,6 +32520,20 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
                  condition acquired three contradictory answers:\n{help}"
             );
         }
+    }
+
+    /// nw-587. The runbook used to say only that "the un-checkpointed tail is
+    /// lost", without naming what that tail can be: a whole vault publication,
+    /// while the code repos survive. It must say so and point at the surface
+    /// that names the dropped vaults.
+    #[test]
+    fn wal_runbook_names_vault_loss_and_the_status_that_discloses_it() {
+        let runbook = wal_corruption_runbook("/tmp/my brain.lbug");
+        assert!(runbook.contains("vault publication"), "{runbook}");
+        assert!(
+            runbook.contains("nestweaver brain status --db '/tmp/my brain.lbug'"),
+            "the pasted command must be quoted: {runbook}"
+        );
     }
 
     /// nw-333. The other half, and what keeps the first from over-correcting:
@@ -40188,6 +40470,78 @@ credential_method = "gh"
             &["greet".to_string()],
             0,
             None,
+            Some(std::path::Path::new("/explicit/repo")),
+        );
+        assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
+    }
+
+    /// nw-560 (extraction follow-up). `investigate_rpc_args` is the ONE
+    /// helper both `investigate-expand` and `investigate-hydrate` call to
+    /// build their daemon args — the identical `if let Some(explicit_root)
+    /// = root.as_deref() { .. }` block that used to live at each call site
+    /// had already been hand-edited twice (nw-340 added a cwd default,
+    /// nw-560 removed it) before this extraction, which is exactly the
+    /// "fixed once, drifted back" pattern a shared function is meant to
+    /// close off. Mirrors `read_symbols_rpc_args_omit_root_when_flag_absent`
+    /// above: an omitted `--root` must omit the `root` key entirely (not
+    /// resend the client's cwd, which is what defeats the daemon's
+    /// per-symbol `local_root` resolution), and an explicit `--root` must
+    /// win outright.
+    ///
+    /// A helper that reintroduced `client_source_root`-style cwd defaulting
+    /// (i.e. `root.unwrap_or_else(|| ...cwd...)` instead of `if let Some`)
+    /// would make the first assertion below fail: `args.get("root")` would
+    /// be `Some(<cwd>)` instead of `None`.
+    #[test]
+    fn investigate_rpc_args_omits_root_when_flag_absent_and_bundles_expand_or_hydrate_fields() {
+        // `investigate-expand` shape: bundle_id + targets, no token_budget.
+        let args = investigate_rpc_args("bndl_1", Some(&["a1".to_string()]), None, None);
+        assert!(
+            args.get("root").is_none(),
+            "omitting --root must omit the field, not send cwd; got {args}"
+        );
+        assert!(
+            args.get("token_budget").is_none(),
+            "investigate-expand has no token_budget arg; got {args}"
+        );
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "bundle_id": "bndl_1",
+                "targets": ["a1"],
+            })
+        );
+
+        let args = investigate_rpc_args(
+            "bndl_1",
+            Some(&["a1".to_string()]),
+            None,
+            Some(std::path::Path::new("/explicit/repo")),
+        );
+        assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
+
+        // `investigate-hydrate` shape: bundle_id + token_budget, no targets.
+        let args = investigate_rpc_args("bndl_2", None, Some(4000), None);
+        assert!(
+            args.get("root").is_none(),
+            "omitting --root must omit the field on the hydrate shape too; got {args}"
+        );
+        assert!(
+            args.get("targets").is_none(),
+            "investigate-hydrate has no targets arg; got {args}"
+        );
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "bundle_id": "bndl_2",
+                "token_budget": 4000,
+            })
+        );
+
+        let args = investigate_rpc_args(
+            "bndl_2",
+            None,
+            Some(4000),
             Some(std::path::Path::new("/explicit/repo")),
         );
         assert_eq!(args["root"], serde_json::json!("/explicit/repo"));

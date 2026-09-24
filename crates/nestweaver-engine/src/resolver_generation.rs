@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(affected.resolver_stale_repos, vec![repo.uid.clone()]);
         assert_eq!(affected.recommendation, "run-full-suite");
 
-        let detected = crate::process::detect_changes_impact(&store, &files, 3).unwrap();
+        let detected = crate::process::detect_changes_impact(&store, &files, 3, Some(&db)).unwrap();
         assert_eq!(detected.resolver_stale_repos, vec![repo.uid.clone()]);
         assert_eq!(
             detected.gate_state,

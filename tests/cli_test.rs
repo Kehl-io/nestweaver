@@ -2599,6 +2599,168 @@ fn cli_capability_aliases_execute_mcp_equivalent_contracts() {
     assert_eq!(backlinks["backlinks"][0]["source_note_title"], "Source");
 }
 
+/// nw-544: `detect-changes` and `blast-radius` must return the same risk and
+/// gate for the same changed files — the item's fixture is an unindexed
+/// `Makefile` plus `src/a.js`, whose function has five root callers (five
+/// processes, which the old process-count bucketing read as `high`). Run
+/// through the real CLI so the MCP tool wiring and the direct route's db-path
+/// plumbing (cluster/co-change sidecars) are covered, not just the engine.
+/// Index the nw-544 fixture: an unindexed `Makefile`, `src/a.js` with five
+/// callers in `src/callers.js`, and a lone `src/leaf.js`. No cluster or
+/// co-change sidecar is produced, as on a fresh install.
+fn nw544_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    std::fs::write(repo_dir.join("Makefile"), "all:\n\techo build\n").unwrap();
+    std::fs::write(
+        repo_dir.join("src/a.js"),
+        "export function sharedTarget(x) { return x + 1; }\n",
+    )
+    .unwrap();
+    let mut callers = String::from("import { sharedTarget } from './a.js';\n");
+    for n in 0..5 {
+        callers.push_str(&format!(
+            "export function caller{n}() {{ return sharedTarget({n}); }}\n"
+        ));
+    }
+    std::fs::write(repo_dir.join("src/callers.js"), callers).unwrap();
+    std::fs::write(
+        repo_dir.join("src/leaf.js"),
+        "export function lonelyLeaf() { return 42; }\n",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    (dir, db_path)
+}
+
+#[test]
+fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
+    let (_dir, db_path) = nw544_fixture();
+
+    let run = |command: &str, files: &[&str]| -> serde_json::Value {
+        let mut cmd = nestweaver_cmd();
+        cmd.arg(command);
+        for file in files {
+            cmd.args(["--files", file]);
+        }
+        let output = cmd.args(["--json", "--db"]).arg(&db_path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command} {files:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let cases: [&[&str]; 4] = [
+        &["Makefile", "src/a.js"],
+        &["src/a.js"],
+        &["Makefile"],
+        &["src/leaf.js"],
+    ];
+    for files in cases {
+        let detect = run("detect-changes", files);
+        let blast = run("blast-radius", files);
+        assert_eq!(
+            detect["risk"], blast["risk"],
+            "{files:?}: risk differs\ndetect: {detect}\nblast: {blast}"
+        );
+        assert_eq!(
+            detect["gate_state"], blast["gate_state"],
+            "{files:?}: gate differs\ndetect: {detect}\nblast: {blast}"
+        );
+        if files.contains(&"Makefile") {
+            assert_ne!(detect["gate_state"], "ok", "{files:?}: {detect}");
+            assert_ne!(detect["risk"], "low", "{files:?}: {detect}");
+        }
+    }
+
+    // COUNTERWEIGHT: a genuinely low-risk change still reads low / ok in both.
+    let leaf = run("detect-changes", &["src/leaf.js"]);
+    assert_eq!(leaf["risk"], "low", "{leaf}");
+    assert_eq!(leaf["gate_state"], "ok", "{leaf}");
+}
+
+/// nw-544 follow-up: detect-changes now carries blast radius's Note-level
+/// disclosures (`clusters-not-computed`, `cochange-unavailable`), and its
+/// text output printed EVERY notification as "Warning:", so a fresh install
+/// got two false warnings on every ordinary run. Notes render at their real
+/// level through the shared blast-radius renderer and are folded into a
+/// count unless `--verbose`; JSON keeps them all.
+#[test]
+fn detect_changes_text_prints_notifications_at_their_real_level() {
+    let (_dir, db_path) = nw544_fixture();
+    let text = |files: &[&str], verbose: bool| -> String {
+        let mut cmd = nestweaver_cmd();
+        cmd.arg("detect-changes");
+        for file in files {
+            cmd.args(["--files", file]);
+        }
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        let output = cmd.arg("--db").arg(&db_path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let json = {
+        let output = nestweaver_cmd()
+            .args(["detect-changes", "--files", "src/leaf.js", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert!(
+        json["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["descriptor"] == "clusters-not-computed" && n["level"] == "note"),
+        "JSON must keep the note: {json}"
+    );
+
+    let plain = text(&["src/leaf.js"], false);
+    assert!(
+        !plain.to_lowercase().contains("warning"),
+        "an ordinary run must not print a warning for a note: {plain}"
+    );
+    assert!(
+        !plain.contains("no cluster data"),
+        "notes are folded unless --verbose: {plain}"
+    );
+    assert!(
+        plain.contains("--verbose"),
+        "folded notes must still be disclosed as a count: {plain}"
+    );
+    let verbose = text(&["src/leaf.js"], true);
+    assert!(
+        verbose.contains("[note] no cluster data"),
+        "--verbose shows the note at its real level: {verbose}"
+    );
+
+    // COUNTERWEIGHT: a genuine Warning still prints, as a warning.
+    let makefile = text(&["Makefile"], false);
+    assert!(
+        makefile.contains("[warning] Makefile is an execution/build/configuration dependency"),
+        "{makefile}"
+    );
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])
@@ -5100,6 +5262,237 @@ fn cli_missing_db_brain_search() {
 #[test]
 fn cli_missing_db_instance_merge() {
     assert_missing_db_guard(&["instance", "merge", "--from", "a", "--to", "b"]);
+}
+
+/// nw-634: `list-repos --json` and `stale-check --json` must both carry the
+/// row's `uid`, `root_path`, and a resolved `display_name` — the same
+/// identity `resolve_repo_selector` / `repo_display_name` already compute
+/// for `--repo` selectors and unknown-repo errors, not a second naming rule.
+///
+/// This repo is indexed with no explicit name override, so the counterweight
+/// lives right here too: the raw `name` field must stay `null` rather than
+/// being silently backfilled with the URL-derived fallback — only the
+/// additive `display_name` field is guaranteed non-null.
+#[test]
+fn list_repos_and_stale_check_json_carry_uid_and_display_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir(&repo_dir).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() {}").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "initial"]);
+
+    // The CLI canonicalizes --repo before minting the identity, so
+    // root_path comparisons below must go through the same canonical form
+    // (macOS's /tmp is a symlink into /private/tmp).
+    let canonical_repo_dir = std::fs::canonicalize(&repo_dir).unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let list_repos_out = nestweaver_cmd()
+        .args([
+            "list-repos",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&list_repos_out.stdout);
+    let repos: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("list-repos --json: {e}\n{stdout}"));
+    let row = repos
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or_else(|| panic!("no repo row in:\n{stdout}"));
+    assert!(row["uid"].is_string(), "missing uid:\n{stdout}");
+    assert_eq!(
+        row["root_path"].as_str(),
+        Some(canonical_repo_dir.display().to_string().as_str()),
+        "{stdout}"
+    );
+    assert!(
+        row["name"].is_null(),
+        "no --name override was given, so the raw field must stay null \
+         rather than being backfilled with the URL-derived fallback:\n{stdout}"
+    );
+    assert!(
+        row["display_name"].as_str().is_some_and(|s| !s.is_empty()),
+        "display_name must always resolve, even without an override:\n{stdout}"
+    );
+
+    let stale_check_out = nestweaver_cmd()
+        .args([
+            "stale-check",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&stale_check_out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stale-check --json: {e}\n{stdout}"));
+    let row = parsed["repos"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or_else(|| panic!("no repo row in:\n{stdout}"));
+    assert!(row["uid"].is_string(), "missing uid:\n{stdout}");
+    assert_eq!(
+        row["root_path"].as_str(),
+        Some(canonical_repo_dir.display().to_string().as_str()),
+        "{stdout}"
+    );
+    assert!(
+        row["name"].is_null(),
+        "counterweight: an unconfigured repo's name stays null on stale-check \
+         rows too:\n{stdout}"
+    );
+    assert!(
+        row["display_name"].as_str().is_some_and(|s| !s.is_empty()),
+        "display_name must always resolve on stale-check rows too:\n{stdout}"
+    );
+}
+
+/// nw-560: `investigate-expand` with an OMITTED `--root`, run from a working
+/// directory OUTSIDE every indexed repo, must still return a non-empty body
+/// by resolving the symbol's owning repo's recorded `local_root` — not by
+/// reading the process cwd. This exercises the CLI's DIRECT (no-daemon)
+/// route end to end (`nestweaver_cmd()` pins `NESTWEAVER_NO_DAEMON`), the
+/// route where main.rs used to `Some(detect_repo_root())` an unrelated
+/// directory-walk guess instead of passing `None` through to the engine's
+/// per-symbol resolution.
+#[test]
+fn investigate_expand_omitted_root_resolves_from_outside_the_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("app.js"),
+        "function myFunc(x) { return x + 1; }",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    // Build the bundle with an explicit root so bundle creation itself
+    // (out of this item's scope) is not what is under test here.
+    let investigate_out = nestweaver_cmd()
+        .args([
+            "investigate",
+            "myFunc",
+            "--root",
+            &repo_dir.display().to_string(),
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&investigate_out.stdout);
+    let investigated: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("investigate --json: {e}\n{stdout}"));
+    let bundle_id = investigated["bundle_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no bundle_id in:\n{stdout}"))
+        .to_string();
+    let asset_id = investigated["entries"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e["uid"].as_str().is_some_and(|u| u.starts_with("sym:")))
+        })
+        .and_then(|e| e["asset_id"].as_str())
+        .unwrap_or_else(|| panic!("no symbol entry in:\n{stdout}"))
+        .to_string();
+
+    // A directory outside the repo AND outside the db's own directory —
+    // the working directory a bare `nestweaver mcp --db ...` launch would
+    // actually have.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir_all(&unrelated_cwd).unwrap();
+
+    let expand_out = nestweaver_cmd()
+        .args([
+            "investigate-expand",
+            &bundle_id,
+            "--targets",
+            &asset_id,
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&expand_out.stdout);
+    let expanded: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("investigate-expand --json: {e}\n{stdout}"));
+    let entry = expanded["expanded"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or_else(|| panic!("no expanded entry in:\n{stdout}"));
+    assert_eq!(
+        entry["expanded"], true,
+        "entry must be marked expanded even with root omitted, run outside \
+         every indexed repo: {stdout}"
+    );
+    assert!(
+        entry["inline_body"].as_str().is_some_and(|b| !b.is_empty()),
+        "body must be read from the symbol's repo local_root when --root is \
+         omitted, even though the process cwd is outside every indexed \
+         repo — not left empty by defaulting to that cwd: {stdout}"
+    );
+    assert!(
+        entry["unavailable_reason"].is_null(),
+        "no unavailable_reason expected once local_root resolution \
+         succeeds: {stdout}"
+    );
 }
 
 #[test]
@@ -8975,7 +9368,7 @@ fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_curren
             key_files: vec![],
         }],
     };
-    nestweaver_engine::save_clusters(&db, &stale).unwrap();
+    nestweaver_engine::save_clusters(&db, &stale, 1).unwrap();
 
     let current = nestweaver_engine::ClusteringOutput {
         resolution: 5.0,
@@ -8989,7 +9382,7 @@ fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_curren
             key_files: vec![],
         }],
     };
-    nestweaver_engine::save_clusters(&db, &current).unwrap();
+    nestweaver_engine::save_clusters(&db, &current, 1).unwrap();
 
     let canonical_path = dir.path().join("scratch.lbug.clusters.json");
     let stale_path = nestweaver_engine::sidecar_path_for_resolution(&db, 0.5);
@@ -9053,7 +9446,7 @@ fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
         modularity: 0.5,
         communities: vec![],
     };
-    nestweaver_engine::save_clusters(&db, &only).unwrap();
+    nestweaver_engine::save_clusters(&db, &only, 1).unwrap();
     let only_path = nestweaver_engine::sidecar_path_for_resolution(&db, 1.0);
     assert!(only_path.exists(), "precondition");
 
@@ -9072,6 +9465,260 @@ fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
         "the only resolution ever computed must survive: {combined}"
     );
     assert!(!combined.contains("cluster sidecar"), "{combined}");
+}
+
+/// nw-646. A clusters sidecar built at an OLDER graph generation than the
+/// live graph is stale even when its `--resolution` matches — the old gate
+/// checked resolution alone, so `clusters --json` served a cache whose
+/// modularity did not match anything currently on disk. This pins the fix:
+/// a matching generation is a genuine cache hit (the fabricated sidecar's
+/// distinctive modularity comes back verbatim), and advancing the graph
+/// generation without touching resolution forces a fresh compute.
+#[test]
+fn clusters_cache_is_gated_on_graph_generation_not_just_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    let generation_path = std::path::PathBuf::from(format!("{}.generation", db_path.display()));
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    }
+
+    // Fabricate a sidecar with a distinctive modularity, tagged generation 5,
+    // and pin the live graph's persisted generation to the SAME value.
+    let fabricated = nestweaver_engine::ClusteringOutput {
+        resolution: 1.0,
+        modularity: 0.918273,
+        communities: vec![],
+    };
+    nestweaver_engine::save_clusters(&db_path, &fabricated, 5).unwrap();
+    std::fs::write(&generation_path, "5").unwrap();
+
+    // Cache HIT: generation matches (5 == 5), resolution matches (1.0).
+    let hit = nestweaver_cmd()
+        .args(["clusters", "--json", "--resolution", "1.0", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let hit_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&hit.stdout),
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert!(
+        hit_out.contains("Using cached clusters"),
+        "matching generation must reuse the cache: {hit_out}"
+    );
+    assert!(
+        hit_out.contains("0.918273"),
+        "a genuine cache hit must return the SIDECAR's own modularity: {hit_out}"
+    );
+    // nw-646 follow-up: the stderr status line is human-only — a `--json`
+    // caller (script, MCP client) needs the same cache identity IN the
+    // payload, not just on stderr.
+    let hit_payload: serde_json::Value = serde_json::from_slice(&hit.stdout).unwrap();
+    assert_eq!(
+        hit_payload["graph_generation"],
+        serde_json::json!(5),
+        "the JSON payload must name the generation the cache hit was served at: {hit_payload}"
+    );
+    assert_eq!(
+        hit_payload["cached"],
+        serde_json::json!(true),
+        "a genuine cache hit must disclose `cached: true` in the JSON payload: {hit_payload}"
+    );
+
+    // Advance the graph generation (simulating a reindex) WITHOUT touching
+    // resolution or the sidecar file directly.
+    std::fs::write(&generation_path, "6").unwrap();
+
+    let miss = nestweaver_cmd()
+        .args(["clusters", "--json", "--resolution", "1.0", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let miss_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&miss.stdout),
+        String::from_utf8_lossy(&miss.stderr)
+    );
+    assert!(
+        !miss_out.contains("Using cached clusters"),
+        "a generation mismatch must NOT be reported as a cache hit: {miss_out}"
+    );
+    assert!(
+        !miss_out.contains("0.918273"),
+        "a stale generation must trigger a fresh compute, not replay the fabricated \
+         sidecar's modularity: {miss_out}"
+    );
+    let miss_payload: serde_json::Value = serde_json::from_slice(&miss.stdout).unwrap();
+    assert_eq!(
+        miss_payload["graph_generation"],
+        serde_json::json!(6),
+        "a fresh compute's JSON payload must name the NEW generation it ran at: {miss_payload}"
+    );
+    assert_eq!(
+        miss_payload["cached"],
+        serde_json::json!(false),
+        "a fresh compute must disclose `cached: false` in the JSON payload: {miss_payload}"
+    );
+
+    // The freshly-computed sidecar must now carry the NEW generation.
+    let (_, saved_generation) = nestweaver_engine::load_clusters_with_generation(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_generation, Some(6));
+}
+
+fn write_two_repo_cluster_fixture(db_path: &std::path::Path) {
+    use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    let store = nestweaver_store::GraphStore::open_or_create(db_path).unwrap();
+    for repo_uid in ["repo-a", "repo-b"] {
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: format!("https://example.test/{repo_uid}"),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+    let mk = |uid: &str, repo_uid: &str| Symbol {
+        uid: uid.to_string(),
+        name: uid.to_string(),
+        kind: SymbolKind::Function,
+        repo_uid: repo_uid.to_string(),
+        file_path: "src/lib.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        signature: format!("fn {uid}()"),
+        summary: None,
+        content_hash: format!("h_{uid}"),
+        embedding: None,
+        pagerank_score: None,
+        is_entry_point: false,
+        entry_point_kind: None,
+        visibility: Visibility::Inferred,
+        type_info: None,
+        framework_hint: None,
+        canonical_id: None,
+    };
+    for (uid, repo) in [
+        ("a0", "repo-a"),
+        ("a1", "repo-a"),
+        ("b0", "repo-b"),
+        ("b1", "repo-b"),
+    ] {
+        store.insert_symbol(&mk(uid, repo)).unwrap();
+    }
+    for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: src.to_string(),
+                target_uid: dst.to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+    }
+}
+
+/// nw-479. `clusters --repo <repo>` must return ONLY that repo's members —
+/// never a symbol from a repo outside the scope.
+#[test]
+fn clusters_cli_repo_scope_returns_only_the_scoped_repos_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args([
+            "clusters",
+            "--repo",
+            "repo-a",
+            "--resolution",
+            "1.0",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["scope"]["id_space"],
+        serde_json::json!("repo_scoped")
+    );
+    let clusters = payload["clusters"].as_array().expect("clusters array");
+    assert!(!clusters.is_empty(), "{combined}");
+    for cluster in clusters {
+        for member in cluster["members"].as_array().unwrap() {
+            let uid = member["uid"].as_str().unwrap();
+            assert!(
+                uid.starts_with('a'),
+                "a repo-a scoped call must never return a repo-b symbol: {uid}"
+            );
+        }
+    }
+}
+
+/// nw-479. An unknown `--repo` selector is an ERROR (exit 2, named), never a
+/// silent empty scope — matching `hubs --repo`/`bridges --repo`.
+#[test]
+fn clusters_cli_rejects_an_unknown_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["clusters", "--repo", "no-such-repo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2), "{combined}");
+    assert!(combined.contains("no-such-repo"), "{combined}");
+}
+
+/// COUNTERWEIGHT: omitting `--repo` must leave unscoped `clusters` output
+/// unchanged — no `scope` key, and the command still succeeds.
+#[test]
+fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["clusters", "--resolution", "1.0", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        payload.get("scope").is_none(),
+        "an unscoped call must not carry a scope object: {combined}"
+    );
 }
 
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
@@ -10563,6 +11210,275 @@ fn dead_code_names_the_language_causing_a_degrade_on_every_surface() {
     );
 }
 
+/// nw-657: a MALFORMED `--page-token` (right type, wrong shape — not 64
+/// lowercase-hex characters) used to bail through `anyhow::ensure!` inside
+/// the MCP handler `dead_code_page_arguments`, which the daemon route
+/// surfaced as exit 1 "Internal error" — indistinguishable from a real bug,
+/// and inconsistent with the documented exit-2 contract a well-formed-but-
+/// WRONG token already gets (`page_population_or_database_changed`). This
+/// exercises the real CLI, direct (non-daemon) route.
+#[test]
+fn dead_code_malformed_page_token_is_a_usage_error_not_an_internal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args([
+            "dead-code",
+            "--json",
+            "--page-token",
+            "not-a-valid-token",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a malformed page_token must refuse with the documented exit 2, not \
+         exit 1 Internal error: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not-a-valid-token"),
+        "the refusal must name the bad token: {stderr}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["refused"], serde_json::json!(true));
+    assert_eq!(payload["reason"], serde_json::json!("page_token_malformed"));
+
+    // ── COUNTERWEIGHT: a well-formed 64-char lowercase-hex token that simply
+    // does not match this population must be unaffected — still exit 2, but
+    // the pre-existing value-mismatch reason, not the new shape reason.
+    let wrong_but_well_formed = "a".repeat(64);
+    let mismatch = nestweaver_cmd()
+        .args(["dead-code", "--json", "--page-token"])
+        .arg(&wrong_but_well_formed)
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2));
+    let mismatch_payload: serde_json::Value = serde_json::from_slice(&mismatch.stdout).unwrap();
+    assert_eq!(
+        mismatch_payload["reason"],
+        serde_json::json!("page_population_or_database_changed"),
+        "a well-formed-but-wrong token must keep its existing reason: {mismatch_payload}"
+    );
+
+    // ── COUNTERWEIGHT: valid paging (no page_token, first page) is unaffected.
+    let valid = nestweaver_cmd()
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "ordinary first-page paging must be unaffected: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+}
+
+/// nw-657 daemon-route parity: the direct (non-daemon) CLI route above never
+/// actually exhibited the exit-1 "Internal error" symptom the item describes
+/// — its own `DeadCodePageRequest` construction never called the MCP
+/// handler's `dead_code_page_arguments`, so a malformed token there just fell
+/// through to the hash-mismatch refusal (exit 2, generic reason) even before
+/// this fix. The route that actually broke was `use_daemon`: it used to send
+/// the token straight to the `dead_code` RPC, which dispatches through the
+/// MCP tool's strict JSON schema and failed as a raw schema-validation error
+/// (exit 1). The fix moved the shape check into the CLI handler itself,
+/// BEFORE either route is chosen, so a malformed token is refused (exit 2)
+/// without ever reaching the daemon at all — which makes "prove the daemon
+/// route was actually taken" a real thing to verify: this test first spawns
+/// a genuine daemon for this database with an ordinary (well-formed) call and
+/// confirms its pidfile, so the malformed-token call below runs in an
+/// environment where the daemon route is genuinely live and available, not
+/// merely configured. Isolated HOME + XDG dirs (same shape as
+/// `a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_database`)
+/// so this spawns its own throwaway daemon rather than touching a real one.
+#[test]
+fn dead_code_malformed_page_token_daemon_route_matches_direct_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    fn isolate(
+        cmd: &mut StdCommand,
+        home: &std::path::Path,
+        state: &std::path::Path,
+        runtime: &std::path::Path,
+        sock: &std::path::Path,
+    ) {
+        cmd.env_remove("NESTWEAVER_NO_DAEMON")
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", state)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock)
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30");
+    }
+
+    /// RAII: stops the throwaway daemon on drop, even if an assertion below
+    /// panics — otherwise a failed run leaks a live daemon process pointed at
+    /// a deleted temp DB.
+    struct DaemonStopGuard {
+        db_path: std::path::PathBuf,
+        home: std::path::PathBuf,
+        state: std::path::PathBuf,
+        runtime: std::path::PathBuf,
+        sock: std::path::PathBuf,
+    }
+    impl Drop for DaemonStopGuard {
+        fn drop(&mut self) {
+            // `every_cli_invocation_pins_its_daemon_routing` scans for a
+            // literal `NESTWEAVER_NO_DAEMON` mention between the binary
+            // constructor and the terminal call — inline it here too, even
+            // though `isolate()` below does the same thing, since the
+            // scanner reads source text, not the `isolate()` helper's body.
+            let mut stop = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+            stop.env_remove("NESTWEAVER_NO_DAEMON")
+                .args(["daemon", "--db"])
+                .arg(&self.db_path)
+                .arg("stop");
+            isolate(
+                &mut stop,
+                &self.home,
+                &self.state,
+                &self.runtime,
+                &self.sock,
+            );
+            let _ = stop.output();
+        }
+    }
+    let _guard = DaemonStopGuard {
+        db_path: db_path.clone(),
+        home: home.path().to_path_buf(),
+        state: state.path().to_path_buf(),
+        runtime: runtime.path().to_path_buf(),
+        sock: sock.path().to_path_buf(),
+    };
+
+    // ── Baseline: an ordinary well-formed call through the daemon-route
+    // environment, proving the daemon route is actually live for this DB —
+    // not just that `use_daemon` would have been selected.
+    let mut baseline = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    baseline
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path);
+    isolate(
+        &mut baseline,
+        home.path(),
+        state.path(),
+        runtime.path(),
+        sock.path(),
+    );
+    let baseline_output = baseline.output().unwrap();
+    assert!(
+        baseline_output.status.success(),
+        "the baseline daemon-route call must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&baseline_output.stdout),
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = runtime
+        .path()
+        .join("nestweaver")
+        .join(&instance_id)
+        .join("daemon.pid");
+    assert!(
+        pidfile.exists(),
+        "the daemon route was NOT actually taken — no pidfile at {}: this test's \
+         isolation or the daemon-route CLI plumbing broke, and everything below \
+         would be exercising the direct route instead",
+        pidfile.display()
+    );
+    let daemon_pid_before = std::fs::read_to_string(&pidfile).unwrap();
+
+    // ── The actual regression check: a malformed page_token, in an
+    // environment where a live daemon for this DB is confirmed running.
+    let mut malformed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    malformed
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .args([
+            "dead-code",
+            "--json",
+            "--page-token",
+            "not-a-valid-token",
+            "--db",
+        ])
+        .arg(&db_path);
+    isolate(
+        &mut malformed,
+        home.path(),
+        state.path(),
+        runtime.path(),
+        sock.path(),
+    );
+    let output = malformed.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the daemon-route environment must refuse a malformed page_token with \
+         exit 2, not exit 1 'Internal error' — this is the route that actually \
+         exhibited nw-657: stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("not-a-valid-token"),
+        "the daemon-route environment's refusal must also name the bad token: {stderr}"
+    );
+    // Same daemon, undisturbed: the shape check short-circuited client-side
+    // and never touched it.
+    assert_eq!(
+        std::fs::read_to_string(&pidfile).unwrap_or_default(),
+        daemon_pid_before,
+        "the malformed-token call must not have restarted or otherwise \
+         disturbed the already-live daemon"
+    );
+}
+
 /// nw-435 leg 2 (precision), end to end. `detect_python`/`detect_bash` only
 /// ever recognised a function literally named `main`, so a Python module or
 /// bash script whose top level was bare statements had NO entry point at all
@@ -11355,4 +12271,247 @@ fn impact_substring_not_found_carries_did_you_mean_and_text_goes_to_stderr() {
         uid_payload.get("did_you_mean").is_none(),
         "a UID miss must carry no did_you_mean key: {uid_payload}"
     );
+}
+
+/// nw-587. The WAL move-aside recovery loses whatever the log held and the
+/// main file did not. Simulated faithfully: snapshot the checkpointed database
+/// while it holds only a code repo, publish a vault, then put the snapshot
+/// back — the graph has lost the vault publication while every sidecar beside
+/// it survives, which is exactly the state the runbook leaves. `brain list`
+/// used to answer `No vaults indexed` with exit 0 and nothing else.
+#[test]
+fn wal_move_aside_that_drops_a_vault_is_disclosed_by_brain_list_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("lostvault");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(repo_dir.join("main.js"), "function keptRepoFn() {}\n").unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Lost note\n\nbody\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let checkpointed = dir.path().join("checkpointed.lbug");
+    std::fs::copy(&db_path, &checkpointed).unwrap();
+    assert!(
+        !sidecar_path(&db_path, ".wal").exists(),
+        "fixture assumes the repo index was fully checkpointed"
+    );
+
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let status_json = || {
+        let output = nestweaver_cmd()
+            .args(["brain", "status", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "brain status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let missing_warnings = |status: &serde_json::Value| -> Vec<serde_json::Value> {
+        status["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| w["kind"] == "vault_registration_missing")
+            .collect()
+    };
+
+    // Counterweight: the healthy database lists its vault and reports nothing
+    // missing.
+    let healthy = status_json();
+    assert_eq!(healthy["vault_count"], 1, "{healthy}");
+    assert!(missing_warnings(&healthy).is_empty(), "{healthy}");
+    let listed = nestweaver_cmd()
+        .args(["brain", "list", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("lostvault"));
+    assert!(
+        !String::from_utf8_lossy(&listed.stderr).contains("not in the graph"),
+        "a healthy list must not warn: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    // The recovery: the graph falls back to its checkpointed state.
+    std::fs::copy(&checkpointed, &db_path).unwrap();
+    let _ = std::fs::remove_file(sidecar_path(&db_path, ".wal"));
+
+    let listed = nestweaver_cmd()
+        .args(["brain", "list", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(stdout.contains("No vaults indexed"), "{stdout}");
+    assert!(
+        stderr.contains("vault 'lostvault'") && stderr.contains("not in the graph"),
+        "brain list must name the dropped vault: {stderr}"
+    );
+    assert!(
+        stderr.contains("nestweaver brain add") && stderr.contains("lostvault --db"),
+        "brain list must print the re-add command: {stderr}"
+    );
+
+    let recovered = status_json();
+    assert_eq!(recovered["vault_count"], 0, "{recovered}");
+    assert_eq!(recovered["repo_count"], 1, "the repo survived: {recovered}");
+    let missing = missing_warnings(&recovered);
+    assert_eq!(missing.len(), 1, "{recovered}");
+    assert_eq!(missing[0]["name"], "lostvault");
+    let action = missing[0]["action"].as_str().unwrap();
+    assert!(
+        action.starts_with("nestweaver brain add ") && action.contains("lostvault"),
+        "{action}"
+    );
+
+    let status_text = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status_text.stdout),
+        String::from_utf8_lossy(&status_text.stderr)
+    );
+    assert!(
+        combined.contains("vault 'lostvault'") && combined.contains("nestweaver brain add"),
+        "brain status text must name the dropped vault and its remedy: {combined}"
+    );
+
+    // Running the remedy clears the disclosure.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let restored = status_json();
+    assert_eq!(restored["vault_count"], 1, "{restored}");
+    assert!(missing_warnings(&restored).is_empty(), "{restored}");
+}
+
+/// nw-602. `index --with-trigrams` must leave `regex-search` answering from
+/// the index — for EVERY shard search would distrust, not only the scopes a
+/// writer enqueued. A shard stamped at a later graph generation than the store
+/// now reports (the `.generation` sidecar went backwards) is in no outbox; the
+/// refresh used to skip it and report success while every search scanned it
+/// and told the user to rerun the very command that had skipped it.
+#[test]
+fn index_with_trigrams_leaves_regex_search_on_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let js = dir.path().join("js");
+    let py = dir.path().join("py");
+    std::fs::create_dir_all(&js).unwrap();
+    std::fs::create_dir_all(&py).unwrap();
+    std::fs::write(js.join("a.js"), "function bomFn() { return 1; }\n").unwrap();
+    std::fs::write(py.join("b.py"), "def py_fn():\n    return 2\n").unwrap();
+
+    let index = |repo: &std::path::Path, trigrams: &str| {
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(repo)
+            .arg("--db")
+            .arg(&db_path)
+            .arg(trigrams)
+            .assert()
+            .success();
+    };
+    let regex = || {
+        let output = nestweaver_cmd()
+            .args(["regex-search", "bomFn", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "regex-search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let assert_on_index = |value: &serde_json::Value, when: &str| {
+        assert_eq!(value["scanned_fallback"], false, "{when}: {value}");
+        assert_eq!(value["stale_index"], false, "{when}: {value}");
+        assert_eq!(value["dirty_scopes"], 0, "{when}: {value}");
+        assert_eq!(value["ready_scopes"], 2, "{when}: {value}");
+    };
+
+    index(&js, "--with-trigrams");
+    index(&py, "--with-trigrams");
+    assert_on_index(&regex(), "after two --with-trigrams indexes");
+
+    // Shards now carry a generation the store no longer reports.
+    std::fs::write(sidecar_path(&db_path, ".generation"), "1").unwrap();
+    let distrusted = regex();
+    assert_eq!(distrusted["dirty_scopes"], 2, "{distrusted}");
+    index(&js, "--with-trigrams");
+    assert_on_index(&regex(), "after --with-trigrams repaired distrusted shards");
+
+    // Counterweight: `--no-trigrams` leaves a changed scope disclosed.
+    std::fs::write(js.join("a.js"), "function bomFn() { return 2; }\n").unwrap();
+    index(&js, "--no-trigrams");
+    let stale = regex();
+    assert_eq!(stale["stale_index"], true, "{stale}");
+    assert_eq!(stale["scanned_fallback"], true, "{stale}");
+    assert_eq!(stale["dirty_scopes"], 1, "{stale}");
+}
+
+/// nw-587 review: with an unreadable registrations sidecar, `brain remove`
+/// of a path the graph does not hold must still be the ordinary not-found
+/// (exit 2), not an error raised by the registration lookup.
+#[test]
+fn brain_remove_with_an_unreadable_registration_sidecar_is_plain_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let repo_dir = dir.path().join("repo");
+    let absent = dir.path().join("absent-vault");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&absent).unwrap();
+    std::fs::write(repo_dir.join("main.js"), "function f() {}\n").unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    std::fs::write(
+        sidecar_path(&db_path, ".vault-registrations.json"),
+        b"{not json",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["brain", "remove"])
+        .arg(&absent)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .code(2)
+        .stdout(contains("No vault found"));
 }

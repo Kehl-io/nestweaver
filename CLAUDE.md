@@ -430,7 +430,8 @@ Sidecar files written alongside the database:
 - `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index). **v3**: the mtime is NANOSECONDS, not seconds — truncating to seconds made same-second edits permanently invisible. Versioned in lockstep with `resolution_cache::CACHE_VERSION`; a stale version is discarded, costing one full re-index rather than risking a mis-classification
 - `<db>.summaries.json` — hierarchical code summaries cache (symbol/file/cluster levels)
 - `<db>.tantivy/` — BM25 full-text search index for notes and sections
-- `<db>.clusters.json` — community/cluster detection output
+- `<db>.clusters.json` — community/cluster detection output; records the `graph_generation` it was computed at, and `clusters` recomputes when the graph has moved on (nw-646)
+- `<db>.vault-registrations.json` — the vaults this database has published, kept outside the graph so a WAL move-aside that drops the vault graph can be disclosed by `brain status` / `brain list` with the `brain add` remedy (nw-587). Deliberately not archived by `backup` (it is evidence about the live DB, not state to restore)
 - `<db>.extensions.json` — user-defined extension properties on nodes
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
 - `<db>.interactions.json` — agent interaction memory (query patterns, access frequency, follow-up signals)

@@ -1349,6 +1349,18 @@ fn index_markdown_since_with_reader_mode(
         &notes_near_size_limit,
     );
     if notes_updated == 0 && notes_deleted == 0 && vault_existed {
+        // nw-587: register on the no-change path too (idempotent, no rewrite
+        // when already recorded), so a vault indexed before registrations
+        // existed is protected by its next refresh rather than its next edit.
+        crate::vault_registration::record_for_store(
+            store,
+            &Vault {
+                uid: v_uid.clone(),
+                name: vault_name.to_string(),
+                root_path: root_str.clone(),
+                instance_id: instance_id.to_string(),
+            },
+        );
         return Ok(MarkdownSinceResult {
             vault_name: vault_name.to_string(),
             files_checked,
@@ -1725,6 +1737,10 @@ fn index_markdown_since_with_reader_mode(
         plan.commit(store, true)?;
         publication.finish(true)?
     };
+    // nw-587: the refresh route registers too (as does its no-change early
+    // return above), so a vault first added by an older binary is recorded on
+    // its next refresh.
+    crate::vault_registration::record_for_store(store, &plan.vault);
 
     // Publication completion reconciles vectors against the committed live graph.
 
@@ -3045,6 +3061,20 @@ where
     }
 
     let publication = graph_publication.finish(true)?;
+    // nw-587: evidence that survives losing the graph's un-checkpointed tail.
+    // Local-directory vaults only: the server-mode path (`record_repo_sha`)
+    // indexes a repo checkout under its URL, which `brain add` cannot re-add.
+    if record_repo_sha.is_none() {
+        crate::vault_registration::record_for_store(
+            store,
+            &Vault {
+                uid: v_uid.clone(),
+                name: vault_name.to_string(),
+                root_path: root_str.clone(),
+                instance_id: instance_id.to_string(),
+            },
+        );
+    }
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -7364,5 +7394,32 @@ mod hardening_inventory_tests {
                 .unwrap()
                 .contains("unavailable")
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_registration_refresh_tests {
+    use super::*;
+
+    /// nw-587 review: a no-change refresh returned before registering, so a
+    /// vault indexed before registrations existed stayed unprotected until
+    /// its content changed.
+    #[test]
+    fn a_no_change_refresh_registers_a_pre_existing_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("n.md"), "# N\n\nbody\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        index_markdown_directory(&vault, &db, "default", "vault").unwrap();
+        // As if indexed by a binary that predates the registrations sidecar.
+        std::fs::remove_file(crate::vault_registration::registrations_path(&db)).unwrap();
+
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let result =
+            index_markdown_directory_since(&vault, &db, "default", "vault", since).unwrap();
+        assert_eq!((result.notes_updated, result.notes_deleted), (0, 0));
+        let registered = crate::vault_registration::registrations(&db).unwrap();
+        assert_eq!(registered.len(), 1, "{registered:?}");
     }
 }

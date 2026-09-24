@@ -9011,6 +9011,40 @@ fn brain_status_warnings_for(
         }));
     }
 
+    // nw-587: vaults the database was asked to hold that the graph no longer
+    // has — what a WAL move-aside costs when the vault publication was in the
+    // lost tail. Without this the status read "Vaults: 0" and nothing else.
+    //
+    // Re-listed rather than reusing `vaults` above: that one is
+    // `unwrap_or_default()`, and a failed read must not report every
+    // registration as lost.
+    if let Some(db_path) = db_path
+        && let Ok(live_vaults) = store.list_vaults(None)
+    {
+        let live = live_vaults
+            .iter()
+            .map(|v| (v.uid.as_str(), v.root_path.as_str()));
+        match nestweaver_engine::vault_registration::missing(db_path, live) {
+            Ok(missing) => warnings.extend(missing.iter().map(|entry| {
+                json!({
+                    "kind": "vault_registration_missing",
+                    "warning": nestweaver_engine::vault_registration::missing_warning(entry),
+                    "action": nestweaver_engine::vault_registration::readd_command(db_path, entry),
+                    "uid": entry.uid,
+                    "name": entry.name,
+                    "root_path": entry.root_path,
+                    "instance_id": entry.instance_id,
+                })
+            })),
+            Err(error) => warnings.push(json!({
+                "kind": "vault_registrations_unreadable",
+                "warning": format!(
+                    "cannot tell whether any registered vault is missing from the graph: {error:#}"
+                ),
+            })),
+        }
+    }
+
     warnings
 }
 
@@ -10799,7 +10833,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -10968,7 +11002,8 @@ fn tool_detect_changes_scoped(
         }));
     }
 
-    let impact = detect_changes_impact(store, &files, 10).context("detect_changes_impact")?;
+    let impact = detect_changes_impact(store, &files, 10, current_db_path(store).ok().as_deref())
+        .context("detect_changes_impact")?;
 
     // Sorted before truncating. `affected_symbols` is built in
     // changed_files x symbols_in_file discovery order with no scoring, so a
@@ -11380,24 +11415,139 @@ fn tool_schema_clusters() -> Value {
                 "cluster_id": {
                     "type": "integer",
                     "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the preview. Use the same resolution as the call that produced the id."
+                },
+                // nw-479. Sibling of `hub_nodes`/`bridge_nodes`'s `repos`: an
+                // optional repo scope so an architecture question about ONE
+                // repo does not have to wade through graph-wide noise (wasm
+                // glue, unrelated services). Unlike `hub_nodes`/`bridge_nodes`
+                // — which rank the GLOBAL graph and then filter rows down to
+                // the scope — this runs Louvain on the repo-INDUCED SUBGRAPH
+                // (see `compute_clusters_scoped`'s doc comment), so cohesion,
+                // key_files and modularity all describe ONLY what the caller
+                // asked about.
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1, "maxLength": MAX_IDENTIFIER_LEN },
+                    // nw-646 review: an empty `repos: []` is a contradiction
+                    // for `compute_clusters_scoped` ("induced by these repos"
+                    // with no repos named) -- the engine already refuses it
+                    // with an untyped anyhow error. `minItems: 1` moves that
+                    // refusal to the SCHEMA, so an empty array is a typed
+                    // JSON-Schema validation failure at the transport, not an
+                    // internal error surfacing from the handler.
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": "Restrict to the repo-INDUCED SUBGRAPH of these repos (names or UIDs): communities are computed from scratch over only these repos' symbols and their internal edges, not filtered post-hoc from the global partition. The response's `scope.id_space` is \"repo_scoped\" — community ids are NOT comparable across different scopes or to an unscoped call, and this result is never written to the clusters sidecar (hub_nodes/bridge_nodes/blast_radius/`cluster <id>` keep reading the unscoped, cached partition). `scope.cross_repo_edges_excluded` counts edges cut by the scope boundary. An unknown repo name is an error, never a silent empty result. Must be non-empty when present — omit the key entirely to run unscoped."
                 }
             }
         }
     })
 }
 
+/// Render one [`nestweaver_engine::CommunityInfo`] as the tool's community
+/// JSON shape, shared by the unscoped and repo-scoped branches of
+/// [`tool_clusters`] so the two populations can never drift in shape (the
+/// class of bug the sibling-gaps rule exists for).
+fn cluster_community_json(
+    c: &nestweaver_engine::CommunityInfo,
+    requested_id: Option<i64>,
+    preview_members: usize,
+) -> Value {
+    // Full membership when a specific cluster is requested (bounded so a giant
+    // cluster can't blow the context window), a caller-sized preview otherwise.
+    const FULL_MEMBER_CAP: usize = 2000;
+    let member_cap = if requested_id.is_some() {
+        FULL_MEMBER_CAP
+    } else if preview_members == 0 {
+        c.members.len()
+    } else {
+        preview_members
+    };
+    let members: Vec<Value> = c
+        .members
+        .iter()
+        .take(member_cap)
+        .map(|m| {
+            json!({
+                "uid": m.uid,
+                "name": m.name,
+                "file_path": m.file_path,
+                // Include kind so the daemon path renders the same
+                // member shape as the CLI direct path (ClusterMember).
+                "kind": m.kind,
+            })
+        })
+        .collect();
+    let members_returned = members.len();
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "size": c.member_count,
+        "cohesion": c.cohesion,
+        "key_files": c.key_files,
+        "members": members,
+        "returned_members": members_returned,
+        "members_truncated": c.members.len() > member_cap,
+    })
+}
+
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
+    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
+    // it, every cluster returns a 20-member preview (`size` still reports the true
+    // count), which made large clusters' membership unretrievable from the tool.
+    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
+    let resolution_arg = args.get("resolution").and_then(|v| v.as_f64());
+
+    // nw-479: an explicit `repos` scope takes a COMPLETELY separate path —
+    // computed on the repo-induced subgraph, never persisted to the clusters
+    // sidecar (a partial-graph partition must never become the last-writer-
+    // wins answer `hub_nodes`/`bridge_nodes`/`blast_radius`/`cluster <id>`
+    // read), and its community ids live in their own `repo_scoped` id space.
+    if let Some(entries) = args.get("repos").and_then(|v| v.as_array()) {
+        let selectors: Vec<String> = bound_identifiers(
+            entries
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            "repos",
+        )?;
+        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)
+            .context("compute_clusters_scoped")?;
+
+        let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
+            .communities
+            .iter()
+            .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
+            .collect();
+        let bounded = Bounded::take(matching, limit)
+            .map(|c| cluster_community_json(c, requested_id, preview_members));
+
+        let symbol_count: usize = scoped.communities.iter().map(|c| c.member_count).sum();
+        let mut payload = json!({
+            "resolution": scoped.resolution,
+            "cluster_count": scoped.communities.len(),
+            "symbol_count": symbol_count,
+            "modularity": scoped.modularity,
+            "limit": limit,
+            "scope": {
+                "repos": scoped.scope.repos,
+                "cross_repo_edges_excluded": scoped.scope.cross_repo_edges_excluded,
+                "id_space": scoped.scope.id_space,
+            },
+        });
+        bounded.merge_into(&mut payload, "clusters");
+        return Ok(payload);
+    }
+
     // F-DC-7: the adaptive default now comes from the engine, so this tool,
     // the `clusters`/`cluster` CLI commands and `summary --level cluster` all
     // partition the graph the same way. They did not: summaries hard-coded
     // resolution 1.0, which put its cluster IDs in a different ID SPACE from
     // the one `cluster <id>` resolves against — 26 of 50 IDs did not resolve.
-    let resolution = args
-        .get("resolution")
-        .and_then(|v| v.as_f64())
-        .unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
-    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
-    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    let resolution =
+        resolution_arg.unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -11407,18 +11557,12 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     // only writes derived cache data to a fixed sidecar path, never graph
     // state, and degrades to warn-only (e.g. on a read-only filesystem).
     if let Ok(db_path) = current_db_path(store)
-        && let Err(e) = nestweaver_engine::save_clusters(&db_path, &output)
+        && let Err(e) =
+            nestweaver_engine::save_clusters(&db_path, &output, store.graph_generation())
     {
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
-    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
-    // it, every cluster returns a 20-member preview (`size` still reports the true
-    // count), which made large clusters' membership unretrievable from the tool.
-    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
-    // Full membership when a specific cluster is requested (bounded so a giant
-    // cluster can't blow the context window), a caller-sized preview otherwise.
-    const FULL_MEMBER_CAP: usize = 2000;
     let matching: Vec<&nestweaver_engine::CommunityInfo> = output
         .communities
         .iter()
@@ -11426,43 +11570,8 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         .collect();
     // Cut BEFORE rendering, and capture the pre-cut total. Rendering the whole
     // corpus for a bounded answer is the other half of this defect class.
-    let bounded = Bounded::take(matching, limit).map(|c| {
-        {
-            let member_cap = if requested_id.is_some() {
-                FULL_MEMBER_CAP
-            } else if preview_members == 0 {
-                c.members.len()
-            } else {
-                preview_members
-            };
-            let members: Vec<Value> = c
-                .members
-                .iter()
-                .take(member_cap)
-                .map(|m| {
-                    json!({
-                        "uid": m.uid,
-                        "name": m.name,
-                        "file_path": m.file_path,
-                        // Include kind so the daemon path renders the same
-                        // member shape as the CLI direct path (ClusterMember).
-                        "kind": m.kind,
-                    })
-                })
-                .collect();
-            let members_returned = members.len();
-            json!({
-                "id": c.id,
-                "name": c.name,
-                "size": c.member_count,
-                "cohesion": c.cohesion,
-                "key_files": c.key_files,
-                "members": members,
-                "returned_members": members_returned,
-                "members_truncated": c.members.len() > member_cap,
-            })
-        }
-    });
+    let bounded = Bounded::take(matching, limit)
+        .map(|c| cluster_community_json(c, requested_id, preview_members));
 
     let symbol_count: usize = output.communities.iter().map(|c| c.member_count).sum();
 
@@ -11475,6 +11584,14 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "symbol_count": symbol_count,
         "modularity": output.modularity,
         "limit": limit,
+        // nw-646 parity: the CLI's `clusters --json` discloses which graph
+        // generation the result came from and whether it was a cache hit
+        // (`no_cli_command_discloses_more_than_its_mcp_twin` forbids the CLI
+        // knowing more than this route). This tool ALWAYS computes fresh
+        // (never reads the sidecar back), so `cached` is always `false` here
+        // — only the CLI's own cache-reuse gate can ever set it `true`.
+        "graph_generation": store.graph_generation(),
+        "cached": false,
     });
     bounded.merge_into(&mut payload, "clusters");
     Ok(payload)
@@ -11638,6 +11755,19 @@ fn tool_stale_check(
         }
 
         results.push(json!({
+            // nw-634: `uid`/`root_path`/`name` were absent from every row,
+            // so a caller who wanted to KNOW which repo a `[stale]` line
+            // named had to round-trip through `list-repos` and join on
+            // `url`. These three are the raw fields `--repo` selectors and
+            // `list-repos` already carry; `display_name` is the SAME
+            // resolver `resolve_repo_selector` / unknown-repo errors use
+            // (`nestweaver_engine::repo_display_name`), not a second naming
+            // rule. `name` stays null when unconfigured rather than being
+            // silently backfilled — see the counterweight test.
+            "uid": repo.uid,
+            "root_path": repo.root_path,
+            "name": repo.name,
+            "display_name": nestweaver_engine::repo_display_name(repo),
             "url": repo.url,
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
@@ -13030,21 +13160,21 @@ fn dead_code_page_arguments(
                 .ok_or_else(|| anyhow!("expected_generation must be an unsigned integer"))?,
         ),
     };
+    // nw-657: a bad TYPE (not a string at all) is still a hard parse error —
+    // the caller sent something `dead_code_page_guard` cannot even name as a
+    // token. A bad SHAPE (a string, wrong length/characters) is deliberately
+    // NOT validated here; it is left to reach `DeadCodePageRequest` and the
+    // shared `dead_code_page_guard` shape check, which both this route and
+    // the direct CLI route call before ever hashing a population, so a
+    // malformed token refuses with `page_token_malformed` (exit 2, naming the
+    // bad token) instead of bailing here as an opaque internal error.
     let page_token = match args.get("page_token") {
         None => None,
-        Some(value) => {
-            let token = value
+        Some(value) => Some(
+            value
                 .as_str()
-                .ok_or_else(|| anyhow!("page_token must be a string"))?;
-            anyhow::ensure!(
-                token.len() == 64
-                    && token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "page_token must contain exactly 64 lowercase hexadecimal characters"
-            );
-            Some(token)
-        }
+                .ok_or_else(|| anyhow!("page_token must be a string"))?,
+        ),
     };
     anyhow::ensure!(
         !args.get("offset").is_some_and(Value::is_null),
@@ -13085,10 +13215,10 @@ mod dead_code_argument_contract_tests {
             json!({"expected_generation": -1}),
             json!({"expected_generation": 1.5}),
             json!({"expected_generation": null}),
+            // A bad TYPE for page_token is still a parse-time error here —
+            // there is no string to hand to the shape check.
             json!({"page_token": 42}),
             json!({"page_token": null}),
-            json!({"page_token": "short"}),
-            json!({"page_token": "G".repeat(64)}),
             json!({"repos": "repo:a"}),
             json!({"repos": ["repo:a", 42]}),
             json!({"repos": null}),
@@ -13099,6 +13229,22 @@ mod dead_code_argument_contract_tests {
             json!({"min_confidence": null}),
         ] {
             assert!(dead_code_page_arguments(&arguments).is_err(), "{arguments}");
+        }
+    }
+
+    /// nw-657: a page_token that IS a string but the wrong shape ("short",
+    /// wrong case) must NOT fail parsing here — this is the seam that used to
+    /// bail with `anyhow::ensure!`, which `tool_dead_code` had no choice but
+    /// to propagate as a raw internal error. It now parses through cleanly;
+    /// `dead_code_page_guard`'s shape check (dead_code.rs) is what refuses it,
+    /// as a structured `page_token_malformed` payload instead.
+    #[test]
+    fn malformed_shape_page_tokens_parse_through_for_the_shared_guard_to_refuse() {
+        for token in ["short", "G".repeat(64).as_str(), ""] {
+            let arguments = json!({"page_token": token});
+            let (request, _selectors) = dead_code_page_arguments(&arguments)
+                .unwrap_or_else(|e| panic!("page_token {token:?} must parse: {e}"));
+            assert_eq!(request.page_token, Some(token));
         }
     }
 
@@ -13113,6 +13259,27 @@ mod dead_code_argument_contract_tests {
         assert_eq!(request.offset, 3);
         assert_eq!(request.min_confidence, DeadCodeConfidence::High);
         assert_eq!(selectors, Some(vec!["repo:a".to_string()]));
+    }
+
+    /// nw-657 end-to-end: through the actual `tool_dead_code` handler (the
+    /// seam the daemon's `dead_code` RPC calls, bypassing the MCP gateway's
+    /// JSON-schema `pattern` gate), a malformed page_token must come back as
+    /// an `Ok` refusal payload — never an `Err` that the CLI can only render
+    /// as exit 1 "Internal error".
+    #[test]
+    fn tool_dead_code_refuses_malformed_page_token_instead_of_erroring() {
+        let store = GraphStore::in_memory().unwrap();
+        let payload = tool_dead_code(&store, json!({ "page_token": "not-hex" }), None, None)
+            .expect("a malformed page_token must be a structured refusal, not an Err");
+        assert_eq!(payload["refused"], true);
+        assert_eq!(payload["reason"], "page_token_malformed");
+        assert!(
+            payload["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not-hex"),
+            "{payload}"
+        );
     }
 
     #[test]
@@ -15850,6 +16017,19 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+/// Like [`arg_root`], but returns `None` when `root` was omitted instead of
+/// defaulting to cwd.
+///
+/// nw-560: `investigate_expand`/`investigate_hydrate` need to tell "omitted"
+/// from "explicit" apart so they can fall back to each symbol's owning-repo
+/// `local_root` (like `read_symbols`) rather than the server's working
+/// directory, while an explicit `root` still wins outright.
+fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
+    args.get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+}
+
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
@@ -15942,7 +16122,7 @@ fn tool_schema_investigate_expand() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id", "targets"]
         }
@@ -15966,9 +16146,9 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
     if targets.is_empty() {
         return Err(anyhow!("'targets' must be a non-empty array"));
     }
-    let root = arg_root(&args);
+    let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_expand(store, &db_path, &root, bundle_id, &targets)?;
+    let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -15982,7 +16162,7 @@ fn tool_schema_investigate_hydrate() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id"]
         }
@@ -16005,9 +16185,9 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root(&args);
+    let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
+    let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -16137,7 +16317,7 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 /// is a gRPC handler in `nestweaver-daemon`, not an entry in either of this
 /// file's dispatch tables, so it could not reach this — and `repo-map`'s entire
 /// output ORDERING is PageRank order (`generate_repo_map` →
-/// `symbols_by_pagerank`), which makes it the sharpest ranking-derived surface
+/// `symbols_by_pagerank`, callable kinds first since nw-645), which makes it the sharpest ranking-derived surface
 /// there is. Exporting the one attacher is what stops the daemon growing a
 /// second, drifting spelling of the same disclosure.
 pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
@@ -20824,6 +21004,142 @@ mod arg_alias_tests {
         assert!(tool_bridge_nodes(&store, json!({ "top_n": 3 }), None).is_ok());
     }
 
+    // ── nw-479: `clusters` gains a `repos` scope ────────────────────────
+
+    fn cluster_scope_store() -> GraphStore {
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        for repo_uid in ["repo-a", "repo-b"] {
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid.to_string(),
+                    url: format!("https://example.test/{repo_uid}"),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let mk = |uid: &str, repo_uid: &str| Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {uid}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for (uid, repo) in [
+            ("a0", "repo-a"),
+            ("a1", "repo-a"),
+            ("b0", "repo-b"),
+            ("b1", "repo-b"),
+        ] {
+            store.insert_symbol(&mk(uid, repo)).unwrap();
+        }
+        for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: dst.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// A `repos` scope must return ONLY the scoped repo's members — never a
+    /// symbol from a repo outside the scope, even though the global partition
+    /// (see `compute_clusters_scoped`'s doc comment) might otherwise merge
+    /// them into one community.
+    #[test]
+    fn tool_clusters_repo_scope_returns_only_the_scoped_repos_members() {
+        let store = cluster_scope_store();
+        let payload = tool_clusters(&store, json!({ "repos": ["repo-a"], "resolution": 1.0 }))
+            .expect("scoped clusters call must succeed");
+
+        assert_eq!(payload["scope"]["id_space"], json!("repo_scoped"));
+        assert_eq!(payload["scope"]["repos"], json!(["repo-a"]));
+        let clusters = payload["clusters"].as_array().expect("clusters array");
+        assert!(!clusters.is_empty(), "{payload}");
+        for cluster in clusters {
+            for member in cluster["members"].as_array().expect("members array") {
+                let uid = member["uid"].as_str().unwrap();
+                assert!(
+                    uid.starts_with('a'),
+                    "a repo-a scoped call must never return a repo-b symbol: {uid}"
+                );
+            }
+        }
+    }
+
+    /// An unknown repo name in `repos` must ERROR, matching `hub_nodes`/
+    /// `bridge_nodes` — never a silently empty scoped result.
+    #[test]
+    fn tool_clusters_rejects_an_unknown_repo_name() {
+        let store = cluster_scope_store();
+        let err = tool_clusters(&store, json!({ "repos": ["no-such-repo"] }))
+            .expect_err("an unknown repo name must not resolve");
+        assert!(
+            format!("{err:#}").contains("no-such-repo"),
+            "the error must name the unresolved selector: {err:#}"
+        );
+        assert!(
+            err.chain().any(|cause| cause
+                .downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+                .is_some()),
+            "must be the typed RepoFilterUnresolved so the CLI/daemon can classify it: {err:#}"
+        );
+    }
+
+    /// COUNTERWEIGHT: omitting `repos` must produce the SAME shape as before
+    /// this change — no `scope` key, unscoped population.
+    #[test]
+    fn tool_clusters_without_repos_is_unscoped_and_unchanged() {
+        let store = cluster_scope_store();
+        let payload =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("unscoped clusters call");
+        assert!(
+            payload.get("scope").is_none(),
+            "an unscoped call must not carry a scope object: {payload}"
+        );
+        let clusters = payload["clusters"].as_array().expect("clusters array");
+        assert!(!clusters.is_empty(), "{payload}");
+    }
+
+    /// nw-646 parity. The CLI's unscoped `clusters --json` discloses
+    /// `graph_generation`/`cached`; this tool must carry the same keys so
+    /// `no_cli_command_discloses_more_than_its_mcp_twin` stays true rather
+    /// than needing a new `KNOWN_GAPS` entry. This tool always computes
+    /// fresh (it never reads the sidecar back), so `cached` is always
+    /// `false` here.
+    #[test]
+    fn tool_clusters_discloses_graph_generation_and_cached_for_cli_parity() {
+        let store = cluster_scope_store();
+        let payload =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("unscoped clusters call");
+        assert_eq!(payload["graph_generation"], json!(store.graph_generation()));
+        assert_eq!(payload["cached"], json!(false));
+    }
+
     #[test]
     fn detect_changes_accepts_changed_files_and_files_alias() {
         let store = GraphStore::in_memory().unwrap();
@@ -20996,7 +21312,9 @@ mod arg_alias_tests {
         )
         .unwrap();
 
-        assert_eq!(result["status"], json!("partial"));
+        // nw-544: the verdict is blast radius's, which also flags this EMPTY
+        // store as `index-empty` (degraded) — never lighter than partial.
+        assert_eq!(result["status"], json!("degraded"));
         assert_eq!(result["gate_state"], json!("degraded-unknown"));
         assert!(
             result["notifications"]
@@ -23026,6 +23344,87 @@ mod stale_check_tool_tests {
         assert_eq!(result["any_stale"], false, "{result}");
     }
 
+    /// nw-634: every row must carry `uid`, `root_path`, and the resolved
+    /// `display_name` — the same identity `repo_display_name` /
+    /// `resolve_repo_selector` already compute for `--repo` and
+    /// unknown-repo errors. Before this test the row had neither field at
+    /// all, so a caller could not tell WHICH repo a `[stale]` line named
+    /// without a second `list-repos` round trip.
+    ///
+    /// Counterweight: a repo with no explicit `name` override must still
+    /// report `name: null` on the row — the URL-derived fallback belongs in
+    /// a separately-named field, not blended into `name` as if it had been
+    /// configured. Mixing the two would make every unnamed repo look
+    /// indistinguishable from a named sibling.
+    #[test]
+    fn stale_check_rows_carry_uid_root_path_and_resolved_display_name() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let named = tempfile::tempdir().unwrap();
+        let named_path = named.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:named".to_string(),
+                url: format!("file://{named_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some("pretty-name".to_string()),
+                root_path: Some(named_path.clone()),
+            })
+            .expect("insert repo");
+
+        let unnamed = tempfile::tempdir().unwrap();
+        let unnamed_path = unnamed.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:unnamed".to_string(),
+                url: format!("file://{unnamed_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(unnamed_path.clone()),
+            })
+            .expect("insert repo");
+
+        let result = tool_stale_check(&store, None).expect("stale check");
+        let rows = result["repos"].as_array().expect("repos array");
+
+        let named_row = rows
+            .iter()
+            .find(|r| r["uid"] == "repo:named")
+            .expect("named row present");
+        assert_eq!(named_row["uid"], "repo:named", "{result}");
+        assert_eq!(named_row["root_path"], named_path, "{result}");
+        assert_eq!(named_row["name"], "pretty-name", "{result}");
+        assert_eq!(named_row["display_name"], "pretty-name", "{result}");
+
+        let unnamed_row = rows
+            .iter()
+            .find(|r| r["uid"] == "repo:unnamed")
+            .expect("unnamed row present");
+        assert_eq!(unnamed_row["uid"], "repo:unnamed", "{result}");
+        assert_eq!(unnamed_row["root_path"], unnamed_path, "{result}");
+        assert!(
+            unnamed_row["name"].is_null(),
+            "an unconfigured repo must keep name: null rather than being \
+             silently backfilled with the URL-derived fallback: {result}"
+        );
+        assert_eq!(
+            unnamed_row["display_name"],
+            nestweaver_engine::repo_display_name(&nestweaver_schema::Repo {
+                uid: "repo:unnamed".to_string(),
+                url: format!("file://{unnamed_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(unnamed_path.clone()),
+            }),
+            "{result}"
+        );
+    }
+
     /// The same repo, but with a NONZERO stored staleness counter — the case
     /// the test above missed by pinning only `staleness_commits_behind: 0`.
     ///
@@ -23819,6 +24218,24 @@ mod cluster_flag_forwarding_precondition_tests {
             validate_tool_arguments("clusters", &json!({ "members": 500 })).is_err(),
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
+        );
+    }
+
+    /// nw-646 review. `repos: []` is a contradiction for `compute_clusters_
+    /// scoped` ("induced by these repos" naming none) — the schema's
+    /// `minItems: 1` must refuse it at validation, before the handler ever
+    /// sees it and has to raise an untyped anyhow error instead.
+    #[test]
+    fn the_tool_rejects_an_empty_repos_array() {
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "repos": [] })).is_err(),
+            "an empty `repos` array must fail schema validation, not reach \
+             compute_clusters_scoped's own (untyped) empty-selector refusal"
+        );
+        // COUNTERWEIGHT: a non-empty `repos` array is still valid.
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "repos": ["repo-a"] })).is_ok(),
+            "a non-empty repos array must still validate"
         );
     }
 }

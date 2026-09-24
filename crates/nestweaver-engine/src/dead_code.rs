@@ -212,6 +212,65 @@ pub fn dead_code_page_refusal(reason: &str) -> serde_json::Value {
     })
 }
 
+/// A page token is a lowercase-hex SHA-256 digest ([`serialize_dead_code_page`]
+/// hashes the bound population into exactly this shape). Anything else —
+/// wrong length, uppercase, non-hex characters — cannot be a token this
+/// database ever issued, and is a shape problem, not a "page moved" problem.
+///
+/// `pub` so the CLI (`src/main.rs`'s `Commands::DeadCode` handler) can check
+/// shape BEFORE choosing the daemon or direct route, and refuse locally with
+/// exit 2 rather than ever sending a malformed token to the daemon's `dead_code`
+/// RPC — that RPC dispatches through the MCP tool's JSON schema
+/// (`page_token` is `minLength`/`maxLength: 64` + a hex `pattern`), which is
+/// deliberately kept strict so external MCP clients get a visible,
+/// standards-shaped `-32602 invalid params`. This function stays the single
+/// source of truth for "well-formed" on both sides of that boundary.
+pub fn is_well_formed_page_token(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// nw-657: cap what a malformed token echoes back. Both callers that reach
+/// this today (the CLI's pre-check in `src/main.rs`, ahead of any schema; and
+/// [`dead_code_page_guard`] as defense in depth for any other direct caller
+/// of the engine, e.g. a future embedder with no schema layer at all) may
+/// hand this an unbounded string, so it must never be echoed verbatim into
+/// the refusal payload.
+fn describe_malformed_page_token(token: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 128;
+    let char_count = token.chars().count();
+    if char_count > MAX_ECHO_CHARS {
+        let truncated: String = token.chars().take(MAX_ECHO_CHARS).collect();
+        format!("{truncated}... ({char_count} chars total)")
+    } else {
+        token.to_string()
+    }
+}
+
+/// nw-657: a malformed page_token (right JSON type, wrong shape) used to
+/// reach the MCP handler's `anyhow::ensure!` and bail as a hard error —
+/// exit 1 "Internal error" on the CLI, indistinguishable from a real bug, and
+/// contradicting the documented exit-2 contract that a well-formed-but-wrong
+/// token already gets from `page_population_or_database_changed` below. This
+/// is that same contract, naming the bad token, for the shape check instead
+/// of the value check.
+///
+/// `pub`: the CLI builds this same payload directly (see
+/// [`is_well_formed_page_token`]'s doc) rather than routing a malformed token
+/// through the daemon/MCP schema at all.
+pub fn dead_code_page_malformed_token_refusal(token: &str) -> serde_json::Value {
+    let mut payload = dead_code_page_refusal("page_token_malformed");
+    payload["note"] = serde_json::json!(format!(
+        "page_token {:?} is not a valid page token: expected exactly 64 lowercase \
+         hexadecimal characters (0-9, a-f). Start a fresh page at offset 0 without a \
+         page_token instead of guessing one.",
+        describe_malformed_page_token(token)
+    ));
+    payload
+}
+
 /// Check both before and after computation; an open publication cannot
 /// support a reproducible result page, even when its generation is unchanged.
 pub fn dead_code_page_guard(
@@ -233,6 +292,16 @@ fn dead_code_page_state_refusal(
     publication_dirty: bool,
     request: &DeadCodePageRequest<'_>,
 ) -> Option<serde_json::Value> {
+    // Shape-check first, ahead of every other reason below: a malformed token
+    // cannot be trusted to reason about staleness or continuation either, and
+    // both the MCP/daemon route (`tool_dead_code`) and the direct CLI route
+    // (which builds its request without calling `dead_code_page_arguments`)
+    // share this one guard, so they refuse it identically.
+    if let Some(token) = request.page_token
+        && !is_well_formed_page_token(token)
+    {
+        return Some(dead_code_page_malformed_token_refusal(token));
+    }
     let reason = if publication_dirty {
         Some("publication_in_progress")
     } else if generation != current_generation
@@ -1265,6 +1334,66 @@ mod page_contract_tests {
             assert!(refusal.get("unreachable_symbols").is_none());
         }
         assert!(dead_code_page_state_refusal(42, 42, false, &first_request()).is_none());
+    }
+
+    /// nw-657: a malformed page_token (right shape of value, wrong contents —
+    /// not the well-formed-but-mismatched case covered elsewhere) must refuse
+    /// through the same `refused: true` contract as every other page-state
+    /// reason, naming the bad token, instead of reaching a hash comparison or
+    /// bubbling up as an internal error.
+    #[test]
+    fn malformed_page_token_refuses_by_shape_before_any_other_check() {
+        for bad_token in [
+            "short",
+            &"G".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(65),
+            "",
+        ] {
+            let request = DeadCodePageRequest {
+                page_token: Some(bad_token),
+                ..first_request()
+            };
+            // Even a generation/publication state that would otherwise pass
+            // clean must still refuse on the malformed shape first.
+            let refusal = dead_code_page_state_refusal(42, 42, false, &request).unwrap();
+            assert_eq!(refusal["refused"], true);
+            assert_eq!(refusal["reason"], "page_token_malformed");
+            let note = refusal["note"].as_str().unwrap_or_default();
+            assert!(
+                note.contains(bad_token) || bad_token.is_empty(),
+                "the refusal note must name the bad token: {note}"
+            );
+        }
+    }
+
+    /// Counterweight: a well-formed 64-char lowercase-hex token that simply
+    /// does not match this population still reaches the VALUE check
+    /// (`page_population_or_database_changed`), not the shape check — valid
+    /// paging is unaffected by the new guard.
+    #[test]
+    fn well_formed_page_token_is_not_treated_as_malformed() {
+        let token = "a".repeat(64);
+        let request = DeadCodePageRequest {
+            page_token: Some(&token),
+            ..first_request()
+        };
+        assert!(dead_code_page_state_refusal(42, 42, false, &request).is_none());
+        let result = population();
+        let refused = serialize_dead_code_page(&result, None, &request, 42, "db:a").unwrap();
+        assert_eq!(refused["refused"], true);
+        assert_eq!(refused["reason"], "page_population_or_database_changed");
+    }
+
+    #[test]
+    fn malformed_page_token_echo_is_bounded() {
+        let huge = "z".repeat(10_000);
+        let described = describe_malformed_page_token(&huge);
+        assert!(
+            described.len() < huge.len(),
+            "an oversized token must not be echoed back verbatim"
+        );
+        assert!(described.contains("10000 chars total"));
     }
 
     #[test]

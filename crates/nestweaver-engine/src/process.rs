@@ -302,27 +302,54 @@ fn derive_process_name(entry_point: &nestweaver_schema::Symbol) -> String {
 ///    that overlap the affected set, but without the O(all-entry-points × BFS)
 ///    scan that made this hang on a large store.
 /// 3. Cross-references to find which processes contain affected symbols.
-/// 4. Assigns a risk level: High (>3 processes), Medium (1-3), Low (0).
+/// 4. Takes `risk` and `gate_state` from [`crate::blast_radius::analyze_blast_radius`]
+///    over the same files at its default options (see [`adopt_blast_verdict`]).
+///
+/// `db_path` locates the cluster and co-change sidecars that blast radius reads;
+/// pass the same path the `blast_radius` route would, or the two verdicts can
+/// differ by the cluster-count risk boost.
 pub fn detect_changes_impact(
     store: &GraphStore,
     changed_files: &[String],
     max_depth: u32,
+    db_path: Option<&std::path::Path>,
 ) -> Result<ChangeImpact> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    detect_changes_impact_until(store, changed_files, max_depth, deadline)
+    detect_changes_impact_until(store, changed_files, max_depth, db_path, deadline)
 }
 
 fn detect_changes_impact_until(
     store: &GraphStore,
     changed_files: &[String],
     max_depth: u32,
+    db_path: Option<&std::path::Path>,
     deadline: std::time::Instant,
 ) -> Result<ChangeImpact> {
     // Validate before entering the timed operation so expiry never turns an
     // invalid/empty request into a successful partial response.
-    crate::changed_files::require_changed_files(changed_files)?;
+    let paths: Vec<std::path::PathBuf> =
+        crate::changed_files::require_changed_files(changed_files)?
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
     let result = store.with_read_deadline(deadline, || {
-        detect_changes_impact_with_work_budget(store, changed_files, max_depth, 2_000_000, deadline)
+        let mut impact = detect_changes_impact_with_work_budget(
+            store,
+            changed_files,
+            max_depth,
+            2_000_000,
+            deadline,
+        )?;
+        let verdict = crate::blast_radius::analyze_blast_radius(
+            store,
+            &paths,
+            &crate::blast_radius::BlastRadiusOptions::default(),
+            None,
+            db_path,
+        )
+        .context("blast radius verdict for change impact")?;
+        adopt_blast_verdict(&mut impact, &verdict);
+        Ok(impact)
     });
     match result {
         Ok(mut result) if std::time::Instant::now() >= deadline => {
@@ -355,6 +382,45 @@ fn detect_changes_impact_until(
         }),
         other => other,
     }
+}
+
+/// nw-544: `detect-changes` and `blast-radius` are two views of ONE question —
+/// "how risky is this change set?" — and CI gates are built on either. They
+/// used to answer it with two unrelated bucketings (affected-process count
+/// here; affected-symbol count + centrality + clusters there), so the same
+/// files read `high / risk-flagged` from one and `low / ok` from the other.
+/// Per the sibling-gaps rule the verdict is now computed ONCE, by blast radius,
+/// and copied here rather than re-derived; the process list stays as detail.
+///
+/// * `risk` is blast radius's `risk_level`, verbatim.
+/// * `status` is the worse of the two analyses, and blast radius's
+///   notifications are merged in (deduplicated), so every input the verdict
+///   depended on is disclosed.
+/// * `gate_state` is blast radius's, except that an incomplete PROCESS
+///   analysis (work budget, unreadable symbol rows, unassessed files) forces
+///   `DegradedUnknown`: this report may never read safer than its own
+///   evidence. On every path where both analyses finish, the two gates agree.
+fn adopt_blast_verdict(
+    impact: &mut ChangeImpact,
+    verdict: &crate::blast_radius::BlastRadiusResult,
+) {
+    let process_status = impact.status;
+    impact.risk = verdict.risk_level;
+    impact.status = impact.status.max(verdict.status);
+    for notification in &verdict.notifications {
+        let already = impact.notifications.iter().any(|existing| {
+            existing.descriptor == notification.descriptor
+                && existing.message == notification.message
+        });
+        if !already {
+            impact.notifications.push(notification.clone());
+        }
+    }
+    impact.gate_state = if process_status == AnalysisStatus::Complete {
+        verdict.gate_state
+    } else {
+        GateState::DegradedUnknown
+    };
 }
 
 fn deadline_notification() -> Notification {
@@ -428,12 +494,12 @@ fn detect_changes_impact_with_work_budget(
     }
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
-        // nw-472: a missing/unindexed source is not a confident Low finding.
-        // Explicitly classified Markdown documentation stays Complete + Low.
-        let risk = crate::blast_radius::risk_if_unassessed(RiskLevel::Low, &notifications);
+        // Risk is assigned by `adopt_blast_verdict` (nw-544); Unknown until
+        // then so this leg can never be mistaken for a verdict on its own.
         // Traversal has not started, so any non-Complete status here reflects
         // drift, an undecodable row, or resolver staleness. The outer deadline
         // guard independently discloses an expired planning budget.
+        let risk = RiskLevel::Unknown;
         let gate_state = crate::blast_radius::derive_gate_state(status, risk, false);
         return Ok(ChangeImpact {
             affected_symbols,
@@ -583,17 +649,9 @@ fn detect_changes_impact_with_work_budget(
         });
     }
 
-    // Step 4: risk level. nw-472: a mixed change set — some files assessed,
-    // others with no indexed symbols — must not report a confident Low for the
-    // part it never looked at, exactly like the all-unassessed early out above.
-    let risk = crate::blast_radius::risk_if_unassessed(
-        match affected_processes.len() {
-            0 => RiskLevel::Low,
-            1..=3 => RiskLevel::Medium,
-            _ => RiskLevel::High,
-        },
-        &notifications,
-    );
+    // Step 4: risk is NOT bucketed from the process count any more — nw-544
+    // made it blast radius's verdict, assigned by `adopt_blast_verdict`.
+    let risk = RiskLevel::Unknown;
 
     let blast_radius = affected_symbols.len() + affected_processes.len();
     // A bounded partial traversal is distinct from independent graph degradation.
@@ -626,6 +684,7 @@ mod tests {
             &store,
             &["src/file.rs".into()],
             10,
+            None,
             std::time::Instant::now(),
         )
         .unwrap();
@@ -634,7 +693,9 @@ mod tests {
         assert_eq!(result.gate_state, GateState::DegradedUnknown);
         assert!(!result.notifications.is_empty());
         assert_eq!(store.count_symbols().unwrap(), 0);
-        assert!(detect_changes_impact_until(&store, &[], 10, std::time::Instant::now()).is_err());
+        assert!(
+            detect_changes_impact_until(&store, &[], 10, None, std::time::Instant::now()).is_err()
+        );
     }
 
     #[test]
@@ -684,11 +745,13 @@ mod tests {
                     .unwrap();
             }
         }
-        let complete = detect_changes_impact(&store, &files, 10).unwrap();
+        let complete = detect_changes_impact(&store, &files, 10, None).unwrap();
         assert_eq!(complete.affected_symbols.len(), 56);
         assert_eq!(complete.affected_processes.len(), 56);
         assert!(!complete.work_budget_exceeded);
-        assert_eq!(complete.status, AnalysisStatus::Complete);
+        // nw-544: `status` now also carries blast radius's depth-bounded
+        // `partial`; the process leg finishing is what keeps the gate `ok`.
+        assert_eq!(complete.gate_state, GateState::Ok);
         let limited = detect_changes_impact_with_work_budget(
             &store,
             &files,
@@ -751,8 +814,9 @@ mod tests {
             "unknown.input",
             "src/計算.rs",
         ] {
-            let impact = detect_changes_impact(&store, &[file.into()], 10).unwrap();
-            assert_eq!(impact.status, AnalysisStatus::Partial, "{file}");
+            let impact = detect_changes_impact(&store, &[file.into()], 10, None).unwrap();
+            // Degraded on this EMPTY store (blast radius's `index-empty`).
+            assert!(impact.status >= AnalysisStatus::Partial, "{file}");
             assert_eq!(impact.risk, RiskLevel::Unknown, "{file}");
             assert_eq!(impact.gate_state, GateState::DegradedUnknown, "{file}");
         }
@@ -761,10 +825,11 @@ mod tests {
     #[test]
     fn detect_changes_impact_marks_unknown_source_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");
-        let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
         assert_eq!(impact.risk, RiskLevel::Unknown);
-        assert_eq!(impact.status, AnalysisStatus::Partial);
+        // nw-544: the empty store also trips blast radius's `index-empty`.
+        assert_eq!(impact.status, AnalysisStatus::Degraded);
         assert_eq!(impact.gate_state, GateState::DegradedUnknown);
         assert!(
             impact
@@ -779,7 +844,7 @@ mod tests {
     #[test]
     fn detect_changes_impact_explicitly_excludes_documentation() {
         let store = GraphStore::in_memory().expect("in_memory store");
-        let impact = detect_changes_impact(&store, &["README.md".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["README.md".to_string()], 10, None)
             .expect("detect_changes_impact");
 
         assert!(
@@ -854,6 +919,7 @@ mod tests {
             &store,
             &["src/lib.rs".to_string(), "src/missing.rs".to_string()],
             10,
+            None,
         )
         .expect("detect_changes_impact");
         assert!(
@@ -872,7 +938,7 @@ mod tests {
 
         // COUNTERWEIGHT: the same assessed file alone is a confident Low, so
         // the assertion above cannot pass by marking every change Unknown.
-        let assessed_only = detect_changes_impact(&store, &["src/lib.rs".to_string()], 10)
+        let assessed_only = detect_changes_impact(&store, &["src/lib.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
         assert_eq!(assessed_only.risk, RiskLevel::Low);
         assert_ne!(assessed_only.gate_state, GateState::DegradedUnknown);
@@ -1009,10 +1075,12 @@ mod tests {
             })
             .expect("insert edge");
 
-        let impact = detect_changes_impact(&store, &["src/lib.rs".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["src/lib.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
 
-        assert_eq!(impact.risk, RiskLevel::Medium);
+        // nw-544: one affected process no longer buckets to Medium; risk is
+        // blast radius's verdict (one dependent symbol → Low).
+        assert_eq!(impact.risk, RiskLevel::Low);
         assert!(!impact.affected_symbols.is_empty());
         assert!(impact.affected_symbols.iter().any(|s| s.name == "helper"),);
         assert!(!impact.affected_processes.is_empty());
@@ -1073,7 +1141,7 @@ mod tests {
                 .unwrap();
         }
 
-        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
 
         // Exactly one affected process — the one rooted at entryA that reaches
@@ -1157,7 +1225,7 @@ mod tests {
                 .unwrap();
         }
 
-        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
 
         assert_ne!(
@@ -1221,7 +1289,7 @@ mod tests {
             })
             .unwrap();
 
-        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10, None)
             .expect("detect_changes_impact");
         assert_eq!(impact.status, AnalysisStatus::Complete);
         assert_eq!(impact.gate_state, GateState::Ok);
@@ -1231,5 +1299,118 @@ mod tests {
                 .iter()
                 .any(|n| n.descriptor == "store.list-symbols-incomplete")
         );
+    }
+
+    /// nw-544: `detect-changes` and `blast-radius` must not disagree about the
+    /// SAME changed files. They used to bucket risk by two unrelated measures
+    /// (affected-process count vs affected-symbol count + centrality + clusters),
+    /// so a CI gate built on one read green where the other read red. The
+    /// fixture is the item's: an unindexed `Makefile` plus `src/a.js`, whose
+    /// one function is called by five root callers (five processes — `High`
+    /// under the old process bucketing, while blast-radius counts five
+    /// affected symbols).
+    #[test]
+    fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
+        use crate::blast_radius::{BlastRadiusOptions, analyze_blast_radius};
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".into(),
+                url: "file:///fixture".into(),
+                indexed_sha: "local".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .expect("insert repo");
+        let function = |uid: &str, name: &str, file_path: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("function {name}()"),
+            summary: None,
+            content_hash: format!("h-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&function("sym:target", "target", "src/a.js"))
+            .expect("insert target");
+        for n in 0..5 {
+            let uid = format!("sym:caller{n}");
+            store
+                .insert_symbol(&function(&uid, &format!("caller{n}"), "src/callers.js"))
+                .expect("insert caller");
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "sym:target".into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .expect("insert edge");
+        }
+        // Counterweight fixture: a leaf with no callers and no callees.
+        store
+            .insert_symbol(&function("sym:leaf", "leafHelper", "src/leaf.js"))
+            .expect("insert leaf");
+
+        let cases: [&[&str]; 4] = [
+            &["Makefile", "src/a.js"],
+            &["src/a.js"],
+            &["Makefile"],
+            &["src/leaf.js"],
+        ];
+        for files in cases {
+            let strings: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+            let paths: Vec<std::path::PathBuf> =
+                files.iter().map(std::path::PathBuf::from).collect();
+            let detect = detect_changes_impact(&store, &strings, 10, None).expect("detect");
+            let blast =
+                analyze_blast_radius(&store, &paths, &BlastRadiusOptions::default(), None, None)
+                    .expect("blast");
+            assert_eq!(
+                detect.risk, blast.risk_level,
+                "{files:?}: detect-changes risk must equal blast-radius risk"
+            );
+            assert_eq!(
+                detect.gate_state, blast.gate_state,
+                "{files:?}: detect-changes gate must equal blast-radius gate"
+            );
+            if files.contains(&"Makefile") {
+                // An unindexed Makefile must never read as a confident green.
+                assert_ne!(detect.gate_state, GateState::Ok, "{files:?}");
+                assert_ne!(detect.risk, RiskLevel::Low, "{files:?}");
+                assert!(
+                    detect
+                        .notifications
+                        .iter()
+                        .any(|n| n.descriptor == "changed-file-unassessed"),
+                    "{files:?}: {:?}",
+                    detect.notifications
+                );
+            }
+        }
+
+        // COUNTERWEIGHT: a genuinely low-risk change still reads low and ok in
+        // both, so agreement cannot be bought by escalating everything.
+        let leaf = detect_changes_impact(&store, &["src/leaf.js".into()], 10, None).expect("leaf");
+        assert_eq!(leaf.risk, RiskLevel::Low);
+        assert_eq!(leaf.gate_state, GateState::Ok);
     }
 }
