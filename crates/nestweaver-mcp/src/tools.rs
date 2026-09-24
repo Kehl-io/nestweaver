@@ -15647,6 +15647,41 @@ where
     Ok((message, terminal))
 }
 
+/// The `brain_add_source` payload for a vault the daemon indexed, from its
+/// terminal progress. A function rather than an inline literal so the
+/// payload's contract (nw-585's `frontmatter_unparsed` beside the coverage
+/// fields) is testable without a live daemon.
+#[cfg(feature = "daemon")]
+fn vault_add_source_payload(
+    path: &str,
+    last_msg: String,
+    terminal: Option<&nestweaver_proto::IndexProgress>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "indexed",
+        "path": path,
+        "type": "vault",
+        "message": last_msg,
+        "exclusion_inventory": terminal.and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
+        "coverage_status": terminal.map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
+        "skipped_count": terminal.map_or(0, |progress| progress.skipped_count),
+        "skipped_files": terminal.map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
+            "path": file.path,
+            "reason_code": file.reason_code,
+            "detail": file.detail,
+            "observed_bytes": file.observed_bytes,
+            "limit_bytes": file.limit_bytes,
+        })).collect::<Vec<_>>()).unwrap_or_default(),
+        // nw-585: indexed WITHOUT their frontmatter (unparsable YAML);
+        // not skipped, so not counted in `skipped_count`.
+        "frontmatter_unparsed": terminal.map(|progress| progress.frontmatter_unparsed.iter().map(|file| serde_json::json!({
+            "path": file.path,
+            "reason_code": file.reason_code,
+            "detail": file.detail,
+        })).collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
 /// Heuristic vault detector for `brain_add_source`: true when markdown files are
 /// the majority of the "content" files in a bounded shallow scan of `dir`. Used
 /// to distinguish a notes vault from a code directory so a code dir without a
@@ -15787,22 +15822,7 @@ fn dispatch_add_source_via_daemon(
                 .into_inner();
             let (last_msg, terminal) =
                 consume_daemon_index_progress_detailed(DaemonIndexSource::Vault, stream).await?;
-            Ok(serde_json::json!({
-                "status": "indexed",
-                "path": path,
-                "type": "vault",
-                "message": last_msg,
-                "exclusion_inventory": terminal.as_ref().and_then(|progress| progress.exclusion_inventory.as_ref()).map(nestweaver_proto::exclusion_inventory_json),
-                "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
-                "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
-                "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
-                    "path": file.path,
-                    "reason_code": file.reason_code,
-                    "detail": file.detail,
-                    "observed_bytes": file.observed_bytes,
-                    "limit_bytes": file.limit_bytes,
-                })).collect::<Vec<_>>()).unwrap_or_default(),
-            }))
+            Ok(vault_add_source_payload(&path, last_msg, terminal.as_ref()))
         } else {
             let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
                 repo_path: path.clone(),
@@ -15911,6 +15931,39 @@ mod daemon_index_progress_tests {
         set_current_instance_config(Some(std::sync::Arc::new(cfg)));
         assert_eq!(resolve_add_source_instance_id(), "cfg-instance");
         set_current_instance_config(None);
+    }
+
+    /// nw-585: a vault note indexed without its frontmatter reaches the
+    /// `brain_add_source` JSON with its reason, while coverage stays
+    /// `complete` and `skipped_count` 0 -- it was indexed, not skipped. The
+    /// original report was exactly a clean-looking add.
+    #[test]
+    fn vault_add_source_payload_discloses_notes_indexed_without_frontmatter() {
+        let terminal = IndexProgress {
+            phase: Phase::Done as i32,
+            coverage_status: nestweaver_proto::CoverageStatus::Complete as i32,
+            frontmatter_unparsed: vec![nestweaver_proto::IndexSkipDetail {
+                path: "Broken.md".to_string(),
+                reason_code: "parse_error".to_string(),
+                detail: "frontmatter could not be parsed; indexed without frontmatter".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = vault_add_source_payload("/v", "done".to_string(), Some(&terminal));
+        assert_eq!(payload["coverage_status"], serde_json::json!("complete"));
+        assert_eq!(payload["skipped_count"], serde_json::json!(0));
+        assert_eq!(
+            payload["frontmatter_unparsed"][0]["path"],
+            serde_json::json!("Broken.md")
+        );
+        assert!(
+            payload["frontmatter_unparsed"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("frontmatter could not be parsed"),
+            "{payload}"
+        );
     }
 
     #[tokio::test]

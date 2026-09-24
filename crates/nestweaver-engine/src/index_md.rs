@@ -68,6 +68,10 @@ pub struct MarkdownIndexResult {
     /// Distinct (source note, target) — what `broken-links` / `doc-stats` show.
     pub unresolved_link_targets: usize,
     pub skipped: Vec<SkippedFile>,
+    /// nw-585: notes this run indexed WITHOUT their frontmatter because the
+    /// YAML would not parse (vault-relative). Not in `skipped`: they were
+    /// indexed, and a skip row would mark the vault's coverage degraded.
+    pub frontmatter_unparsed: Vec<SkippedFile>,
 }
 
 /// Full-refresh outcome with the committed cascade count. Kept separate from
@@ -133,6 +137,10 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
             summary.push_str(&format!("\n  {} - {}", sf.path, sf.reason));
         }
     }
+    if let Some(unparsed) = frontmatter_unparsed_summary(&result.index.frontmatter_unparsed) {
+        summary.push('\n');
+        summary.push_str(&unparsed);
+    }
     if !result.notes_near_size_limit.is_empty() {
         summary.push_str(&format!(
             "\nNotes approaching the size limit ({}):",
@@ -143,6 +151,24 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
         }
     }
     summary
+}
+
+/// nw-585: the per-run disclosure of notes indexed without their frontmatter,
+/// in the `  {path} - {reason}` shape the skip list uses, or `None` when there
+/// are none. ONE spelling for every vault route's output (the full-refresh
+/// summary, the `--since` messages, direct `brain add`).
+pub fn frontmatter_unparsed_summary(rows: &[SkippedFile]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut summary = format!(
+        "Indexed without frontmatter (unparsable YAML): {}",
+        rows.len()
+    );
+    for row in rows {
+        summary.push_str(&format!("\n  {} - {}", row.path, row.reason));
+    }
+    Some(summary)
 }
 
 /// Directory names skipped when walking a vault.
@@ -3340,6 +3366,7 @@ where
                 unresolved_link_section_targets: since.unresolved_link_section_targets,
                 unresolved_link_targets: since.unresolved_link_targets,
                 skipped: since.skipped,
+                frontmatter_unparsed: since.frontmatter_unparsed,
             },
             notes_deleted: since.notes_removed,
             publication: since.publication,
@@ -4034,6 +4061,7 @@ where
             unresolved_link_section_targets,
             unresolved_link_targets,
             skipped,
+            frontmatter_unparsed,
         },
         notes_deleted,
         publication,
@@ -5811,6 +5839,13 @@ mod tests {
             "the note was indexed, so vault coverage is not degraded: {:?}",
             result.skipped
         );
+        // The per-run result says so too (`brain add` printed a clean run).
+        let paths: Vec<&str> = result
+            .frontmatter_unparsed
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["Broken.md"], "per-run disclosure");
         let status = || skipped_notes_status_json(Some(&db)).0;
         let disclosed = status();
         assert_eq!(
@@ -5880,7 +5915,7 @@ mod tests {
 
         // Broken on the --since route: disclosed there too.
         fs::write(root.join("Ok.md"), BROKEN).unwrap();
-        index_markdown_directory_since(
+        let since = index_markdown_directory_since(
             &root,
             &db,
             "default",
@@ -5888,6 +5923,18 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         )
         .unwrap();
+        let paths: Vec<&str> = since
+            .frontmatter_unparsed
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["Ok.md"], "per-run disclosure on --since");
+        let summary = frontmatter_unparsed_summary(&since.frontmatter_unparsed).unwrap_or_default();
+        assert!(
+            summary.contains("Indexed without frontmatter (unparsable YAML): 1")
+                && summary.contains("Ok.md - frontmatter could not be parsed"),
+            "{summary}"
+        );
         let disclosed = status();
         assert_eq!(
             disclosed["frontmatter_unparsed"],
@@ -5918,6 +5965,34 @@ mod tests {
             "{}",
             status()
         );
+    }
+
+    /// nw-585: `brain refresh` (both routes) and the daemon's `brain add`
+    /// print this shared summary, so it carries the per-run disclosure.
+    #[test]
+    fn refresh_summary_lists_notes_indexed_without_frontmatter() {
+        let (_dir, root) = make_vault(&[
+            ("Broken.md", "---\ntags: [x\n---\n# Broken\n"),
+            ("Ok.md", "# Ok\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        let summary = format_markdown_refresh_summary(&result);
+        assert!(
+            summary.contains("Indexed without frontmatter (unparsable YAML): 1")
+                && summary.contains("Broken.md - frontmatter could not be parsed"),
+            "{summary}"
+        );
+        // COUNTERWEIGHT: not reported as a coverage gap.
+        assert!(!summary.contains("Coverage DEGRADED"), "{summary}");
     }
 
     /// nw-585: the sidecar is rewritten by many writers (watcher debt, code

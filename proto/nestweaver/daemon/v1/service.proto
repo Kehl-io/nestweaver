@@ -181,6 +181,10 @@ message IndexProgress {
   CoverageStatus coverage_status = 8;
   TrigramRefreshDetail trigram_refresh = 9;
   ExclusionInventory exclusion_inventory = 10;
+  // nw-585: vault notes this run indexed WITHOUT their frontmatter because the
+  // YAML would not parse. Not in `skipped_files`/`skipped_count`: they were
+  // indexed, and coverage stays complete. Empty for repos and older daemons.
+  repeated IndexSkipDetail frontmatter_unparsed = 11;
 }
 
 message ExclusionInventory {

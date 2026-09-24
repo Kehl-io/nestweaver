@@ -7381,6 +7381,7 @@ impl NestWeaverDaemon for DaemonService {
                         CoverageStatus::Degraded as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: Vec::new(),
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} files, {} symbols{}",
@@ -7422,6 +7423,7 @@ impl NestWeaverDaemon for DaemonService {
                     // truncated failure.
                     if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
                         let _ = tx.blocking_send(Ok(IndexProgress {
+                            frontmatter_unparsed: Vec::new(),
                             phase: Phase::Done as i32,
                             message: index_done_message(
                                 result.files_count,
@@ -7563,6 +7565,7 @@ impl NestWeaverDaemon for DaemonService {
                     // and the committed-after-cancel variant must say so
                     // plainly rather than claim a clean `Done`.
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: Vec::new(),
                         phase: Phase::Done as i32,
                         message: index_done_message(
                             result.files_count,
@@ -7667,6 +7670,10 @@ impl NestWeaverDaemon for DaemonService {
             match index_result {
                 Ok(result) => {
                     let skipped_files = index_skip_details(&result.index.skipped);
+                    // nw-585: indexed without frontmatter -- disclosed, but
+                    // not a skip and not a coverage gap.
+                    let frontmatter_unparsed =
+                        index_skip_details(&result.index.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
                     let coverage_status = if skipped_count == 0 {
                         CoverageStatus::Complete as i32
@@ -7674,6 +7681,7 @@ impl NestWeaverDaemon for DaemonService {
                         CoverageStatus::Degraded as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} notes, {} headings, {} sections",
@@ -7720,6 +7728,7 @@ impl NestWeaverDaemon for DaemonService {
                         degraded_graph_publication_message("IndexVault", &result.publication)
                     {
                         let _ = tx.blocking_send(Ok(IndexProgress {
+                            frontmatter_unparsed: frontmatter_unparsed.clone(),
                             phase: Phase::Error as i32,
                             message,
                             files_processed: result.index.notes_count as u64,
@@ -7744,6 +7753,7 @@ impl NestWeaverDaemon for DaemonService {
                         Ok(stamp) => stamp,
                         Err(error) => {
                             let _ = tx.blocking_send(Ok(IndexProgress {
+                                frontmatter_unparsed: frontmatter_unparsed.clone(),
                                 phase: Phase::Error as i32,
                                 message: format!(
                                     "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
@@ -7770,6 +7780,7 @@ impl NestWeaverDaemon for DaemonService {
                         message.push_str(DERIVATION_WITHHELD_NOTE);
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Done as i32,
                         message,
                         files_processed: result.index.notes_count as u64,
@@ -7948,6 +7959,8 @@ impl NestWeaverDaemon for DaemonService {
                     // coverage gap demotes a Current vault — the same rule
                     // IndexVault applies, via the same helper.
                     let skipped_files = index_skip_details(&result.skipped);
+                    // nw-585: see IndexVault.
+                    let frontmatter_unparsed = index_skip_details(&result.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
                     let coverage_status = if skipped_count == 0 {
                         CoverageStatus::Complete as i32
@@ -7964,6 +7977,7 @@ impl NestWeaverDaemon for DaemonService {
                         Ok(withheld) => withheld,
                         Err(error) => {
                             let _ = tx.blocking_send(Ok(IndexProgress {
+                                frontmatter_unparsed: frontmatter_unparsed.clone(),
                                 phase: Phase::Error as i32,
                                 message: format!(
                                     "RefreshVaultSince committed graph and search but could not demote Markdown derivation over a coverage gap: {error:#}"
@@ -7991,10 +8005,19 @@ impl NestWeaverDaemon for DaemonService {
                         result.tags_count,
                         result.changed_note_link_edges,
                     );
+                    if let Some(unparsed) =
+                        nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                            &result.frontmatter_unparsed,
+                        )
+                    {
+                        message.push('\n');
+                        message.push_str(&unparsed);
+                    }
                     if withheld {
                         message.push_str(DERIVATION_WITHHELD_NOTE);
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Done as i32,
                         message,
                         files_processed: result.files_checked as u64,
@@ -16500,6 +16523,44 @@ credential_method = "gh"
     /// COMPLETES (the user's decision: disclose, not a hard failure), with the
     /// readable notes indexed. Before the fix the walk only logged the error,
     /// the vault was stamped Current and `locked/`'s notes were silently gone.
+    /// nw-585: IndexVault (daemon `brain add` / full `brain refresh` /
+    /// MCP `brain_add_source`) reports a note indexed without its unparsable
+    /// frontmatter in its terminal progress and message -- without degrading
+    /// coverage or withholding derivation, because the note WAS indexed.
+    #[tokio::test]
+    async fn index_vault_discloses_notes_indexed_without_frontmatter() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("Broken.md"), "---\ntags: [x\n---\n# Broken\n").unwrap();
+        std::fs::write(root.join("Ok.md"), "---\ntags: [ok]\n---\n# Ok\n").unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.files_processed, 2, "both notes are indexed");
+        assert_eq!(last.coverage_status, CoverageStatus::Complete as i32);
+        assert!(last.skipped_files.is_empty(), "{:?}", last.skipped_files);
+        let paths: Vec<&str> = last
+            .frontmatter_unparsed
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["Broken.md"], "{:?}", last.frontmatter_unparsed);
+        assert!(
+            last.message
+                .contains("Indexed without frontmatter (unparsable YAML): 1"),
+            "{}",
+            last.message
+        );
+        assert_ne!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "not a coverage gap"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn index_vault_discloses_an_unreadable_subdirectory_and_withholds_derivation() {
@@ -17129,6 +17190,11 @@ credential_method = "gh"
             sidecar
                 .unindexable_mtimes
                 .insert(format!("{root}/broken.md"), "2026-09-24T00:00:00Z".into());
+            // nw-585: a note indexed without its frontmatter.
+            sidecar.frontmatter_unparsed.insert(
+                format!("{root}/bad-yaml.md"),
+                "frontmatter could not be parsed; indexed without frontmatter".into(),
+            );
         }
         std::fs::write(
             nestweaver_engine::sidecar_path(
@@ -17156,6 +17222,14 @@ credential_method = "gh"
             1,
             "{:?}",
             left.unindexable_mtimes
+        );
+        // nw-585: the removed vault's frontmatter disclosure goes with it;
+        // the survivor's stays.
+        let unparsed: Vec<&String> = left.frontmatter_unparsed.keys().collect();
+        assert_eq!(
+            unparsed,
+            vec![&format!("{survivor}/bad-yaml.md")],
+            "{unparsed:?}"
         );
     }
 

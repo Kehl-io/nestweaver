@@ -26901,6 +26901,13 @@ fn run_brain(
                     out.status(&format!("  {} - {}", sf.path, sf.reason));
                 }
             }
+            // nw-585: indexed, but without their frontmatter. The daemon
+            // route prints the same lines inside its terminal message.
+            if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                &result.frontmatter_unparsed,
+            ) {
+                out.status(&unparsed);
+            }
 
             let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -28359,6 +28366,12 @@ fn run_brain(
                     result.tags_count,
                     result.changed_note_link_edges,
                 );
+                // nw-585: the same lines the daemon route appends.
+                if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                    &result.frontmatter_unparsed,
+                ) {
+                    println!("{unparsed}");
+                }
             } else {
                 // Full refresh: the markdown indexer's writable store performs
                 // the old-vault cascade and replacement in one transaction.
