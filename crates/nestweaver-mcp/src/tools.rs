@@ -12975,20 +12975,7 @@ fn tool_schema_dead_code() -> Value {
                 "repos": { "type": "array", "items": { "type": "string" }, "maxItems": 100, "description": "Repository names or UIDs; restrict the result population before paging." },
                 "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0 },
                 "expected_generation": { "type": "integer", "minimum": 0, "description": "Required with page_token for offset greater than zero." },
-                // nw-657: NOT `minLength`/`maxLength: 64` + `pattern` anymore.
-                // Those made a malformed token fail JSON-schema validation
-                // (`validate_tool_arguments`, ahead of `dispatch_cancellable`)
-                // on EVERY route this schema gates — the MCP stdio gateway,
-                // and the daemon's json_rpc! dispatch (`dispatch_json_tool` ->
-                // `dispatch_cancellable` -> `validate_tool_arguments`), which
-                // this tool's `dead_code` RPC also goes through. That surfaced
-                // as an opaque schema-validation error (Internal error / exit
-                // 1 on the CLI) instead of the structured, token-naming
-                // `page_token_malformed` refusal `dead_code_page_guard`
-                // (dead_code.rs) now produces. `maxLength` stays as a coarse
-                // DoS bound; the exact shape is the guard's job now, uniformly
-                // on every route.
-                "page_token": { "type": "string", "maxLength": 4096, "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
+                "page_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },

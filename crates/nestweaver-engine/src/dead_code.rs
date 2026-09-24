@@ -216,18 +216,28 @@ pub fn dead_code_page_refusal(reason: &str) -> serde_json::Value {
 /// hashes the bound population into exactly this shape). Anything else —
 /// wrong length, uppercase, non-hex characters — cannot be a token this
 /// database ever issued, and is a shape problem, not a "page moved" problem.
-fn is_well_formed_page_token(token: &str) -> bool {
+///
+/// `pub` so the CLI (`src/main.rs`'s `Commands::DeadCode` handler) can check
+/// shape BEFORE choosing the daemon or direct route, and refuse locally with
+/// exit 2 rather than ever sending a malformed token to the daemon's `dead_code`
+/// RPC — that RPC dispatches through the MCP tool's JSON schema
+/// (`page_token` is `minLength`/`maxLength: 64` + a hex `pattern`), which is
+/// deliberately kept strict so external MCP clients get a visible,
+/// standards-shaped `-32602 invalid params`. This function stays the single
+/// source of truth for "well-formed" on both sides of that boundary.
+pub fn is_well_formed_page_token(token: &str) -> bool {
     token.len() == 64
         && token
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// nw-657: cap what a malformed token echoes back. This runs ahead of any
-/// length bound on `page_token` (the MCP JSON-schema's `maxLength: 64` gates
-/// the in-process gateway, but daemon RPCs reach [`dead_code_page_guard`]
-/// without it — see `dead_code_page_arguments`), so an arbitrarily long
-/// string must not be echoed verbatim into the refusal payload.
+/// nw-657: cap what a malformed token echoes back. Both callers that reach
+/// this today (the CLI's pre-check in `src/main.rs`, ahead of any schema; and
+/// [`dead_code_page_guard`] as defense in depth for any other direct caller
+/// of the engine, e.g. a future embedder with no schema layer at all) may
+/// hand this an unbounded string, so it must never be echoed verbatim into
+/// the refusal payload.
 fn describe_malformed_page_token(token: &str) -> String {
     const MAX_ECHO_CHARS: usize = 128;
     let char_count = token.chars().count();
@@ -246,7 +256,11 @@ fn describe_malformed_page_token(token: &str) -> String {
 /// token already gets from `page_population_or_database_changed` below. This
 /// is that same contract, naming the bad token, for the shape check instead
 /// of the value check.
-fn dead_code_page_malformed_token_refusal(token: &str) -> serde_json::Value {
+///
+/// `pub`: the CLI builds this same payload directly (see
+/// [`is_well_formed_page_token`]'s doc) rather than routing a malformed token
+/// through the daemon/MCP schema at all.
+pub fn dead_code_page_malformed_token_refusal(token: &str) -> serde_json::Value {
     let mut payload = dead_code_page_refusal("page_token_malformed");
     payload["note"] = serde_json::json!(format!(
         "page_token {:?} is not a valid page token: expected exactly 64 lowercase \

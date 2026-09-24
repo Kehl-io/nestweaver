@@ -10655,10 +10655,17 @@ fn dead_code_malformed_page_token_is_a_usage_error_not_an_internal_error() {
 /// — its own `DeadCodePageRequest` construction never called the MCP
 /// handler's `dead_code_page_arguments`, so a malformed token there just fell
 /// through to the hash-mismatch refusal (exit 2, generic reason) even before
-/// this fix. The DAEMON route is the one that actually broke: it dispatches
-/// through `tool_dead_code`, which called `dead_code_page_arguments` and used
-/// to bail with `anyhow::ensure!` on a malformed shape, surfacing as exit 1.
-/// Isolated XDG dirs (same pattern as
+/// this fix. The route that actually broke was `use_daemon`: it used to send
+/// the token straight to the `dead_code` RPC, which dispatches through the
+/// MCP tool's strict JSON schema and failed as a raw schema-validation error
+/// (exit 1). The fix moved the shape check into the CLI handler itself,
+/// BEFORE either route is chosen, so a malformed token is refused (exit 2)
+/// without ever reaching the daemon at all — which makes "prove the daemon
+/// route was actually taken" a real thing to verify: this test first spawns
+/// a genuine daemon for this database with an ordinary (well-formed) call and
+/// confirms its pidfile, so the malformed-token call below runs in an
+/// environment where the daemon route is genuinely live and available, not
+/// merely configured. Isolated HOME + XDG dirs (same shape as
 /// `a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_database`)
 /// so this spawns its own throwaway daemon rather than touching a real one.
 #[test]
@@ -10681,11 +10688,111 @@ fn dead_code_malformed_page_token_daemon_route_matches_direct_route() {
         .assert()
         .success();
 
+    let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     let sock = tempfile::tempdir().unwrap();
 
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+    fn isolate(
+        cmd: &mut StdCommand,
+        home: &std::path::Path,
+        state: &std::path::Path,
+        runtime: &std::path::Path,
+        sock: &std::path::Path,
+    ) {
+        cmd.env_remove("NESTWEAVER_NO_DAEMON")
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", state)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock)
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30");
+    }
+
+    /// RAII: stops the throwaway daemon on drop, even if an assertion below
+    /// panics — otherwise a failed run leaks a live daemon process pointed at
+    /// a deleted temp DB.
+    struct DaemonStopGuard {
+        db_path: std::path::PathBuf,
+        home: std::path::PathBuf,
+        state: std::path::PathBuf,
+        runtime: std::path::PathBuf,
+        sock: std::path::PathBuf,
+    }
+    impl Drop for DaemonStopGuard {
+        fn drop(&mut self) {
+            // `every_cli_invocation_pins_its_daemon_routing` scans for a
+            // literal `NESTWEAVER_NO_DAEMON` mention between the binary
+            // constructor and the terminal call — inline it here too, even
+            // though `isolate()` below does the same thing, since the
+            // scanner reads source text, not the `isolate()` helper's body.
+            let mut stop = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+            stop.env_remove("NESTWEAVER_NO_DAEMON")
+                .args(["daemon", "--db"])
+                .arg(&self.db_path)
+                .arg("stop");
+            isolate(
+                &mut stop,
+                &self.home,
+                &self.state,
+                &self.runtime,
+                &self.sock,
+            );
+            let _ = stop.output();
+        }
+    }
+    let _guard = DaemonStopGuard {
+        db_path: db_path.clone(),
+        home: home.path().to_path_buf(),
+        state: state.path().to_path_buf(),
+        runtime: runtime.path().to_path_buf(),
+        sock: sock.path().to_path_buf(),
+    };
+
+    // ── Baseline: an ordinary well-formed call through the daemon-route
+    // environment, proving the daemon route is actually live for this DB —
+    // not just that `use_daemon` would have been selected.
+    let mut baseline = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    baseline
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .args(["dead-code", "--json", "--db"])
+        .arg(&db_path);
+    isolate(
+        &mut baseline,
+        home.path(),
+        state.path(),
+        runtime.path(),
+        sock.path(),
+    );
+    let baseline_output = baseline.output().unwrap();
+    assert!(
+        baseline_output.status.success(),
+        "the baseline daemon-route call must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&baseline_output.stdout),
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = runtime
+        .path()
+        .join("nestweaver")
+        .join(&instance_id)
+        .join("daemon.pid");
+    assert!(
+        pidfile.exists(),
+        "the daemon route was NOT actually taken — no pidfile at {}: this test's \
+         isolation or the daemon-route CLI plumbing broke, and everything below \
+         would be exercising the direct route instead",
+        pidfile.display()
+    );
+    let daemon_pid_before = std::fs::read_to_string(&pidfile).unwrap();
+
+    // ── The actual regression check: a malformed page_token, in an
+    // environment where a live daemon for this DB is confirmed running.
+    let mut malformed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    malformed
+        .env_remove("NESTWEAVER_NO_DAEMON")
         .args([
             "dead-code",
             "--json",
@@ -10693,39 +10800,36 @@ fn dead_code_malformed_page_token_daemon_route_matches_direct_route() {
             "not-a-valid-token",
             "--db",
         ])
-        .arg(&db_path)
-        // The route this whole test exists to exercise — pinned explicitly
-        // per `every_cli_invocation_pins_its_daemon_routing`.
-        .env_remove("NESTWEAVER_NO_DAEMON")
-        .env("XDG_STATE_HOME", state.path())
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
-        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
-        .output()
-        .unwrap();
+        .arg(&db_path);
+    isolate(
+        &mut malformed,
+        home.path(),
+        state.path(),
+        runtime.path(),
+        sock.path(),
+    );
+    let output = malformed.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         output.status.code(),
         Some(2),
-        "the daemon route must refuse a malformed page_token with exit 2, \
-         not exit 1 'Internal error' — this is the route that actually \
+        "the daemon-route environment must refuse a malformed page_token with \
+         exit 2, not exit 1 'Internal error' — this is the route that actually \
          exhibited nw-657: stdout={} stderr={stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
         stderr.contains("not-a-valid-token"),
-        "the daemon route's refusal must also name the bad token: {stderr}"
+        "the daemon-route environment's refusal must also name the bad token: {stderr}"
     );
-
-    let _ = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .args(["daemon", "--db"])
-        .arg(&db_path)
-        .arg("stop")
-        .env_remove("NESTWEAVER_NO_DAEMON")
-        .env("XDG_STATE_HOME", state.path())
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
-        .output();
+    // Same daemon, undisturbed: the shape check short-circuited client-side
+    // and never touched it.
+    assert_eq!(
+        std::fs::read_to_string(&pidfile).unwrap_or_default(),
+        daemon_pid_before,
+        "the malformed-token call must not have restarted or otherwise \
+         disturbed the already-live daemon"
+    );
 }
 
 /// nw-435 leg 2 (precision), end to end. `detect_python`/`detect_bash` only

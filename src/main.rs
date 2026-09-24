@@ -18326,6 +18326,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             use nestweaver_engine::dead_code::{
                 DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
+                dead_code_page_malformed_token_refusal, is_well_formed_page_token,
                 serialize_dead_code_page,
             };
             let db_path = db.clone().unwrap_or_else(default_db_path);
@@ -18343,7 +18344,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(value) = &page_token {
                 args["page_token"] = serde_json::json!(value);
             }
-            let payload = if use_daemon {
+            // nw-657: check shape BEFORE picking a route. The daemon route
+            // sends `args` to the `dead_code` MCP tool, whose `page_token`
+            // schema is deliberately strict (`minLength`/`maxLength: 64` + a
+            // hex `pattern`) so raw MCP clients get a visible schema-shaped
+            // refusal — a malformed token sent there fails as a generic
+            // internal/protocol error, not the documented exit 2. Refusing
+            // here, before either branch, gives both CLI routes the same
+            // `page_token_malformed` exit 2 without ever routing a malformed
+            // token through that schema.
+            let payload = if let Some(token) = &page_token
+                && !is_well_formed_page_token(token)
+            {
+                dead_code_page_malformed_token_refusal(token)
+            } else if use_daemon {
                 // A reproducible page belongs to the selected database. Never
                 // substitute or merge an upstream population for this route.
                 require_existing_db(&db_path)?;
