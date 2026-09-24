@@ -977,7 +977,18 @@ impl BrainWatcher {
             ),
         };
         let (paths, error) = match drift {
-            Ok(paths) if paths.is_empty() => return Ok(None),
+            Ok(paths) if paths.is_empty() => {
+                // Nothing left to reconcile: settle any debt an earlier
+                // attempt disclosed (including an uncomputable drift), or
+                // status reports it pending forever.
+                crate::index_md::record_watch_reconciliation_debt(
+                    store.db_path(),
+                    &self.vault_root,
+                    &[],
+                    None,
+                );
+                return Ok(None);
+            }
             Ok(paths) => {
                 tracing::info!(
                     vault = %self.vault_root.display(),
@@ -1817,7 +1828,7 @@ mod tests {
         );
         assert_eq!(
             pending(&db_path),
-            vec!["New.md".to_string()],
+            vec![root.join("New.md").to_string_lossy().into_owned()],
             "the owed reconciliation must be disclosed in status"
         );
 
@@ -1844,6 +1855,38 @@ mod tests {
                 .any(|note| note.file_path == "New.md"),
             "the retry must ingest the note"
         );
+    }
+
+    /// nw-653 review: a debt disclosed when the drift could not be computed
+    /// must clear once a retry finds nothing left to reconcile; only the
+    /// watcher clears it, so otherwise status reports it pending forever.
+    #[test]
+    fn a_retry_with_no_drift_clears_an_uncomputable_drift_debt() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        crate::index_md::record_watch_reconciliation_debt(
+            Some(&db_path),
+            &root,
+            std::slice::from_ref(&root),
+            Some("drift could not be computed"),
+        );
+        let pending = || {
+            crate::index_md::skipped_notes_status_json(Some(&db_path)).0["reconciliation_pending"]
+                .clone()
+        };
+        assert_eq!(pending(), serde_json::json!(1));
+
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let next = watcher
+            .attempt_reconciliation(&store, None, &v_uid, &None, None, 1)
+            .unwrap();
+        assert!(next.is_none(), "nothing is left to reconcile");
+        assert_eq!(pending(), serde_json::json!(0), "the debt must clear");
     }
 
     /// nw-653 review: a partial scan is not a deletion. Notes under a
