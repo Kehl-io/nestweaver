@@ -7622,36 +7622,48 @@ impl NestWeaverDaemon for DaemonService {
                         return;
                     }
 
-                    if let Err(error) = vault_derivation::stamp_index_success(
+                    let stamp = match vault_derivation::stamp_index_success(
                         &state,
                         &vault_path,
                         &extra_patterns,
                         note_limits.max_note_bytes(),
                         &result,
                     ) {
-                        let _ = tx.blocking_send(Ok(IndexProgress {
-                            phase: Phase::Error as i32,
-                            message: format!(
-                                "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
-                            ),
-                            files_processed: result.index.notes_count as u64,
-                            files_total: result.index.notes_count as u64,
-                            symbols_found: result.index.headings_count as u64,
-                            skipped_count: skipped_count as u64,
-                            skipped_files,
-                            coverage_status,
-                            trigram_refresh: None,
-                            exclusion_inventory: None,
-                        }));
-                        return;
-                    }
+                        Ok(stamp) => stamp,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
+                                ),
+                                files_processed: result.index.notes_count as u64,
+                                files_total: result.index.notes_count as u64,
+                                symbols_found: result.index.headings_count as u64,
+                                skipped_count: skipped_count as u64,
+                                skipped_files,
+                                coverage_status,
+                                trigram_refresh: None,
+                                exclusion_inventory: None,
+                            }));
+                            return;
+                        }
+                    };
 
-                    // DONE phase
+                    // DONE phase. nw-651: a coverage gap is disclosed (the
+                    // skip rows, degraded coverage), not a failure — say why
+                    // derivation was left un-Current instead of erroring.
+                    let mut message =
+                        nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
+                    if stamp == vault_derivation::IndexStamp::WithheldForCoverageGap {
+                        message.push_str(
+                            "\nMarkdown link derivation NOT marked current: a skipped path \
+                             above could not be read or parsed. Fix it and re-run; until \
+                             then link-graph tools report this vault as blocked.",
+                        );
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: nestweaver_engine::index_md::format_markdown_refresh_summary(
-                            &result,
-                        ),
+                        message,
                         files_processed: result.index.notes_count as u64,
                         files_total: result.index.notes_count as u64,
                         symbols_found: result.index.headings_count as u64,
@@ -16267,9 +16279,16 @@ credential_method = "gh"
 
     /// Counterweight to the policy-skip test: a note the reader cannot read is
     /// a genuine coverage gap and must still keep derivation from stamping.
+    ///
+    /// nw-651 changed HOW it refuses, not WHETHER: IndexVault used to end in
+    /// `Phase::Error` ("vault derivation requires complete publication
+    /// coverage") with the previous record left untouched. A failure skip is
+    /// now disclosed and the RPC completes, with the record persisted Blocked
+    /// — the same contract as an unreadable subdirectory.
     #[cfg(unix)]
     #[tokio::test]
     async fn index_vault_refuses_derivation_when_a_note_is_unreadable() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
         use std::os::unix::fs::PermissionsExt;
         let state = test_state_with_writer();
         let vault = tempfile::tempdir().unwrap();
@@ -16287,14 +16306,155 @@ credential_method = "gh"
         std::fs::set_permissions(root.join("B.md"), std::fs::Permissions::from_mode(0o644))
             .unwrap();
         let last = progress.last().expect("IndexVault streamed progress");
-        assert_eq!(last.phase, Phase::Error as i32, "{last:?}");
+        assert_eq!(last.phase, Phase::Done as i32, "{last:?}");
+        assert_eq!(last.coverage_status, CoverageStatus::Degraded as i32);
         assert!(
-            last.message
-                .contains("vault derivation requires complete publication coverage"),
+            last.message.contains("NOT marked current"),
             "{}",
             last.message
         );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked
+        );
         vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// nw-651: a vault subdirectory the walk cannot read is DISCLOSED — a
+    /// `read_error` row naming it, coverage degraded — and derivation is NOT
+    /// stamped Current: the record is persisted Blocked so `brain status`
+    /// counts it and derivation-gated tools refuse. But IndexVault still
+    /// COMPLETES (the user's decision: disclose, not a hard failure), with the
+    /// readable notes indexed. Before the fix the walk only logged the error,
+    /// the vault was stamped Current and `locked/`'s notes were silently gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_discloses_an_unreadable_subdirectory_and_withholds_derivation() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(
+            last.phase,
+            Phase::Done as i32,
+            "an unreadable subdirectory is disclosed, not a hard failure: {}",
+            last.message
+        );
+        assert_eq!(last.files_processed, 2, "the readable notes are indexed");
+        assert_eq!(last.coverage_status, CoverageStatus::Degraded as i32);
+        assert!(
+            last.skipped_files
+                .iter()
+                .any(|row| row.path == "locked" && row.reason_code == "read_error"),
+            "{:?}",
+            last.skipped_files
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "derivation must not be stamped Current over a coverage gap"
+        );
+        let mut status = serde_json::json!({});
+        vault_derivation::status_overlay(&state, &mut status);
+        assert_eq!(
+            status["vault_derivation"]["pending_or_blocked_vaults"], 1,
+            "brain status must show the vault is not current: {status}"
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// nw-651: a vault that WAS Current does not stay Current when a
+    /// subdirectory becomes unreadable. The pre-fix refusal returned before
+    /// touching the record, so yesterday's Current survived today's gap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_demotes_a_current_vault_when_a_subdirectory_becomes_unreadable() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current,
+            "precondition"
+        );
+
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let second = index_vault_via_rpc(&state, &root).await;
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(second.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// nw-651 counterweight: a brainignored unreadable subdirectory is policy,
+    /// not a gap — IndexVault stamps Current exactly as without it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_stamps_derivation_over_a_brainignored_unreadable_subdirectory() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::write(root.join(".brainignore"), "locked/**\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
     }
 
     /// Blocked used to be terminal: admission reported it non-retryable, so

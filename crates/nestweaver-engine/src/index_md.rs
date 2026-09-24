@@ -1456,6 +1456,59 @@ pub(crate) fn refresh_watched_paths(
     Ok(())
 }
 
+/// Drain a vault reader's prune recorder into skip rows, for every vault route
+/// (the full index and the `--since` refresh) — ONE drain, so the two cannot
+/// disagree about the same vault (nw-436/nw-651).
+///
+/// CALL ONLY IMMEDIATELY AFTER `list_files`: the recorder is cleared at the top
+/// of every walk.
+///
+/// nw-651: `.brainignore` is applied per NOTE after the walk, not by the
+/// walker, so a brainignored directory is still descended and — when it is
+/// unreadable — still records an `UNREADABLE_DIR_REASON` row. Nothing beneath
+/// it would have been indexed, so that row is dropped here: ignore rules win,
+/// exactly as `.gitignore` wins by never letting the walker descend.
+fn disclose_vault_prunes(reader: &dyn ContentReader, ignore_set: &GlobSet) -> Vec<SkippedFile> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|pruned| {
+            pruned.reason != crate::content_reader::UNREADABLE_DIR_REASON
+                || !brainignore_covers_dir(&pruned.path, ignore_set)
+        })
+        .filter_map(|pruned| {
+            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
+        })
+        .collect()
+}
+
+/// Whether `.brainignore` excludes every note a directory could hold, judged
+/// by the directory itself or a note nested two levels inside it (globset's
+/// `*` crosses `/`, so `dir/**`, `dir/*` and `**/dir/**` all match the probe).
+/// A pattern that excludes only SOME of its notes does not cover it: the row
+/// stays, erring toward disclosure.
+fn brainignore_covers_dir(dir: &str, ignore_set: &GlobSet) -> bool {
+    dir != "."
+        && (crate::brainignore::is_ignored(dir, ignore_set)
+            || crate::brainignore::is_ignored(
+                &format!("{dir}/nestweaver-probe/nestweaver-probe.md"),
+                ignore_set,
+            ))
+}
+
+/// Directories the last walk of `reader` could not read (vault-relative), for
+/// the refresh's deletion guard. `.` stands for "somewhere unknown" and covers
+/// everything. Same recorder, same "call right after `list_files`" rule as
+/// [`disclose_vault_prunes`].
+fn unreadable_dirs(reader: &dyn ContentReader) -> Vec<PathBuf> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect()
+}
+
 fn index_markdown_since_with_reader(
     store: &GraphStore,
     reader: &dyn ContentReader,
@@ -1532,7 +1585,10 @@ fn index_markdown_since_with_reader_mode(
     let mut candidates = Vec::new();
     let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
     let mut eligible_note_uids = HashSet::new();
-    let mut skipped: Vec<SkippedFile> = Vec::new();
+    // nw-651: the same drain the full index runs, so an unreadable (or
+    // pruned) directory is disclosed on this route too.
+    let mut skipped: Vec<SkippedFile> = disclose_vault_prunes(reader, ignore_set);
+    let unreadable = unreadable_dirs(reader);
     let mut notes_near_size_limit: Vec<NearLimitNote> = Vec::new();
     let mut touched_paths: Vec<String> = Vec::new();
 
@@ -1654,9 +1710,18 @@ fn index_markdown_since_with_reader_mode(
         );
     }
 
+    // nw-651: a note under a directory this walk could not read was not
+    // OBSERVED gone, so it is kept (nw-287: a deletion must be observed, never
+    // inferred from silence) — the disclosed row says why it was not
+    // refreshed. nw-653's startup drift keeps it for the same reason.
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
         .filter(|note| !eligible_note_uids.contains(&note.uid))
+        .filter(|note| {
+            !unreadable
+                .iter()
+                .any(|dir| dir.as_os_str() == "." || Path::new(&note.file_path).starts_with(dir))
+        })
         .map(|note| note.uid.clone())
         .collect();
     let changed_uids: std::collections::HashSet<String> = candidates
@@ -2737,13 +2802,7 @@ where
     // two commands cannot disagree about the same vault. MUST STAY
     // IMMEDIATELY AFTER `list_files`, for the same reason `index.rs`'s drain
     // does: the recorder is cleared at the top of every `list_files` call.
-    for pruned in reader.skipped_dirs() {
-        if let Some(sf) =
-            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
-        {
-            skipped.push(sf);
-        }
-    }
+    skipped.extend(disclose_vault_prunes(reader, ignore_set));
 
     for rel_path in all_files {
         // nw-653: the shared eligibility rule (vault skip dirs such as
@@ -4922,6 +4981,153 @@ mod tests {
             store.list_notes(None).unwrap().len(),
             2,
             "an unreadable vault directory must never delete indexed notes"
+        );
+    }
+
+    /// Restores a directory's mode on drop, so a failing assertion cannot
+    /// leave an unreadable directory behind for `TempDir` to trip over.
+    #[cfg(unix)]
+    struct RestoreMode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> RestoreMode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        RestoreMode(dir.to_path_buf())
+    }
+
+    /// nw-651: a vault subdirectory the walk cannot read is a `ReadError`
+    /// row naming it — a coverage GAP, so derivation cannot be stamped
+    /// Current — while the readable notes are still indexed. Before the fix
+    /// the walk only logged it and the vault read as complete.
+    #[cfg(unix)]
+    #[test]
+    fn full_vault_index_discloses_an_unreadable_subdirectory_as_a_gap() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        let _restore = lock_dir(&root.join("locked"));
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 1, "the readable note is indexed");
+        let row = result
+            .index
+            .skipped
+            .iter()
+            .find(|s| s.path == "locked")
+            .unwrap_or_else(|| panic!("no row for locked/: {:?}", result.index.skipped));
+        assert_eq!(row.reason_code, SkipReasonCode::ReadError);
+        assert!(crate::markdown_derivation::is_coverage_gap(row));
+        assert!(
+            row.reason.contains(".brainignore") && !row.reason.contains("[[repos]]"),
+            "a vault must be offered the vault remedy: {}",
+            row.reason
+        );
+    }
+
+    /// nw-651 COUNTERWEIGHT: `.brainignore` wins. It is applied per note after
+    /// the walk, so the walker still trips over a brainignored unreadable
+    /// directory — but nothing in it would have been indexed, so it is not a
+    /// gap and must not keep the vault from reading complete.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_brainignored_subdirectory_is_not_disclosed() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n"),
+            (".brainignore", "locked/**\n"),
+            ("locked/b.md", "# B\n"),
+        ]);
+        let _restore = lock_dir(&root.join("locked"));
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 1);
+        assert!(
+            result.index.skipped.is_empty(),
+            "a brainignored unreadable dir is not a coverage gap: {:?}",
+            result.index.skipped
+        );
+    }
+
+    /// nw-651 on the `--since` route (RefreshVaultSince / the watcher's
+    /// refresh): the row is disclosed there too, and — because a deletion
+    /// must be OBSERVED, never inferred from silence (nw-287) — notes already
+    /// indexed under the now-unreadable directory are kept, matching nw-653's
+    /// startup drift, instead of being deleted as "no longer on disk".
+    #[cfg(unix)]
+    #[test]
+    fn since_refresh_discloses_an_unreadable_subdirectory_and_keeps_its_notes() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.list_notes(None).unwrap().len(), 2, "precondition");
+
+        let _restore = lock_dir(&root.join("locked"));
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+            "the since route must disclose it: {:?}",
+            result.skipped
+        );
+        // `notes_deleted` also counts rewritten notes, so assert the graph.
+        let kept: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/b.md"),
+            "an unread note is not a deleted one: {kept:?}"
         );
     }
 

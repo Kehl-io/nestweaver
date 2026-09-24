@@ -449,6 +449,46 @@ pub struct SkippedDir {
     /// directory-prune `CONFIGURED_EXCLUDE_REASON` case — see that constant's
     /// sibling doc comment on why the directory path cannot recover this.
     pub matched_pattern: Option<String>,
+    /// The underlying error text, for [`UNREADABLE_DIR_REASON`] rows only
+    /// (e.g. `Permission denied (os error 13)`). `None` for every policy row.
+    pub detail: Option<String>,
+}
+
+/// The `reason` a [`SkippedDir`] carries when the walk could not READ a path
+/// below the root — almost always a subdirectory whose permissions deny
+/// listing it.
+///
+/// nw-651. The non-strict walk used to `tracing::warn!("walk error")` and
+/// `continue`, recording nothing, so a vault's derivation was stamped Current
+/// and a repo's coverage read `"complete"` while that subdirectory's notes and
+/// sources were silently absent. DECISION (2026-09-24): DISCLOSE, for repos and
+/// vaults alike. Unlike every other reason here this is a FAILURE, not a
+/// policy: `index::disclose_pruned_dir` codes it `ReadError`, which degrades
+/// coverage, trips `--fail-on-skip`, and — through
+/// `markdown_derivation::is_coverage_gap` — keeps a vault's derivation from
+/// being stamped Current. Indexing still completes; strict enumeration (the
+/// background derivation migration) still fails closed instead.
+///
+/// Ignore rules win: the walker applies `.gitignore`, `[[repos]] exclude` and
+/// `SKIP_DIRS` BEFORE descending, so an ignored unreadable directory is never
+/// read and never produces a row. (`.brainignore` is applied per note AFTER
+/// the walk, so the vault drain filters these rows against it instead.)
+pub const UNREADABLE_DIR_REASON: &str = "unreadable during enumeration";
+
+/// The path an `ignore` walk error is about, if it names one.
+///
+/// `WalkBuilder` wraps a failed `read_dir` as `WithDepth { WithPath { path,
+/// Io } }`; the path is the directory that could not be listed.
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errs) => errs.iter().find_map(walk_error_path),
+        _ => None,
+    }
 }
 
 impl FilesystemReader {
@@ -607,6 +647,18 @@ impl FilesystemReader {
             return;
         };
         let seen: HashSet<&Path> = enumerated.iter().map(PathBuf::as_path).collect();
+        // nw-651: a FIFTH suppression. A tracked file below a directory the
+        // walk could not read is already disclosed at directory granularity
+        // (`UNREADABLE_DIR_REASON`) with the remedy that works; reporting it
+        // again as "gitignored" would hand out a `.gitignore` fix for a
+        // permissions problem. Usually `symlink_metadata` below already fails
+        // for it, but not for an execute-only (`0o100`) directory.
+        let unreadable: Vec<PathBuf> = self
+            .skipped_dirs()
+            .into_iter()
+            .filter(|row| row.reason == UNREADABLE_DIR_REASON)
+            .map(|row| PathBuf::from(row.path))
+            .collect();
         let mut rows: Vec<SkippedDir> = tracked
             .iter()
             .filter(|rel| !seen.contains(rel.as_path()))
@@ -625,6 +677,7 @@ impl FilesystemReader {
                     !dir.as_os_str().is_empty() && dir_is_excluded(self.dir_excludes.as_ref(), dir)
                 })
             })
+            .filter(|rel| !unreadable.iter().any(|dir| rel.starts_with(dir)))
             .filter(|rel| {
                 std::fs::symlink_metadata(self.repo_path.join(rel))
                     .is_ok_and(|meta| meta.file_type().is_file())
@@ -633,6 +686,7 @@ impl FilesystemReader {
                 path: rel.to_string_lossy().into_owned(),
                 reason: TRACKED_BUT_IGNORED_REASON.to_string(),
                 matched_pattern: None,
+                detail: None,
             })
             .collect();
         if rows.is_empty() {
@@ -884,6 +938,7 @@ impl ContentReader for FilesystemReader {
                                 path: rel.to_string_lossy().into_owned(),
                                 reason: reason.to_string(),
                                 matched_pattern: None,
+                                detail: None,
                             });
                         }
                     };
@@ -928,6 +983,36 @@ impl ContentReader for FilesystemReader {
                         return Err(anyhow::anyhow!("incomplete source inventory: {err}"));
                     }
                     tracing::warn!("walk error: {err}");
+                    // nw-651: disclose, don't just log. See
+                    // `UNREADABLE_DIR_REASON`. A path-less error (none is
+                    // known to reach here) is pinned to the root rather than
+                    // dropped, so the loss is still visible.
+                    let rel = walk_error_path(&err)
+                        .and_then(|path| path.strip_prefix(&self.repo_path).ok())
+                        .map(|rel| rel.to_string_lossy().into_owned())
+                        .filter(|rel| !rel.is_empty())
+                        .unwrap_or_else(|| ".".to_string());
+                    // The OS error alone: walkdir's own message repeats the
+                    // ABSOLUTE path, which the row already names relatively.
+                    let detail = match err.io_error() {
+                        Some(io) => io.raw_os_error().map_or_else(
+                            || io.kind().to_string(),
+                            |code| std::io::Error::from_raw_os_error(code).to_string(),
+                        ),
+                        None => err.to_string(),
+                    };
+                    if let Ok(mut recorded) = self.skipped_dirs.lock()
+                        && !recorded
+                            .iter()
+                            .any(|row| row.path == rel && row.reason == UNREADABLE_DIR_REASON)
+                    {
+                        recorded.push(SkippedDir {
+                            path: rel,
+                            reason: UNREADABLE_DIR_REASON.to_string(),
+                            matched_pattern: None,
+                            detail: Some(detail),
+                        });
+                    }
                     continue;
                 }
             };
@@ -955,6 +1040,7 @@ impl ContentReader for FilesystemReader {
                                 path: rel.to_string_lossy().into_owned(),
                                 reason: CONFIGURED_FILE_EXCLUDE_REASON.to_string(),
                                 matched_pattern,
+                                detail: None,
                             });
                         }
                         continue;
