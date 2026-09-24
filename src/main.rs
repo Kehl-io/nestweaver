@@ -2991,6 +2991,36 @@ fn render_investigate_text(payload: &serde_json::Value) {
 /// drift — the rule established when `dead-code` and `investigate` were found
 /// emitting JSON or text depending on whether a daemon happened to be running
 /// (nw-108).
+/// Print a change-impact payload's `notifications` as `[level] message`, the
+/// one renderer shared by `blast-radius` and `detect-changes` (nw-544).
+///
+/// `show_notes: false` folds Note-level entries into a single count line
+/// instead of printing them. detect-changes carries blast radius's
+/// informational notes (`clusters-not-computed`, `cochange-unavailable`) on
+/// every run of a fresh install; printing them as warnings trained readers to
+/// skip the block. They are still disclosed — as a count with the flag that
+/// reveals them — so text never says less than JSON about what exists.
+fn print_change_notifications(payload: &serde_json::Value, indent: &str, show_notes: bool) {
+    let mut folded = 0usize;
+    for note in payload
+        .get("notifications")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
+        if level == "note" && !show_notes {
+            folded += 1;
+            continue;
+        }
+        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        println!("{indent}[{level}] {msg}");
+    }
+    if folded > 0 {
+        println!("{indent}({folded} informational note(s) hidden; rerun with --verbose or --json)");
+    }
+}
+
 fn render_blast_radius_text(payload: &serde_json::Value) {
     // nw-454. Every read below is a TOP-LEVEL key, and a two-tier payload has
     // none of them up there -- it carries `tier`, `local_impact` and
@@ -3051,16 +3081,7 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
     println!("  status:     {}", s("status"));
     println!("  gate_state: {}", s("gate_state"));
 
-    for note in payload
-        .get("notifications")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
-        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        println!("  [{level}] {msg}");
-    }
+    print_change_notifications(payload, "  ", true);
 
     let blind: Vec<&str> = payload
         .get("blind_spots")
@@ -18278,16 +18299,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     payload["affected_process_count"].as_u64().unwrap_or(0),
                     payload["blast_radius"].as_u64().unwrap_or(0)
                 );
-                if let Some(notifications) = payload["notifications"].as_array() {
-                    for notification in notifications {
-                        println!(
-                            "Warning: {}",
-                            notification["message"]
-                                .as_str()
-                                .unwrap_or("analysis degraded")
-                        );
-                    }
-                }
+                // nw-544: real levels via the blast-radius renderer; notes
+                // (now contributed by blast radius) fold unless --verbose.
+                print_change_notifications(&payload, "", out.verbose);
             }
             let exit = if payload["resolver_stale_repos"]
                 .as_array()

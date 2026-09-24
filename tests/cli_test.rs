@@ -2605,8 +2605,10 @@ fn cli_capability_aliases_execute_mcp_equivalent_contracts() {
 /// processes, which the old process-count bucketing read as `high`). Run
 /// through the real CLI so the MCP tool wiring and the direct route's db-path
 /// plumbing (cluster/co-change sidecars) are covered, not just the engine.
-#[test]
-fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
+/// Index the nw-544 fixture: an unindexed `Makefile`, `src/a.js` with five
+/// callers in `src/callers.js`, and a lone `src/leaf.js`. No cluster or
+/// co-change sidecar is produced, as on a fresh install.
+fn nw544_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("test.lbug");
@@ -2637,6 +2639,12 @@ fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
         .arg(&db_path)
         .assert()
         .success();
+    (dir, db_path)
+}
+
+#[test]
+fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
+    let (_dir, db_path) = nw544_fixture();
 
     let run = |command: &str, files: &[&str]| -> serde_json::Value {
         let mut cmd = nestweaver_cmd();
@@ -2680,6 +2688,77 @@ fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
     let leaf = run("detect-changes", &["src/leaf.js"]);
     assert_eq!(leaf["risk"], "low", "{leaf}");
     assert_eq!(leaf["gate_state"], "ok", "{leaf}");
+}
+
+/// nw-544 follow-up: detect-changes now carries blast radius's Note-level
+/// disclosures (`clusters-not-computed`, `cochange-unavailable`), and its
+/// text output printed EVERY notification as "Warning:", so a fresh install
+/// got two false warnings on every ordinary run. Notes render at their real
+/// level through the shared blast-radius renderer and are folded into a
+/// count unless `--verbose`; JSON keeps them all.
+#[test]
+fn detect_changes_text_prints_notifications_at_their_real_level() {
+    let (_dir, db_path) = nw544_fixture();
+    let text = |files: &[&str], verbose: bool| -> String {
+        let mut cmd = nestweaver_cmd();
+        cmd.arg("detect-changes");
+        for file in files {
+            cmd.args(["--files", file]);
+        }
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        let output = cmd.arg("--db").arg(&db_path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let json = {
+        let output = nestweaver_cmd()
+            .args(["detect-changes", "--files", "src/leaf.js", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert!(
+        json["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["descriptor"] == "clusters-not-computed" && n["level"] == "note"),
+        "JSON must keep the note: {json}"
+    );
+
+    let plain = text(&["src/leaf.js"], false);
+    assert!(
+        !plain.to_lowercase().contains("warning"),
+        "an ordinary run must not print a warning for a note: {plain}"
+    );
+    assert!(
+        !plain.contains("no cluster data"),
+        "notes are folded unless --verbose: {plain}"
+    );
+    assert!(
+        plain.contains("--verbose"),
+        "folded notes must still be disclosed as a count: {plain}"
+    );
+    let verbose = text(&["src/leaf.js"], true);
+    assert!(
+        verbose.contains("[note] no cluster data"),
+        "--verbose shows the note at its real level: {verbose}"
+    );
+
+    // COUNTERWEIGHT: a genuine Warning still prints, as a warning.
+    let makefile = text(&["Makefile"], false);
+    assert!(
+        makefile.contains("[warning] Makefile is an execution/build/configuration dependency"),
+        "{makefile}"
+    );
 }
 
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {

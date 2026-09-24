@@ -10,7 +10,7 @@ When reviewing a PR or set of changes:
 1. Get the list of changed files from git diff
 2. Call `blast_radius` with the changed files — review the `impact_score` on each affected symbol to prioritize review effort
 3. Call `affected_tests` to identify which tests cover the changed code and should be run
-4. Call `detect_changes` with the changed file list for process-level risk assessment
+4. Call `detect_changes` with the changed file list for a risk assessment (risk and gate come from blast radius; affected processes are detail)
 5. For each high-impact changed file, call `code_context` with the REPO-RELATIVE file path as seed for surrounding context (`brain_context` does not resolve file paths — seed it with a symbol name when you want vault notes folded in)
 6. Call `contract_drift` if the changes touch public API boundaries
 7. Optionally call `dead_code` to see whether the changes interact with code that looks unreachable — a review prompt, never a recommendation to delete (see Limitations)
