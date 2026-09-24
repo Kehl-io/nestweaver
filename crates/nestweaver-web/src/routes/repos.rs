@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
+use nestweaver_engine::manifest::without_force_index_advice;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -53,13 +54,6 @@ pub async fn cross_repo_refs(
     let refs = state.store.cross_repo_links(&uid)?;
     let json = serde_json::to_value(&refs)?;
     Ok(Json(json).into_response())
-}
-
-fn without_force_index_advice(message: &str) -> String {
-    message.replace(
-        "; re-index with `nestweaver index --repo <path> --force`",
-        "",
-    )
 }
 
 fn manifest_unavailable(
@@ -332,6 +326,65 @@ mod tests {
         assert!(
             nested_message.contains("stale artifact generation"),
             "the operator still needs the stale generation numbers in the nested error: {payload}"
+        );
+    }
+
+    /// nw-637 COUNTERWEIGHT: a NON-retryable nested rebuild error (a blocked
+    /// source failure, same shape `blocked_source_failure_overrides_...`
+    /// uses for the top-level case) must keep its message byte-for-byte
+    /// intact, `--force` phrase and all. Only a retryable attempt is a
+    /// watcher's job to silently retry; a blocked source failure needs a
+    /// human, and stripping its own remediation text would be a REGRESSION
+    /// of the same shape nw-637 fixes for the retryable path, just aimed the
+    /// other way.
+    #[tokio::test]
+    async fn nested_rebuild_error_keeps_a_non_retryable_message_intact() {
+        use nestweaver_engine::manifest::{
+            ManifestRecoveryRuntime, ManifestUnavailable, ManifestUnavailableReason,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let state = AppState::new(store, None, db_path);
+        let runtime = Arc::new(ManifestRecoveryRuntime::default());
+        let nested_message = "repo:default:fixture: go.mod: unsupported directive; re-index \
+             with `nestweaver index --repo <path> --force` will not help until the module \
+             directive is fixed";
+        runtime.publish(
+            "blocked",
+            3,
+            None,
+            Some(ManifestUnavailable::new(
+                ManifestUnavailableReason::SourceUnavailable,
+                generation,
+                nested_message,
+            )),
+        );
+        assert!(state.manifest_recovery.set(runtime).is_ok());
+        // Top-level error is Corrupt (non-retryable) so the earlier
+        // SourceUnavailable-override branch (exercised by
+        // `blocked_source_failure_overrides_later_retryable_stale_generation`)
+        // never fires here — this test is specifically about the NESTED
+        // error's own independent gating, not that override.
+        let mut current = ManifestUnavailable::new(
+            ManifestUnavailableReason::Corrupt,
+            generation,
+            "current artifact failure, unrelated to force advice",
+        );
+        current.actual_generation = Some(generation);
+        let response = manifest_unavailable(&state, current);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nested = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            nested, nested_message,
+            "a non-retryable nested error must be left byte-for-byte intact, \
+             --force phrase and all: {payload}"
         );
     }
 

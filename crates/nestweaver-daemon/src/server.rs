@@ -9749,29 +9749,59 @@ impl NestWeaverDaemon for DaemonService {
         let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
-        let result = tokio::task::spawn_blocking(move || {
-            let generation = state.store.graph_generation();
-            let unavailable = |error: nestweaver_engine::manifest::ManifestUnavailable| {
-                state.manifest_recovery.wake.notify_one();
-                let body = serde_json::json!({ "error": error, "rebuild": state.manifest_recovery.status() });
-                Status::unavailable(body.to_string())
-            };
-            let manifests = nestweaver_engine::manifest::current_manifest_snapshot(&state.store, &state.db_path)
+        let result =
+            tokio::task::spawn_blocking(move || {
+                let generation = state.store.graph_generation();
+                let unavailable = |mut error: nestweaver_engine::manifest::ManifestUnavailable| {
+                    state.manifest_recovery.wake.notify_one();
+                    let mut rebuild = state.manifest_recovery.status();
+                    // nw-637 sibling gap: the web crate's `suggest-links` HTTP
+                    // route strips the `--force` reindex instruction from BOTH
+                    // the top-level error and the nested `rebuild.error` (the
+                    // recovery runtime's own last-attempt error) when that
+                    // message's reason is retryable — recovery, not the
+                    // operator, owns retrying it. This RPC is the CLI's actual
+                    // daemon route for the same command and stripped neither.
+                    // The daemon always has a recovery runtime installed
+                    // (unlike the web crate's optional one), so both strips
+                    // apply unconditionally here.
+                    if error.retryable {
+                        error.message =
+                            nestweaver_engine::manifest::without_force_index_advice(&error.message);
+                    }
+                    if let Some(rebuild_error) = &mut rebuild.error
+                        && rebuild_error.retryable
+                    {
+                        rebuild_error.message =
+                            nestweaver_engine::manifest::without_force_index_advice(
+                                &rebuild_error.message,
+                            );
+                    }
+                    let body = serde_json::json!({ "error": error, "rebuild": rebuild });
+                    Status::unavailable(body.to_string())
+                };
+                let manifests = nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
                 .map_err(&unavailable)?;
-            let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
-                .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
-            nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation).map_err(&unavailable)?;
-            if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
-                .map_err(|e| Status::unavailable(e.to_string()))?.is_some() {
-                return Err(unavailable(nestweaver_engine::manifest::ManifestUnavailable::new(
+                let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
+                    .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
+                nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation)
+                    .map_err(&unavailable)?;
+                if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                    .map_err(|e| Status::unavailable(e.to_string()))?
+                    .is_some()
+                {
+                    return Err(unavailable(nestweaver_engine::manifest::ManifestUnavailable::new(
                     nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
                     generation, "manifest source changed while computing suggestions")));
-            }
-            serde_json::to_string(&suggestions)
-                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+                }
+                serde_json::to_string(&suggestions)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
@@ -17881,6 +17911,101 @@ credential_method = "gh"
         assert!(error.message().contains("missing"));
         assert!(!canonical_path.exists());
         assert!(legacy_path.exists());
+    }
+
+    /// nw-637 sibling gap: `suggest_links_json` is the CLI's actual daemon
+    /// route for `suggest-links` (see `dispatch_json_rpc_authed`'s
+    /// `"suggest_links" => client.suggest_links_json(...)` in
+    /// nestweaver-federation). Its `unavailable` closure built `{error,
+    /// rebuild}` with NEITHER message's `--force` advice stripped, even
+    /// though the web crate's HTTP route for the same underlying data
+    /// stripped both. Force a `PendingSourceChange` refusal (a retryable
+    /// top-level reason with no repos to walk, so the two earlier
+    /// `unavailable()` call sites in the RPC never fire) and pre-publish a
+    /// retryable nested rebuild error carrying the raw `--force` template —
+    /// the shape the recovery loop actually publishes — and confirm it comes
+    /// back stripped.
+    #[tokio::test]
+    async fn suggest_links_json_strips_force_advice_from_nested_rebuild_error() {
+        let state = test_state_with_writer();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "test forces a pending-source-change refusal",
+        )
+        .unwrap();
+        state.manifest_recovery.publish(
+            "retry_scheduled",
+            1,
+            Some(2),
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::StaleGeneration,
+                state.store.graph_generation() + 1,
+                "repo_manifest stale artifact generation 16, expected 17; re-index with \
+                 `nestweaver index --repo <path> --force`",
+            )),
+        );
+
+        let error = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        let payload: serde_json::Value = serde_json::from_str(error.message()).unwrap();
+        assert_eq!(payload["error"]["reason"], "pending_source_change");
+        let nested = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !nested.to_ascii_lowercase().contains("force"),
+            "suggest_links_json must strip --force from the nested rebuild error too: {payload}"
+        );
+        assert!(
+            nested.contains("stale artifact generation"),
+            "the operator still needs the stale generation numbers: {payload}"
+        );
+    }
+
+    /// nw-637 COUNTERWEIGHT: a non-retryable nested rebuild error must keep
+    /// its message intact through the daemon route too.
+    #[tokio::test]
+    async fn suggest_links_json_keeps_a_non_retryable_nested_message_intact() {
+        let state = test_state_with_writer();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "test forces a pending-source-change refusal",
+        )
+        .unwrap();
+        let nested_message = "repo:default:fixture: go.mod: unsupported directive; re-index \
+             with `nestweaver index --repo <path> --force` will not help until the module \
+             directive is fixed";
+        state.manifest_recovery.publish(
+            "blocked",
+            3,
+            None,
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::SourceUnavailable,
+                state.store.graph_generation(),
+                nested_message,
+            )),
+        );
+
+        let error = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        let payload: serde_json::Value = serde_json::from_str(error.message()).unwrap();
+        let nested = payload["rebuild"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            nested, nested_message,
+            "a non-retryable nested error must be left byte-for-byte intact, \
+             --force phrase and all: {payload}"
+        );
     }
 
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
