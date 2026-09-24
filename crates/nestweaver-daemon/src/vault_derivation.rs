@@ -225,16 +225,16 @@ pub(super) fn stamp_index_success(
     max_note_bytes: u64,
     result: &MarkdownRefreshResult,
 ) -> anyhow::Result<IndexStamp> {
-    let vault = lookup_vault(state, vault_path)?;
-    if result
-        .index
-        .skipped
-        .iter()
-        .any(markdown_derivation::is_coverage_gap)
-    {
-        withhold_for_coverage_gap(state, &vault, extra, max_note_bytes)?;
+    if withhold_if_coverage_gap(
+        state,
+        vault_path,
+        extra,
+        max_note_bytes,
+        &result.index.skipped,
+    )? {
         return Ok(IndexStamp::WithheldForCoverageGap);
     }
+    let vault = lookup_vault(state, vault_path)?;
     stamp_from_refresh(
         state,
         &vault,
@@ -244,6 +244,32 @@ pub(super) fn stamp_index_success(
         result,
     )?;
     Ok(IndexStamp::Current)
+}
+
+/// Persist the vault's derivation Blocked when `skipped` holds a coverage
+/// GAP; `Ok(true)` when it did. ONE rule for every daemon route that commits
+/// vault content without stamping it: IndexVault (via
+/// [`stamp_index_success`]) and RefreshVaultSince.
+///
+/// nw-651: RefreshVaultSince admits a Current vault through `ensure_current`
+/// and never touched the record afterwards, so a watcher- or RPC-driven
+/// refresh that disclosed an unreadable directory left the vault Current —
+/// contradicting the decision that derivation must not read Current while
+/// such a row exists. A refresh never STAMPS Current, so this only ever
+/// demotes; a clean refresh leaves the record exactly as it was.
+pub(super) fn withhold_if_coverage_gap(
+    state: &DaemonState,
+    vault_path: &Path,
+    extra: &[String],
+    max_note_bytes: u64,
+    skipped: &[nestweaver_parser::SkippedFile],
+) -> anyhow::Result<bool> {
+    if !skipped.iter().any(markdown_derivation::is_coverage_gap) {
+        return Ok(false);
+    }
+    let vault = lookup_vault(state, vault_path)?;
+    withhold_for_coverage_gap(state, &vault, extra, max_note_bytes)?;
+    Ok(true)
 }
 
 fn withhold_for_coverage_gap(

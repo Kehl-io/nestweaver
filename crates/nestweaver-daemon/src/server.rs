@@ -2389,6 +2389,13 @@ fn index_done_message(
     }
 }
 
+/// Appended to a vault RPC's Done message when a coverage gap kept (or
+/// demoted) Markdown derivation from Current (nw-651). One constant so
+/// IndexVault and RefreshVaultSince say the same thing.
+const DERIVATION_WITHHELD_NOTE: &str = "\nMarkdown link derivation NOT marked current: a \
+     skipped path above could not be read or parsed. Fix it and re-run; until then \
+     link-graph tools report this vault as blocked.";
+
 fn index_skip_details(skipped: &[nestweaver_parser::SkippedFile]) -> Vec<IndexSkipDetail> {
     skipped
         .iter()
@@ -7655,11 +7662,7 @@ impl NestWeaverDaemon for DaemonService {
                     let mut message =
                         nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
                     if stamp == vault_derivation::IndexStamp::WithheldForCoverageGap {
-                        message.push_str(
-                            "\nMarkdown link derivation NOT marked current: a skipped path \
-                             above could not be read or parsed. Fix it and re-run; until \
-                             then link-graph tools report this vault as blocked.",
-                        );
+                        message.push_str(DERIVATION_WITHHELD_NOTE);
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
@@ -7835,23 +7838,68 @@ impl NestWeaverDaemon for DaemonService {
                     {
                         tracing::warn!(%error, "failed to record incremental vault timestamp");
                     }
+                    // nw-651: the refresh's skip rows reach the client (they
+                    // used to be dropped by `..Default::default()`), and a
+                    // coverage gap demotes a Current vault — the same rule
+                    // IndexVault applies, via the same helper.
+                    let skipped_files = index_skip_details(&result.skipped);
+                    let skipped_count = skipped_files.len();
+                    let coverage_status = if skipped_count == 0 {
+                        CoverageStatus::Complete as i32
+                    } else {
+                        CoverageStatus::Degraded as i32
+                    };
+                    let withheld = match vault_derivation::withhold_if_coverage_gap(
+                        &state,
+                        &vault_path,
+                        &extra_patterns,
+                        note_limits.max_note_bytes(),
+                        &result.skipped,
+                    ) {
+                        Ok(withheld) => withheld,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "RefreshVaultSince committed graph and search but could not demote Markdown derivation over a coverage gap: {error:#}"
+                                ),
+                                files_processed: result.files_checked as u64,
+                                files_total: result.files_checked as u64,
+                                symbols_found: result.headings_count as u64,
+                                skipped_count: skipped_count as u64,
+                                skipped_files,
+                                coverage_status,
+                                trigram_refresh: None,
+                                exclusion_inventory: None,
+                            }));
+                            return;
+                        }
+                    };
+                    let mut message = format!(
+                        "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s) on changed notes.",
+                        result.vault_name,
+                        result.files_checked,
+                        result.notes_updated,
+                        result.notes_deleted,
+                        result.headings_count,
+                        result.sections_count,
+                        result.tags_count,
+                        result.changed_note_link_edges,
+                    );
+                    if withheld {
+                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s) on changed notes.",
-                            result.vault_name,
-                            result.files_checked,
-                            result.notes_updated,
-                            result.notes_deleted,
-                            result.headings_count,
-                            result.sections_count,
-                            result.tags_count,
-                            result.changed_note_link_edges,
-                        ),
+                        message,
                         files_processed: result.files_checked as u64,
                         files_total: result.files_checked as u64,
                         symbols_found: result.headings_count as u64,
-                        ..Default::default()
+                        skipped_count: skipped_count as u64,
+                        skipped_files,
+                        coverage_status,
+                        trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
                 }
                 Err(error) => {
@@ -16439,6 +16487,112 @@ credential_method = "gh"
             DerivationPhase::Blocked
         );
         vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    async fn refresh_vault_since_via_rpc(
+        state: &Arc<DaemonState>,
+        root: &Path,
+    ) -> Vec<IndexProgress> {
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RefreshVaultSinceRequest {
+            vault_path: root.display().to_string(),
+            vault_name: "vault".to_string(),
+            since_unix_seconds: 0,
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut rx = service
+            .refresh_vault_since(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .into_inner();
+        let mut progress = Vec::new();
+        while let Some(event) = rx.recv().await {
+            progress.push(event.unwrap());
+        }
+        progress
+    }
+
+    /// nw-651: a RefreshVaultSince (the watcher/RPC refresh) that discloses an
+    /// unreadable directory must demote a Current vault — it used to admit the
+    /// vault through `ensure_current`, never touch the record again, and drop
+    /// the skip rows from its Done progress, so the vault stayed Current over
+    /// a disclosed gap and the client saw `complete`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_vault_since_demotes_a_current_vault_over_an_unreadable_subdirectory() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current,
+            "precondition"
+        );
+
+        let _restore = lock_dir(&root.join("locked"));
+        let progress = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = progress
+            .last()
+            .expect("RefreshVaultSince streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Degraded as i32,
+            "{last:?}"
+        );
+        assert!(
+            last.skipped_files
+                .iter()
+                .any(|row| row.path == "locked" && row.reason_code == "read_error"),
+            "{last:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "a disclosed coverage gap must not leave the vault Current"
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+        let kept: Vec<String> = state
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(kept.iter().any(|path| path == "locked/C.md"), "{kept:?}");
+    }
+
+    /// Counterweight: a clean RefreshVaultSince leaves a Current vault Current
+    /// and reports complete coverage.
+    #[tokio::test]
+    async fn refresh_vault_since_keeps_a_clean_vault_current() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        let progress = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = progress.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.coverage_status, CoverageStatus::Complete as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
     }
 
     /// nw-651 counterweight: a brainignored unreadable subdirectory is policy,
