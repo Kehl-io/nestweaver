@@ -1214,6 +1214,15 @@ pub struct MarkdownSinceResult {
     /// actually CHANGED — a fifth population, and the narrowest of them. It is
     /// not comparable with a full index's `resolved_link_edges`.
     pub changed_note_link_edges: usize,
+    /// Notes OBSERVED gone from disk and removed. `notes_deleted` also counts
+    /// every rewritten note (a rewrite is a delete plus an insert); nw-651's
+    /// full-index handoff needs the removals alone to report `notes_deleted`
+    /// with a full index's meaning.
+    pub notes_removed: usize,
+    /// nw-345's unresolved populations, over the notes this pass rebuilt.
+    pub unresolved_link_occurrences: usize,
+    pub unresolved_link_section_targets: usize,
+    pub unresolved_link_targets: usize,
     pub publication: crate::manifest::GraphMutationPublicationOutcome,
     pub skipped: Vec<SkippedFile>,
     pub notes_near_size_limit: Vec<NearLimitNote>,
@@ -1486,7 +1495,9 @@ fn disclose_vault_prunes(reader: &dyn ContentReader, ignore_set: &GlobSet) -> Ve
 /// by the directory itself or a note nested two levels inside it (globset's
 /// `*` crosses `/`, so `dir/**`, `dir/*` and `**/dir/**` all match the probe).
 /// A pattern that excludes only SOME of its notes does not cover it: the row
-/// stays, erring toward disclosure.
+/// stays, erring toward disclosure. The probe is a `.md` path on purpose: a
+/// vault indexes only Markdown, so a pattern like `locked/*.md` covers
+/// everything the directory could contribute.
 fn brainignore_covers_dir(dir: &str, ignore_set: &GlobSet) -> bool {
     dir != "."
         && (crate::brainignore::is_ignored(dir, ignore_set)
@@ -1714,14 +1725,20 @@ fn index_markdown_since_with_reader_mode(
     // OBSERVED gone, so it is kept (nw-287: a deletion must be observed, never
     // inferred from silence) — the disclosed row says why it was not
     // refreshed. nw-653's startup drift keeps it for the same reason.
-    let removed_uids: std::collections::HashSet<String> = existing_notes
+    let unread_note_uids: HashSet<String> = existing_notes
         .iter()
         .filter(|note| !eligible_note_uids.contains(&note.uid))
         .filter(|note| {
-            !unreadable
+            unreadable
                 .iter()
                 .any(|dir| dir.as_os_str() == "." || Path::new(&note.file_path).starts_with(dir))
         })
+        .map(|note| note.uid.clone())
+        .collect();
+    let removed_uids: std::collections::HashSet<String> = existing_notes
+        .iter()
+        .filter(|note| !eligible_note_uids.contains(&note.uid))
+        .filter(|note| !unread_note_uids.contains(&note.uid))
         .map(|note| note.uid.clone())
         .collect();
     let changed_uids: std::collections::HashSet<String> = candidates
@@ -1773,6 +1790,10 @@ fn index_markdown_since_with_reader_mode(
             sections_count: 0,
             tags_count: 0,
             changed_note_link_edges: 0,
+            notes_removed: 0,
+            unresolved_link_occurrences: 0,
+            unresolved_link_section_targets: 0,
+            unresolved_link_targets: 0,
             publication: crate::manifest::finalize_committed_graph_mutation(store, false),
             skipped,
             notes_near_size_limit,
@@ -1886,9 +1907,15 @@ fn index_markdown_since_with_reader_mode(
         }
     }
     affected_sources.retain(|uid| !removed_uids.contains(uid));
+    // nw-651: a kept note under an unreadable directory cannot be re-parsed,
+    // so it keeps its stored body and is not rebuilt here. Its outgoing links
+    // into rewritten notes may be dropped — which is exactly why the row is a
+    // coverage GAP and derivation is withheld (not Current) until it is
+    // readable again. Aborting the whole refresh instead would stall every
+    // other note in the vault behind one unreadable directory.
     for source_uid in affected_sources
         .iter()
-        .filter(|uid| !changed_uids.contains(*uid))
+        .filter(|uid| !changed_uids.contains(*uid) && !unread_note_uids.contains(*uid))
     {
         let Some((rel_path, abs_path)) = indexed_paths.get(source_uid) else {
             return Err(anyhow::anyhow!(
@@ -2104,6 +2131,18 @@ fn index_markdown_since_with_reader_mode(
             }
         }
     }
+    let notes_removed = removed_uids.len();
+    let unresolved_link_occurrences = unresolved.len();
+    let unresolved_link_section_targets = unresolved
+        .iter()
+        .map(|record| record.0.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let unresolved_link_targets = unresolved
+        .iter()
+        .map(|record| (record.1.as_str(), record.4.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
     let plan = VaultRefreshPlan {
         vault: Vault {
             uid: v_uid.clone(),
@@ -2156,6 +2195,10 @@ fn index_markdown_since_with_reader_mode(
         sections_count: total_sections,
         tags_count: total_tags,
         changed_note_link_edges: changed_wikilinks,
+        notes_removed,
+        unresolved_link_occurrences,
+        unresolved_link_section_targets,
+        unresolved_link_targets,
         publication,
         skipped,
         notes_near_size_limit,
@@ -2803,6 +2846,58 @@ where
     // IMMEDIATELY AFTER `list_files`, for the same reason `index.rs`'s drain
     // does: the recorder is cleared at the top of every `list_files` call.
     skipped.extend(disclose_vault_prunes(reader, ignore_set));
+
+    // nw-651: RETAIN WHAT COULD NOT BE READ. The write below is a TOTAL
+    // replacement (`bulk_vault_reindex_write`), so a note under a directory
+    // this walk could not read never reaches the new set and would be
+    // cascade-deleted — inferred, not observed, which nw-287's empty-scan
+    // guard does not cover. For an already-indexed vault, hand the run to the
+    // `--since` route at the epoch instead: it re-parses every readable note,
+    // deletes only removals it observed, keeps the unreadable directory's
+    // notes, and discloses the same row. A first index has nothing to retain,
+    // and the server-mode repo path (`record_repo_sha`) reads a bare clone.
+    if record_repo_sha.is_none()
+        && !unreadable_dirs(reader).is_empty()
+        && store.lookup_vault(&v_uid).is_ok()
+    {
+        scan_pb.finish_and_clear();
+        let _write_guard = acquire_write_guard()?;
+        let since = index_markdown_since_with_reader_mode(
+            store,
+            reader,
+            instance_id,
+            vault_name,
+            std::time::SystemTime::UNIX_EPOCH,
+            ignore_set,
+            None,
+        )?;
+        // Full-index semantics for the sidecar: this run's skips replace the
+        // vault's previous ones rather than merging with them.
+        persist_skipped_notes_replace(
+            store.db_path(),
+            vault_root,
+            &since.skipped,
+            &since.notes_near_size_limit,
+        );
+        return Ok(MarkdownRefreshResult {
+            index: MarkdownIndexResult {
+                vault_uid: v_uid,
+                vault_name: vault_name.to_string(),
+                notes_count: since.notes_updated,
+                headings_count: since.headings_count,
+                sections_count: since.sections_count,
+                tags_count: since.tags_count,
+                resolved_link_edges: since.changed_note_link_edges,
+                unresolved_link_occurrences: since.unresolved_link_occurrences,
+                unresolved_link_section_targets: since.unresolved_link_section_targets,
+                unresolved_link_targets: since.unresolved_link_targets,
+                skipped: since.skipped,
+            },
+            notes_deleted: since.notes_removed,
+            publication: since.publication,
+            notes_near_size_limit: since.notes_near_size_limit,
+        });
+    }
 
     for rel_path in all_files {
         // nw-653: the shared eligibility rule (vault skip dirs such as
@@ -5076,6 +5171,56 @@ mod tests {
         );
     }
 
+    /// nw-651 RETENTION on the FULL vault index: `bulk_vault_reindex_write`
+    /// replaces the whole vault, so a note under a directory that became
+    /// unreadable never reached the new set and was cascade-deleted — nw-287's
+    /// guard only covers an EMPTY scan. It must be kept while disclosed.
+    #[cfg(unix)]
+    #[test]
+    fn full_vault_reindex_keeps_notes_under_an_unreadable_subdirectory() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\nsee [[a]]\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let full = |store: &GraphStore| {
+            index_markdown_directory_with_store_and_deletion_count(
+                store,
+                &root,
+                &root.join("unused.lbug"),
+                "default",
+                "v",
+                &[],
+            )
+            .unwrap()
+        };
+        full(&store);
+        assert_eq!(store.list_notes(None).unwrap().len(), 2, "precondition");
+
+        let _restore = lock_dir(&root.join("locked"));
+        let result = full(&store);
+        assert!(
+            result
+                .index
+                .skipped
+                .iter()
+                .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+            "the loss must be disclosed: {:?}",
+            result.index.skipped
+        );
+        let kept: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/b.md") && kept.iter().any(|p| p == "a.md"),
+            "an unread note is not a deleted one: {kept:?}"
+        );
+        assert_eq!(result.notes_deleted, 0, "nothing was observed deleted");
+    }
+
     /// nw-651 on the `--since` route (RefreshVaultSince / the watcher's
     /// refresh): the row is disclosed there too, and — because a deletion
     /// must be OBSERVED, never inferred from silence (nw-287) — notes already
@@ -5087,7 +5232,9 @@ mod tests {
         if running_as_root() {
             return;
         }
-        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        // `b` LINKS to `a`: rewriting `a` puts `b` in the affected-source
+        // closure, whose source cannot be read — that must not abort the run.
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\nsee [[a]]\n")]);
         let store = GraphStore::in_memory().unwrap();
         index_markdown_directory_with_store_and_deletion_count(
             &store,

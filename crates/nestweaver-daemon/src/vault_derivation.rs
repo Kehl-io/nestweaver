@@ -212,6 +212,12 @@ pub(super) enum IndexStamp {
 /// (`PublicationIncomplete`), so `brain status` counts it, gated tools refuse,
 /// and the background loop retries it on the Blocked backoff — its strict walk
 /// fails closed until the directory is readable, then stamps Current.
+///
+/// What the graph holds meanwhile: every route RETAINS already-indexed notes
+/// under an unreadable directory (the full index hands off to the `--since`
+/// route rather than replacing the vault). They are kept but not refreshed,
+/// and their links into rewritten notes may be stale — which is precisely what
+/// "not Current" tells the link-graph tools.
 pub(super) fn stamp_index_success(
     state: &DaemonState,
     vault_path: &Path,

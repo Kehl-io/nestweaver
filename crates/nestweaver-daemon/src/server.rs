@@ -16320,6 +16320,26 @@ credential_method = "gh"
         vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
     }
 
+    /// Restores a directory's mode on drop, so a panicking assertion cannot
+    /// leave a mode-000 directory behind for `TempDir` to trip over (nw-651).
+    #[cfg(unix)]
+    struct RestoreMode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> RestoreMode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        RestoreMode(dir.to_path_buf())
+    }
+
     /// nw-651: a vault subdirectory the walk cannot read is DISCLOSED — a
     /// `read_error` row naming it, coverage degraded — and derivation is NOT
     /// stamped Current: the record is persisted Blocked so `brain status`
@@ -16331,7 +16351,6 @@ credential_method = "gh"
     #[tokio::test]
     async fn index_vault_discloses_an_unreadable_subdirectory_and_withholds_derivation() {
         use nestweaver_engine::markdown_derivation::DerivationPhase;
-        use std::os::unix::fs::PermissionsExt;
         // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -16343,12 +16362,9 @@ credential_method = "gh"
         std::fs::write(root.join("B.md"), "# B\n").unwrap();
         std::fs::create_dir(root.join("locked")).unwrap();
         std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        let _restore = lock_dir(&root.join("locked"));
 
         let progress = index_vault_via_rpc(&state, &root).await;
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         let last = progress.last().expect("IndexVault streamed progress");
         assert_eq!(
             last.phase,
@@ -16386,7 +16402,6 @@ credential_method = "gh"
     #[tokio::test]
     async fn index_vault_demotes_a_current_vault_when_a_subdirectory_becomes_unreadable() {
         use nestweaver_engine::markdown_derivation::DerivationPhase;
-        use std::os::unix::fs::PermissionsExt;
         // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -16405,12 +16420,20 @@ credential_method = "gh"
             "precondition"
         );
 
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        let _restore = lock_dir(&root.join("locked"));
         let second = index_vault_via_rpc(&state, &root).await;
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         assert_eq!(second.last().unwrap().phase, Phase::Done as i32);
+        let kept: Vec<String> = state
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/C.md"),
+            "a note that could not be read is retained, not deleted: {kept:?}"
+        );
         assert_eq!(
             vault_derivation_record(&state).phase,
             DerivationPhase::Blocked
@@ -16424,7 +16447,6 @@ credential_method = "gh"
     #[tokio::test]
     async fn index_vault_stamps_derivation_over_a_brainignored_unreadable_subdirectory() {
         use nestweaver_engine::markdown_derivation::DerivationPhase;
-        use std::os::unix::fs::PermissionsExt;
         // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -16437,12 +16459,9 @@ credential_method = "gh"
         std::fs::write(root.join(".brainignore"), "locked/**\n").unwrap();
         std::fs::create_dir(root.join("locked")).unwrap();
         std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        let _restore = lock_dir(&root.join("locked"));
 
         let progress = index_vault_via_rpc(&state, &root).await;
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
         let last = progress.last().expect("IndexVault streamed progress");
         assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
         assert_eq!(

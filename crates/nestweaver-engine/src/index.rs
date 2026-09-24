@@ -2360,6 +2360,14 @@ pub(crate) fn disclose_pruned_dir(
     ))
 }
 
+/// Whether `path` (repo-relative) lies under a directory the walk could not
+/// read (nw-651). `.` — an error the walker could not attribute — covers all.
+fn path_under_unreadable_dir(path: &str, unreadable_dirs: &[PathBuf]) -> bool {
+    unreadable_dirs
+        .iter()
+        .any(|dir| dir.as_os_str() == "." || Path::new(path).starts_with(dir))
+}
+
 /// Index a directory into a persistent GraphStore at `db_path`.
 ///
 /// When `force` is false, tiered change detection is used: files whose
@@ -3655,6 +3663,17 @@ where
     // The row itself — reason code, message and the `.git` carve-out — is built
     // by `disclose_pruned_dir`, shared with the incremental drains so the two
     // commands cannot disagree about the same repo.
+    // nw-651: directories this walk could not READ. Their files were not
+    // observed, which is not the same as observed deleted: stored File/Symbol
+    // nodes under them must be RETAINED (while the row below discloses them),
+    // so both the whole-repo replacement and the vanished-file prune consult
+    // this. Captured here because the recorder is cleared on every walk.
+    let unreadable_dirs: Vec<PathBuf> = reader
+        .skipped_dirs()
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
     for pruned in reader.skipped_dirs() {
         if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             scan_skipped_files.push(skipped);
@@ -4359,7 +4378,13 @@ where
         //     insert of files, symbols, AND resolved edges — see
         //     `bulk_reindex_write` — so concurrent readers never see symbols
         //     without CALLS while type-env/resolve CPU runs.
-        let force_reindex = existing_repo.is_some() && files_unchanged == 0;
+        //
+        //     nw-651: never the whole-repo replacement while a directory was
+        //     unreadable — it would delete that directory's stored files, which
+        //     this run never saw. The per-file branch below re-inserts every
+        //     parsed file just the same and its prune skips those paths.
+        let force_reindex =
+            existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
         // nw-204: this whole-store re-index path deletes symbols too, and used
         // to discard the fact entirely. Accumulate what it removed so the
         // epilogue can tombstone the embeddings of symbols that do not come
@@ -4385,7 +4410,9 @@ where
             // not present anymore is stale and gets dropped.
             if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
                 for (f_uid, path) in &stored_files {
-                    if !present_files.contains(path) {
+                    if !present_files.contains(path)
+                        && !path_under_unreadable_dir(path, &unreadable_dirs)
+                    {
                         if let Ok(removed) = store.delete_symbols_in_file(&r_uid, path) {
                             reindex_deleted_uids.extend(removed);
                             reindex_deleted_files.push(path.clone());
@@ -8309,6 +8336,78 @@ mod tests {
             "the changed-file incremental branch must disclose it too: {:?}",
             third.skipped_files
         );
+    }
+
+    /// nw-651 RETENTION: a directory that becomes unreadable was not OBSERVED
+    /// deleted, so its already-indexed File and Symbol nodes must survive
+    /// every full-scan route while the row discloses it. Before the fix
+    /// `index --force` took the whole-repo replacement (`bulk_reindex_write`)
+    /// and a plain full scan's vanished-file prune deleted `locked/hidden.py`
+    /// outright — a silent loss behind a now-honest row.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_keeps_its_indexed_files_on_force_and_plain_scans() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("locked")).unwrap();
+        fs::write(repo.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("locked/hidden.py"),
+            "def hidden():\n    return 2\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        let repo_url = "https://example.test/unreadable-retained";
+        let run = |force: bool| {
+            index_directory_with_options_and_limits(
+                &repo,
+                &db,
+                "test",
+                repo_url,
+                "fixture",
+                force,
+                None,
+                crate::index_limits::IndexLimits::default(),
+            )
+            .unwrap()
+        };
+        let hidden_state = || {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let file = store
+                .list_files_by_repo(&repo_uid("test", repo_url))
+                .unwrap()
+                .into_iter()
+                .any(|(_, path)| path == "locked/hidden.py");
+            let symbols = store.symbols_in_file("locked/hidden.py").unwrap().len();
+            (file, symbols)
+        };
+        run(true);
+        assert_eq!(
+            hidden_state(),
+            (true, 1),
+            "precondition: indexed while readable"
+        );
+
+        let _restore = lock_dir(&repo.join("locked"));
+        for (label, force) in [("--force", true), ("plain full scan", false)] {
+            let result = run(force);
+            assert!(
+                result
+                    .skipped_files
+                    .iter()
+                    .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+                "{label}: the loss must be disclosed: {:?}",
+                result.skipped_files
+            );
+            assert_eq!(
+                hidden_state(),
+                (true, 1),
+                "{label}: an unreadable file is not a deleted one"
+            );
+        }
     }
 
     /// nw-651 COUNTERWEIGHT: ignore rules win. A gitignored directory is never
