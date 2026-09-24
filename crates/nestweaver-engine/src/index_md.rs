@@ -792,6 +792,59 @@ pub(crate) fn record_vault_reconciliation_debt(
     replace_reconciliation_debt(db_path, vault_root.to_string_lossy().into_owned(), owed);
 }
 
+/// nw-668: disclose vault notes whose TEXT committed but whose code links
+/// (cross-domain edges) did not, and which the watcher is retrying. Same
+/// `WATCH_RECONCILIATION_PENDING_REASON` prefix as a startup reconciliation —
+/// both are "not yet reconciled into the graph" — but its own wording, since
+/// nothing about startup failed. With `replace_existing` this is the vault's
+/// whole debt (a replay that described all of it); otherwise the rows for
+/// `paths` are replaced and every other row, e.g. an owed startup replay's,
+/// is kept.
+pub(crate) fn record_vault_link_debt(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    paths: &[PathBuf],
+    error: &str,
+    replace_existing: bool,
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let reason = format!(
+        "{WATCH_RECONCILIATION_PENDING_REASON}: brain watcher code links not yet written; \
+         retrying ({error})"
+    );
+    let owed_paths: HashSet<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let key = vault_root.to_string_lossy().into_owned();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let mut owed = if replace_existing {
+            Vec::new()
+        } else {
+            sidecar
+                .reconciliation_pending
+                .remove(&key)
+                .unwrap_or_default()
+        };
+        owed.retain(|row| !owed_paths.contains(&row.path));
+        owed.extend(
+            owed_paths
+                .iter()
+                .map(|path| SkippedFile::new(path.clone(), SkipReasonCode::Other, reason.clone())),
+        );
+        owed.sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar.reconciliation_pending.insert(key, owed);
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        ))
+    });
+}
+
 /// nw-664: set the CODE watcher's reconciliation debt for `repo_root` to
 /// `owed` (absolute paths, reasons built by the watcher; empty clears it).
 /// Namespaced apart from any vault at the same root.

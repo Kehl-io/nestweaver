@@ -1063,6 +1063,9 @@ impl BrainWatcher {
             paths.dedup();
             paths
         });
+        // nw-668: a replay whose text landed but whose code links did not is
+        // disclosed as owed links, not as a failed startup reconciliation.
+        let mut link_failure = false;
         let (paths, error) = match drift {
             Ok(paths) if paths.is_empty() => {
                 // Nothing left to reconcile: settle any debt an earlier
@@ -1085,7 +1088,10 @@ impl BrainWatcher {
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
                     // nw-668: the text landed but some notes' code links did
                     // not; only those are still owed.
-                    Ok(Some(debt)) => (Some(debt.paths), anyhow::anyhow!(debt.error)),
+                    Ok(Some(debt)) => {
+                        link_failure = true;
+                        (Some(debt.paths), anyhow::anyhow!(debt.error))
+                    }
                     Ok(None) => {
                         crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
@@ -1126,12 +1132,22 @@ impl BrainWatcher {
             .clone()
             .unwrap_or_else(|| vec![self.vault_root.clone()]);
         disclosed.extend(also_replay.iter().cloned());
-        crate::index_md::record_vault_reconciliation_debt(
-            store.db_path(),
-            &self.vault_root,
-            &disclosed,
-            Some(&message),
-        );
+        if link_failure {
+            crate::index_md::record_vault_link_debt(
+                store.db_path(),
+                &self.vault_root,
+                &disclosed,
+                &message,
+                true,
+            );
+        } else {
+            crate::index_md::record_vault_reconciliation_debt(
+                store.db_path(),
+                &self.vault_root,
+                &disclosed,
+                Some(&message),
+            );
+        }
         Ok(Some(PendingReconciliation {
             paths,
             also_replay,
@@ -1177,24 +1193,21 @@ impl BrainWatcher {
                 next_attempt: Instant::now() + reconcile_retry_delay(self.reconcile_retry_base, 1),
             },
         };
-        let mut disclosed = next
-            .paths
-            .clone()
-            .unwrap_or_else(|| vec![self.vault_root.clone()]);
-        disclosed.extend(next.also_replay.iter().cloned());
-        let message = format!("code links were not written: {}", debt.error);
         tracing::error!(
             vault = %self.vault_root.display(),
-            error = %message,
+            error = %debt.error,
             notes = debt.paths.len(),
             "BrainWatcher could not write code links for committed notes; they have none \
              until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
         );
-        crate::index_md::record_vault_reconciliation_debt(
+        // Merged, not replaced: rows an owed startup replay already disclosed
+        // keep their own (startup) reason.
+        crate::index_md::record_vault_link_debt(
             store.db_path(),
             &self.vault_root,
-            &disclosed,
-            Some(&message),
+            &debt.paths,
+            &debt.error,
+            false,
         );
         next
     }
@@ -3972,6 +3985,22 @@ mod tests {
             vec![path.to_string_lossy().into_owned()],
             "the owed notes are disclosed"
         );
+        let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+            .skipped
+            .into_iter()
+            .map(|file| file.reason)
+            .collect();
+        let expected_prefix = format!(
+            "{}: brain watcher code links not yet written; retrying (",
+            crate::index_md::WATCH_RECONCILIATION_PENDING_REASON
+        );
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].starts_with(&expected_prefix)
+                && reasons[0].contains("injected cross-domain flush failure")
+                && !reasons[0].contains("startup"),
+            "a live link failure must say what is owed, not blame startup: {reasons:?}"
+        );
 
         let next = watcher
             .attempt_reconciliation(
@@ -4023,6 +4052,15 @@ mod tests {
             nw_668_owed_debt(&fx.db_path),
             vec![path.to_string_lossy().into_owned()]
         );
+        assert!(
+            crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+                .skipped
+                .iter()
+                .all(|file| file
+                    .reason
+                    .contains("brain watcher code links not yet written")),
+            "a replay whose text landed discloses owed links, not a failed startup"
+        );
 
         let next = watcher
             .attempt_reconciliation(
@@ -4050,6 +4088,13 @@ mod tests {
         let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
         let path = fx.root.join("n000.md");
         let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        // What the failed drift attempt that produced `existing` disclosed.
+        crate::index_md::record_vault_reconciliation_debt(
+            fx.store.db_path(),
+            &fx.root,
+            std::slice::from_ref(&fx.root),
+            Some("drift failed"),
+        );
         let existing = PendingReconciliation {
             paths: None,
             also_replay: Vec::new(),
@@ -4067,14 +4112,23 @@ mod tests {
         assert!(merged.paths.is_none(), "still recomputes drift");
         assert_eq!(merged.also_replay, vec![path.clone()]);
         assert_eq!(merged.failures, 3, "an owed retry keeps its schedule");
-        let mut debt = nw_668_owed_debt(&fx.db_path);
-        debt.sort();
-        let mut expected = vec![
-            fx.root.to_string_lossy().into_owned(),
-            path.to_string_lossy().into_owned(),
-        ];
-        expected.sort();
-        assert_eq!(debt, expected);
+        let rows: HashMap<String, String> =
+            crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+                .skipped
+                .into_iter()
+                .map(|file| (file.path, file.reason))
+                .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[&fx.root.to_string_lossy().into_owned()]
+                .contains("brain watcher startup reconciliation failed; retrying (drift failed)"),
+            "the startup row keeps its own reason: {rows:?}"
+        );
+        assert!(
+            rows[&path.to_string_lossy().into_owned()]
+                .contains("brain watcher code links not yet written; retrying (injected)"),
+            "{rows:?}"
+        );
     }
 
     /// nw-668 review (M5): `sidecar_scan_skipped` is reachable — an edit that
