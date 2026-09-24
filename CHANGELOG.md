@@ -1,5 +1,28 @@
 # Changelog
 
+## [10.2.1](https://github.com/Kehl-io/nestweaver/compare/v10.2.0...v10.2.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* batch 3 — stop silent loss of notes and dead-code false negatives ([33f4fd0](https://github.com/Kehl-io/nestweaver/commit/33f4fd007b2fcc9799b9713acfeb8cdbc88ca783))
+* batch 3 — stop silent loss of notes and dead-code false negatives ([#429](https://github.com/Kehl-io/nestweaver/issues/429)) ([33f4fd0](https://github.com/Kehl-io/nestweaver/commit/33f4fd007b2fcc9799b9713acfeb8cdbc88ca783))
+* **cli:** exit with the usage code on schema-invalid tool arguments ([14e74f4](https://github.com/Kehl-io/nestweaver/commit/14e74f47ad708dfb59e156ea5f9e44b69536577f))
+* **daemon:** clear a removed vault's skipped-notes debt ([16ea763](https://github.com/Kehl-io/nestweaver/commit/16ea763471d1e79508fcbf745bdd9e125adff15b))
+* **daemon:** demote vault derivation when a since refresh finds a gap ([7ed66d8](https://github.com/Kehl-io/nestweaver/commit/7ed66d89f7c6133c8bb2cf272c9a1d820c7d5ba8))
+* **engine:** classify walk errors by cause before disclosing them ([e292cd9](https://github.com/Kehl-io/nestweaver/commit/e292cd96aee98318e79b48c4ecc6f5dccb033c1c))
+* **engine:** clear stale directory rows on a vault since refresh ([517fc3e](https://github.com/Kehl-io/nestweaver/commit/517fc3ec978692a4af3695e1a6d35fefc17c1293))
+* **engine:** disclose directories the walk cannot read ([29d8d25](https://github.com/Kehl-io/nestweaver/commit/29d8d252f5b609243c2169d17b3faca30a022d6b))
+* **engine:** reconcile vault notes changed while no watcher ran ([9eb67a3](https://github.com/Kehl-io/nestweaver/commit/9eb67a378d2c777e1deb3c440a5b1fd0c15ad6ea))
+* **engine:** report owed vault reconciliation uncapped in status ([bb73aeb](https://github.com/Kehl-io/nestweaver/commit/bb73aeb33276d3a798c24bae0889b32bd98f8e27))
+* **engine:** retain content under unreadable directories ([ff8f001](https://github.com/Kehl-io/nestweaver/commit/ff8f0016b07297da8062a39b3afa5d5d43e02262))
+* **engine:** retry and disclose failed vault startup reconciliation ([ad7a823](https://github.com/Kehl-io/nestweaver/commit/ad7a8230f87169289764021284bc7aa352aa753e))
+* **engine:** scope owed vault reconciliation debt to its vault ([8954971](https://github.com/Kehl-io/nestweaver/commit/8954971185a21a6e8daaa8737148bfbe5c825c52))
+* **engine:** serialize and atomically write the skipped-notes sidecar ([a6676a6](https://github.com/Kehl-io/nestweaver/commit/a6676a6f672a23571a46c521842757b377a93575))
+* **parser:** count svelte directive names and skip html comments ([4b4a2cd](https://github.com/Kehl-io/nestweaver/commit/4b4a2cdeb4c6829fd2ab4644fce6d2d4f5905f12))
+* **parser:** root component symbols the template markup uses ([6076834](https://github.com/Kehl-io/nestweaver/commit/60768344f634d6adca97dd470fd450bfa7e13eb7))
+* **parser:** root only framework hooks in component route files ([e85529b](https://github.com/Kehl-io/nestweaver/commit/e85529b0f1f9a159635b88b84f4502f77f429ef8))
+
 ## [10.2.0](https://github.com/Kehl-io/nestweaver/compare/v10.1.2...v10.2.0) (2026-09-24)
 
 
