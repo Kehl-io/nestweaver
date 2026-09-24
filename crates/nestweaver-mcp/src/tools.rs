@@ -15900,6 +15900,19 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+/// Like [`arg_root`], but returns `None` when `root` was omitted instead of
+/// defaulting to cwd.
+///
+/// nw-560: `investigate_expand`/`investigate_hydrate` need to tell "omitted"
+/// from "explicit" apart so they can fall back to each symbol's owning-repo
+/// `local_root` (like `read_symbols`) rather than the server's working
+/// directory, while an explicit `root` still wins outright.
+fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
+    args.get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+}
+
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
@@ -15992,7 +16005,7 @@ fn tool_schema_investigate_expand() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id", "targets"]
         }
@@ -16016,9 +16029,9 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
     if targets.is_empty() {
         return Err(anyhow!("'targets' must be a non-empty array"));
     }
-    let root = arg_root(&args);
+    let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_expand(store, &db_path, &root, bundle_id, &targets)?;
+    let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -16032,7 +16045,7 @@ fn tool_schema_investigate_hydrate() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id"]
         }
@@ -16055,9 +16068,9 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root(&args);
+    let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
+    let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)?;
     Ok(serde_json::to_value(result)?)
 }
 

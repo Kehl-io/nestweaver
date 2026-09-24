@@ -21762,7 +21762,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             let root = root.unwrap_or_else(detect_repo_root);
             let result = nestweaver_engine::investigate_expand(
-                &store, &db_path, &root, &bundle_id, &targets,
+                &store,
+                &db_path,
+                Some(root.as_path()),
+                &bundle_id,
+                &targets,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -21836,7 +21840,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let result = nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
-                &root,
+                Some(root.as_path()),
                 &bundle_id,
                 Some(token_budget),
             )?;
