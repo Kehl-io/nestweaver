@@ -575,6 +575,12 @@ fn record_ingest_failures(
         .filter(|file| is_ingest_failure(file.reason_code))
     {
         let abs = vault_root.join(&file.path);
+        // nw-651 review: an unreadable-DIRECTORY row is a ReadError too, but
+        // this map is per NOTE (startup drift looks notes up in it); a
+        // directory entry would only outlive the directory's fix.
+        if abs.is_dir() {
+            continue;
+        }
         if let Some(mtime) = file_mtime_string(&abs) {
             map.insert(abs.to_string_lossy().into_owned(), mtime);
         }
@@ -635,11 +641,20 @@ fn persist_skipped_notes_merge(
             .unindexable_mtimes
             .remove(&*vault_root.join(path).to_string_lossy());
     }
+    // nw-651 review: entries an older build recorded for directories.
+    sidecar
+        .unindexable_mtimes
+        .retain(|path, _| !(Path::new(path).starts_with(vault_root) && Path::new(path).is_dir()));
     record_ingest_failures(&mut sidecar.unindexable_mtimes, vault_root, skipped);
     let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
+    // nw-651 review: this route WALKS the whole vault too, and every row the
+    // walk produces (an unreadable or pruned directory, an ignore file it
+    // could not apply) is in `skipped` again when it still holds. Keeping the
+    // old ones kept a directory "unreadable" in `brain status` after its
+    // permissions were fixed, until the next full index.
     sidecar
         .skipped
-        .retain(|file| !touched.contains(file.path.as_str()));
+        .retain(|file| !touched.contains(file.path.as_str()) && !is_walk_row(vault_root, file));
     sidecar
         .notes_near_size_limit
         .retain(|note| !touched.contains(note.path.as_str()));
@@ -660,6 +675,21 @@ fn persist_skipped_notes_merge(
         sidecar.reconciliation_pending,
     );
     persist_skipped_notes_sidecar(db_path, &rebuilt);
+}
+
+/// Whether a sidecar row came from the vault WALK rather than from reading a
+/// note: `.` (an unplaced walk error), a path that is a directory in this
+/// vault, or an ignore-file row. Judged against THIS vault's disk, because
+/// `skipped` holds vault-relative paths for every vault in the database: a
+/// directory row of another vault survives unless this vault has a directory
+/// at the same path. (A directory that has since been DELETED is not
+/// recognised and keeps its row until the next full index.)
+fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
+    file.path == "."
+        || file
+            .reason
+            .starts_with(crate::index::IGNORE_FILE_ROW_PREFIX)
+        || vault_root.join(&file.path).is_dir()
 }
 
 /// nw-653: reason prefix of the entries that disclose a watcher startup
@@ -5275,6 +5305,65 @@ mod tests {
         assert!(
             kept.iter().any(|path| path == "locked/b.md"),
             "an unread note is not a deleted one: {kept:?}"
+        );
+    }
+
+    /// nw-651 review: the `--since` / watcher route MERGES its skip rows into
+    /// the sidecar, dropping old rows only for touched NOTE paths — so a
+    /// `locked` directory row outlived the fix of its permissions until the
+    /// next full index, and `brain status` kept reporting it. The walk sees
+    /// the whole vault on every refresh, so a directory row it no longer
+    /// produces is dropped; one it still produces stays exactly once. The
+    /// directory never enters `unindexable_mtimes` (a NOTE map).
+    #[cfg(unix)]
+    #[test]
+    fn since_refresh_clears_the_row_of_a_directory_readable_again() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        let since = || {
+            index_markdown_directory_since(
+                &root,
+                &db,
+                "default",
+                "v",
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .unwrap()
+        };
+        let locked_rows = || {
+            load_skipped_notes_sidecar(&db)
+                .skipped
+                .iter()
+                .filter(|row| row.path == "locked")
+                .count()
+        };
+
+        let restore = lock_dir(&root.join("locked"));
+        since();
+        since();
+        assert_eq!(locked_rows(), 1, "still locked: disclosed once");
+        let recorded = load_skipped_notes_sidecar(&db).unindexable_mtimes;
+        assert!(
+            !recorded.keys().any(|path| path.ends_with("locked")),
+            "a directory is not an unindexable note: {recorded:?}"
+        );
+        drop(restore);
+
+        since();
+        let sidecar = load_skipped_notes_sidecar(&db);
+        assert_eq!(locked_rows(), 0, "readable again: {:?}", sidecar.skipped);
+        assert!(
+            !sidecar
+                .unindexable_mtimes
+                .keys()
+                .any(|path| path.ends_with("locked")),
+            "a directory is not an unindexable note: {:?}",
+            sidecar.unindexable_mtimes
         );
     }
 

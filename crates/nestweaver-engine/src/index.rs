@@ -2201,6 +2201,11 @@ pub(crate) enum SkipDirCaller {
     Vault,
 }
 
+/// How every [`crate::content_reader::IGNORE_FILE_ERROR_REASON`] row's
+/// message starts, so a sidecar merge can recognise a walk-level row whose
+/// `path` is a file (nw-651 review).
+pub(crate) const IGNORE_FILE_ROW_PREFIX: &str = "ignore file `";
+
 /// Turn one recorded prune into the `SkippedFile` row the coverage gate reads,
 /// or `None` when that prune is deliberately not disclosed.
 ///
@@ -2274,7 +2279,7 @@ pub(crate) fn disclose_pruned_dir(
             pruned.path.clone(),
             SkipReasonCode::Ignored,
             format!(
-                "ignore file `{path}` could not be applied ({detail}); the rule it \
+                "{IGNORE_FILE_ROW_PREFIX}{path}` could not be applied ({detail}); the rule it \
                  holds was skipped, so paths it meant to exclude may be indexed — fix \
                  the pattern (or the file's permissions) and re-run the index",
                 path = pruned.path,
