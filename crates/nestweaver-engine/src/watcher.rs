@@ -22,7 +22,7 @@ use nestweaver_parser::is_markdown;
 use nestweaver_schema::{Vault, note_uid, vault_uid};
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use notify::event::{MetadataKind, ModifyKind};
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::{Event, EventKind};
 
 /// Opaque caller-owned protection held for one watcher mutation window.
 ///
@@ -146,20 +146,114 @@ struct BatchPhaseTimings {
     /// `graph_batch`, unlike the five phases above.
     non_graph_events_ms: u64,
     finalize_ms: u64,
+    /// nw-668: the sidecar phase split into its parts, so a slow one names
+    /// its culprit. `sidecar_scan_ms` runs with no lease held;
+    /// `sidecar_flush_ms` and `sidecar_tantivy_ms` under it.
+    sidecar_scan_ms: u64,
+    sidecar_flush_ms: u64,
+    sidecar_tantivy_ms: u64,
+    /// Cross-domain edges the scan produced for this batch.
+    sidecar_edges: usize,
+    /// Write transactions and statements the cross-domain flush cost.
+    sidecar_transactions: usize,
+    sidecar_statements: usize,
+    /// Changed notes still in the graph whose text this batch did not read.
+    /// Reachable only for an edit that pushed a note over the size limit
+    /// (nw-469): the refresh skips it without replacing its nodes, so it
+    /// keeps its stored body AND the code links that body produced. (A read
+    /// or parse failure of an indexed note fails the refresh instead.)
+    sidecar_scan_skipped: usize,
+    /// Flush attempts that failed and rolled back (non-fatal; logged). A
+    /// chunk is retried once; one that fails twice is owed (`SidecarDebt`).
+    sidecar_flush_failures: usize,
+    /// nw-668: parameterized statements the flushes executed, counted at the
+    /// store's execute boundary rather than taken from the flush's report.
+    sidecar_boundary_statements: u64,
 }
 
-/// nw-653: backoff for retrying a failed startup reconciliation.
-const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(5);
-const RECONCILE_RETRY_CAP: Duration = Duration::from_secs(300);
+/// nw-653: backoff for retrying a failed startup reconciliation. Shared with
+/// the code watcher's (nw-664), which retries on the same schedule.
+pub(crate) const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(5);
+pub(crate) const RECONCILE_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// nw-653 / nw-664: the delay before retry `failures` (1-based) of a startup
+/// reconciliation: `base` doubling per failure, capped at
+/// [`RECONCILE_RETRY_CAP`]. One schedule for the vault and code watchers.
+pub(crate) fn reconcile_retry_delay(base: Duration, failures: u32) -> Duration {
+    base.saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(RECONCILE_RETRY_CAP)
+}
 
 /// nw-653: a startup reconciliation that has not yet committed. It is kept and
 /// retried from the event loop rather than dropped: dropping it is exactly how
 /// the notes this fixes were lost. `paths` is `None` when the drift itself
 /// could not be computed, so the retry recomputes it.
-struct PendingReconciliation {
-    paths: Option<Vec<PathBuf>>,
-    failures: u32,
-    next_attempt: Instant,
+pub(crate) struct PendingReconciliation {
+    pub(crate) paths: Option<Vec<PathBuf>>,
+    /// Vault watcher only (nw-668): notes whose text committed but whose
+    /// code links did not, replayed ON TOP of a recomputed drift — drift
+    /// compares disk with the graph's text and cannot see them. Always empty
+    /// when `paths` is `Some` (they are merged in) and for the code watcher.
+    pub(crate) also_replay: Vec<PathBuf>,
+    pub(crate) failures: u32,
+    pub(crate) next_attempt: Instant,
+}
+
+/// nw-668: notes a batch committed whose cross-domain links did not land —
+/// the flush failed, and so did its one immediate retry. The refresh already
+/// replaced these notes' nodes, so they carry NO code links; the watcher owes
+/// them a replay through the reconciliation retry.
+#[derive(Debug)]
+pub(crate) struct SidecarDebt {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) error: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint (nw-668): fail this many upcoming note-structure reads
+    /// in the sidecar phase.
+    static FAIL_NOTE_STRUCTURE_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A committed note's sections, and its headings when `with_headings`, for
+/// the sidecar phase.
+fn read_note_structure(
+    store: &GraphStore,
+    uid: &str,
+    with_headings: bool,
+) -> Result<
+    (
+        Vec<nestweaver_schema::Section>,
+        Vec<nestweaver_schema::Heading>,
+    ),
+    anyhow::Error,
+> {
+    #[cfg(test)]
+    if FAIL_NOTE_STRUCTURE_READS.with(|fail| {
+        let armed = fail.get();
+        fail.set(armed.saturating_sub(1));
+        armed > 0
+    }) {
+        anyhow::bail!("injected note structure read failure");
+    }
+    let sections = store.sections_in_note(uid)?;
+    let headings = if with_headings {
+        store.headings_in_note(uid)?
+    } else {
+        Vec::new()
+    };
+    Ok((sections, headings))
+}
+
+/// Add `paths` to the batch's [`SidecarDebt`], keeping the first error.
+fn owe(debt: &mut Option<SidecarDebt>, paths: &[PathBuf], error: &str) {
+    debt.get_or_insert_with(|| SidecarDebt {
+        paths: Vec::new(),
+        error: error.to_string(),
+    })
+    .paths
+    .extend(paths.iter().cloned());
 }
 
 /// Live file-watcher for a single vault. Construct via `new`, then call
@@ -201,6 +295,13 @@ pub struct BrainWatcher {
     /// mutability because `process_batch` takes `&self`.
     #[cfg(test)]
     last_batch_phase_timings: std::sync::Mutex<Option<BatchPhaseTimings>>,
+    #[cfg(test)]
+    /// nw-668 test probe, called before each note's cross-domain scan with
+    /// how many scanned-but-unflushed notes are held at that moment.
+    sidecar_scan_probe: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    /// Test seam: subscribe as inotify would fail on an unreadable subtree.
+    #[cfg(test)]
+    emulate_inotify_watch: bool,
 }
 
 impl BrainWatcher {
@@ -315,7 +416,47 @@ impl BrainWatcher {
             ready_signal: None,
             #[cfg(test)]
             last_batch_phase_timings: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sidecar_scan_probe: None,
+            #[cfg(test)]
+            emulate_inotify_watch: false,
         }
+    }
+
+    /// nw-651 on Linux: disclose the directories the subscription could not
+    /// cover as the vault walk's unreadable-directory rows, minus `SKIP_DIRS`
+    /// (never walked) — `.brainignore` is applied by the writer. A directory
+    /// that became watchable again needs no call: the batch that follows
+    /// walks the vault and re-derives every walk row.
+    fn disclose_unwatchable_dirs(&self, store: &GraphStore, dirs: &[(PathBuf, String)]) {
+        let dirs: Vec<(PathBuf, String)> = dirs
+            .iter()
+            .filter(|(dir, _)| !path_in_skip_dir(dir))
+            .cloned()
+            .collect();
+        for (dir, error) in &dirs {
+            tracing::warn!(
+                dir = %dir.display(),
+                %error,
+                "brain watcher cannot watch this directory; edits beneath it are not seen live"
+            );
+        }
+        crate::index_md::disclose_unwatchable_vault_dirs(
+            store.db_path(),
+            &self.vault_root,
+            &self.ignore_set,
+            &dirs,
+        );
+    }
+
+    /// Test hook: make the recursive subscription fail the way Linux inotify
+    /// does on an unreadable subdirectory (see `watch_tree`).
+    /// Linux tests use real inotify instead, so the hook is unused there.
+    #[cfg(test)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn emulating_inotify_watch(mut self) -> Self {
+        self.emulate_inotify_watch = true;
+        self
     }
 
     /// Enable Tantivy index sync. When set, every note update/delete
@@ -524,7 +665,7 @@ impl BrainWatcher {
         // mutation while initial publication and callbacks are running.
         // Channel from the debouncer into our loop.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let mut watcher =
+        let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_kind_can_mutate(&event.kind) => {
                     let _ = tx.send(Ok(event.paths));
@@ -535,9 +676,19 @@ impl BrainWatcher {
                 }
             })
             .with_context(|| "init filesystem watcher")?;
-        watcher
-            .watch(&self.vault_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", self.vault_root.display()))?;
+        // nw-651 on Linux: an unreadable subdirectory must not stop the whole
+        // subscription; it is skipped and disclosed instead (`watch_tree`).
+        #[cfg(test)]
+        let tree = if self.emulate_inotify_watch {
+            crate::watch_tree::TreeWatch::start_emulating_inotify(watcher, &self.vault_root)
+        } else {
+            crate::watch_tree::TreeWatch::start(watcher, &self.vault_root)
+        };
+        #[cfg(not(test))]
+        let tree = crate::watch_tree::TreeWatch::start(watcher, &self.vault_root);
+        let mut tree = tree.with_context(|| format!("watch {}", self.vault_root.display()))?;
+        self.disclose_unwatchable_dirs(&store, tree.unwatchable());
+        let mut subscribed_unwatchable = tree.unwatchable().to_vec();
         // Use external Tantivy if provided (daemon mode), otherwise open from path.
         let tantivy: Option<Arc<TantivyIndex>> = if let Some(ext) = self.external_tantivy.take() {
             Some(ext)
@@ -561,6 +712,13 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
+        // nw-608: before publishing the Vault node below.
+        crate::vault_registration::refuse_duplicate_vault_name(
+            &store,
+            &v_uid,
+            &self.vault_name,
+            &self.vault_root,
+        )?;
         let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
             Ok(lease) => lease,
             Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -617,6 +775,12 @@ impl BrainWatcher {
             &v_uid,
             &on_change,
             None,
+            // nw-668: notes a previous run still owed (their text landed,
+            // their code links did not) — invisible to the drift below.
+            store
+                .db_path()
+                .map(|db| crate::index_md::vault_owed_note_paths(db, &self.vault_root))
+                .unwrap_or_default(),
             0,
         ) {
             Ok(pending) => pending,
@@ -658,13 +822,14 @@ impl BrainWatcher {
                     &v_uid,
                     &on_change,
                     owed.paths,
+                    owed.also_replay,
                     owed.failures,
                 ) {
                     Ok(next) => pending = next,
                     Err(_) => return Ok(()),
                 }
             }
-            let batch = match receive_debounced_paths(
+            let mut batch = match receive_debounced_paths(
                 &rx,
                 Duration::from_millis(self.debounce_ms),
                 &self.stop_flag,
@@ -712,8 +877,21 @@ impl BrainWatcher {
                 }
             };
 
+            // nw-651 on Linux: a directory created under a non-recursively
+            // watched one needs its own watch, and its notes may predate it.
+            let adopted = tree.adopt_new_dirs(&batch);
+            batch.extend(adopted);
+            if tree.unwatchable() != subscribed_unwatchable.as_slice() {
+                subscribed_unwatchable = tree.unwatchable().to_vec();
+                self.disclose_unwatchable_dirs(&store, &subscribed_unwatchable);
+            }
             match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
-                Ok(()) => {}
+                Ok(None) => {}
+                // nw-668: committed text, missing code links — owed, disclosed
+                // and retried on the reconciliation backoff, not just logged.
+                Ok(Some(debt)) => {
+                    pending = Some(self.owe_sidecar_retry(&store, pending.take(), debt))
+                }
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                     return Ok(());
                 }
@@ -740,7 +918,7 @@ impl BrainWatcher {
         v_uid: &str,
         batch: Vec<PathBuf>,
         on_change: &Option<Box<dyn Fn() + Send>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Option<SidecarDebt>, anyhow::Error> {
         let mut unique_paths = batch;
         unique_paths.sort();
         unique_paths.dedup();
@@ -816,6 +994,7 @@ impl BrainWatcher {
             build_symbol_index_started.elapsed().as_millis() as u64;
 
         let mut batch_failures = Vec::new();
+        let mut sidecar_debt = None;
         if graph_batch {
             let embedding_candidates_started = Instant::now();
             let mut embedding_candidates = Vec::new();
@@ -833,7 +1012,7 @@ impl BrainWatcher {
             // any deletion. A failed plan or transaction leaves the publication
             // marker dirty and never emits a successful change callback.
             let refresh_watched_paths_started = Instant::now();
-            crate::index_md::refresh_watched_paths(
+            let committed_sources = crate::index_md::refresh_watched_paths(
                 store,
                 &self.vault_root,
                 &self.instance_id,
@@ -848,17 +1027,16 @@ impl BrainWatcher {
 
             let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
             let sidecars_started = Instant::now();
-            for path in &graph_paths {
-                let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
-                self.refresh_prepared_note_sidecars(
-                    store,
-                    tantivy,
-                    v_uid,
-                    path,
-                    symbol_index.as_ref(),
-                    &note_tags,
-                )?;
-            }
+            sidecar_debt = self.refresh_prepared_sidecars(
+                store,
+                tantivy,
+                v_uid,
+                &graph_paths,
+                symbol_index.as_ref(),
+                &note_tags,
+                &committed_sources,
+                &mut phase_timings,
+            )?;
             phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
 
             let tombstones_started = Instant::now();
@@ -933,6 +1111,14 @@ impl BrainWatcher {
             embedding_candidates_ms = phase_timings.embedding_candidates_ms,
             refresh_watched_paths_ms = phase_timings.refresh_watched_paths_ms,
             sidecars_ms = phase_timings.sidecars_ms,
+            sidecar_scan_ms = phase_timings.sidecar_scan_ms,
+            sidecar_flush_ms = phase_timings.sidecar_flush_ms,
+            sidecar_tantivy_ms = phase_timings.sidecar_tantivy_ms,
+            sidecar_edges = phase_timings.sidecar_edges,
+            sidecar_transactions = phase_timings.sidecar_transactions,
+            sidecar_statements = phase_timings.sidecar_statements,
+            sidecar_scan_skipped = phase_timings.sidecar_scan_skipped,
+            sidecar_flush_failures = phase_timings.sidecar_flush_failures,
             tombstones_ms = phase_timings.tombstones_ms,
             non_graph_events_ms = phase_timings.non_graph_events_ms,
             finalize_ms = phase_timings.finalize_ms,
@@ -951,13 +1137,14 @@ impl BrainWatcher {
                 batch_failures.join("; ")
             );
         }
-        Ok(())
+        Ok(sidecar_debt)
     }
 
     /// nw-653: one reconciliation attempt. `Ok(None)` means the graph now
     /// matches disk and any disclosed debt was cleared; `Ok(Some(_))` means it
     /// failed, was disclosed in the skipped-notes status, and is owed a retry.
     /// `Err` only for a shutdown refusal, which ends the watcher.
+    #[allow(clippy::too_many_arguments)]
     fn attempt_reconciliation(
         &self,
         store: &GraphStore,
@@ -965,6 +1152,7 @@ impl BrainWatcher {
         v_uid: &str,
         on_change: &Option<Box<dyn Fn() + Send>>,
         known: Option<Vec<PathBuf>>,
+        also_replay: Vec<PathBuf>,
         failures: u32,
     ) -> Result<Option<PendingReconciliation>, anyhow::Error> {
         let drift = match known {
@@ -976,13 +1164,22 @@ impl BrainWatcher {
                 &self.ignore_set,
                 self.note_limits,
             ),
-        };
+        }
+        .map(|mut paths| {
+            paths.extend(also_replay.iter().cloned());
+            paths.sort();
+            paths.dedup();
+            paths
+        });
+        // nw-668: a replay whose text landed but whose code links did not is
+        // disclosed as owed links, not as a failed startup reconciliation.
+        let mut link_failure = false;
         let (paths, error) = match drift {
             Ok(paths) if paths.is_empty() => {
                 // Nothing left to reconcile: settle any debt an earlier
                 // attempt disclosed (including an uncomputable drift), or
                 // status reports it pending forever.
-                crate::index_md::record_watch_reconciliation_debt(
+                crate::index_md::record_vault_reconciliation_debt(
                     store.db_path(),
                     &self.vault_root,
                     &[],
@@ -997,8 +1194,14 @@ impl BrainWatcher {
                     "BrainWatcher startup: reconciling notes changed while no watcher ran"
                 );
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
-                    Ok(()) => {
-                        crate::index_md::record_watch_reconciliation_debt(
+                    // nw-668: the text landed but some notes' code links did
+                    // not; only those are still owed.
+                    Ok(Some(debt)) => {
+                        link_failure = true;
+                        (Some(debt.paths), anyhow::anyhow!(debt.error))
+                    }
+                    Ok(None) => {
+                        crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
                             &self.vault_root,
                             &paths,
@@ -1015,34 +1218,118 @@ impl BrainWatcher {
             Err(error) => (None, error),
         };
         let failures = failures.saturating_add(1);
-        let delay = self
-            .reconcile_retry_base
-            .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
-            .min(RECONCILE_RETRY_CAP);
+        let delay = reconcile_retry_delay(self.reconcile_retry_base, failures);
         let message = format!("{error:#}");
-        tracing::error!(
-            vault = %self.vault_root.display(),
-            error = %message,
-            failures,
-            retry_in_ms = delay.as_millis() as u64,
-            "BrainWatcher startup reconciliation failed; notes changed while no watcher \
-             ran are missing or stale until it succeeds (retrying; `nestweaver brain \
-             refresh` also heals it)"
-        );
-        // An uncomputable drift is disclosed against the vault root itself.
-        crate::index_md::record_watch_reconciliation_debt(
-            store.db_path(),
-            &self.vault_root,
-            paths
-                .as_deref()
-                .unwrap_or(std::slice::from_ref(&self.vault_root)),
-            Some(&message),
-        );
+        if link_failure {
+            tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %message,
+                failures,
+                retry_in_ms = delay.as_millis() as u64,
+                "BrainWatcher reconciled the notes' text but could not write their code \
+                 links; they have none until the retry lands (retrying; `nestweaver brain \
+                 refresh` also heals it)"
+            );
+        } else {
+            tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %message,
+                failures,
+                retry_in_ms = delay.as_millis() as u64,
+                "BrainWatcher startup reconciliation failed; notes changed while no watcher \
+                 ran are missing or stale until it succeeds (retrying; `nestweaver brain \
+                 refresh` also heals it)"
+            );
+        }
+        // An uncomputable drift is disclosed against the vault root itself,
+        // plus any owed links it must still replay on top (nw-668).
+        let also_replay = if paths.is_some() {
+            Vec::new()
+        } else {
+            also_replay
+        };
+        let mut disclosed = paths
+            .clone()
+            .unwrap_or_else(|| vec![self.vault_root.clone()]);
+        disclosed.extend(also_replay.iter().cloned());
+        if link_failure {
+            crate::index_md::record_vault_link_debt(
+                store.db_path(),
+                &self.vault_root,
+                &disclosed,
+                &message,
+                true,
+            );
+        } else {
+            crate::index_md::record_vault_reconciliation_debt(
+                store.db_path(),
+                &self.vault_root,
+                &disclosed,
+                Some(&message),
+            );
+        }
         Ok(Some(PendingReconciliation {
             paths,
+            also_replay,
             failures,
             next_attempt: Instant::now() + delay,
         }))
+    }
+
+    /// nw-668: hand notes whose code links failed to land to the
+    /// reconciliation retry, the same seam nw-653 uses for a failed startup
+    /// replay: disclosed as owed in the skipped-notes status, replayed on the
+    /// shared backoff, disclosure cleared when the replay lands. Merged into
+    /// an already-owed retry, that retry keeps its schedule. A retry that
+    /// recomputes drift (`paths: None`) cannot see these notes — their text
+    /// matches disk — so they ride along in `also_replay`.
+    fn owe_sidecar_retry(
+        &self,
+        store: &GraphStore,
+        pending: Option<PendingReconciliation>,
+        debt: SidecarDebt,
+    ) -> PendingReconciliation {
+        let merge = |mut owed: Vec<PathBuf>| {
+            owed.extend(debt.paths.iter().cloned());
+            owed.sort();
+            owed.dedup();
+            owed
+        };
+        let next = match pending {
+            Some(owed) => match owed.paths {
+                Some(known) => PendingReconciliation {
+                    paths: Some(merge(known)),
+                    ..owed
+                },
+                None => PendingReconciliation {
+                    also_replay: merge(owed.also_replay),
+                    ..owed
+                },
+            },
+            None => PendingReconciliation {
+                paths: Some(merge(Vec::new())),
+                also_replay: Vec::new(),
+                failures: 1,
+                next_attempt: Instant::now() + reconcile_retry_delay(self.reconcile_retry_base, 1),
+            },
+        };
+        tracing::error!(
+            vault = %self.vault_root.display(),
+            error = %debt.error,
+            notes = debt.paths.len(),
+            "BrainWatcher could not write code links for committed notes; they have none \
+             until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
+        );
+        // Merged, not replaced: rows an owed startup replay already disclosed
+        // keep their own (startup) reason.
+        crate::index_md::record_vault_link_debt(
+            store.db_path(),
+            &self.vault_root,
+            &debt.paths,
+            &debt.error,
+            false,
+        );
+        next
     }
 
     /// nw-653: diff disk against the graph (`index_md::vault_startup_drift`)
@@ -1074,80 +1361,248 @@ impl BrainWatcher {
             notes = replayed,
             "BrainWatcher startup: reconciling notes changed while no watcher ran"
         );
-        self.process_batch(store, tantivy, v_uid, drift, on_change)?;
+        if let Some(debt) = self.process_batch(store, tantivy, v_uid, drift, on_change)? {
+            anyhow::bail!(debt.error);
+        }
         Ok(replayed)
     }
 
-    /// Mirror the committed note representation, rather than reading the file
-    /// again: another save can occur while this prepared batch is committing.
+    /// Refresh the cross-domain edges and BM25 docs of every note in a
+    /// committed batch, mirroring the committed note representation rather
+    /// than reading the files again: another save can occur while this
+    /// prepared batch is committing.
+    ///
+    /// nw-668: this used to take the `watch_vault_sidecars` lease once per
+    /// note and, under it, re-read the file from disk and write every
+    /// note→symbol and section→symbol edge as its own auto-committed
+    /// statement — 10K–100K commits for one edited note, holding the write
+    /// lease for up to 22 minutes while reconcilers queued behind it. Now,
+    /// chunk by chunk of [`crate::cross_domain::NOTES_PER_TXN`] notes:
+    ///
+    /// 1. SCAN with no lease held: tokenise each changed note's committed
+    ///    text (`sources`, from the refresh that just committed it) against
+    ///    the symbol index. Only one chunk's scanned edges are ever held, so
+    ///    a large startup replay of heavily linked notes stays bounded.
+    /// 2. FLUSH the chunk under its own lease: one transaction, set-based
+    ///    statements. Releasing between chunks keeps the gate FIFO-fair.
+    /// 3. Tantivy docs (text-sized) are gathered along the way and committed
+    ///    ONCE for the batch, deletions included, under the last lease.
+    ///
+    /// A failed flush rolls back whole — never a partial edge set — and is
+    /// retried once at once. It cannot fall back to the notes' PREVIOUS
+    /// edges: the refresh that just committed them replaced each changed
+    /// Note and its Sections (`delete_note_cascade_on` DETACH-deletes them,
+    /// edges included). So a chunk that fails twice leaves its notes with NO
+    /// code links, and they are returned as a [`SidecarDebt`] for the caller
+    /// to owe, disclose and replay. It stays non-fatal to the batch: the
+    /// notes' text is committed and still publishes.
     #[allow(clippy::too_many_arguments)]
-    fn refresh_prepared_note_sidecars(
+    fn refresh_prepared_sidecars(
         &self,
         store: &GraphStore,
         tantivy: Option<&TantivyIndex>,
         v_uid: &str,
-        path: &Path,
+        paths: &[PathBuf],
         symbols: Option<&crate::cross_domain::SymbolIndex>,
         note_tags: &HashMap<String, Vec<String>>,
-    ) -> Result<(), anyhow::Error> {
-        let relative = path.strip_prefix(&self.vault_root)?;
-        let uid = note_uid(v_uid, &relative.to_string_lossy());
-        let note = store
-            .lookup_notes_by_uids(std::slice::from_ref(&uid))?
+        sources: &HashMap<PathBuf, String>,
+        timings: &mut BatchPhaseTimings,
+    ) -> Result<Option<SidecarDebt>, anyhow::Error> {
+        let setup_started = Instant::now();
+        let mut targets = Vec::with_capacity(paths.len());
+        for path in paths {
+            let relative = path.strip_prefix(&self.vault_root)?;
+            let uid = note_uid(v_uid, &relative.to_string_lossy());
+            targets.push((path, relative.to_path_buf(), uid));
+        }
+        let uids: Vec<String> = targets.iter().map(|(_, _, uid)| uid.clone()).collect();
+        let notes: HashMap<String, nestweaver_schema::Note> = store
+            .lookup_notes_by_uids(&uids)?
             .into_iter()
-            .next();
-        let Some(note) = note else {
-            if let Some(index) = tantivy {
-                index.remove_note(&uid)?;
-            }
-            return Ok(());
-        };
-        let cross_domain = if let Some(symbols) = symbols {
-            crate::cross_domain::discover_cross_domain_links_for_note_with_index(
-                store, &uid, symbols,
-            )
-        } else {
-            crate::cross_domain::discover_cross_domain_links_for_note(store, &uid)
-        };
-        if let Err(error) = cross_domain {
-            tracing::warn!(%error, "watcher cross-domain refresh failed");
+            .map(|note| (note.uid.clone(), note))
+            .collect();
+        let built_index;
+        let index = match symbols {
+            Some(index) => Some(index),
+            None => match crate::cross_domain::build_symbol_index(store) {
+                Ok(index) => {
+                    built_index = index;
+                    Some(&built_index)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "watcher cross-domain refresh failed");
+                    None
+                }
+            },
         }
-        if let Some(index) = tantivy {
-            let headings = store.headings_in_note(&uid)?;
-            let sections = store.sections_in_note(&uid)?;
-            let heading_docs: Vec<_> = headings
-                .iter()
-                .map(|h| (h.uid.clone(), h.text.clone()))
-                .collect();
-            let section_docs: Vec<_> = sections
-                .iter()
-                .map(|s| {
-                    let title = s
-                        .heading_uid
-                        .as_ref()
-                        .and_then(|uid| headings.iter().find(|h| &h.uid == uid))
-                        .map(|h| h.text.clone())
-                        .unwrap_or_default();
-                    (s.uid.clone(), s.text_content.clone(), title)
-                })
-                .collect();
-            let mut body = Vec::new();
-            if let Some(raw) = note.frontmatter_raw {
-                body.push(raw);
+        // No code indexed: nothing to bridge to, and existing edges are left
+        // alone, as the per-note path did.
+        .filter(|index| !index.is_empty());
+        timings.sidecar_scan_ms += setup_started.elapsed().as_millis() as u64;
+
+        let mut debt: Option<SidecarDebt> = None;
+        let mut chunk: Vec<crate::cross_domain::ScannedNote> = Vec::new();
+        let mut chunk_paths: Vec<PathBuf> = Vec::new();
+        let mut removals = Vec::new();
+        let mut removed_paths: Vec<PathBuf> = Vec::new();
+        let mut docs: Vec<nestweaver_store::tantivy_index::NoteDocBatchEntry> = Vec::new();
+        for (path, relative, uid) in &targets {
+            // Flush a full chunk before scanning further, so at most one
+            // chunk of scanned edges is ever held.
+            if chunk.len() == crate::cross_domain::NOTES_PER_TXN {
+                let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
+                self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+                chunk.clear();
+                chunk_paths.clear();
             }
-            body.extend(sections.iter().map(|s| s.text_content.clone()));
-            let names = note_tags.get(&uid).cloned().unwrap_or_default();
-            index.update_note(
-                &uid,
-                &note.title,
-                v_uid,
-                &body,
-                &heading_docs,
-                &section_docs,
-                &names,
-            )?;
+            let scan_started = Instant::now();
+            let Some(note) = notes.get(uid) else {
+                removals.push(uid.clone());
+                removed_paths.push((*path).clone());
+                continue;
+            };
+            // nw-668: a note whose structure cannot be read is owed — no
+            // links, no Tantivy doc this batch — and replayed by the retry,
+            // with or without Tantivy. It used to fail the whole batch (and,
+            // live, end the run loop) when Tantivy was on. Nothing here gates
+            // publication: the text is committed; only derived sidecars wait.
+            let (sections, headings) = match read_note_structure(store, uid, tantivy.is_some()) {
+                Ok(structure) => structure,
+                Err(error) => {
+                    tracing::warn!(%error, note = %uid, "watcher sidecar refresh failed");
+                    owe(
+                        &mut debt,
+                        std::slice::from_ref(*path),
+                        &format!("{error:#}"),
+                    );
+                    continue;
+                }
+            };
+            #[cfg(test)]
+            if let Some(probe) = &self.sidecar_scan_probe {
+                probe(chunk.len());
+            }
+            if let Some(index) = index {
+                match sources.get(relative) {
+                    Some(source) => {
+                        chunk.push(crate::cross_domain::scan_note_source(
+                            uid, source, &sections, index,
+                        ));
+                        chunk_paths.push((*path).clone());
+                    }
+                    None => timings.sidecar_scan_skipped += 1,
+                }
+            }
+            if tantivy.is_some() {
+                let section_docs: Vec<_> = sections
+                    .iter()
+                    .map(|s| {
+                        let title = s
+                            .heading_uid
+                            .as_ref()
+                            .and_then(|uid| headings.iter().find(|h| &h.uid == uid))
+                            .map(|h| h.text.clone())
+                            .unwrap_or_default();
+                        (s.uid.clone(), s.text_content.clone(), title)
+                    })
+                    .collect();
+                let heading_docs: Vec<_> = headings.into_iter().map(|h| (h.uid, h.text)).collect();
+                let mut body = Vec::new();
+                if let Some(raw) = &note.frontmatter_raw {
+                    body.push(raw.clone());
+                }
+                body.extend(sections.into_iter().map(|s| s.text_content));
+                docs.push((
+                    uid.clone(),
+                    note.title.clone(),
+                    v_uid.to_string(),
+                    body,
+                    heading_docs,
+                    section_docs,
+                    note_tags.get(uid).cloned().unwrap_or_default(),
+                ));
+            }
+            timings.sidecar_scan_ms += scan_started.elapsed().as_millis() as u64;
         }
-        Ok(())
+
+        let tantivy_work = tantivy.filter(|_| !docs.is_empty() || !removals.is_empty());
+        if !chunk.is_empty() || tantivy_work.is_some() {
+            let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
+            self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+            if let Some(index) = tantivy_work {
+                let tantivy_started = Instant::now();
+                index.apply_note_batch(&docs, &removals)?;
+                timings.sidecar_tantivy_ms = tantivy_started.elapsed().as_millis() as u64;
+            }
+        }
+        // A deleted note owes nothing any more.
+        if let Some(db_path) = store.db_path() {
+            crate::index_md::clear_vault_reconciliation_paths(
+                db_path,
+                &self.vault_root,
+                &removed_paths,
+            );
+        }
+        Ok(debt)
+    }
+
+    /// Flush one chunk of scanned notes (caller holds the lease), retrying
+    /// once on failure; a chunk that fails twice is added to `debt`.
+    fn flush_sidecar_chunk(
+        &self,
+        store: &GraphStore,
+        chunk: &[crate::cross_domain::ScannedNote],
+        chunk_paths: &[PathBuf],
+        timings: &mut BatchPhaseTimings,
+        debt: &mut Option<SidecarDebt>,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        timings.sidecar_edges += chunk
+            .iter()
+            .map(crate::cross_domain::ScannedNote::edge_count)
+            .sum::<usize>();
+        let flush_started = Instant::now();
+        let mut last_error = None;
+        for _attempt in 0..2 {
+            let mut result = crate::cross_domain::CrossDomainResult::default();
+            let boundary = nestweaver_store::write::parameterized_writes_on_this_thread();
+            let flushed = crate::cross_domain::flush_scanned_notes(store, chunk, &mut result);
+            timings.sidecar_boundary_statements +=
+                nestweaver_store::write::parameterized_writes_on_this_thread() - boundary;
+            match flushed {
+                Ok(stats) => {
+                    timings.sidecar_transactions += stats.transactions;
+                    timings.sidecar_statements += stats.statements;
+                    // These notes' text and links have both landed: settle
+                    // any owed disclosure now rather than at the next retry.
+                    if let Some(db_path) = store.db_path() {
+                        crate::index_md::clear_vault_reconciliation_paths(
+                            db_path,
+                            &self.vault_root,
+                            chunk_paths,
+                        );
+                    }
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    timings.sidecar_flush_failures += 1;
+                    tracing::warn!(
+                        %error,
+                        notes = chunk.len(),
+                        "watcher cross-domain flush failed and rolled back; these notes \
+                         have no code links until it lands"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        timings.sidecar_flush_ms += flush_started.elapsed().as_millis() as u64;
+        if let Some(error) = last_error {
+            owe(debt, chunk_paths, &format!("{error:#}"));
+        }
     }
 
     /// Advance and persist the graph generation for a manifest edit (nw-498),
@@ -1583,6 +2038,47 @@ mod tests {
             .unwrap();
     }
 
+    /// nw-608: `brain watch --name r4-vault` on a new root, against a copied
+    /// database that already held `r4-vault` at its original root, published
+    /// a SECOND same-named vault; `brain search` then returned both notes.
+    /// The watcher must refuse at startup, before it publishes anything.
+    #[test]
+    fn watching_a_new_root_under_an_existing_vault_name_is_refused() {
+        let _guard = serial_watcher_test();
+        let (_original_dir, original) = make_vault(&[("Orphan.md", "# Orphan\n\noriginal\n")]);
+        let (_copy_dir, copy) = make_vault(&[("Orphan.md", "# Orphan\n\ncopy\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&original, &db_path, "default", "r4-vault")
+            .unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let run = |root: &Path, name: &str| {
+            let watcher = BrainWatcher::new(&db_path, root, "default", name);
+            let stop = watcher.shutdown_handle();
+            watcher
+                .with_ready_callback(move || stop.stop())
+                .run_with_store(store.clone(), None)
+        };
+
+        let message = format!("{:#}", run(&copy, "r4-vault").unwrap_err());
+        assert!(
+            message.contains("r4-vault")
+                && message.contains(&*original.to_string_lossy())
+                && message.contains("brain remove"),
+            "{message}"
+        );
+        assert_eq!(store.list_vaults(None).unwrap().len(), 1);
+
+        // Counterweight: re-watching the SAME root under its name still
+        // works, and a first watch under a unique name still indexes.
+        run(&original, "r4-vault").unwrap();
+        run(&copy, "r4-copy").unwrap();
+        let copy_uid = vault_uid("default", &copy.to_string_lossy());
+        let copied = store.list_notes(Some(&copy_uid)).unwrap();
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        assert_eq!(store.list_vaults(None).unwrap().len(), 2);
+    }
+
     /// nw-653: notes created, edited or deleted while no watcher was
     /// processing events (daemon down, watcher wedged behind a deadlocked
     /// write gate, launchd crash-looping on a version mismatch) produced
@@ -1869,7 +2365,7 @@ mod tests {
         let db_path = db_dir.path().join("brain.lbug");
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
         let store = GraphStore::open_or_create(&db_path).unwrap();
-        crate::index_md::record_watch_reconciliation_debt(
+        crate::index_md::record_vault_reconciliation_debt(
             Some(&db_path),
             &root,
             std::slice::from_ref(&root),
@@ -1884,10 +2380,152 @@ mod tests {
         let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
         let v_uid = vault_uid("default", &root.to_string_lossy());
         let next = watcher
-            .attempt_reconciliation(&store, None, &v_uid, &None, None, 1)
+            .attempt_reconciliation(&store, None, &v_uid, &None, None, Vec::new(), 1)
             .unwrap();
         assert!(next.is_none(), "nothing is left to reconcile");
         assert_eq!(pending(), serde_json::json!(0), "the debt must clear");
+    }
+
+    /// nw-651 on Linux (PR #431 CI): notify's inotify backend fails the
+    /// WHOLE recursive watch on the first subdirectory it cannot watch, so a
+    /// vault holding one unreadable directory had no brain watcher at all.
+    /// The seam fails the subscription the way inotify does (FSEvents never
+    /// would). Startup must proceed, the directory must be disclosed as the
+    /// walk's unreadable-directory row and its notes kept, and edits
+    /// elsewhere — including in a directory created afterwards — must land.
+    #[cfg(unix)]
+    #[test]
+    fn brain_watcher_stays_live_when_a_subdirectory_cannot_be_watched() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n"),
+            ("docs/Guide.md", "# Guide\n"),
+            ("locked/Hidden.md", "# Hidden\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let locked = root.join("locked");
+        let ignored = root.join("node_modules");
+        fs::create_dir_all(&ignored).unwrap();
+        let fresh_locked = root.join("fresh_locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o000)).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let has = |path: &str| {
+            store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .iter()
+                .any(|note| note.file_path == path)
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            // On Linux this is REAL inotify failing on the unreadable
+            // directory; elsewhere the seam fails the way it does.
+            let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+            #[cfg(not(target_os = "linux"))]
+            let watcher = watcher.emulating_inotify_watch();
+            let watcher = watcher.with_debounce_ms(100).with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+            let stop = watcher.shutdown_handle();
+            let running = store.clone();
+            let handle = thread::spawn(move || watcher.run_with_store(running, None));
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while ready_rx.try_recv().is_err() {
+                    assert!(
+                        !handle.is_finished(),
+                        "an unwatchable subdirectory must not stop the watcher starting"
+                    );
+                    assert!(Instant::now() < deadline, "watcher never became ready");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                thread::sleep(Duration::from_millis(300));
+                let rows = crate::index_md::load_skipped_notes_sidecar(&db_path).skipped;
+                assert!(
+                    rows.iter().any(|row| row.path == "locked"
+                        && row.reason_code == nestweaver_parser::SkipReasonCode::ReadError),
+                    "the unwatchable directory must be disclosed: {rows:?}"
+                );
+                assert!(
+                    !rows.iter().any(|row| row.path == "node_modules"),
+                    "an ignored unreadable directory is not disclosed: {rows:?}"
+                );
+
+                let wait = |what: &str, path: &str| {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !has(path) {
+                        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                };
+                fs::write(root.join("docs/Fresh.md"), "# Fresh\n").unwrap();
+                wait("a note in a watched directory", "docs/Fresh.md");
+                fs::create_dir(root.join("newdir")).unwrap();
+                fs::write(root.join("newdir/Born.md"), "# Born\n").unwrap();
+                wait("a note in a directory created later", "newdir/Born.md");
+                // Its own watch, not only the create event, carries later notes.
+                thread::sleep(Duration::from_millis(300));
+                fs::write(root.join("newdir/Later.md"), "# Later\n").unwrap();
+                wait("a later note in the new directory", "newdir/Later.md");
+
+                // Deleted and re-created within one debounce window: the new
+                // directory needs a watch of its own again.
+                fs::remove_dir_all(root.join("newdir")).unwrap();
+                fs::create_dir(root.join("newdir")).unwrap();
+                fs::write(root.join("newdir/Again.md"), "# Again\n").unwrap();
+                wait("a note in the re-created directory", "newdir/Again.md");
+                thread::sleep(Duration::from_millis(300));
+                fs::write(root.join("newdir/After.md"), "# After\n").unwrap();
+                wait(
+                    "a later note in the re-created directory",
+                    "newdir/After.md",
+                );
+
+                // Discovered live: disclosed when it appears unreadable.
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .mode(0o000)
+                    .create(&fresh_locked)
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !crate::index_md::load_skipped_notes_sidecar(&db_path)
+                    .skipped
+                    .iter()
+                    .any(|row| row.path == "fresh_locked")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a directory found unreadable live must be disclosed"
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    has("locked/Hidden.md"),
+                    "an unwatchable directory's notes are never deleted"
+                );
+            }));
+            stop.stop();
+            let joined = handle.join().unwrap();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            joined.unwrap();
+        }));
+        for dir in [&locked, &ignored, &fresh_locked] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// nw-653 review: a partial scan is not a deletion. Notes under a
@@ -2259,6 +2897,75 @@ mod tests {
         // skips for oversized notes are covered by
         // `watcher_discloses_note_grown_past_limit_without_failing_the_batch`.
         fs::write(root.join("Alpha.md"), "# Alpha\n\n[[Beta]]\n").unwrap();
+    }
+
+    /// nw-585 on the watcher's two routes: a live batch discloses a note
+    /// whose frontmatter broke (and clears it once fixed), and startup
+    /// reconciliation discloses one broken while no watcher ran.
+    #[test]
+    fn watcher_discloses_and_clears_unparsable_frontmatter() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Live.md", "---\ntags: [a]\n---\n# Live\n"),
+            ("Gap.md", "---\ntags: [b]\n---\n# Gap\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let unparsed = || -> Vec<String> {
+            crate::index_md::skipped_notes_status_json(Some(&db_path)).0
+                ["frontmatter_unparsed_notes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|row| row["path"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(unparsed().is_empty(), "precondition");
+
+        // Live batch.
+        fs::write(root.join("Live.md"), "---\ntags: [a\n---\n# Live\n").unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Live.md")], &None)
+            .unwrap();
+        let rows = unparsed();
+        assert!(
+            rows.len() == 1 && rows[0].ends_with("Live.md"),
+            "live batch: {rows:?}"
+        );
+        fs::write(root.join("Live.md"), "---\ntags: [a]\n---\n# Live\n").unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("Live.md")], &None)
+            .unwrap();
+        assert!(
+            unparsed().is_empty(),
+            "fixed in a live batch: {:?}",
+            unparsed()
+        );
+
+        // Startup reconciliation: broken while nothing watched.
+        fs::write(root.join("Gap.md"), "---\ntags: [b\n---\n# Gap\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("Gap.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        let restarted = BrainWatcher::new(&db_path, &root, "default", "test");
+        let stop = restarted.shutdown_handle();
+        restarted
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        let rows = unparsed();
+        assert!(
+            rows.len() == 1 && rows[0].ends_with("Gap.md"),
+            "startup reconciliation: {rows:?}"
+        );
     }
 
     #[test]
@@ -3105,5 +3812,881 @@ mod tests {
 
         let after = GraphStore::open(&db_path).unwrap().count_notes().unwrap();
         assert_eq!(before, after, ".obsidian/ files must not be indexed");
+    }
+
+    // ── nw-668: the sidecar phase is set-based, transactional, off-lease ──
+
+    fn nw_668_insert_symbol(store: &GraphStore, repo: &str, name: &str, line: u32) {
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: nestweaver_schema::symbol_uid(repo, "src/lib.rs", name, line),
+                name: name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: repo.to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: line,
+                end_line: line,
+                signature: format!("fn {name}()"),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+    }
+
+    struct Nw668Fixture {
+        _vault_dir: tempfile::TempDir,
+        root: PathBuf,
+        _db_dir: tempfile::TempDir,
+        db_path: PathBuf,
+        store: GraphStore,
+        v_uid: String,
+    }
+
+    /// A vault of `notes` indexed notes plus a repo of `symbols` symbols.
+    fn nw_668_fixture(files: &[(&str, &str)], notes: usize, symbols: &[&str]) -> Nw668Fixture {
+        let mut all: Vec<(String, String)> = (0..notes)
+            .map(|i| (format!("n{i:03}.md"), format!("# N{i}\n\nplain body {i}\n")))
+            .collect();
+        all.extend(files.iter().map(|(p, c)| (p.to_string(), c.to_string())));
+        let borrowed: Vec<(&str, &str)> =
+            all.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let (vault_dir, root) = make_vault(&borrowed);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:nw668");
+        for (line, name) in symbols.iter().enumerate() {
+            nw_668_insert_symbol(&store, "repo:nw668", name, line as u32 + 1);
+        }
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        Nw668Fixture {
+            _vault_dir: vault_dir,
+            root,
+            _db_dir: db_dir,
+            db_path,
+            store,
+            v_uid,
+        }
+    }
+
+    /// Mentions every name in the whole note and once more in a second
+    /// section, so each edited note yields `k` note edges and `k + 1`
+    /// section edges.
+    fn nw_668_edited_body(title: &str, names: &[String]) -> String {
+        format!(
+            "# {title}\n\n{}\n\n## Tail\n\n{}\n",
+            names.join(" "),
+            names[0]
+        )
+    }
+
+    fn nw_668_statements_for(k: usize) -> (BatchPhaseTimings, usize) {
+        let names: Vec<String> = (0..k).map(|j| format!("Widget{j:04}Handler")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let fx = nw_668_fixture(&[], 200, &name_refs);
+        for i in 0..2 {
+            fs::write(
+                fx.root.join(format!("n{i:03}.md")),
+                nw_668_edited_body(&format!("Edited {i}"), &names),
+            )
+            .unwrap();
+        }
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+        let edges = fx.store.list_references_code_edges().unwrap().len();
+        (watcher.last_batch_phase_timings().unwrap(), edges)
+    }
+
+    /// nw-668: the watcher wrote every note→symbol and section→symbol edge
+    /// as its own auto-committed statement, so one edited note with 10K–100K
+    /// name matches cost as many commits and held the write lease for up to
+    /// 22 minutes. The flush must be set-based: the statement and
+    /// transaction counts depend on how many NOTES a batch touches, never on
+    /// how many symbols each note mentions.
+    #[test]
+    fn nw_668_sidecar_flush_statements_do_not_scale_with_matches_per_note() {
+        let _guard = serial_watcher_test();
+        let (small, small_edges) = nw_668_statements_for(10);
+        let (large, large_edges) = nw_668_statements_for(500);
+
+        // Counterweight: the fixture really does produce K-proportional
+        // edges, so equal statement counts below are not two empty flushes.
+        assert_eq!(small_edges, 2 * (10 + 10 + 1));
+        assert_eq!(large_edges, 2 * (500 + 500 + 1));
+
+        assert!(
+            small.sidecar_transactions <= 2usize.div_ceil(crate::cross_domain::NOTES_PER_TXN),
+            "a 2-note batch flushes in ONE transaction: {small:?}"
+        );
+        assert_eq!(small.sidecar_transactions, large.sidecar_transactions);
+        assert_eq!(
+            small.sidecar_statements, large.sidecar_statements,
+            "statements must not scale with matches per note: K=10 {small:?} vs K=500 {large:?}"
+        );
+        assert!(
+            large.sidecar_statements <= 4,
+            "one delete per edge kind and one insert per edge kind: {large:?}"
+        );
+        assert_eq!(large.sidecar_edges, 2 * (500 + 500 + 1));
+        // The same property observed at the store's execute boundary, not
+        // taken from the flush's report about itself.
+        assert_eq!(
+            small.sidecar_boundary_statements, large.sidecar_boundary_statements,
+            "boundary-counted statements must not scale with matches per note"
+        );
+        assert!(large.sidecar_boundary_statements <= 4, "{large:?}");
+        assert!(
+            large.sidecar_boundary_statements > 0,
+            "the counter must see the flush"
+        );
+    }
+
+    /// nw-668: the lease was taken once PER NOTE and held across the scan.
+    /// The scan (tokenising bodies against a 200K-symbol index) is read-only
+    /// and must run with no lease held; the flush takes one lease per
+    /// NOTES_PER_TXN chunk, so a 2-note batch takes exactly one.
+    #[test]
+    fn nw_668_sidecars_scan_off_lease_and_take_one_lease_per_chunk() {
+        use std::sync::atomic::AtomicI32;
+
+        struct LiveLease(Arc<AtomicI32>);
+        impl Drop for LiveLease {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 3, &["AlphaWidget", "BravoWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses BravoWidget\n").unwrap();
+
+        let live = Arc::new(AtomicI32::new(0));
+        let labels = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let (live_f, labels_f) = (Arc::clone(&live), Arc::clone(&labels));
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            labels_f.lock().unwrap().push(label);
+            live_f.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(LiveLease(Arc::clone(&live_f))) as Box<dyn WatchMutationLease>)
+        });
+        let observed = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let (observed_p, live_p) = (Arc::clone(&observed), Arc::clone(&live));
+        let mut watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_mutation_lease_factory(factory);
+        watcher.sidecar_scan_probe = Some(Box::new(move |_held| {
+            observed_p
+                .lock()
+                .unwrap()
+                .push(live_p.load(Ordering::SeqCst));
+        }));
+
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+
+        let sidecar_leases = labels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|label| **label == "watch_vault_sidecars")
+            .count();
+        assert_eq!(sidecar_leases, 1, "labels: {:?}", labels.lock().unwrap());
+        let observed = observed.lock().unwrap().clone();
+        assert!(!observed.is_empty(), "the scan probe must have run");
+        assert!(
+            observed.iter().all(|live| *live == 0),
+            "the cross-domain scan must run with NO lease held: {observed:?}"
+        );
+        // Counterweight: the edges were still written.
+        assert_eq!(fx.store.list_references_code_edges().unwrap().len(), 4);
+    }
+
+    /// nw-668: moving the scan off the disk re-read (onto the text the batch
+    /// committed) and onto set-based statements must not change WHICH edges
+    /// exist. The fixture covers every shape the old whole-file scan saw:
+    /// frontmatter, heading text, a preamble, a link inside a heading, a
+    /// setext heading, a repeated mention, a stoplisted and a too-short name,
+    /// and a trailing empty section. Pinned twice: against the literal set
+    /// the pre-nw-668 path produced (characterised on that code), and
+    /// against the bulk `discover_cross_domain_links` pass over the same
+    /// files. The `@b` rows (one name defined in two repos links to both)
+    /// were added after the characterisation run; they follow the index's
+    /// all-candidates rule and are pinned against the bulk pass.
+    #[test]
+    fn nw_668_watcher_edges_equal_the_pre_change_and_bulk_edge_sets() {
+        let _guard = serial_watcher_test();
+        let symbols = [
+            "FrontThing",
+            "HeadThing",
+            "PreambleThing",
+            "LinkThing",
+            "UrlThing",
+            "SetextThing",
+            "BodyThing",
+            "TwiceThing",
+            "Error",
+            "Foo",
+            "NeverMentioned",
+        ];
+        let fx = nw_668_fixture(&[], 2, &symbols);
+        // The same name in a second repo: a mention links to BOTH symbols.
+        nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
+        fs::write(
+            fx.root.join("n000.md"),
+            "---\nrelated: FrontThing\n---\nPreambleThing intro\n\n\
+             # HeadThing title\n\nBodyThing TwiceThing TwiceThing Error Foo\n\n\
+             ## See [LinkThing](https://example.com/UrlThing)\n\nTwiceThing again\n\n\
+             SetextThing\n-----------\n\nplain\n\n## Empty\n",
+        )
+        .unwrap();
+        fs::write(fx.root.join("n001.md"), "# Other\n\nBodyThing only\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+
+        // Render every edge as `<note-file>[:<section start line>] -> <symbol name>`.
+        let render = |store: &GraphStore| -> Vec<String> {
+            let mut labels: HashMap<String, String> = HashMap::new();
+            for file in ["n000.md", "n001.md"] {
+                let uid = note_uid(&fx.v_uid, file);
+                for section in store.sections_in_note(&uid).unwrap() {
+                    labels.insert(section.uid, format!("{file}:{}", section.start_line));
+                }
+                labels.insert(uid, file.to_string());
+            }
+            let mut out: Vec<String> = store
+                .list_references_code_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(from, to, confidence, source)| {
+                    let name = if to
+                        == nestweaver_schema::symbol_uid(
+                            "repo:nw668b",
+                            "src/lib.rs",
+                            "BodyThing",
+                            1,
+                        ) {
+                        "BodyThing@b"
+                    } else {
+                        symbols
+                            .iter()
+                            .enumerate()
+                            .find(|(line, name)| {
+                                nestweaver_schema::symbol_uid(
+                                    "repo:nw668",
+                                    "src/lib.rs",
+                                    name,
+                                    *line as u32 + 1,
+                                ) == to
+                            })
+                            .map(|(_, name)| *name)
+                            .unwrap()
+                    };
+                    format!(
+                        "{} -> {name} ({confidence:.1}, {source})",
+                        labels.get(&from).cloned().unwrap_or(from)
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let watched = render(&fx.store);
+        let expected: Vec<String> = vec![
+            "n000.md -> BodyThing (0.9, name-match)",
+            "n000.md -> BodyThing@b (0.9, name-match)",
+            "n000.md -> FrontThing (0.9, name-match)",
+            "n000.md -> HeadThing (0.9, name-match)",
+            "n000.md -> LinkThing (0.9, name-match)",
+            "n000.md -> PreambleThing (0.9, name-match)",
+            "n000.md -> SetextThing (0.9, name-match)",
+            "n000.md -> TwiceThing (0.9, name-match)",
+            "n000.md -> UrlThing (0.9, name-match)",
+            "n000.md:11 -> TwiceThing (0.9, name-match)",
+            "n000.md:4 -> PreambleThing (0.9, name-match)",
+            "n000.md:7 -> BodyThing (0.9, name-match)",
+            "n000.md:7 -> BodyThing@b (0.9, name-match)",
+            "n000.md:7 -> TwiceThing (0.9, name-match)",
+            "n001.md -> BodyThing (0.9, name-match)",
+            "n001.md -> BodyThing@b (0.9, name-match)",
+            "n001.md:2 -> BodyThing (0.9, name-match)",
+            "n001.md:2 -> BodyThing@b (0.9, name-match)",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            watched, expected,
+            "watcher edge set drifted from pre-nw-668"
+        );
+
+        crate::cross_domain::discover_cross_domain_links(&fx.store).unwrap();
+        assert_eq!(
+            render(&fx.store),
+            watched,
+            "the watcher and the bulk pass must agree on the same files"
+        );
+    }
+
+    /// nw-668: a batch that edits two notes and deletes a third paid one
+    /// Tantivy commit (fsync + reader reload) per note under the lease. It
+    /// must pay one for the whole batch — deletions included.
+    #[test]
+    fn nw_668_one_tantivy_commit_per_batch() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 3, &["AlphaWidget"]);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        tantivy.reindex_from_store(&fx.store).unwrap();
+        let deleted = note_uid(&fx.v_uid, "n002.md");
+        assert!(
+            tantivy
+                .search("N2", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.uid == deleted || hit.note_uid == deleted),
+            "precondition: the note to delete is searchable"
+        );
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget zebra\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses AlphaWidget yak\n").unwrap();
+        fs::remove_file(fx.root.join("n002.md")).unwrap();
+        let before = tantivy.commit_count();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                Some(&tantivy),
+                &fx.v_uid,
+                vec![
+                    fx.root.join("n000.md"),
+                    fx.root.join("n001.md"),
+                    fx.root.join("n002.md"),
+                ],
+                &None,
+            )
+            .unwrap();
+        assert_eq!(tantivy.commit_count() - before, 1);
+        // Counterweight: the one commit carried all three changes.
+        assert!(!tantivy.search("zebra", 10).unwrap().is_empty());
+        assert!(!tantivy.search("yak", 10).unwrap().is_empty());
+        assert!(
+            tantivy
+                .search("N2", 10)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.uid != deleted && hit.note_uid != deleted),
+            "the deleted note's docs must be gone"
+        );
+    }
+
+    fn nw_668_owed_debt(db_path: &Path) -> Vec<String> {
+        crate::index_md::load_skipped_notes_sidecar(db_path)
+            .skipped
+            .into_iter()
+            .filter(|file| {
+                file.reason
+                    .starts_with(crate::index_md::WATCH_RECONCILIATION_PENDING_REASON)
+            })
+            .map(|file| file.path)
+            .collect()
+    }
+
+    fn nw_668_targets(store: &GraphStore) -> Vec<String> {
+        store
+            .list_references_code_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(_, to, _, _)| to)
+            .collect()
+    }
+
+    /// nw-668 review (I1): the whole batch was scanned into memory before the
+    /// first chunk flushed, so a startup replay of thousands of heavily
+    /// linked notes held every one of their edge lists at once. Scanning and
+    /// flushing interleave: at most one chunk of scanned notes is held while
+    /// the next note is scanned, each chunk takes its own lease and
+    /// transaction, and Tantivy still commits once for the batch.
+    #[test]
+    fn nw_668_a_large_batch_scans_and_flushes_one_chunk_at_a_time() {
+        let _guard = serial_watcher_test();
+        let notes = crate::cross_domain::NOTES_PER_TXN + 1;
+        let fx = nw_668_fixture(&[], notes, &["AlphaWidget", "BodyThing"]);
+        nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..notes {
+            let path = fx.root.join(format!("n{i:03}.md"));
+            fs::write(
+                &path,
+                format!("# N{i}\n\nuses AlphaWidget\n\n## B\n\nBodyThing\n"),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+
+        let labels = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let labels_f = Arc::clone(&labels);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            labels_f.lock().unwrap().push(label);
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let held = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let held_p = Arc::clone(&held);
+        let mut watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_mutation_lease_factory(factory);
+        watcher.sidecar_scan_probe = Some(Box::new(move |count| {
+            held_p.lock().unwrap().push(count);
+        }));
+        let commits = tantivy.commit_count();
+        let owed = watcher
+            .process_batch(&fx.store, Some(&tantivy), &fx.v_uid, paths, &None)
+            .unwrap();
+        assert!(owed.is_none());
+
+        let held = held.lock().unwrap().clone();
+        assert_eq!(held.len(), notes, "every note was scanned");
+        assert!(
+            held.iter()
+                .all(|count| *count < crate::cross_domain::NOTES_PER_TXN),
+            "a full chunk must be flushed before the next note is scanned: max held {:?}",
+            held.iter().max()
+        );
+        let sidecar_leases = labels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|label| **label == "watch_vault_sidecars")
+            .count();
+        assert_eq!(sidecar_leases, 2);
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_transactions,
+            2
+        );
+        assert_eq!(tantivy.commit_count() - commits, 1);
+
+        // Equivalence at chunk scale, including a name defined in two repos.
+        let watched = fx.store.list_references_code_edges().unwrap();
+        assert_eq!(
+            watched.len(),
+            notes * 6,
+            "2 note + 1 section edge + 2 BodyThing each"
+        );
+        crate::cross_domain::discover_cross_domain_links(&fx.store).unwrap();
+        assert_eq!(fx.store.list_references_code_edges().unwrap(), watched);
+    }
+
+    /// nw-668 review (I2): a flush that failed was only logged, and nothing
+    /// ever rebuilt the notes' code links — the refresh had already replaced
+    /// their nodes, so they sat with none. One immediate retry absorbs a
+    /// transient failure inside the batch.
+    #[test]
+    fn nw_668_a_transient_flush_failure_is_retried_within_the_batch() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(1));
+        let owed = watcher.process_batch(
+            &fx.store,
+            None,
+            &fx.v_uid,
+            vec![fx.root.join("n000.md")],
+            &None,
+        );
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        assert!(owed.unwrap().is_none(), "the retry landed; nothing is owed");
+        assert_eq!(nw_668_targets(&fx.store).len(), 2);
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_flush_failures,
+            1
+        );
+    }
+
+    /// nw-668 review (I2): when the immediate retry also fails, the chunk is
+    /// all-or-nothing (no partial edge set), the batch still publishes the
+    /// committed text, and the notes are OWED: disclosed in the skipped-notes
+    /// status and replayed through the reconciliation retry, which rebuilds
+    /// their links and clears the disclosure.
+    #[test]
+    fn nw_668_a_live_flush_failure_is_owed_disclosed_and_healed_by_the_retry() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let owed = watcher.process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &callback);
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("a twice-failed flush is owed");
+        assert_eq!(owed.paths, vec![path.clone()]);
+        assert_eq!(
+            nw_668_targets(&fx.store),
+            Vec::<String>::new(),
+            "no partial set"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the committed text still publishes"
+        );
+
+        let pending = watcher.owe_sidecar_retry(&fx.store, None, owed);
+        assert_eq!(pending.paths.as_deref(), Some(&[path.clone()][..]));
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![path.to_string_lossy().into_owned()],
+            "the owed notes are disclosed"
+        );
+        let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+            .skipped
+            .into_iter()
+            .map(|file| file.reason)
+            .collect();
+        let expected_prefix = format!(
+            "{}: brain watcher code links not yet written; retrying (",
+            crate::index_md::WATCH_RECONCILIATION_PENDING_REASON
+        );
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].starts_with(&expected_prefix)
+                && reasons[0].contains("injected cross-domain flush failure")
+                && !reasons[0].contains("startup"),
+            "a live link failure must say what is owed, not blame startup: {reasons:?}"
+        );
+
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none(), "the retry landed");
+        assert_eq!(nw_668_targets(&fx.store).len(), 2, "links rebuilt");
+        assert!(
+            nw_668_owed_debt(&fx.db_path).is_empty(),
+            "disclosure cleared"
+        );
+    }
+
+    /// nw-668 review (I2): the startup replay is the same seam. A replay
+    /// whose sidecar flush fails twice is not "reconciled": it stays owed
+    /// and disclosed, and the next attempt heals it.
+    #[test]
+    fn nw_668_a_startup_replay_with_a_failed_flush_stays_owed() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let first = watcher.attempt_reconciliation(
+            &fx.store,
+            None,
+            &fx.v_uid,
+            &None,
+            Some(vec![path.clone()]),
+            Vec::new(),
+            0,
+        );
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let pending = first
+            .unwrap()
+            .expect("a replay whose links failed is still owed");
+        assert_eq!(pending.paths.as_deref(), Some(&[path.clone()][..]));
+        assert_eq!(pending.failures, 1);
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![path.to_string_lossy().into_owned()]
+        );
+        assert!(
+            crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+                .skipped
+                .iter()
+                .all(|file| file
+                    .reason
+                    .contains("brain watcher code links not yet written")),
+            "a replay whose text landed discloses owed links, not a failed startup"
+        );
+
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        assert_eq!(nw_668_targets(&fx.store).len(), 2);
+        assert!(nw_668_owed_debt(&fx.db_path).is_empty());
+    }
+
+    /// nw-668 review (I2): an owed retry whose drift could not be computed
+    /// (`paths: None`) recomputes drift from disk vs graph — which cannot see
+    /// notes whose text committed but whose links did not. Owing such notes
+    /// must carry them alongside, not drop them.
+    #[test]
+    fn nw_668_owed_links_survive_merging_into_an_uncomputed_drift_retry() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        // What the failed drift attempt that produced `existing` disclosed.
+        crate::index_md::record_vault_reconciliation_debt(
+            fx.store.db_path(),
+            &fx.root,
+            std::slice::from_ref(&fx.root),
+            Some("drift failed"),
+        );
+        let existing = PendingReconciliation {
+            paths: None,
+            also_replay: Vec::new(),
+            failures: 3,
+            next_attempt: Instant::now() + Duration::from_secs(60),
+        };
+        let merged = watcher.owe_sidecar_retry(
+            &fx.store,
+            Some(existing),
+            SidecarDebt {
+                paths: vec![path.clone()],
+                error: "injected".to_string(),
+            },
+        );
+        assert!(merged.paths.is_none(), "still recomputes drift");
+        assert_eq!(merged.also_replay, vec![path.clone()]);
+        assert_eq!(merged.failures, 3, "an owed retry keeps its schedule");
+        let rows: HashMap<String, String> =
+            crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+                .skipped
+                .into_iter()
+                .map(|file| (file.path, file.reason))
+                .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[&fx.root.to_string_lossy().into_owned()]
+                .contains("brain watcher startup reconciliation failed; retrying (drift failed)"),
+            "the startup row keeps its own reason: {rows:?}"
+        );
+        assert!(
+            rows[&path.to_string_lossy().into_owned()]
+                .contains("brain watcher code links not yet written; retrying (injected)"),
+            "{rows:?}"
+        );
+    }
+
+    /// nw-668 review (M5): `sidecar_scan_skipped` is reachable — an edit that
+    /// pushes a note over the size limit is not read (nw-469), the note keeps
+    /// its stored body, and so it keeps the code links that body produced.
+    #[test]
+    fn nw_668_an_oversized_edit_keeps_its_previous_code_links() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
+        let path = fx.root.join("n000.md");
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
+            .unwrap();
+        let before = nw_668_targets(&fx.store);
+        assert_eq!(before.len(), 2);
+
+        let huge = format!(
+            "# A\n\nuses BravoWidget\n{}",
+            "x".repeat(crate::index_limits::DEFAULT_MAX_NOTE_BYTES as usize)
+        );
+        fs::write(&path, huge).unwrap();
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
+            .unwrap();
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_scan_skipped,
+            1
+        );
+        assert_eq!(nw_668_targets(&fx.store), before);
+    }
+
+    /// nw-668 re-review (N1): owed link debt lives in the skipped-notes
+    /// sidecar, but startup reconciliation only diffed disk against the
+    /// graph's TEXT — which matches for a note whose links were owed — then
+    /// cleared the vault's debt. A restart silently dropped the owed links.
+    /// Startup must replay the persisted owed notes.
+    #[test]
+    fn nw_668_owed_links_survive_a_watcher_restart() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        // The text lands, the links do not (both flush attempts fail).
+        let first = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let owed = first.process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None);
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("owed");
+        crate::index_md::record_vault_link_debt(
+            fx.store.db_path(),
+            &fx.root,
+            &owed.paths,
+            &owed.error,
+            false,
+        );
+        assert!(nw_668_targets(&fx.store).is_empty());
+        drop(first);
+
+        // The daemon restarts: a fresh watcher's startup reconciliation.
+        let store = Arc::new(GraphStore::open_or_create(&fx.db_path).unwrap());
+        drop(fx.store);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        assert_eq!(
+            nw_668_targets(&store).len(),
+            2,
+            "owed links rebuilt at startup"
+        );
+        assert!(
+            nw_668_owed_debt(&fx.db_path).is_empty(),
+            "and the debt cleared"
+        );
+    }
+
+    /// nw-668 re-review: a live batch that rebuilds an owed note's links
+    /// settles its disclosure then, not only when the scheduled retry runs.
+    #[test]
+    fn nw_668_a_live_batch_that_lands_an_owed_notes_links_clears_its_row() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let owed = fx.root.join("n000.md");
+        let other = fx.root.join("n001.md");
+        fs::write(&owed, "# A\n\nuses AlphaWidget\n").unwrap();
+        crate::index_md::record_vault_link_debt(
+            fx.store.db_path(),
+            &fx.root,
+            &[owed.clone(), other.clone()],
+            "earlier failure",
+            false,
+        );
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![owed.clone()], &None)
+            .unwrap();
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![other.to_string_lossy().into_owned()],
+            "only the note whose links landed is settled"
+        );
+    }
+
+    /// nw-668 re-review (M4): a note whose sections cannot be read is owed
+    /// like a failed flush, with or without Tantivy — not a batch failure
+    /// that ends the live watcher's run loop.
+    #[test]
+    fn nw_668_an_unreadable_note_structure_is_owed_even_with_tantivy() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let path = fx.root.join("n000.md");
+        let fine = fx.root.join("n001.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget zebra\n").unwrap();
+        fs::write(&fine, "# B\n\nuses AlphaWidget yak\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        FAIL_NOTE_STRUCTURE_READS.with(|fail| fail.set(1));
+        let owed = watcher.process_batch(
+            &fx.store,
+            Some(&tantivy),
+            &fx.v_uid,
+            vec![path.clone(), fine.clone()],
+            &callback,
+        );
+        FAIL_NOTE_STRUCTURE_READS.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("the unreadable note is owed");
+        assert_eq!(owed.paths, vec![path.clone()]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the batch still publishes");
+        assert!(
+            !tantivy.search("yak", 10).unwrap().is_empty(),
+            "other notes land"
+        );
+        assert_eq!(
+            nw_668_targets(&fx.store).len(),
+            2,
+            "the readable note's links land"
+        );
+
+        // The owed replay heals it, Tantivy included.
+        let pending = watcher.owe_sidecar_retry(&fx.store, None, owed);
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                Some(&tantivy),
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        assert!(!tantivy.search("zebra", 10).unwrap().is_empty());
+        assert_eq!(nw_668_targets(&fx.store).len(), 4);
     }
 }

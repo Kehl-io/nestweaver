@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use nestweaver_parser::detect_language;
 use nestweaver_store::{GraphScope, GraphStore};
-use notify::{Event, RecursiveMode, Watcher};
+use notify::Event;
 
 use crate::content_reader::ContentReader;
 use crate::index::is_minified_or_bundled;
+use crate::watch_tree::TreeWatch;
 use crate::watcher::{
     RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
     WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
@@ -41,8 +42,18 @@ pub struct CodeWatcher {
     debounce: Duration,
     limits: crate::index_limits::IndexLimits,
     instance_config: Option<Arc<crate::InstanceConfig>>,
+    ready_callback: Option<Box<dyn FnOnce() + Send>>,
+    /// nw-664: first delay before retrying a failed startup reconciliation;
+    /// doubles per failure up to [`crate::watcher::RECONCILE_RETRY_CAP`].
+    reconcile_retry_base: Duration,
+    /// nw-651 on Linux: directories the filesystem subscription could not
+    /// cover (`watch_tree`), disclosed with the rest of this repo's debt.
+    unwatched_dirs: Vec<(PathBuf, String)>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
+    /// Test seam: subscribe as inotify would fail on an unreadable subtree.
+    #[cfg(test)]
+    emulate_inotify_watch: bool,
 }
 
 #[derive(Debug)]
@@ -106,9 +117,41 @@ impl CodeWatcher {
             debounce: Duration::from_secs(2),
             limits: crate::index_limits::IndexLimits::default(),
             instance_config: None,
+            ready_callback: None,
+            reconcile_retry_base: crate::watcher::RECONCILE_RETRY_BASE,
+            unwatched_dirs: Vec::new(),
             #[cfg(test)]
             ready_signal: None,
+            #[cfg(test)]
+            emulate_inotify_watch: false,
         }
+    }
+
+    /// Called once startup has subscribed to the filesystem, published any
+    /// cold snapshot and attempted the startup reconciliation (nw-664), so
+    /// "ready" normally means the graph matches disk. A failed reconciliation
+    /// does not withhold readiness: it is disclosed and retried. Dropping the
+    /// watcher without invoking it means startup failed or was cancelled.
+    pub fn with_ready_callback(mut self, ready: impl FnOnce() + Send + 'static) -> Self {
+        self.ready_callback = Some(Box::new(ready));
+        self
+    }
+
+    /// Test hook: make the recursive subscription fail the way Linux inotify
+    /// does on an unreadable subdirectory (see `watch_tree`).
+    /// Linux tests use real inotify instead, so the hook is unused there.
+    #[cfg(test)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn emulating_inotify_watch(mut self) -> Self {
+        self.emulate_inotify_watch = true;
+        self
+    }
+
+    /// Test hook: shorten the startup-reconciliation retry backoff (nw-664).
+    #[cfg(test)]
+    fn with_reconcile_retry_base(mut self, base: Duration) -> Self {
+        self.reconcile_retry_base = base;
+        self
     }
 
     pub fn with_limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
@@ -141,7 +184,9 @@ impl CodeWatcher {
     // `-D warnings`, they were DELETED in 01c585b8 — which broke the Linux
     // build outright. The platform gate has to match the test's, not the
     // platform the lint happened to run on.
-    #[cfg(all(test, target_os = "linux"))]
+    // nw-664 review: the live-disclosure tests use it on every unix too, so
+    // the gate follows theirs (a superset of the Linux test's).
+    #[cfg(all(test, unix))]
     fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
         self.debounce = Duration::from_millis(debounce_ms);
         self
@@ -222,7 +267,7 @@ impl CodeWatcher {
 
     /// Shared implementation used by both `run` and `run_with_store`.
     fn run_inner(
-        self,
+        mut self,
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
@@ -230,7 +275,7 @@ impl CodeWatcher {
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let mut watcher =
+        let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_kind_can_mutate(&event.kind) => {
                     let _ = tx.send(Ok(event.paths));
@@ -241,9 +286,17 @@ impl CodeWatcher {
                 }
             })
             .context("init code filesystem watcher")?;
-        watcher
-            .watch(&self.repo_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", self.repo_root.display()))?;
+        // nw-651 on Linux: an unreadable subdirectory must not stop the whole
+        // subscription; it is skipped and disclosed instead (`watch_tree`).
+        #[cfg(test)]
+        let tree = if self.emulate_inotify_watch {
+            TreeWatch::start_emulating_inotify(watcher, &self.repo_root)
+        } else {
+            TreeWatch::start(watcher, &self.repo_root)
+        };
+        #[cfg(not(test))]
+        let tree = TreeWatch::start(watcher, &self.repo_root);
+        let mut tree = tree.with_context(|| format!("watch {}", self.repo_root.display()))?;
         #[cfg(test)]
         if let Some(ready) = &self.ready_signal {
             let _ = ready.send(());
@@ -253,12 +306,17 @@ impl CodeWatcher {
         // `file://` graph rather than re-identifying+pruning, so a watch-first
         // start over a legacy DB never empties the graph.
         let (repo_url, r_uid) = resolve_watch_identity(&store, &self.instance_id, &self.repo_root)?;
+        // Always, so a previous run's rows for directories that are now
+        // watchable are cleared (no write when nothing changed).
+        self.sync_unwatched_dirs(&repo_url, tree.unwatchable(), true);
+        let mut subscribed_unwatchable = tree.unwatchable().to_vec();
 
         // A contract plan is a whole-repo view and must never point at
         // unchanged controllers that a minimal watch-first graph omitted.
         // Cold watchers therefore publish an authoritative initial source +
         // contract snapshot through the exact same atomic batch seam.
-        if store.lookup_repo(&r_uid)?.is_none() {
+        let cold = store.lookup_repo(&r_uid)?.is_none();
+        if cold {
             loop {
                 let reader = self.reader_for(&repo_url)?;
                 let initial_paths: Vec<PathBuf> = reader
@@ -322,6 +380,37 @@ impl CodeWatcher {
             }
         }
 
+        // nw-664: replay what changed while no watcher was listening. A cold
+        // repo was just snapshotted whole, so only an indexed one needs it.
+        // The notify subscription is already live, so a save racing this
+        // scan is queued and replayed by the loop; overlap is harmless. Runs
+        // before readiness so "ready" normally means the graph matches disk.
+        // A failure does not stop live watching (a restart would only meet
+        // the same failure): it is disclosed and retried below with backoff.
+        let mut pending = None;
+        if !cold {
+            if self.stop_flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            pending = match self.attempt_reconciliation(
+                &store,
+                &r_uid,
+                &repo_url,
+                on_change.as_deref().map(|callback| callback as &dyn Fn()),
+                0,
+            ) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::info!(
+                        "CodeWatcher startup reconciliation refused during shutdown; exiting: {error:#}"
+                    );
+                    return Ok(());
+                }
+            };
+        }
+        if let Some(ready) = self.ready_callback.take() {
+            ready();
+        }
         tracing::info!(
             repo = %self.repo_root.display(),
             db = %self.db_path.display(),
@@ -335,8 +424,23 @@ impl CodeWatcher {
                 tracing::info!("CodeWatcher stop requested; exiting");
                 return Ok(());
             }
+            // nw-664: retry an owed startup reconciliation once its backoff
+            // elapses — on the receive-timeout tick when idle, between
+            // batches when busy.
+            if let Some(owed) = pending.take_if(|owed| Instant::now() >= owed.next_attempt) {
+                match self.attempt_reconciliation(
+                    &store,
+                    &r_uid,
+                    &repo_url,
+                    on_change.as_deref().map(|callback| callback as &dyn Fn()),
+                    owed.failures,
+                ) {
+                    Ok(next) => pending = next,
+                    Err(_) => return Ok(()),
+                }
+            }
 
-            let batch = if !replay_batch.is_empty() {
+            let mut batch = if !replay_batch.is_empty() {
                 std::mem::take(&mut replay_batch)
             } else {
                 match receive_debounced_paths(&rx, self.debounce, &self.stop_flag) {
@@ -379,6 +483,14 @@ impl CodeWatcher {
                 }
             };
 
+            // nw-651 on Linux: a directory created under a non-recursively
+            // watched one needs its own watch, and its files may predate it.
+            let adopted = tree.adopt_new_dirs(&batch);
+            batch.extend(adopted);
+            if tree.unwatchable() != subscribed_unwatchable.as_slice() {
+                subscribed_unwatchable = tree.unwatchable().to_vec();
+                self.sync_unwatched_dirs(&repo_url, &subscribed_unwatchable, false);
+            }
             let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -397,13 +509,57 @@ impl CodeWatcher {
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
             )?;
             let files_processed = match outcome {
-                WatchBatchOutcome::Published { files_processed } => files_processed,
+                WatchBatchOutcome::Published { files_processed } => {
+                    // nw-664 review: these paths are now what the graph holds,
+                    // so any disclosure about them is stale.
+                    // An unwatched directory's row stays: a batch touching
+                    // it (or an ancestor) says nothing about its watch.
+                    let settled: Vec<PathBuf> = batch
+                        .iter()
+                        .filter(|path| {
+                            !self
+                                .unwatched_dirs
+                                .iter()
+                                .any(|(dir, _)| dir.starts_with(path))
+                        })
+                        .cloned()
+                        .collect();
+                    crate::index_md::clear_code_reconciliation_paths(
+                        &self.db_path,
+                        &self.repo_root,
+                        &settled,
+                    );
+                    files_processed
+                }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
                 WatchBatchOutcome::Skipped { reason } => {
+                    // nw-669: this used to be the whole handling — a warning,
+                    // then the batch was gone. Nothing retried it and nothing
+                    // disclosed it, so with one unreadable contract-language
+                    // source in the repo every live edit was silently lost.
+                    // Hand it to the startup reconciliation's retry instead:
+                    // an attempt recomputes disk-vs-graph drift (which holds
+                    // these paths, since the graph never took them), replays
+                    // it, and on failure discloses it as owed and retries on
+                    // the shared backoff until it lands.
                     tracing::warn!(
                         error = %reason,
-                        "skipping transient watcher batch before publication; previous graph preserved"
+                        "code watcher batch skipped before publication; previous graph \
+                         preserved; reconciling with retry"
                     );
+                    // nw-669 review: only when no retry is owed yet. An owed
+                    // retry keeps its schedule — its recomputed drift will
+                    // include these paths — so in a permanently blocked repo
+                    // an autosave costs one failing live batch, not also a
+                    // full walk and a failing replay every time.
+                    if pending.is_none() {
+                        pending = Some(crate::watcher::PendingReconciliation {
+                            paths: None,
+                            also_replay: Vec::new(),
+                            failures: 0,
+                            next_attempt: Instant::now(),
+                        });
+                    }
                     continue;
                 }
             };
@@ -679,16 +835,7 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            let exclusion_reason = if path_has_symlink(&self.repo_root, rel_path)? {
-                Some("symlink outside the admitted source tree")
-            } else if !reader.accepts_path(rel_path) {
-                Some("configured repository exclusion")
-            } else if is_minified_or_bundled(path) {
-                Some("minified/generated file policy")
-            } else {
-                None
-            };
-            if let Some(reason) = exclusion_reason {
+            if let Some(reason) = source_policy_exclusion(&reader, &self.repo_root, path)? {
                 tracing::warn!(
                     path = %rel_path.display(), reason,
                     "watched source is policy-excluded; removing stale graph coverage"
@@ -941,6 +1088,435 @@ impl CodeWatcher {
         }
         Ok(outcome)
     }
+
+    /// nw-664: the sources whose graph state no longer matches disk, for the
+    /// code watcher to replay as its first batch — the code twin of nw-653's
+    /// `index_md::vault_startup_drift`.
+    ///
+    /// A watcher learns about changes only through events, and events that
+    /// arrive while nothing listens (daemon down, laptop asleep, a crash) are
+    /// gone. Only a COLD repo used to get a startup snapshot, so an indexed
+    /// repo stayed stale until each file was touched again. Startup therefore
+    /// diffs disk against the graph:
+    ///
+    /// - a source the graph has no File for (a lost create), unless it could
+    ///   never be graphed: oversized or binary (the index skips and discloses
+    ///   those) or recorded unindexable at this mtime by an earlier replay;
+    /// - a graphed source whose content differs from the graph's
+    ///   `content_hash` (a lost edit);
+    /// - a graphed source whose file no longer exists (a lost delete). Only
+    ///   inferred when the walk found files at all — an empty scan is an
+    ///   unmounted or unreadable tree, not a deletion (nw-287) — and only on
+    ///   `NotFound`, so a file under a directory the walk could not read
+    ///   (nw-651: EACCES, or an execute-only dir it could stat) is kept.
+    ///
+    /// Cheap: ONE walk through the index's own `FilesystemReader` (SKIP_DIRS,
+    /// gitignore, `[[repos]] exclude`), one `stat` per source against the
+    /// `<db>.filemeta.json` cache the index keeps, and a read + BLAKE3 hash
+    /// only where the stat moved (a file the watcher re-parsed since the last
+    /// index has a stale filemeta entry, so the hash is compared with the
+    /// GRAPH, which is what actually has to match). Nothing is parsed here.
+    ///
+    /// Why not `indexed_sha` vs `HEAD` plus `git status`: watcher batches do
+    /// not advance `indexed_sha`, and the graph routinely holds uncommitted
+    /// edits the watcher ingested, so a git diff answers "what changed since
+    /// the last full index", not "what does the graph lack". It also would not
+    /// cover non-git repos. The stat/hash comparison answers the right
+    /// question for both.
+    ///
+    /// Scope: supported SOURCE files, the inputs that carry File nodes.
+    ///
+    /// nw-664 review: ONE bad file must not block the rest. A source that
+    /// cannot be read (EACCES, an I/O fault) is NOT drift — replaying it made
+    /// the batch skip every path, so the real lost edits beside it never
+    /// landed and the replay retried forever. It is left as the graph has it
+    /// (nw-651: unread is not deleted) and returned in `unreadable` for the
+    /// caller to disclose; the next start reads it again. A graphed source
+    /// turned binary is treated the same way, matching the live batch, which
+    /// keeps a file's previous symbols when the reader refuses it; an
+    /// ungraphed binary one is remembered by stamp, not re-read per start.
+    ///
+    /// Checks the stop flag per file: a shutdown mid-walk is a refusal.
+    fn startup_drift(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+    ) -> Result<CodeStartupDrift, anyhow::Error> {
+        let indexed: std::collections::HashMap<String, String> = store
+            .list_file_hashes_by_repo(r_uid)
+            .context("list indexed repo files")?
+            .into_iter()
+            .collect();
+        let filemeta = crate::index::load_filemeta_sidecar(&crate::sidecar_path(
+            &self.db_path,
+            ".filemeta.json",
+        ))
+        .repos
+        .remove(r_uid)
+        .unwrap_or_default();
+        let unindexable = crate::index_md::load_code_unindexable_stamps(&self.db_path);
+        let reader = self.reader_for(repo_url)?;
+        let listed = reader
+            .list_files()
+            .context("list files for code watcher startup reconciliation")?;
+        let max_bytes = reader.max_source_file_bytes();
+        let is_policy_skip = |error: &anyhow::Error| {
+            error
+                .downcast_ref::<crate::content_reader::BinarySource>()
+                .is_some()
+                || error
+                    .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    .is_some()
+        };
+        let mut seen = HashSet::new();
+        let mut drift = CodeStartupDrift::default();
+        for rel_path in listed {
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return Err(WatchMutationRefused.into());
+            }
+            let rel_str = rel_path.to_string_lossy().into_owned();
+            seen.insert(rel_str.clone());
+            let abs_path = self.repo_root.join(&rel_path);
+            if !is_supported_source(&abs_path) {
+                continue;
+            }
+            let recorded = indexed.get(&rel_str);
+            match source_policy_exclusion(&reader, &self.repo_root, &abs_path) {
+                Ok(Some(_)) => {
+                    // The batch retracts an excluded file's stale coverage;
+                    // one the graph does not hold has nothing to retract.
+                    if recorded.is_some() {
+                        drift.replay.push(abs_path);
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                // nw-664 final review: the policy check stats every path
+                // component, and an EACCES there used to fail the WHOLE
+                // drift — retried on backoff forever while the real lost
+                // edits beside it never landed. It is the unreadable case:
+                // disclosed, left as the graph has it, the rest reconciled.
+                Err(error) => {
+                    drift.unreadable.push((abs_path, format!("{error:#}")));
+                    continue;
+                }
+            }
+            // Vanished since the walk: its deletion is an event of its own.
+            let Ok(Some((mtime_nanos, size_bytes))) = reader.file_meta_nanos(&rel_path) else {
+                continue;
+            };
+            let drifted = match recorded {
+                Some(hash) => {
+                    let stat_matches = filemeta.get(&rel_str).is_some_and(|cached| {
+                        cached.mtime_nanos == mtime_nanos
+                            && cached.size_bytes == size_bytes
+                            && &cached.content_hash == hash
+                    });
+                    if stat_matches || hash.is_empty() {
+                        // No recorded hash: leave it alone rather than
+                        // re-parse it on every start (nw-653's rule).
+                        false
+                    } else if size_bytes > max_bytes {
+                        // Grown past the cap: the batch retracts it.
+                        true
+                    } else {
+                        match reader.read_file(&rel_path) {
+                            Ok(source) => crate::hash::blake3_hex(&source) != *hash,
+                            // Unreadable or turned binary: a live batch keeps
+                            // the previously indexed symbols for a file the
+                            // reader cannot handle (and skips), so the replay
+                            // must not carry it either — disclosed instead.
+                            Err(error) => {
+                                drift.unreadable.push((abs_path, format!("{error:#}")));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let stamp = code_source_stamp(mtime_nanos, size_bytes);
+                    if size_bytes > max_bytes || unindexable.get(&abs_path) == Some(&stamp) {
+                        false
+                    } else {
+                        match reader.read_file(&rel_path) {
+                            Ok(_) => true,
+                            Err(error) if is_policy_skip(&error) => {
+                                drift.unindexable.push((abs_path, stamp));
+                                continue;
+                            }
+                            Err(error) => {
+                                drift.unreadable.push((abs_path, format!("{error:#}")));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            };
+            if drifted {
+                drift.replay.push(abs_path);
+            }
+        }
+        if !seen.is_empty() {
+            for rel_str in indexed.keys().filter(|path| !seen.contains(*path)) {
+                let abs_path = self.repo_root.join(rel_str);
+                if matches!(
+                    std::fs::symlink_metadata(&abs_path),
+                    Err(error) if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    )
+                ) {
+                    drift.replay.push(abs_path);
+                }
+            }
+        }
+        drift.replay.sort();
+        drift.unreadable.sort();
+        Ok(drift)
+    }
+
+    /// nw-664: one startup reconciliation attempt, mirroring the brain
+    /// watcher's (nw-653). `Ok(None)` means the graph now matches disk (bar
+    /// any disclosed unreadable source) and no retry is owed; `Ok(Some(_))`
+    /// means it failed, was disclosed through nw-653's
+    /// `reconciliation_pending` status channel (under this repo's `code:`
+    /// key) and is owed a retry with backoff. `Err` only for a shutdown
+    /// refusal, which ends the watcher.
+    ///
+    /// Every attempt, retries included, recomputes the drift: disk may have
+    /// moved on, and the unreadable disclosure must describe it now.
+    ///
+    /// The drifted paths go through `process_batch_and_notify` — the seam
+    /// every live batch uses — so reverse-dependent resolution, contracts,
+    /// publication, tombstones and the change callback behave identically.
+    fn attempt_reconciliation(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+        on_change: Option<&dyn Fn()>,
+        failures: u32,
+    ) -> Result<Option<crate::watcher::PendingReconciliation>, anyhow::Error> {
+        // nw-664 review: a repo removed or pruned while a retry was owed is
+        // owed nothing. The batch would re-create its Repo node (the cold
+        // path's `insert_initial_repo`) and rewrite the debt removal cleared.
+        if matches!(store.lookup_repo(r_uid), Ok(None)) {
+            tracing::info!(
+                repo = %self.repo_root.display(),
+                "CodeWatcher: repo no longer in the graph; dropping its startup reconciliation"
+            );
+            crate::index_md::record_code_reconciliation_debt(
+                &self.db_path,
+                &self.repo_root,
+                Vec::new(),
+            );
+            return Ok(None);
+        }
+        let drift = match self.startup_drift(store, r_uid, repo_url) {
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                return Err(error);
+            }
+            drift => drift,
+        };
+        let (paths, unreadable, error) = match drift {
+            Ok(drift) => {
+                crate::index_md::record_code_unindexable_stamps(
+                    &self.db_path,
+                    &[],
+                    &drift.unindexable,
+                );
+                if drift.replay.is_empty() {
+                    self.record_debt(&[], &drift.unreadable, None);
+                    return Ok(None);
+                }
+                tracing::info!(
+                    repo = %self.repo_root.display(),
+                    files = drift.replay.len(),
+                    unreadable = drift.unreadable.len(),
+                    "CodeWatcher startup: reconciling sources changed while no watcher ran"
+                );
+                let replayed = match self.acquire_mutation_lease("watch_code_batch") {
+                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) => Err(error.context("acquire code watcher batch lease")),
+                    Ok(_lease) => self.process_batch_and_notify(
+                        store,
+                        r_uid,
+                        repo_url,
+                        &drift.replay,
+                        &crate::index::FileSystemIndexEpilogueIo,
+                        on_change,
+                    ),
+                };
+                match replayed {
+                    Ok(WatchBatchOutcome::Skipped { reason }) => {
+                        (Some(drift.replay), drift.unreadable, reason)
+                    }
+                    Ok(_) => {
+                        self.record_unindexable_after_replay(store, r_uid, repo_url, &drift.replay);
+                        self.record_debt(&[], &drift.unreadable, None);
+                        return Ok(None);
+                    }
+                    Err(error) => (Some(drift.replay), drift.unreadable, error),
+                }
+            }
+            Err(error) => (None, Vec::new(), error),
+        };
+        let failures = failures.saturating_add(1);
+        let delay = crate::watcher::reconcile_retry_delay(self.reconcile_retry_base, failures);
+        let message = format!("{error:#}");
+        tracing::error!(
+            repo = %self.repo_root.display(),
+            error = %message,
+            failures,
+            retry_in_ms = delay.as_millis() as u64,
+            "CodeWatcher startup reconciliation failed; sources changed while no watcher \
+             ran are missing or stale until it succeeds (retrying; `nestweaver index` \
+             also heals it)"
+        );
+        // An uncomputable drift is disclosed against the repo root itself.
+        self.record_debt(
+            paths
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&self.repo_root)),
+            &unreadable,
+            Some(&message),
+        );
+        Ok(Some(crate::watcher::PendingReconciliation {
+            paths,
+            also_replay: Vec::new(),
+            failures,
+            next_attempt: Instant::now() + delay,
+        }))
+    }
+
+    /// nw-664: describe this repo's WHOLE debt — the `owed` replay when it
+    /// failed with `error`, plus every source the drift could not read — in
+    /// the status channel; nothing to describe clears it.
+    fn record_debt(&self, owed: &[PathBuf], unreadable: &[(PathBuf, String)], error: Option<&str>) {
+        let prefix = crate::index_md::WATCH_RECONCILIATION_PENDING_REASON;
+        let mut entries: Vec<nestweaver_parser::SkippedFile> = Vec::new();
+        if let Some(error) = error {
+            let reason =
+                format!("{prefix}: code watcher startup reconciliation failed; retrying ({error})");
+            entries.extend(owed.iter().map(|path| {
+                nestweaver_parser::SkippedFile::new(
+                    path.to_string_lossy().into_owned(),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    reason.clone(),
+                )
+            }));
+        }
+        entries.extend(unreadable.iter().map(|(path, error)| {
+            nestweaver_parser::SkippedFile::new(
+                path.to_string_lossy().into_owned(),
+                nestweaver_parser::SkipReasonCode::ReadError,
+                format!(
+                    "{prefix}: code watcher could not read this source ({error}); the graph \
+                     keeps its last indexed state, re-checked at the next watcher start"
+                ),
+            )
+        }));
+        entries.extend(self.unwatched_dirs.iter().map(|(dir, error)| {
+            nestweaver_parser::SkippedFile::new(
+                dir.to_string_lossy().into_owned(),
+                nestweaver_parser::SkipReasonCode::ReadError,
+                unwatched_dir_reason(error),
+            )
+        }));
+        crate::index_md::record_code_reconciliation_debt(&self.db_path, &self.repo_root, entries);
+    }
+
+    /// nw-651 on Linux: adopt the subscription's current unwatchable
+    /// directories — minus those the index ignores anyway (`SKIP_DIRS`,
+    /// `[[repos]] exclude`, `.gitignore`: e.g. a container's database
+    /// directory), which are no loss — and persist their rows when the set
+    /// changed (or `force`), leaving the rest of the debt alone.
+    fn sync_unwatched_dirs(&mut self, repo_url: &str, dirs: &[(PathBuf, String)], force: bool) {
+        let reader = self.reader_for(repo_url).ok();
+        let disclosable: Vec<(PathBuf, String)> = dirs
+            .iter()
+            .filter(|(dir, _)| {
+                let Ok(rel) = dir.strip_prefix(&self.repo_root) else {
+                    return true;
+                };
+                let excluded = reader
+                    .as_ref()
+                    .is_some_and(|reader| !reader.accepts_path(&rel.join("nestweaver-probe")));
+                !excluded
+                    && !matches!(
+                        manifest_path_not_gitignored(&self.repo_root, rel),
+                        Ok(false)
+                    )
+            })
+            .cloned()
+            .collect();
+        if !force && disclosable == self.unwatched_dirs {
+            return;
+        }
+        for (dir, error) in disclosable
+            .iter()
+            .filter(|dir| !self.unwatched_dirs.contains(dir))
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                %error,
+                "code watcher cannot watch this directory; edits beneath it are not seen live"
+            );
+        }
+        self.unwatched_dirs = disclosable;
+        let rows = self
+            .unwatched_dirs
+            .iter()
+            .map(|(dir, error)| {
+                nestweaver_parser::SkippedFile::new(
+                    dir.to_string_lossy().into_owned(),
+                    nestweaver_parser::SkipReasonCode::ReadError,
+                    unwatched_dir_reason(error),
+                )
+            })
+            .collect();
+        crate::index_md::record_code_unwatched_dirs(&self.db_path, &self.repo_root, rows);
+    }
+
+    /// nw-664: after a successful replay, a replayed source that still exists
+    /// but that the graph does not hold (unparsable, say) is remembered with
+    /// its stamp so the next start does not replay it again until it changes;
+    /// every other replayed path is forgotten.
+    fn record_unindexable_after_replay(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+        replayed: &[PathBuf],
+    ) {
+        let graphed: HashSet<String> = match store.list_files_by_repo(r_uid) {
+            Ok(files) => files.into_iter().map(|(_, path)| path).collect(),
+            Err(error) => {
+                tracing::warn!("nw-664: could not list graphed files after replay: {error}");
+                return;
+            }
+        };
+        let Ok(reader) = self.reader_for(repo_url) else {
+            return;
+        };
+        let unindexable: Vec<(PathBuf, String)> = replayed
+            .iter()
+            .filter_map(|path| {
+                let rel = path.strip_prefix(&self.repo_root).ok()?;
+                if graphed.contains(&*rel.to_string_lossy())
+                    || !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+                {
+                    return None;
+                }
+                let (mtime_nanos, size_bytes) = reader.file_meta_nanos(rel).ok()??;
+                Some((path.clone(), code_source_stamp(mtime_nanos, size_bytes)))
+            })
+            .collect();
+        crate::index_md::record_code_unindexable_stamps(&self.db_path, replayed, &unindexable);
+    }
 }
 
 // Do not admit a symlink in any component, including an ancestor replaced
@@ -970,6 +1546,47 @@ fn path_has_symlink(root: &Path, relative: &Path) -> anyhow::Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// nw-664: what the code watcher's startup reconciliation found.
+#[derive(Debug, Default)]
+struct CodeStartupDrift {
+    /// Absolute paths to replay through the batch seam, sorted.
+    replay: Vec<PathBuf>,
+    /// Sources the walk could not read, with the error: disclosed, not
+    /// replayed, and never treated as deleted.
+    unreadable: Vec<(PathBuf, String)>,
+    /// Ungraphed sources seen to be binary: remembered by stamp.
+    unindexable: Vec<(PathBuf, String)>,
+}
+
+/// nw-664 review: nanosecond mtime plus size (the filemeta quick check), so
+/// a restore within the same second is still seen as a change.
+fn code_source_stamp(mtime_nanos: u64, size_bytes: u64) -> String {
+    format!("{mtime_nanos}:{size_bytes}")
+}
+
+/// Why policy keeps the watched source `path` out of the graph, if it does.
+///
+/// nw-664: ONE predicate for the batch (which retracts a now-excluded file's
+/// stale coverage) and the startup drift (which must not replay a file the
+/// batch would only drop), so the two cannot disagree (CONTRIBUTING, sibling
+/// gaps).
+fn source_policy_exclusion(
+    reader: &crate::content_reader::FilesystemReader,
+    repo_root: &Path,
+    path: &Path,
+) -> anyhow::Result<Option<&'static str>> {
+    let rel_path = path.strip_prefix(repo_root)?;
+    Ok(if path_has_symlink(repo_root, rel_path)? {
+        Some("symlink outside the admitted source tree")
+    } else if !reader.accepts_path(rel_path) {
+        Some("configured repository exclusion")
+    } else if is_minified_or_bundled(path) {
+        Some("minified/generated file policy")
+    } else {
+        None
+    })
 }
 
 fn drain_queued_events(rx: &std::sync::mpsc::Receiver<RawWatchResult>) -> Vec<PathBuf> {
@@ -1036,6 +1653,16 @@ fn resolve_watch_identity(
 /// Returns true if the file is a supported source language.
 fn is_supported_source(path: &Path) -> bool {
     detect_language(path).is_some()
+}
+
+/// The debt row reason for a directory the code watcher cannot watch.
+fn unwatched_dir_reason(error: &str) -> String {
+    format!(
+        "{}: {} ({error}); edits beneath it are not picked up live until it can be \
+         watched again",
+        crate::index_md::WATCH_RECONCILIATION_PENDING_REASON,
+        crate::index_md::CODE_UNWATCHED_DIR_MARKER,
+    )
 }
 
 fn is_watcher_input(path: &Path) -> bool {
@@ -2916,5 +3543,1047 @@ mod tests {
             assert_eq!(url, "https://example.com/acme/fresh.git");
             assert_eq!(uid, repo_uid("test", "https://example.com/acme/fresh.git"));
         }
+    }
+
+    /// Index the `index_fixture_repo` JS files (plus `extra`) into an ON-DISK
+    /// graph, as `nestweaver index` would, so the filemeta cache and every
+    /// sidecar exist. Returns the db path, canonical root and repo uid.
+    fn index_fixture_repo_on_disk(
+        dir: &tempfile::TempDir,
+        extra: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf, String) {
+        let repo_root = dir.path().join("repo");
+        let files = [
+            ("src/a.js", "export function helper() { return 7; }\n"),
+            (
+                "src/b.js",
+                "import { helper } from './a.js';\nexport function alpha() { return helper() + 1; }\n",
+            ),
+            (
+                "src/c.js",
+                "import { alpha } from './b.js';\nexport function gamma() { return alpha() * 2; }\n",
+            ),
+        ];
+        for (rel, body) in files.iter().chain(extra) {
+            let path = repo_root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&root, &db_path, "test", &repo_url, "sha1").unwrap();
+        (
+            db_path,
+            root,
+            nestweaver_schema::repo_uid("test", &repo_url),
+        )
+    }
+
+    /// Start a code watcher over `root`, stop it at readiness, and return how
+    /// many batch leases (`watch_code_batch`) its startup took — zero means
+    /// startup ran no batch at all.
+    fn code_startup_batches(db_path: &Path, root: &Path, store: &Arc<GraphStore>) -> u32 {
+        use std::sync::atomic::AtomicU32;
+        let batches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&batches);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_code_batch" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let watcher = CodeWatcher::new(db_path, root, "test").with_mutation_lease_factory(factory);
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        batches.load(Ordering::SeqCst)
+    }
+
+    fn repo_symbol_names(store: &GraphStore, r_uid: &str) -> HashSet<String> {
+        store
+            .lookup_symbols_by_repo(r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    }
+
+    fn repo_file_paths(store: &GraphStore, r_uid: &str) -> HashSet<String> {
+        store
+            .list_files_by_repo(r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    /// nw-664: the code watcher only snapshotted a COLD repo. For an indexed
+    /// one, sources created, edited or deleted while no watcher ran (daemon
+    /// down, laptop asleep, a crash) produced events nobody received, and the
+    /// graph stayed stale until the file was touched again or a manual
+    /// `index` ran. Startup must reconcile all three before readiness.
+    #[test]
+    fn code_watcher_startup_reconciles_sources_changed_while_no_watcher_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+
+        // The gap: nothing is watching while these land on disk.
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/a.js"),
+            "export function helperEdited() { return 8; }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("src/c.js")).unwrap();
+
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        assert!(code_startup_batches(&db_path, &root, &store) > 0);
+
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("delta"),
+            "a source created while no watcher ran must be ingested before ready: {names:?}"
+        );
+        assert!(
+            names.contains("helperEdited") && !names.contains("helper"),
+            "an edit made while no watcher ran must be ingested before ready: {names:?}"
+        );
+        assert!(
+            !names.contains("gamma") && !repo_file_paths(&store, &uid).contains("src/c.js"),
+            "a source deleted while no watcher ran must leave the graph: {names:?}"
+        );
+        assert!(
+            names.contains("alpha"),
+            "counterweight: untouched b.js stays"
+        );
+
+        // Counterweight: once reconciled, the next start finds nothing to do.
+        assert_eq!(code_startup_batches(&db_path, &root, &store), 0);
+    }
+
+    /// nw-664 counterweight: an unchanged indexed repo publishes nothing at
+    /// startup — no batch, no re-parse, no new graph generation.
+    #[test]
+    fn code_watcher_startup_over_an_unchanged_repo_runs_no_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, _uid) = index_fixture_repo_on_disk(&dir, &[]);
+        // A stat-only change (content identical) must not replay either.
+        let a = root.join("src/a.js");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let generation = store.graph_generation();
+        assert_eq!(code_startup_batches(&db_path, &root, &store), 0);
+        assert_eq!(store.graph_generation(), generation);
+    }
+
+    /// nw-664 / nw-651: a partial scan is not a deletion. Sources under a
+    /// subdirectory the walk cannot read stay in the graph, while a genuine
+    /// deletion elsewhere in the same scan is still reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn code_watcher_startup_keeps_sources_in_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads through 0o000, so the fixture cannot lock it out.
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(
+            &dir,
+            &[(
+                "locked/hidden.js",
+                "export function hidden() { return 1; }\n",
+            )],
+        );
+        std::fs::remove_file(root.join("src/c.js")).unwrap();
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            code_startup_batches(&db_path, &root, &store)
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        started.unwrap();
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("hidden"),
+            "an unreadable subdirectory must not be replayed as a deletion: {names:?}"
+        );
+        assert!(
+            !names.contains("gamma"),
+            "a real deletion in the same scan is still reconciled: {names:?}"
+        );
+    }
+
+    /// nw-651 on Linux (PR #431 CI): notify's inotify backend fails the
+    /// WHOLE recursive watch on the first subdirectory it cannot watch, so a
+    /// repo holding one unreadable directory had no code watcher at all —
+    /// every live edit silently lost. The seam fails the subscription the
+    /// way inotify does (FSEvents never would). Startup must proceed, the
+    /// unreadable directory must be disclosed and its sources kept, and
+    /// edits elsewhere — including in a directory created afterwards — must
+    /// still land.
+    #[cfg(unix)]
+    #[test]
+    fn code_watcher_stays_live_when_a_subdirectory_cannot_be_watched() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(
+            &dir,
+            &[(
+                "locked/hidden.js",
+                "export function hidden() { return 1; }\n",
+            )],
+        );
+        let locked = root.join("locked");
+        // An ignored unreadable directory (a container's data dir under a
+        // SKIP_DIRS name) is no loss, so it is not a debt row.
+        let ignored = root.join("node_modules");
+        std::fs::create_dir_all(&ignored).unwrap();
+        let fresh_locked = root.join("fresh_locked");
+        let restore = || {
+            for dir in [&locked, &ignored, &fresh_locked] {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+            }
+        };
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&ignored, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // On Linux this is REAL inotify failing on the unreadable
+            // directory; elsewhere the seam fails the way it does.
+            let watcher = CodeWatcher::new(&db_path, &root, "test");
+            #[cfg(not(target_os = "linux"))]
+            let watcher = watcher.emulating_inotify_watch();
+            let (stop, handle) = spawn_live_code_watcher(watcher, store.clone());
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let locked_key = locked.to_string_lossy().into_owned();
+                let disclosed = || {
+                    code_debt(&db_path).iter().any(|(path, reason)| {
+                        *path == locked_key && reason.contains("cannot watch")
+                    })
+                };
+                assert!(
+                    disclosed(),
+                    "the unwatchable directory must be disclosed: {:?}",
+                    code_debt(&db_path)
+                );
+                let ignored_key = ignored.to_string_lossy().into_owned();
+                assert!(
+                    !code_debt(&db_path)
+                        .iter()
+                        .any(|(path, _)| *path == ignored_key),
+                    "an ignored unreadable directory is not a debt row: {:?}",
+                    code_debt(&db_path)
+                );
+
+                std::fs::write(
+                    root.join("src/a.js"),
+                    "export function helperLive() { return 9; }\n",
+                )
+                .unwrap();
+                wait_until("an edit in a watched directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("helperLive")
+                });
+                std::fs::create_dir(root.join("fresh")).unwrap();
+                std::fs::write(
+                    root.join("fresh/born.js"),
+                    "export function bornLive() { return 1; }\n",
+                )
+                .unwrap();
+                wait_until("a source in a directory created later to land", || {
+                    repo_symbol_names(&store, &uid).contains("bornLive")
+                });
+                // Its own watch, not only the create event, carries later edits.
+                std::fs::write(
+                    root.join("fresh/born.js"),
+                    "export function bornEdited() { return 2; }\n",
+                )
+                .unwrap();
+                wait_until("a later edit in the new directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("bornEdited")
+                });
+
+                // Deleted and re-created within one debounce window: the new
+                // directory needs a watch of its own again.
+                std::fs::remove_dir_all(root.join("fresh")).unwrap();
+                std::fs::create_dir(root.join("fresh")).unwrap();
+                std::fs::write(
+                    root.join("fresh/again.js"),
+                    "export function againLive() { return 3; }\n",
+                )
+                .unwrap();
+                wait_until("a source in the re-created directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("againLive")
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(
+                    root.join("fresh/again.js"),
+                    "export function againEdited() { return 4; }\n",
+                )
+                .unwrap();
+                wait_until("a later edit in the re-created directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("againEdited")
+                });
+
+                // Discovered live: disclosed when it appears unreadable, and
+                // retried (and cleared) once its permissions are fixed.
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o000)
+                    .create(&fresh_locked)
+                    .unwrap();
+                let fresh_key = fresh_locked.to_string_lossy().into_owned();
+                let fresh_disclosed = || {
+                    code_debt(&db_path)
+                        .iter()
+                        .any(|(path, _)| *path == fresh_key)
+                };
+                wait_until(
+                    "a directory found unreadable live to be disclosed",
+                    fresh_disclosed,
+                );
+                std::fs::set_permissions(&fresh_locked, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                wait_until("its row to clear once it is watchable", || {
+                    !fresh_disclosed()
+                });
+                assert!(
+                    repo_symbol_names(&store, &uid).contains("hidden"),
+                    "an unwatchable directory's sources are never deleted"
+                );
+                assert!(
+                    disclosed(),
+                    "published live batches must not clear the directory's row"
+                );
+            }));
+            stop.stop();
+            let joined = handle.join().unwrap();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            joined.unwrap();
+        }));
+        restore();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Review of 8adb6a5c: a change in the subscription's unwatched
+    /// directories replaces only those rows — the rest of the repo's debt
+    /// (re-derived by the startup reconciliation) is never wiped first.
+    #[test]
+    fn unwatched_dir_rows_merge_into_the_code_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let root = dir.path().join("repo");
+        let owed = nestweaver_parser::SkippedFile::new(
+            root.join("src/a.js").to_string_lossy().into_owned(),
+            nestweaver_parser::SkipReasonCode::Other,
+            "owed".to_string(),
+        );
+        crate::index_md::record_code_reconciliation_debt(&db_path, &root, vec![owed]);
+        let row = |dir: &str| {
+            nestweaver_parser::SkippedFile::new(
+                root.join(dir).to_string_lossy().into_owned(),
+                nestweaver_parser::SkipReasonCode::ReadError,
+                unwatched_dir_reason("Permission denied"),
+            )
+        };
+        let paths = || {
+            code_debt(&db_path)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        };
+        let key = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        crate::index_md::record_code_unwatched_dirs(&db_path, &root, vec![row("locked")]);
+        assert_eq!(paths(), vec![key("locked"), key("src/a.js")]);
+        crate::index_md::record_code_unwatched_dirs(&db_path, &root, Vec::new());
+        assert_eq!(
+            paths(),
+            vec![key("src/a.js")],
+            "only the unwatched row goes"
+        );
+    }
+
+    /// nw-664 / nw-287: a scan that finds no files at all (unmounted, emptied)
+    /// is not evidence that every source was deleted.
+    #[test]
+    fn code_watcher_startup_never_infers_deletions_from_an_empty_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        assert_eq!(code_startup_batches(&db_path, &root, &store), 0);
+        assert!(repo_symbol_names(&store, &uid).contains("gamma"));
+    }
+
+    /// nw-664: a source no watcher batch can graph (here unparsable) is absent
+    /// by design. Startup tries it once, then must not replay it on every
+    /// start; once it changes it is tried again.
+    #[test]
+    fn code_watcher_startup_does_not_replay_a_source_that_cannot_be_graphed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let broken = root.join("src/broken.js");
+        std::fs::write(&broken, "}}} ((( @@@ %%% ;;\n").unwrap();
+        assert!(code_startup_batches(&db_path, &root, &store) > 0);
+        assert!(!repo_file_paths(&store, &uid).contains("src/broken.js"));
+        assert_eq!(
+            code_startup_batches(&db_path, &root, &store),
+            0,
+            "an unchanged source that cannot be graphed must not be replayed per start"
+        );
+
+        // Counterweight: fixed while no watcher ran, it is replayed and lands.
+        std::fs::write(&broken, "export function mended() { return 1; }\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(code_startup_batches(&db_path, &root, &store) > 0);
+        assert!(repo_symbol_names(&store, &uid).contains("mended"));
+    }
+
+    /// nw-664: a failed startup replay must not be dropped after a log line.
+    /// The watcher still becomes ready and keeps watching, discloses the debt
+    /// in the status sidecar nw-653 introduced, retries with backoff, and
+    /// clears the disclosure once the retry lands.
+    #[test]
+    fn failed_code_startup_reconciliation_is_disclosed_and_retried_until_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+
+        // The first replay fails at its batch lease; later ones succeed.
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&failed_once);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_code_batch" && !flag.swap(true, Ordering::SeqCst) {
+                anyhow::bail!("injected replay failure");
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let pending = |db: &Path| {
+            crate::index_md::load_skipped_notes_sidecar(db)
+                .reconciliation_pending
+                .into_values()
+                .flatten()
+                .map(|file| (file.path, file.reason))
+                .collect::<Vec<_>>()
+        };
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_mutation_lease_factory(factory)
+            .with_reconcile_retry_base(Duration::from_millis(300))
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+        let stop = watcher.shutdown_handle();
+        let running = store.clone();
+        let handle = std::thread::spawn(move || watcher.run_with_store(running, None));
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a failed reconciliation must not prevent readiness");
+        assert!(
+            failed_once.load(Ordering::SeqCst),
+            "the injected failure ran"
+        );
+        let owed = pending(&db_path);
+        assert_eq!(
+            owed.iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.join("src/d.js").to_string_lossy().into_owned()],
+            "the owed reconciliation must be disclosed in status"
+        );
+        assert!(
+            owed[0]
+                .1
+                .starts_with(crate::index_md::WATCH_RECONCILIATION_PENDING_REASON)
+                && owed[0].1.contains("code watcher"),
+            "{:?}",
+            owed[0].1
+        );
+        assert_eq!(
+            crate::index_md::skipped_notes_status_json(Some(&db_path)).0["reconciliation_pending"],
+            serde_json::json!(1)
+        );
+        // Code debt is disclosed as pending reconciliation, never as a
+        // "skipped note".
+        assert!(
+            crate::index_md::load_skipped_notes_sidecar(&db_path)
+                .skipped
+                .is_empty(),
+            "code watcher debt must stay out of the skipped-notes list"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pending(&db_path).is_empty() {
+            assert!(
+                !handle.is_finished(),
+                "the watcher must keep running after a failed reconciliation"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the reconciliation was never retried"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.stop();
+        handle.join().unwrap().unwrap();
+        assert!(
+            repo_symbol_names(&store, &uid).contains("delta"),
+            "the retry must ingest the source"
+        );
+    }
+
+    fn code_debt(db_path: &Path) -> Vec<(String, String)> {
+        let mut owed: Vec<(String, String)> = crate::index_md::load_skipped_notes_sidecar(db_path)
+            .reconciliation_pending
+            .into_values()
+            .flatten()
+            .map(|file| (file.path, file.reason))
+            .collect();
+        owed.sort();
+        owed
+    }
+
+    /// nw-664 review: one source the watcher cannot read must not block the
+    /// rest of the startup reconciliation. Before, a read error counted as
+    /// drift and the batch turned it into `Skipped` for EVERY path, so the
+    /// real lost edit next to it never landed and the replay was retried
+    /// forever. Now the unreadable file is left as the graph has it and
+    /// disclosed, the rest lands, and no retry is owed. (Python: it cannot
+    /// contribute a contract, so the contract snapshot must not read it
+    /// either — see the JS counterpart below.)
+    #[cfg(unix)]
+    #[test]
+    fn code_startup_reconciliation_is_not_blocked_by_an_unreadable_source() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let repo_url = format!("file://{}", root.display());
+        std::fs::write(
+            root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alphaEdited() { return helper() + 1; }\n",
+        )
+        .unwrap();
+        let secret = root.join("src/secret.py");
+        std::fs::write(&secret, "def secret():\n    return 1\n").unwrap();
+        let graphed = root.join("tools/util.py");
+        std::fs::write(&graphed, "def util_edited():\n    return 2\n").unwrap();
+        for path in [&secret, &graphed] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let attempt = watcher.attempt_reconciliation(&store, &uid, &repo_url, None, 0);
+        for path in [&secret, &graphed] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(
+            attempt.unwrap().is_none(),
+            "an unreadable source must not leave the reconciliation owed a retry"
+        );
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("alphaEdited"),
+            "the real lost edit lands: {names:?}"
+        );
+        assert!(
+            names.contains("util") && !names.contains("secret"),
+            "an unreadable source keeps what the graph had: {names:?}"
+        );
+        let owed = code_debt(&db_path);
+        assert_eq!(
+            owed.iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                secret.to_string_lossy().into_owned(),
+                graphed.to_string_lossy().into_owned()
+            ],
+            "{owed:?}"
+        );
+        assert!(
+            owed.iter()
+                .all(|(_, reason)| reason.contains("could not read")),
+            "{owed:?}"
+        );
+
+        // Readable again: the next start picks both up and the disclosure clears.
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("util_edited") && names.contains("secret"),
+            "{names:?}"
+        );
+        assert!(code_debt(&db_path).is_empty());
+    }
+
+    /// nw-664 final review (M6): the policy check that runs BEFORE the read
+    /// (`source_policy_exclusion` -> `path_has_symlink`) propagated its stat
+    /// error, so one listed source the watcher could not `lstat` (EACCES under
+    /// a read-only, non-searchable directory) failed the WHOLE drift — the
+    /// real lost edits beside it never landed and the attempt was retried on
+    /// backoff indefinitely. It is now the same case as an unreadable source:
+    /// disclosed, left as the graph has it, the rest reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn an_unstatable_source_does_not_fail_the_startup_drift() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        std::fs::write(
+            root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alphaEdited() { return helper() + 1; }\n",
+        )
+        .unwrap();
+        // Listable (r) but not searchable (no x): the walk sees `blind.py`,
+        // any stat beneath the directory is EACCES.
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        let blind = sealed.join("blind.py");
+        std::fs::write(&blind, "def blind():\n    return 1\n").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watcher.attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+        }));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let attempt = attempt.unwrap();
+        let owed = code_debt(&db_path);
+        let outcome = match &attempt {
+            Ok(None) => "reconciled".to_string(),
+            Ok(Some(_)) => "owed a retry".to_string(),
+            Err(error) => format!("refused: {error:#}"),
+        };
+        assert_eq!(
+            outcome, "reconciled",
+            "an unstatable source must not leave the reconciliation owed a retry: {owed:?}"
+        );
+        let names = repo_symbol_names(&store, &uid);
+        assert!(
+            names.contains("alphaEdited"),
+            "the real lost edit lands: {names:?}"
+        );
+        // Counterweight: it is disclosed, not silently dropped.
+        assert_eq!(
+            owed.iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![blind.to_string_lossy().into_owned()],
+            "{owed:?}"
+        );
+    }
+
+    /// nw-664 review, the deliberate limit: an unreadable JS/TS/Java source
+    /// may be a controller, and the watcher's whole-repo contract plan fails
+    /// CLOSED on it (as the full index does) rather than publish a contract
+    /// set that silently drops its routes. So a replay cannot land while one
+    /// exists: it stays owed and retried, and the disclosure names the
+    /// unreadable file as well as the blocked replay.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_contract_language_source_keeps_the_replay_owed_and_disclosed() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+        let locked = root.join("src/locked.js");
+        std::fs::write(&locked, "export function locked() { return 1; }\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let attempt = watcher.attempt_reconciliation(&store, &uid, &repo_url, None, 0);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(attempt.unwrap().is_some(), "the blocked replay stays owed");
+        let owed = code_debt(&db_path);
+        let reason_for = |path: &Path| {
+            owed.iter()
+                .find(|(owed, _)| owed == &*path.to_string_lossy())
+                .map(|(_, reason)| reason.clone())
+                .unwrap_or_default()
+        };
+        assert!(reason_for(&locked).contains("could not read"), "{owed:?}");
+        assert!(
+            reason_for(&root.join("src/d.js")).contains("retrying"),
+            "{owed:?}"
+        );
+        assert!(!repo_symbol_names(&store, &uid).contains("delta"));
+    }
+
+    /// nw-664 review: an indexed source rewritten as binary must not block
+    /// the replay (it made the batch skip every path). Like the live batch,
+    /// the graph keeps its previous symbols and the file is disclosed; a lost
+    /// create beside it still lands and no retry is owed.
+    #[test]
+    fn code_startup_is_not_blocked_by_an_indexed_source_turned_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        let binary = root.join("src/a.js");
+        std::fs::write(&binary, b"export function helper() {}\0\0\n").unwrap();
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        let names = repo_symbol_names(&store, &uid);
+        assert!(names.contains("delta"), "{names:?}");
+        assert!(names.contains("helper"), "previous symbols kept: {names:?}");
+        let owed = code_debt(&db_path);
+        assert_eq!(owed.len(), 1, "{owed:?}");
+        assert_eq!(owed[0].0, binary.to_string_lossy());
+        assert!(owed[0].1.contains("binary"), "{owed:?}");
+    }
+
+    /// nw-664 review: a retry owed by a watcher whose repo was removed (or
+    /// pruned) meanwhile must not resurrect it: the batch re-creates a missing
+    /// Repo node, and would rewrite the debt removal just cleared.
+    #[test]
+    fn code_startup_retry_does_not_resurrect_a_removed_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bulk_delete_repo_files_and_symbols(&uid).unwrap();
+        store.clear_repo_derived_nodes(&uid).unwrap();
+        store.delete_repo_node(&uid).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let next = watcher
+            .attempt_reconciliation(&store, &uid, &repo_url, None, 1)
+            .unwrap();
+        assert!(next.is_none(), "a removed repo is owed nothing");
+        assert!(
+            store.lookup_repo(&uid).unwrap().is_none(),
+            "not resurrected"
+        );
+        assert!(code_debt(&db_path).is_empty());
+    }
+
+    /// nw-664 review: shutdown requested during the startup walk ends the
+    /// reconciliation as a refusal — no replay, no debt.
+    #[test]
+    fn code_startup_reconciliation_honours_a_stop_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let repo_url = format!("file://{}", root.display());
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        watcher.shutdown_handle().stop();
+        let attempt = watcher.attempt_reconciliation(&store, &uid, &repo_url, None, 0);
+        assert!(attempt.is_err_and(|error| error.downcast_ref::<WatchMutationRefused>().is_some()),);
+        assert!(!repo_symbol_names(&store, &uid).contains("delta"));
+        assert!(code_debt(&db_path).is_empty());
+    }
+
+    /// nw-664 review: unindexable memory is keyed by NANOSECOND mtime and
+    /// size, so a fixed file restored with the same whole second and size
+    /// (`rsync -a`, `tar x`) is retried rather than ignored.
+    #[test]
+    fn code_startup_retries_a_fixed_source_restored_within_the_same_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let broken = root.join("src/broken.js");
+        let broken_body = "}}} ((( @@@ %%% ;;\n";
+        std::fs::write(&broken, broken_body).unwrap();
+        assert!(code_startup_batches(&db_path, &root, &store) > 0);
+        let recorded = std::fs::metadata(&broken).unwrap().modified().unwrap();
+        let since_epoch = recorded.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let same_second = std::time::UNIX_EPOCH
+            + Duration::from_secs(since_epoch.as_secs())
+            + Duration::from_nanos(if since_epoch.subsec_nanos() == 123_456_789 {
+                987_654_321
+            } else {
+                123_456_789
+            });
+        let mut fixed = String::from("function mended(){}");
+        while fixed.len() < broken_body.len() {
+            fixed.push(' ');
+        }
+        assert_eq!(fixed.len(), broken_body.len());
+        std::fs::write(&broken, &fixed).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(same_second)
+            .unwrap();
+        assert!(code_startup_batches(&db_path, &root, &store) > 0);
+        assert!(repo_symbol_names(&store, &uid).contains("mended"));
+    }
+
+    /// Run a code watcher on a thread until `stop`; returns once it is ready.
+    #[cfg(unix)]
+    fn spawn_live_code_watcher(
+        watcher: CodeWatcher,
+        store: Arc<GraphStore>,
+    ) -> (
+        ShutdownHandle,
+        std::thread::JoinHandle<Result<(), anyhow::Error>>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = watcher.with_debounce_ms(100).with_ready_callback(move || {
+            let _ = ready_tx.send(());
+        });
+        let stop = watcher.shutdown_handle();
+        let handle = std::thread::spawn(move || watcher.run_with_store(store, None));
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("code watcher should become ready");
+        // Let the filesystem subscription settle before the test edits.
+        std::thread::sleep(Duration::from_millis(300));
+        (stop, handle)
+    }
+
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// nw-664 review: a "could not read" disclosure must not outlive the
+    /// problem until the next restart. Once a live batch reads (or deletes)
+    /// the path and publishes, `brain status` stops showing it.
+    #[cfg(unix)]
+    #[test]
+    fn a_published_live_batch_clears_a_stale_unreadable_disclosure() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let util = root.join("tools/util.py");
+        std::fs::write(&util, "def util_gap():\n    return 2\n").unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let (stop, handle) =
+            spawn_live_code_watcher(CodeWatcher::new(&db_path, &root, "test"), store.clone());
+        let disclosed = code_debt(&db_path);
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            disclosed
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![util.to_string_lossy().into_owned()],
+            "precondition: startup disclosed the unreadable source"
+        );
+
+        std::fs::write(&util, "def util_live():\n    return 3\n").unwrap();
+        wait_until("the live edit to land", || {
+            repo_symbol_names(&store, &uid).contains("util_live")
+        });
+        wait_until("the stale disclosure to clear", || {
+            code_debt(&db_path).is_empty()
+        });
+        stop.stop();
+        handle.join().unwrap().unwrap();
+    }
+
+    /// nw-669: the LIVE path dropped a `Skipped` batch after a warning — no
+    /// retry, no disclosure. With one unreadable contract-language source in
+    /// the repo every live edit was silently lost. A skipped live batch is
+    /// now disclosed as owed and retried on the shared backoff until it lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_live_batch_is_disclosed_and_retried_until_it_lands() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let locked = root.join("src/locked.js");
+        std::fs::write(&locked, "export function locked() { return 1; }\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_reconcile_retry_base(Duration::from_millis(300));
+        let (stop, handle) = spawn_live_code_watcher(watcher, store.clone());
+
+        let edited = root.join("src/b.js");
+        std::fs::write(
+            &edited,
+            "import { helper } from './a.js';\nexport function alphaLive() { return helper(); }\n",
+        )
+        .unwrap();
+        let edited_key = edited.to_string_lossy().into_owned();
+        let owed = || {
+            code_debt(&db_path)
+                .into_iter()
+                .any(|(path, reason)| path == edited_key && reason.contains("retrying"))
+        };
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_until("the skipped live edit to be disclosed as owed", owed);
+            // Checked while the file is still locked, before anything can land.
+            assert!(
+                !handle.is_finished(),
+                "the watcher keeps running while the edit is owed"
+            );
+            assert!(!repo_symbol_names(&store, &uid).contains("alphaLive"));
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if let Err(panic) = blocked {
+            stop.stop();
+            let _ = handle.join();
+            std::panic::resume_unwind(panic);
+        }
+
+        wait_until("the retried edit to land", || {
+            repo_symbol_names(&store, &uid).contains("alphaLive")
+        });
+        wait_until("the disclosure to clear", || code_debt(&db_path).is_empty());
+        stop.stop();
+        handle.join().unwrap().unwrap();
+    }
+
+    /// nw-669 review counterweight: while a retry is already owed and its
+    /// backoff is not due, another skipped live batch must NOT trigger an
+    /// extra reconciliation. The owed retry's recomputed drift already covers
+    /// the new paths; resetting it to "now" made every autosave in a
+    /// permanently blocked repo cost a walk + a failing replay.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_live_batch_does_not_hurry_an_owed_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicU32;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, _uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let locked = root.join("src/locked.js");
+        std::fs::write(&locked, "export function locked() { return 1; }\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let batches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&batches);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_code_batch" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_mutation_lease_factory(factory)
+            .with_reconcile_retry_base(Duration::from_secs(600));
+        let (stop, handle) = spawn_live_code_watcher(watcher, store);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first = root.join("src/b.js");
+            std::fs::write(&first, "export function first() { return 1; }\n").unwrap();
+            let first_key = first.to_string_lossy().into_owned();
+            // One live batch, then the immediate reconciliation's replay:
+            // both fail, and a retry is owed ten minutes out.
+            wait_until("the first skipped edit to be disclosed as owed", || {
+                code_debt(&db_path)
+                    .iter()
+                    .any(|(path, reason)| path == &first_key && reason.contains("retrying"))
+            });
+            let owed_once = batches.load(Ordering::SeqCst);
+            assert_eq!(owed_once, 2, "one live batch plus one replay");
+
+            std::fs::write(
+                root.join("src/c.js"),
+                "export function second() { return 2; }\n",
+            )
+            .unwrap();
+            wait_until("the second live batch", || {
+                batches.load(Ordering::SeqCst) > owed_once
+            });
+            std::thread::sleep(Duration::from_millis(1500));
+            assert_eq!(
+                batches.load(Ordering::SeqCst),
+                owed_once + 1,
+                "a second skipped batch must not trigger another reconciliation \
+                 while one is owed and not yet due"
+            );
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        stop.stop();
+        let joined = handle.join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        joined.unwrap().unwrap();
     }
 }

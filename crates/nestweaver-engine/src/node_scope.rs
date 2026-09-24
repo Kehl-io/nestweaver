@@ -187,6 +187,14 @@ pub fn resolve_repo_filter(
         .collect()
 }
 
+/// The form a vault name is compared in wherever it selects a vault. Shared by
+/// [`resolve_vault_filter`] and the duplicate-name guard
+/// (`vault_registration::refuse_duplicate_vault_name`, nw-608) so a name the
+/// guard admits can never be ambiguous to a selector.
+pub fn vault_name_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
 /// Resolve caller-supplied `vaults:` / `--vaults` entries to concrete vault
 /// UIDs.
 ///
@@ -205,12 +213,12 @@ pub fn resolve_vault_filter(
     selectors
         .iter()
         .map(|selector| {
-            let needle = selector.to_lowercase();
+            let needle = vault_name_key(selector);
             let matches: Vec<&nestweaver_schema::Vault> = vaults
                 .iter()
                 .filter(|vault| {
                     vault.uid == *selector
-                        || vault.name.to_lowercase() == needle
+                        || vault_name_key(&vault.name) == needle
                         || vault.root_path == *selector
                 })
                 .collect();

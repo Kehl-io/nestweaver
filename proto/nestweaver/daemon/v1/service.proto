@@ -181,6 +181,10 @@ message IndexProgress {
   CoverageStatus coverage_status = 8;
   TrigramRefreshDetail trigram_refresh = 9;
   ExclusionInventory exclusion_inventory = 10;
+  // nw-585: vault notes this run indexed WITHOUT their frontmatter because the
+  // YAML would not parse. Not in `skipped_files`/`skipped_count`: they were
+  // indexed, and coverage stays complete. Empty for repos and older daemons.
+  repeated IndexSkipDetail frontmatter_unparsed = 11;
 }
 
 message ExclusionInventory {
@@ -608,6 +612,13 @@ message SkippedNotesStatus {
   // The first few owed notes with the failure as their reason, so they do not
   // read like brainignored notes in `paths`.
   repeated PendingReconciliationNote reconciliation_pending_notes = 5;
+  // nw-585: notes indexed WITHOUT their frontmatter because the YAML would not
+  // parse. Not in `count`/`paths`: those notes were indexed. 0 on an older
+  // daemon.
+  uint32 frontmatter_unparsed = 6;
+  // The first few, with the parse error as their reason (a path + reason pair,
+  // hence the shared message type).
+  repeated PendingReconciliationNote frontmatter_unparsed_notes = 7;
 }
 
 message PendingReconciliationNote {

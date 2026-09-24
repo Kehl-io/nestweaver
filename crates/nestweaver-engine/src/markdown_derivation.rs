@@ -975,6 +975,7 @@ mod tests {
                 unresolved_link_section_targets: 0,
                 unresolved_link_targets: 0,
                 skipped,
+                frontmatter_unparsed: Vec::new(),
             },
             notes_deleted: 0,
             publication: GraphMutationPublicationOutcome {

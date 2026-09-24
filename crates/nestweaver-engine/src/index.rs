@@ -5015,6 +5015,19 @@ impl ContractSet {
     }
 }
 
+/// Languages whose sources can contribute handler-derived contracts
+/// (Rust only when the repo has gRPC specs). nw-664 review: ONE gate for the
+/// contract plan and the watcher's contract snapshot, which had drifted.
+fn is_contract_handler_language(lang: nestweaver_schema::Language, has_grpc_specs: bool) -> bool {
+    matches!(
+        lang,
+        nestweaver_schema::Language::Java
+            | nestweaver_schema::Language::Kotlin
+            | nestweaver_schema::Language::JavaScript
+            | nestweaver_schema::Language::TypeScript
+    ) || (has_grpc_specs && lang == nestweaver_schema::Language::Rust)
+}
+
 /// Rebuild the whole-repo inputs consumed by contract derivation.
 ///
 /// Full indexing accumulates these while parsing every file. Incremental
@@ -5061,15 +5074,7 @@ fn collect_contract_derivation_inputs(
         // Filtering before metadata/read is important in strict mode: an
         // unreadable unrelated Python/Go/etc. file must not abort otherwise
         // valid contract publication.
-        let eligible_handler_language = matches!(
-            lang,
-            nestweaver_schema::Language::Java
-                | nestweaver_schema::Language::Kotlin
-                | nestweaver_schema::Language::JavaScript
-                | nestweaver_schema::Language::TypeScript
-        ) || (has_grpc_specs
-            && lang == nestweaver_schema::Language::Rust);
-        if !eligible_handler_language {
+        if !is_contract_handler_language(lang, has_grpc_specs) {
             continue;
         }
         if reader
@@ -5106,6 +5111,18 @@ fn collect_contract_derivation_inputs(
                     oversized.observed_bytes,
                     oversized.limit_bytes,
                 ));
+                continue;
+            }
+            // nw-664 review: binary content cannot be a controller, and the
+            // full index already skips it as policy (nw-355). Failing strict
+            // mode on it blocked EVERY watcher batch while one binary
+            // JS/TS/Java file existed anywhere in the repo.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+            {
+                skipped_files.push(SkippedFile::binary(rel_path.to_string_lossy().into_owned()));
                 continue;
             }
             Err(error) if strict => {
@@ -5297,7 +5314,14 @@ pub(crate) fn watcher_contract_input_snapshot(
         let abs_path = reader.root().join(&rel_path);
         let is_spec = crate::contracts::is_spec_file(&abs_path.to_string_lossy());
         let language = detect_language(&abs_path);
-        if !is_spec && language.is_none() {
+        // nw-664 review: the same language gate the plan's reader applies
+        // (`collect_contract_derivation_inputs`) BEFORE reading. This snapshot
+        // read every source language, so one unreadable Python/Go/etc. file —
+        // which cannot contribute a contract — failed every watcher batch,
+        // exactly what that gate exists to prevent.
+        if !is_spec
+            && !language.is_some_and(|lang| is_contract_handler_language(lang, has_grpc_specs))
+        {
             continue;
         }
         if !is_spec && is_minified_or_bundled(&abs_path) {
@@ -5310,9 +5334,22 @@ pub(crate) fn watcher_contract_input_snapshot(
         {
             continue;
         }
-        let source = reader
-            .read_file(&rel_path)
-            .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
+        let source = match reader.read_file(&rel_path) {
+            Ok(source) => source,
+            // Binary cannot be a contract input; the plan skips it too.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read watcher contract input {}", rel_path.display())
+                });
+            }
+        };
         if source.len() as u64 > reader.max_source_file_bytes() {
             continue;
         }
@@ -6439,10 +6476,15 @@ fn incremental_index_with_name_and_io_and_authority(
             return Err(error).context("prepare incremental contract derivation");
         }
     };
-    result
-        .skipped_files
-        .extend(contract_plan.skipped_files.iter().cloned());
-    result.files_skipped += contract_plan.skipped_files.len();
+    // nw-664 review: through the one dedupe the per-file rows use, so a file
+    // both the contract plan and the change loop skip (a binary `.ts`) is one
+    // row and one `files_skipped`, whatever order the two report in.
+    for skipped in &contract_plan.skipped_files {
+        record_incremental_file_outcome(
+            &mut result,
+            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+        );
+    }
     // nw-387 RESIDUAL: the changed-file half of the same durability problem.
     // Free here — `prepare_incremental_contract_derivation` has just walked the
     // tree via `list_files`, so the recorder is populated and current.
@@ -6842,10 +6884,15 @@ where
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
     let mut result = IncrementalResult::default();
-    result
-        .skipped_files
-        .extend(contract_plan.skipped_files.iter().cloned());
-    result.files_skipped += contract_plan.skipped_files.len();
+    // nw-664 review: through the one dedupe the per-file rows use, so a file
+    // both the contract plan and the change loop skip (a binary `.ts`) is one
+    // row and one `files_skipped`, whatever order the two report in.
+    for skipped in &contract_plan.skipped_files {
+        record_incremental_file_outcome(
+            &mut result,
+            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+        );
+    }
     // nw-387: same drain as the CLI incremental path, so the daemon's view of a
     // repo's coverage matches the CLI's instead of being quietly rosier.
     // `prepare_incremental_contract_derivation` above has just walked, so the
@@ -8133,6 +8180,43 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", message]);
         git
+    }
+
+    /// nw-664 review: a binary file with a contract-language extension (an
+    /// MPEG transport stream is `.ts`) used to fail a plain incremental index
+    /// in strict contract derivation ("prepare incremental contract
+    /// derivation"). It is a policy skip like everywhere else (nw-355): the
+    /// index succeeds and discloses it as exactly ONE `Binary` row, although
+    /// both the contract plan and the changed-file loop see it.
+    #[test]
+    fn an_incremental_index_skips_a_binary_contract_language_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("app.ts"), "export function app() { return 1; }\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let db = dir.path().join("graph.lbug");
+        let repo_url = "https://example.test/binary-ts";
+        index_directory(&repo, &db, "test", repo_url, &head).unwrap();
+
+        fs::write(
+            repo.join("clip.ts"),
+            b"G\x40\x00\x10\x00\x00\xb0\x0d\x00\x01",
+        )
+        .unwrap();
+        git(&["add", "clip.ts"]);
+        git(&["commit", "-q", "-m", "add a transport stream"]);
+        let result = incremental_index(&repo, &db, "test", repo_url)
+            .expect("a binary .ts must not fail the incremental index");
+        let binary_rows: Vec<_> = result
+            .skipped_files
+            .iter()
+            .filter(|row| row.path == "clip.ts")
+            .collect();
+        assert_eq!(binary_rows.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(binary_rows[0].reason_code, SkipReasonCode::Binary);
+        assert_eq!(result.files_skipped, result.skipped_files.len());
     }
 
     #[test]

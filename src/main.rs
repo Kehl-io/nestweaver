@@ -4905,10 +4905,22 @@ fn format_daemon_status_response(
                 && skipped.reconciliation_pending > 0
             {
                 lines.push(format!(
-                    "Watcher reconciliation pending: {} note(s)",
+                    "Watcher reconciliation pending: {} file(s)",
                     skipped.reconciliation_pending
                 ));
                 for note in &skipped.reconciliation_pending_notes {
+                    lines.push(format!("  - {}: {}", note.path, note.reason));
+                }
+            }
+            // nw-585: indexed, but without their frontmatter -- not skipped.
+            if let Some(skipped) = status.skipped_notes.as_ref()
+                && skipped.frontmatter_unparsed > 0
+            {
+                lines.push(format!(
+                    "Notes indexed without frontmatter (unparsable YAML): {}",
+                    skipped.frontmatter_unparsed
+                ));
+                for note in &skipped.frontmatter_unparsed_notes {
                     lines.push(format!("  - {}: {}", note.path, note.reason));
                 }
             }
@@ -5014,6 +5026,11 @@ mod daemon_status_renderer_tests {
                     path: "owed.md".to_string(),
                     reason: "not yet reconciled".to_string(),
                 }],
+                frontmatter_unparsed: 1,
+                frontmatter_unparsed_notes: vec![nestweaver_proto::PendingReconciliationNote {
+                    path: "/v/Broken.md".to_string(),
+                    reason: "frontmatter could not be parsed".to_string(),
+                }],
             }),
             notes_near_size_limit: Some(nestweaver_proto::NotesNearSizeLimit {
                 count: 1,
@@ -5034,10 +5051,19 @@ mod daemon_status_renderer_tests {
         );
         assert!(output.contains("near.md (600000 bytes)"), "{output}");
         assert!(
-            output.contains("Watcher reconciliation pending: 2 note(s)"),
+            output.contains("Watcher reconciliation pending: 2 file(s)"),
             "{output}"
         );
         assert!(output.contains("owed.md: not yet reconciled"), "{output}");
+        // nw-585.
+        assert!(
+            output.contains("Notes indexed without frontmatter (unparsable YAML): 1"),
+            "{output}"
+        );
+        assert!(
+            output.contains("/v/Broken.md: frontmatter could not be parsed"),
+            "{output}"
+        );
     }
 
     /// A3 acceptance: an operator looking at `brain status` during a long
@@ -8046,6 +8072,13 @@ enum ExtensionCommands {
     },
 }
 
+/// nw-608: one help text for every `--name` that registers a vault. Names are
+/// unique per database (compared case-insensitively, like vault selectors), so
+/// two folders that share a directory name now need `--name` on the second.
+const VAULT_NAME_HELP: &str = "Friendly name for the vault (default: directory name). \
+Must be unique in the database, ignoring case: a second vault whose folder has the \
+same name needs its own --name";
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum BrainCommands {
@@ -8054,7 +8087,7 @@ enum BrainCommands {
     Add {
         /// Path to the vault directory.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
@@ -8150,7 +8183,7 @@ enum BrainCommands {
     Watch {
         /// Vault directory to watch.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID")]
         instance: Option<String>,
@@ -8182,7 +8215,7 @@ enum BrainCommands {
     Refresh {
         /// Vault directory to refresh.
         path: PathBuf,
-        #[arg(long, help = "Friendly name for the vault (default: directory name)")]
+        #[arg(long, help = VAULT_NAME_HELP)]
         name: Option<String>,
         #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
@@ -8276,7 +8309,8 @@ enum BrainCommands {
     },
     /// Unified PPR context across code + notes. Seeds may be note titles,
     /// tag names (with or without #), symbol names, or any UID
-    /// (sym:/note:/head:/sec:/tag:/repo:/vlt:).
+    /// (sym:/note:/head:/sec:/tag:/repo:/vlt:). A vlt: or repo: UID expands
+    /// to its member notes/symbols; the most central few stay seeds.
     Context {
         /// Seed strings to anchor the PPR walk.
         #[arg(required = true)]
@@ -26874,6 +26908,13 @@ fn run_brain(
                     out.status(&format!("  {} - {}", sf.path, sf.reason));
                 }
             }
+            // nw-585: indexed, but without their frontmatter. The daemon
+            // route prints the same lines inside its terminal message.
+            if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                &result.frontmatter_unparsed,
+            ) {
+                out.status(&unparsed);
+            }
 
             let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -27094,9 +27135,30 @@ fn run_brain(
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
                         if pending > 0 {
-                            println!("  Watcher reconciliation pending: {pending} note(s)");
+                            println!("  Watcher reconciliation pending: {pending} file(s)");
                             for note in skipped
                                 .get("reconciliation_pending_notes")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                            {
+                                let field = |key: &str| {
+                                    note.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+                                };
+                                println!("    - {}: {}", field("path"), field("reason"));
+                            }
+                        }
+                        // nw-585: see the typed render above.
+                        let unparsed = skipped
+                            .get("frontmatter_unparsed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if unparsed > 0 {
+                            println!(
+                                "  Notes indexed without frontmatter (unparsable YAML): {unparsed}"
+                            );
+                            for note in skipped
+                                .get("frontmatter_unparsed_notes")
                                 .and_then(|v| v.as_array())
                                 .into_iter()
                                 .flatten()
@@ -28311,6 +28373,12 @@ fn run_brain(
                     result.tags_count,
                     result.changed_note_link_edges,
                 );
+                // nw-585: the same lines the daemon route appends.
+                if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                    &result.frontmatter_unparsed,
+                ) {
+                    println!("{unparsed}");
+                }
             } else {
                 // Full refresh: the markdown indexer's writable store performs
                 // the old-vault cascade and replacement in one transaction.

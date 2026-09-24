@@ -3150,6 +3150,26 @@ async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
     stopped
 }
 
+/// nw-664 review: after a repo is removed or pruned, stop the code watcher
+/// registered on its root (if the canonical slot holds one) and forget its
+/// code-watcher state. Left running, an owed startup-reconciliation retry or
+/// the next save would re-create the Repo node the removal just deleted and
+/// re-disclose debt for it. Roots compare canonically: the slot records the
+/// path as requested, the graph the canonical one.
+fn forget_removed_repo_watch(state: &DaemonState, root: &Path) {
+    use nestweaver_engine::vault_registration::canonical;
+    let watcher_id = state.watcher_stop.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|w| w.kind == "code" && canonical(Path::new(&w.target)) == canonical(root))
+            .map(|w| w.id)
+    });
+    if let Some(id) = watcher_id {
+        stop_watcher_registration(state, id);
+    }
+    nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, root);
+}
+
 /// Signal `id` only if it still owns the canonical slot.
 fn stop_watcher_registration(state: &DaemonState, id: u64) -> bool {
     let Ok(mut guard) = state.watcher_stop.lock() else {
@@ -4954,6 +4974,14 @@ where
     C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
     D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
 {
+    // nw-664: resolved before the Repo node goes, to clear its code watcher's
+    // owed-reconciliation disclosure after it.
+    let repo_root = state
+        .store
+        .lookup_repo(repo_uid)
+        .ok()
+        .flatten()
+        .and_then(|repo| repo.local_root().map(PathBuf::from));
     let mutation = match bulk_delete(&state.store, repo_uid) {
         Ok((file_count, sym_count)) => clear_derived(&state.store, repo_uid)
             .and_then(|()| delete_repo(&state.store, repo_uid))
@@ -4964,6 +4992,12 @@ where
             }),
         Err(error) => Err(error),
     };
+    // nw-664: only this repo's (now gone) watcher would ever clear it.
+    if mutation.is_ok()
+        && let Some(root) = &repo_root
+    {
+        forget_removed_repo_watch(state, root);
+    }
 
     let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
         &state.store,
@@ -5116,7 +5150,7 @@ fn rebuild_tantivy_after_mutation(
 
 fn run_prune_stale_with<DR, DV, R>(
     state: &DaemonState,
-    delete_repo: DR,
+    mut delete_repo: DR,
     mut delete_vault: DV,
     mut reconcile_search: R,
 ) -> Result<PruneStaleResponse, Status>
@@ -5126,7 +5160,14 @@ where
     R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
     let search_rows_before = indexed_search_rows_before(state);
-    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
+    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, |store, repo| {
+        delete_repo(store, repo)?;
+        // nw-664: pruned on purpose; clear its code watcher's disclosure.
+        if let Some(root) = repo.local_root() {
+            forget_removed_repo_watch(state, Path::new(root));
+        }
+        Ok(())
+    });
     let mut removed_vaults = Vec::new();
     let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
@@ -7339,6 +7380,7 @@ impl NestWeaverDaemon for DaemonService {
                         CoverageStatus::Degraded as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: Vec::new(),
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} files, {} symbols{}",
@@ -7380,6 +7422,7 @@ impl NestWeaverDaemon for DaemonService {
                     // truncated failure.
                     if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
                         let _ = tx.blocking_send(Ok(IndexProgress {
+                            frontmatter_unparsed: Vec::new(),
                             phase: Phase::Done as i32,
                             message: index_done_message(
                                 result.files_count,
@@ -7521,6 +7564,7 @@ impl NestWeaverDaemon for DaemonService {
                     // and the committed-after-cancel variant must say so
                     // plainly rather than claim a clean `Done`.
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: Vec::new(),
                         phase: Phase::Done as i32,
                         message: index_done_message(
                             result.files_count,
@@ -7625,6 +7669,10 @@ impl NestWeaverDaemon for DaemonService {
             match index_result {
                 Ok(result) => {
                     let skipped_files = index_skip_details(&result.index.skipped);
+                    // nw-585: indexed without frontmatter -- disclosed, but
+                    // not a skip and not a coverage gap.
+                    let frontmatter_unparsed =
+                        index_skip_details(&result.index.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
                     let coverage_status = if skipped_count == 0 {
                         CoverageStatus::Complete as i32
@@ -7632,6 +7680,7 @@ impl NestWeaverDaemon for DaemonService {
                         CoverageStatus::Degraded as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} notes, {} headings, {} sections",
@@ -7678,6 +7727,7 @@ impl NestWeaverDaemon for DaemonService {
                         degraded_graph_publication_message("IndexVault", &result.publication)
                     {
                         let _ = tx.blocking_send(Ok(IndexProgress {
+                            frontmatter_unparsed: frontmatter_unparsed.clone(),
                             phase: Phase::Error as i32,
                             message,
                             files_processed: result.index.notes_count as u64,
@@ -7702,6 +7752,7 @@ impl NestWeaverDaemon for DaemonService {
                         Ok(stamp) => stamp,
                         Err(error) => {
                             let _ = tx.blocking_send(Ok(IndexProgress {
+                                frontmatter_unparsed: frontmatter_unparsed.clone(),
                                 phase: Phase::Error as i32,
                                 message: format!(
                                     "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
@@ -7728,6 +7779,7 @@ impl NestWeaverDaemon for DaemonService {
                         message.push_str(DERIVATION_WITHHELD_NOTE);
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Done as i32,
                         message,
                         files_processed: result.index.notes_count as u64,
@@ -7906,6 +7958,8 @@ impl NestWeaverDaemon for DaemonService {
                     // coverage gap demotes a Current vault — the same rule
                     // IndexVault applies, via the same helper.
                     let skipped_files = index_skip_details(&result.skipped);
+                    // nw-585: see IndexVault.
+                    let frontmatter_unparsed = index_skip_details(&result.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
                     let coverage_status = if skipped_count == 0 {
                         CoverageStatus::Complete as i32
@@ -7922,6 +7976,7 @@ impl NestWeaverDaemon for DaemonService {
                         Ok(withheld) => withheld,
                         Err(error) => {
                             let _ = tx.blocking_send(Ok(IndexProgress {
+                                frontmatter_unparsed: frontmatter_unparsed.clone(),
                                 phase: Phase::Error as i32,
                                 message: format!(
                                     "RefreshVaultSince committed graph and search but could not demote Markdown derivation over a coverage gap: {error:#}"
@@ -7949,10 +8004,19 @@ impl NestWeaverDaemon for DaemonService {
                         result.tags_count,
                         result.changed_note_link_edges,
                     );
+                    if let Some(unparsed) =
+                        nestweaver_engine::index_md::frontmatter_unparsed_summary(
+                            &result.frontmatter_unparsed,
+                        )
+                    {
+                        message.push('\n');
+                        message.push_str(&unparsed);
+                    }
                     if withheld {
                         message.push_str(DERIVATION_WITHHELD_NOTE);
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
+                        frontmatter_unparsed: frontmatter_unparsed.clone(),
                         phase: Phase::Done as i32,
                         message,
                         files_processed: result.files_checked as u64,
@@ -16458,6 +16522,44 @@ credential_method = "gh"
     /// COMPLETES (the user's decision: disclose, not a hard failure), with the
     /// readable notes indexed. Before the fix the walk only logged the error,
     /// the vault was stamped Current and `locked/`'s notes were silently gone.
+    /// nw-585: IndexVault (daemon `brain add` / full `brain refresh` /
+    /// MCP `brain_add_source`) reports a note indexed without its unparsable
+    /// frontmatter in its terminal progress and message -- without degrading
+    /// coverage or withholding derivation, because the note WAS indexed.
+    #[tokio::test]
+    async fn index_vault_discloses_notes_indexed_without_frontmatter() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("Broken.md"), "---\ntags: [x\n---\n# Broken\n").unwrap();
+        std::fs::write(root.join("Ok.md"), "---\ntags: [ok]\n---\n# Ok\n").unwrap();
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.files_processed, 2, "both notes are indexed");
+        assert_eq!(last.coverage_status, CoverageStatus::Complete as i32);
+        assert!(last.skipped_files.is_empty(), "{:?}", last.skipped_files);
+        let paths: Vec<&str> = last
+            .frontmatter_unparsed
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["Broken.md"], "{:?}", last.frontmatter_unparsed);
+        assert!(
+            last.message
+                .contains("Notes indexed without frontmatter (unparsable YAML): 1"),
+            "{}",
+            last.message
+        );
+        assert_ne!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "not a coverage gap"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn index_vault_discloses_an_unreadable_subdirectory_and_withholds_derivation() {
@@ -17087,6 +17189,11 @@ credential_method = "gh"
             sidecar
                 .unindexable_mtimes
                 .insert(format!("{root}/broken.md"), "2026-09-24T00:00:00Z".into());
+            // nw-585: a note indexed without its frontmatter.
+            sidecar.frontmatter_unparsed.insert(
+                format!("{root}/bad-yaml.md"),
+                "frontmatter could not be parsed; indexed without frontmatter".into(),
+            );
         }
         std::fs::write(
             nestweaver_engine::sidecar_path(
@@ -17114,6 +17221,14 @@ credential_method = "gh"
             1,
             "{:?}",
             left.unindexable_mtimes
+        );
+        // nw-585: the removed vault's frontmatter disclosure goes with it;
+        // the survivor's stays.
+        let unparsed: Vec<&String> = left.frontmatter_unparsed.keys().collect();
+        assert_eq!(
+            unparsed,
+            vec![&format!("{survivor}/bad-yaml.md")],
+            "{unparsed:?}"
         );
     }
 
@@ -17151,6 +17266,197 @@ credential_method = "gh"
         .unwrap();
 
         assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    /// nw-664: seed code-watcher debt (`code:`-namespaced) for each repo root,
+    /// plus vault debt at the SAME root to prove removal leaves it alone.
+    fn seed_code_watch_debt(state: &DaemonState, roots: &[&str]) {
+        use nestweaver_engine::index_md::code_watch_key;
+        let mut sidecar = nestweaver_engine::index_md::SkippedNotesSidecar::default();
+        for root in roots {
+            let root_path = Path::new(root);
+            sidecar.reconciliation_pending.insert(
+                code_watch_key(root_path),
+                vec![nestweaver_parser::SkippedFile::new(
+                    format!("{root}/src/a.js"),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar.reconciliation_pending.insert(
+                (*root).to_string(),
+                vec![nestweaver_parser::SkippedFile::new(
+                    format!("{root}/Owed.md"),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar.unindexable_mtimes.insert(
+                code_watch_key(&root_path.join("src/broken.js")),
+                "1:2".into(),
+            );
+        }
+        std::fs::write(
+            nestweaver_engine::sidecar_path(
+                &state.db_path,
+                nestweaver_engine::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX,
+            ),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_code_watch_debt_forgotten_for(state: &DaemonState, gone: &str, survivor: &str) {
+        use nestweaver_engine::index_md::code_watch_key;
+        let left = nestweaver_engine::index_md::load_skipped_notes_sidecar(&state.db_path);
+        let mut pending: Vec<String> = left.reconciliation_pending.keys().cloned().collect();
+        pending.sort();
+        let mut expected = vec![
+            gone.to_string(),
+            survivor.to_string(),
+            code_watch_key(Path::new(survivor)),
+        ];
+        expected.sort();
+        assert_eq!(pending, expected, "only the removed repo's code debt goes");
+        assert_eq!(
+            left.unindexable_mtimes.keys().collect::<Vec<_>>(),
+            vec![&code_watch_key(&Path::new(survivor).join("src/broken.js"))],
+        );
+    }
+
+    /// nw-664: a removed repo's code-watcher debt and unindexable memory are
+    /// cleared with it — never a vault's at the same root — and its running
+    /// code watcher is stopped, so an owed retry cannot resurrect the repo.
+    #[test]
+    fn remove_repo_clears_its_code_watcher_debt_and_stops_its_watcher() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:debt",
+                &format!("file://{root_str}"),
+                Some(&root_str),
+            ))
+            .unwrap();
+        seed_code_watch_debt(&state, &[&root_str, "/other/repo"]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", root.path());
+
+        run_remove_repo_with(
+            &state,
+            "repo:test:debt",
+            |store, uid| {
+                store
+                    .clear_repo_derived_nodes(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+            |store, uid| {
+                store
+                    .delete_repo_node(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+        )
+        .unwrap();
+
+        assert_code_watch_debt_forgotten_for(&state, &root_str, "/other/repo");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the removed repo's code watcher must be stopped"
+        );
+    }
+
+    /// Counterweight: removing a repo leaves a watcher on ANOTHER root alone.
+    #[test]
+    fn remove_repo_leaves_another_roots_watcher_running() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:other",
+                &format!("file://{root_str}"),
+                Some(&root_str),
+            ))
+            .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", other.path());
+        run_remove_repo_with(
+            &state,
+            "repo:test:other",
+            |store, uid| {
+                store
+                    .clear_repo_derived_nodes(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+            |store, uid| {
+                store
+                    .delete_repo_node(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+        )
+        .unwrap();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn prune_stale_clears_a_pruned_repos_code_watcher_debt() {
+        let state = test_state_with_writer();
+        let gone = "/definitely/missing/prune-repo-debt";
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:prune-debt",
+                &format!("file://{gone}"),
+                Some(gone),
+            ))
+            .unwrap();
+        seed_code_watch_debt(&state, &[gone, "/other/repo"]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        describe_watcher(&state, id, "code", Path::new(gone));
+
+        run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_code_watch_debt_forgotten_for(&state, gone, "/other/repo");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the pruned repo's watcher stops"
+        );
     }
 
     #[test]

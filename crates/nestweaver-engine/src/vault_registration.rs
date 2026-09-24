@@ -156,6 +156,67 @@ pub(crate) fn record_for_store(
     }
 }
 
+/// nw-608: refuse to register a NEW vault under a name another vault at a
+/// different root already holds.
+///
+/// A vault's uid is derived from its root path, so registering `r4-vault` at a
+/// new root (a copied database watched from a new checkout) did not move the
+/// existing vault — it created a second one with the same name. `brain search`
+/// then returned both vaults' notes, and every name selector (`brain remove
+/// <name>`, `brain_remove_source`) became ambiguous.
+///
+/// Refused rather than rehomed: a uid, and every note/heading/section/tag uid
+/// beneath it, is a hash of the root, so there is no primitive that moves a
+/// vault — "rehoming" would be a remove plus a full re-index, a destructive
+/// write the operator should choose, not one a watch should perform.
+///
+/// Scope, deliberately narrow so existing states keep working:
+///   * a vault whose uid is already in the graph refreshes in place, even in a
+///     database that was forked before this guard existed;
+///   * another vault at the SAME root (a different instance) is nw-098's case,
+///     guarded by the CLI and repaired by `instance merge`, not this one.
+///
+/// Every local vault publication calls this — the full and `--since` index
+/// routes and the watcher's startup — so `brain add`, `brain refresh`,
+/// `brain watch`, the daemon RPCs and MCP `brain_add_source` share one answer.
+pub fn refuse_duplicate_vault_name(
+    store: &nestweaver_store::GraphStore,
+    uid: &str,
+    name: &str,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let vaults = store.list_vaults(None)?;
+    if vaults.iter().any(|vault| vault.uid == uid) {
+        return Ok(());
+    }
+    // Compared the way vault SELECTORS compare names (case-insensitively), so
+    // `Brain` beside `brain` is refused too: a selector could not tell them
+    // apart either.
+    let wanted = canonical(root);
+    let key = crate::node_scope::vault_name_key(name);
+    let Some(existing) = vaults.iter().find(|vault| {
+        crate::node_scope::vault_name_key(&vault.name) == key
+            && canonical(Path::new(&vault.root_path)) != wanted
+    }) else {
+        return Ok(());
+    };
+    // The remedy pins the EXISTING vault's instance: `list_vaults(None)` spans
+    // instances, and an unpinned `brain remove` resolves the caller's.
+    anyhow::bail!(
+        "a vault named '{}' is already indexed at {} ({}); refusing to register a \
+         second vault named '{name}' at {} — both would answer searches and \
+         selecting the vault by name would be ambiguous.\n\
+         help: pass a different --name, or if the vault moved, remove the old one first \
+         (`nestweaver brain remove {} --instance {}`) and add it at the new path.",
+        existing.name,
+        existing.root_path,
+        existing.uid,
+        root.display(),
+        crate::shell_quote(&existing.root_path),
+        crate::shell_quote(&existing.instance_id),
+    )
+}
+
 /// Forget registrations matching `predicate`. Returns how many were dropped.
 fn forget_where(
     db_path: &Path,
@@ -195,7 +256,11 @@ pub fn forget_root(db_path: &Path, root: &Path) -> anyhow::Result<usize> {
     })
 }
 
-fn canonical(path: &Path) -> PathBuf {
+/// The form two watched roots are compared in: canonicalized when the path
+/// exists, as given when it does not (a removed root still has to match the
+/// registration that names it). Public so the daemon's watcher bookkeeping
+/// compares roots the same way instead of restating it.
+pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -358,6 +423,38 @@ mod tests {
         record(&db, &vault("vlt:default:v", &root)).unwrap();
         assert_eq!(registrations(&db).unwrap().len(), 1);
         assert!(missing(&db, std::iter::empty()).unwrap().len() == 1);
+    }
+
+    /// nw-608 review: vault selectors match names case-insensitively
+    /// (`node_scope::resolve_vault_filter`), so `Brain` beside `brain` is
+    /// just as ambiguous as an exact duplicate. And the hint must name the
+    /// existing vault's instance, or `brain remove` targets the wrong one.
+    #[test]
+    fn a_case_variant_name_is_refused_and_the_hint_pins_the_existing_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("a");
+        let copy = dir.path().join("b");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:work:a".into(),
+                name: "brain".into(),
+                root_path: original.to_string_lossy().into_owned(),
+                instance_id: "work".into(),
+            })
+            .unwrap();
+
+        let message = format!(
+            "{:#}",
+            refuse_duplicate_vault_name(&store, "vlt:default:b", "Brain", &copy).unwrap_err()
+        );
+        assert!(message.contains("--instance work"), "{message}");
+        assert!(message.contains("brain remove"), "{message}");
+
+        // Counterweight: a genuinely different name passes.
+        refuse_duplicate_vault_name(&store, "vlt:default:b", "brain-copy", &copy).unwrap();
     }
 
     #[test]

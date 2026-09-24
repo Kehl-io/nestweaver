@@ -257,6 +257,18 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// One keyset page of notes from [`GraphStore::list_notes_after`].
+#[derive(Debug, Clone, Default)]
+pub struct NoteKeysetPage {
+    /// Decoded notes, uid-ordered. May be shorter than the requested limit
+    /// even mid-vault: corrupt rows are dropped (and disclosed via tracing).
+    pub notes: Vec<Note>,
+    /// Cursor for the next page — the uid of the last row the scan reached,
+    /// decoded or not. `None` only when the scan returned fewer rows than the
+    /// limit, i.e. there is nothing after this page.
+    pub next_after: Option<String>,
+}
+
 /// What a whole-corpus scan actually covered.
 ///
 /// nw-335 made the whole-corpus scans TOLERATE a corrupt row instead of losing
@@ -1535,6 +1547,10 @@ impl GraphStore {
     /// bind LIMIT) so a catalog caller does not materialize the whole vault.
     /// `offset` is applied after the scan of `offset + limit` rows; SKIP is not
     /// assumed. Same corrupt-row policy as [`Self::list_notes`].
+    ///
+    /// nw-648: a paged scan is ordered by uid. Unordered, `LIMIT` returned
+    /// whichever rows the engine produced first, so page 2 of a vault was not
+    /// guaranteed to be the rows page 1 left out.
     pub fn list_notes_page(
         &self,
         vault_uid: Option<&str>,
@@ -1571,7 +1587,7 @@ impl GraphStore {
         // KuzuDB does not support LIMIT with a bound parameter — embed the
         // integer directly (safe: it's a usize from caller code, not user input).
         let limit_clause = match limit {
-            Some(n) => format!(" LIMIT {n}"),
+            Some(n) => format!(" ORDER BY n.uid LIMIT {n}"),
             None => String::new(),
         };
         let result = if let Some(vid) = vault_uid {
@@ -1651,11 +1667,113 @@ impl GraphStore {
 
     /// Count of all Note nodes (cheap for status output — no body load).
     pub fn count_notes(&self) -> Result<usize, StoreError> {
+        // nw-648 review: an aggregate, not a fetch of every uid to count rows.
+        let conn = self.conn()?;
+        let mut result = conn
+            .query("MATCH (n:Note) RETURN count(n)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        match result.next() {
+            Some(row) => Ok(usize::try_from(extract_i64(&row, 0)?).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// nw-648: note count for ONE vault, as an aggregate.
+    pub fn count_notes_in_vault(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("vid", Value::String(vault_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(usize::try_from(extract_i64(&row, 0)?).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// nw-648: one uid-ordered page of notes strictly after `after`, optionally
+    /// within one vault. Keyset paging: every page costs one bounded top-k, so
+    /// a vault of any size pages to completion — unlike `offset`, whose scan
+    /// grows with the skip and is therefore capped by its callers.
+    ///
+    /// The page's [`NoteKeysetPage::next_after`] is computed from the rows the
+    /// scan REACHED, before corrupt ones are dropped (nw-648 review): a full
+    /// scan that decoded one row short is not the end of the vault, and a
+    /// caller that read "short page" as "done" lost every later note.
+    pub fn list_notes_after(
+        &self,
+        vault_uid: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<NoteKeysetPage, StoreError> {
+        if limit == 0 {
+            return Ok(NoteKeysetPage::default());
+        }
+        let conn = self.conn()?;
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(vid) = vault_uid {
+            clauses.push("n.vault_uid = $vid");
+            params.push(("vid", Value::String(vid.to_string())));
+        }
+        if let Some(after) = after {
+            clauses.push("n.uid > $after");
+            params.push(("after", Value::String(after.to_string())));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        // LIMIT is inlined (Ladybug/Kuzu does not bind it); a usize from code.
+        let q = format!(
+            "MATCH (n:Note){where_clause} RETURN {NOTE_COLUMNS} ORDER BY n.uid LIMIT {limit}"
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let mut scanned = 0usize;
+        let mut last_uid: Option<String> = None;
+        let rows = result.map(|row| {
+            scanned += 1;
+            // The raw uid, NUL check skipped: it only has to be what Cypher
+            // compared in `n.uid > $after`, so the next page resumes after it
+            // even when this row itself is too corrupt to return.
+            if let Some(Value::String(uid)) = row.first() {
+                last_uid = Some(uid.clone());
+            }
+            row_to_note(&row)
+        });
+        let (notes, _integrity) = collect_tolerating_corrupt(rows, "list_notes_after")?;
+        let next_after = if scanned >= limit { last_uid } else { None };
+        Ok(NoteKeysetPage { notes, next_after })
+    }
+
+    /// nw-648: note count per vault uid, in one aggregate query. The web
+    /// explorer used to count the rows of one 1000-note page per vault, so a
+    /// second vault (or anything past the page) was simply absent. A vault
+    /// with no notes has no entry.
+    pub fn note_counts_by_vault(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, StoreError> {
         let conn = self.conn()?;
         let result = conn
-            .query("MATCH (n:Note) RETURN n.uid")
+            .query("MATCH (n:Note) RETURN n.vault_uid, count(n)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        Ok(result.count())
+        let mut counts = std::collections::HashMap::new();
+        for row in result {
+            let count = usize::try_from(extract_i64(&row, 1)?).unwrap_or(0);
+            counts.insert(extract_string(&row, 0)?, count);
+        }
+        Ok(counts)
     }
 
     /// Return all headings in a given note, in document order (by start_line).
@@ -2227,6 +2345,47 @@ impl GraphStore {
         Ok(note_to_sym + sec_to_sym)
     }
 
+    /// Every REFERENCES_CODE edge as `(from_uid, symbol_uid, confidence,
+    /// source)`, note-to-symbol and section-to-symbol together, sorted. The
+    /// two relations never share a `from_uid` (a Note uid is not a Section
+    /// uid), so the union is unambiguous. nw-668: lets a caller compare the
+    /// EXACT edge set two discovery paths produce, not just a count.
+    pub fn list_references_code_edges(
+        &self,
+    ) -> Result<Vec<(String, String, f64, String)>, StoreError> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for query in [
+            "MATCH (a:Note)-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) \
+             RETURN a.uid, b.uid, r.confidence, r.source",
+            "MATCH (a:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) \
+             RETURN a.uid, b.uid, r.confidence, r.source",
+        ] {
+            let rows = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in rows {
+                let confidence = match row.get(2) {
+                    Some(lbug::Value::Float(value)) => f64::from(*value),
+                    Some(lbug::Value::Double(value)) => *value,
+                    _ => f64::NAN,
+                };
+                out.push((
+                    extract_string(&row, 0)?,
+                    extract_string(&row, 1)?,
+                    confidence,
+                    extract_string(&row, 3)?,
+                ));
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.0, &a.1, &a.3)
+                .cmp(&(&b.0, &b.1, &b.3))
+                .then(a.2.total_cmp(&b.2))
+        });
+        Ok(out)
+    }
+
     /// Count of all wikilink edges (to either Note or Heading). Cheap status
     /// summary — does two separate queries since LadybugDB splits the
     /// logical WIKILINK into two physical REL tables.
@@ -2487,6 +2646,31 @@ impl GraphStore {
                 let path = extract_string(&row, 1)?;
                 Ok((uid, path))
             })
+            .collect()
+    }
+
+    /// Every File node of `repo_uid` as `(file_path, content_hash)`.
+    ///
+    /// nw-664: the code watcher's startup reconciliation compares disk
+    /// against the content the graph actually holds, which a watcher batch
+    /// may have moved past the last full index's filemeta cache.
+    pub fn list_file_hashes_by_repo(
+        &self,
+        repo_uid: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (f:File) WHERE f.repo_uid = $repo RETURN f.path, f.content_hash";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("repo", Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result
+            .map(|row| Ok((extract_string(&row, 0)?, extract_string(&row, 1)?)))
             .collect()
     }
 
@@ -3170,6 +3354,73 @@ impl GraphStore {
                 _ => None,
             })
             .collect())
+    }
+
+    /// The top `limit` symbols of `repo_uid` by stored PageRank (ties by
+    /// UID), plus how many symbols the repository holds in all.
+    ///
+    /// nw-609 review: a `repo:` context seed expands to the repository's
+    /// members, and a repository can hold tens of thousands of symbols. The
+    /// seed is bounded BEFORE the walk, exactly as `project_context` bounds a
+    /// project with [`Self::list_project_symbol_uids_by_pagerank`]; the total
+    /// is returned so the caller can disclose the cut. Unlike that twin this
+    /// fails closed -- a query error, or a publication that blocks ranking,
+    /// is an error, not an empty repository. The gate is PPR's own
+    /// [`Self::index_publication_blocks_ranking`], not the raw dirty marker:
+    /// a young brain-watcher batch (nw-475 Q7) is answered through, exactly
+    /// as it is for every other seed's walk. A never-ranked symbol (NULL
+    /// score) ranks as 0.0, so it cannot top the cut by sorting first.
+    pub fn repo_symbol_seed_candidates(
+        &self,
+        repo_uid: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, usize), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.index_publication_blocks_ranking() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::RankingUnavailable);
+        }
+        let conn = self.conn()?;
+        let mut count_stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $repo RETURN count(s.uid)")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let total = conn
+            .execute(
+                &mut count_stmt,
+                vec![("repo", Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?
+            .next()
+            .map(|row| extract_i64(&row, 0))
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+        if limit == 0 || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let mut stmt = conn
+            .prepare(
+                "MATCH (s:Symbol) WHERE s.repo_uid = $repo \
+                 RETURN s.uid ORDER BY coalesce(s.pagerank_score, 0.0) DESC, s.uid ASC LIMIT $limit",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("repo", Value::String(repo_uid.to_string())),
+                    ("limit", Value::Int64(limit as i64)),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let mut uids = Vec::new();
+        for row in result {
+            uids.push(extract_string(&row, 0)?);
+        }
+        Ok((uids, total))
     }
 
     /// Return up to `limit` Symbol UIDs from a project, ranked by PageRank descending.

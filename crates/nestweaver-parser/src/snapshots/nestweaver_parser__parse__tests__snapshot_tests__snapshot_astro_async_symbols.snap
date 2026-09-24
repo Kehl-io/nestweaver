@@ -1,0 +1,52 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"async.astro\", &source)"
+---
+- name: async
+  kind: Class
+  start_line: 1
+  end_line: 18
+  signature: "<astro:component name=\"async\">"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: EventListener
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: getStaticPaths
+  kind: Function
+  start_line: 2
+  end_line: 5
+  signature: "export async function getStaticPaths() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: HttpHandler
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: fetchPosts
+  kind: Function
+  start_line: 7
+  end_line: 9
+  signature: "async function fetchPosts() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: formatDate
+  kind: Function
+  start_line: 11
+  end_line: 13
+  signature: "export function formatDate(d) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~

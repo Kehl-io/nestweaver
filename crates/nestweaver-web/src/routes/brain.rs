@@ -49,10 +49,26 @@ pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response
     .into_response())
 }
 
+/// nw-648: each vault carries its TRUE `note_count` (one aggregate query), so
+/// the explorer can list every vault with its real size instead of counting
+/// the rows of whatever page it happened to load.
 pub async fn list_vaults(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let vaults = state.store.list_vaults(None)?;
-    let json = serde_json::to_value(&vaults)?;
-    Ok(Json(json).into_response())
+    let counts = state.store.note_counts_by_vault()?;
+    let rows = vaults
+        .iter()
+        .map(|vault| {
+            let mut row = serde_json::to_value(vault)?;
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "note_count".to_string(),
+                    json!(counts.get(&vault.uid).copied().unwrap_or(0)),
+                );
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    Ok(Json(rows).into_response())
 }
 
 pub async fn list_tags(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -68,10 +84,34 @@ pub const LIST_NOTES_DEFAULT_LIMIT: usize = 20;
 /// Hard cap on `limit` / effective page size for GET `/api/v1/brain/notes`.
 pub const LIST_NOTES_LIMIT_MAX: usize = 1000;
 
+/// Response header carrying how many notes match the request's filter, so a
+/// caller holding one page can disclose or fetch the rest (nw-648). The body
+/// stays a raw array, matching the sibling brain list routes.
+pub const LIST_NOTES_TOTAL_HEADER: &str = "x-total-count";
+
+/// Response header carrying the `after` cursor for the next page of a cursor
+/// listing (any request without `offset`), form-urlencoded so any uid fits a
+/// header. ABSENT means the listing reached the end.
+///
+/// nw-648 review: the store drops a corrupt row from a page, so a page one
+/// row short is not the end of the vault — a caller that treated a short
+/// page as "done" lost every later note. The cursor is computed from the
+/// rows the scan reached, before any were dropped.
+pub const LIST_NOTES_NEXT_AFTER_HEADER: &str = "x-next-after";
+
 #[derive(Deserialize)]
 pub struct ListNotesParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// nw-648: restrict to one vault uid. `vault_uid` is accepted too — both
+    /// spellings were tried against the live UI, and both were silently
+    /// ignored, returning the first vault's page.
+    #[serde(alias = "vault_uid")]
+    pub vault: Option<String>,
+    /// nw-648: keyset cursor — return notes whose uid sorts after this one.
+    /// Pages of any vault size reach the end, where `offset` stops at
+    /// [`LIST_NOTES_LIMIT_MAX`]. Cannot be combined with `offset`.
+    pub after: Option<String>,
 }
 
 pub async fn list_notes(
@@ -82,13 +122,72 @@ pub async fn list_notes(
         .limit
         .unwrap_or(LIST_NOTES_DEFAULT_LIMIT)
         .min(LIST_NOTES_LIMIT_MAX);
-    let offset = params.offset.unwrap_or(0).min(LIST_NOTES_LIMIT_MAX);
+    let offset = params.offset.unwrap_or(0);
     // Raw JSON array, matching `/brain/vaults`, `/brain/tags`, and `/symbols/top`.
     // Offset is capped at LIST_NOTES_LIMIT_MAX so Cypher's LIMIT offset+limit
     // cannot reconstruct an unbounded scan via ?limit=1000&offset=N.
-    let notes = state.store.list_notes_page(None, limit, offset)?;
+    //
+    // nw-648: an offset PAST the cap is an empty page, not a clamp. Clamping
+    // made `offset=2000` silently return rows 1000..2000 a second time; a
+    // caller paging a large vault now sees the end, and the total header
+    // tells it how much it could not reach.
+    let limit = if offset > LIST_NOTES_LIMIT_MAX {
+        0
+    } else {
+        limit
+    };
+    // nw-648 review: a malformed request is refused before any vault lookup
+    // or count — it is a 400 whatever the vault, not a 404 because the vault
+    // also happens to be unknown.
+    if params.after.is_some() && params.offset.is_some() {
+        return Err(ApiError::bad_request(
+            "`after` and `offset` cannot be combined; page with one or the other",
+        ));
+    }
+    let vault = params.vault.as_deref().filter(|uid| !uid.is_empty());
+    let total = match vault {
+        Some(uid) => {
+            // An unknown vault is a 404, not an empty page that reads as
+            // "this vault has no notes". Any OTHER store failure propagates:
+            // a broken database is not a missing vault.
+            match state.store.lookup_vault(uid) {
+                Ok(_) => {}
+                Err(nestweaver_store::StoreError::NotFound) => {
+                    return Err(ApiError::not_found(format!("vault '{uid}' not found")));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            state.store.count_notes_in_vault(uid)?
+        }
+        None => state.store.count_notes()?,
+    };
+    // Without `offset` this is a cursor listing (the first page is simply
+    // `after` = none), which is what lets it hand out the next cursor.
+    let (notes, next_after) = if params.offset.is_some() {
+        (state.store.list_notes_page(vault, limit, offset)?, None)
+    } else {
+        let page = state
+            .store
+            .list_notes_after(vault, params.after.as_deref(), limit)?;
+        (page.notes, page.next_after)
+    };
     let json = serde_json::to_value(&notes)?;
-    Ok(Json(json).into_response())
+    let mut response = Json(json).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        LIST_NOTES_TOTAL_HEADER,
+        axum::http::HeaderValue::from(total),
+    );
+    if let Some(next) = next_after {
+        let encoded: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+        // Form-urlencoded output is visible ASCII, so this cannot fail; if it
+        // somehow did, a missing cursor would read as "end", so fail loudly.
+        let value = axum::http::HeaderValue::from_str(&encoded).map_err(|error| {
+            ApiError::internal(format!("next-page cursor is not a header value: {error}"))
+        })?;
+        headers.insert(LIST_NOTES_NEXT_AFTER_HEADER, value);
+    }
+    Ok(response)
 }
 
 pub async fn note_by_uid(
