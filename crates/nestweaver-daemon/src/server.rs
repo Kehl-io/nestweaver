@@ -50,8 +50,9 @@ impl Drop for RpcIndexActivity {
 
 /// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
 /// a cancelled query surfaces as `deadline_exceeded` rather than an opaque
-/// `internal`. Repository-scope refusals are `permission_denied`; other errors
-/// keep the `internal` mapping. This is
+/// `internal`. Repository-scope refusals are `permission_denied`; schema
+/// violations are `invalid_argument` (nw-660); other errors keep the
+/// `internal` mapping. This is
 /// defense-in-depth: on timeout the safeguard's `select!` already returns
 /// `deadline_exceeded` and drops this future, but a query that finishes with a
 /// cancel error just before that race is mapped consistently here too.
@@ -65,6 +66,24 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         .any(|cause| cause.is::<nestweaver_mcp::tools::RepositoryScopeRefused>())
     {
         return Status::permission_denied(format!("tool {tool_name} refused: {e}"));
+    }
+    // nw-660. Arguments that fail the tool's schema are the caller's mistake.
+    // Mapping them to `internal` made the CLI exit 1 with "Internal error" for
+    // every schema violation on every tool; `invalid_argument` plus a stamped
+    // code lets the CLI report a usage error without reading prose.
+    if e.chain()
+        .any(|cause| cause.is::<nestweaver_mcp::tools::ToolArgumentsInvalid>())
+    {
+        let mut status = Status::invalid_argument(format!("tool {tool_name} failed: {e}"));
+        if let Ok(value) =
+            nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE.parse::<MetadataValue<_>>()
+        {
+            status.metadata_mut().insert(
+                nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                value,
+            );
+        }
+        return status;
     }
     if let Some(reason) = e
         .downcast_ref::<nestweaver_store::StoreError>()
@@ -238,6 +257,43 @@ mod dispatch_err_to_status_tests {
                 .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
                 .is_none()
         );
+    }
+
+    /// nw-660: a schema violation from `validate_tool_arguments` is the
+    /// caller's input mistake. It used to map to `Internal`, which the CLI
+    /// reports as exit 1 "Internal error".
+    #[test]
+    fn a_schema_violation_is_invalid_argument_with_its_error_code() {
+        let error = nestweaver_mcp::tools::validate_tool_arguments(
+            "read_symbols",
+            &serde_json::json!({ "targets": ["x".repeat(513)] }),
+        )
+        .expect_err("an over-long target violates the read_symbols schema");
+        let status = dispatch_err_to_status("read_symbols", error);
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let code = status
+            .metadata()
+            .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+            .expect("a schema violation must carry a machine-readable code")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(code, nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE);
+        assert!(
+            status
+                .message()
+                .contains("schema keyword 'maxLength' failed"),
+            "the schema message is kept; got {:?}",
+            status.message()
+        );
+    }
+
+    /// COUNTERWEIGHT: a genuine internal failure stays `Internal`.
+    #[test]
+    fn a_genuine_failure_stays_internal() {
+        let status = dispatch_err_to_status("read_symbols", anyhow::anyhow!("disk I/O error"));
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 }
 
@@ -2388,6 +2444,13 @@ fn index_done_message(
         )
     }
 }
+
+/// Appended to a vault RPC's Done message when a coverage gap kept (or
+/// demoted) Markdown derivation from Current (nw-651). One constant so
+/// IndexVault and RefreshVaultSince say the same thing.
+const DERIVATION_WITHHELD_NOTE: &str = "\nMarkdown link derivation NOT marked current: a \
+     skipped path above could not be read or parsed. Fix it and re-run; until then \
+     link-graph tools report this vault as blocked.";
 
 fn index_skip_details(skipped: &[nestweaver_parser::SkippedFile]) -> Vec<IndexSkipDetail> {
     skipped
@@ -5650,6 +5713,7 @@ where
 /// pre-merge uid there) — so `brain status` / `brain list` do not report it as
 /// dropped. Shared by `remove_vault` and `prune_stale`. Best-effort: the graph
 /// delete already committed, and a failure only leaves a stale disclosure.
+/// Also clears the vault's skipped-notes sidecar debt when its root is known.
 fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Option<&str>) {
     let forgotten = match root_path {
         Some(root) => {
@@ -5659,6 +5723,12 @@ fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Op
     };
     if let Err(error) = forgotten {
         tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    }
+    // nw-653 review: and its owed reconciliation / unindexable-note entries
+    // in the shared skipped-notes sidecar, which only its (now gone) watcher
+    // would ever have cleared.
+    if let Some(root) = root_path {
+        nestweaver_engine::index_md::forget_vault_skipped_notes(&state.db_path, Path::new(root));
     }
 }
 
@@ -7622,36 +7692,44 @@ impl NestWeaverDaemon for DaemonService {
                         return;
                     }
 
-                    if let Err(error) = vault_derivation::stamp_index_success(
+                    let stamp = match vault_derivation::stamp_index_success(
                         &state,
                         &vault_path,
                         &extra_patterns,
                         note_limits.max_note_bytes(),
                         &result,
                     ) {
-                        let _ = tx.blocking_send(Ok(IndexProgress {
-                            phase: Phase::Error as i32,
-                            message: format!(
-                                "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
-                            ),
-                            files_processed: result.index.notes_count as u64,
-                            files_total: result.index.notes_count as u64,
-                            symbols_found: result.index.headings_count as u64,
-                            skipped_count: skipped_count as u64,
-                            skipped_files,
-                            coverage_status,
-                            trigram_refresh: None,
-                            exclusion_inventory: None,
-                        }));
-                        return;
-                    }
+                        Ok(stamp) => stamp,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "IndexVault committed graph and search but could not persist Markdown derivation: {error:#}"
+                                ),
+                                files_processed: result.index.notes_count as u64,
+                                files_total: result.index.notes_count as u64,
+                                symbols_found: result.index.headings_count as u64,
+                                skipped_count: skipped_count as u64,
+                                skipped_files,
+                                coverage_status,
+                                trigram_refresh: None,
+                                exclusion_inventory: None,
+                            }));
+                            return;
+                        }
+                    };
 
-                    // DONE phase
+                    // DONE phase. nw-651: a coverage gap is disclosed (the
+                    // skip rows, degraded coverage), not a failure — say why
+                    // derivation was left un-Current instead of erroring.
+                    let mut message =
+                        nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
+                    if stamp == vault_derivation::IndexStamp::WithheldForCoverageGap {
+                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: nestweaver_engine::index_md::format_markdown_refresh_summary(
-                            &result,
-                        ),
+                        message,
                         files_processed: result.index.notes_count as u64,
                         files_total: result.index.notes_count as u64,
                         symbols_found: result.index.headings_count as u64,
@@ -7823,23 +7901,68 @@ impl NestWeaverDaemon for DaemonService {
                     {
                         tracing::warn!(%error, "failed to record incremental vault timestamp");
                     }
+                    // nw-651: the refresh's skip rows reach the client (they
+                    // used to be dropped by `..Default::default()`), and a
+                    // coverage gap demotes a Current vault — the same rule
+                    // IndexVault applies, via the same helper.
+                    let skipped_files = index_skip_details(&result.skipped);
+                    let skipped_count = skipped_files.len();
+                    let coverage_status = if skipped_count == 0 {
+                        CoverageStatus::Complete as i32
+                    } else {
+                        CoverageStatus::Degraded as i32
+                    };
+                    let withheld = match vault_derivation::withhold_if_coverage_gap(
+                        &state,
+                        &vault_path,
+                        &extra_patterns,
+                        note_limits.max_note_bytes(),
+                        &result.skipped,
+                    ) {
+                        Ok(withheld) => withheld,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "RefreshVaultSince committed graph and search but could not demote Markdown derivation over a coverage gap: {error:#}"
+                                ),
+                                files_processed: result.files_checked as u64,
+                                files_total: result.files_checked as u64,
+                                symbols_found: result.headings_count as u64,
+                                skipped_count: skipped_count as u64,
+                                skipped_files,
+                                coverage_status,
+                                trigram_refresh: None,
+                                exclusion_inventory: None,
+                            }));
+                            return;
+                        }
+                    };
+                    let mut message = format!(
+                        "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s) on changed notes.",
+                        result.vault_name,
+                        result.files_checked,
+                        result.notes_updated,
+                        result.notes_deleted,
+                        result.headings_count,
+                        result.sections_count,
+                        result.tags_count,
+                        result.changed_note_link_edges,
+                    );
+                    if withheld {
+                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                    }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s) on changed notes.",
-                            result.vault_name,
-                            result.files_checked,
-                            result.notes_updated,
-                            result.notes_deleted,
-                            result.headings_count,
-                            result.sections_count,
-                            result.tags_count,
-                            result.changed_note_link_edges,
-                        ),
+                        message,
                         files_processed: result.files_checked as u64,
                         files_total: result.files_checked as u64,
                         symbols_found: result.headings_count as u64,
-                        ..Default::default()
+                        skipped_count: skipped_count as u64,
+                        skipped_files,
+                        coverage_status,
+                        trigram_refresh: None,
+                        exclusion_inventory: None,
                     }));
                 }
                 Err(error) => {
@@ -16267,9 +16390,16 @@ credential_method = "gh"
 
     /// Counterweight to the policy-skip test: a note the reader cannot read is
     /// a genuine coverage gap and must still keep derivation from stamping.
+    ///
+    /// nw-651 changed HOW it refuses, not WHETHER: IndexVault used to end in
+    /// `Phase::Error` ("vault derivation requires complete publication
+    /// coverage") with the previous record left untouched. A failure skip is
+    /// now disclosed and the RPC completes, with the record persisted Blocked
+    /// — the same contract as an unreadable subdirectory.
     #[cfg(unix)]
     #[tokio::test]
     async fn index_vault_refuses_derivation_when_a_note_is_unreadable() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
         use std::os::unix::fs::PermissionsExt;
         let state = test_state_with_writer();
         let vault = tempfile::tempdir().unwrap();
@@ -16287,14 +16417,280 @@ credential_method = "gh"
         std::fs::set_permissions(root.join("B.md"), std::fs::Permissions::from_mode(0o644))
             .unwrap();
         let last = progress.last().expect("IndexVault streamed progress");
-        assert_eq!(last.phase, Phase::Error as i32, "{last:?}");
+        assert_eq!(last.phase, Phase::Done as i32, "{last:?}");
+        assert_eq!(last.coverage_status, CoverageStatus::Degraded as i32);
         assert!(
-            last.message
-                .contains("vault derivation requires complete publication coverage"),
+            last.message.contains("NOT marked current"),
             "{}",
             last.message
         );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked
+        );
         vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// Restores a directory's mode on drop, so a panicking assertion cannot
+    /// leave a mode-000 directory behind for `TempDir` to trip over (nw-651).
+    #[cfg(unix)]
+    struct RestoreMode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> RestoreMode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        RestoreMode(dir.to_path_buf())
+    }
+
+    /// nw-651: a vault subdirectory the walk cannot read is DISCLOSED — a
+    /// `read_error` row naming it, coverage degraded — and derivation is NOT
+    /// stamped Current: the record is persisted Blocked so `brain status`
+    /// counts it and derivation-gated tools refuse. But IndexVault still
+    /// COMPLETES (the user's decision: disclose, not a hard failure), with the
+    /// readable notes indexed. Before the fix the walk only logged the error,
+    /// the vault was stamped Current and `locked/`'s notes were silently gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_discloses_an_unreadable_subdirectory_and_withholds_derivation() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let _restore = lock_dir(&root.join("locked"));
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(
+            last.phase,
+            Phase::Done as i32,
+            "an unreadable subdirectory is disclosed, not a hard failure: {}",
+            last.message
+        );
+        assert_eq!(last.files_processed, 2, "the readable notes are indexed");
+        assert_eq!(last.coverage_status, CoverageStatus::Degraded as i32);
+        assert!(
+            last.skipped_files
+                .iter()
+                .any(|row| row.path == "locked" && row.reason_code == "read_error"),
+            "{:?}",
+            last.skipped_files
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "derivation must not be stamped Current over a coverage gap"
+        );
+        let mut status = serde_json::json!({});
+        vault_derivation::status_overlay(&state, &mut status);
+        assert_eq!(
+            status["vault_derivation"]["pending_or_blocked_vaults"], 1,
+            "brain status must show the vault is not current: {status}"
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    /// nw-651: a vault that WAS Current does not stay Current when a
+    /// subdirectory becomes unreadable. The pre-fix refusal returned before
+    /// touching the record, so yesterday's Current survived today's gap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_demotes_a_current_vault_when_a_subdirectory_becomes_unreadable() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current,
+            "precondition"
+        );
+
+        let _restore = lock_dir(&root.join("locked"));
+        let second = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(second.last().unwrap().phase, Phase::Done as i32);
+        let kept: Vec<String> = state
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/C.md"),
+            "a note that could not be read is retained, not deleted: {kept:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+    }
+
+    async fn refresh_vault_since_via_rpc(
+        state: &Arc<DaemonState>,
+        root: &Path,
+    ) -> Vec<IndexProgress> {
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RefreshVaultSinceRequest {
+            vault_path: root.display().to_string(),
+            vault_name: "vault".to_string(),
+            since_unix_seconds: 0,
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut rx = service
+            .refresh_vault_since(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .into_inner();
+        let mut progress = Vec::new();
+        while let Some(event) = rx.recv().await {
+            progress.push(event.unwrap());
+        }
+        progress
+    }
+
+    /// nw-651: a RefreshVaultSince (the watcher/RPC refresh) that discloses an
+    /// unreadable directory must demote a Current vault — it used to admit the
+    /// vault through `ensure_current`, never touch the record again, and drop
+    /// the skip rows from its Done progress, so the vault stayed Current over
+    /// a disclosed gap and the client saw `complete`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_vault_since_demotes_a_current_vault_over_an_unreadable_subdirectory() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current,
+            "precondition"
+        );
+
+        let _restore = lock_dir(&root.join("locked"));
+        let progress = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = progress
+            .last()
+            .expect("RefreshVaultSince streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Degraded as i32,
+            "{last:?}"
+        );
+        assert!(
+            last.skipped_files
+                .iter()
+                .any(|row| row.path == "locked" && row.reason_code == "read_error"),
+            "{last:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Blocked,
+            "a disclosed coverage gap must not leave the vault Current"
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+        let kept: Vec<String> = state
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(kept.iter().any(|path| path == "locked/C.md"), "{kept:?}");
+    }
+
+    /// Counterweight: a clean RefreshVaultSince leaves a Current vault Current
+    /// and reports complete coverage.
+    #[tokio::test]
+    async fn refresh_vault_since_keeps_a_clean_vault_current() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+        let progress = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = progress.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(last.coverage_status, CoverageStatus::Complete as i32);
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+    }
+
+    /// nw-651 counterweight: a brainignored unreadable subdirectory is policy,
+    /// not a gap — IndexVault stamps Current exactly as without it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_vault_stamps_derivation_over_a_brainignored_unreadable_subdirectory() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        std::fs::write(root.join(".brainignore"), "locked/**\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let _restore = lock_dir(&root.join("locked"));
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        let last = progress.last().expect("IndexVault streamed progress");
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
     }
 
     /// Blocked used to be terminal: admission reported it non-retryable, so
@@ -16670,6 +17066,91 @@ credential_method = "gh"
 
         let left = nestweaver_engine::vault_registration::registrations(&state.db_path).unwrap();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// nw-653 review: a removed vault's owed startup reconciliation and its
+    /// unindexable-note mtimes lived on in the shared skipped-notes sidecar
+    /// forever — `brain status` kept reporting debt for a vault that no
+    /// longer exists. Removal clears them; another vault's entries stay.
+    fn seed_skipped_notes_debt(state: &DaemonState, roots: &[&str]) {
+        let mut sidecar = nestweaver_engine::index_md::SkippedNotesSidecar::default();
+        for root in roots {
+            let note = format!("{root}/owed.md");
+            sidecar.reconciliation_pending.insert(
+                (*root).to_string(),
+                vec![nestweaver_parser::SkippedFile::new(
+                    note.clone(),
+                    nestweaver_parser::SkipReasonCode::Other,
+                    "owed",
+                )],
+            );
+            sidecar
+                .unindexable_mtimes
+                .insert(format!("{root}/broken.md"), "2026-09-24T00:00:00Z".into());
+        }
+        std::fs::write(
+            nestweaver_engine::sidecar_path(
+                &state.db_path,
+                nestweaver_engine::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX,
+            ),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_only_debt_left_for(state: &DaemonState, survivor: &str) {
+        let left = nestweaver_engine::index_md::load_skipped_notes_sidecar(&state.db_path);
+        let pending: Vec<&String> = left.reconciliation_pending.keys().collect();
+        assert_eq!(pending, vec![survivor], "{pending:?}");
+        assert!(
+            left.unindexable_mtimes
+                .keys()
+                .all(|path| path.starts_with(&format!("{survivor}/"))),
+            "{:?}",
+            left.unindexable_mtimes
+        );
+        assert_eq!(
+            left.unindexable_mtimes.len(),
+            1,
+            "{:?}",
+            left.unindexable_mtimes
+        );
+    }
+
+    #[test]
+    fn remove_vault_clears_its_skipped_notes_debt() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:debt:gone", "debt", &root_str);
+        seed_skipped_notes_debt(&state, &[&root_str, "/other/vault"]);
+
+        run_remove_vault_with_projection(&state, "vlt:debt:gone", None).unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    #[test]
+    fn prune_stale_clears_a_pruned_vaults_skipped_notes_debt() {
+        let state = test_state_with_writer();
+        let gone = "/definitely/missing/prune-debt";
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:debt", "prune", gone);
+        seed_skipped_notes_debt(&state, &[gone, "/other/vault"]);
+
+        run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
     }
 
     #[test]

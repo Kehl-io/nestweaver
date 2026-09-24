@@ -231,6 +231,13 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
         }
     }
 
+    // nw-453: the template calls what it binds; root it (see `markup.rs`).
+    let used_by_markup = crate::markup::markup_identifiers(
+        markup_after_frontmatter(source),
+        crate::markup::Dialect::Braces,
+    );
+    crate::markup::root_markup_used_symbols(&mut symbols, &used_by_markup);
+
     ParsedFile {
         path: path_str,
         symbols,
@@ -239,6 +246,23 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
         // Regex-based parser: no syntax tree, so no error signal (nw-601).
         has_syntax_errors: false,
     }
+}
+
+/// The template: everything after the closing frontmatter fence, or the
+/// whole file when there is no frontmatter.
+fn markup_after_frontmatter(source: &str) -> &str {
+    let mut fences = 0;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim() == "---" {
+            fences += 1;
+            if fences == 2 {
+                return &source[offset..];
+            }
+        }
+    }
+    source
 }
 
 /// Extract the frontmatter content (between `---` markers) and its starting

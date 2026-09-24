@@ -229,6 +229,179 @@ fn path_has_vault_skip_dir(rel_path: &Path, has_file: &dyn Fn(&Path) -> bool) ->
     )
 }
 
+/// How a vault-relative path relates to the notes this vault indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultNoteEligibility {
+    /// Not Markdown, or under a vault skip dir: never a note.
+    NotANote,
+    /// A Markdown note the user excluded with `.brainignore`. The full index
+    /// discloses these; incremental paths just leave them out.
+    Ignored,
+    Eligible,
+}
+
+/// nw-653: the ONE eligibility rule. The full index, the incremental refresh
+/// and the watcher's startup reconciliation all answer "which on-disk files
+/// belong in the graph"; they call this so they cannot drift apart
+/// (CONTRIBUTING, sibling gaps).
+fn vault_note_eligibility(
+    rel_path: &Path,
+    reader: &dyn ContentReader,
+    ignore_set: &GlobSet,
+) -> VaultNoteEligibility {
+    if !is_markdown(rel_path) || path_has_vault_skip_dir(rel_path, &|probe| reader.has_file(probe))
+    {
+        return VaultNoteEligibility::NotANote;
+    }
+    let rel_str = rel_path.to_string_lossy();
+    if crate::brainignore::is_ignored(&rel_str, ignore_set) {
+        tracing::debug!("brainignore: skipping {}", rel_str);
+        return VaultNoteEligibility::Ignored;
+    }
+    VaultNoteEligibility::Eligible
+}
+
+fn is_eligible_vault_note(
+    rel_path: &Path,
+    reader: &dyn ContentReader,
+    ignore_set: &GlobSet,
+) -> bool {
+    vault_note_eligibility(rel_path, reader, ignore_set) == VaultNoteEligibility::Eligible
+}
+
+/// Classify a failed note read the same way on every vault path: oversize and
+/// binary are policy skips (nw-469, nw-355), anything else a read error.
+fn note_read_failure_skip(rel_path: String, err: &anyhow::Error, limit_bytes: u64) -> SkippedFile {
+    if let Some(oversized) = err.downcast_ref::<crate::content_reader::SourceTooLarge>() {
+        return oversized_skip(rel_path, oversized.observed_bytes, limit_bytes);
+    }
+    if err
+        .downcast_ref::<crate::content_reader::BinarySource>()
+        .is_some()
+    {
+        return SkippedFile::binary(rel_path);
+    }
+    SkippedFile::new(
+        rel_path,
+        SkipReasonCode::ReadError,
+        format!("read error: {err}"),
+    )
+}
+
+/// nw-653: skips that mean "an index attempt tried and could not ingest this
+/// note", as opposed to a policy decision made before reading it. Their
+/// on-disk mtime is remembered so the watcher does not replay them on every
+/// start (see [`SkippedNotesSidecar::unindexable_mtimes`]).
+fn is_ingest_failure(code: SkipReasonCode) -> bool {
+    matches!(
+        code,
+        SkipReasonCode::Binary | SkipReasonCode::ReadError | SkipReasonCode::ParseError
+    )
+}
+
+/// A file's mtime in the representation notes record (`Note::modified_at`).
+///
+/// nw-653: this is WHOLE SECONDS (`format_system_time`), so a change made in
+/// the same second as the recorded one is invisible to anything comparing
+/// these strings — the watcher's startup reconciliation included. An edit
+/// made while no watcher ran, within the second of the previous ingest, is
+/// not detected at startup; the next edit or a `brain refresh` picks it up.
+fn file_mtime_string(path: &Path) -> Option<String> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(format_system_time)
+}
+
+/// nw-653: the vault paths whose graph state no longer matches disk, for the
+/// brain watcher to replay as its first batch.
+///
+/// A watcher only learns about changes through filesystem events, and events
+/// that arrive while nothing is processing them are gone: the daemon was
+/// down, the watcher was wedged behind a deadlocked write gate, or launchd was
+/// crash-looping the controller on a version mismatch. In the live repro a
+/// watcher stuck for ~20 hours lost the create events of five notes, and every
+/// later watcher reacted only to new events, so those notes never reached the
+/// graph. Startup therefore diffs disk against the graph:
+///
+/// - an eligible note absent from the graph (a lost create);
+/// - an indexed note whose file mtime differs from the one recorded when it
+///   was ingested (a lost edit) — notes with no recorded mtime are left alone
+///   rather than re-parsed on every start;
+/// - an indexed note whose file no longer exists (a lost delete). Only
+///   inferred when the scan found notes at all: an empty scan of an indexed
+///   vault is an unreadable or unmounted directory, not a deletion (nw-287).
+///
+/// Cheap for large vaults: one directory walk, one `stat` per note and set
+/// lookups. Nothing is read or parsed here, and an unchanged note is never in
+/// the result. Returned paths are absolute, like watcher events.
+pub(crate) fn vault_startup_drift(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    ignore_set: &GlobSet,
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<Vec<PathBuf>, anyhow::Error> {
+    let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
+    let indexed: HashMap<String, Option<String>> = store
+        .list_notes(Some(&v_uid))
+        .context("list indexed vault notes")?
+        .into_iter()
+        .map(|note| (note.file_path, note.modified_at))
+        .collect();
+    let reader = filesystem_note_reader(vault_root, note_limits);
+    let unindexable = store
+        .db_path()
+        .map(load_skipped_notes_sidecar)
+        .unwrap_or_default()
+        .unindexable_mtimes;
+    let mut seen = HashSet::new();
+    let mut drift = Vec::new();
+    for rel_path in reader.list_files()? {
+        if !is_eligible_vault_note(&rel_path, &reader, ignore_set) {
+            continue;
+        }
+        let rel_str = rel_path.to_string_lossy().into_owned();
+        let abs_path = vault_root.join(&rel_path);
+        let meta = std::fs::metadata(&abs_path).ok();
+        // Whole-second granularity: see `file_mtime_string`.
+        let on_disk = file_mtime_string(&abs_path);
+        let drifted = match indexed.get(&rel_str) {
+            // An oversized note the graph never held would only be skipped
+            // (and is already disclosed) again; replaying it on every start
+            // would buy a full publication for nothing. The same holds for a
+            // note an earlier attempt could not read or parse, until the
+            // file changes.
+            None => {
+                meta.as_ref()
+                    .is_some_and(|meta| meta.len() <= reader.max_source_file_bytes())
+                    && (on_disk.is_none()
+                        || unindexable.get(&abs_path.to_string_lossy().into_owned())
+                            != on_disk.as_ref())
+            }
+            Some(Some(recorded)) => on_disk.is_some_and(|on_disk| &on_disk != recorded),
+            Some(None) => false,
+        };
+        if drifted {
+            drift.push(abs_path);
+        }
+        seen.insert(rel_str);
+    }
+    if !seen.is_empty() {
+        for rel_str in indexed.keys().filter(|path| !seen.contains(*path)) {
+            let abs_path = vault_root.join(rel_str);
+            if matches!(
+                std::fs::symlink_metadata(&abs_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                drift.push(abs_path);
+            }
+        }
+    }
+    drift.sort();
+    Ok(drift)
+}
+
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
 /// pasted into a note). Files above this size are skipped with a warning.
 /// Per-file cap on note size. Files larger than this are skipped with a
@@ -263,6 +436,25 @@ pub struct SkippedNotesSidecar {
     pub skipped_truncated: bool,
     #[serde(default)]
     pub near_limit_truncated: bool,
+    /// nw-653: ABSOLUTE path -> whole-second mtime of each eligible note an
+    /// index attempt could not ingest (binary, unreadable, unparseable). The
+    /// watcher's startup reconciliation skips a missing note whose mtime still
+    /// matches, instead of replaying a batch for it on every start; a changed
+    /// file is retried. Absolute because this sidecar is shared by every vault
+    /// in the database. Not capped like the lists above: it is bounded by the
+    /// number of broken notes, and truncating it would bring the replays back.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unindexable_mtimes: std::collections::BTreeMap<String, String>,
+    /// nw-653: per vault root, every note a failed brain-watcher startup
+    /// reconciliation still owes the graph, as an ABSOLUTE path (the vault
+    /// root itself when the drift could not be computed), with the failure as
+    /// its reason. Keyed by vault because this sidecar is shared by every
+    /// vault in the database: one vault's success must not clear another's
+    /// debt. UNCAPPED and the source of truth: the capped `skipped` list
+    /// mirrors these entries first so they are never the ones truncated, and
+    /// status reports the full count. Only the watcher adds or clears entries.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub reconciliation_pending: std::collections::BTreeMap<String, Vec<SkippedFile>>,
 }
 
 impl Default for SkippedNotesSidecar {
@@ -273,6 +465,8 @@ impl Default for SkippedNotesSidecar {
             notes_near_size_limit: Vec::new(),
             skipped_truncated: false,
             near_limit_truncated: false,
+            unindexable_mtimes: std::collections::BTreeMap::new(),
+            reconciliation_pending: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -332,8 +526,31 @@ fn maybe_near_limit(path: &str, size: u64, limit_bytes: u64) -> Option<NearLimit
 fn build_skipped_notes_sidecar(
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
+    unindexable_mtimes: std::collections::BTreeMap<String, String>,
+    reconciliation_pending: std::collections::BTreeMap<String, Vec<SkippedFile>>,
 ) -> SkippedNotesSidecar {
-    let (skipped, skipped_truncated) = cap_sidecar_list(skipped.to_vec());
+    // nw-653: owed reconciliation entries go FIRST, so the cap never cuts
+    // them; any stale mirror of them in `skipped` is replaced.
+    let owed: HashSet<&str> = reconciliation_pending
+        .values()
+        .flatten()
+        .map(|file| file.path.as_str())
+        .collect();
+    let skipped: Vec<SkippedFile> = reconciliation_pending
+        .values()
+        .flatten()
+        .cloned()
+        .chain(
+            skipped
+                .iter()
+                .filter(|file| {
+                    !file.reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)
+                        && !owed.contains(file.path.as_str())
+                })
+                .cloned(),
+        )
+        .collect();
+    let (skipped, skipped_truncated) = cap_sidecar_list(skipped);
     let (notes_near_size_limit, near_limit_truncated) = cap_sidecar_list(near.to_vec());
     SkippedNotesSidecar {
         version: SKIPPED_NOTES_SIDECAR_VERSION,
@@ -341,14 +558,71 @@ fn build_skipped_notes_sidecar(
         notes_near_size_limit,
         skipped_truncated,
         near_limit_truncated,
+        unindexable_mtimes,
+        reconciliation_pending,
     }
 }
 
+/// Record the ingest failures in `skipped` (vault-relative paths) with their
+/// current mtimes, keyed by absolute path.
+fn record_ingest_failures(
+    map: &mut std::collections::BTreeMap<String, String>,
+    vault_root: &Path,
+    skipped: &[SkippedFile],
+) {
+    for file in skipped
+        .iter()
+        .filter(|file| is_ingest_failure(file.reason_code))
+    {
+        let abs = vault_root.join(&file.path);
+        // nw-651 review: an unreadable-DIRECTORY row is a ReadError too, but
+        // this map is per NOTE (startup drift looks notes up in it); a
+        // directory entry would only outlive the directory's fix.
+        if abs.is_dir() {
+            continue;
+        }
+        if let Some(mtime) = file_mtime_string(&abs) {
+            map.insert(abs.to_string_lossy().into_owned(), mtime);
+        }
+    }
+}
+
+/// nw-651 review: serialises every load-modify-write of the skipped-notes
+/// sidecar in this process. The sidecar is shared by every vault in the
+/// database and every vault watcher starts at once, so unserialised
+/// read-modify-writes dropped each other's `reconciliation_pending` and
+/// `unindexable_mtimes`. ONE lock for every database: contention is a few
+/// small JSON writes. It does NOT serialise another PROCESS: a direct-mode
+/// CLI index racing the daemon can still lose one side's update (never tear
+/// the file — writes are atomic renames); the next write of that vault
+/// re-derives its rows.
+static SKIPPED_NOTES_SIDECAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load, change and persist the sidecar under [`SKIPPED_NOTES_SIDECAR_LOCK`].
+/// `update` returns `None` to leave the file untouched.
+fn update_skipped_notes_sidecar(
+    db_path: &Path,
+    update: impl FnOnce(SkippedNotesSidecar) -> Option<SkippedNotesSidecar>,
+) {
+    let _guard = SKIPPED_NOTES_SIDECAR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sidecar) = update(load_skipped_notes_sidecar(db_path)) {
+        persist_skipped_notes_sidecar(db_path, &sidecar);
+    }
+}
+
+/// Written by temp file + rename, so a concurrent reader never sees a torn
+/// file — which it would parse as EMPTY and could write back.
 fn persist_skipped_notes_sidecar(db_path: &Path, sidecar: &SkippedNotesSidecar) {
     let path = crate::sidecar_path(db_path, SKIPPED_NOTES_SIDECAR_SUFFIX);
-    match serde_json::to_string_pretty(sidecar) {
+    match serde_json::to_vec_pretty(sidecar) {
         Ok(json) => {
-            if let Err(error) = std::fs::write(&path, json) {
+            if let Err(error) =
+                nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+                    std::io::Write::write_all(file, &json)
+                })
+            {
                 tracing::warn!(
                     path = %path.display(),
                     %error,
@@ -362,17 +636,32 @@ fn persist_skipped_notes_sidecar(db_path: &Path, sidecar: &SkippedNotesSidecar) 
 
 fn persist_skipped_notes_replace(
     db_path: Option<&Path>,
+    vault_root: &Path,
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
 ) {
     let Some(db_path) = db_path else {
         return;
     };
-    persist_skipped_notes_sidecar(db_path, &build_skipped_notes_sidecar(skipped, near));
+    // A full index re-derives this vault's failures; other vaults' entries
+    // are not its to drop, and owed watcher reconciliation is the watcher's
+    // to clear.
+    update_skipped_notes_sidecar(db_path, |existing| {
+        let mut unindexable = existing.unindexable_mtimes;
+        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        record_ingest_failures(&mut unindexable, vault_root, skipped);
+        Some(build_skipped_notes_sidecar(
+            skipped,
+            near,
+            unindexable,
+            existing.reconciliation_pending,
+        ))
+    });
 }
 
 fn persist_skipped_notes_merge(
     db_path: Option<&Path>,
+    vault_root: &Path,
     touched_paths: &[String],
     skipped: &[SkippedFile],
     near: &[NearLimitNote],
@@ -380,26 +669,139 @@ fn persist_skipped_notes_merge(
     let Some(db_path) = db_path else {
         return;
     };
-    let mut sidecar = load_skipped_notes_sidecar(db_path);
-    let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
-    sidecar
-        .skipped
-        .retain(|file| !touched.contains(file.path.as_str()));
-    sidecar
-        .notes_near_size_limit
-        .retain(|note| !touched.contains(note.path.as_str()));
-    sidecar.skipped.extend(skipped.iter().cloned());
-    sidecar.notes_near_size_limit.extend(near.iter().cloned());
-    sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-    sidecar.skipped.dedup_by(|a, b| a.path == b.path);
-    sidecar
-        .notes_near_size_limit
-        .sort_by(|a, b| a.path.cmp(&b.path));
-    sidecar
-        .notes_near_size_limit
-        .dedup_by(|a, b| a.path == b.path);
-    let rebuilt = build_skipped_notes_sidecar(&sidecar.skipped, &sidecar.notes_near_size_limit);
-    persist_skipped_notes_sidecar(db_path, &rebuilt);
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        for path in touched_paths {
+            sidecar
+                .unindexable_mtimes
+                .remove(&*vault_root.join(path).to_string_lossy());
+        }
+        // nw-651 review: entries an older build recorded for directories.
+        sidecar.unindexable_mtimes.retain(|path, _| {
+            !(Path::new(path).starts_with(vault_root) && Path::new(path).is_dir())
+        });
+        record_ingest_failures(&mut sidecar.unindexable_mtimes, vault_root, skipped);
+        let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
+        // nw-651 review: this route WALKS the whole vault too, and every row the
+        // walk produces (an unreadable or pruned directory, an ignore file it
+        // could not apply) is in `skipped` again when it still holds. Keeping the
+        // old ones kept a directory "unreadable" in `brain status` after its
+        // permissions were fixed, until the next full index.
+        sidecar
+            .skipped
+            .retain(|file| !touched.contains(file.path.as_str()) && !is_walk_row(vault_root, file));
+        sidecar
+            .notes_near_size_limit
+            .retain(|note| !touched.contains(note.path.as_str()));
+        sidecar.skipped.extend(skipped.iter().cloned());
+        sidecar.notes_near_size_limit.extend(near.iter().cloned());
+        sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar.skipped.dedup_by(|a, b| a.path == b.path);
+        sidecar
+            .notes_near_size_limit
+            .sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar
+            .notes_near_size_limit
+            .dedup_by(|a, b| a.path == b.path);
+        let rebuilt = build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        );
+        Some(rebuilt)
+    });
+}
+
+/// Whether a sidecar row came from the vault WALK rather than from reading a
+/// note: `.` (an unplaced walk error), a path that is a directory in this
+/// vault, or an ignore-file row. Judged against THIS vault's disk, because
+/// `skipped` holds vault-relative paths for every vault in the database: a
+/// directory row of another vault survives unless this vault has a directory
+/// at the same path. (A directory that has since been DELETED is not
+/// recognised and keeps its row until the next full index.)
+fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
+    file.path == "."
+        || file
+            .reason
+            .starts_with(crate::index::IGNORE_FILE_ROW_PREFIX)
+        || vault_root.join(&file.path).is_dir()
+}
+
+/// nw-653: reason prefix of the entries that disclose a watcher startup
+/// reconciliation still owed (see
+/// [`SkippedNotesSidecar::reconciliation_pending`]).
+pub const WATCH_RECONCILIATION_PENDING_REASON: &str =
+    "not yet reconciled into the graph: brain watcher startup reconciliation failed";
+
+/// nw-653: set `vault_root`'s startup reconciliation debt to `paths`
+/// (absolute; the vault root itself for an uncomputable drift) when `error` is
+/// `Some`, or clear it when `None`. Every attempt describes the vault's whole
+/// debt, so it REPLACES the vault's previous entries; other vaults' entries
+/// are never touched.
+pub(crate) fn record_watch_reconciliation_debt(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    paths: &[PathBuf],
+    error: Option<&str>,
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let key = vault_root.to_string_lossy().into_owned();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        match error {
+            Some(error) if !paths.is_empty() => {
+                let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}; retrying ({error})");
+                let mut owed: Vec<SkippedFile> = paths
+                    .iter()
+                    .map(|path| {
+                        SkippedFile::new(
+                            path.to_string_lossy().into_owned(),
+                            SkipReasonCode::Other,
+                            reason.clone(),
+                        )
+                    })
+                    .collect();
+                owed.sort_by(|a, b| a.path.cmp(&b.path));
+                sidecar.reconciliation_pending.insert(key, owed);
+            }
+            _ => {
+                sidecar.reconciliation_pending.remove(&key)?;
+            }
+        }
+        let rebuilt = build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        );
+        Some(rebuilt)
+    });
+}
+
+/// nw-653 review: forget a REMOVED vault's entries in the shared sidecar —
+/// its owed startup reconciliation and its unindexable-note mtimes (both
+/// keyed by absolute path, so they are unambiguously this vault's). Without
+/// this, `brain status` reported debt for a vault that no longer exists,
+/// forever: only that vault's watcher clears it. Other vaults' entries are
+/// untouched. Called by the daemon's `remove_vault` and `prune_stale`.
+pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
+    update_skipped_notes_sidecar(db_path, |sidecar| {
+        let mut pending = sidecar.reconciliation_pending;
+        let mut unindexable = sidecar.unindexable_mtimes;
+        let (pending_before, unindexable_before) = (pending.len(), unindexable.len());
+        pending.retain(|root, _| Path::new(root) != vault_root);
+        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        if pending.len() == pending_before && unindexable.len() == unindexable_before {
+            return None;
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            unindexable,
+            pending,
+        ))
+    });
 }
 
 /// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty
@@ -412,13 +814,32 @@ pub fn load_skipped_notes_sidecar(db_path: &Path) -> SkippedNotesSidecar {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
+/// How many owed notes `brain status` lists with their reason.
+pub const RECONCILIATION_PENDING_STATUS_NOTES: usize = 10;
+
 /// Shape consumed by `brain_status` / `brain_status_json`. Never walks the vault.
 pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, serde_json::Value) {
     let sidecar = db_path.map(load_skipped_notes_sidecar).unwrap_or_default();
+    // nw-653: `paths` carries no reasons, so an owed reconciliation would read
+    // like a brainignored note. The uncapped count and the first few owed
+    // notes WITH their reason are reported separately.
+    let pending_notes: Vec<serde_json::Value> = sidecar
+        .reconciliation_pending
+        .values()
+        .flatten()
+        .take(RECONCILIATION_PENDING_STATUS_NOTES)
+        .map(|file| serde_json::json!({ "path": file.path, "reason": file.reason }))
+        .collect();
     let skipped = serde_json::json!({
         "count": sidecar.skipped.len(),
         "paths": sidecar.skipped.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
         "truncated": sidecar.skipped_truncated,
+        "reconciliation_pending": sidecar
+            .reconciliation_pending
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        "reconciliation_pending_notes": pending_notes,
     });
     let near = serde_json::json!({
         "count": sidecar.notes_near_size_limit.len(),
@@ -882,6 +1303,15 @@ pub struct MarkdownSinceResult {
     /// actually CHANGED — a fifth population, and the narrowest of them. It is
     /// not comparable with a full index's `resolved_link_edges`.
     pub changed_note_link_edges: usize,
+    /// Notes OBSERVED gone from disk and removed. `notes_deleted` also counts
+    /// every rewritten note (a rewrite is a delete plus an insert); nw-651's
+    /// full-index handoff needs the removals alone to report `notes_deleted`
+    /// with a full index's meaning.
+    pub notes_removed: usize,
+    /// nw-345's unresolved populations, over the notes this pass rebuilt.
+    pub unresolved_link_occurrences: usize,
+    pub unresolved_link_section_targets: usize,
+    pub unresolved_link_targets: usize,
     pub publication: crate::manifest::GraphMutationPublicationOutcome,
     pub skipped: Vec<SkippedFile>,
     pub notes_near_size_limit: Vec<NearLimitNote>,
@@ -1124,6 +1554,61 @@ pub(crate) fn refresh_watched_paths(
     Ok(())
 }
 
+/// Drain a vault reader's prune recorder into skip rows, for every vault route
+/// (the full index and the `--since` refresh) — ONE drain, so the two cannot
+/// disagree about the same vault (nw-436/nw-651).
+///
+/// CALL ONLY IMMEDIATELY AFTER `list_files`: the recorder is cleared at the top
+/// of every walk.
+///
+/// nw-651: `.brainignore` is applied per NOTE after the walk, not by the
+/// walker, so a brainignored directory is still descended and — when it is
+/// unreadable — still records an `UNREADABLE_DIR_REASON` row. Nothing beneath
+/// it would have been indexed, so that row is dropped here: ignore rules win,
+/// exactly as `.gitignore` wins by never letting the walker descend.
+fn disclose_vault_prunes(reader: &dyn ContentReader, ignore_set: &GlobSet) -> Vec<SkippedFile> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|pruned| {
+            pruned.reason != crate::content_reader::UNREADABLE_DIR_REASON
+                || !brainignore_covers_dir(&pruned.path, ignore_set)
+        })
+        .filter_map(|pruned| {
+            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
+        })
+        .collect()
+}
+
+/// Whether `.brainignore` excludes every note a directory could hold, judged
+/// by the directory itself or a note nested two levels inside it (globset's
+/// `*` crosses `/`, so `dir/**`, `dir/*` and `**/dir/**` all match the probe).
+/// A pattern that excludes only SOME of its notes does not cover it: the row
+/// stays, erring toward disclosure. The probe is a `.md` path on purpose: a
+/// vault indexes only Markdown, so a pattern like `locked/*.md` covers
+/// everything the directory could contribute.
+fn brainignore_covers_dir(dir: &str, ignore_set: &GlobSet) -> bool {
+    dir != "."
+        && (crate::brainignore::is_ignored(dir, ignore_set)
+            || crate::brainignore::is_ignored(
+                &format!("{dir}/nestweaver-probe/nestweaver-probe.md"),
+                ignore_set,
+            ))
+}
+
+/// Directories the last walk of `reader` could not read (vault-relative), for
+/// the refresh's deletion guard. `.` stands for "somewhere unknown" and covers
+/// everything. Same recorder, same "call right after `list_files`" rule as
+/// [`disclose_vault_prunes`].
+fn unreadable_dirs(reader: &dyn ContentReader) -> Vec<PathBuf> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect()
+}
+
 fn index_markdown_since_with_reader(
     store: &GraphStore,
     reader: &dyn ContentReader,
@@ -1200,35 +1685,35 @@ fn index_markdown_since_with_reader_mode(
     let mut candidates = Vec::new();
     let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
     let mut eligible_note_uids = HashSet::new();
-    let mut skipped: Vec<SkippedFile> = Vec::new();
+    // nw-651: the same drain the full index runs, so an unreadable (or
+    // pruned) directory is disclosed on this route too.
+    let mut skipped: Vec<SkippedFile> = disclose_vault_prunes(reader, ignore_set);
+    let unreadable = unreadable_dirs(reader);
     let mut notes_near_size_limit: Vec<NearLimitNote> = Vec::new();
     let mut touched_paths: Vec<String> = Vec::new();
 
     for rel_path in all_files {
-        if !is_markdown(&rel_path) {
-            continue;
-        }
-        // Skip vault-specific directories.
-        if path_has_vault_skip_dir(&rel_path, &|probe| reader.has_file(probe)) {
-            continue;
-        }
-        // Apply .brainignore patterns.
-        let rel_str = rel_path.to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_str);
+        if !is_eligible_vault_note(&rel_path, reader, ignore_set) {
             continue;
         }
 
         files_checked += 1;
-        let rel_path_str = rel_str.into_owned();
+        let rel_path_str = rel_path.to_string_lossy().into_owned();
         let n_uid = note_uid(&v_uid, &rel_path_str);
         eligible_note_uids.insert(n_uid.clone());
+        // nw-653: a note the graph has never held is changed by definition,
+        // whatever its mtime. `since` answers "what changed after the graph
+        // last saw this file"; for a file it never saw (its create event was
+        // lost while no watcher was processing) an mtime cutoff skipped it on
+        // every later refresh, forever.
+        let never_indexed = !existing_note_uids.contains(&n_uid);
 
         // Parse changed files now. Unchanged sources are read later only when
         // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta_nanos(&rel_path) {
             Ok(Some((mtime_nanos, file_size))) => {
-                if mtime_nanos >= since_nanos {
+                let changed = mtime_nanos >= since_nanos || never_indexed;
+                if changed {
                     touched_paths.push(rel_path_str.clone());
                     if let Some(near) = maybe_near_limit(&rel_path_str, file_size, note_limit_bytes)
                     {
@@ -1247,7 +1732,7 @@ fn index_markdown_since_with_reader_mode(
                     tracing::warn!("skipping oversized file: {}", rel_path_str);
                     continue;
                 }
-                mtime_nanos >= since_nanos
+                changed
             }
             Ok(None) => true, // bare repo: no mtime, process unconditionally
             Err(error) => {
@@ -1274,6 +1759,9 @@ fn index_markdown_since_with_reader_mode(
                     ));
                 }
                 tracing::warn!("read error {}: {err}", rel_path_str);
+                // nw-653: disclose like the full index does, so the failure
+                // is visible and remembered rather than retried blind.
+                skipped.push(note_read_failure_skip(rel_path_str, &err, note_limit_bytes));
                 continue;
             }
         };
@@ -1287,6 +1775,11 @@ fn index_markdown_since_with_reader_mode(
                     ));
                 }
                 tracing::warn!("parse error {rel_path_str}: {err}");
+                skipped.push(SkippedFile::new(
+                    rel_path_str,
+                    SkipReasonCode::ParseError,
+                    err.to_string(),
+                ));
                 continue;
             }
         };
@@ -1317,9 +1810,24 @@ fn index_markdown_since_with_reader_mode(
         );
     }
 
+    // nw-651: a note under a directory this walk could not read was not
+    // OBSERVED gone, so it is kept (nw-287: a deletion must be observed, never
+    // inferred from silence) — the disclosed row says why it was not
+    // refreshed. nw-653's startup drift keeps it for the same reason.
+    let unread_note_uids: HashSet<String> = existing_notes
+        .iter()
+        .filter(|note| !eligible_note_uids.contains(&note.uid))
+        .filter(|note| {
+            unreadable
+                .iter()
+                .any(|dir| dir.as_os_str() == "." || Path::new(&note.file_path).starts_with(dir))
+        })
+        .map(|note| note.uid.clone())
+        .collect();
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
         .filter(|note| !eligible_note_uids.contains(&note.uid))
+        .filter(|note| !unread_note_uids.contains(&note.uid))
         .map(|note| note.uid.clone())
         .collect();
     let changed_uids: std::collections::HashSet<String> = candidates
@@ -1344,6 +1852,7 @@ fn index_markdown_since_with_reader_mode(
     let notes_deleted = delete_note_uids.len();
     persist_skipped_notes_merge(
         store.db_path(),
+        vault_root,
         &touched_paths,
         &skipped,
         &notes_near_size_limit,
@@ -1370,6 +1879,10 @@ fn index_markdown_since_with_reader_mode(
             sections_count: 0,
             tags_count: 0,
             changed_note_link_edges: 0,
+            notes_removed: 0,
+            unresolved_link_occurrences: 0,
+            unresolved_link_section_targets: 0,
+            unresolved_link_targets: 0,
             publication: crate::manifest::finalize_committed_graph_mutation(store, false),
             skipped,
             notes_near_size_limit,
@@ -1483,9 +1996,15 @@ fn index_markdown_since_with_reader_mode(
         }
     }
     affected_sources.retain(|uid| !removed_uids.contains(uid));
+    // nw-651: a kept note under an unreadable directory cannot be re-parsed,
+    // so it keeps its stored body and is not rebuilt here. Its outgoing links
+    // into rewritten notes may be dropped — which is exactly why the row is a
+    // coverage GAP and derivation is withheld (not Current) until it is
+    // readable again. Aborting the whole refresh instead would stall every
+    // other note in the vault behind one unreadable directory.
     for source_uid in affected_sources
         .iter()
-        .filter(|uid| !changed_uids.contains(*uid))
+        .filter(|uid| !changed_uids.contains(*uid) && !unread_note_uids.contains(*uid))
     {
         let Some((rel_path, abs_path)) = indexed_paths.get(source_uid) else {
             return Err(anyhow::anyhow!(
@@ -1701,6 +2220,18 @@ fn index_markdown_since_with_reader_mode(
             }
         }
     }
+    let notes_removed = removed_uids.len();
+    let unresolved_link_occurrences = unresolved.len();
+    let unresolved_link_section_targets = unresolved
+        .iter()
+        .map(|record| record.0.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let unresolved_link_targets = unresolved
+        .iter()
+        .map(|record| (record.1.as_str(), record.4.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
     let plan = VaultRefreshPlan {
         vault: Vault {
             uid: v_uid.clone(),
@@ -1753,6 +2284,10 @@ fn index_markdown_since_with_reader_mode(
         sections_count: total_sections,
         tags_count: total_tags,
         changed_note_link_edges: changed_wikilinks,
+        notes_removed,
+        unresolved_link_occurrences,
+        unresolved_link_section_targets,
+        unresolved_link_targets,
         publication,
         skipped,
         notes_near_size_limit,
@@ -2399,33 +2934,75 @@ where
     // two commands cannot disagree about the same vault. MUST STAY
     // IMMEDIATELY AFTER `list_files`, for the same reason `index.rs`'s drain
     // does: the recorder is cleared at the top of every `list_files` call.
-    for pruned in reader.skipped_dirs() {
-        if let Some(sf) =
-            crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
-        {
-            skipped.push(sf);
-        }
+    skipped.extend(disclose_vault_prunes(reader, ignore_set));
+
+    // nw-651: RETAIN WHAT COULD NOT BE READ. The write below is a TOTAL
+    // replacement (`bulk_vault_reindex_write`), so a note under a directory
+    // this walk could not read never reaches the new set and would be
+    // cascade-deleted — inferred, not observed, which nw-287's empty-scan
+    // guard does not cover. For an already-indexed vault, hand the run to the
+    // `--since` route at the epoch instead: it re-parses every readable note,
+    // deletes only removals it observed, keeps the unreadable directory's
+    // notes, and discloses the same row. A first index has nothing to retain,
+    // and the server-mode repo path (`record_repo_sha`) reads a bare clone.
+    if record_repo_sha.is_none()
+        && !unreadable_dirs(reader).is_empty()
+        && store.lookup_vault(&v_uid).is_ok()
+    {
+        scan_pb.finish_and_clear();
+        let _write_guard = acquire_write_guard()?;
+        let since = index_markdown_since_with_reader_mode(
+            store,
+            reader,
+            instance_id,
+            vault_name,
+            std::time::SystemTime::UNIX_EPOCH,
+            ignore_set,
+            None,
+        )?;
+        // Full-index semantics for the sidecar: this run's skips replace the
+        // vault's previous ones rather than merging with them.
+        persist_skipped_notes_replace(
+            store.db_path(),
+            vault_root,
+            &since.skipped,
+            &since.notes_near_size_limit,
+        );
+        return Ok(MarkdownRefreshResult {
+            index: MarkdownIndexResult {
+                vault_uid: v_uid,
+                vault_name: vault_name.to_string(),
+                notes_count: since.notes_updated,
+                headings_count: since.headings_count,
+                sections_count: since.sections_count,
+                tags_count: since.tags_count,
+                resolved_link_edges: since.changed_note_link_edges,
+                unresolved_link_occurrences: since.unresolved_link_occurrences,
+                unresolved_link_section_targets: since.unresolved_link_section_targets,
+                unresolved_link_targets: since.unresolved_link_targets,
+                skipped: since.skipped,
+            },
+            notes_deleted: since.notes_removed,
+            publication: since.publication,
+            notes_near_size_limit: since.notes_near_size_limit,
+        });
     }
 
     for rel_path in all_files {
-        if !is_markdown(&rel_path) {
-            continue;
-        }
-        // Skip vault-specific directories (e.g. .obsidian, .trash).
-        if path_has_vault_skip_dir(&rel_path, &|probe| reader.has_file(probe)) {
-            continue;
-        }
-
-        // Apply .brainignore patterns.
+        // nw-653: the shared eligibility rule (vault skip dirs such as
+        // .obsidian/.trash, then .brainignore).
         let rel_str = rel_path.to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_str);
-            skipped.push(SkippedFile::new(
-                rel_str.into_owned(),
-                SkipReasonCode::Ignored,
-                "matched .brainignore pattern",
-            ));
-            continue;
+        match vault_note_eligibility(&rel_path, reader, ignore_set) {
+            VaultNoteEligibility::NotANote => continue,
+            VaultNoteEligibility::Ignored => {
+                skipped.push(SkippedFile::new(
+                    rel_str.into_owned(),
+                    SkipReasonCode::Ignored,
+                    "matched .brainignore pattern",
+                ));
+                continue;
+            }
+            VaultNoteEligibility::Eligible => {}
         }
 
         // Size guard.
@@ -2497,26 +3074,11 @@ where
             Ok(s) => s,
             Err(err) => {
                 parse_pb.inc(1);
-                if let Some(oversized) = err.downcast_ref::<crate::content_reader::SourceTooLarge>()
-                {
-                    return NoteOutcome::Skipped(oversized_skip(
-                        rel_path,
-                        oversized.observed_bytes,
-                        note_limit_bytes,
-                    ));
-                }
-                // nw-355, as on the code index path: a NUL byte in the
-                // leading 8 KiB is a policy skip, not a read failure.
-                if err
-                    .downcast_ref::<crate::content_reader::BinarySource>()
-                    .is_some()
-                {
-                    return NoteOutcome::Skipped(SkippedFile::binary(rel_path));
-                }
-                return NoteOutcome::Skipped(SkippedFile::new(
+                // nw-355/nw-469: oversize and binary are policy skips.
+                return NoteOutcome::Skipped(note_read_failure_skip(
                     rel_path,
-                    SkipReasonCode::ReadError,
-                    format!("read error: {err}"),
+                    &err,
+                    note_limit_bytes,
                 ));
             }
         };
@@ -3089,7 +3651,12 @@ where
         elapsed.as_secs_f64(),
     );
 
-    persist_skipped_notes_replace(store.db_path(), &skipped, &notes_near_size_limit);
+    persist_skipped_notes_replace(
+        store.db_path(),
+        vault_root,
+        &skipped,
+        &notes_near_size_limit,
+    );
 
     Ok(MarkdownRefreshResult {
         index: MarkdownIndexResult {
@@ -4598,6 +5165,264 @@ mod tests {
             store.list_notes(None).unwrap().len(),
             2,
             "an unreadable vault directory must never delete indexed notes"
+        );
+    }
+
+    /// Restores a directory's mode on drop, so a failing assertion cannot
+    /// leave an unreadable directory behind for `TempDir` to trip over.
+    #[cfg(unix)]
+    struct RestoreMode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> RestoreMode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        RestoreMode(dir.to_path_buf())
+    }
+
+    /// nw-651: a vault subdirectory the walk cannot read is a `ReadError`
+    /// row naming it — a coverage GAP, so derivation cannot be stamped
+    /// Current — while the readable notes are still indexed. Before the fix
+    /// the walk only logged it and the vault read as complete.
+    #[cfg(unix)]
+    #[test]
+    fn full_vault_index_discloses_an_unreadable_subdirectory_as_a_gap() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        let _restore = lock_dir(&root.join("locked"));
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 1, "the readable note is indexed");
+        let row = result
+            .index
+            .skipped
+            .iter()
+            .find(|s| s.path == "locked")
+            .unwrap_or_else(|| panic!("no row for locked/: {:?}", result.index.skipped));
+        assert_eq!(row.reason_code, SkipReasonCode::ReadError);
+        assert!(crate::markdown_derivation::is_coverage_gap(row));
+        assert!(
+            row.reason.contains(".brainignore") && !row.reason.contains("[[repos]]"),
+            "a vault must be offered the vault remedy: {}",
+            row.reason
+        );
+    }
+
+    /// nw-651 COUNTERWEIGHT: `.brainignore` wins. It is applied per note after
+    /// the walk, so the walker still trips over a brainignored unreadable
+    /// directory — but nothing in it would have been indexed, so it is not a
+    /// gap and must not keep the vault from reading complete.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_brainignored_subdirectory_is_not_disclosed() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n"),
+            (".brainignore", "locked/**\n"),
+            ("locked/b.md", "# B\n"),
+        ]);
+        let _restore = lock_dir(&root.join("locked"));
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 1);
+        assert!(
+            result.index.skipped.is_empty(),
+            "a brainignored unreadable dir is not a coverage gap: {:?}",
+            result.index.skipped
+        );
+    }
+
+    /// nw-651 RETENTION on the FULL vault index: `bulk_vault_reindex_write`
+    /// replaces the whole vault, so a note under a directory that became
+    /// unreadable never reached the new set and was cascade-deleted — nw-287's
+    /// guard only covers an EMPTY scan. It must be kept while disclosed.
+    #[cfg(unix)]
+    #[test]
+    fn full_vault_reindex_keeps_notes_under_an_unreadable_subdirectory() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\nsee [[a]]\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let full = |store: &GraphStore| {
+            index_markdown_directory_with_store_and_deletion_count(
+                store,
+                &root,
+                &root.join("unused.lbug"),
+                "default",
+                "v",
+                &[],
+            )
+            .unwrap()
+        };
+        full(&store);
+        assert_eq!(store.list_notes(None).unwrap().len(), 2, "precondition");
+
+        let _restore = lock_dir(&root.join("locked"));
+        let result = full(&store);
+        assert!(
+            result
+                .index
+                .skipped
+                .iter()
+                .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+            "the loss must be disclosed: {:?}",
+            result.index.skipped
+        );
+        let kept: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/b.md") && kept.iter().any(|p| p == "a.md"),
+            "an unread note is not a deleted one: {kept:?}"
+        );
+        assert_eq!(result.notes_deleted, 0, "nothing was observed deleted");
+    }
+
+    /// nw-651 on the `--since` route (RefreshVaultSince / the watcher's
+    /// refresh): the row is disclosed there too, and — because a deletion
+    /// must be OBSERVED, never inferred from silence (nw-287) — notes already
+    /// indexed under the now-unreadable directory are kept, matching nw-653's
+    /// startup drift, instead of being deleted as "no longer on disk".
+    #[cfg(unix)]
+    #[test]
+    fn since_refresh_discloses_an_unreadable_subdirectory_and_keeps_its_notes() {
+        if running_as_root() {
+            return;
+        }
+        // `b` LINKS to `a`: rewriting `a` puts `b` in the affected-source
+        // closure, whose source cannot be read — that must not abort the run.
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\nsee [[a]]\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.list_notes(None).unwrap().len(), 2, "precondition");
+
+        let _restore = lock_dir(&root.join("locked"));
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+            "the since route must disclose it: {:?}",
+            result.skipped
+        );
+        // `notes_deleted` also counts rewritten notes, so assert the graph.
+        let kept: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            kept.iter().any(|path| path == "locked/b.md"),
+            "an unread note is not a deleted one: {kept:?}"
+        );
+    }
+
+    /// nw-651 review: the `--since` / watcher route MERGES its skip rows into
+    /// the sidecar, dropping old rows only for touched NOTE paths — so a
+    /// `locked` directory row outlived the fix of its permissions until the
+    /// next full index, and `brain status` kept reporting it. The walk sees
+    /// the whole vault on every refresh, so a directory row it no longer
+    /// produces is dropped; one it still produces stays exactly once. The
+    /// directory never enters `unindexable_mtimes` (a NOTE map).
+    #[cfg(unix)]
+    #[test]
+    fn since_refresh_clears_the_row_of_a_directory_readable_again() {
+        if running_as_root() {
+            return;
+        }
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("locked/b.md", "# B\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        let since = || {
+            index_markdown_directory_since(
+                &root,
+                &db,
+                "default",
+                "v",
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .unwrap()
+        };
+        let locked_rows = || {
+            load_skipped_notes_sidecar(&db)
+                .skipped
+                .iter()
+                .filter(|row| row.path == "locked")
+                .count()
+        };
+
+        let restore = lock_dir(&root.join("locked"));
+        since();
+        since();
+        assert_eq!(locked_rows(), 1, "still locked: disclosed once");
+        let recorded = load_skipped_notes_sidecar(&db).unindexable_mtimes;
+        assert!(
+            !recorded.keys().any(|path| path.ends_with("locked")),
+            "a directory is not an unindexable note: {recorded:?}"
+        );
+        drop(restore);
+
+        since();
+        let sidecar = load_skipped_notes_sidecar(&db);
+        assert_eq!(locked_rows(), 0, "readable again: {:?}", sidecar.skipped);
+        assert!(
+            !sidecar
+                .unindexable_mtimes
+                .keys()
+                .any(|path| path.ends_with("locked")),
+            "a directory is not an unindexable note: {:?}",
+            sidecar.unindexable_mtimes
         );
     }
 
@@ -6435,6 +7260,53 @@ sub b body
         );
     }
 
+    /// nw-653: a note the graph has NEVER held is not "unchanged" merely
+    /// because its mtime predates `since`. The live repro: notes created while
+    /// the vault watcher was wedged were never ingested, and every later
+    /// cutoff sat past their mtime, so an mtime-only filter skipped them
+    /// forever.
+    #[test]
+    fn since_refresh_ingests_a_never_indexed_note_older_than_since() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\nalpha body\n"),
+            (".brainignore", "ignored.md\n"),
+        ]);
+        let db_path = root.join("brain.lbug");
+        index_markdown_directory(&root, &db_path, "default", "v").unwrap();
+
+        // Created after the full index, but the refresh cutoff has already
+        // advanced past it — exactly the state a lost create event leaves.
+        fs::write(root.join("missed.md"), "# Missed\n\ncreated in the gap\n").unwrap();
+        fs::write(root.join("ignored.md"), "# Ignored\n\nstays out\n").unwrap();
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+
+        let res = index_markdown_directory_since(&root, &db_path, "default", "v", since).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid(
+            "default",
+            &std::fs::canonicalize(&root).unwrap().to_string_lossy(),
+        );
+        let paths: HashSet<String> = store
+            .list_notes(Some(&v_uid))
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            paths.contains("missed.md"),
+            "an eligible on-disk note absent from the graph must be ingested \
+             regardless of mtime: {paths:?}"
+        );
+        // Counterweights: the already-indexed, unchanged note is not
+        // re-parsed (only the missing note counts as updated), and a
+        // brainignored note stays out.
+        assert_eq!(res.notes_updated, 1, "only the missing note is ingested");
+        assert!(
+            !paths.contains("ignored.md"),
+            "brainignore must still apply"
+        );
+    }
+
     #[test]
     fn since_refresh_advances_and_persists_generation_on_in_place_edit() {
         let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
@@ -6905,8 +7777,11 @@ sub b body
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let since = std::time::SystemTime::now();
         fs::write(root.join("note-100.md"), "# Changed leaf\n\nnew body\n").unwrap();
+        // The full index above canonicalized `root`; the reader must name the
+        // same vault. Before nw-653 a non-canonical root here refreshed a
+        // DIFFERENT (empty) vault identity and the mtime cutoff hid it.
         let reader = CountingReader {
-            inner: crate::content_reader::FilesystemReader::new(&root),
+            inner: crate::content_reader::FilesystemReader::new(&fs::canonicalize(&root).unwrap()),
             reads: AtomicUsize::new(0),
         };
         let ignore_set = crate::brainignore::load_brain_ignore(&root, &[]);
@@ -6939,7 +7814,10 @@ sub b body
         );
         assert_eq!(
             store
-                .lookup_vault(&vault_uid("owned", &root.to_string_lossy()))
+                .lookup_vault(&vault_uid(
+                    "owned",
+                    &fs::canonicalize(&root).unwrap().to_string_lossy()
+                ))
                 .unwrap()
                 .name,
             "new"
@@ -7421,5 +8299,165 @@ mod vault_registration_refresh_tests {
         assert_eq!((result.notes_updated, result.notes_deleted), (0, 0));
         let registered = crate::vault_registration::registrations(&db).unwrap();
         assert_eq!(registered.len(), 1, "{registered:?}");
+    }
+}
+
+#[cfg(test)]
+mod watch_reconciliation_disclosure_tests {
+    use super::*;
+
+    /// nw-651 review: every vault watcher starts together and each one
+    /// load-modify-writes this shared sidecar. Unserialised, one watcher's
+    /// write replaced another's, and a reader catching a half-written file
+    /// parsed it as empty and wrote that back — dropping every vault's owed
+    /// reconciliation. Concurrent writers must all land.
+    #[test]
+    fn concurrent_debt_records_for_different_vaults_all_land() {
+        const VAULTS: usize = 16;
+        for round in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("brain.lbug");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(VAULTS));
+            let handles: Vec<_> = (0..VAULTS)
+                .map(|i| {
+                    let (db_path, barrier) = (db_path.clone(), barrier.clone());
+                    let root = dir.path().join(format!("vault-{i}"));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        record_watch_reconciliation_debt(
+                            Some(&db_path),
+                            &root,
+                            &[root.join("n.md")],
+                            Some("injected"),
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            let owed = load_skipped_notes_sidecar(&db_path).reconciliation_pending;
+            assert_eq!(owed.len(), VAULTS, "round {round}: {:?}", owed.keys());
+        }
+    }
+
+    /// nw-653 review: the sidecar is shared by every vault in the database,
+    /// so one vault's successful reconciliation must not clear another's
+    /// debt, even for the same relative path or the whole-vault "." entry.
+    #[test]
+    fn one_vaults_reconciliation_leaves_another_vaults_debt_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        for root in [&first, &second] {
+            record_watch_reconciliation_debt(
+                Some(&db_path),
+                root,
+                &[root.join("same.md")],
+                Some("injected"),
+            );
+        }
+        // An uncomputable drift for the second vault (disclosed for the root).
+        record_watch_reconciliation_debt(
+            Some(&db_path),
+            &second,
+            std::slice::from_ref(&second),
+            Some("injected"),
+        );
+        record_watch_reconciliation_debt(Some(&db_path), &first, &[], None);
+
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(1),
+            "{skipped}"
+        );
+        let owed = skipped["reconciliation_pending_notes"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            Path::new(&owed).starts_with(&second),
+            "the second vault's debt must survive: {skipped}"
+        );
+    }
+
+    /// nw-653 review: the skipped list is capped at 50 and was sorted by
+    /// path, so an owed reconciliation could be cut by brainignored entries
+    /// that sort ahead of it (the live brain already has 33), and status
+    /// showed bare paths, so an owed note read like an ignored one.
+    #[test]
+    fn owed_reconciliation_survives_the_skipped_list_cap_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let vault_root = dir.path().join("vault");
+        let ignored: Vec<SkippedFile> = (0..60)
+            .map(|index| {
+                SkippedFile::new(
+                    format!("a-ignored-{index:02}.md"),
+                    SkipReasonCode::Ignored,
+                    "matched .brainignore pattern",
+                )
+            })
+            .collect();
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        record_watch_reconciliation_debt(
+            Some(&db_path),
+            &vault_root,
+            &[vault_root.join("z-owed.md")],
+            Some("injected"),
+        );
+
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(1),
+            "{skipped}"
+        );
+        assert_eq!(
+            skipped["paths"][0],
+            serde_json::json!(vault_root.join("z-owed.md").to_string_lossy()),
+            "{skipped}"
+        );
+        let owed = &skipped["reconciliation_pending_notes"][0];
+        assert_eq!(
+            owed["path"],
+            serde_json::json!(vault_root.join("z-owed.md").to_string_lossy()),
+            "{skipped}"
+        );
+        assert!(
+            owed["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)),
+            "{skipped}"
+        );
+
+        // A later full index (replace) must not silently drop the debt the
+        // watcher still owes; clearing it is the watcher's success path.
+        persist_skipped_notes_replace(Some(&db_path), &vault_root, &ignored, &[]);
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(1),
+            "{skipped}"
+        );
+
+        record_watch_reconciliation_debt(
+            Some(&db_path),
+            &vault_root,
+            &[vault_root.join("z-owed.md")],
+            None,
+        );
+        let (skipped, _) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(
+            skipped["reconciliation_pending"],
+            serde_json::json!(0),
+            "{skipped}"
+        );
+        assert_ne!(
+            skipped["paths"][0],
+            serde_json::json!(vault_root.join("z-owed.md").to_string_lossy()),
+            "{skipped}"
+        );
     }
 }

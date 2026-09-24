@@ -157,6 +157,31 @@ pub fn skipped_notes_from_status_json(
                 .get("truncated")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            reconciliation_pending: skipped
+                .get("reconciliation_pending")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            reconciliation_pending_notes: skipped
+                .get("reconciliation_pending_notes")
+                .and_then(|v| v.as_array())
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .map(|note| PendingReconciliationNote {
+                            path: note
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            reason: note
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
     let near = value
         .get("notes_near_size_limit")
@@ -417,6 +442,7 @@ mod additive_status_contract_tests {
                 count: 1,
                 paths: vec!["big.md".to_string()],
                 truncated: false,
+                ..Default::default()
             }),
             notes_near_size_limit: Some(NotesNearSizeLimit {
                 count: 1,
@@ -437,6 +463,33 @@ mod additive_status_contract_tests {
             .expect("notes_near_size_limit");
         assert_eq!(near.notes[0].path, "near.md");
         assert_eq!(near.notes[0].bytes, 600_000);
+    }
+
+    /// nw-653: the daemon's typed status must carry the uncapped owed
+    /// reconciliation count and the owed notes' reasons, or `brain status`
+    /// through the daemon shows them as bare paths (or not at all, once the
+    /// skipped list is truncated).
+    #[test]
+    fn reconciliation_pending_maps_onto_the_typed_status() {
+        let value = serde_json::json!({
+            "skipped_notes": {
+                "count": 1,
+                "paths": ["owed.md"],
+                "truncated": false,
+                "reconciliation_pending": 3,
+                "reconciliation_pending_notes": [
+                    {"path": "owed.md", "reason": "not yet reconciled"}
+                ]
+            }
+        });
+        let (skipped, _) = skipped_notes_from_status_json(&value);
+        let skipped = skipped.expect("skipped_notes");
+        assert_eq!(skipped.reconciliation_pending, 3);
+        assert_eq!(skipped.reconciliation_pending_notes[0].path, "owed.md");
+        assert_eq!(
+            skipped.reconciliation_pending_notes[0].reason,
+            "not yet reconciled"
+        );
     }
 
     #[test]

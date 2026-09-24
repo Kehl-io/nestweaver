@@ -9,6 +9,7 @@ pub mod entry_points;
 pub mod frameworks;
 pub mod language;
 pub mod markdown;
+pub(crate) mod markup;
 pub mod mermaid;
 pub mod parse;
 pub mod registry;

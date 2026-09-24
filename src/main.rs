@@ -4898,6 +4898,20 @@ fn format_daemon_status_response(
                     lines.push("  (list truncated)".to_string());
                 }
             }
+            // nw-653: owed watcher reconciliation, uncapped and with reasons,
+            // so it neither vanishes behind the truncated list above nor reads
+            // like a brainignored note.
+            if let Some(skipped) = status.skipped_notes.as_ref()
+                && skipped.reconciliation_pending > 0
+            {
+                lines.push(format!(
+                    "Watcher reconciliation pending: {} note(s)",
+                    skipped.reconciliation_pending
+                ));
+                for note in &skipped.reconciliation_pending_notes {
+                    lines.push(format!("  - {}: {}", note.path, note.reason));
+                }
+            }
             if let Some(near) = status.notes_near_size_limit.as_ref()
                 && near.count > 0
             {
@@ -4995,6 +5009,11 @@ mod daemon_status_renderer_tests {
                 count: 1,
                 paths: vec!["big.md".to_string()],
                 truncated: false,
+                reconciliation_pending: 2,
+                reconciliation_pending_notes: vec![nestweaver_proto::PendingReconciliationNote {
+                    path: "owed.md".to_string(),
+                    reason: "not yet reconciled".to_string(),
+                }],
             }),
             notes_near_size_limit: Some(nestweaver_proto::NotesNearSizeLimit {
                 count: 1,
@@ -5014,6 +5033,11 @@ mod daemon_status_renderer_tests {
             "{output}"
         );
         assert!(output.contains("near.md (600000 bytes)"), "{output}");
+        assert!(
+            output.contains("Watcher reconciliation pending: 2 note(s)"),
+            "{output}"
+        );
+        assert!(output.contains("owed.md: not yet reconciled"), "{output}");
     }
 
     /// A3 acceptance: an operator looking at `brain status` during a long
@@ -14173,9 +14197,16 @@ fn main() {
                 eprintln!("{stdout}");
                 process::exit(EXIT_ERROR);
             }
+            // nw-660: a schema violation is the caller's input mistake, so it
+            // exits with the usage code clap-rejected values already use.
+            let code = if error_is_invalid_tool_arguments(&e) {
+                EXIT_USAGE
+            } else {
+                EXIT_ERROR
+            };
             let report = into_diagnostic(e);
             eprintln!("{report:?}");
-            EXIT_ERROR
+            code
         }
     };
 
@@ -25991,6 +26022,28 @@ fn error_is_unresolved_repo_filter(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("repo filter entry ")
 }
 
+/// Whether `error` is a tool-argument schema violation (nw-660).
+///
+/// Typed on the direct route (`ToolArgumentsInvalid` is in the chain). Across
+/// gRPC the type does not survive, so the daemon stamps
+/// [`nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE`] into the status
+/// metadata, the same way nw-443 carries `RepoFilterUnresolved`. Both checks
+/// key on the type or code, never on the message, so a genuine internal
+/// failure that merely quotes an argument cannot be reclassified.
+fn error_is_invalid_tool_arguments(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<nestweaver_mcp::tools::ToolArgumentsInvalid>()
+            || cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                status.code() == tonic::Code::InvalidArgument
+                    && status
+                        .metadata()
+                        .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE)
+            })
+    })
+}
+
 fn report_unresolved_repo_filter(error: &anyhow::Error, json: bool) -> i32 {
     let message = format!("{error:#}");
     let ambiguous = message.to_ascii_lowercase().contains("ambiguous");
@@ -26032,6 +26085,51 @@ mod repo_filter_honesty_tests {
             &anyhow::anyhow!("repo 'missing' not found in graph"),
         ));
         assert!(error_is_unresolved_repo_filter(&error));
+    }
+
+    /// nw-660: the daemon's stamped `invalid_argument` status, wrapped in the
+    /// client's context the way it reaches `main`, is a usage error.
+    #[test]
+    fn a_stamped_schema_violation_status_is_a_usage_error() {
+        let mut status = tonic::Status::invalid_argument(
+            "tool read_symbols failed: invalid arguments for tool 'read_symbols'",
+        );
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            nestweaver_mcp::tools::TOOL_ARGUMENTS_INVALID_CODE
+                .parse()
+                .unwrap(),
+        );
+        let error = anyhow::Error::new(status).context("read_symbols rpc failed");
+        assert!(error_is_invalid_tool_arguments(&error));
+
+        let direct = nestweaver_mcp::tools::validate_tool_arguments(
+            "read_symbols",
+            &serde_json::json!({ "targets": [] }),
+        )
+        .expect_err("an empty targets list violates minItems");
+        assert!(error_is_invalid_tool_arguments(&direct));
+    }
+
+    /// COUNTERWEIGHT: an internal failure, and an `invalid_argument` carrying
+    /// a DIFFERENT code (an unresolved `--repo`, which has its own exit
+    /// codes), are not usage errors -- even when the prose quotes the
+    /// schema message.
+    #[test]
+    fn other_failures_are_not_schema_violations() {
+        let internal = anyhow::Error::new(tonic::Status::internal(
+            "tool read_symbols failed: invalid arguments for tool 'read_symbols'",
+        ));
+        assert!(!error_is_invalid_tool_arguments(&internal));
+
+        let mut repo = tonic::Status::invalid_argument("repo filter entry 'x' not found");
+        repo.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE
+                .parse()
+                .unwrap(),
+        );
+        assert!(!error_is_invalid_tool_arguments(&anyhow::Error::new(repo)));
     }
 
     #[test]
@@ -26988,6 +27086,25 @@ fn run_brain(
                                 .unwrap_or(false)
                             {
                                 println!("    (list truncated)");
+                            }
+                        }
+                        // nw-653: see the typed render above.
+                        let pending = skipped
+                            .get("reconciliation_pending")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if pending > 0 {
+                            println!("  Watcher reconciliation pending: {pending} note(s)");
+                            for note in skipped
+                                .get("reconciliation_pending_notes")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                            {
+                                let field = |key: &str| {
+                                    note.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+                                };
+                                println!("    - {}: {}", field("path"), field("reason"));
                             }
                         }
                     }

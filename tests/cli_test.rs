@@ -4637,6 +4637,77 @@ fn fail_on_skip_rejects_an_unparsable_source_file() {
     assert_eq!(payload["skipped_files"][0]["reason_code"], "parse_error");
 }
 
+/// nw-651: a subdirectory the walk cannot read used to be `tracing::warn!`ed
+/// and nothing else — `index --json` read `coverage_status: "complete"` and
+/// `--fail-on-skip` exited 0 with `locked/`'s source absent. It is now a
+/// `read_error` row naming the directory; the index still completes (the
+/// readable file is indexed, exit 0 without the gate). Counterweight: the same
+/// unreadable directory, gitignored, is never descended and reads complete.
+#[cfg(unix)]
+#[test]
+fn index_json_discloses_an_unreadable_subdirectory_and_fail_on_skip_trips() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("locked")).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_init.status.success(), "{git_init:?}");
+    std::fs::write(repo.join("good.js"), "function good() { return 1; }\n").unwrap();
+    std::fs::write(repo.join("locked/hidden.js"), "function hidden() {}\n").unwrap();
+    std::fs::set_permissions(repo.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = Restore(repo.join("locked"));
+
+    let run = |db: &std::path::Path, fail_on_skip: bool| {
+        let mut command = nestweaver_cmd();
+        command
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(db)
+            .args(["--force", "--json"]);
+        if fail_on_skip {
+            command.arg("--fail-on-skip");
+        }
+        command.output().unwrap()
+    };
+
+    let best_effort = run(&dir.path().join("best-effort.lbug"), false);
+    assert!(best_effort.status.success(), "{best_effort:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&best_effort.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "degraded", "{payload:#}");
+    assert_eq!(payload["files_processed"], 1, "{payload:#}");
+    let rows = payload["skipped_files"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["path"] == "locked" && row["reason_code"] == "read_error"),
+        "{payload:#}"
+    );
+
+    let strict = run(&dir.path().join("strict.lbug"), true);
+    assert!(!strict.status.success(), "{strict:?}");
+
+    std::fs::write(repo.join(".gitignore"), "locked/\n").unwrap();
+    let ignored = run(&dir.path().join("ignored.lbug"), true);
+    assert!(ignored.status.success(), "{ignored:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&ignored.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "complete", "{payload:#}");
+    assert_eq!(payload["skipped_count"], 0, "{payload:#}");
+}
+
 #[test]
 fn invalid_source_limit_fails_before_database_creation() {
     let dir = tempfile::tempdir().unwrap();

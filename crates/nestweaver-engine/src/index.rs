@@ -2201,6 +2201,11 @@ pub(crate) enum SkipDirCaller {
     Vault,
 }
 
+/// How every [`crate::content_reader::IGNORE_FILE_ERROR_REASON`] row's
+/// message starts, so a sidecar merge can recognise a walk-level row whose
+/// `path` is a file (nw-651 review).
+pub(crate) const IGNORE_FILE_ROW_PREFIX: &str = "ignore file `";
+
 /// Turn one recorded prune into the `SkippedFile` row the coverage gate reads,
 /// or `None` when that prune is deliberately not disclosed.
 ///
@@ -2241,6 +2246,46 @@ pub(crate) fn disclose_pruned_dir(
         )
     {
         return None; // Reported independently by ExclusionInventory.
+    }
+    if pruned.reason == crate::content_reader::UNREADABLE_DIR_REASON {
+        // nw-651: the one row here that is a FAILURE, not a policy — so it is
+        // coded `ReadError`, which `markdown_derivation::is_coverage_gap`
+        // counts as a gap. Every drain (repo scan, both incremental paths, the
+        // vault indexer) funnels through here, so every route codes it alike.
+        // The ignore remedy differs by caller for the same reason the generic
+        // branch's does: name only a config surface that exists there.
+        let ignore_remedy = match caller {
+            SkipDirCaller::Repo => "`.gitignore` or `[[repos]] exclude`",
+            SkipDirCaller::Vault => "`.brainignore`",
+        };
+        return Some(SkippedFile::new(
+            pruned.path.clone(),
+            SkipReasonCode::ReadError,
+            format!(
+                "directory `{path}` could not be read while enumerating ({detail}), so \
+                 nothing beneath it was indexed on this run; fix its permissions \
+                 (e.g. `chmod -R u+rX {path}`) and re-run the index, or list it in \
+                 {ignore_remedy} if it should never be indexed",
+                path = pruned.path,
+                detail = pruned.detail.as_deref().unwrap_or("read error"),
+            ),
+        ));
+    }
+    if pruned.reason == crate::content_reader::IGNORE_FILE_ERROR_REASON {
+        // nw-651 review: an ignore file the walk could not apply. Everything
+        // was READ, so this is a policy row (`Ignored`, no coverage gap) and
+        // the remedy is the file, not its permissions.
+        return Some(SkippedFile::new(
+            pruned.path.clone(),
+            SkipReasonCode::Ignored,
+            format!(
+                "{IGNORE_FILE_ROW_PREFIX}{path}` could not be applied ({detail}); the rule it \
+                 holds was skipped, so paths it meant to exclude may be indexed — fix \
+                 the pattern (or the file's permissions) and re-run the index",
+                path = pruned.path,
+                detail = pruned.detail.as_deref().unwrap_or("parse error"),
+            ),
+        ));
     }
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
@@ -2334,6 +2379,14 @@ pub(crate) fn disclose_pruned_dir(
         SkipReasonCode::Ignored,
         reason,
     ))
+}
+
+/// Whether `path` (repo-relative) lies under a directory the walk could not
+/// read (nw-651). `.` — an error the walker could not attribute — covers all.
+fn path_under_unreadable_dir(path: &str, unreadable_dirs: &[PathBuf]) -> bool {
+    unreadable_dirs
+        .iter()
+        .any(|dir| dir.as_os_str() == "." || Path::new(path).starts_with(dir))
 }
 
 /// Index a directory into a persistent GraphStore at `db_path`.
@@ -3615,7 +3668,9 @@ where
     // `discovered_files`, is what makes the two consistent.
     //
     // `Ignored` is the reason code because this is a POLICY skip, the same
-    // class as the minified-bundle skip below, not a read or parse defect.
+    // class as the minified-bundle skip below, not a read or parse defect —
+    // with one exception (nw-651): a directory the walk could not READ is a
+    // failure and arrives here coded `ReadError`.
     //
     // FORMER KNOWN ASYMMETRY, CLOSED BY nw-437: the recorder captures
     // `[[repos]] exclude` patterns that prune a whole DIRECTORY, disclosed
@@ -3629,6 +3684,17 @@ where
     // The row itself — reason code, message and the `.git` carve-out — is built
     // by `disclose_pruned_dir`, shared with the incremental drains so the two
     // commands cannot disagree about the same repo.
+    // nw-651: directories this walk could not READ. Their files were not
+    // observed, which is not the same as observed deleted: stored File/Symbol
+    // nodes under them must be RETAINED (while the row below discloses them),
+    // so both the whole-repo replacement and the vanished-file prune consult
+    // this. Captured here because the recorder is cleared on every walk.
+    let unreadable_dirs: Vec<PathBuf> = reader
+        .skipped_dirs()
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
     for pruned in reader.skipped_dirs() {
         if let Some(skipped) = disclose_pruned_dir(pruned, SkipDirCaller::Repo) {
             scan_skipped_files.push(skipped);
@@ -4333,7 +4399,13 @@ where
         //     insert of files, symbols, AND resolved edges — see
         //     `bulk_reindex_write` — so concurrent readers never see symbols
         //     without CALLS while type-env/resolve CPU runs.
-        let force_reindex = existing_repo.is_some() && files_unchanged == 0;
+        //
+        //     nw-651: never the whole-repo replacement while a directory was
+        //     unreadable — it would delete that directory's stored files, which
+        //     this run never saw. The per-file branch below re-inserts every
+        //     parsed file just the same and its prune skips those paths.
+        let force_reindex =
+            existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
         // nw-204: this whole-store re-index path deletes symbols too, and used
         // to discard the fact entirely. Accumulate what it removed so the
         // epilogue can tombstone the embeddings of symbols that do not come
@@ -4359,7 +4431,9 @@ where
             // not present anymore is stale and gets dropped.
             if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
                 for (f_uid, path) in &stored_files {
-                    if !present_files.contains(path) {
+                    if !present_files.contains(path)
+                        && !path_under_unreadable_dir(path, &unreadable_dirs)
+                    {
                         if let Ok(removed) = store.delete_symbols_in_file(&r_uid, path) {
                             reindex_deleted_uids.extend(removed);
                             reindex_deleted_files.push(path.clone());
@@ -8180,6 +8254,221 @@ mod tests {
             changed.skipped_files
         );
         assert_eq!(changed.files_skipped, 0);
+    }
+
+    /// Restores a directory's mode on drop, so a failing assertion cannot
+    /// leave an unreadable directory behind for `TempDir` to trip over.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_dir(dir: &Path) -> RestoreMode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        RestoreMode(dir.to_path_buf())
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// nw-651: a subdirectory the walk cannot read is DISCLOSED as a
+    /// `ReadError` row naming it, on the `--force` scan AND on both incremental
+    /// branches (nw-387 learned the hard way that "every route" means every
+    /// command). Before the fix the walker only `tracing::warn!`ed and the
+    /// index reported `coverage_status: "complete"` with `locked/`'s source
+    /// silently absent. Indexing still COMPLETES: the readable file is indexed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_is_disclosed_as_a_read_error_on_every_route() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("locked")).unwrap();
+        fs::write(repo.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("locked/hidden.py"),
+            "def hidden():\n    return 2\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let _restore = lock_dir(&repo.join("locked"));
+
+        let is_locked_row =
+            |s: &SkippedFile| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError;
+        let db = dir.path().join("graph.lbug");
+        let repo_url = "https://example.test/unreadable-subdir";
+        let first = index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(first.files_count, 1, "the readable file is still indexed");
+        let row = first
+            .skipped_files
+            .iter()
+            .find(|s| is_locked_row(s))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the --force scan must disclose the unreadable dir: {:?}",
+                    first.skipped_files
+                )
+            });
+        assert!(
+            row.reason.contains("permission") && row.reason.contains("re-run"),
+            "the remedy must say fix permissions then re-run: {}",
+            row.reason
+        );
+
+        let second = incremental_index(&repo, &db, "test", repo_url).unwrap();
+        assert!(
+            second.skipped_files.iter().any(is_locked_row),
+            "the up-to-date incremental branch must re-derive it: {:?}",
+            second.skipped_files
+        );
+        assert_eq!(second.files_skipped, second.skipped_files.len());
+
+        fs::write(repo.join("later.py"), "def later():\n    return 3\n").unwrap();
+        git(&["add", "later.py"]);
+        git(&["commit", "-q", "-m", "later"]);
+        let third = incremental_index(&repo, &db, "test", repo_url).unwrap();
+        assert_eq!(third.files_added, 1, "precondition: the new file landed");
+        assert!(
+            third.skipped_files.iter().any(is_locked_row),
+            "the changed-file incremental branch must disclose it too: {:?}",
+            third.skipped_files
+        );
+    }
+
+    /// nw-651 RETENTION: a directory that becomes unreadable was not OBSERVED
+    /// deleted, so its already-indexed File and Symbol nodes must survive
+    /// every full-scan route while the row discloses it. Before the fix
+    /// `index --force` took the whole-repo replacement (`bulk_reindex_write`)
+    /// and a plain full scan's vanished-file prune deleted `locked/hidden.py`
+    /// outright — a silent loss behind a now-honest row.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_keeps_its_indexed_files_on_force_and_plain_scans() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("locked")).unwrap();
+        fs::write(repo.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("locked/hidden.py"),
+            "def hidden():\n    return 2\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        let repo_url = "https://example.test/unreadable-retained";
+        let run = |force: bool| {
+            index_directory_with_options_and_limits(
+                &repo,
+                &db,
+                "test",
+                repo_url,
+                "fixture",
+                force,
+                None,
+                crate::index_limits::IndexLimits::default(),
+            )
+            .unwrap()
+        };
+        let hidden_state = || {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let file = store
+                .list_files_by_repo(&repo_uid("test", repo_url))
+                .unwrap()
+                .into_iter()
+                .any(|(_, path)| path == "locked/hidden.py");
+            let symbols = store.symbols_in_file("locked/hidden.py").unwrap().len();
+            (file, symbols)
+        };
+        run(true);
+        assert_eq!(
+            hidden_state(),
+            (true, 1),
+            "precondition: indexed while readable"
+        );
+
+        let _restore = lock_dir(&repo.join("locked"));
+        for (label, force) in [("--force", true), ("plain full scan", false)] {
+            let result = run(force);
+            assert!(
+                result
+                    .skipped_files
+                    .iter()
+                    .any(|s| s.path == "locked" && s.reason_code == SkipReasonCode::ReadError),
+                "{label}: the loss must be disclosed: {:?}",
+                result.skipped_files
+            );
+            assert_eq!(
+                hidden_state(),
+                (true, 1),
+                "{label}: an unreadable file is not a deleted one"
+            );
+        }
+    }
+
+    /// nw-651 COUNTERWEIGHT: ignore rules win. A gitignored directory is never
+    /// descended, so its being unreadable is not a coverage loss and must not
+    /// degrade coverage — otherwise every repo with an unreadable ignored
+    /// cache (a root-owned `docker-data/`) fails `--fail-on-skip` forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_gitignored_subdirectory_is_not_disclosed() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("cache")).unwrap();
+        fs::write(repo.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        fs::write(repo.join(".gitignore"), "cache/\n").unwrap();
+        fs::write(repo.join("cache/c.py"), "def c():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let _restore = lock_dir(&repo.join("cache"));
+
+        let db = dir.path().join("graph.lbug");
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            "https://example.test/unreadable-ignored",
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.files_count, 1);
+        assert!(
+            result.skipped_files.is_empty(),
+            "an ignored unreadable dir is not a coverage loss: {:?}",
+            result.skipped_files
+        );
     }
 
     #[test]

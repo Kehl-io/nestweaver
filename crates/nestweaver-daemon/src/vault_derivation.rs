@@ -190,13 +190,50 @@ fn stamp_from_refresh(
     Ok(())
 }
 
+/// What IndexVault's derivation stamp did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexStamp {
+    /// Derivation is Current.
+    Current,
+    /// The refresh disclosed a coverage GAP (a failure skip: an unreadable
+    /// directory or note, a parse error), so the record was persisted Blocked
+    /// instead of Current. The graph and its skip rows are committed.
+    WithheldForCoverageGap,
+}
+
+/// Stamp IndexVault's derivation, or withhold it over a coverage gap.
+///
+/// nw-651 (DECISION 2026-09-24): a failure skip is DISCLOSED, not a hard
+/// failure — IndexVault completes with degraded coverage — and derivation must
+/// not read Current while it exists. Refusing by returning an error (the
+/// pre-nw-651 shape) failed the whole RPC AND left whatever record was there
+/// before untouched: a vault stamped Current yesterday stayed Current over
+/// today's unreadable subdirectory. The record is therefore written Blocked
+/// (`PublicationIncomplete`), so `brain status` counts it, gated tools refuse,
+/// and the background loop retries it on the Blocked backoff — its strict walk
+/// fails closed until the directory is readable, then stamps Current.
+///
+/// What the graph holds meanwhile: every route RETAINS already-indexed notes
+/// under an unreadable directory (the full index hands off to the `--since`
+/// route rather than replacing the vault). They are kept but not refreshed,
+/// and their links into rewritten notes may be stale — which is precisely what
+/// "not Current" tells the link-graph tools.
 pub(super) fn stamp_index_success(
     state: &DaemonState,
     vault_path: &Path,
     extra: &[String],
     max_note_bytes: u64,
     result: &MarkdownRefreshResult,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IndexStamp> {
+    if withhold_if_coverage_gap(
+        state,
+        vault_path,
+        extra,
+        max_note_bytes,
+        &result.index.skipped,
+    )? {
+        return Ok(IndexStamp::WithheldForCoverageGap);
+    }
     let vault = lookup_vault(state, vault_path)?;
     stamp_from_refresh(
         state,
@@ -205,7 +242,68 @@ pub(super) fn stamp_index_success(
         max_note_bytes,
         CoverageScope::FullRegisteredPolicy,
         result,
-    )
+    )?;
+    Ok(IndexStamp::Current)
+}
+
+/// Persist the vault's derivation Blocked when `skipped` holds a coverage
+/// GAP; `Ok(true)` when it did. ONE rule for every daemon route that commits
+/// vault content without stamping it: IndexVault (via
+/// [`stamp_index_success`]) and RefreshVaultSince.
+///
+/// nw-651: RefreshVaultSince admits a Current vault through `ensure_current`
+/// and never touched the record afterwards, so a watcher- or RPC-driven
+/// refresh that disclosed an unreadable directory left the vault Current —
+/// contradicting the decision that derivation must not read Current while
+/// such a row exists. A refresh never STAMPS Current, so this only ever
+/// demotes; a clean refresh leaves the record exactly as it was.
+pub(super) fn withhold_if_coverage_gap(
+    state: &DaemonState,
+    vault_path: &Path,
+    extra: &[String],
+    max_note_bytes: u64,
+    skipped: &[nestweaver_parser::SkippedFile],
+) -> anyhow::Result<bool> {
+    if !skipped.iter().any(markdown_derivation::is_coverage_gap) {
+        return Ok(false);
+    }
+    let vault = lookup_vault(state, vault_path)?;
+    withhold_for_coverage_gap(state, &vault, extra, max_note_bytes)?;
+    Ok(true)
+}
+
+fn withhold_for_coverage_gap(
+    state: &DaemonState,
+    vault: &Vault,
+    extra: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<()> {
+    let identity = state
+        .store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
+    let source = filesystem_source(Path::new(&vault.root_path))?;
+    let coverage = coverage_identity(
+        Path::new(&source.canonical_root),
+        extra,
+        max_note_bytes,
+        CoverageScope::FullRegisteredPolicy,
+    )?;
+    let mut records = load_or_empty(state, &identity)?;
+    let mut record = records
+        .vaults
+        .remove(&vault.uid)
+        .unwrap_or_else(|| VaultDerivationRecord::pending(vault, source.clone(), coverage.clone()));
+    record.source = source;
+    record.coverage = coverage;
+    record.derivation_version = markdown_derivation::DERIVATION_VERSION;
+    block_record(
+        &mut record,
+        markdown_derivation::BlockedReason::PublicationIncomplete,
+    );
+    records.vaults.insert(vault.uid.clone(), record);
+    persist(state, &identity, &records)?;
+    Ok(())
 }
 
 fn migrate_vault(

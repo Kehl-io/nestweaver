@@ -32,8 +32,8 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   end_line: 9
   signature: export let count = 0
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: EventListener
   visibility: Public
   type_info: ~
   parent_name: ~
@@ -44,8 +44,8 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   end_line: 14
   signature: "function handleClick() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: EventListener
   visibility: Private
   type_info: ~
   parent_name: ~

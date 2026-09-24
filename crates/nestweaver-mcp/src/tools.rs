@@ -1102,6 +1102,28 @@ fn render_validation_error(tool: &str, error: &jsonschema::ValidationError<'_>) 
     )
 }
 
+/// The machine-readable code the daemon stamps (under
+/// `nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY`) on a status
+/// raised by [`ToolArgumentsInvalid`], so a CLI on the far side of gRPC can
+/// recognise the condition by code rather than by prose.
+pub const TOOL_ARGUMENTS_INVALID_CODE: &str = "tool-arguments-invalid";
+
+/// Arguments that failed a tool's JSON Schema.
+///
+/// nw-660. `validate_tool_arguments` used to return a bare `anyhow!`, so the
+/// daemon could not tell a caller's input mistake from its own failure and
+/// `dispatch_err_to_status` mapped both to `Status::internal`: the CLI exited
+/// 1 with "Internal error" for what is a usage error. The repo patched that
+/// per flag by restating schema bounds in clap parsers (nw-400, nw-217b),
+/// which every new schema constraint reopened. Typing it here fixes it for
+/// every tool in one place. The `Display` is the message the untyped error
+/// carried, so MCP's in-band tool error text is unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ToolArgumentsInvalid {
+    message: String,
+}
+
 pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
     let Some(validator) = tool_validators().get(name) else {
         let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
@@ -1130,10 +1152,10 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::E
     } else {
         let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
         let message = format!("invalid arguments for tool '{name}': {}", errors.join("; "));
-        Err(anyhow!(truncate_utf8_bytes(
-            &message,
-            MAX_VALIDATION_ERROR_BYTES
-        )))
+        Err(ToolArgumentsInvalid {
+            message: truncate_utf8_bytes(&message, MAX_VALIDATION_ERROR_BYTES),
+        }
+        .into())
     }
 }
 

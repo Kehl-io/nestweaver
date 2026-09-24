@@ -528,7 +528,7 @@ Canonical list: the `EXIT_*` constants at the top of `src/main.rs`.
 | 3 | Ambiguous match (multiple symbols with same name) |
 | 4 | Unauthorized (pull) |
 | 5 | Unavailable (pull) |
-| 64 | Usage error — unknown flag, bad value, missing argument (`EX_USAGE` from BSD `sysexits.h`) |
+| 64 | Usage error — unknown flag, bad value, missing argument, or a value a tool's schema rejects (`EX_USAGE` from BSD `sysexits.h`) |
 
 **64, not clap's 2.** Clap's default collided with `EXIT_NEEDS_REINDEX`, so a CI
 gate could not tell `nestweaver stale-chekc` (a typo) from "your graph is

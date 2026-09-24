@@ -4921,23 +4921,134 @@ use crate::config::{Settings, load as load_config};
         );
     }
 
+    /// nw-453, end to end through the real parsers: the item's 8-file
+    /// SvelteKit/Astro/Nuxt route corpus. The blanket `/routes/`/`/pages/`
+    /// rule used to promote every export in these component files (11 of 14
+    /// symbols), so `computeTotal`, `trackPageView` and `summarize` rooted the
+    /// dead-code walk. Now only components and real framework hooks do.
+    #[test]
+    fn component_route_corpus_roots_only_components_and_framework_hooks() {
+        let corpus: [(&str, &str); 8] = [
+            (
+                "src/routes/cart/+page.svelte",
+                "<script>\nexport function computeTotal(items) {\n  return items.length;\n}\nexport function unusedHelper() {\n  return 1;\n}\nfunction handleSubmit() {\n  return 0;\n}\n</script>\n<form on:submit|preventDefault={handleSubmit}>\n  <p>{computeTotal([])}</p>\n</form>\n",
+            ),
+            (
+                "src/routes/+layout.svelte",
+                "<script>\nexport const trackPageView = (path) => path;\n</script>\n<slot />\n",
+            ),
+            (
+                "src/routes/blog/+page.svelte",
+                "<script context=\"module\">\nexport function load() {\n  return {};\n}\nexport const prerender = true;\n</script>\n<h1>Blog</h1>\n",
+            ),
+            (
+                "src/pages/blog/[slug].astro",
+                "---\nexport function getStaticPaths() {\n  return [];\n}\nexport function summarize(text) {\n  return text;\n}\nfunction formatDate(d) {\n  return d;\n}\nconst d = 1;\n---\n<h1>Post</h1>\n<time>{formatDate(d)}</time>\n<p>summarize</p>\n",
+            ),
+            (
+                "src/pages/about.astro",
+                "---\nexport const prerender = true;\n---\n<h1>About</h1>\n",
+            ),
+            (
+                "src/pages/index.vue",
+                "<template><h1 @click=\"onSelect\">Home</h1></template>\n<script>\nexport const trackPageView = (path) => path;\nfunction onSelect() {\n  return 0;\n}\nexport default {}\n</script>\n",
+            ),
+            (
+                "src/lib/Counter.svelte",
+                "<script>\nlet count = 0;\n</script>\n<button>{count}</button>\n",
+            ),
+            (
+                "src/routes/cart/+page.ts",
+                "export function cartHelper(items) {\n  return items;\n}\n",
+            ),
+        ];
+
+        let mut entry: Vec<String> = Vec::new();
+        let mut non_entry: Vec<String> = Vec::new();
+        for (path, source) in corpus {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for symbol in &parsed.symbols {
+                let label = format!("{path}::{}", symbol.name);
+                if symbol.is_entry_point {
+                    entry.push(label);
+                } else {
+                    non_entry.push(label);
+                }
+            }
+        }
+
+        // Truly unused helpers: the point of nw-453 is that these are dead.
+        // `summarize` also appears in static text, which is not a use.
+        for helper in [
+            "src/routes/cart/+page.svelte::unusedHelper",
+            "src/routes/+layout.svelte::trackPageView",
+            "src/pages/blog/[slug].astro::summarize",
+            "src/pages/index.vue::trackPageView",
+        ] {
+            assert!(
+                non_entry.iter().any(|s| s == helper),
+                "{helper} is a plain helper and must not root the walk; entry points: {entry:?}"
+            );
+        }
+        // COUNTERWEIGHT: components, framework hooks, symbols the MARKUP
+        // uses (the template calls them, not any script code -- see
+        // `markup.rs`) and the plain-TS route file (D-2 leaves `.ts` on the
+        // blanket rule) stay rooted.
+        for rooted in [
+            "src/routes/cart/+page.svelte::+page",
+            "src/routes/cart/+page.svelte::computeTotal",
+            "src/routes/cart/+page.svelte::handleSubmit",
+            "src/pages/blog/[slug].astro::formatDate",
+            "src/pages/index.vue::onSelect",
+            "src/routes/+layout.svelte::+layout",
+            "src/routes/blog/+page.svelte::+page",
+            "src/routes/blog/+page.svelte::load",
+            "src/routes/blog/+page.svelte::prerender",
+            "src/pages/blog/[slug].astro::[slug]",
+            "src/pages/blog/[slug].astro::getStaticPaths",
+            "src/pages/about.astro::about",
+            "src/pages/about.astro::prerender",
+            "src/pages/index.vue::index",
+            "src/lib/Counter.svelte::Counter",
+            "src/routes/cart/+page.ts::cartHelper",
+        ] {
+            assert!(
+                entry.iter().any(|s| s == rooted),
+                "{rooted} must stay an entry point; entry points: {entry:?}"
+            );
+        }
+    }
+
     /// COUNTERWEIGHT. Without this the three tests above would also pass if
     /// the parsers flipped `is_entry_point: true` on EVERYTHING -- which
     /// would make `dead-code` report nothing dead in a component corpus, the
-    /// opposite failure and an equally useless one. A private helper in the
-    /// same file must stay non-entry.
+    /// opposite failure and an equally useless one. A helper the markup does
+    /// not use must stay non-entry.
+    ///
+    /// nw-453 moved the Svelte half from `handleClick` to `greet`: the
+    /// fixture binds `on:click={handleClick}`, so the template calls it and
+    /// it IS rooted now (asserted below). `greet` is called only from script.
     #[test]
     fn a_private_helper_in_a_component_file_stays_non_entry() {
         let source = fixture("svelte/simple.svelte");
         let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("fixture defines greet");
+        assert!(
+            !helper.is_entry_point,
+            "a helper only script code calls is not an entry point"
+        );
         let handler = parsed
             .symbols
             .iter()
             .find(|s| s.name == "handleClick")
             .expect("fixture defines handleClick");
         assert!(
-            !handler.is_entry_point,
-            "a non-exported handler is not an entry point"
+            handler.is_entry_point,
+            "a handler the template binds is called by the framework"
         );
 
         let source = fixture("astro/simple.astro");

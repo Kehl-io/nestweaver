@@ -602,6 +602,17 @@ message SkippedNotesStatus {
   uint32 count = 1;
   repeated string paths = 2;
   bool truncated = 3;
+  // nw-653: notes a failed brain-watcher startup reconciliation still owes the
+  // graph. Uncapped, unlike `paths`; 0 on an older daemon.
+  uint32 reconciliation_pending = 4;
+  // The first few owed notes with the failure as their reason, so they do not
+  // read like brainignored notes in `paths`.
+  repeated PendingReconciliationNote reconciliation_pending_notes = 5;
+}
+
+message PendingReconciliationNote {
+  string path = 1;
+  string reason = 2;
 }
 
 message NearLimitNote {
