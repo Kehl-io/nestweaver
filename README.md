@@ -239,6 +239,7 @@ Also changing behaviour in this release, in ways a script may notice:
 | Change | What to do |
 | --- | --- |
 | Invalid `export --format` / `--scope` now exits **64**, not 1 | Gate on 64 for usage errors; 1 still means the export itself failed |
+| A value a tool's schema rejects (e.g. an over-long `read-symbols` target) now exits **64**, not 1 "Internal error", on the daemon route | Gate on 64 for usage errors; 1 still means the command itself failed |
 | `impact --no-daemon` now caps at 50 like the daemon route; `--limit` maxes at 1000 | Pass `--limit` explicitly if you relied on an uncapped direct route |
 | `project-context` without `--include-components` now **includes** component sub-projects | Pass `--include-components false` to keep the old behaviour |
 | `_meta` moved from the MCP envelope into the payload and lost its `nestweaver.io/` prefix | Raw HTTP MCP clients must read `payload._meta`, not `envelope["nestweaver.io/sources"]` |
