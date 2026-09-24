@@ -251,6 +251,35 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
         .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
 }
 
+/// JSON-serialize `repos` with an additive `display_name` field computed by
+/// [`repo_display_name`] — the SAME resolver `resolve_repo_selector` and the
+/// `--repo` / unknown-repo error paths already use (nw-634).
+///
+/// The raw `name` field is left exactly as stored (`null` when unconfigured)
+/// so `list-repos --json` cannot make an unnamed repo look like a named one;
+/// `display_name` is always present and always resolved, for callers that
+/// just want something to print. Both the daemon RPC and the direct CLI
+/// route call this one function so the added field cannot drift between them
+/// (CONTRIBUTING "sibling gaps").
+pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_json::Value {
+    serde_json::Value::Array(
+        repos
+            .iter()
+            .map(|repo| {
+                let mut value =
+                    serde_json::to_value(repo).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert(
+                        "display_name".to_string(),
+                        serde_json::Value::String(repo_display_name(repo)),
+                    );
+                }
+                value
+            })
+            .collect(),
+    )
+}
+
 /// Resolve a user-facing repository selector deterministically.
 ///
 /// Candidates must already be filtered for the caller's authorization scope.
@@ -829,5 +858,33 @@ mod repo_selector_tests {
             error.contains("repo:a") && error.contains("repo:b"),
             "{error}"
         );
+    }
+
+    /// nw-634: `list-repos --json` must carry a `display_name` resolved via
+    /// the SAME `repo_display_name` the `--repo` selector uses, alongside the
+    /// raw `name` field untouched.
+    ///
+    /// Counterweight: an unconfigured repo's raw `name` stays `null` rather
+    /// than being backfilled with the URL-derived fallback, so it is never
+    /// silently indistinguishable from a repo with a real `name` override.
+    #[test]
+    fn repos_json_with_display_name_adds_resolved_name_without_touching_raw_name() {
+        let repos = vec![
+            repo("repo:a", "https://example.test/org/api.git", Some("api"), None),
+            repo("repo:b", "https://example.test/org/other-thing.git", None, None),
+        ];
+        let value = repos_json_with_display_name(&repos);
+        let rows = value.as_array().expect("array of repo rows");
+
+        let named = rows.iter().find(|r| r["uid"] == "repo:a").unwrap();
+        assert_eq!(named["name"], "api");
+        assert_eq!(named["display_name"], "api");
+
+        let unnamed = rows.iter().find(|r| r["uid"] == "repo:b").unwrap();
+        assert!(
+            unnamed["name"].is_null(),
+            "unconfigured repo must keep name: null: {unnamed}"
+        );
+        assert_eq!(unnamed["display_name"], repo_display_name(&repos[1]));
     }
 }

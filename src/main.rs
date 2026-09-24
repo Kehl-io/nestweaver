@@ -14908,7 +14908,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repos = list_repos(&store, instance.as_deref())?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&repos)?);
+                // nw-634: additive `display_name` per row, the SAME resolver
+                // the daemon route (`list_repos_json`) already calls — see
+                // `repos_json_with_display_name`.
+                let value = nestweaver_engine::repos_json_with_display_name(&repos);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else if repos.is_empty() {
                 println!("No repositories found.");
             } else {
@@ -27487,6 +27491,14 @@ fn run_brain(
                 }
 
                 results.push(serde_json::json!({
+                    // nw-634: `uid`/`root_path`/`name`/`display_name`,
+                    // matching `tool_stale_check` exactly — same fields, same
+                    // resolver (`nestweaver_engine::repo_display_name`), so a
+                    // caller cannot tell which route answered.
+                    "uid": repo.uid,
+                    "root_path": repo.root_path,
+                    "name": repo.name,
+                    "display_name": nestweaver_engine::repo_display_name(repo),
                     "url": repo.url,
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,

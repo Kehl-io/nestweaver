@@ -11638,6 +11638,19 @@ fn tool_stale_check(
         }
 
         results.push(json!({
+            // nw-634: `uid`/`root_path`/`name` were absent from every row,
+            // so a caller who wanted to KNOW which repo a `[stale]` line
+            // named had to round-trip through `list-repos` and join on
+            // `url`. These three are the raw fields `--repo` selectors and
+            // `list-repos` already carry; `display_name` is the SAME
+            // resolver `resolve_repo_selector` / unknown-repo errors use
+            // (`nestweaver_engine::repo_display_name`), not a second naming
+            // rule. `name` stays null when unconfigured rather than being
+            // silently backfilled — see the counterweight test.
+            "uid": repo.uid,
+            "root_path": repo.root_path,
+            "name": repo.name,
+            "display_name": nestweaver_engine::repo_display_name(repo),
             "url": repo.url,
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
@@ -23061,6 +23074,87 @@ mod stale_check_tool_tests {
              what made this command contradict itself: {result}"
         );
         assert_eq!(result["any_stale"], false, "{result}");
+    }
+
+    /// nw-634: every row must carry `uid`, `root_path`, and the resolved
+    /// display `name` — the same identity `repo_display_name` /
+    /// `resolve_repo_selector` already compute for `--repo` and
+    /// unknown-repo errors. Before this test the row had neither field at
+    /// all, so a caller could not tell WHICH repo a `[stale]` line named
+    /// without a second `list-repos` round trip.
+    ///
+    /// Counterweight: a repo with no explicit `name` override must still
+    /// report `name: null` on the row — the URL-derived fallback belongs in
+    /// a separately-named field, not blended into `name` as if it had been
+    /// configured. Mixing the two would make every unnamed repo look
+    /// indistinguishable from a named sibling.
+    #[test]
+    fn stale_check_rows_carry_uid_root_path_and_resolved_display_name() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let named = tempfile::tempdir().unwrap();
+        let named_path = named.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:named".to_string(),
+                url: format!("file://{named_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some("pretty-name".to_string()),
+                root_path: Some(named_path.clone()),
+            })
+            .expect("insert repo");
+
+        let unnamed = tempfile::tempdir().unwrap();
+        let unnamed_path = unnamed.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:unnamed".to_string(),
+                url: format!("file://{unnamed_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(unnamed_path.clone()),
+            })
+            .expect("insert repo");
+
+        let result = tool_stale_check(&store, None).expect("stale check");
+        let rows = result["repos"].as_array().expect("repos array");
+
+        let named_row = rows
+            .iter()
+            .find(|r| r["uid"] == "repo:named")
+            .expect("named row present");
+        assert_eq!(named_row["uid"], "repo:named", "{result}");
+        assert_eq!(named_row["root_path"], named_path, "{result}");
+        assert_eq!(named_row["name"], "pretty-name", "{result}");
+        assert_eq!(named_row["display_name"], "pretty-name", "{result}");
+
+        let unnamed_row = rows
+            .iter()
+            .find(|r| r["uid"] == "repo:unnamed")
+            .expect("unnamed row present");
+        assert_eq!(unnamed_row["uid"], "repo:unnamed", "{result}");
+        assert_eq!(unnamed_row["root_path"], unnamed_path, "{result}");
+        assert!(
+            unnamed_row["name"].is_null(),
+            "an unconfigured repo must keep name: null rather than being \
+             silently backfilled with the URL-derived fallback: {result}"
+        );
+        assert_eq!(
+            unnamed_row["display_name"],
+            nestweaver_engine::repo_display_name(&nestweaver_schema::Repo {
+                uid: "repo:unnamed".to_string(),
+                url: format!("file://{unnamed_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(unnamed_path.clone()),
+            }),
+            "{result}"
+        );
     }
 
     /// The same repo, but with a NONZERO stored staleness counter — the case

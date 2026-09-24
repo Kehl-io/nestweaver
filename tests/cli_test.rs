@@ -5102,6 +5102,114 @@ fn cli_missing_db_instance_merge() {
     assert_missing_db_guard(&["instance", "merge", "--from", "a", "--to", "b"]);
 }
 
+/// nw-634: `list-repos --json` and `stale-check --json` must both carry the
+/// row's `uid`, `root_path`, and a resolved `display_name` — the same
+/// identity `resolve_repo_selector` / `repo_display_name` already compute
+/// for `--repo` selectors and unknown-repo errors, not a second naming rule.
+///
+/// This repo is indexed with no explicit name override, so the counterweight
+/// lives right here too: the raw `name` field must stay `null` rather than
+/// being silently backfilled with the URL-derived fallback — only the
+/// additive `display_name` field is guaranteed non-null.
+#[test]
+fn list_repos_and_stale_check_json_carry_uid_and_display_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir(&repo_dir).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() {}").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "initial"]);
+
+    // The CLI canonicalizes --repo before minting the identity, so
+    // root_path comparisons below must go through the same canonical form
+    // (macOS's /tmp is a symlink into /private/tmp).
+    let canonical_repo_dir = std::fs::canonicalize(&repo_dir).unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let list_repos_out = nestweaver_cmd()
+        .args(["list-repos", "--json", "--db", &db_path.display().to_string()])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&list_repos_out.stdout);
+    let repos: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("list-repos --json: {e}\n{stdout}"));
+    let row = repos
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or_else(|| panic!("no repo row in:\n{stdout}"));
+    assert!(row["uid"].is_string(), "missing uid:\n{stdout}");
+    assert_eq!(
+        row["root_path"].as_str(),
+        Some(canonical_repo_dir.display().to_string().as_str()),
+        "{stdout}"
+    );
+    assert!(
+        row["name"].is_null(),
+        "no --name override was given, so the raw field must stay null \
+         rather than being backfilled with the URL-derived fallback:\n{stdout}"
+    );
+    assert!(
+        row["display_name"].as_str().is_some_and(|s| !s.is_empty()),
+        "display_name must always resolve, even without an override:\n{stdout}"
+    );
+
+    let stale_check_out = nestweaver_cmd()
+        .args(["stale-check", "--json", "--db", &db_path.display().to_string()])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&stale_check_out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stale-check --json: {e}\n{stdout}"));
+    let row = parsed["repos"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or_else(|| panic!("no repo row in:\n{stdout}"));
+    assert!(row["uid"].is_string(), "missing uid:\n{stdout}");
+    assert_eq!(
+        row["root_path"].as_str(),
+        Some(canonical_repo_dir.display().to_string().as_str()),
+        "{stdout}"
+    );
+    assert!(
+        row["name"].is_null(),
+        "counterweight: an unconfigured repo's name stays null on stale-check \
+         rows too:\n{stdout}"
+    );
+    assert!(
+        row["display_name"].as_str().is_some_and(|s| !s.is_empty()),
+        "display_name must always resolve on stale-check rows too:\n{stdout}"
+    );
+}
+
 #[test]
 fn cli_missing_db_stale_check() {
     assert_missing_db_guard(&["stale-check"]);

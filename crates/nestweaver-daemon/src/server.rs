@@ -9458,7 +9458,11 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .list_repos(instance)
                 .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
-            serde_json::to_string(&repos)
+            // nw-634: additive `display_name` per row, resolved by the same
+            // function `--repo` selectors and unknown-repo errors already
+            // call — see `repos_json_with_display_name`.
+            let value = nestweaver_engine::repos_json_with_display_name(&repos);
+            serde_json::to_string(&value)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
