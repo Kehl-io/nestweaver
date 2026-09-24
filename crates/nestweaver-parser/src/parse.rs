@@ -4921,6 +4921,96 @@ use crate::config::{Settings, load as load_config};
         );
     }
 
+    /// nw-453, end to end through the real parsers: the item's 8-file
+    /// SvelteKit/Astro/Nuxt route corpus. The blanket `/routes/`/`/pages/`
+    /// rule used to promote every export in these component files (11 of 14
+    /// symbols), so `computeTotal`, `trackPageView` and `summarize` rooted the
+    /// dead-code walk. Now only components and real framework hooks do.
+    #[test]
+    fn component_route_corpus_roots_only_components_and_framework_hooks() {
+        let corpus: [(&str, &str); 8] = [
+            (
+                "src/routes/cart/+page.svelte",
+                "<script>\nexport function computeTotal(items) {\n  return items.length;\n}\n</script>\n<p>{computeTotal([])}</p>\n",
+            ),
+            (
+                "src/routes/+layout.svelte",
+                "<script>\nexport const trackPageView = (path) => path;\n</script>\n<slot />\n",
+            ),
+            (
+                "src/routes/blog/+page.svelte",
+                "<script context=\"module\">\nexport function load() {\n  return {};\n}\nexport const prerender = true;\n</script>\n<h1>Blog</h1>\n",
+            ),
+            (
+                "src/pages/blog/[slug].astro",
+                "---\nexport function getStaticPaths() {\n  return [];\n}\nexport function summarize(text) {\n  return text;\n}\n---\n<h1>Post</h1>\n",
+            ),
+            (
+                "src/pages/about.astro",
+                "---\nexport const prerender = true;\n---\n<h1>About</h1>\n",
+            ),
+            (
+                "src/pages/index.vue",
+                "<template><h1>Home</h1></template>\n<script>\nexport const trackPageView = (path) => path;\nexport default {}\n</script>\n",
+            ),
+            (
+                "src/lib/Counter.svelte",
+                "<script>\nlet count = 0;\n</script>\n<button>{count}</button>\n",
+            ),
+            (
+                "src/routes/cart/+page.ts",
+                "export function cartHelper(items) {\n  return items;\n}\n",
+            ),
+        ];
+
+        let mut entry: Vec<String> = Vec::new();
+        let mut non_entry: Vec<String> = Vec::new();
+        for (path, source) in corpus {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for symbol in &parsed.symbols {
+                let label = format!("{path}::{}", symbol.name);
+                if symbol.is_entry_point {
+                    entry.push(label);
+                } else {
+                    non_entry.push(label);
+                }
+            }
+        }
+
+        for helper in [
+            "src/routes/cart/+page.svelte::computeTotal",
+            "src/routes/+layout.svelte::trackPageView",
+            "src/pages/blog/[slug].astro::summarize",
+            "src/pages/index.vue::trackPageView",
+        ] {
+            assert!(
+                non_entry.iter().any(|s| s == helper),
+                "{helper} is a plain helper and must not root the walk; entry points: {entry:?}"
+            );
+        }
+        // COUNTERWEIGHT: components, framework hooks and the plain-TS
+        // route file (D-2 leaves `.ts` on the blanket rule) stay rooted.
+        for rooted in [
+            "src/routes/cart/+page.svelte::+page",
+            "src/routes/+layout.svelte::+layout",
+            "src/routes/blog/+page.svelte::+page",
+            "src/routes/blog/+page.svelte::load",
+            "src/routes/blog/+page.svelte::prerender",
+            "src/pages/blog/[slug].astro::[slug]",
+            "src/pages/blog/[slug].astro::getStaticPaths",
+            "src/pages/about.astro::about",
+            "src/pages/about.astro::prerender",
+            "src/pages/index.vue::index",
+            "src/lib/Counter.svelte::Counter",
+            "src/routes/cart/+page.ts::cartHelper",
+        ] {
+            assert!(
+                entry.iter().any(|s| s == rooted),
+                "{rooted} must stay an entry point; entry points: {entry:?}"
+            );
+        }
+    }
+
     /// COUNTERWEIGHT. Without this the three tests above would also pass if
     /// the parsers flipped `is_entry_point: true` on EVERYTHING -- which
     /// would make `dead-code` report nothing dead in a component corpus, the

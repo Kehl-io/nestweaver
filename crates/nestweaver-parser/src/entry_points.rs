@@ -232,7 +232,13 @@ pub fn detect_entry_point(
         // TypeScript, so the JS/TS rules apply to everything in it; what the
         // JS rules cannot know is that the FILE is itself an instantiable
         // component. `detect_component_framework` adds only that.
-        "vue" | "svelte" | "astro" => detect_component_framework(name, file_path, kind, signature),
+        "vue" => detect_component_framework(name, file_path, kind, signature, VUE_ROUTE_EXPORTS),
+        "svelte" => {
+            detect_component_framework(name, file_path, kind, signature, SVELTE_ROUTE_EXPORTS)
+        }
+        "astro" => {
+            detect_component_framework(name, file_path, kind, signature, ASTRO_ROUTE_EXPORTS)
+        }
         "python" => detect_python(name, file_path, kind, signature),
         "java" => detect_java(name, file_path, kind, signature),
         "go" => detect_go(name, file_path, kind, signature),
@@ -280,9 +286,20 @@ pub fn detect_entry_point(
 ///
 /// Everything else in the file falls through to `detect_js_ts`, because a
 /// `<script>` block or an Astro frontmatter fence genuinely IS JS/TS -- so
-/// `getStaticPaths`, a `/pages/` route and a `/components/` component all
+/// `getStaticPaths`, a `/hooks/` hook and a `/components/` component all
 /// keep the meaning those rules already give them, rather than getting a
 /// second, divergent spelling here.
+///
+/// With ONE exception, nw-453 (decision D-2, option 2): the blanket page
+/// rule. `detect_js_ts` promotes every exported function/const/class under
+/// `/routes/`, `/pages/` or `/app/`, and SvelteKit and Astro put almost ALL
+/// route logic there, so plain helpers (`computeTotal`, `summarize`) rooted
+/// the reachability walk -- 11 of 14 symbols on the item's fixture -- and
+/// `dead-code` went silent on them. That is a false negative, the direction
+/// this codebase treats as the more dangerous one. In a component file the
+/// page rule is therefore narrowed to `route_exports`, the names the
+/// framework itself calls. Plain `.ts`/`.tsx` keeps the blanket rule: D-2
+/// rejected narrowing it for every language (option 3).
 ///
 /// `EntryPointKind::EventListener` is the existing overload for UI
 /// components (see the React hook/component notes in `detect_js_ts`); this
@@ -292,11 +309,80 @@ fn detect_component_framework(
     file_path: &str,
     kind: &str,
     signature: Option<&str>,
+    route_exports: &'static [&'static str],
 ) -> Option<EntryPointKind> {
     if kind == "class" && name == component_file_stem(file_path) {
         return Some(EntryPointKind::EventListener);
     }
-    detect_js_ts(name, file_path, kind, signature)
+    detect_js_ts_with(
+        name,
+        file_path,
+        kind,
+        signature,
+        PageExports::Only(route_exports),
+    )
+}
+
+/// nw-453. SvelteKit route-module exports that can sit in a `.svelte` file's
+/// module script (`<script context="module">` / `<script module>`): the page
+/// options, `load`/`actions`, `snapshot` (the `+page.svelte` export), Sapper's
+/// legacy `preload`, and the `+server` verbs plus `fallback`. Most of these
+/// normally live in `+page.ts`/`+server.ts`, which are plain TypeScript and
+/// never reach this list; carrying them is harmless and keeps a legacy
+/// module-script page rooted.
+const SVELTE_ROUTE_EXPORTS: &[&str] = &[
+    "load",
+    "actions",
+    "prerender",
+    "ssr",
+    "csr",
+    "trailingSlash",
+    "entries",
+    "config",
+    "snapshot",
+    "preload",
+    "fallback",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "HEAD",
+];
+
+/// nw-453. Astro page-frontmatter exports: `getStaticPaths`, `prerender`,
+/// `partial`, and the endpoint verbs including Astro's catch-all `ALL`.
+const ASTRO_ROUTE_EXPORTS: &[&str] = &[
+    "getStaticPaths",
+    "prerender",
+    "partial",
+    "ALL",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "HEAD",
+];
+
+/// nw-453. Nuxt has no named route exports in a `.vue` page: page metadata
+/// is the `definePageMeta(...)` compiler macro (a call, not an export) and
+/// Nuxt 2's `asyncData`/`head`/`middleware` are options on the default
+/// export, which is the component itself. So under `pages/` only the
+/// component is an entry point.
+const VUE_ROUTE_EXPORTS: &[&str] = &[];
+
+/// How `detect_js_ts` treats an export under a `/routes/`, `/pages/` or
+/// `/app/` directory.
+#[derive(Clone, Copy)]
+enum PageExports {
+    /// Plain JS/TS: every exported function/const/class not starting with
+    /// `_`/`validate`/`parse`/`format` (React/Next/Remix/TanStack).
+    AnyExport,
+    /// Component frameworks (nw-453): only these names.
+    Only(&'static [&'static str]),
 }
 
 /// The file stem of `file_path` -- `src/lib/Counter.svelte` -> `Counter`.
@@ -316,6 +402,16 @@ fn detect_js_ts(
     file_path: &str,
     kind: &str,
     signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    detect_js_ts_with(name, file_path, kind, signature, PageExports::AnyExport)
+}
+
+fn detect_js_ts_with(
+    name: &str,
+    file_path: &str,
+    kind: &str,
+    signature: Option<&str>,
+    page_exports: PageExports,
 ) -> Option<EntryPointKind> {
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
 
@@ -423,13 +519,16 @@ fn detect_js_ts(
         || file_path.contains("/app/")
         || file_path.contains("/routes/");
 
-    if is_page_path
-        && matches!(kind, "function" | "class" | "constant")
-        && !name.starts_with('_')
-        && !name.starts_with("validate")
-        && !name.starts_with("parse")
-        && !name.starts_with("format")
-    {
+    let is_page_export = match page_exports {
+        PageExports::AnyExport => {
+            !name.starts_with('_')
+                && !name.starts_with("validate")
+                && !name.starts_with("parse")
+                && !name.starts_with("format")
+        }
+        PageExports::Only(names) => names.contains(&name),
+    };
+    if is_page_path && matches!(kind, "function" | "class" | "constant") && is_page_export {
         return Some(EntryPointKind::HttpHandler);
     }
 
@@ -468,8 +567,11 @@ fn detect_js_ts(
             return Some(EntryPointKind::HttpHandler);
         }
         // Next.js API route handlers
+        // nw-453: a component file's route exports are exactly its
+        // framework allowlist, which already names the verbs it supports.
         if (name == "GET" || name == "POST" || name == "PUT" || name == "DELETE" || name == "PATCH")
             && is_page_path
+            && matches!(page_exports, PageExports::AnyExport)
         {
             return Some(EntryPointKind::HttpHandler);
         }
@@ -1297,6 +1399,129 @@ mod tests {
         assert!(language_has_entry_point_model(Language::Vue));
         assert!(language_has_entry_point_model(Language::Svelte));
         assert!(language_has_entry_point_model(Language::Astro));
+    }
+
+    // ── nw-453: route directories in component files ────────────────────
+
+    /// nw-453. A component file under `/routes/`, `/pages/` or `/app/` used to
+    /// fall through to `detect_js_ts`'s blanket page rule, which promotes
+    /// EVERY exported function/const/class there. SvelteKit and Astro put
+    /// almost all route logic under those directories, so plain helpers
+    /// rooted the reachability walk and `dead-code` went silent on them (11
+    /// of 14 symbols promoted on the item's fixture). Only each framework's
+    /// real special exports may be promoted now.
+    #[test]
+    fn a_plain_helper_in_a_component_route_file_is_not_an_entry_point() {
+        for (name, path, kind, language) in [
+            (
+                "computeTotal",
+                "src/routes/cart/+page.svelte",
+                "function",
+                "svelte",
+            ),
+            (
+                "trackPageView",
+                "src/routes/+layout.svelte",
+                "constant",
+                "svelte",
+            ),
+            (
+                "summarize",
+                "src/pages/blog/[slug].astro",
+                "function",
+                "astro",
+            ),
+            ("PostCard", "src/pages/index.astro", "class", "astro"),
+            ("trackPageView", "src/pages/index.vue", "constant", "vue"),
+            ("computeTotal", "app/pages/cart.vue", "function", "vue"),
+            // Nuxt has no endpoint-verb exports in a `.vue` page; the
+            // Next.js verb rule must not reach component files either.
+            ("GET", "src/pages/api.vue", "function", "vue"),
+        ] {
+            let signature = format!("export function {name}() {{");
+            assert_eq!(
+                detect_entry_point(name, path, kind, Some(&signature), language),
+                None,
+                "{name} in {path} is a plain helper, not a framework hook"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT. The allowlist must still root the exports the framework
+    /// itself calls, or SvelteKit/Astro route hooks become false positives.
+    #[test]
+    fn framework_special_exports_in_component_route_files_stay_entry_points() {
+        for (name, path, kind, language) in [
+            ("load", "src/routes/blog/+page.svelte", "function", "svelte"),
+            ("prerender", "src/routes/+page.svelte", "constant", "svelte"),
+            ("ssr", "src/routes/+page.svelte", "constant", "svelte"),
+            ("csr", "src/routes/+page.svelte", "constant", "svelte"),
+            ("snapshot", "src/routes/+page.svelte", "constant", "svelte"),
+            (
+                "getStaticPaths",
+                "src/pages/blog/[slug].astro",
+                "function",
+                "astro",
+            ),
+            ("prerender", "src/pages/about.astro", "constant", "astro"),
+            ("partial", "src/pages/fragment.astro", "constant", "astro"),
+            ("GET", "src/pages/feed.astro", "function", "astro"),
+        ] {
+            let signature = format!("export const {name} = 1;");
+            assert_eq!(
+                detect_entry_point(name, path, kind, Some(&signature), language),
+                Some(EntryPointKind::HttpHandler),
+                "{name} in {path} is a framework hook"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT. The route component ITSELF (`+page.svelte` mints a class
+    /// named `+page`) is still the entry point it was under nw-441.
+    #[test]
+    fn the_route_component_itself_stays_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "+page",
+                "src/routes/cart/+page.svelte",
+                "class",
+                None,
+                "svelte"
+            ),
+            Some(EntryPointKind::EventListener)
+        );
+        assert_eq!(
+            detect_entry_point("index", "src/pages/index.astro", "class", None, "astro"),
+            Some(EntryPointKind::EventListener)
+        );
+    }
+
+    /// COUNTERWEIGHT (D-2 scope). The allowlist is gated on the component
+    /// frameworks only. Plain `.ts`/`.tsx` under React/Remix/TanStack (and a
+    /// SvelteKit `+page.ts`) keeps the blanket page rule unchanged: narrowing
+    /// that is option 3, which D-2 rejected.
+    #[test]
+    fn plain_ts_route_files_keep_the_blanket_page_rule() {
+        assert_eq!(
+            detect_entry_point(
+                "computeTotal",
+                "src/routes/cart/+page.ts",
+                "function",
+                None,
+                "typescript"
+            ),
+            Some(EntryPointKind::HttpHandler)
+        );
+        assert_eq!(
+            detect_entry_point(
+                "trackPageView",
+                "src/pages/index.tsx",
+                "constant",
+                None,
+                "typescript"
+            ),
+            Some(EntryPointKind::HttpHandler)
+        );
     }
 
     // ── nw-351: the C++ entry-point surface ─────────────────────────────
