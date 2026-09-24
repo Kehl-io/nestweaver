@@ -1612,6 +1612,12 @@ struct WatchedNoteReader {
     filesystem: crate::content_reader::FilesystemReader,
     files: Vec<PathBuf>,
     changed: HashSet<PathBuf>,
+    /// nw-668: the text of every CHANGED note exactly as this refresh read,
+    /// parsed and committed it, keyed by vault-relative path. The watcher's
+    /// cross-domain scan runs over this rather than re-reading the file: a
+    /// later save would otherwise be scanned against the section line spans
+    /// of the earlier one.
+    captured: std::sync::Mutex<HashMap<PathBuf, String>>,
 }
 
 impl ContentReader for WatchedNoteReader {
@@ -1625,7 +1631,14 @@ impl ContentReader for WatchedNoteReader {
         Ok(self.files.clone())
     }
     fn read_file(&self, path: &Path) -> Result<String, anyhow::Error> {
-        self.filesystem.read_file(path)
+        let source = self.filesystem.read_file(path)?;
+        if self.changed.contains(path) {
+            self.captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(path.to_path_buf(), source.clone());
+        }
+        Ok(source)
     }
     fn file_meta_nanos(&self, path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
         if self.changed.contains(path) {
@@ -1640,6 +1653,11 @@ impl ContentReader for WatchedNoteReader {
     }
 }
 
+/// Commit the watcher's changed `paths` through the incremental indexer.
+/// Returns the source text of each changed note that was read (keyed by
+/// vault-relative path) — the exact text parsed and committed — so the
+/// watcher's sidecars mirror the committed representation (nw-668). A note
+/// that was not read (oversized, deleted) has no entry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_watched_paths(
     store: &GraphStore,
@@ -1650,7 +1668,7 @@ pub(crate) fn refresh_watched_paths(
     ignore_set: &GlobSet,
     note_limits: crate::index_limits::NoteLimits,
     lease: &WatchLeaseAcquirer<'_>,
-) -> Result<(), anyhow::Error> {
+) -> Result<HashMap<PathBuf, String>, anyhow::Error> {
     let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
     let mut files: HashSet<PathBuf> = store
         .list_notes(Some(&v_uid))?
@@ -1685,6 +1703,7 @@ pub(crate) fn refresh_watched_paths(
         filesystem: filesystem_note_reader(vault_root, note_limits),
         files: files.into_iter().collect(),
         changed,
+        captured: std::sync::Mutex::new(HashMap::new()),
     };
     index_markdown_since_with_reader_mode(
         store,
@@ -1695,7 +1714,10 @@ pub(crate) fn refresh_watched_paths(
         ignore_set,
         Some(lease),
     )?;
-    Ok(())
+    Ok(reader
+        .captured
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
 /// Drain a vault reader's prune recorder into skip rows, for every vault route

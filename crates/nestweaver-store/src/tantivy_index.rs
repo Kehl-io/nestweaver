@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -380,6 +380,22 @@ impl From<TantivyError> for StoreError {
 /// Write methods (`reindex_from_store`, `update_note`, `remove_note`)
 /// return `TantivyError::WriterUnavailable` when called on a
 /// reader-only instance.
+/// One note's documents for [`TantivyIndex::update_notes_batch`] /
+/// [`TantivyIndex::apply_note_batch`]:
+/// `(note_uid, title, vault_uid, body_chunks, headings, sections, tags)`, the
+/// same shape as [`TantivyIndex::update_note`]'s parameters. `headings`
+/// entries are `(uid, heading_text)`; `sections` are
+/// `(uid, body_text, heading_title)`.
+pub type NoteDocBatchEntry = (
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<(String, String)>,
+    Vec<(String, String, String)>,
+    Vec<String>,
+);
+
 pub struct TantivyIndex {
     index: Index,
     reader: IndexReader,
@@ -388,6 +404,11 @@ pub struct TantivyIndex {
     path: PathBuf,
     counted_search_supported: bool,
     migration_completed: AtomicBool,
+    /// Writer commits made through this handle (nw-668). Each Tantivy
+    /// commit is an fsync plus a reader reload, so "one commit per watcher
+    /// batch, not one per note" is a property worth asserting directly
+    /// rather than inferring from wall time. Read via [`Self::commit_count`].
+    commits: AtomicU64,
 }
 
 /// Field handles bundled together so we don't look them up by name on
@@ -440,6 +461,7 @@ impl TantivyIndex {
             path: path.to_path_buf(),
             counted_search_supported: schema.current,
             migration_completed: AtomicBool::new(false),
+            commits: AtomicU64::new(0),
         })
     }
 
@@ -477,6 +499,7 @@ impl TantivyIndex {
             path: resolved,
             counted_search_supported: schema.current,
             migration_completed: AtomicBool::new(false),
+            commits: AtomicU64::new(0),
         })
     }
 
@@ -510,6 +533,7 @@ impl TantivyIndex {
         writer.delete_all_documents()?;
         let count = self.write_full_corpus(&mut writer, store)?;
         writer.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         // Manually reload the reader so subsequent searches see the new
         // segments without waiting for the OnCommitWithDelay tick.
         self.reader.reload()?;
@@ -575,6 +599,7 @@ impl TantivyIndex {
             &staging_schema.fields,
         )?;
         staging_writer.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         drop(staging_writer);
         drop(staging_index);
 
@@ -713,6 +738,7 @@ impl TantivyIndex {
         let _ = tags;
 
         writer.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         self.reader.reload()?;
         Ok(())
     }
@@ -732,28 +758,38 @@ impl TantivyIndex {
     ///
     /// `headings` entries are `(uid, heading_text)`.
     /// `sections` entries are `(uid, body_text, heading_title)`.
-    #[allow(clippy::type_complexity)]
-    pub fn update_notes_batch(
+    pub fn update_notes_batch(&self, notes: &[NoteDocBatchEntry]) -> Result<(), TantivyError> {
+        self.apply_note_batch(notes, &[])
+    }
+
+    /// [`Self::update_notes_batch`] plus deletions, under ONE commit and one
+    /// reader reload (nw-668). The vault watcher calls this once per batch:
+    /// a batch that edits some notes and deletes others previously paid one
+    /// commit per note (`update_note` / `remove_note` each commit), which is
+    /// an fsync and a reader reload apiece while the write lease is held.
+    ///
+    /// `removals` drops every doc tagged with each note uid, exactly as
+    /// [`Self::remove_note`] does. An empty batch commits nothing.
+    pub fn apply_note_batch(
         &self,
-        notes: &[(
-            String,
-            String,
-            String,
-            Vec<String>,
-            Vec<(String, String)>,
-            Vec<(String, String, String)>,
-            Vec<String>,
-        )],
+        notes: &[NoteDocBatchEntry],
+        removals: &[String],
     ) -> Result<(), TantivyError> {
         self.ensure_reopen_not_required()?;
         let writer_mutex = self
             .writer
             .as_ref()
             .ok_or(TantivyError::WriterUnavailable)?;
+        if notes.is_empty() && removals.is_empty() {
+            return Ok(());
+        }
         let mut writer = writer_mutex
             .lock()
             .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
 
+        for note_uid in removals {
+            writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
+        }
         for (note_uid, title, vault_uid, body_chunks, headings, sections, tags) in notes {
             // Remove all existing docs for this note.
             writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
@@ -799,6 +835,7 @@ impl TantivyIndex {
 
         // Single commit for the entire batch.
         writer.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         drop(writer);
         self.reader.reload()?;
         Ok(())
@@ -817,8 +854,15 @@ impl TantivyIndex {
             .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
         writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
         writer.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         self.reader.reload()?;
         Ok(())
+    }
+
+    /// How many writer commits this handle has made (nw-668). Diagnostic:
+    /// lets a caller assert "one commit per batch" deterministically.
+    pub fn commit_count(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
     }
 
     /// Reload the reader so subsequent searches see any newly committed

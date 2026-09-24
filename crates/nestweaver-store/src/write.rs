@@ -803,6 +803,60 @@ fn exec_params(
     Ok(())
 }
 
+/// Upper bound on REFERENCES_CODE rows bound into one `UNWIND` statement
+/// (nw-668). Bounds the size of a single parameter list for a note with an
+/// extreme match count; far above any normal note, so a typical flush is one
+/// statement per edge kind.
+pub const CROSS_DOMAIN_ROWS_PER_STATEMENT: usize = 10_000;
+
+/// Execute `UNWIND $rows AS r <tail>` for `edges` in chunks of
+/// [`CROSS_DOMAIN_ROWS_PER_STATEMENT`]; returns the statements executed.
+/// `tail` sees each row as `r.src`, `r.dst`, `r.conf` and `r.origin`.
+fn insert_references_code_rows_on(
+    conn: &lbug::Connection<'_>,
+    tail: &str,
+    edges: &[(&str, &str, f32, &str)],
+) -> Result<usize, StoreError> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let row_type = lbug::LogicalType::Struct {
+        fields: vec![
+            ("src".to_string(), lbug::LogicalType::String),
+            ("dst".to_string(), lbug::LogicalType::String),
+            ("conf".to_string(), lbug::LogicalType::Float),
+            ("origin".to_string(), lbug::LogicalType::String),
+        ],
+    };
+    let mut stmt = conn
+        .prepare(&format!("UNWIND $rows AS r {tail}"))
+        .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+    let mut statements = 0;
+    for chunk in edges.chunks(CROSS_DOMAIN_ROWS_PER_STATEMENT) {
+        let rows = chunk
+            .iter()
+            .map(|(src, dst, conf, origin)| {
+                lbug::Value::Struct(vec![
+                    ("src".to_string(), lbug::Value::String((*src).to_string())),
+                    ("dst".to_string(), lbug::Value::String((*dst).to_string())),
+                    ("conf".to_string(), lbug::Value::Float(*conf)),
+                    (
+                        "origin".to_string(),
+                        lbug::Value::String((*origin).to_string()),
+                    ),
+                ])
+            })
+            .collect();
+        conn.execute(
+            &mut stmt,
+            vec![("rows", lbug::Value::List(row_type.clone(), rows))],
+        )
+        .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        statements += 1;
+    }
+    Ok(statements)
+}
+
 impl GraphStore {
     fn plan_instance_project_merges(
         &self,
@@ -3919,135 +3973,86 @@ impl GraphStore {
         })
     }
 
-    /// Batch insert REFERENCES_CODE edges from Note → Symbol. Each tuple
-    /// is (note_uid, symbol_uid, confidence, source) where `source` is a
-    /// short tag (`"name-match"`, `"code-block"`, `"annotation"`).
-    pub fn batch_insert_note_to_symbol_edges(
-        &self,
-        edges: &[(&str, &str, f32, &str)],
-    ) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        Self::batch_insert_note_to_symbol_edges_on(&conn, edges)
-    }
-
-    /// Insert note→symbol edges using an externally-provided connection
-    /// (for transaction batching across many notes — avoids one fsync per call).
+    /// Insert REFERENCES_CODE edges from Note → Symbol on a caller-owned
+    /// connection (normally inside `begin_transaction`). Each tuple is
+    /// `(note_uid, symbol_uid, confidence, source)` where `source` is a short
+    /// tag (`"name-match"`, `"code-block"`, `"annotation"`). Returns the number
+    /// of statements executed.
+    ///
+    /// nw-668: set-based. This used to execute one `MATCH .. CREATE` per edge,
+    /// and a note that mentions 100K symbol names is 100K statements — on a
+    /// plain connection, 100K auto-commits, which is what held the vault
+    /// watcher's write lease for 22 minutes. One `UNWIND $rows` statement per
+    /// [`CROSS_DOMAIN_ROWS_PER_STATEMENT`] edges keeps the statement count
+    /// independent of how many symbols a note mentions. Semantics are the
+    /// per-edge statement's: a row whose note or symbol no longer exists
+    /// matches nothing and creates nothing, rather than failing the batch
+    /// (which `COPY` would).
     pub fn batch_insert_note_to_symbol_edges_on(
         conn: &lbug::Connection<'_>,
         edges: &[(&str, &str, f32, &str)],
-    ) -> Result<(), StoreError> {
-        if edges.is_empty() {
-            return Ok(());
-        }
-        let mut stmt = conn
-            .prepare(
-                "MATCH (n:Note {uid: $nid}), (s:Symbol {uid: $sid}) \
-                 CREATE (n)-[:REFERENCES_CODE_NOTE_TO_SYMBOL \
-                 {confidence: $conf, source: $source}]->(s)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (n_uid, s_uid, conf, src) in edges {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("nid", lbug::Value::String(n_uid.to_string())),
-                    ("sid", lbug::Value::String(s_uid.to_string())),
-                    ("conf", lbug::Value::Double(*conf as f64)),
-                    ("source", lbug::Value::String(src.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        }
-        Ok(())
+    ) -> Result<usize, StoreError> {
+        insert_references_code_rows_on(
+            conn,
+            "MATCH (a:Note {uid: r.src}), (b:Symbol {uid: r.dst}) \
+             CREATE (a)-[:REFERENCES_CODE_NOTE_TO_SYMBOL \
+             {confidence: r.conf, source: r.origin}]->(b)",
+            edges,
+        )
     }
 
-    /// Batch insert REFERENCES_CODE edges from Section → Symbol.
-    pub fn batch_insert_section_to_symbol_edges(
-        &self,
-        edges: &[(&str, &str, f32, &str)],
-    ) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        Self::batch_insert_section_to_symbol_edges_on(&conn, edges)
-    }
-
-    /// Insert section→symbol edges using an externally-provided connection
-    /// (for transaction batching across many notes — avoids one fsync per call).
+    /// Section → Symbol twin of [`Self::batch_insert_note_to_symbol_edges_on`]
+    /// (same row shape, same set-based statement, same count returned).
     pub fn batch_insert_section_to_symbol_edges_on(
         conn: &lbug::Connection<'_>,
         edges: &[(&str, &str, f32, &str)],
-    ) -> Result<(), StoreError> {
-        if edges.is_empty() {
-            return Ok(());
-        }
-        let mut stmt = conn
-            .prepare(
-                "MATCH (sec:Section {uid: $sid}), (sym:Symbol {uid: $symid}) \
-                 CREATE (sec)-[:REFERENCES_CODE_SECTION_TO_SYMBOL \
-                 {confidence: $conf, source: $source}]->(sym)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (sec_uid, sym_uid, conf, src) in edges {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("sid", lbug::Value::String(sec_uid.to_string())),
-                    ("symid", lbug::Value::String(sym_uid.to_string())),
-                    ("conf", lbug::Value::Double(*conf as f64)),
-                    ("source", lbug::Value::String(src.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        }
-        Ok(())
+    ) -> Result<usize, StoreError> {
+        insert_references_code_rows_on(
+            conn,
+            "MATCH (a:Section {uid: r.src}), (b:Symbol {uid: r.dst}) \
+             CREATE (a)-[:REFERENCES_CODE_SECTION_TO_SYMBOL \
+             {confidence: r.conf, source: r.origin}]->(b)",
+            edges,
+        )
     }
 
-    /// Delete all REFERENCES_CODE edges originating from a note and its
-    /// sections. Called before re-emitting cross-domain edges to ensure
-    /// idempotency.
-    pub fn delete_cross_domain_edges_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        Self::delete_cross_domain_edges_for_note_on(&conn, note_uid)
-    }
-
-    /// Delete cross-domain edges for a note using an externally-provided
-    /// connection (for transaction batching across many notes).
-    pub fn delete_cross_domain_edges_for_note_on(
+    /// Delete every REFERENCES_CODE edge originating from each note in
+    /// `note_uids` or from any of its sections, on a caller-owned connection.
+    /// Returns the number of statements executed: two, however many notes,
+    /// sections or edges are involved.
+    ///
+    /// nw-668: this used to run one DELETE per SECTION after a section query,
+    /// each auto-committed, so a failure part-way left a note half-deleted.
+    /// Run it inside the same transaction as the inserts that replace the
+    /// edges and a failure rolls back to the note's previous edges.
+    pub fn delete_cross_domain_edges_for_notes_on(
         conn: &lbug::Connection<'_>,
-        note_uid: &str,
-    ) -> Result<(), StoreError> {
+        note_uids: &[&str],
+    ) -> Result<usize, StoreError> {
+        if note_uids.is_empty() {
+            return Ok(0);
+        }
+        let uids = lbug::Value::List(
+            lbug::LogicalType::String,
+            note_uids
+                .iter()
+                .map(|uid| lbug::Value::String((*uid).to_string()))
+                .collect(),
+        );
         exec_params(
             conn,
-            "MATCH (n:Note {uid: $uid})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() DELETE r",
-            vec![("uid", lbug::Value::String(note_uid.to_string()))],
+            "UNWIND $uids AS u \
+             MATCH (n:Note {uid: u})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() DELETE r",
+            vec![("uids", uids.clone())],
         )?;
-        // Section-level edges: find sections belonging to this note and
-        // delete their outgoing REFERENCES_CODE edges.
-        let section_uids: Vec<String> = {
-            // LadybugDB does not support parameterized compound
-            // property-match queries. Sanitize user-derived UIDs by
-            // escaping single quotes to prevent Cypher injection.
-            let safe_note_uid = note_uid.replace('\'', "\\'");
-            let rows = conn
-                .query(&format!(
-                    "MATCH (n:Note {{uid: '{safe_note_uid}'}})-[:NOTE_HAS_SECTION]->(s:Section) RETURN s.uid"
-                ))
-                .map_err(|e| StoreError::Query(format!("query sections: {e}")))?;
-            rows.filter_map(|row| {
-                row.first().and_then(|v| match v {
-                    lbug::Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-            })
-            .collect()
-        };
-        for s_uid in &section_uids {
-            exec_params(
-                conn,
-                "MATCH (s:Section {uid: $uid})-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() DELETE r",
-                vec![("uid", lbug::Value::String(s_uid.clone()))],
-            )?;
-        }
-        Ok(())
+        exec_params(
+            conn,
+            "UNWIND $uids AS u \
+             MATCH (n:Note {uid: u})-[:NOTE_HAS_SECTION]->(:Section)\
+             -[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() DELETE r",
+            vec![("uids", uids)],
+        )?;
+        Ok(2)
     }
 
     /// Delete all Symbol nodes that belong to a specific file (matching both

@@ -2227,6 +2227,47 @@ impl GraphStore {
         Ok(note_to_sym + sec_to_sym)
     }
 
+    /// Every REFERENCES_CODE edge as `(from_uid, symbol_uid, confidence,
+    /// source)`, note-to-symbol and section-to-symbol together, sorted. The
+    /// two relations never share a `from_uid` (a Note uid is not a Section
+    /// uid), so the union is unambiguous. nw-668: lets a caller compare the
+    /// EXACT edge set two discovery paths produce, not just a count.
+    pub fn list_references_code_edges(
+        &self,
+    ) -> Result<Vec<(String, String, f64, String)>, StoreError> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for query in [
+            "MATCH (a:Note)-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) \
+             RETURN a.uid, b.uid, r.confidence, r.source",
+            "MATCH (a:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) \
+             RETURN a.uid, b.uid, r.confidence, r.source",
+        ] {
+            let rows = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in rows {
+                let confidence = match row.get(2) {
+                    Some(lbug::Value::Float(value)) => f64::from(*value),
+                    Some(lbug::Value::Double(value)) => *value,
+                    _ => f64::NAN,
+                };
+                out.push((
+                    extract_string(&row, 0)?,
+                    extract_string(&row, 1)?,
+                    confidence,
+                    extract_string(&row, 3)?,
+                ));
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.0, &a.1, &a.3)
+                .cmp(&(&b.0, &b.1, &b.3))
+                .then(a.2.total_cmp(&b.2))
+        });
+        Ok(out)
+    }
+
     /// Count of all wikilink edges (to either Note or Heading). Cheap status
     /// summary — does two separate queries since LadybugDB splits the
     /// logical WIKILINK into two physical REL tables.

@@ -131,6 +131,32 @@ pub fn discover_cross_domain_links_with_config(
     discover_cross_domain_links_full(store, config, &VaultReaders::new())
 }
 
+/// Notes flushed per write transaction, by the bulk pass and the vault
+/// watcher alike. Bounds peak transaction memory while amortising the commit
+/// (an fsync) over many notes. nw-668: the watcher also takes its write lease
+/// once per chunk of this size, so a large replayed batch releases the gate
+/// between chunks for FIFO-queued reconcilers.
+pub(crate) const NOTES_PER_TXN: usize = 100;
+
+/// What one cross-domain flush cost the store (nw-668): write transactions
+/// opened and statements executed. The statement count is independent of how
+/// many symbols a note mentions — the property that keeps a note with 100K
+/// name matches from costing 100K commits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CrossDomainFlushStats {
+    pub transactions: usize,
+    pub statements: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint (nw-668): fail the next flush after its deletes and
+    /// note-level inserts ran and before its section-level inserts — the
+    /// point where the old auto-commit path left a partial edge set.
+    pub(crate) static FAIL_NEXT_CROSS_DOMAIN_FLUSH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Full implementation accepting both config and vault readers.
 fn discover_cross_domain_links_full(
     store: &GraphStore,
@@ -164,10 +190,7 @@ fn discover_cross_domain_links_full(
     // Scan all notes in memory first (no DB writes), then flush in
     // transaction-batched chunks. Earlier versions committed once per
     // note × section, which on macOS amounts to thousands of fsync'd
-    // commits and dominates indexing time. NOTES_PER_TXN bounds peak
-    // transaction memory while still amortising fsync cost.
-    const NOTES_PER_TXN: usize = 100;
-
+    // commits and dominates indexing time.
     let mut pending: Vec<ScannedNote> = Vec::with_capacity(NOTES_PER_TXN);
     for note in &notes {
         match scan_one_note(store, note, &index, vault_readers)? {
@@ -187,9 +210,9 @@ fn discover_cross_domain_links_full(
 }
 
 /// Accumulated scan results for a single note — built outside any
-/// transaction so the heavy regex/index work runs lock-free, then
+/// transaction so the heavy tokenising work runs lock-free, then
 /// flushed in batched transactions by `flush_scanned_notes`.
-struct ScannedNote {
+pub(crate) struct ScannedNote {
     note_uid: String,
     note_edges: Vec<(String, String, f32, &'static str)>,
     section_edges: Vec<(String, String, f32, &'static str)>,
@@ -201,8 +224,11 @@ enum ScanOutcome {
 }
 
 /// Flush a batch of scanned notes inside a single write transaction:
-/// delete each note's existing cross-domain edges, then bulk-insert the
-/// fresh ones. One fsync per batch, not per note × section.
+/// delete the notes' existing cross-domain edges, then insert the fresh
+/// ones, with set-based statements (nw-668) — a constant number per edge
+/// kind, not one per edge. One commit per batch, not per note × section ×
+/// edge. Any failure rolls the transaction back, so every note in `batch`
+/// keeps its PREVIOUS edges rather than being left half-deleted.
 ///
 /// Store errors are folded INTO the message (`{op}: {cause}`) rather than
 /// attached via `anyhow::Context`: callers log discovery failures with `{e}`
@@ -210,51 +236,75 @@ enum ScanOutcome {
 /// warning to a bare function name and hide the underlying cause — e.g.
 /// `Cannot execute write operations in a read-only database!`, which is what
 /// `brain add` hits because its discovery store is opened read-only.
-fn flush_scanned_notes(
+pub(crate) fn flush_scanned_notes(
     store: &GraphStore,
     batch: &[ScannedNote],
     result: &mut CrossDomainResult,
-) -> Result<(), anyhow::Error> {
+) -> Result<CrossDomainFlushStats, anyhow::Error> {
+    if batch.is_empty() {
+        return Ok(CrossDomainFlushStats::default());
+    }
     let conn = store
         .begin_transaction()
         .map_err(|e| anyhow::anyhow!("begin_transaction for cross-domain flush: {e}"))?;
-
+    let statements = match flush_on(&conn, batch) {
+        Ok(statements) => statements,
+        Err(error) => {
+            if let Err(rollback) = store.rollback_transaction(&conn) {
+                tracing::warn!(%rollback, "cross-domain flush rollback failed");
+            }
+            return Err(error);
+        }
+    };
+    store
+        .commit_transaction(&conn)
+        .map_err(|e| anyhow::anyhow!("commit_transaction for cross-domain flush: {e}"))?;
     for scanned in batch {
-        nestweaver_store::GraphStore::delete_cross_domain_edges_for_note_on(
-            &conn,
-            &scanned.note_uid,
-        )
-        .map_err(|e| anyhow::anyhow!("delete_cross_domain_edges_for_note_on: {e}"))?;
-
-        if !scanned.note_edges.is_empty() {
-            let refs: Vec<(&str, &str, f32, &str)> = scanned
-                .note_edges
-                .iter()
-                .map(|(n, s, c, src)| (n.as_str(), s.as_str(), *c, *src))
-                .collect();
-            nestweaver_store::GraphStore::batch_insert_note_to_symbol_edges_on(&conn, &refs)
-                .map_err(|e| anyhow::anyhow!("batch_insert_note_to_symbol_edges_on: {e}"))?;
-        }
-
-        if !scanned.section_edges.is_empty() {
-            let refs: Vec<(&str, &str, f32, &str)> = scanned
-                .section_edges
-                .iter()
-                .map(|(s, sym, c, src)| (s.as_str(), sym.as_str(), *c, *src))
-                .collect();
-            nestweaver_store::GraphStore::batch_insert_section_to_symbol_edges_on(&conn, &refs)
-                .map_err(|e| anyhow::anyhow!("batch_insert_section_to_symbol_edges_on: {e}"))?;
-        }
-
         result.notes_scanned += 1;
         result.note_to_symbol_edges += scanned.note_edges.len();
         result.section_to_symbol_edges += scanned.section_edges.len();
     }
+    Ok(CrossDomainFlushStats {
+        transactions: 1,
+        statements,
+    })
+}
 
-    store
-        .commit_transaction(&conn)
-        .map_err(|e| anyhow::anyhow!("commit_transaction for cross-domain flush: {e}"))?;
-    Ok(())
+/// The statements of [`flush_scanned_notes`], on its open transaction.
+/// Returns how many were executed.
+fn flush_on(
+    conn: &nestweaver_store::DbConnection<'_>,
+    batch: &[ScannedNote],
+) -> Result<usize, anyhow::Error> {
+    let note_uids: Vec<&str> = batch.iter().map(|s| s.note_uid.as_str()).collect();
+    let mut statements = GraphStore::delete_cross_domain_edges_for_notes_on(conn, &note_uids)
+        .map_err(|e| anyhow::anyhow!("delete_cross_domain_edges_for_notes_on: {e}"))?;
+
+    let note_edges: Vec<_> = batch
+        .iter()
+        .flat_map(|s| edge_refs(&s.note_edges))
+        .collect();
+    statements += GraphStore::batch_insert_note_to_symbol_edges_on(conn, &note_edges)
+        .map_err(|e| anyhow::anyhow!("batch_insert_note_to_symbol_edges_on: {e}"))?;
+    #[cfg(test)]
+    if FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.replace(false)) {
+        anyhow::bail!("injected cross-domain flush failure");
+    }
+    let section_edges: Vec<_> = batch
+        .iter()
+        .flat_map(|s| edge_refs(&s.section_edges))
+        .collect();
+    statements += GraphStore::batch_insert_section_to_symbol_edges_on(conn, &section_edges)
+        .map_err(|e| anyhow::anyhow!("batch_insert_section_to_symbol_edges_on: {e}"))?;
+    Ok(statements)
+}
+
+fn edge_refs<'a>(
+    edges: &'a [(String, String, f32, &'static str)],
+) -> impl Iterator<Item = (&'a str, &'a str, f32, &'static str)> {
+    edges
+        .iter()
+        .map(|(from, to, conf, src)| (from.as_str(), to.as_str(), *conf, *src))
 }
 
 /// Build a SymbolIndex from the store's symbol list. Pre-build once per
@@ -292,6 +342,9 @@ pub fn discover_cross_domain_links_for_note_with_index(
 
 /// Like [`discover_cross_domain_links_for_note_with_index`] but accepts
 /// [`VaultReaders`] for server-mode bare-clone support.
+///
+/// nw-668: one scan and one transactional flush, the same two steps the bulk
+/// pass runs, rather than a separate per-edge auto-commit path.
 pub fn discover_cross_domain_links_for_note_with_index_and_readers(
     store: &GraphStore,
     note_uid: &str,
@@ -302,19 +355,18 @@ pub fn discover_cross_domain_links_for_note_with_index_and_readers(
         return Ok((0, 0));
     }
     let note = store.lookup_note(note_uid).context("lookup_note")?;
-    let outcome = discover_one_note(store, &note, index, vault_readers)?;
-    match outcome {
-        NoteOutcome::Indexed {
-            note_edges,
-            section_edges,
-        } => Ok((note_edges, section_edges)),
-        NoteOutcome::Skipped => Ok((0, 0)),
+    match scan_one_note(store, &note, index, vault_readers)? {
+        ScanOutcome::Scanned(scanned) => {
+            let mut result = CrossDomainResult::default();
+            flush_scanned_notes(store, std::slice::from_ref(&scanned), &mut result)?;
+            Ok((result.note_to_symbol_edges, result.section_to_symbol_edges))
+        }
+        ScanOutcome::Skipped => Ok((0, 0)),
     }
 }
 
-/// Rebuild cross-domain links for one note only. Called by the watcher
-/// after re-indexing a saved file so the bridges reflect the current
-/// body content. Returns the count of edges emitted.
+/// Rebuild cross-domain links for one note only. Returns the count of
+/// edges emitted.
 pub fn discover_cross_domain_links_for_note(
     store: &GraphStore,
     note_uid: &str,
@@ -326,26 +378,7 @@ pub fn discover_cross_domain_links_for_note(
         return Ok((0, 0));
     }
     let index = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-    if index.is_empty() {
-        return Ok((0, 0));
-    }
-    let note = store.lookup_note(note_uid).context("lookup_note")?;
-    let outcome = discover_one_note(store, &note, &index, &VaultReaders::new())?;
-    match outcome {
-        NoteOutcome::Indexed {
-            note_edges,
-            section_edges,
-        } => Ok((note_edges, section_edges)),
-        NoteOutcome::Skipped => Ok((0, 0)),
-    }
-}
-
-enum NoteOutcome {
-    Indexed {
-        note_edges: usize,
-        section_edges: usize,
-    },
-    Skipped,
+    discover_cross_domain_links_for_note_with_index(store, note_uid, &index)
 }
 
 /// Read-only scan: load the note body, scan for symbol mentions, and
@@ -361,20 +394,36 @@ fn scan_one_note(
         Some(s) => s,
         None => return Ok(ScanOutcome::Skipped),
     };
+    let sections = store.sections_in_note(&note.uid).unwrap_or_default();
+    Ok(ScanOutcome::Scanned(scan_note_source(
+        &note.uid, &body, &sections, index,
+    )))
+}
 
+/// Pure scan of one note's full source text against `index` (nw-668): the
+/// whole-note pass over `source`, then a per-section pass over each
+/// section's line span of it. No I/O, so the vault watcher runs it with no
+/// write lease held, over the exact text its batch parsed and committed.
+///
+/// `sections` must come from parsing `source`: their file-absolute
+/// `start_line`/`end_line` spans index into its lines.
+pub(crate) fn scan_note_source(
+    note_uid: &str,
+    source: &str,
+    sections: &[nestweaver_schema::Section],
+    index: &SymbolIndex,
+) -> ScannedNote {
     // Whole-note pass.
-    let note_matches = index.scan(&body);
-    let mut note_edges: Vec<(String, String, f32, &'static str)> =
-        Vec::with_capacity(note_matches.len());
-    for (sym_uid, conf) in &note_matches {
-        note_edges.push((note.uid.clone(), sym_uid.clone(), *conf, "name-match"));
-    }
+    let note_edges = index
+        .scan(source)
+        .into_iter()
+        .map(|(sym_uid, conf)| (note_uid.to_string(), sym_uid, conf, "name-match"))
+        .collect();
 
     // Per-section pass.
-    let sections = store.sections_in_note(&note.uid).unwrap_or_default();
-    let body_lines: Vec<&str> = body.lines().collect();
+    let body_lines: Vec<&str> = source.lines().collect();
     let mut section_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
-    for sec in &sections {
+    for sec in sections {
         let text = slice_body_lines(&body_lines, sec.start_line, sec.end_line);
         if text.trim().is_empty() {
             continue;
@@ -384,76 +433,18 @@ fn scan_one_note(
         }
     }
 
-    Ok(ScanOutcome::Scanned(ScannedNote {
-        note_uid: note.uid.clone(),
+    ScannedNote {
+        note_uid: note_uid.to_string(),
         note_edges,
         section_edges,
-    }))
+    }
 }
 
-fn discover_one_note(
-    store: &GraphStore,
-    note: &nestweaver_schema::Note,
-    index: &SymbolIndex,
-    vault_readers: &VaultReaders<'_>,
-) -> Result<NoteOutcome, anyhow::Error> {
-    // Load the note body via ContentReader (server/bare-clone mode) or
-    // filesystem fallback (local/daemon mode).
-    let body = match read_note_body(store, note, vault_readers) {
-        Some(s) => s,
-        None => return Ok(NoteOutcome::Skipped),
-    };
-
-    // Delete existing cross-domain edges before re-emitting (idempotency).
-    store
-        .delete_cross_domain_edges_for_note(&note.uid)
-        .context("delete_cross_domain_edges_for_note")?;
-
-    // ── Whole-note pass — coarse edges to every symbol mentioned ────────
-    let note_matches = index.scan(&body);
-    let mut note_edges: Vec<(String, String, f32, &str)> = Vec::new();
-    for (sym_uid, conf) in &note_matches {
-        note_edges.push((note.uid.clone(), sym_uid.clone(), *conf, "name-match"));
+impl ScannedNote {
+    /// Edges this scan will write (note-level plus section-level).
+    pub(crate) fn edge_count(&self) -> usize {
+        self.note_edges.len() + self.section_edges.len()
     }
-    let n_note_edges = note_edges.len();
-    if !note_edges.is_empty() {
-        let refs: Vec<(&str, &str, f32, &str)> = note_edges
-            .iter()
-            .map(|(n, s, c, src)| (n.as_str(), s.as_str(), *c, *src))
-            .collect();
-        store
-            .batch_insert_note_to_symbol_edges(&refs)
-            .context("batch_insert_note_to_symbol_edges")?;
-    }
-
-    // ── Per-section pass — finer-grained edges scoped to section text ───
-    let sections = store.sections_in_note(&note.uid).unwrap_or_default();
-    let body_lines: Vec<&str> = body.lines().collect();
-    let mut sec_edges: Vec<(String, String, f32, &str)> = Vec::new();
-    for sec in &sections {
-        let text = slice_body_lines(&body_lines, sec.start_line, sec.end_line);
-        if text.trim().is_empty() {
-            continue;
-        }
-        for (sym_uid, conf) in index.scan(&text) {
-            sec_edges.push((sec.uid.clone(), sym_uid, conf, "name-match"));
-        }
-    }
-    let n_sec_edges = sec_edges.len();
-    if !sec_edges.is_empty() {
-        let refs: Vec<(&str, &str, f32, &str)> = sec_edges
-            .iter()
-            .map(|(s, sym, c, src)| (s.as_str(), sym.as_str(), *c, *src))
-            .collect();
-        store
-            .batch_insert_section_to_symbol_edges(&refs)
-            .context("batch_insert_section_to_symbol_edges")?;
-    }
-
-    Ok(NoteOutcome::Indexed {
-        note_edges: n_note_edges,
-        section_edges: n_sec_edges,
-    })
 }
 
 /// Concatenate body lines `[start..=end]` (1-based, inclusive). Falls
@@ -520,7 +511,7 @@ impl SymbolIndex {
         Self { by_name }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
 
@@ -876,7 +867,7 @@ mod tests {
             .expect_err("discovery against a read-only store must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("delete_cross_domain_edges_for_note_on"),
+            msg.contains("delete_cross_domain_edges_for_notes_on"),
             "the failing operation must be named, got: {msg}"
         );
         assert!(
@@ -1101,5 +1092,85 @@ mod tests {
         let result = discover_cross_domain_links(&store).unwrap();
         assert_eq!(result.notes_scanned, 0);
         assert_eq!(result.note_to_symbol_edges, 0);
+    }
+
+    /// nw-668: a single-note refresh deleted the note's edges in its own
+    /// auto-committed statements and then inserted, so a failure between the
+    /// two committed a partial set. It is one transaction now: a failure
+    /// rolls back to the note's PREVIOUS edges. (Unlike the vault watcher,
+    /// this path does not recreate the note's nodes first, so its previous
+    /// edges are still there to keep.)
+    #[test]
+    fn a_failed_single_note_flush_keeps_the_notes_previous_edges() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(vault_root.join("a.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        let db_path = dir.path().join("test.lbug");
+        crate::index_md::index_markdown_directory(&vault_root, &db_path, "default", "vault")
+            .unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        for (line, name) in ["AlphaWidget", "BravoWidget"].into_iter().enumerate() {
+            store
+                .insert_symbol(&Symbol {
+                    uid: symbol_uid(&r_uid, "src/w.rs", name, line as u32 + 1),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: r_uid.clone(),
+                    file_path: "src/w.rs".to_string(),
+                    start_line: line as u32 + 1,
+                    end_line: line as u32 + 1,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: "h".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        discover_cross_domain_links(&store).unwrap();
+        let previous = store.list_references_code_edges().unwrap();
+        assert_eq!(previous.len(), 2, "precondition: note + section edge");
+        let note = store.list_notes(None).unwrap().remove(0);
+
+        std::fs::write(
+            vault_root.join("a.md"),
+            "# A\n\nuses AlphaWidget and BravoWidget\n",
+        )
+        .unwrap();
+        FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(true));
+        let failed = discover_cross_domain_links_for_note(&store, &note.uid);
+        FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must surface");
+        assert_eq!(
+            store.list_references_code_edges().unwrap(),
+            previous,
+            "a failed flush must roll back to the previous edges, not commit a partial set"
+        );
+
+        // Counterweight: the same refresh without the failure replaces them.
+        assert_eq!(
+            discover_cross_domain_links_for_note(&store, &note.uid).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(store.list_references_code_edges().unwrap().len(), 4);
     }
 }

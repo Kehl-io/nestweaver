@@ -146,6 +146,23 @@ struct BatchPhaseTimings {
     /// `graph_batch`, unlike the five phases above.
     non_graph_events_ms: u64,
     finalize_ms: u64,
+    /// nw-668: the sidecar phase split into its parts, so a slow one names
+    /// its culprit. `sidecar_scan_ms` runs with no lease held;
+    /// `sidecar_flush_ms` and `sidecar_tantivy_ms` under it.
+    sidecar_scan_ms: u64,
+    sidecar_flush_ms: u64,
+    sidecar_tantivy_ms: u64,
+    /// Cross-domain edges the scan produced for this batch.
+    sidecar_edges: usize,
+    /// Write transactions and statements the cross-domain flush cost.
+    sidecar_transactions: usize,
+    sidecar_statements: usize,
+    /// Changed notes present in the graph whose text this batch did not
+    /// read (oversized): their cross-domain edges are left as they were,
+    /// matching the stored body they still carry.
+    sidecar_scan_skipped: usize,
+    /// Flush chunks that failed and rolled back (non-fatal; logged).
+    sidecar_flush_failures: usize,
 }
 
 /// nw-653: backoff for retrying a failed startup reconciliation. Shared with
@@ -210,6 +227,8 @@ pub struct BrainWatcher {
     /// mutability because `process_batch` takes `&self`.
     #[cfg(test)]
     last_batch_phase_timings: std::sync::Mutex<Option<BatchPhaseTimings>>,
+    #[cfg(test)]
+    sidecar_scan_probe: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl BrainWatcher {
@@ -324,6 +343,8 @@ impl BrainWatcher {
             ready_signal: None,
             #[cfg(test)]
             last_batch_phase_timings: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sidecar_scan_probe: None,
         }
     }
 
@@ -842,7 +863,7 @@ impl BrainWatcher {
             // any deletion. A failed plan or transaction leaves the publication
             // marker dirty and never emits a successful change callback.
             let refresh_watched_paths_started = Instant::now();
-            crate::index_md::refresh_watched_paths(
+            let committed_sources = crate::index_md::refresh_watched_paths(
                 store,
                 &self.vault_root,
                 &self.instance_id,
@@ -857,17 +878,16 @@ impl BrainWatcher {
 
             let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
             let sidecars_started = Instant::now();
-            for path in &graph_paths {
-                let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
-                self.refresh_prepared_note_sidecars(
-                    store,
-                    tantivy,
-                    v_uid,
-                    path,
-                    symbol_index.as_ref(),
-                    &note_tags,
-                )?;
-            }
+            self.refresh_prepared_sidecars(
+                store,
+                tantivy,
+                v_uid,
+                &graph_paths,
+                symbol_index.as_ref(),
+                &note_tags,
+                &committed_sources,
+                &mut phase_timings,
+            )?;
             phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
 
             let tombstones_started = Instant::now();
@@ -942,6 +962,14 @@ impl BrainWatcher {
             embedding_candidates_ms = phase_timings.embedding_candidates_ms,
             refresh_watched_paths_ms = phase_timings.refresh_watched_paths_ms,
             sidecars_ms = phase_timings.sidecars_ms,
+            sidecar_scan_ms = phase_timings.sidecar_scan_ms,
+            sidecar_flush_ms = phase_timings.sidecar_flush_ms,
+            sidecar_tantivy_ms = phase_timings.sidecar_tantivy_ms,
+            sidecar_edges = phase_timings.sidecar_edges,
+            sidecar_transactions = phase_timings.sidecar_transactions,
+            sidecar_statements = phase_timings.sidecar_statements,
+            sidecar_scan_skipped = phase_timings.sidecar_scan_skipped,
+            sidecar_flush_failures = phase_timings.sidecar_flush_failures,
             tombstones_ms = phase_timings.tombstones_ms,
             non_graph_events_ms = phase_timings.non_graph_events_ms,
             finalize_ms = phase_timings.finalize_ms,
@@ -1084,74 +1112,168 @@ impl BrainWatcher {
         Ok(replayed)
     }
 
-    /// Mirror the committed note representation, rather than reading the file
-    /// again: another save can occur while this prepared batch is committing.
+    /// Refresh the cross-domain edges and BM25 docs of every note in a
+    /// committed batch, mirroring the committed note representation rather
+    /// than reading the files again: another save can occur while this
+    /// prepared batch is committing.
+    ///
+    /// nw-668: this used to take the `watch_vault_sidecars` lease once per
+    /// note and, under it, re-read the file from disk and write every
+    /// note→symbol and section→symbol edge as its own auto-committed
+    /// statement — 10K–100K commits for one edited note, holding the write
+    /// lease for up to 22 minutes while reconcilers queued behind it. Now:
+    ///
+    /// 1. SCAN with no lease held: tokenise each changed note's committed
+    ///    text (`sources`, from the refresh that just committed it) against
+    ///    the symbol index, and gather its Tantivy docs.
+    /// 2. FLUSH one [`crate::cross_domain::NOTES_PER_TXN`] chunk per lease:
+    ///    one transaction, set-based statements. Releasing between chunks
+    ///    keeps the gate FIFO-fair for a large replayed batch.
+    /// 3. One Tantivy commit for the whole batch, deletions included, under
+    ///    the last chunk's lease.
+    ///
+    /// A failed flush chunk rolls back whole and stays non-fatal to the
+    /// batch, exactly as the per-note path was. It cannot restore the notes'
+    /// PREVIOUS edges: the refresh that just committed them replaced each
+    /// changed Note and its Sections (`delete_note_cascade_on` DETACH-deletes
+    /// them, edges included). What the transaction guarantees is no PARTIAL
+    /// set — the notes carry no code links until their next edit or a
+    /// `brain refresh`, and the failure is counted and logged. Failing the
+    /// batch instead would heal nothing: the text is committed, so neither a
+    /// retry nor startup reconciliation would see drift to replay.
     #[allow(clippy::too_many_arguments)]
-    fn refresh_prepared_note_sidecars(
+    fn refresh_prepared_sidecars(
         &self,
         store: &GraphStore,
         tantivy: Option<&TantivyIndex>,
         v_uid: &str,
-        path: &Path,
+        paths: &[PathBuf],
         symbols: Option<&crate::cross_domain::SymbolIndex>,
         note_tags: &HashMap<String, Vec<String>>,
+        sources: &HashMap<PathBuf, String>,
+        timings: &mut BatchPhaseTimings,
     ) -> Result<(), anyhow::Error> {
-        let relative = path.strip_prefix(&self.vault_root)?;
-        let uid = note_uid(v_uid, &relative.to_string_lossy());
-        let note = store
-            .lookup_notes_by_uids(std::slice::from_ref(&uid))?
-            .into_iter()
-            .next();
-        let Some(note) = note else {
-            if let Some(index) = tantivy {
-                index.remove_note(&uid)?;
-            }
-            return Ok(());
-        };
-        let cross_domain = if let Some(symbols) = symbols {
-            crate::cross_domain::discover_cross_domain_links_for_note_with_index(
-                store, &uid, symbols,
-            )
-        } else {
-            crate::cross_domain::discover_cross_domain_links_for_note(store, &uid)
-        };
-        if let Err(error) = cross_domain {
-            tracing::warn!(%error, "watcher cross-domain refresh failed");
+        let scan_started = Instant::now();
+        #[cfg(test)]
+        if let Some(probe) = &self.sidecar_scan_probe {
+            probe();
         }
-        if let Some(index) = tantivy {
-            let headings = store.headings_in_note(&uid)?;
-            let sections = store.sections_in_note(&uid)?;
-            let heading_docs: Vec<_> = headings
-                .iter()
-                .map(|h| (h.uid.clone(), h.text.clone()))
-                .collect();
-            let section_docs: Vec<_> = sections
-                .iter()
-                .map(|s| {
-                    let title = s
-                        .heading_uid
-                        .as_ref()
-                        .and_then(|uid| headings.iter().find(|h| &h.uid == uid))
-                        .map(|h| h.text.clone())
-                        .unwrap_or_default();
-                    (s.uid.clone(), s.text_content.clone(), title)
-                })
-                .collect();
-            let mut body = Vec::new();
-            if let Some(raw) = note.frontmatter_raw {
-                body.push(raw);
+        let mut targets = Vec::with_capacity(paths.len());
+        for path in paths {
+            let relative = path.strip_prefix(&self.vault_root)?;
+            let uid = note_uid(v_uid, &relative.to_string_lossy());
+            targets.push((relative.to_path_buf(), uid));
+        }
+        let uids: Vec<String> = targets.iter().map(|(_, uid)| uid.clone()).collect();
+        let notes: HashMap<String, nestweaver_schema::Note> = store
+            .lookup_notes_by_uids(&uids)?
+            .into_iter()
+            .map(|note| (note.uid.clone(), note))
+            .collect();
+        let built_index;
+        let index = match symbols {
+            Some(index) => Some(index),
+            None => match crate::cross_domain::build_symbol_index(store) {
+                Ok(index) => {
+                    built_index = index;
+                    Some(&built_index)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "watcher cross-domain refresh failed");
+                    None
+                }
+            },
+        }
+        // No code indexed: nothing to bridge to, and existing edges are left
+        // alone, as the per-note path did.
+        .filter(|index| !index.is_empty());
+
+        let mut scanned = Vec::new();
+        let mut removals = Vec::new();
+        let mut docs: Vec<nestweaver_store::tantivy_index::NoteDocBatchEntry> = Vec::new();
+        for (relative, uid) in &targets {
+            let Some(note) = notes.get(uid) else {
+                removals.push(uid.clone());
+                continue;
+            };
+            let sections = store.sections_in_note(uid)?;
+            if let Some(index) = index {
+                match sources.get(relative) {
+                    Some(source) => scanned.push(crate::cross_domain::scan_note_source(
+                        uid, source, &sections, index,
+                    )),
+                    None => timings.sidecar_scan_skipped += 1,
+                }
             }
-            body.extend(sections.iter().map(|s| s.text_content.clone()));
-            let names = note_tags.get(&uid).cloned().unwrap_or_default();
-            index.update_note(
-                &uid,
-                &note.title,
-                v_uid,
-                &body,
-                &heading_docs,
-                &section_docs,
-                &names,
-            )?;
+            if tantivy.is_some() {
+                let headings = store.headings_in_note(uid)?;
+                let section_docs: Vec<_> = sections
+                    .iter()
+                    .map(|s| {
+                        let title = s
+                            .heading_uid
+                            .as_ref()
+                            .and_then(|uid| headings.iter().find(|h| &h.uid == uid))
+                            .map(|h| h.text.clone())
+                            .unwrap_or_default();
+                        (s.uid.clone(), s.text_content.clone(), title)
+                    })
+                    .collect();
+                let heading_docs: Vec<_> = headings.into_iter().map(|h| (h.uid, h.text)).collect();
+                let mut body = Vec::new();
+                if let Some(raw) = &note.frontmatter_raw {
+                    body.push(raw.clone());
+                }
+                body.extend(sections.into_iter().map(|s| s.text_content));
+                docs.push((
+                    uid.clone(),
+                    note.title.clone(),
+                    v_uid.to_string(),
+                    body,
+                    heading_docs,
+                    section_docs,
+                    note_tags.get(uid).cloned().unwrap_or_default(),
+                ));
+            }
+        }
+        timings.sidecar_edges = scanned
+            .iter()
+            .map(crate::cross_domain::ScannedNote::edge_count)
+            .sum();
+        timings.sidecar_scan_ms = scan_started.elapsed().as_millis() as u64;
+
+        let chunks: Vec<_> = scanned.chunks(crate::cross_domain::NOTES_PER_TXN).collect();
+        let tantivy_work = tantivy.filter(|_| !docs.is_empty() || !removals.is_empty());
+        let rounds = chunks.len().max(usize::from(tantivy_work.is_some()));
+        for round in 0..rounds {
+            let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
+            if let Some(chunk) = chunks.get(round) {
+                let flush_started = Instant::now();
+                let mut result = crate::cross_domain::CrossDomainResult::default();
+                match crate::cross_domain::flush_scanned_notes(store, chunk, &mut result) {
+                    Ok(stats) => {
+                        timings.sidecar_transactions += stats.transactions;
+                        timings.sidecar_statements += stats.statements;
+                    }
+                    Err(error) => {
+                        timings.sidecar_flush_failures += 1;
+                        tracing::warn!(
+                            %error,
+                            notes = chunk.len(),
+                            "watcher cross-domain refresh failed; these notes keep their \
+                             previous code links until their next edit or `brain refresh`"
+                        );
+                    }
+                }
+                timings.sidecar_flush_ms += flush_started.elapsed().as_millis() as u64;
+            }
+            if round + 1 == rounds
+                && let Some(index) = tantivy_work
+            {
+                let tantivy_started = Instant::now();
+                index.apply_note_batch(&docs, &removals)?;
+                timings.sidecar_tantivy_ms = tantivy_started.elapsed().as_millis() as u64;
+            }
         }
         Ok(())
     }
@@ -3111,5 +3233,421 @@ mod tests {
 
         let after = GraphStore::open(&db_path).unwrap().count_notes().unwrap();
         assert_eq!(before, after, ".obsidian/ files must not be indexed");
+    }
+
+    // ── nw-668: the sidecar phase is set-based, transactional, off-lease ──
+
+    fn nw_668_insert_symbol(store: &GraphStore, repo: &str, name: &str, line: u32) {
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: nestweaver_schema::symbol_uid(repo, "src/lib.rs", name, line),
+                name: name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: repo.to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: line,
+                end_line: line,
+                signature: format!("fn {name}()"),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+    }
+
+    struct Nw668Fixture {
+        _vault_dir: tempfile::TempDir,
+        root: PathBuf,
+        _db_dir: tempfile::TempDir,
+        db_path: PathBuf,
+        store: GraphStore,
+        v_uid: String,
+    }
+
+    /// A vault of `notes` indexed notes plus a repo of `symbols` symbols.
+    fn nw_668_fixture(files: &[(&str, &str)], notes: usize, symbols: &[&str]) -> Nw668Fixture {
+        let mut all: Vec<(String, String)> = (0..notes)
+            .map(|i| (format!("n{i:03}.md"), format!("# N{i}\n\nplain body {i}\n")))
+            .collect();
+        all.extend(files.iter().map(|(p, c)| (p.to_string(), c.to_string())));
+        let borrowed: Vec<(&str, &str)> =
+            all.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let (vault_dir, root) = make_vault(&borrowed);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        insert_watched_repo(&store, &root, "repo:nw668");
+        for (line, name) in symbols.iter().enumerate() {
+            nw_668_insert_symbol(&store, "repo:nw668", name, line as u32 + 1);
+        }
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        Nw668Fixture {
+            _vault_dir: vault_dir,
+            root,
+            _db_dir: db_dir,
+            db_path,
+            store,
+            v_uid,
+        }
+    }
+
+    /// Mentions every name in the whole note and once more in a second
+    /// section, so each edited note yields `k` note edges and `k + 1`
+    /// section edges.
+    fn nw_668_edited_body(title: &str, names: &[String]) -> String {
+        format!(
+            "# {title}\n\n{}\n\n## Tail\n\n{}\n",
+            names.join(" "),
+            names[0]
+        )
+    }
+
+    fn nw_668_statements_for(k: usize) -> (BatchPhaseTimings, usize) {
+        let names: Vec<String> = (0..k).map(|j| format!("Widget{j:04}Handler")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let fx = nw_668_fixture(&[], 200, &name_refs);
+        for i in 0..2 {
+            fs::write(
+                fx.root.join(format!("n{i:03}.md")),
+                nw_668_edited_body(&format!("Edited {i}"), &names),
+            )
+            .unwrap();
+        }
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+        let edges = fx.store.list_references_code_edges().unwrap().len();
+        (watcher.last_batch_phase_timings().unwrap(), edges)
+    }
+
+    /// nw-668: the watcher wrote every note→symbol and section→symbol edge
+    /// as its own auto-committed statement, so one edited note with 10K–100K
+    /// name matches cost as many commits and held the write lease for up to
+    /// 22 minutes. The flush must be set-based: the statement and
+    /// transaction counts depend on how many NOTES a batch touches, never on
+    /// how many symbols each note mentions.
+    #[test]
+    fn nw_668_sidecar_flush_statements_do_not_scale_with_matches_per_note() {
+        let _guard = serial_watcher_test();
+        let (small, small_edges) = nw_668_statements_for(10);
+        let (large, large_edges) = nw_668_statements_for(500);
+
+        // Counterweight: the fixture really does produce K-proportional
+        // edges, so equal statement counts below are not two empty flushes.
+        assert_eq!(small_edges, 2 * (10 + 10 + 1));
+        assert_eq!(large_edges, 2 * (500 + 500 + 1));
+
+        assert!(
+            small.sidecar_transactions <= 2usize.div_ceil(crate::cross_domain::NOTES_PER_TXN),
+            "a 2-note batch flushes in ONE transaction: {small:?}"
+        );
+        assert_eq!(small.sidecar_transactions, large.sidecar_transactions);
+        assert_eq!(
+            small.sidecar_statements, large.sidecar_statements,
+            "statements must not scale with matches per note: K=10 {small:?} vs K=500 {large:?}"
+        );
+        assert!(
+            large.sidecar_statements <= 4,
+            "one delete per edge kind and one insert per edge kind: {large:?}"
+        );
+        assert_eq!(large.sidecar_edges, 2 * (500 + 500 + 1));
+    }
+
+    /// nw-668: the lease was taken once PER NOTE and held across the scan.
+    /// The scan (tokenising bodies against a 200K-symbol index) is read-only
+    /// and must run with no lease held; the flush takes one lease per
+    /// NOTES_PER_TXN chunk, so a 2-note batch takes exactly one.
+    #[test]
+    fn nw_668_sidecars_scan_off_lease_and_take_one_lease_per_chunk() {
+        use std::sync::atomic::AtomicI32;
+
+        struct LiveLease(Arc<AtomicI32>);
+        impl Drop for LiveLease {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 3, &["AlphaWidget", "BravoWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses BravoWidget\n").unwrap();
+
+        let live = Arc::new(AtomicI32::new(0));
+        let labels = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let (live_f, labels_f) = (Arc::clone(&live), Arc::clone(&labels));
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            labels_f.lock().unwrap().push(label);
+            live_f.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(LiveLease(Arc::clone(&live_f))) as Box<dyn WatchMutationLease>)
+        });
+        let observed = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let (observed_p, live_p) = (Arc::clone(&observed), Arc::clone(&live));
+        let mut watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_mutation_lease_factory(factory);
+        watcher.sidecar_scan_probe = Some(Box::new(move || {
+            observed_p
+                .lock()
+                .unwrap()
+                .push(live_p.load(Ordering::SeqCst));
+        }));
+
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+
+        let sidecar_leases = labels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|label| **label == "watch_vault_sidecars")
+            .count();
+        assert_eq!(sidecar_leases, 1, "labels: {:?}", labels.lock().unwrap());
+        let observed = observed.lock().unwrap().clone();
+        assert!(!observed.is_empty(), "the scan probe must have run");
+        assert!(
+            observed.iter().all(|live| *live == 0),
+            "the cross-domain scan must run with NO lease held: {observed:?}"
+        );
+        // Counterweight: the edges were still written.
+        assert_eq!(fx.store.list_references_code_edges().unwrap().len(), 4);
+    }
+
+    /// nw-668: moving the scan off the disk re-read (onto the text the batch
+    /// committed) and onto set-based statements must not change WHICH edges
+    /// exist. The fixture covers every shape the old whole-file scan saw:
+    /// frontmatter, heading text, a preamble, a link inside a heading, a
+    /// setext heading, a repeated mention, a stoplisted and a too-short name,
+    /// and a trailing empty section. Pinned twice: against the literal set
+    /// the pre-nw-668 path produced (characterised on that code), and
+    /// against the bulk `discover_cross_domain_links` pass over the same
+    /// files.
+    #[test]
+    fn nw_668_watcher_edges_equal_the_pre_change_and_bulk_edge_sets() {
+        let _guard = serial_watcher_test();
+        let symbols = [
+            "FrontThing",
+            "HeadThing",
+            "PreambleThing",
+            "LinkThing",
+            "UrlThing",
+            "SetextThing",
+            "BodyThing",
+            "TwiceThing",
+            "Error",
+            "Foo",
+            "NeverMentioned",
+        ];
+        let fx = nw_668_fixture(&[], 2, &symbols);
+        fs::write(
+            fx.root.join("n000.md"),
+            "---\nrelated: FrontThing\n---\nPreambleThing intro\n\n\
+             # HeadThing title\n\nBodyThing TwiceThing TwiceThing Error Foo\n\n\
+             ## See [LinkThing](https://example.com/UrlThing)\n\nTwiceThing again\n\n\
+             SetextThing\n-----------\n\nplain\n\n## Empty\n",
+        )
+        .unwrap();
+        fs::write(fx.root.join("n001.md"), "# Other\n\nBodyThing only\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+
+        // Render every edge as `<note-file>[:<section start line>] -> <symbol name>`.
+        let render = |store: &GraphStore| -> Vec<String> {
+            let mut labels: HashMap<String, String> = HashMap::new();
+            for file in ["n000.md", "n001.md"] {
+                let uid = note_uid(&fx.v_uid, file);
+                for section in store.sections_in_note(&uid).unwrap() {
+                    labels.insert(section.uid, format!("{file}:{}", section.start_line));
+                }
+                labels.insert(uid, file.to_string());
+            }
+            let mut out: Vec<String> = store
+                .list_references_code_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(from, to, confidence, source)| {
+                    let name = symbols
+                        .iter()
+                        .find(|name| {
+                            let line = symbols.iter().position(|n| n == *name).unwrap() as u32 + 1;
+                            nestweaver_schema::symbol_uid("repo:nw668", "src/lib.rs", name, line)
+                                == to
+                        })
+                        .unwrap();
+                    format!(
+                        "{} -> {name} ({confidence:.1}, {source})",
+                        labels.get(&from).cloned().unwrap_or(from)
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let watched = render(&fx.store);
+        let expected: Vec<String> = vec![
+            "n000.md -> BodyThing (0.9, name-match)",
+            "n000.md -> FrontThing (0.9, name-match)",
+            "n000.md -> HeadThing (0.9, name-match)",
+            "n000.md -> LinkThing (0.9, name-match)",
+            "n000.md -> PreambleThing (0.9, name-match)",
+            "n000.md -> SetextThing (0.9, name-match)",
+            "n000.md -> TwiceThing (0.9, name-match)",
+            "n000.md -> UrlThing (0.9, name-match)",
+            "n000.md:11 -> TwiceThing (0.9, name-match)",
+            "n000.md:4 -> PreambleThing (0.9, name-match)",
+            "n000.md:7 -> BodyThing (0.9, name-match)",
+            "n000.md:7 -> TwiceThing (0.9, name-match)",
+            "n001.md -> BodyThing (0.9, name-match)",
+            "n001.md:2 -> BodyThing (0.9, name-match)",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            watched, expected,
+            "watcher edge set drifted from pre-nw-668"
+        );
+
+        crate::cross_domain::discover_cross_domain_links(&fx.store).unwrap();
+        assert_eq!(
+            render(&fx.store),
+            watched,
+            "the watcher and the bulk pass must agree on the same files"
+        );
+    }
+
+    /// nw-668: a batch that edits two notes and deletes a third paid one
+    /// Tantivy commit (fsync + reader reload) per note under the lease. It
+    /// must pay one for the whole batch — deletions included.
+    #[test]
+    fn nw_668_one_tantivy_commit_per_batch() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 3, &["AlphaWidget"]);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        tantivy.reindex_from_store(&fx.store).unwrap();
+        let deleted = note_uid(&fx.v_uid, "n002.md");
+        assert!(
+            tantivy
+                .search("N2", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.uid == deleted || hit.note_uid == deleted),
+            "precondition: the note to delete is searchable"
+        );
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget zebra\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses AlphaWidget yak\n").unwrap();
+        fs::remove_file(fx.root.join("n002.md")).unwrap();
+        let before = tantivy.commit_count();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(
+                &fx.store,
+                Some(&tantivy),
+                &fx.v_uid,
+                vec![
+                    fx.root.join("n000.md"),
+                    fx.root.join("n001.md"),
+                    fx.root.join("n002.md"),
+                ],
+                &None,
+            )
+            .unwrap();
+        assert_eq!(tantivy.commit_count() - before, 1);
+        // Counterweight: the one commit carried all three changes.
+        assert!(!tantivy.search("zebra", 10).unwrap().is_empty());
+        assert!(!tantivy.search("yak", 10).unwrap().is_empty());
+        assert!(
+            tantivy
+                .search("N2", 10)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.uid != deleted && hit.note_uid != deleted),
+            "the deleted note's docs must be gone"
+        );
+    }
+
+    /// nw-668: the old path inserted a note's edges in auto-committed
+    /// statements, so a failure part-way left a partial set (note-level edges
+    /// without their section-level twins). The flush is one transaction: a
+    /// failure leaves none of the chunk's new edges. It stays non-fatal to
+    /// the batch, as before — the note's text is still published — and is
+    /// counted so the batch-complete line discloses it.
+    #[test]
+    fn nw_668_failed_flush_is_all_or_nothing_and_non_fatal() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let batch = || vec![fx.root.join("n000.md")];
+
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses BravoWidget now\n").unwrap();
+        crate::cross_domain::FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(true));
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        let result = watcher.process_batch(&fx.store, None, &fx.v_uid, batch(), &callback);
+        crate::cross_domain::FAIL_NEXT_CROSS_DOMAIN_FLUSH.with(|fail| fail.set(false));
+        result.unwrap();
+        assert_eq!(
+            fx.store.list_references_code_edges().unwrap(),
+            Vec::new(),
+            "a failed flush must commit none of its edges, not the note-level half"
+        );
+        assert_eq!(
+            watcher
+                .last_batch_phase_timings()
+                .unwrap()
+                .sidecar_flush_failures,
+            1
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "non-fatal: the committed text is still published"
+        );
+
+        // Counterweight: the next clean batch writes the full set.
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, batch(), &None)
+            .unwrap();
+        let bravo = nestweaver_schema::symbol_uid("repo:nw668", "src/lib.rs", "BravoWidget", 2);
+        let now: Vec<_> = fx
+            .store
+            .list_references_code_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(_, to, _, _)| to)
+            .collect();
+        assert_eq!(now, vec![bravo.clone(), bravo]);
     }
 }
