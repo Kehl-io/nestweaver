@@ -5152,7 +5152,12 @@ fn list_repos_and_stale_check_json_carry_uid_and_display_name() {
         .success();
 
     let list_repos_out = nestweaver_cmd()
-        .args(["list-repos", "--json", "--db", &db_path.display().to_string()])
+        .args([
+            "list-repos",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -5181,7 +5186,12 @@ fn list_repos_and_stale_check_json_carry_uid_and_display_name() {
     );
 
     let stale_check_out = nestweaver_cmd()
-        .args(["stale-check", "--json", "--db", &db_path.display().to_string()])
+        .args([
+            "stale-check",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()

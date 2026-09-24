@@ -256,13 +256,7 @@ pub fn lookup_symbol(
                 if !in_instance(&sym.repo_uid) {
                     return Ok(LookupResult::NotFound);
                 }
-                let callers = store.callers_of(&sym.uid).context("fetch callers")?;
-                let callees = store.callees_of(&sym.uid).context("fetch callees")?;
-                Ok(LookupResult::Found(Box::new(SymbolDetail {
-                    symbol: sym,
-                    callers,
-                    callees,
-                })))
+                found_symbol_detail(store, sym)
             }
             Err(nestweaver_store::StoreError::NotFound) => Ok(LookupResult::NotFound),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -280,13 +274,7 @@ pub fn lookup_symbol(
             0 => Ok(LookupResult::NotFound),
             1 => {
                 let sym = matches.into_iter().next().expect("checked len == 1");
-                let callers = store.callers_of(&sym.uid).context("fetch callers")?;
-                let callees = store.callees_of(&sym.uid).context("fetch callees")?;
-                Ok(LookupResult::Found(Box::new(SymbolDetail {
-                    symbol: sym,
-                    callers,
-                    callees,
-                })))
+                found_symbol_detail(store, sym)
             }
             _ => {
                 let candidates = matches.iter().map(SymbolCandidate::from).collect();
@@ -294,6 +282,45 @@ pub fn lookup_symbol(
             }
         }
     }
+}
+
+/// Build the `Found` result for a resolved symbol: fetch its call-graph
+/// neighbours and hydrate `pagerank_score` for the symbol AND its
+/// callers/callees from the store's PageRank cache. Shared by both
+/// `lookup_symbol` paths (UID and name) so they cannot drift from each
+/// other.
+///
+/// nw-547: the `pagerank_score` DB COLUMN `row_to_symbol` reads is never
+/// populated, so every `Symbol` this crate builds carries a confident
+/// `Some(0.0)` regardless of its real rank. The genuine per-UID scores live
+/// only in the store's PageRank cache — the same source `hubs` / `ranking
+/// rank` read, and the same accessor `export.rs` already uses for the graph
+/// export path. `pagerank_scores()` is called ONCE here rather than once per
+/// symbol so the symbol plus its callers/callees share a single cache read.
+///
+/// `None` on a symbol means genuinely unavailable: no computed score exists
+/// for that uid, or the cache itself is unavailable right now (e.g. mid a
+/// dirty index publication) — never a fabricated zero. A lookup failure here
+/// must not fail the whole symbol lookup, since pagerank is supplementary
+/// metadata on top of the symbol identity the caller actually asked for.
+fn found_symbol_detail(
+    store: &GraphStore,
+    mut symbol: Symbol,
+) -> Result<LookupResult, anyhow::Error> {
+    let mut callers = store.callers_of(&symbol.uid).context("fetch callers")?;
+    let mut callees = store.callees_of(&symbol.uid).context("fetch callees")?;
+    let scores = store.pagerank_scores().ok();
+    let hydrate = |sym: &mut Symbol| {
+        sym.pagerank_score = scores.as_ref().and_then(|m| m.get(&sym.uid).copied());
+    };
+    hydrate(&mut symbol);
+    callers.iter_mut().for_each(hydrate);
+    callees.iter_mut().for_each(hydrate);
+    Ok(LookupResult::Found(Box::new(SymbolDetail {
+        symbol,
+        callers,
+        callees,
+    })))
 }
 
 /// Search for symbols whose name contains `query` (substring match).
@@ -5122,6 +5149,126 @@ mod instance_validation_tests {
         assert!(
             msg.contains("instance merge --from c37ccf01 --to kory-brain"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pagerank_hydration_tests {
+    use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphScope, GraphStore};
+
+    use super::{LookupResult, lookup_symbol};
+
+    fn symbol(uid: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: "anything".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            signature: "fn anything()".to_string(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// nw-547: `symbol --json` (via `lookup_symbol`, the single implementation
+    /// shared by the daemon `symbol_lookup` RPC and the CLI's direct route)
+    /// must report the REAL pagerank score — the same value `ranking rank` /
+    /// `hubs` read from the store's PageRank cache — not the DB
+    /// `pagerank_score` COLUMN, which is never populated and always reads
+    /// back as `Some(0.0)`.
+    #[test]
+    fn lookup_symbol_reports_the_real_pagerank_score() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store.insert_symbol(&symbol("sym:1")).unwrap();
+
+        // Force a real PageRank compute (mirrors what `hubs`/`ranking rank`
+        // trigger) so this test compares against a genuinely computed score
+        // rather than an accidental default.
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let expected = *store
+            .pagerank_scores()
+            .unwrap()
+            .get("sym:1")
+            .expect("computed score");
+        assert!(
+            expected > 0.0,
+            "sanity: even a lone node gets a nonzero baseline PageRank score"
+        );
+
+        let detail = match lookup_symbol(&store, "sym:1", None).unwrap() {
+            LookupResult::Found(detail) => detail,
+            LookupResult::NotFound => panic!("symbol not found"),
+            LookupResult::Ambiguous(_) => panic!("unexpectedly ambiguous"),
+        };
+        assert_eq!(
+            detail.symbol.pagerank_score,
+            Some(expected),
+            "symbol --json's pagerank_score must match ranking rank / hubs for the same uid"
+        );
+    }
+
+    /// Counterweight: when the PageRank cache is genuinely unavailable (a
+    /// dirty index publication in flight — the same condition `hubs`/
+    /// `ranking rank` fail closed on), the field must be `None`/`null`, never
+    /// a fabricated `0.0` masquerading as a real answer.
+    #[test]
+    fn lookup_symbol_reports_no_score_when_ranking_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&symbol("sym:1")).unwrap();
+
+        let publication = store.acquire_index_publication_lease().unwrap();
+        store
+            .with_index_publication_rank_barrier(|| -> Result<u64, nestweaver_store::StoreError> {
+                std::fs::write(&marker_path, b"dirty")
+                    .map_err(|error| nestweaver_store::StoreError::Query(error.to_string()))?;
+                publication.reserve_generation()
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                store.pagerank_scores(),
+                Err(nestweaver_store::StoreError::RankingUnavailable)
+            ),
+            "sanity: the dirty publication must actually block ranking"
+        );
+
+        let detail = match lookup_symbol(&store, "sym:1", None).unwrap() {
+            LookupResult::Found(detail) => detail,
+            LookupResult::NotFound => panic!("symbol not found"),
+            LookupResult::Ambiguous(_) => panic!("unexpectedly ambiguous"),
+        };
+        assert_eq!(
+            detail.symbol.pagerank_score, None,
+            "genuinely unavailable ranking must surface as None, not a fabricated 0.0"
         );
     }
 }

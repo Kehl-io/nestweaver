@@ -2078,7 +2078,11 @@ impl BodyUnavailable {
 /// silently emptied every body for a caller who omitted `root`. Only symbols
 /// have an owning repo to resolve this way; non-symbol UIDs never reach this
 /// function (see the match in [`fetch_full_body`]).
-fn resolve_symbol_body_root(store: &GraphStore, uid: &str, root: Option<&Path>) -> std::path::PathBuf {
+fn resolve_symbol_body_root(
+    store: &GraphStore,
+    uid: &str,
+    root: Option<&Path>,
+) -> std::path::PathBuf {
     if let Some(explicit) = root {
         return explicit.to_path_buf();
     }
@@ -3307,14 +3311,9 @@ mod tests {
         )
         .unwrap();
 
-        let hydrated = investigate_hydrate(
-            &store,
-            &db_path,
-            Some(&alt),
-            &result.bundle_id,
-            Some(4000),
-        )
-        .unwrap();
+        let hydrated =
+            investigate_hydrate(&store, &db_path, Some(&alt), &result.bundle_id, Some(4000))
+                .unwrap();
 
         let symbol_entry = hydrated
             .entries
@@ -3754,7 +3753,8 @@ mod tests {
             .count();
 
         let hydrated =
-            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000))
+                .unwrap();
         assert!(
             hydrated.hydrated <= missing_before,
             "cannot hydrate more entries than were missing"
@@ -3811,7 +3811,8 @@ mod tests {
         .unwrap();
 
         let hydrated =
-            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000)).unwrap();
+            investigate_hydrate(&store, &db_path, Some(&src), &result.bundle_id, Some(4000))
+                .unwrap();
         // Every hydrated entry must have an inline_body and a body_complete
         // value that reflects whether truncation actually happened (i.e. the
         // flag is `false` iff char count == the cap).
@@ -6368,7 +6369,8 @@ mod tests {
 
         // A huge body truncates to INLINE_MAX_BODY_TOKENS (400) tokens; the
         // tiny body costs only a few. Budget 450 fits hugeA + tinyC.
-        let res = investigate_hydrate(&store, &db_path, Some(&src), "bndl_test", Some(450)).unwrap();
+        let res =
+            investigate_hydrate(&store, &db_path, Some(&src), "bndl_test", Some(450)).unwrap();
         assert_eq!(
             res.hydrated, 2,
             "the tiny entry after an over-budget body must still hydrate"

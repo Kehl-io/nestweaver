@@ -266,8 +266,7 @@ pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_
         repos
             .iter()
             .map(|repo| {
-                let mut value =
-                    serde_json::to_value(repo).unwrap_or(serde_json::Value::Null);
+                let mut value = serde_json::to_value(repo).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(ref mut map) = value {
                     map.insert(
                         "display_name".to_string(),
@@ -870,8 +869,18 @@ mod repo_selector_tests {
     #[test]
     fn repos_json_with_display_name_adds_resolved_name_without_touching_raw_name() {
         let repos = vec![
-            repo("repo:a", "https://example.test/org/api.git", Some("api"), None),
-            repo("repo:b", "https://example.test/org/other-thing.git", None, None),
+            repo(
+                "repo:a",
+                "https://example.test/org/api.git",
+                Some("api"),
+                None,
+            ),
+            repo(
+                "repo:b",
+                "https://example.test/org/other-thing.git",
+                None,
+                None,
+            ),
         ];
         let value = repos_json_with_display_name(&repos);
         let rows = value.as_array().expect("array of repo rows");
