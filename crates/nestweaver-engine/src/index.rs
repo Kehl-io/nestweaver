@@ -6476,10 +6476,15 @@ fn incremental_index_with_name_and_io_and_authority(
             return Err(error).context("prepare incremental contract derivation");
         }
     };
-    result
-        .skipped_files
-        .extend(contract_plan.skipped_files.iter().cloned());
-    result.files_skipped += contract_plan.skipped_files.len();
+    // nw-664 review: through the one dedupe the per-file rows use, so a file
+    // both the contract plan and the change loop skip (a binary `.ts`) is one
+    // row and one `files_skipped`, whatever order the two report in.
+    for skipped in &contract_plan.skipped_files {
+        record_incremental_file_outcome(
+            &mut result,
+            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+        );
+    }
     // nw-387 RESIDUAL: the changed-file half of the same durability problem.
     // Free here — `prepare_incremental_contract_derivation` has just walked the
     // tree via `list_files`, so the recorder is populated and current.
@@ -6879,10 +6884,15 @@ where
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
     let mut result = IncrementalResult::default();
-    result
-        .skipped_files
-        .extend(contract_plan.skipped_files.iter().cloned());
-    result.files_skipped += contract_plan.skipped_files.len();
+    // nw-664 review: through the one dedupe the per-file rows use, so a file
+    // both the contract plan and the change loop skip (a binary `.ts`) is one
+    // row and one `files_skipped`, whatever order the two report in.
+    for skipped in &contract_plan.skipped_files {
+        record_incremental_file_outcome(
+            &mut result,
+            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+        );
+    }
     // nw-387: same drain as the CLI incremental path, so the daemon's view of a
     // repo's coverage matches the CLI's instead of being quietly rosier.
     // `prepare_incremental_contract_derivation` above has just walked, so the
@@ -8170,6 +8180,43 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", message]);
         git
+    }
+
+    /// nw-664 review: a binary file with a contract-language extension (an
+    /// MPEG transport stream is `.ts`) used to fail a plain incremental index
+    /// in strict contract derivation ("prepare incremental contract
+    /// derivation"). It is a policy skip like everywhere else (nw-355): the
+    /// index succeeds and discloses it as exactly ONE `Binary` row, although
+    /// both the contract plan and the changed-file loop see it.
+    #[test]
+    fn an_incremental_index_skips_a_binary_contract_language_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("app.ts"), "export function app() { return 1; }\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let head = git(&["rev-parse", "HEAD"]);
+        let db = dir.path().join("graph.lbug");
+        let repo_url = "https://example.test/binary-ts";
+        index_directory(&repo, &db, "test", repo_url, &head).unwrap();
+
+        fs::write(
+            repo.join("clip.ts"),
+            b"G\x40\x00\x10\x00\x00\xb0\x0d\x00\x01",
+        )
+        .unwrap();
+        git(&["add", "clip.ts"]);
+        git(&["commit", "-q", "-m", "add a transport stream"]);
+        let result = incremental_index(&repo, &db, "test", repo_url)
+            .expect("a binary .ts must not fail the incremental index");
+        let binary_rows: Vec<_> = result
+            .skipped_files
+            .iter()
+            .filter(|row| row.path == "clip.ts")
+            .collect();
+        assert_eq!(binary_rows.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(binary_rows[0].reason_code, SkipReasonCode::Binary);
+        assert_eq!(result.files_skipped, result.skipped_files.len());
     }
 
     #[test]
