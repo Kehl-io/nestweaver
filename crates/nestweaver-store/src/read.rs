@@ -1655,11 +1655,75 @@ impl GraphStore {
 
     /// Count of all Note nodes (cheap for status output — no body load).
     pub fn count_notes(&self) -> Result<usize, StoreError> {
+        // nw-648 review: an aggregate, not a fetch of every uid to count rows.
         let conn = self.conn()?;
-        let result = conn
-            .query("MATCH (n:Note) RETURN n.uid")
+        let mut result = conn
+            .query("MATCH (n:Note) RETURN count(n)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        Ok(result.count())
+        match result.next() {
+            Some(row) => Ok(usize::try_from(extract_i64(&row, 0)?).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// nw-648: note count for ONE vault, as an aggregate.
+    pub fn count_notes_in_vault(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("vid", Value::String(vault_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(usize::try_from(extract_i64(&row, 0)?).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// nw-648: one uid-ordered page of notes strictly after `after`, optionally
+    /// within one vault. Keyset paging: every page costs one bounded top-k, so
+    /// a vault of any size pages to completion — unlike `offset`, whose scan
+    /// grows with the skip and is therefore capped by its callers.
+    pub fn list_notes_after(
+        &self,
+        vault_uid: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Note>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(vid) = vault_uid {
+            clauses.push("n.vault_uid = $vid");
+            params.push(("vid", Value::String(vid.to_string())));
+        }
+        if let Some(after) = after {
+            clauses.push("n.uid > $after");
+            params.push(("after", Value::String(after.to_string())));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        // LIMIT is inlined (Ladybug/Kuzu does not bind it); a usize from code.
+        let q = format!(
+            "MATCH (n:Note){where_clause} RETURN {NOTE_COLUMNS} ORDER BY n.uid LIMIT {limit}"
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        Ok(collect_tolerating_corrupt(result.map(|row| row_to_note(&row)), "list_notes_after")?.0)
     }
 
     /// nw-648: note count per vault uid, in one aggregate query. The web

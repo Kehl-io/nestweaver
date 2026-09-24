@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 interface CollapsibleProps {
   title: string;
-  count?: number;
+  count?: number | string;
   defaultOpen?: boolean;
   active?: boolean;
   children: ReactNode;

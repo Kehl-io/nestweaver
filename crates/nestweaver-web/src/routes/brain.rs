@@ -98,6 +98,10 @@ pub struct ListNotesParams {
     /// ignored, returning the first vault's page.
     #[serde(alias = "vault_uid")]
     pub vault: Option<String>,
+    /// nw-648: keyset cursor — return notes whose uid sorts after this one.
+    /// Pages of any vault size reach the end, where `offset` stops at
+    /// [`LIST_NOTES_LIMIT_MAX`]. Cannot be combined with `offset`.
+    pub after: Option<String>,
 }
 
 pub async fn list_notes(
@@ -126,21 +130,28 @@ pub async fn list_notes(
     let total = match vault {
         Some(uid) => {
             // An unknown vault is a 404, not an empty page that reads as
-            // "this vault has no notes".
-            state
-                .store
-                .lookup_vault(uid)
-                .map_err(|_| ApiError::not_found(format!("vault '{uid}' not found")))?;
-            state
-                .store
-                .note_counts_by_vault()?
-                .get(uid)
-                .copied()
-                .unwrap_or(0)
+            // "this vault has no notes". Any OTHER store failure propagates:
+            // a broken database is not a missing vault.
+            match state.store.lookup_vault(uid) {
+                Ok(_) => {}
+                Err(nestweaver_store::StoreError::NotFound) => {
+                    return Err(ApiError::not_found(format!("vault '{uid}' not found")));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            state.store.count_notes_in_vault(uid)?
         }
         None => state.store.count_notes()?,
     };
-    let notes = state.store.list_notes_page(vault, limit, offset)?;
+    let notes = match params.after.as_deref() {
+        Some(_) if params.offset.is_some() => {
+            return Err(ApiError::bad_request(
+                "`after` and `offset` cannot be combined; page with one or the other",
+            ));
+        }
+        Some(after) => state.store.list_notes_after(vault, Some(after), limit)?,
+        None => state.store.list_notes_page(vault, limit, offset)?,
+    };
     let json = serde_json::to_value(&notes)?;
     let mut response = Json(json).into_response();
     response.headers_mut().insert(

@@ -1079,6 +1079,61 @@ async fn brain_notes_vault_filter_selects_that_vault_and_discloses_its_total() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// nw-648 review: the offset ceiling (offset <= 1000, page <= 1000) left
+/// notes past the 2000th unreachable, and the live main vault is ~1960 notes.
+/// A vault-filtered listing pages by uid cursor (`?after=`), so a vault of any
+/// size is covered exactly: no overlap, no skip.
+#[tokio::test]
+async fn brain_notes_cursor_pages_a_vault_past_the_offset_ceiling() {
+    const BIG: usize = 2005;
+    let store = setup_test_store();
+    insert_named_vault_notes(&store, "vlt:big", "big", BIG);
+    insert_named_vault_notes(&store, "vlt:docs", "kehl-craft-docs", 4);
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/test.lbug"),
+    ));
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &after {
+            Some(uid) => format!("/api/v1/brain/notes?vault=vlt:big&limit=1000&after={uid}"),
+            None => "/api/v1/brain/notes?vault=vlt:big&limit=1000".to_string(),
+        };
+        let (status, json, total) = get_json_with_total(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(total, Some(BIG));
+        let rows = json.as_array().expect("still a raw array");
+        assert!(rows.iter().all(|row| row["vault_uid"] == "vlt:big"));
+        if rows.is_empty() {
+            break;
+        }
+        seen.extend(
+            rows.iter()
+                .map(|row| row["uid"].as_str().unwrap().to_string()),
+        );
+        after = seen.last().cloned();
+        if rows.len() < 1000 {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), BIG, "the cursor must reach every note");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, seen, "pages are uid-ordered with no overlap");
+
+    // A cursor and an offset together are contradictory.
+    let (status, _, _) = get_json_with_total(
+        &app,
+        "/api/v1/brain/notes?vault=vlt:big&after=note:big:0001&offset=5",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn brain_vaults_report_each_vaults_true_note_count() {
     let app = two_vault_app();

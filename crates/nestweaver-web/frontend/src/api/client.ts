@@ -28,11 +28,6 @@ import { normalizeBrainContext } from "./context";
 
 /** Page size the notes route allows (`LIST_NOTES_LIMIT_MAX`). */
 export const NOTES_PAGE_SIZE = 1000;
-/**
- * The notes route serves no offset past `LIST_NOTES_LIMIT_MAX`, so a vault's
- * first `NOTES_MAX_REACHABLE` notes are listable; the rest must be disclosed.
- */
-export const NOTES_MAX_REACHABLE = 2 * NOTES_PAGE_SIZE;
 
 export class ApiError extends Error {
   status: number;
@@ -151,14 +146,12 @@ export const api = {
 
   // NotesTab is a catalog, not a "top N" view, so it requests the API maximum
   // page (1000) PER VAULT (nw-648: one unfiltered page held only the first
-  // vault). The handler still caps omitted `limit` at 20 so curl/MCP cannot
-  // dump the whole vault; `total` comes from `X-Total-Count`.
-  async brainNotesPage(vaultUid: string, offset = 0, limit = NOTES_PAGE_SIZE): Promise<NotesPage> {
-    const params = new URLSearchParams({
-      vault: vaultUid,
-      limit: String(limit),
-      offset: String(offset),
-    });
+  // vault) and pages on with the uid cursor `after`, which reaches the end
+  // of a vault of any size. The handler still caps omitted `limit` at 20 so
+  // curl/MCP cannot dump the whole vault; `total` comes from `X-Total-Count`.
+  async brainNotesPage(vaultUid: string, after?: string, limit = NOTES_PAGE_SIZE): Promise<NotesPage> {
+    const params = new URLSearchParams({ vault: vaultUid, limit: String(limit) });
+    if (after !== undefined) params.set("after", after);
     const res = await fetch(`/api/v1/brain/notes?${params}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));
