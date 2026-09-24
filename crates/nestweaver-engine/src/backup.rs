@@ -47,6 +47,13 @@ use std::time::{Duration, Instant};
 ///   remove orphaned instances of this prefix.
 ///
 /// Known sidecar suffixes to include in backups.
+///
+/// `.vault-registrations.json` (nw-587) is deliberately NOT listed: it is
+/// evidence about which vaults the LIVE database has published, used to
+/// disclose vaults a WAL move-aside dropped. Restoring an older copy of it
+/// would make a restored database claim registrations it never had, and after
+/// a restore any vault added since the backup is correctly reported missing
+/// from the current file.
 const SIDECAR_SUFFIXES: &[&str] = &[
     ".tantivy",
     ".regex-v3",

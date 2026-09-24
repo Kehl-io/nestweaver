@@ -6495,7 +6495,8 @@ enum Commands {
     ///
     /// Runs community detection on the code graph and prints a summary of
     /// each cluster. Results are cached in a sidecar file alongside the
-    /// database so subsequent invocations are instant.
+    /// database and reused while the graph generation is unchanged, so
+    /// repeat invocations skip the recompute.
     #[command(
         after_help = "Examples:\n  nestweaver clusters\n  nestweaver clusters --resolution 0.5 --json"
     )]
