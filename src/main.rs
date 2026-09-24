@@ -17726,7 +17726,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // replaces was a copy of the text arm with the bounding
                     // removed, which is exactly how the two routes came to
                     // disagree about whether `--limit` means anything.
-                    print_clusters_output_with_total(&output, false, limit, members, total)?;
+                    print_clusters_output_with_total(
+                        &output, false, limit, members, total, None, false,
+                    )?;
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -17776,7 +17778,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 out.status(&format!(
                     "Using cached clusters (resolution={effective_resolution}, generation={current_generation}) from sidecar."
                 ));
-                print_clusters_output(&cached_output, json, limit, members)?;
+                print_clusters_output(
+                    &cached_output,
+                    json,
+                    limit,
+                    members,
+                    current_generation,
+                    true,
+                )?;
                 return Ok((EXIT_SUCCESS, None));
             }
 
@@ -17800,7 +17809,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // main) terminates without running destructors, so this
             // is safe.
 
-            print_clusters_output(&output, json, limit, members)?;
+            print_clusters_output(&output, json, limit, members, current_generation, false)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -30043,10 +30052,19 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool) -> usize 
 /// `returned_communities`, and a per-community `returned_members`, so a caller
 /// can tell a small graph from a truncated view. `0` means unlimited for both
 /// bounds, so the previous full output is still reachable.
+/// `graph_generation`/`cached` are nw-646's cache-identity disclosure: before
+/// this, "was this cache hit or a fresh compute, and against which graph
+/// generation" was ONLY in the human-readable stderr status line
+/// ("Using cached clusters (resolution=…, generation=…)"), which `--json`
+/// callers (scripts, the MCP client) cannot read. `graph_generation` is
+/// `None` only for the daemon-routed text path, which never reaches `--json`
+/// (see the call site's comment) and so never serializes this payload.
 fn bounded_clusters_payload(
     output: &nestweaver_engine::ClusteringOutput,
     limit: usize,
     members: usize,
+    graph_generation: Option<u64>,
+    cached: bool,
 ) -> serde_json::Value {
     let total = output.communities.len();
     let take = if limit == 0 { total } else { limit.min(total) };
@@ -30078,6 +30096,8 @@ fn bounded_clusters_payload(
         "total_communities": total,
         "returned_communities": take,
         "truncated": take < total,
+        "graph_generation": graph_generation,
+        "cached": cached,
     })
 }
 
@@ -30262,10 +30282,20 @@ fn print_clusters_output(
     json: bool,
     limit: usize,
     members: usize,
+    graph_generation: u64,
+    cached: bool,
 ) -> anyhow::Result<()> {
     // The direct path holds the whole population, so the total IS the length.
     let total = output.communities.len();
-    print_clusters_output_with_total(output, json, limit, members, total)
+    print_clusters_output_with_total(
+        output,
+        json,
+        limit,
+        members,
+        total,
+        Some(graph_generation),
+        cached,
+    )
 }
 
 /// [`print_clusters_output`] with the pre-cap total supplied by the caller, for
@@ -30366,11 +30396,19 @@ fn print_clusters_output_with_total(
     limit: usize,
     members: usize,
     total: usize,
+    graph_generation: Option<u64>,
+    cached: bool,
 ) -> anyhow::Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&bounded_clusters_payload(output, limit, members))?
+            serde_json::to_string_pretty(&bounded_clusters_payload(
+                output,
+                limit,
+                members,
+                graph_generation,
+                cached
+            ))?
         );
         return Ok(());
     }

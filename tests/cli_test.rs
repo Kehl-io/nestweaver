@@ -9350,6 +9350,20 @@ fn clusters_cache_is_gated_on_graph_generation_not_just_resolution() {
         hit_out.contains("0.918273"),
         "a genuine cache hit must return the SIDECAR's own modularity: {hit_out}"
     );
+    // nw-646 follow-up: the stderr status line is human-only — a `--json`
+    // caller (script, MCP client) needs the same cache identity IN the
+    // payload, not just on stderr.
+    let hit_payload: serde_json::Value = serde_json::from_slice(&hit.stdout).unwrap();
+    assert_eq!(
+        hit_payload["graph_generation"],
+        serde_json::json!(5),
+        "the JSON payload must name the generation the cache hit was served at: {hit_payload}"
+    );
+    assert_eq!(
+        hit_payload["cached"],
+        serde_json::json!(true),
+        "a genuine cache hit must disclose `cached: true` in the JSON payload: {hit_payload}"
+    );
 
     // Advance the graph generation (simulating a reindex) WITHOUT touching
     // resolution or the sidecar file directly.
@@ -9373,6 +9387,17 @@ fn clusters_cache_is_gated_on_graph_generation_not_just_resolution() {
         !miss_out.contains("0.918273"),
         "a stale generation must trigger a fresh compute, not replay the fabricated \
          sidecar's modularity: {miss_out}"
+    );
+    let miss_payload: serde_json::Value = serde_json::from_slice(&miss.stdout).unwrap();
+    assert_eq!(
+        miss_payload["graph_generation"],
+        serde_json::json!(6),
+        "a fresh compute's JSON payload must name the NEW generation it ran at: {miss_payload}"
+    );
+    assert_eq!(
+        miss_payload["cached"],
+        serde_json::json!(false),
+        "a fresh compute must disclose `cached: false` in the JSON payload: {miss_payload}"
     );
 
     // The freshly-computed sidecar must now carry the NEW generation.

@@ -11393,8 +11393,16 @@ fn tool_schema_clusters() -> Value {
                 "repos": {
                     "type": "array",
                     "items": { "type": "string", "minLength": 1, "maxLength": MAX_IDENTIFIER_LEN },
+                    // nw-646 review: an empty `repos: []` is a contradiction
+                    // for `compute_clusters_scoped` ("induced by these repos"
+                    // with no repos named) -- the engine already refuses it
+                    // with an untyped anyhow error. `minItems: 1` moves that
+                    // refusal to the SCHEMA, so an empty array is a typed
+                    // JSON-Schema validation failure at the transport, not an
+                    // internal error surfacing from the handler.
+                    "minItems": 1,
                     "maxItems": 100,
-                    "description": "Restrict to the repo-INDUCED SUBGRAPH of these repos (names or UIDs): communities are computed from scratch over only these repos' symbols and their internal edges, not filtered post-hoc from the global partition. The response's `scope.id_space` is \"repo_scoped\" — community ids are NOT comparable across different scopes or to an unscoped call, and this result is never written to the clusters sidecar (hub_nodes/bridge_nodes/blast_radius/`cluster <id>` keep reading the unscoped, cached partition). `scope.cross_repo_edges_excluded` counts edges cut by the scope boundary. An unknown repo name is an error, never a silent empty result."
+                    "description": "Restrict to the repo-INDUCED SUBGRAPH of these repos (names or UIDs): communities are computed from scratch over only these repos' symbols and their internal edges, not filtered post-hoc from the global partition. The response's `scope.id_space` is \"repo_scoped\" — community ids are NOT comparable across different scopes or to an unscoped call, and this result is never written to the clusters sidecar (hub_nodes/bridge_nodes/blast_radius/`cluster <id>` keep reading the unscoped, cached partition). `scope.cross_repo_edges_excluded` counts edges cut by the scope boundary. An unknown repo name is an error, never a silent empty result. Must be non-empty when present — omit the key entirely to run unscoped."
                 }
             }
         }
@@ -11541,6 +11549,14 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "symbol_count": symbol_count,
         "modularity": output.modularity,
         "limit": limit,
+        // nw-646 parity: the CLI's `clusters --json` discloses which graph
+        // generation the result came from and whether it was a cache hit
+        // (`no_cli_command_discloses_more_than_its_mcp_twin` forbids the CLI
+        // knowing more than this route). This tool ALWAYS computes fresh
+        // (never reads the sidecar back), so `cached` is always `false` here
+        // — only the CLI's own cache-reuse gate can ever set it `true`.
+        "graph_generation": store.graph_generation(),
+        "cached": false,
     });
     bounded.merge_into(&mut payload, "clusters");
     Ok(payload)
@@ -21074,6 +21090,21 @@ mod arg_alias_tests {
         assert!(!clusters.is_empty(), "{payload}");
     }
 
+    /// nw-646 parity. The CLI's unscoped `clusters --json` discloses
+    /// `graph_generation`/`cached`; this tool must carry the same keys so
+    /// `no_cli_command_discloses_more_than_its_mcp_twin` stays true rather
+    /// than needing a new `KNOWN_GAPS` entry. This tool always computes
+    /// fresh (it never reads the sidecar back), so `cached` is always
+    /// `false` here.
+    #[test]
+    fn tool_clusters_discloses_graph_generation_and_cached_for_cli_parity() {
+        let store = cluster_scope_store();
+        let payload =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("unscoped clusters call");
+        assert_eq!(payload["graph_generation"], json!(store.graph_generation()));
+        assert_eq!(payload["cached"], json!(false));
+    }
+
     #[test]
     fn detect_changes_accepts_changed_files_and_files_alias() {
         let store = GraphStore::in_memory().unwrap();
@@ -24150,6 +24181,24 @@ mod cluster_flag_forwarding_precondition_tests {
             validate_tool_arguments("clusters", &json!({ "members": 500 })).is_err(),
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
+        );
+    }
+
+    /// nw-646 review. `repos: []` is a contradiction for `compute_clusters_
+    /// scoped` ("induced by these repos" naming none) — the schema's
+    /// `minItems: 1` must refuse it at validation, before the handler ever
+    /// sees it and has to raise an untyped anyhow error instead.
+    #[test]
+    fn the_tool_rejects_an_empty_repos_array() {
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "repos": [] })).is_err(),
+            "an empty `repos` array must fail schema validation, not reach \
+             compute_clusters_scoped's own (untyped) empty-selector refusal"
+        );
+        // COUNTERWEIGHT: a non-empty `repos` array is still valid.
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "repos": ["repo-a"] })).is_ok(),
+            "a non-empty repos array must still validate"
         );
     }
 }
