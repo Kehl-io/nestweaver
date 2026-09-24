@@ -729,9 +729,10 @@ fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
 
 /// nw-653: reason prefix of the entries that disclose a watcher startup
 /// reconciliation still owed (see
-/// [`SkippedNotesSidecar::reconciliation_pending`]).
-pub const WATCH_RECONCILIATION_PENDING_REASON: &str =
-    "not yet reconciled into the graph: brain watcher startup reconciliation failed";
+/// [`SkippedNotesSidecar::reconciliation_pending`]). nw-664: shared by the
+/// brain and code watchers; the full reason names which one failed
+/// (`...: code watcher startup reconciliation failed; retrying (...)`).
+pub const WATCH_RECONCILIATION_PENDING_REASON: &str = "not yet reconciled into the graph";
 
 /// nw-653: set `vault_root`'s startup reconciliation debt to `paths`
 /// (absolute; the vault root itself for an uncomputable drift) when `error` is
@@ -744,14 +745,31 @@ pub(crate) fn record_watch_reconciliation_debt(
     paths: &[PathBuf],
     error: Option<&str>,
 ) {
+    record_watcher_reconciliation_debt(db_path, vault_root, paths, error, "brain watcher");
+}
+
+/// nw-664: [`record_watch_reconciliation_debt`] for any watcher. The code
+/// watcher discloses its owed startup reconciliation through this same
+/// channel, keyed by its REPO root, so `brain status` reports both kinds in
+/// one place and one watcher's success never clears another root's debt.
+pub(crate) fn record_watcher_reconciliation_debt(
+    db_path: Option<&Path>,
+    root: &Path,
+    paths: &[PathBuf],
+    error: Option<&str>,
+    watcher: &str,
+) {
     let Some(db_path) = db_path else {
         return;
     };
-    let key = vault_root.to_string_lossy().into_owned();
+    let key = root.to_string_lossy().into_owned();
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
         match error {
             Some(error) if !paths.is_empty() => {
-                let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}; retrying ({error})");
+                let reason = format!(
+                    "{WATCH_RECONCILIATION_PENDING_REASON}: {watcher} startup reconciliation \
+                     failed; retrying ({error})"
+                );
                 let mut owed: Vec<SkippedFile> = paths
                     .iter()
                     .map(|path| {
@@ -779,6 +797,46 @@ pub(crate) fn record_watch_reconciliation_debt(
     });
 }
 
+/// nw-664: after a code watcher startup replay, remember which replayed
+/// sources the graph still does not hold although they exist (unparsable,
+/// say) with their current mtime, and forget every other replayed path. The
+/// code watcher's startup drift consults [`SkippedNotesSidecar::unindexable_mtimes`]
+/// exactly as the vault's does, so such a file is not replayed on every start
+/// until it changes. Same whole-second representation (`file_mtime_string`).
+pub(crate) fn record_watch_unindexable_sources(
+    db_path: &Path,
+    replayed: &[PathBuf],
+    unindexable: &[PathBuf],
+) {
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let before = sidecar.unindexable_mtimes.clone();
+        for path in replayed {
+            sidecar.unindexable_mtimes.remove(&*path.to_string_lossy());
+        }
+        for path in unindexable {
+            if let Some(mtime) = file_mtime_string(path) {
+                sidecar
+                    .unindexable_mtimes
+                    .insert(path.to_string_lossy().into_owned(), mtime);
+            }
+        }
+        if sidecar.unindexable_mtimes == before {
+            return None;
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        ))
+    });
+}
+
+/// nw-664: the whole-second mtime the unindexable map records for `path`.
+pub(crate) fn watch_mtime_string(path: &Path) -> Option<String> {
+    file_mtime_string(path)
+}
+
 /// nw-653 review: forget a REMOVED vault's entries in the shared sidecar —
 /// its owed startup reconciliation and its unindexable-note mtimes (both
 /// keyed by absolute path, so they are unambiguously this vault's). Without
@@ -802,6 +860,14 @@ pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
             pending,
         ))
     });
+}
+
+/// nw-664: forget a REMOVED repo's code-watcher entries in the shared
+/// sidecar — its owed startup reconciliation (keyed by the repo root) and
+/// the unindexable-source mtimes under it. The same rule as a removed vault,
+/// so it calls [`forget_vault_skipped_notes`] rather than restating it.
+pub fn forget_repo_watch_state(db_path: &Path, repo_root: &Path) {
+    forget_vault_skipped_notes(db_path, repo_root);
 }
 
 /// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty

@@ -4905,7 +4905,7 @@ fn format_daemon_status_response(
                 && skipped.reconciliation_pending > 0
             {
                 lines.push(format!(
-                    "Watcher reconciliation pending: {} note(s)",
+                    "Watcher reconciliation pending: {} file(s)",
                     skipped.reconciliation_pending
                 ));
                 for note in &skipped.reconciliation_pending_notes {
@@ -5034,7 +5034,7 @@ mod daemon_status_renderer_tests {
         );
         assert!(output.contains("near.md (600000 bytes)"), "{output}");
         assert!(
-            output.contains("Watcher reconciliation pending: 2 note(s)"),
+            output.contains("Watcher reconciliation pending: 2 file(s)"),
             "{output}"
         );
         assert!(output.contains("owed.md: not yet reconciled"), "{output}");
@@ -27094,7 +27094,7 @@ fn run_brain(
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
                         if pending > 0 {
-                            println!("  Watcher reconciliation pending: {pending} note(s)");
+                            println!("  Watcher reconciliation pending: {pending} file(s)");
                             for note in skipped
                                 .get("reconciliation_pending_notes")
                                 .and_then(|v| v.as_array())

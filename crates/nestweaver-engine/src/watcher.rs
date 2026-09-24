@@ -148,18 +148,27 @@ struct BatchPhaseTimings {
     finalize_ms: u64,
 }
 
-/// nw-653: backoff for retrying a failed startup reconciliation.
-const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(5);
-const RECONCILE_RETRY_CAP: Duration = Duration::from_secs(300);
+/// nw-653: backoff for retrying a failed startup reconciliation. Shared with
+/// the code watcher's (nw-664), which retries on the same schedule.
+pub(crate) const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(5);
+pub(crate) const RECONCILE_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// nw-653 / nw-664: the delay before retry `failures` (1-based) of a startup
+/// reconciliation: `base` doubling per failure, capped at
+/// [`RECONCILE_RETRY_CAP`]. One schedule for the vault and code watchers.
+pub(crate) fn reconcile_retry_delay(base: Duration, failures: u32) -> Duration {
+    base.saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(RECONCILE_RETRY_CAP)
+}
 
 /// nw-653: a startup reconciliation that has not yet committed. It is kept and
 /// retried from the event loop rather than dropped: dropping it is exactly how
 /// the notes this fixes were lost. `paths` is `None` when the drift itself
 /// could not be computed, so the retry recomputes it.
-struct PendingReconciliation {
-    paths: Option<Vec<PathBuf>>,
-    failures: u32,
-    next_attempt: Instant,
+pub(crate) struct PendingReconciliation {
+    pub(crate) paths: Option<Vec<PathBuf>>,
+    pub(crate) failures: u32,
+    pub(crate) next_attempt: Instant,
 }
 
 /// Live file-watcher for a single vault. Construct via `new`, then call
@@ -1015,10 +1024,7 @@ impl BrainWatcher {
             Err(error) => (None, error),
         };
         let failures = failures.saturating_add(1);
-        let delay = self
-            .reconcile_retry_base
-            .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
-            .min(RECONCILE_RETRY_CAP);
+        let delay = reconcile_retry_delay(self.reconcile_retry_base, failures);
         let message = format!("{error:#}");
         tracing::error!(
             vault = %self.vault_root.display(),

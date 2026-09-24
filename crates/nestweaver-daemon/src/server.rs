@@ -4954,6 +4954,14 @@ where
     C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
     D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
 {
+    // nw-664: resolved before the Repo node goes, to clear its code watcher's
+    // owed-reconciliation disclosure after it.
+    let repo_root = state
+        .store
+        .lookup_repo(repo_uid)
+        .ok()
+        .flatten()
+        .and_then(|repo| repo.local_root().map(PathBuf::from));
     let mutation = match bulk_delete(&state.store, repo_uid) {
         Ok((file_count, sym_count)) => clear_derived(&state.store, repo_uid)
             .and_then(|()| delete_repo(&state.store, repo_uid))
@@ -4964,6 +4972,12 @@ where
             }),
         Err(error) => Err(error),
     };
+    // nw-664: only this repo's (now gone) watcher would ever clear it.
+    if mutation.is_ok()
+        && let Some(root) = &repo_root
+    {
+        nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, root);
+    }
 
     let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
         &state.store,
@@ -5116,7 +5130,7 @@ fn rebuild_tantivy_after_mutation(
 
 fn run_prune_stale_with<DR, DV, R>(
     state: &DaemonState,
-    delete_repo: DR,
+    mut delete_repo: DR,
     mut delete_vault: DV,
     mut reconcile_search: R,
 ) -> Result<PruneStaleResponse, Status>
@@ -5126,7 +5140,14 @@ where
     R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
     let search_rows_before = indexed_search_rows_before(state);
-    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
+    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, |store, repo| {
+        delete_repo(store, repo)?;
+        // nw-664: pruned on purpose; clear its code watcher's disclosure.
+        if let Some(root) = repo.local_root() {
+            nestweaver_engine::index_md::forget_repo_watch_state(&state.db_path, Path::new(root));
+        }
+        Ok(())
+    });
     let mut removed_vaults = Vec::new();
     let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
@@ -17135,6 +17156,73 @@ credential_method = "gh"
         let state = test_state_with_writer();
         let gone = "/definitely/missing/prune-debt";
         seed_vault_note_heading_embeddings(&state, "vlt:prune:debt", "prune", gone);
+        seed_skipped_notes_debt(&state, &[gone, "/other/vault"]);
+
+        run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    /// nw-664: a removed repo's code-watcher debt (owed reconciliation keyed
+    /// by the repo root, unindexable-source mtimes under it) is cleared with
+    /// it, like a removed vault's; another root's entries stay.
+    #[test]
+    fn remove_repo_clears_its_code_watcher_debt() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:debt",
+                &format!("file://{root_str}"),
+                Some(&root_str),
+            ))
+            .unwrap();
+        seed_skipped_notes_debt(&state, &[&root_str, "/other/vault"]);
+
+        run_remove_repo_with(
+            &state,
+            "repo:test:debt",
+            |store, uid| {
+                store
+                    .clear_repo_derived_nodes(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+            |store, uid| {
+                store
+                    .delete_repo_node(uid)
+                    .map_err(|e| Status::internal(format!("{e:#}")))
+            },
+        )
+        .unwrap();
+
+        assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    #[test]
+    fn prune_stale_clears_a_pruned_repos_code_watcher_debt() {
+        let state = test_state_with_writer();
+        let gone = "/definitely/missing/prune-repo-debt";
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:prune-debt",
+                &format!("file://{gone}"),
+                Some(gone),
+            ))
+            .unwrap();
         seed_skipped_notes_debt(&state, &[gone, "/other/vault"]);
 
         run_prune_stale_with(

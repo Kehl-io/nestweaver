@@ -2490,6 +2490,31 @@ impl GraphStore {
             .collect()
     }
 
+    /// Every File node of `repo_uid` as `(file_path, content_hash)`.
+    ///
+    /// nw-664: the code watcher's startup reconciliation compares disk
+    /// against the content the graph actually holds, which a watcher batch
+    /// may have moved past the last full index's filemeta cache.
+    pub fn list_file_hashes_by_repo(
+        &self,
+        repo_uid: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (f:File) WHERE f.repo_uid = $repo RETURN f.path, f.content_hash";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("repo", Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result
+            .map(|row| Ok((extract_string(&row, 0)?, extract_string(&row, 1)?)))
+            .collect()
+    }
+
     /// Look up a single Repo by UID. Returns `None` if no such repo exists.
     pub fn lookup_repo(
         &self,
