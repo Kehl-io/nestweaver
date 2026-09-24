@@ -12413,3 +12413,70 @@ fn wal_move_aside_that_drops_a_vault_is_disclosed_by_brain_list_and_status() {
     assert_eq!(restored["vault_count"], 1, "{restored}");
     assert!(missing_warnings(&restored).is_empty(), "{restored}");
 }
+
+/// nw-602. `index --with-trigrams` must leave `regex-search` answering from
+/// the index — for EVERY shard search would distrust, not only the scopes a
+/// writer enqueued. A shard stamped at a later graph generation than the store
+/// now reports (the `.generation` sidecar went backwards) is in no outbox; the
+/// refresh used to skip it and report success while every search scanned it
+/// and told the user to rerun the very command that had skipped it.
+#[test]
+fn index_with_trigrams_leaves_regex_search_on_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let js = dir.path().join("js");
+    let py = dir.path().join("py");
+    std::fs::create_dir_all(&js).unwrap();
+    std::fs::create_dir_all(&py).unwrap();
+    std::fs::write(js.join("a.js"), "function bomFn() { return 1; }\n").unwrap();
+    std::fs::write(py.join("b.py"), "def py_fn():\n    return 2\n").unwrap();
+
+    let index = |repo: &std::path::Path, trigrams: &str| {
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(repo)
+            .arg("--db")
+            .arg(&db_path)
+            .arg(trigrams)
+            .assert()
+            .success();
+    };
+    let regex = || {
+        let output = nestweaver_cmd()
+            .args(["regex-search", "bomFn", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "regex-search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let assert_on_index = |value: &serde_json::Value, when: &str| {
+        assert_eq!(value["scanned_fallback"], false, "{when}: {value}");
+        assert_eq!(value["stale_index"], false, "{when}: {value}");
+        assert_eq!(value["dirty_scopes"], 0, "{when}: {value}");
+        assert_eq!(value["ready_scopes"], 2, "{when}: {value}");
+    };
+
+    index(&js, "--with-trigrams");
+    index(&py, "--with-trigrams");
+    assert_on_index(&regex(), "after two --with-trigrams indexes");
+
+    // Shards now carry a generation the store no longer reports.
+    std::fs::write(sidecar_path(&db_path, ".generation"), "1").unwrap();
+    let distrusted = regex();
+    assert_eq!(distrusted["dirty_scopes"], 2, "{distrusted}");
+    index(&js, "--with-trigrams");
+    assert_on_index(&regex(), "after --with-trigrams repaired distrusted shards");
+
+    // Counterweight: `--no-trigrams` leaves a changed scope disclosed.
+    std::fs::write(js.join("a.js"), "function bomFn() { return 2; }\n").unwrap();
+    index(&js, "--no-trigrams");
+    let stale = regex();
+    assert_eq!(stale["stale_index"], true, "{stale}");
+    assert_eq!(stale["scanned_fallback"], true, "{stale}");
+    assert_eq!(stale["dirty_scopes"], 1, "{stale}");
+}

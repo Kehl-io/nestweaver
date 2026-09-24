@@ -397,6 +397,33 @@ struct RegexGraphScopeState {
     tombstone: bool,
 }
 
+/// nw-602. THE predicate for "search may answer from this shard". ONE
+/// definition, called by both `regex_search`'s planner (which scans any scope
+/// it rejects) and `refresh_regex_v3` (which must therefore repair every scope
+/// it rejects). The two used to disagree: refresh chose its work from the
+/// outbox plus scopes with no metadata, so a shard search distrusted for any
+/// other reason (a publication identity, schema, or graph generation it no
+/// longer matches) was never repaired — `index --with-trigrams` reported
+/// success, and every search kept scanning it while telling the user to rerun
+/// the command that had just not repaired it.
+fn regex_shard_trusted(
+    metadata: &RegexShardMetadata,
+    state: &RegexGraphScopeState,
+    identity: &crate::db::PublicationIdentity,
+    graph_generation: u64,
+) -> bool {
+    !state.tombstone
+        && state.desired_epoch == state.acknowledged_epoch
+        && metadata.schema_version == REGEX_INDEX_SCHEMA_VERSION
+        && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+        && metadata.brain_uuid == identity.brain_uuid
+        && metadata.publication_uuid == identity.publication_uuid
+        && metadata.source_graph_generation <= graph_generation
+        && metadata.scope_epoch == state.acknowledged_epoch
+        && metadata.candidate_count == state.candidate_count
+        && metadata.candidate_digest == state.candidate_digest
+}
+
 struct TrigramPrefilterPlan {
     matching_ready_uids: HashSet<String>,
     ready_scopes: HashSet<String>,
@@ -592,6 +619,21 @@ impl GraphStore {
         };
         let mut stats = TrigramRefreshStats::default();
         let states = self.read_regex_scope_states()?;
+        let graph_generation = self.graph_generation();
+        // nw-602: every active scope search would refuse to trust is work,
+        // whether or not a writer ever enqueued it. The outbox records what
+        // CHANGED; it cannot record a shard that went stale without a write.
+        let distrusted_scopes = active_scopes
+            .iter()
+            .filter(|scope_uid| {
+                existing.get(scope_uid.as_str()).is_some_and(|metadata| {
+                    states.get(scope_uid.as_str()).is_none_or(|state| {
+                        !regex_shard_trusted(metadata, state, &identity, graph_generation)
+                    })
+                })
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut work_scopes = if force_full {
             let mut scopes = active_scopes.clone();
             scopes.extend(states.keys().cloned());
@@ -601,6 +643,7 @@ impl GraphStore {
             self.regex_outbox_scopes()?
         };
         work_scopes.extend(unavailable_scopes);
+        work_scopes.extend(distrusted_scopes);
         // A graph imported from a pre-v3 release has no outbox yet. Bootstrap
         // once; all subsequent normal work is driven only by coalesced scopes.
         if !force_full && work_scopes.is_empty() && (states.is_empty() || existing.is_empty()) {
@@ -676,7 +719,16 @@ impl GraphStore {
                     && state.candidate_count == candidates.len()
                     && state.candidate_digest == digest
             });
-            if compatible && graph_acknowledged && !force_full {
+            // `compatible` is about the candidate set; whether search would
+            // TRUST the shard is the shared predicate's call (nw-602), or a
+            // shard it rejects is counted "unchanged" and never rewritten.
+            let search_trusts =
+                prior
+                    .zip(states.get(&scope_uid))
+                    .is_some_and(|(metadata, state)| {
+                        regex_shard_trusted(metadata, state, &identity, graph_generation)
+                    });
+            if compatible && graph_acknowledged && search_trusts && !force_full {
                 stats.scopes_unchanged += 1;
                 continue;
             }
@@ -1507,15 +1559,7 @@ impl GraphStore {
                     continue;
                 }
             };
-            let trusted = metadata.schema_version == REGEX_INDEX_SCHEMA_VERSION
-                && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
-                && metadata.brain_uuid == identity.brain_uuid
-                && metadata.publication_uuid == identity.publication_uuid
-                && metadata.source_graph_generation <= self.graph_generation()
-                && metadata.scope_epoch == state.acknowledged_epoch
-                && metadata.candidate_count == state.candidate_count
-                && metadata.candidate_digest == state.candidate_digest;
-            if !trusted {
+            if !regex_shard_trusted(&metadata, state, &identity, self.graph_generation()) {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
@@ -2678,6 +2722,64 @@ mod tests {
                 && entry.publication_uuid == identity.publication_uuid
                 && entry.schema_version == REGEX_INDEX_SCHEMA_VERSION
         }));
+    }
+
+    /// nw-602. `refresh` chose its work from the outbox (plus scopes with no
+    /// metadata) while `regex_search` distrusted a shard on a WIDER predicate
+    /// — here a shard recorded at a later graph generation than the store now
+    /// reports. Such a scope is in no outbox, so `index --with-trigrams`
+    /// refreshed nothing and returned success while every search kept
+    /// scanning it and printed "rerun `index --with-trigrams` to repair them":
+    /// a remedy that could not repair anything.
+    #[test]
+    fn refresh_repairs_every_shard_search_distrusts_not_only_outbox_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("brain.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        populate_store(&store);
+        store.bump_graph_generation();
+        store.bump_graph_generation();
+        store.rebuild_trigram_index().unwrap();
+        assert_eq!(
+            store
+                .regex_search("authenticateUser", None, None, None, None)
+                .unwrap()
+                .dirty_scopes,
+            0
+        );
+
+        // Shards now claim a generation the store has not reached.
+        store.graph_generation.store(1, Ordering::Release);
+        let distrusted = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert_eq!(distrusted.dirty_scopes, 2);
+
+        let repaired = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(
+            repaired.scopes_refreshed, 2,
+            "every shard search distrusts must be refreshed: {repaired:?}"
+        );
+        let result = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!result.scanned_fallback, "{result:?}");
+        assert!(!result.stale_index);
+        assert_eq!((result.ready_scopes, result.dirty_scopes), (2, 0));
+        assert_eq!(result.results.len(), 2);
+
+        // Counterweight: a trusted index is left alone, and a scope written
+        // after the refresh is still disclosed as dirty.
+        assert_eq!(
+            store.refresh_trigram_index(false).unwrap().scopes_refreshed,
+            0
+        );
+        store.mark_regex_scope_dirty("vlt:v", false).unwrap();
+        let stale = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(stale.stale_index && stale.scanned_fallback, "{stale:?}");
+        assert_eq!((stale.ready_scopes, stale.dirty_scopes), (1, 1));
     }
 
     #[test]
