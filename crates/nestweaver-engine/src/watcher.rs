@@ -209,6 +209,43 @@ pub(crate) struct SidecarDebt {
     pub(crate) error: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint (nw-668): fail this many upcoming note-structure reads
+    /// in the sidecar phase.
+    static FAIL_NOTE_STRUCTURE_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A committed note's sections, and its headings when `with_headings`, for
+/// the sidecar phase.
+fn read_note_structure(
+    store: &GraphStore,
+    uid: &str,
+    with_headings: bool,
+) -> Result<
+    (
+        Vec<nestweaver_schema::Section>,
+        Vec<nestweaver_schema::Heading>,
+    ),
+    anyhow::Error,
+> {
+    #[cfg(test)]
+    if FAIL_NOTE_STRUCTURE_READS.with(|fail| {
+        let armed = fail.get();
+        fail.set(armed.saturating_sub(1));
+        armed > 0
+    }) {
+        anyhow::bail!("injected note structure read failure");
+    }
+    let sections = store.sections_in_note(uid)?;
+    let headings = if with_headings {
+        store.headings_in_note(uid)?
+    } else {
+        Vec::new()
+    };
+    Ok((sections, headings))
+}
+
 /// Add `paths` to the batch's [`SidecarDebt`], keeping the first error.
 fn owe(debt: &mut Option<SidecarDebt>, paths: &[PathBuf], error: &str) {
     debt.get_or_insert_with(|| SidecarDebt {
@@ -680,7 +717,12 @@ impl BrainWatcher {
             &v_uid,
             &on_change,
             None,
-            Vec::new(),
+            // nw-668: notes a previous run still owed (their text landed,
+            // their code links did not) — invisible to the drift below.
+            store
+                .db_path()
+                .map(|db| crate::index_md::vault_owed_note_paths(db, &self.vault_root))
+                .unwrap_or_default(),
             0,
         ) {
             Ok(pending) => pending,
@@ -1112,15 +1154,27 @@ impl BrainWatcher {
         let failures = failures.saturating_add(1);
         let delay = reconcile_retry_delay(self.reconcile_retry_base, failures);
         let message = format!("{error:#}");
-        tracing::error!(
-            vault = %self.vault_root.display(),
-            error = %message,
-            failures,
-            retry_in_ms = delay.as_millis() as u64,
-            "BrainWatcher startup reconciliation failed; notes changed while no watcher \
-             ran are missing or stale until it succeeds (retrying; `nestweaver brain \
-             refresh` also heals it)"
-        );
+        if link_failure {
+            tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %message,
+                failures,
+                retry_in_ms = delay.as_millis() as u64,
+                "BrainWatcher reconciled the notes' text but could not write their code \
+                 links; they have none until the retry lands (retrying; `nestweaver brain \
+                 refresh` also heals it)"
+            );
+        } else {
+            tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %message,
+                failures,
+                retry_in_ms = delay.as_millis() as u64,
+                "BrainWatcher startup reconciliation failed; notes changed while no watcher \
+                 ran are missing or stale until it succeeds (retrying; `nestweaver brain \
+                 refresh` also heals it)"
+            );
+        }
         // An uncomputable drift is disclosed against the vault root itself,
         // plus any owed links it must still replay on top (nw-668).
         let also_replay = if paths.is_some() {
@@ -1324,6 +1378,7 @@ impl BrainWatcher {
         let mut chunk: Vec<crate::cross_domain::ScannedNote> = Vec::new();
         let mut chunk_paths: Vec<PathBuf> = Vec::new();
         let mut removals = Vec::new();
+        let mut removed_paths: Vec<PathBuf> = Vec::new();
         let mut docs: Vec<nestweaver_store::tantivy_index::NoteDocBatchEntry> = Vec::new();
         for (path, relative, uid) in &targets {
             // Flush a full chunk before scanning further, so at most one
@@ -1337,39 +1392,42 @@ impl BrainWatcher {
             let scan_started = Instant::now();
             let Some(note) = notes.get(uid) else {
                 removals.push(uid.clone());
+                removed_paths.push((*path).clone());
                 continue;
             };
-            let sections = match store.sections_in_note(uid) {
-                Ok(sections) => Some(sections),
-                // Tantivy needs the sections; failing the batch here is what
-                // the per-note path did too.
-                Err(error) if tantivy.is_some() => return Err(error.into()),
-                // Without Tantivy only the cross-domain scan needs them, and
-                // its failures were non-fatal: owe the note rather than scan
-                // it with no sections (a silently partial edge set).
+            // nw-668: a note whose structure cannot be read is owed — no
+            // links, no Tantivy doc this batch — and replayed by the retry,
+            // with or without Tantivy. It used to fail the whole batch (and,
+            // live, end the run loop) when Tantivy was on. Nothing here gates
+            // publication: the text is committed; only derived sidecars wait.
+            let (sections, headings) = match read_note_structure(store, uid, tantivy.is_some()) {
+                Ok(structure) => structure,
                 Err(error) => {
-                    tracing::warn!(%error, note = %uid, "watcher cross-domain refresh failed");
-                    owe(&mut debt, std::slice::from_ref(path), &error.to_string());
-                    None
+                    tracing::warn!(%error, note = %uid, "watcher sidecar refresh failed");
+                    owe(
+                        &mut debt,
+                        std::slice::from_ref(*path),
+                        &format!("{error:#}"),
+                    );
+                    continue;
                 }
             };
             #[cfg(test)]
             if let Some(probe) = &self.sidecar_scan_probe {
                 probe(chunk.len());
             }
-            if let (Some(index), Some(sections)) = (index, &sections) {
+            if let Some(index) = index {
                 match sources.get(relative) {
                     Some(source) => {
                         chunk.push(crate::cross_domain::scan_note_source(
-                            uid, source, sections, index,
+                            uid, source, &sections, index,
                         ));
                         chunk_paths.push((*path).clone());
                     }
                     None => timings.sidecar_scan_skipped += 1,
                 }
             }
-            if let (Some(_), Some(sections)) = (tantivy, sections) {
-                let headings = store.headings_in_note(uid)?;
+            if tantivy.is_some() {
                 let section_docs: Vec<_> = sections
                     .iter()
                     .map(|s| {
@@ -1411,6 +1469,14 @@ impl BrainWatcher {
                 timings.sidecar_tantivy_ms = tantivy_started.elapsed().as_millis() as u64;
             }
         }
+        // A deleted note owes nothing any more.
+        if let Some(db_path) = store.db_path() {
+            crate::index_md::clear_vault_reconciliation_paths(
+                db_path,
+                &self.vault_root,
+                &removed_paths,
+            );
+        }
         Ok(debt)
     }
 
@@ -1443,6 +1509,15 @@ impl BrainWatcher {
                 Ok(stats) => {
                     timings.sidecar_transactions += stats.transactions;
                     timings.sidecar_statements += stats.statements;
+                    // These notes' text and links have both landed: settle
+                    // any owed disclosure now rather than at the next retry.
+                    if let Some(db_path) = store.db_path() {
+                        crate::index_md::clear_vault_reconciliation_paths(
+                            db_path,
+                            &self.vault_root,
+                            chunk_paths,
+                        );
+                    }
                     last_error = None;
                     break;
                 }
@@ -4163,5 +4238,137 @@ mod tests {
             1
         );
         assert_eq!(nw_668_targets(&fx.store), before);
+    }
+
+    /// nw-668 re-review (N1): owed link debt lives in the skipped-notes
+    /// sidecar, but startup reconciliation only diffed disk against the
+    /// graph's TEXT — which matches for a note whose links were owed — then
+    /// cleared the vault's debt. A restart silently dropped the owed links.
+    /// Startup must replay the persisted owed notes.
+    #[test]
+    fn nw_668_owed_links_survive_a_watcher_restart() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let path = fx.root.join("n000.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget\n").unwrap();
+        // The text lands, the links do not (both flush attempts fail).
+        let first = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(2));
+        let owed = first.process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None);
+        crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("owed");
+        crate::index_md::record_vault_link_debt(
+            fx.store.db_path(),
+            &fx.root,
+            &owed.paths,
+            &owed.error,
+            false,
+        );
+        assert!(nw_668_targets(&fx.store).is_empty());
+        drop(first);
+
+        // The daemon restarts: a fresh watcher's startup reconciliation.
+        let store = Arc::new(GraphStore::open_or_create(&fx.db_path).unwrap());
+        drop(fx.store);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        assert_eq!(
+            nw_668_targets(&store).len(),
+            2,
+            "owed links rebuilt at startup"
+        );
+        assert!(
+            nw_668_owed_debt(&fx.db_path).is_empty(),
+            "and the debt cleared"
+        );
+    }
+
+    /// nw-668 re-review: a live batch that rebuilds an owed note's links
+    /// settles its disclosure then, not only when the scheduled retry runs.
+    #[test]
+    fn nw_668_a_live_batch_that_lands_an_owed_notes_links_clears_its_row() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let owed = fx.root.join("n000.md");
+        let other = fx.root.join("n001.md");
+        fs::write(&owed, "# A\n\nuses AlphaWidget\n").unwrap();
+        crate::index_md::record_vault_link_debt(
+            fx.store.db_path(),
+            &fx.root,
+            &[owed.clone(), other.clone()],
+            "earlier failure",
+            false,
+        );
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        watcher
+            .process_batch(&fx.store, None, &fx.v_uid, vec![owed.clone()], &None)
+            .unwrap();
+        assert_eq!(
+            nw_668_owed_debt(&fx.db_path),
+            vec![other.to_string_lossy().into_owned()],
+            "only the note whose links landed is settled"
+        );
+    }
+
+    /// nw-668 re-review (M4): a note whose sections cannot be read is owed
+    /// like a failed flush, with or without Tantivy — not a batch failure
+    /// that ends the live watcher's run loop.
+    #[test]
+    fn nw_668_an_unreadable_note_structure_is_owed_even_with_tantivy() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget"]);
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let path = fx.root.join("n000.md");
+        let fine = fx.root.join("n001.md");
+        fs::write(&path, "# A\n\nuses AlphaWidget zebra\n").unwrap();
+        fs::write(&fine, "# B\n\nuses AlphaWidget yak\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let callback: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        FAIL_NOTE_STRUCTURE_READS.with(|fail| fail.set(1));
+        let owed = watcher.process_batch(
+            &fx.store,
+            Some(&tantivy),
+            &fx.v_uid,
+            vec![path.clone(), fine.clone()],
+            &callback,
+        );
+        FAIL_NOTE_STRUCTURE_READS.with(|fail| fail.set(0));
+        let owed = owed.unwrap().expect("the unreadable note is owed");
+        assert_eq!(owed.paths, vec![path.clone()]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the batch still publishes");
+        assert!(
+            !tantivy.search("yak", 10).unwrap().is_empty(),
+            "other notes land"
+        );
+        assert_eq!(
+            nw_668_targets(&fx.store).len(),
+            2,
+            "the readable note's links land"
+        );
+
+        // The owed replay heals it, Tantivy included.
+        let pending = watcher.owe_sidecar_retry(&fx.store, None, owed);
+        let next = watcher
+            .attempt_reconciliation(
+                &fx.store,
+                Some(&tantivy),
+                &fx.v_uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        assert!(!tantivy.search("zebra", 10).unwrap().is_empty());
+        assert_eq!(nw_668_targets(&fx.store).len(), 4);
     }
 }

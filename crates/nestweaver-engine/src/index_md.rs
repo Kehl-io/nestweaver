@@ -879,7 +879,27 @@ fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<Skippe
 /// deleted — so a "could not read" or owed entry does not outlive the
 /// problem until the next restart. Other entries, and other roots, stay.
 pub(crate) fn clear_code_reconciliation_paths(db_path: &Path, repo_root: &Path, paths: &[PathBuf]) {
-    let key = code_watch_key(repo_root);
+    clear_reconciliation_paths(db_path, code_watch_key(repo_root), paths);
+}
+
+/// nw-668: the vault twin of [`clear_code_reconciliation_paths`] — drop
+/// `vault_root`'s owed entries for `paths` once a batch has landed them
+/// (text AND code links), so a disclosure does not outlive the problem until
+/// the scheduled retry. The vault-root entry (an uncomputable drift) is never
+/// under a note path, so it stays.
+pub(crate) fn clear_vault_reconciliation_paths(
+    db_path: &Path,
+    vault_root: &Path,
+    paths: &[PathBuf],
+) {
+    clear_reconciliation_paths(db_path, vault_root.to_string_lossy().into_owned(), paths);
+}
+
+/// One implementation behind both watchers' clears.
+fn clear_reconciliation_paths(db_path: &Path, key: String, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
         let entries = sidecar.reconciliation_pending.get_mut(&key)?;
         let before = entries.len();
@@ -901,6 +921,22 @@ pub(crate) fn clear_code_reconciliation_paths(db_path: &Path, repo_root: &Path, 
             sidecar.reconciliation_pending,
         ))
     });
+}
+
+/// nw-668: the notes `vault_root`'s persisted reconciliation debt still owes
+/// (absolute paths; the vault-root entry itself excluded). Startup replays
+/// them on top of the disk-vs-graph drift, which cannot see a note whose
+/// text landed but whose code links did not — without this a restart would
+/// clear that debt unpaid.
+pub(crate) fn vault_owed_note_paths(db_path: &Path, vault_root: &Path) -> Vec<PathBuf> {
+    load_skipped_notes_sidecar(db_path)
+        .reconciliation_pending
+        .remove(&vault_root.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| PathBuf::from(file.path))
+        .filter(|path| path != vault_root && path.starts_with(vault_root))
+        .collect()
 }
 
 /// nw-664: the CODE watcher's unindexable-source memory: absolute path ->
