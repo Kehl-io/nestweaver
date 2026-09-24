@@ -489,19 +489,24 @@ impl CodeWatcher {
                     // an attempt recomputes disk-vs-graph drift (which holds
                     // these paths, since the graph never took them), replays
                     // it, and on failure discloses it as owed and retries on
-                    // the shared backoff until it lands. Due now, but keeping
-                    // the failure count, so a persistent fault still backs off.
+                    // the shared backoff until it lands.
                     tracing::warn!(
                         error = %reason,
                         "code watcher batch skipped before publication; previous graph \
                          preserved; reconciling with retry"
                     );
-                    let failures = pending.as_ref().map_or(0, |owed| owed.failures);
-                    pending = Some(crate::watcher::PendingReconciliation {
-                        paths: None,
-                        failures,
-                        next_attempt: Instant::now(),
-                    });
+                    // nw-669 review: only when no retry is owed yet. An owed
+                    // retry keeps its schedule — its recomputed drift will
+                    // include these paths — so in a permanently blocked repo
+                    // an autosave costs one failing live batch, not also a
+                    // full walk and a failing replay every time.
+                    if pending.is_none() {
+                        pending = Some(crate::watcher::PendingReconciliation {
+                            paths: None,
+                            failures: 0,
+                            next_attempt: Instant::now(),
+                        });
+                    }
                     continue;
                 }
             };
@@ -4092,18 +4097,21 @@ mod tests {
                 .into_iter()
                 .any(|(path, reason)| path == edited_key && reason.contains("retrying"))
         };
-        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wait_until("the skipped live edit to be disclosed as owed", owed)
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_until("the skipped live edit to be disclosed as owed", owed);
+            // Checked while the file is still locked, before anything can land.
+            assert!(
+                !handle.is_finished(),
+                "the watcher keeps running while the edit is owed"
+            );
+            assert!(!repo_symbol_names(&store, &uid).contains("alphaLive"));
         }));
-        let running = !handle.is_finished();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
-        if let Err(panic) = waited {
+        if let Err(panic) = blocked {
             stop.stop();
             let _ = handle.join();
             std::panic::resume_unwind(panic);
         }
-        assert!(running, "the watcher keeps running while the edit is owed");
-        assert!(!repo_symbol_names(&store, &uid).contains("alphaLive"));
 
         wait_until("the retried edit to land", || {
             repo_symbol_names(&store, &uid).contains("alphaLive")
@@ -4111,5 +4119,77 @@ mod tests {
         wait_until("the disclosure to clear", || code_debt(&db_path).is_empty());
         stop.stop();
         handle.join().unwrap().unwrap();
+    }
+
+    /// nw-669 review counterweight: while a retry is already owed and its
+    /// backoff is not due, another skipped live batch must NOT trigger an
+    /// extra reconciliation. The owed retry's recomputed drift already covers
+    /// the new paths; resetting it to "now" made every autosave in a
+    /// permanently blocked repo cost a walk + a failing replay.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_live_batch_does_not_hurry_an_owed_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicU32;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, _uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let locked = root.join("src/locked.js");
+        std::fs::write(&locked, "export function locked() { return 1; }\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let batches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&batches);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_code_batch" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_mutation_lease_factory(factory)
+            .with_reconcile_retry_base(Duration::from_secs(600));
+        let (stop, handle) = spawn_live_code_watcher(watcher, store);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first = root.join("src/b.js");
+            std::fs::write(&first, "export function first() { return 1; }\n").unwrap();
+            let first_key = first.to_string_lossy().into_owned();
+            // One live batch, then the immediate reconciliation's replay:
+            // both fail, and a retry is owed ten minutes out.
+            wait_until("the first skipped edit to be disclosed as owed", || {
+                code_debt(&db_path)
+                    .iter()
+                    .any(|(path, reason)| path == &first_key && reason.contains("retrying"))
+            });
+            let owed_once = batches.load(Ordering::SeqCst);
+            assert_eq!(owed_once, 2, "one live batch plus one replay");
+
+            std::fs::write(
+                root.join("src/c.js"),
+                "export function second() { return 2; }\n",
+            )
+            .unwrap();
+            wait_until("the second live batch", || {
+                batches.load(Ordering::SeqCst) > owed_once
+            });
+            std::thread::sleep(Duration::from_millis(1500));
+            assert_eq!(
+                batches.load(Ordering::SeqCst),
+                owed_once + 1,
+                "a second skipped batch must not trigger another reconciliation \
+                 while one is owed and not yet due"
+            );
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        stop.stop();
+        let joined = handle.join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        joined.unwrap().unwrap();
     }
 }
