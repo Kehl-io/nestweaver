@@ -5220,6 +5220,119 @@ fn list_repos_and_stale_check_json_carry_uid_and_display_name() {
     );
 }
 
+/// nw-560: `investigate-expand` with an OMITTED `--root`, run from a working
+/// directory OUTSIDE every indexed repo, must still return a non-empty body
+/// by resolving the symbol's owning repo's recorded `local_root` — not by
+/// reading the process cwd. This exercises the CLI's DIRECT (no-daemon)
+/// route end to end (`nestweaver_cmd()` pins `NESTWEAVER_NO_DAEMON`), the
+/// route where main.rs used to `Some(detect_repo_root())` an unrelated
+/// directory-walk guess instead of passing `None` through to the engine's
+/// per-symbol resolution.
+#[test]
+fn investigate_expand_omitted_root_resolves_from_outside_the_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("app.js"),
+        "function myFunc(x) { return x + 1; }",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    // Build the bundle with an explicit root so bundle creation itself
+    // (out of this item's scope) is not what is under test here.
+    let investigate_out = nestweaver_cmd()
+        .args([
+            "investigate",
+            "myFunc",
+            "--root",
+            &repo_dir.display().to_string(),
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&investigate_out.stdout);
+    let investigated: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("investigate --json: {e}\n{stdout}"));
+    let bundle_id = investigated["bundle_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no bundle_id in:\n{stdout}"))
+        .to_string();
+    let asset_id = investigated["entries"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e["uid"].as_str().is_some_and(|u| u.starts_with("sym:")))
+        })
+        .and_then(|e| e["asset_id"].as_str())
+        .unwrap_or_else(|| panic!("no symbol entry in:\n{stdout}"))
+        .to_string();
+
+    // A directory outside the repo AND outside the db's own directory —
+    // the working directory a bare `nestweaver mcp --db ...` launch would
+    // actually have.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir_all(&unrelated_cwd).unwrap();
+
+    let expand_out = nestweaver_cmd()
+        .args([
+            "investigate-expand",
+            &bundle_id,
+            "--targets",
+            &asset_id,
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&expand_out.stdout);
+    let expanded: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("investigate-expand --json: {e}\n{stdout}"));
+    let entry = expanded["expanded"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or_else(|| panic!("no expanded entry in:\n{stdout}"));
+    assert_eq!(
+        entry["expanded"], true,
+        "entry must be marked expanded even with root omitted, run outside \
+         every indexed repo: {stdout}"
+    );
+    assert!(
+        entry["inline_body"].as_str().is_some_and(|b| !b.is_empty()),
+        "body must be read from the symbol's repo local_root when --root is \
+         omitted, even though the process cwd is outside every indexed \
+         repo — not left empty by defaulting to that cwd: {stdout}"
+    );
+    assert!(
+        entry["unavailable_reason"].is_null(),
+        "no unavailable_reason expected once local_root resolution \
+         succeeds: {stdout}"
+    );
+}
+
 #[test]
 fn cli_missing_db_stale_check() {
     assert_missing_db_guard(&["stale-check"]);

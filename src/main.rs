@@ -21747,10 +21747,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bundle_id": bundle_id,
                     "targets": targets,
                 });
-                // nw-340: always send a root. An omitted `root` is filled by
-                // the DAEMON's cwd, not the caller's, so inline bodies come
-                // back empty from a response that otherwise looks fine.
-                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
+                // nw-560: `root` is sent only when the caller passed
+                // `--root`, mirroring `read_symbols_rpc_args`. Omitting it
+                // lets the daemon resolve each symbol from its own repo
+                // `local_root`; sending the client's cwd here (the old
+                // nw-340 fix) OVERRODE that per-symbol resolution with a
+                // single directory, so a caller running from outside every
+                // indexed repo got empty bodies again regardless of the
+                // daemon-side fix.
+                if let Some(explicit_root) = root.as_deref() {
+                    args["root"] = serde_json::json!(explicit_root.to_string_lossy().into_owned());
+                }
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
@@ -21760,11 +21767,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let root = root.unwrap_or_else(detect_repo_root);
+            // nw-560: an omitted `--root` is passed through as `None` so the
+            // engine resolves each symbol's owning-repo `local_root`
+            // (`resolve_symbol_body_root`), rather than defaulting to
+            // `detect_repo_root()` here — a single directory-walk guess is
+            // no better than the daemon's old cwd default when the caller's
+            // cwd is outside every indexed repo.
             let result = nestweaver_engine::investigate_expand(
                 &store,
                 &db_path,
-                Some(root.as_path()),
+                root.as_deref(),
                 &bundle_id,
                 &targets,
             )?;
@@ -21823,10 +21835,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bundle_id": bundle_id,
                     "token_budget": token_budget,
                 });
-                // nw-340: always send a root. An omitted `root` is filled by
-                // the DAEMON's cwd, not the caller's, so inline bodies come
-                // back empty from a response that otherwise looks fine.
-                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
+                // nw-560: same reasoning as `investigate-expand` above — send
+                // `root` only when the caller explicitly passed `--root`, so
+                // an omission lets the daemon resolve per-symbol local_root
+                // instead of being overridden by the client's cwd.
+                if let Some(explicit_root) = root.as_deref() {
+                    args["root"] = serde_json::json!(explicit_root.to_string_lossy().into_owned());
+                }
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
@@ -21836,11 +21851,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let root = root.unwrap_or_else(detect_repo_root);
+            // nw-560: pass an omitted `--root` through as `None` — see the
+            // matching comment in `investigate-expand` above.
             let result = nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
-                Some(root.as_path()),
+                root.as_deref(),
                 &bundle_id,
                 Some(token_budget),
             )?;

@@ -244,7 +244,6 @@ pub fn read_symbols_from_repo_roots(
     limits: crate::index_limits::IndexLimits,
 ) -> ReadSymbolsResult {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use crate::content_reader::FilesystemReader;
 
@@ -276,13 +275,7 @@ pub fn read_symbols_from_repo_roots(
     let mut remaining_budget = token_budget;
 
     for (repo_uid, group_targets) in &repo_groups {
-        let root = store
-            .lookup_repo(repo_uid)
-            .ok()
-            .flatten()
-            .and_then(|repo| repo.local_root().map(PathBuf::from))
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(|| fallback_root.to_path_buf());
+        let root = repo_local_root(store, repo_uid).unwrap_or_else(|| fallback_root.to_path_buf());
         let reader = FilesystemReader::with_limits(&root, limits);
         // Only the overall first returned window may exceed the budget.
         // Passing the leftover budget into a fresh `read_symbols` would
@@ -317,6 +310,25 @@ fn repo_uid_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
         .into_iter()
         .next()
         .map(|symbol| symbol.repo_uid)
+}
+
+/// Resolve `repo_uid`'s recorded `local_root`, filtered to a directory that
+/// still exists on disk. `None` covers every reason a caller must fall back:
+/// an unknown repo, no recorded root, or a root that no longer exists.
+///
+/// nw-560: shared by this function's own per-repo-group loop above and by
+/// `crate::investigate::resolve_symbol_body_root` (which resolves a single
+/// symbol's uid to its repo_uid first, then calls this). Before this was
+/// extracted, `investigate.rs` reimplemented the identical
+/// lookup→local_root→is_dir chain, which is exactly the kind of duplicate
+/// this repo's "sibling gaps" review rule exists to catch.
+pub(crate) fn repo_local_root(store: &GraphStore, repo_uid: &str) -> Option<std::path::PathBuf> {
+    store
+        .lookup_repo(repo_uid)
+        .ok()
+        .flatten()
+        .and_then(|repo| repo.local_root().map(std::path::PathBuf::from))
+        .filter(|path| path.is_dir())
 }
 
 #[cfg(test)]

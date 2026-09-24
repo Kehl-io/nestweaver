@@ -23090,7 +23090,7 @@ mod stale_check_tool_tests {
     }
 
     /// nw-634: every row must carry `uid`, `root_path`, and the resolved
-    /// display `name` — the same identity `repo_display_name` /
+    /// `display_name` — the same identity `repo_display_name` /
     /// `resolve_repo_selector` already compute for `--repo` and
     /// unknown-repo errors. Before this test the row had neither field at
     /// all, so a caller could not tell WHICH repo a `[stale]` line named
