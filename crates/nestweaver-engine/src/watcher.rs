@@ -22,7 +22,7 @@ use nestweaver_parser::is_markdown;
 use nestweaver_schema::{Vault, note_uid, vault_uid};
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use notify::event::{MetadataKind, ModifyKind};
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::{Event, EventKind};
 
 /// Opaque caller-owned protection held for one watcher mutation window.
 ///
@@ -299,6 +299,9 @@ pub struct BrainWatcher {
     /// nw-668 test probe, called before each note's cross-domain scan with
     /// how many scanned-but-unflushed notes are held at that moment.
     sidecar_scan_probe: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    /// Test seam: subscribe as inotify would fail on an unreadable subtree.
+    #[cfg(test)]
+    emulate_inotify_watch: bool,
 }
 
 impl BrainWatcher {
@@ -415,7 +418,17 @@ impl BrainWatcher {
             last_batch_phase_timings: std::sync::Mutex::new(None),
             #[cfg(test)]
             sidecar_scan_probe: None,
+            #[cfg(test)]
+            emulate_inotify_watch: false,
         }
+    }
+
+    /// Test hook: make the recursive subscription fail the way Linux inotify
+    /// does on an unreadable subdirectory (see `watch_tree`).
+    #[cfg(test)]
+    fn emulating_inotify_watch(mut self) -> Self {
+        self.emulate_inotify_watch = true;
+        self
     }
 
     /// Enable Tantivy index sync. When set, every note update/delete
@@ -624,7 +637,7 @@ impl BrainWatcher {
         // mutation while initial publication and callbacks are running.
         // Channel from the debouncer into our loop.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let mut watcher =
+        let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_kind_can_mutate(&event.kind) => {
                     let _ = tx.send(Ok(event.paths));
@@ -635,9 +648,23 @@ impl BrainWatcher {
                 }
             })
             .with_context(|| "init filesystem watcher")?;
-        watcher
-            .watch(&self.vault_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", self.vault_root.display()))?;
+        // nw-651 on Linux: an unreadable subdirectory must not stop the whole
+        // subscription; it is skipped and disclosed instead (`watch_tree`).
+        #[cfg(test)]
+        let tree = if self.emulate_inotify_watch {
+            crate::watch_tree::TreeWatch::start_emulating_inotify(watcher, &self.vault_root)
+        } else {
+            crate::watch_tree::TreeWatch::start(watcher, &self.vault_root)
+        };
+        #[cfg(not(test))]
+        let tree = crate::watch_tree::TreeWatch::start(watcher, &self.vault_root);
+        let mut tree = tree.with_context(|| format!("watch {}", self.vault_root.display()))?;
+        crate::index_md::disclose_unwatchable_vault_dirs(
+            store.db_path(),
+            &self.vault_root,
+            &self.ignore_set,
+            tree.unwatchable(),
+        );
         // Use external Tantivy if provided (daemon mode), otherwise open from path.
         let tantivy: Option<Arc<TantivyIndex>> = if let Some(ext) = self.external_tantivy.take() {
             Some(ext)
@@ -778,7 +805,7 @@ impl BrainWatcher {
                     Err(_) => return Ok(()),
                 }
             }
-            let batch = match receive_debounced_paths(
+            let mut batch = match receive_debounced_paths(
                 &rx,
                 Duration::from_millis(self.debounce_ms),
                 &self.stop_flag,
@@ -826,6 +853,10 @@ impl BrainWatcher {
                 }
             };
 
+            // nw-651 on Linux: a directory created under a non-recursively
+            // watched one needs its own watch, and its notes may predate it.
+            let adopted = tree.adopt_new_dirs(&batch);
+            batch.extend(adopted);
             match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
                 Ok(None) => {}
                 // nw-668: committed text, missing code links — owed, disclosed
@@ -2325,6 +2356,104 @@ mod tests {
             .unwrap();
         assert!(next.is_none(), "nothing is left to reconcile");
         assert_eq!(pending(), serde_json::json!(0), "the debt must clear");
+    }
+
+    /// nw-651 on Linux (PR #431 CI): notify's inotify backend fails the
+    /// WHOLE recursive watch on the first subdirectory it cannot watch, so a
+    /// vault holding one unreadable directory had no brain watcher at all.
+    /// The seam fails the subscription the way inotify does (FSEvents never
+    /// would). Startup must proceed, the directory must be disclosed as the
+    /// walk's unreadable-directory row and its notes kept, and edits
+    /// elsewhere — including in a directory created afterwards — must land.
+    #[cfg(unix)]
+    #[test]
+    fn brain_watcher_stays_live_when_a_subdirectory_cannot_be_watched() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n"),
+            ("docs/Guide.md", "# Guide\n"),
+            ("locked/Hidden.md", "# Hidden\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let locked = root.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let has = |path: &str| {
+            store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .iter()
+                .any(|note| note.file_path == path)
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+                .emulating_inotify_watch()
+                .with_debounce_ms(100)
+                .with_ready_callback(move || {
+                    let _ = ready_tx.send(());
+                });
+            let stop = watcher.shutdown_handle();
+            let running = store.clone();
+            let handle = thread::spawn(move || watcher.run_with_store(running, None));
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while ready_rx.try_recv().is_err() {
+                    assert!(
+                        !handle.is_finished(),
+                        "an unwatchable subdirectory must not stop the watcher starting"
+                    );
+                    assert!(Instant::now() < deadline, "watcher never became ready");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                thread::sleep(Duration::from_millis(300));
+                let rows = crate::index_md::load_skipped_notes_sidecar(&db_path).skipped;
+                assert!(
+                    rows.iter().any(|row| row.path == "locked"
+                        && row.reason_code == nestweaver_parser::SkipReasonCode::ReadError),
+                    "the unwatchable directory must be disclosed: {rows:?}"
+                );
+
+                let wait = |what: &str, path: &str| {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !has(path) {
+                        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                };
+                fs::write(root.join("docs/Fresh.md"), "# Fresh\n").unwrap();
+                wait("a note in a watched directory", "docs/Fresh.md");
+                fs::create_dir(root.join("newdir")).unwrap();
+                fs::write(root.join("newdir/Born.md"), "# Born\n").unwrap();
+                wait("a note in a directory created later", "newdir/Born.md");
+                // Its own watch, not only the create event, carries later notes.
+                thread::sleep(Duration::from_millis(300));
+                fs::write(root.join("newdir/Later.md"), "# Later\n").unwrap();
+                wait("a later note in the new directory", "newdir/Later.md");
+                assert!(
+                    has("locked/Hidden.md"),
+                    "an unwatchable directory's notes are never deleted"
+                );
+            }));
+            stop.stop();
+            let joined = handle.join().unwrap();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            joined.unwrap();
+        }));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// nw-653 review: a partial scan is not a deletion. Notes under a

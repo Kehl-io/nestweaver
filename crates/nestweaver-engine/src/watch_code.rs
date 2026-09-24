@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use nestweaver_parser::detect_language;
 use nestweaver_store::{GraphScope, GraphStore};
-use notify::{Event, RecursiveMode, Watcher};
+use notify::Event;
 
 use crate::content_reader::ContentReader;
 use crate::index::is_minified_or_bundled;
+use crate::watch_tree::TreeWatch;
 use crate::watcher::{
     RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
     WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
@@ -45,8 +46,14 @@ pub struct CodeWatcher {
     /// nw-664: first delay before retrying a failed startup reconciliation;
     /// doubles per failure up to [`crate::watcher::RECONCILE_RETRY_CAP`].
     reconcile_retry_base: Duration,
+    /// nw-651 on Linux: directories the filesystem subscription could not
+    /// cover (`watch_tree`), disclosed with the rest of this repo's debt.
+    unwatched_dirs: Vec<(PathBuf, String)>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
+    /// Test seam: subscribe as inotify would fail on an unreadable subtree.
+    #[cfg(test)]
+    emulate_inotify_watch: bool,
 }
 
 #[derive(Debug)]
@@ -112,8 +119,11 @@ impl CodeWatcher {
             instance_config: None,
             ready_callback: None,
             reconcile_retry_base: crate::watcher::RECONCILE_RETRY_BASE,
+            unwatched_dirs: Vec::new(),
             #[cfg(test)]
             ready_signal: None,
+            #[cfg(test)]
+            emulate_inotify_watch: false,
         }
     }
 
@@ -124,6 +134,14 @@ impl CodeWatcher {
     /// watcher without invoking it means startup failed or was cancelled.
     pub fn with_ready_callback(mut self, ready: impl FnOnce() + Send + 'static) -> Self {
         self.ready_callback = Some(Box::new(ready));
+        self
+    }
+
+    /// Test hook: make the recursive subscription fail the way Linux inotify
+    /// does on an unreadable subdirectory (see `watch_tree`).
+    #[cfg(test)]
+    fn emulating_inotify_watch(mut self) -> Self {
+        self.emulate_inotify_watch = true;
         self
     }
 
@@ -255,7 +273,7 @@ impl CodeWatcher {
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let mut watcher =
+        let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_kind_can_mutate(&event.kind) => {
                     let _ = tx.send(Ok(event.paths));
@@ -266,9 +284,21 @@ impl CodeWatcher {
                 }
             })
             .context("init code filesystem watcher")?;
-        watcher
-            .watch(&self.repo_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", self.repo_root.display()))?;
+        // nw-651 on Linux: an unreadable subdirectory must not stop the whole
+        // subscription; it is skipped and disclosed instead (`watch_tree`).
+        #[cfg(test)]
+        let tree = if self.emulate_inotify_watch {
+            TreeWatch::start_emulating_inotify(watcher, &self.repo_root)
+        } else {
+            TreeWatch::start(watcher, &self.repo_root)
+        };
+        #[cfg(not(test))]
+        let tree = TreeWatch::start(watcher, &self.repo_root);
+        let mut tree = tree.with_context(|| format!("watch {}", self.repo_root.display()))?;
+        if !tree.unwatchable().is_empty() {
+            self.unwatched_dirs = tree.unwatchable().to_vec();
+            self.record_debt(&[], &[], None);
+        }
         #[cfg(test)]
         if let Some(ready) = &self.ready_signal {
             let _ = ready.send(());
@@ -408,7 +438,7 @@ impl CodeWatcher {
                 }
             }
 
-            let batch = if !replay_batch.is_empty() {
+            let mut batch = if !replay_batch.is_empty() {
                 std::mem::take(&mut replay_batch)
             } else {
                 match receive_debounced_paths(&rx, self.debounce, &self.stop_flag) {
@@ -451,6 +481,13 @@ impl CodeWatcher {
                 }
             };
 
+            // nw-651 on Linux: a directory created under a non-recursively
+            // watched one needs its own watch, and its files may predate it.
+            let adopted = tree.adopt_new_dirs(&batch);
+            batch.extend(adopted);
+            if tree.unwatchable().len() != self.unwatched_dirs.len() {
+                self.unwatched_dirs = tree.unwatchable().to_vec();
+            }
             let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -472,10 +509,22 @@ impl CodeWatcher {
                 WatchBatchOutcome::Published { files_processed } => {
                     // nw-664 review: these paths are now what the graph holds,
                     // so any disclosure about them is stale.
+                    // An unwatched directory's row stays: a batch touching
+                    // it (or an ancestor) says nothing about its watch.
+                    let settled: Vec<PathBuf> = batch
+                        .iter()
+                        .filter(|path| {
+                            !self
+                                .unwatched_dirs
+                                .iter()
+                                .any(|(dir, _)| dir.starts_with(path))
+                        })
+                        .cloned()
+                        .collect();
                     crate::index_md::clear_code_reconciliation_paths(
                         &self.db_path,
                         &self.repo_root,
-                        &batch,
+                        &settled,
                     );
                     files_processed
                 }
@@ -1364,6 +1413,16 @@ impl CodeWatcher {
                 format!(
                     "{prefix}: code watcher could not read this source ({error}); the graph \
                      keeps its last indexed state, re-checked at the next watcher start"
+                ),
+            )
+        }));
+        entries.extend(self.unwatched_dirs.iter().map(|(dir, error)| {
+            nestweaver_parser::SkippedFile::new(
+                dir.to_string_lossy().into_owned(),
+                nestweaver_parser::SkipReasonCode::ReadError,
+                format!(
+                    "{prefix}: code watcher cannot watch this directory ({error}); edits \
+                     beneath it are not picked up live, re-checked at the next watcher start"
                 ),
             )
         }));
@@ -3605,6 +3664,97 @@ mod tests {
             !names.contains("gamma"),
             "a real deletion in the same scan is still reconciled: {names:?}"
         );
+    }
+
+    /// nw-651 on Linux (PR #431 CI): notify's inotify backend fails the
+    /// WHOLE recursive watch on the first subdirectory it cannot watch, so a
+    /// repo holding one unreadable directory had no code watcher at all —
+    /// every live edit silently lost. The seam fails the subscription the
+    /// way inotify does (FSEvents never would). Startup must proceed, the
+    /// unreadable directory must be disclosed and its sources kept, and
+    /// edits elsewhere — including in a directory created afterwards — must
+    /// still land.
+    #[cfg(unix)]
+    #[test]
+    fn code_watcher_stays_live_when_a_subdirectory_cannot_be_watched() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, root, uid) = index_fixture_repo_on_disk(
+            &dir,
+            &[(
+                "locked/hidden.js",
+                "export function hidden() { return 1; }\n",
+            )],
+        );
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let watcher = CodeWatcher::new(&db_path, &root, "test").emulating_inotify_watch();
+            let (stop, handle) = spawn_live_code_watcher(watcher, store.clone());
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let locked_key = locked.to_string_lossy().into_owned();
+                let disclosed = || {
+                    code_debt(&db_path).iter().any(|(path, reason)| {
+                        *path == locked_key && reason.contains("cannot watch")
+                    })
+                };
+                assert!(
+                    disclosed(),
+                    "the unwatchable directory must be disclosed: {:?}",
+                    code_debt(&db_path)
+                );
+
+                std::fs::write(
+                    root.join("src/a.js"),
+                    "export function helperLive() { return 9; }\n",
+                )
+                .unwrap();
+                wait_until("an edit in a watched directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("helperLive")
+                });
+                std::fs::create_dir(root.join("fresh")).unwrap();
+                std::fs::write(
+                    root.join("fresh/born.js"),
+                    "export function bornLive() { return 1; }\n",
+                )
+                .unwrap();
+                wait_until("a source in a directory created later to land", || {
+                    repo_symbol_names(&store, &uid).contains("bornLive")
+                });
+                // Its own watch, not only the create event, carries later edits.
+                std::fs::write(
+                    root.join("fresh/born.js"),
+                    "export function bornEdited() { return 2; }\n",
+                )
+                .unwrap();
+                wait_until("a later edit in the new directory to land", || {
+                    repo_symbol_names(&store, &uid).contains("bornEdited")
+                });
+                assert!(
+                    repo_symbol_names(&store, &uid).contains("hidden"),
+                    "an unwatchable directory's sources are never deleted"
+                );
+                assert!(
+                    disclosed(),
+                    "published live batches must not clear the directory's row"
+                );
+            }));
+            stop.stop();
+            let joined = handle.join().unwrap();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            joined.unwrap();
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// nw-664 / nw-287: a scan that finds no files at all (unmounted, emptied)

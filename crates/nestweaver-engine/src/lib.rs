@@ -498,6 +498,7 @@ pub mod user_config;
 pub mod vault_registration;
 pub mod vector_search;
 pub mod watch_code;
+mod watch_tree;
 pub mod watcher;
 pub mod worker;
 pub mod write_gate;

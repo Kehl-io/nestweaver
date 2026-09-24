@@ -890,6 +890,64 @@ pub(crate) fn record_vault_reconciliation_debt(
     replace_reconciliation_debt(db_path, vault_root.to_string_lossy().into_owned(), owed);
 }
 
+/// nw-651 on Linux: disclose the vault directories the brain watcher could
+/// not subscribe to (see `watch_tree`) as the SAME unreadable-directory row
+/// the vault walk writes (`disclose_pruned_dir`), merged into `skipped` for
+/// `vault_root`. inotify cannot watch exactly the directories the walk cannot
+/// read, so this is the row the next refresh re-derives anyway; writing it at
+/// startup means it is disclosed even when no batch runs. A walk that reads
+/// the directory again drops it like any other walk row (`is_walk_row`).
+/// `.brainignore` wins, as it does for the walk.
+pub(crate) fn disclose_unwatchable_vault_dirs(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    ignore_set: &GlobSet,
+    dirs: &[(PathBuf, String)],
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let rows: Vec<SkippedFile> = dirs
+        .iter()
+        .filter_map(|(dir, detail)| {
+            let rel = dir
+                .strip_prefix(vault_root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+            if rel.is_empty() || brainignore_covers_dir(&rel, ignore_set) {
+                return None;
+            }
+            crate::index::disclose_pruned_dir(
+                crate::content_reader::SkippedDir {
+                    path: rel,
+                    reason: crate::content_reader::UNREADABLE_DIR_REASON.to_string(),
+                    matched_pattern: None,
+                    detail: Some(detail.clone()),
+                },
+                crate::index::SkipDirCaller::Vault,
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        sidecar
+            .skipped
+            .retain(|file| !rows.iter().any(|row| row.path == file.path));
+        sidecar.skipped.extend(rows.iter().cloned());
+        sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+        ))
+    });
+}
+
 /// nw-668: disclose vault notes whose TEXT committed but whose code links
 /// (cross-domain edges) did not, and which the watcher is retrying. Same
 /// `WATCH_RECONCILIATION_PENDING_REASON` prefix as a startup reconciliation —
