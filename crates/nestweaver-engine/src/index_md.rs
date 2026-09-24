@@ -587,11 +587,42 @@ fn record_ingest_failures(
     }
 }
 
+/// nw-651 review: serialises every load-modify-write of the skipped-notes
+/// sidecar in this process. The sidecar is shared by every vault in the
+/// database and every vault watcher starts at once, so unserialised
+/// read-modify-writes dropped each other's `reconciliation_pending` and
+/// `unindexable_mtimes`. ONE lock for every database: contention is a few
+/// small JSON writes. It does NOT serialise another PROCESS: a direct-mode
+/// CLI index racing the daemon can still lose one side's update (never tear
+/// the file — writes are atomic renames); the next write of that vault
+/// re-derives its rows.
+static SKIPPED_NOTES_SIDECAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load, change and persist the sidecar under [`SKIPPED_NOTES_SIDECAR_LOCK`].
+/// `update` returns `None` to leave the file untouched.
+fn update_skipped_notes_sidecar(
+    db_path: &Path,
+    update: impl FnOnce(SkippedNotesSidecar) -> Option<SkippedNotesSidecar>,
+) {
+    let _guard = SKIPPED_NOTES_SIDECAR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sidecar) = update(load_skipped_notes_sidecar(db_path)) {
+        persist_skipped_notes_sidecar(db_path, &sidecar);
+    }
+}
+
+/// Written by temp file + rename, so a concurrent reader never sees a torn
+/// file — which it would parse as EMPTY and could write back.
 fn persist_skipped_notes_sidecar(db_path: &Path, sidecar: &SkippedNotesSidecar) {
     let path = crate::sidecar_path(db_path, SKIPPED_NOTES_SIDECAR_SUFFIX);
-    match serde_json::to_string_pretty(sidecar) {
+    match serde_json::to_vec_pretty(sidecar) {
         Ok(json) => {
-            if let Err(error) = std::fs::write(&path, json) {
+            if let Err(error) =
+                nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+                    std::io::Write::write_all(file, &json)
+                })
+            {
                 tracing::warn!(
                     path = %path.display(),
                     %error,
@@ -615,14 +646,17 @@ fn persist_skipped_notes_replace(
     // A full index re-derives this vault's failures; other vaults' entries
     // are not its to drop, and owed watcher reconciliation is the watcher's
     // to clear.
-    let existing = load_skipped_notes_sidecar(db_path);
-    let mut unindexable = existing.unindexable_mtimes;
-    unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
-    record_ingest_failures(&mut unindexable, vault_root, skipped);
-    persist_skipped_notes_sidecar(
-        db_path,
-        &build_skipped_notes_sidecar(skipped, near, unindexable, existing.reconciliation_pending),
-    );
+    update_skipped_notes_sidecar(db_path, |existing| {
+        let mut unindexable = existing.unindexable_mtimes;
+        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
+        record_ingest_failures(&mut unindexable, vault_root, skipped);
+        Some(build_skipped_notes_sidecar(
+            skipped,
+            near,
+            unindexable,
+            existing.reconciliation_pending,
+        ))
+    });
 }
 
 fn persist_skipped_notes_merge(
@@ -635,46 +669,47 @@ fn persist_skipped_notes_merge(
     let Some(db_path) = db_path else {
         return;
     };
-    let mut sidecar = load_skipped_notes_sidecar(db_path);
-    for path in touched_paths {
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        for path in touched_paths {
+            sidecar
+                .unindexable_mtimes
+                .remove(&*vault_root.join(path).to_string_lossy());
+        }
+        // nw-651 review: entries an older build recorded for directories.
+        sidecar.unindexable_mtimes.retain(|path, _| {
+            !(Path::new(path).starts_with(vault_root) && Path::new(path).is_dir())
+        });
+        record_ingest_failures(&mut sidecar.unindexable_mtimes, vault_root, skipped);
+        let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
+        // nw-651 review: this route WALKS the whole vault too, and every row the
+        // walk produces (an unreadable or pruned directory, an ignore file it
+        // could not apply) is in `skipped` again when it still holds. Keeping the
+        // old ones kept a directory "unreadable" in `brain status` after its
+        // permissions were fixed, until the next full index.
         sidecar
-            .unindexable_mtimes
-            .remove(&*vault_root.join(path).to_string_lossy());
-    }
-    // nw-651 review: entries an older build recorded for directories.
-    sidecar
-        .unindexable_mtimes
-        .retain(|path, _| !(Path::new(path).starts_with(vault_root) && Path::new(path).is_dir()));
-    record_ingest_failures(&mut sidecar.unindexable_mtimes, vault_root, skipped);
-    let touched: HashSet<&str> = touched_paths.iter().map(String::as_str).collect();
-    // nw-651 review: this route WALKS the whole vault too, and every row the
-    // walk produces (an unreadable or pruned directory, an ignore file it
-    // could not apply) is in `skipped` again when it still holds. Keeping the
-    // old ones kept a directory "unreadable" in `brain status` after its
-    // permissions were fixed, until the next full index.
-    sidecar
-        .skipped
-        .retain(|file| !touched.contains(file.path.as_str()) && !is_walk_row(vault_root, file));
-    sidecar
-        .notes_near_size_limit
-        .retain(|note| !touched.contains(note.path.as_str()));
-    sidecar.skipped.extend(skipped.iter().cloned());
-    sidecar.notes_near_size_limit.extend(near.iter().cloned());
-    sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-    sidecar.skipped.dedup_by(|a, b| a.path == b.path);
-    sidecar
-        .notes_near_size_limit
-        .sort_by(|a, b| a.path.cmp(&b.path));
-    sidecar
-        .notes_near_size_limit
-        .dedup_by(|a, b| a.path == b.path);
-    let rebuilt = build_skipped_notes_sidecar(
-        &sidecar.skipped,
-        &sidecar.notes_near_size_limit,
-        sidecar.unindexable_mtimes,
-        sidecar.reconciliation_pending,
-    );
-    persist_skipped_notes_sidecar(db_path, &rebuilt);
+            .skipped
+            .retain(|file| !touched.contains(file.path.as_str()) && !is_walk_row(vault_root, file));
+        sidecar
+            .notes_near_size_limit
+            .retain(|note| !touched.contains(note.path.as_str()));
+        sidecar.skipped.extend(skipped.iter().cloned());
+        sidecar.notes_near_size_limit.extend(near.iter().cloned());
+        sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar.skipped.dedup_by(|a, b| a.path == b.path);
+        sidecar
+            .notes_near_size_limit
+            .sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar
+            .notes_near_size_limit
+            .dedup_by(|a, b| a.path == b.path);
+        let rebuilt = build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        );
+        Some(rebuilt)
+    });
 }
 
 /// Whether a sidecar row came from the vault WALK rather than from reading a
@@ -713,36 +748,35 @@ pub(crate) fn record_watch_reconciliation_debt(
         return;
     };
     let key = vault_root.to_string_lossy().into_owned();
-    let mut sidecar = load_skipped_notes_sidecar(db_path);
-    match error {
-        Some(error) if !paths.is_empty() => {
-            let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}; retrying ({error})");
-            let mut owed: Vec<SkippedFile> = paths
-                .iter()
-                .map(|path| {
-                    SkippedFile::new(
-                        path.to_string_lossy().into_owned(),
-                        SkipReasonCode::Other,
-                        reason.clone(),
-                    )
-                })
-                .collect();
-            owed.sort_by(|a, b| a.path.cmp(&b.path));
-            sidecar.reconciliation_pending.insert(key, owed);
-        }
-        _ => {
-            if sidecar.reconciliation_pending.remove(&key).is_none() {
-                return;
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        match error {
+            Some(error) if !paths.is_empty() => {
+                let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}; retrying ({error})");
+                let mut owed: Vec<SkippedFile> = paths
+                    .iter()
+                    .map(|path| {
+                        SkippedFile::new(
+                            path.to_string_lossy().into_owned(),
+                            SkipReasonCode::Other,
+                            reason.clone(),
+                        )
+                    })
+                    .collect();
+                owed.sort_by(|a, b| a.path.cmp(&b.path));
+                sidecar.reconciliation_pending.insert(key, owed);
+            }
+            _ => {
+                sidecar.reconciliation_pending.remove(&key)?;
             }
         }
-    }
-    let rebuilt = build_skipped_notes_sidecar(
-        &sidecar.skipped,
-        &sidecar.notes_near_size_limit,
-        sidecar.unindexable_mtimes,
-        sidecar.reconciliation_pending,
-    );
-    persist_skipped_notes_sidecar(db_path, &rebuilt);
+        let rebuilt = build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+        );
+        Some(rebuilt)
+    });
 }
 
 /// Read `<db>.skipped_notes.json`. Missing or unreadable files are an empty
@@ -8246,6 +8280,41 @@ mod vault_registration_refresh_tests {
 #[cfg(test)]
 mod watch_reconciliation_disclosure_tests {
     use super::*;
+
+    /// nw-651 review: every vault watcher starts together and each one
+    /// load-modify-writes this shared sidecar. Unserialised, one watcher's
+    /// write replaced another's, and a reader catching a half-written file
+    /// parsed it as empty and wrote that back — dropping every vault's owed
+    /// reconciliation. Concurrent writers must all land.
+    #[test]
+    fn concurrent_debt_records_for_different_vaults_all_land() {
+        const VAULTS: usize = 16;
+        for round in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("brain.lbug");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(VAULTS));
+            let handles: Vec<_> = (0..VAULTS)
+                .map(|i| {
+                    let (db_path, barrier) = (db_path.clone(), barrier.clone());
+                    let root = dir.path().join(format!("vault-{i}"));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        record_watch_reconciliation_debt(
+                            Some(&db_path),
+                            &root,
+                            &[root.join("n.md")],
+                            Some("injected"),
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            let owed = load_skipped_notes_sidecar(&db_path).reconciliation_pending;
+            assert_eq!(owed.len(), VAULTS, "round {round}: {:?}", owed.keys());
+        }
+    }
 
     /// nw-653 review: the sidecar is shared by every vault in the database,
     /// so one vault's successful reconciliation must not clear another's
