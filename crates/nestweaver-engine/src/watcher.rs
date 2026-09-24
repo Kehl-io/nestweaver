@@ -148,6 +148,20 @@ struct BatchPhaseTimings {
     finalize_ms: u64,
 }
 
+/// nw-653: backoff for retrying a failed startup reconciliation.
+const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(5);
+const RECONCILE_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// nw-653: a startup reconciliation that has not yet committed. It is kept and
+/// retried from the event loop rather than dropped: dropping it is exactly how
+/// the notes this fixes were lost. `paths` is `None` when the drift itself
+/// could not be computed, so the retry recomputes it.
+struct PendingReconciliation {
+    paths: Option<Vec<PathBuf>>,
+    failures: u32,
+    next_attempt: Instant,
+}
+
 /// Live file-watcher for a single vault. Construct via `new`, then call
 /// `run` from a dedicated thread — `run` blocks until `stop()` is
 /// signalled or the watcher's debouncer hits a fatal error.
@@ -177,6 +191,9 @@ pub struct BrainWatcher {
     external_tantivy: Option<Arc<TantivyIndex>>,
     mutation_lease_factory: Option<WatchMutationLeaseFactory>,
     ready_callback: Option<Box<dyn FnOnce() + Send>>,
+    /// nw-653: first delay before retrying a failed startup reconciliation;
+    /// doubles per failure up to [`RECONCILE_RETRY_CAP`].
+    reconcile_retry_base: Duration,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
     /// Last batch's phase timings, for tests to assert on directly instead
@@ -293,6 +310,7 @@ impl BrainWatcher {
             external_tantivy: None,
             mutation_lease_factory: None,
             ready_callback: None,
+            reconcile_retry_base: RECONCILE_RETRY_BASE,
             #[cfg(test)]
             ready_signal: None,
             #[cfg(test)]
@@ -394,6 +412,12 @@ impl BrainWatcher {
     }
 
     /// Set the debounce interval for filesystem events.
+    #[cfg(test)]
+    fn with_reconcile_retry_base(mut self, base: Duration) -> Self {
+        self.reconcile_retry_base = base;
+        self
+    }
+
     pub fn with_debounce_ms(mut self, ms: u64) -> Self {
         self.debounce_ms = ms;
         self
@@ -582,25 +606,26 @@ impl BrainWatcher {
         // nw-653: replay what changed while no watcher was listening. The
         // notify subscription above is already live, so a save racing this
         // scan is queued and reprocessed by the loop; overlap is harmless.
-        // Runs before readiness so "ready" means the graph matches disk.
-        match self.reconcile_startup_drift(&store, tantivy.as_deref(), &v_uid, &on_change) {
-            Ok(_) => {}
-            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+        // Runs before readiness so "ready" normally means the graph matches
+        // disk. A failure does not stop live watching (the supervisor would
+        // only restart into the same failure): it is disclosed in the
+        // skipped-notes status and retried from the loop below with backoff.
+        let mut pending = match self.attempt_reconciliation(
+            &store,
+            tantivy.as_deref(),
+            &v_uid,
+            &on_change,
+            None,
+            0,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
                 tracing::info!(
-                    "BrainWatcher startup reconciliation refused during shutdown; exiting"
+                    "BrainWatcher startup reconciliation refused during shutdown; exiting: {error:#}"
                 );
                 return Ok(());
             }
-            // Failing startup here would stop live watching too, and the
-            // supervisor would retry into the same failure. Keep watching and
-            // name the recovery instead.
-            Err(error) => tracing::error!(
-                vault = %self.vault_root.display(),
-                error = %format!("{error:#}"),
-                "BrainWatcher startup reconciliation failed; notes changed while no watcher \
-                 ran may be missing or stale until `nestweaver brain refresh`"
-            ),
-        }
+        };
         if let Some(ready) = self.ready_callback.take() {
             ready();
         }
@@ -621,6 +646,22 @@ impl BrainWatcher {
             if self.stop_flag.load(Ordering::Relaxed) {
                 tracing::info!("BrainWatcher stop requested; exiting");
                 return Ok(());
+            }
+            // nw-653: retry an owed startup reconciliation once its backoff
+            // elapses. Checked every iteration, so an idle vault retries on
+            // the receive timeout tick and a busy one between batches.
+            if let Some(owed) = pending.take_if(|owed| Instant::now() >= owed.next_attempt) {
+                match self.attempt_reconciliation(
+                    &store,
+                    tantivy.as_deref(),
+                    &v_uid,
+                    &on_change,
+                    owed.paths,
+                    owed.failures,
+                ) {
+                    Ok(next) => pending = next,
+                    Err(_) => return Ok(()),
+                }
             }
             let batch = match receive_debounced_paths(
                 &rx,
@@ -912,11 +953,92 @@ impl BrainWatcher {
         Ok(())
     }
 
+    /// nw-653: one reconciliation attempt. `Ok(None)` means the graph now
+    /// matches disk and any disclosed debt was cleared; `Ok(Some(_))` means it
+    /// failed, was disclosed in the skipped-notes status, and is owed a retry.
+    /// `Err` only for a shutdown refusal, which ends the watcher.
+    fn attempt_reconciliation(
+        &self,
+        store: &GraphStore,
+        tantivy: Option<&TantivyIndex>,
+        v_uid: &str,
+        on_change: &Option<Box<dyn Fn() + Send>>,
+        known: Option<Vec<PathBuf>>,
+        failures: u32,
+    ) -> Result<Option<PendingReconciliation>, anyhow::Error> {
+        let drift = match known {
+            Some(paths) => Ok(paths),
+            None => crate::index_md::vault_startup_drift(
+                store,
+                &self.vault_root,
+                &self.instance_id,
+                &self.ignore_set,
+                self.note_limits,
+            ),
+        };
+        let (paths, error) = match drift {
+            Ok(paths) if paths.is_empty() => return Ok(None),
+            Ok(paths) => {
+                tracing::info!(
+                    vault = %self.vault_root.display(),
+                    notes = paths.len(),
+                    "BrainWatcher startup: reconciling notes changed while no watcher ran"
+                );
+                match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
+                    Ok(()) => {
+                        crate::index_md::record_watch_reconciliation_debt(
+                            store.db_path(),
+                            &self.vault_root,
+                            &paths,
+                            None,
+                        );
+                        return Ok(None);
+                    }
+                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) => (Some(paths), error),
+                }
+            }
+            Err(error) => (None, error),
+        };
+        let failures = failures.saturating_add(1);
+        let delay = self
+            .reconcile_retry_base
+            .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+            .min(RECONCILE_RETRY_CAP);
+        let message = format!("{error:#}");
+        tracing::error!(
+            vault = %self.vault_root.display(),
+            error = %message,
+            failures,
+            retry_in_ms = delay.as_millis() as u64,
+            "BrainWatcher startup reconciliation failed; notes changed while no watcher \
+             ran are missing or stale until it succeeds (retrying; `nestweaver brain \
+             refresh` also heals it)"
+        );
+        // An uncomputable drift is disclosed against the vault root itself.
+        crate::index_md::record_watch_reconciliation_debt(
+            store.db_path(),
+            &self.vault_root,
+            paths
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&self.vault_root)),
+            Some(&message),
+        );
+        Ok(Some(PendingReconciliation {
+            paths,
+            failures,
+            next_attempt: Instant::now() + delay,
+        }))
+    }
+
     /// nw-653: diff disk against the graph (`index_md::vault_startup_drift`)
     /// and push the drifted paths through the ordinary batch seam, so lost
     /// creates, edits and deletes get the same publication marker, BM25,
     /// embedding and PageRank maintenance as a live event. Returns how many
     /// paths were replayed; zero means no batch ran.
+    #[cfg(test)]
     fn reconcile_startup_drift(
         &self,
         store: &GraphStore,
@@ -1558,6 +1680,204 @@ mod tests {
             0
         );
         assert!(restarted.last_batch_phase_timings().is_none());
+    }
+
+    /// Start a watcher over `root`, stop it at readiness, and return how many
+    /// batch-scoped leases (`watch_vault_batch`) its startup acquired — zero
+    /// means startup ran no batch at all.
+    fn startup_batch_leases(db_path: &Path, root: &Path, store: &Arc<GraphStore>) -> u32 {
+        use std::sync::atomic::AtomicU32;
+        let batches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&batches);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_vault_batch" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let watcher = BrainWatcher::new(db_path, root, "default", "test")
+            .with_mutation_lease_factory(factory);
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        batches.load(Ordering::SeqCst)
+    }
+
+    /// nw-653 review: a note no index can ingest (here binary; a read or parse
+    /// failure is the same class) is absent from the graph by design. Startup
+    /// reconciliation must not treat it as a lost create and run a full batch
+    /// and publication for it on every restart. It is retried once the file
+    /// changes.
+    #[test]
+    fn watcher_startup_does_not_replay_a_note_that_cannot_be_ingested() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n"),
+            ("Indexed.md", "# Indexed\n\u{0}binary\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let has = |path: &str| {
+            store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .iter()
+                .any(|note| note.file_path == path)
+        };
+
+        // Skipped by the full index: nothing to replay on the first start.
+        assert_eq!(startup_batch_leases(&db_path, &root, &store), 0);
+
+        // Created while no watcher ran: the first start must try it, and
+        // once that attempt fails the next start must not try again.
+        fs::write(root.join("Later.md"), "# Later\n\u{0}binary\n").unwrap();
+        assert!(startup_batch_leases(&db_path, &root, &store) > 0);
+        assert!(!has("Later.md"));
+        assert_eq!(
+            startup_batch_leases(&db_path, &root, &store),
+            0,
+            "an unchanged note that could not be ingested must not be replayed per start"
+        );
+        let disclosed = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        assert!(
+            disclosed.skipped.iter().any(|file| file.path == "Later.md"),
+            "the failed ingest stays disclosed: {:?}",
+            disclosed.skipped
+        );
+
+        // Counterweight: fixed while no watcher ran, it is replayed and lands.
+        fs::write(root.join("Later.md"), "# Later\n\nfixed\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("Later.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(startup_batch_leases(&db_path, &root, &store) > 0);
+        assert!(has("Later.md"));
+    }
+
+    /// nw-653 review: a failed startup replay must not be dropped after a log
+    /// line. The watcher keeps watching, discloses the debt in the
+    /// skipped-notes status, retries, and clears the disclosure on success.
+    #[test]
+    fn failed_startup_reconciliation_is_disclosed_and_retried_until_it_lands() {
+        use std::sync::atomic::AtomicBool;
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        fs::write(root.join("New.md"), "# New\n\ncreated in the gap\n").unwrap();
+
+        // The first replay fails at its first batch lease; later ones succeed.
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&failed_once);
+        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
+            if label == "watch_vault_batch" && !flag.swap(true, Ordering::SeqCst) {
+                anyhow::bail!("injected replay failure");
+            }
+            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
+        });
+        let pending = |db: &Path| {
+            crate::index_md::load_skipped_notes_sidecar(db)
+                .skipped
+                .into_iter()
+                .filter(|file| {
+                    file.reason
+                        .starts_with(crate::index_md::WATCH_RECONCILIATION_PENDING_REASON)
+                })
+                .map(|file| file.path)
+                .collect::<Vec<_>>()
+        };
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_mutation_lease_factory(factory)
+            .with_reconcile_retry_base(Duration::from_millis(300))
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+        let stop = watcher.shutdown_handle();
+        let running = store.clone();
+        let handle = thread::spawn(move || watcher.run_with_store(running, None));
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a failed reconciliation must not prevent readiness");
+        assert!(
+            failed_once.load(Ordering::SeqCst),
+            "the injected failure ran"
+        );
+        assert_eq!(
+            pending(&db_path),
+            vec!["New.md".to_string()],
+            "the owed reconciliation must be disclosed in status"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pending(&db_path).is_empty() {
+            assert!(
+                !handle.is_finished(),
+                "the watcher must keep running after a failed reconciliation"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the reconciliation was never retried"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.stop();
+        handle.join().unwrap().unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        assert!(
+            store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .iter()
+                .any(|note| note.file_path == "New.md"),
+            "the retry must ingest the note"
+        );
+    }
+
+    /// nw-653 review: a partial scan is not a deletion. Notes under a
+    /// subdirectory the walk cannot read are still in the graph and must not
+    /// be replayed as deletions just because they were not enumerated.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_startup_drift_keeps_notes_in_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n"),
+            ("locked/Hidden.md", "# Hidden\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let locked = root.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let drift = crate::index_md::vault_startup_drift(
+            &store,
+            &root,
+            "default",
+            &GlobSet::empty(),
+            crate::index_limits::NoteLimits::default(),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let drift = drift.unwrap();
+        assert!(
+            !drift.contains(&locked.join("Hidden.md")),
+            "an unreadable subdirectory must not be replayed as a deletion: {drift:?}"
+        );
+        assert!(drift.is_empty(), "{drift:?}");
     }
 
     /// nw-653 / nw-287 counterweight: an indexed vault whose scan finds no
