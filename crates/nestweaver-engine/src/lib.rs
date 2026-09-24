@@ -523,7 +523,7 @@ pub use cluster_dispatch::{
     LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, ScopedClusteringOutput,
     compute_clusters, compute_clusters_scoped, default_cluster_resolution,
     default_cluster_resolution_for_symbol_count, load_clusters, load_clusters_for_resolution,
-    save_clusters, sidecar_path_for_resolution,
+    load_clusters_with_generation, save_clusters, sidecar_path_for_resolution,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{

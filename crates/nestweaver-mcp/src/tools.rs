@@ -11380,24 +11380,131 @@ fn tool_schema_clusters() -> Value {
                 "cluster_id": {
                     "type": "integer",
                     "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the preview. Use the same resolution as the call that produced the id."
+                },
+                // nw-479. Sibling of `hub_nodes`/`bridge_nodes`'s `repos`: an
+                // optional repo scope so an architecture question about ONE
+                // repo does not have to wade through graph-wide noise (wasm
+                // glue, unrelated services). Unlike `hub_nodes`/`bridge_nodes`
+                // — which rank the GLOBAL graph and then filter rows down to
+                // the scope — this runs Louvain on the repo-INDUCED SUBGRAPH
+                // (see `compute_clusters_scoped`'s doc comment), so cohesion,
+                // key_files and modularity all describe ONLY what the caller
+                // asked about.
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1, "maxLength": MAX_IDENTIFIER_LEN },
+                    "maxItems": 100,
+                    "description": "Restrict to the repo-INDUCED SUBGRAPH of these repos (names or UIDs): communities are computed from scratch over only these repos' symbols and their internal edges, not filtered post-hoc from the global partition. The response's `scope.id_space` is \"repo_scoped\" — community ids are NOT comparable across different scopes or to an unscoped call, and this result is never written to the clusters sidecar (hub_nodes/bridge_nodes/blast_radius/`cluster <id>` keep reading the unscoped, cached partition). `scope.cross_repo_edges_excluded` counts edges cut by the scope boundary. An unknown repo name is an error, never a silent empty result."
                 }
             }
         }
     })
 }
 
+/// Render one [`nestweaver_engine::CommunityInfo`] as the tool's community
+/// JSON shape, shared by the unscoped and repo-scoped branches of
+/// [`tool_clusters`] so the two populations can never drift in shape (the
+/// class of bug the sibling-gaps rule exists for).
+fn cluster_community_json(
+    c: &nestweaver_engine::CommunityInfo,
+    requested_id: Option<i64>,
+    preview_members: usize,
+) -> Value {
+    // Full membership when a specific cluster is requested (bounded so a giant
+    // cluster can't blow the context window), a caller-sized preview otherwise.
+    const FULL_MEMBER_CAP: usize = 2000;
+    let member_cap = if requested_id.is_some() {
+        FULL_MEMBER_CAP
+    } else if preview_members == 0 {
+        c.members.len()
+    } else {
+        preview_members
+    };
+    let members: Vec<Value> = c
+        .members
+        .iter()
+        .take(member_cap)
+        .map(|m| {
+            json!({
+                "uid": m.uid,
+                "name": m.name,
+                "file_path": m.file_path,
+                // Include kind so the daemon path renders the same
+                // member shape as the CLI direct path (ClusterMember).
+                "kind": m.kind,
+            })
+        })
+        .collect();
+    let members_returned = members.len();
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "size": c.member_count,
+        "cohesion": c.cohesion,
+        "key_files": c.key_files,
+        "members": members,
+        "returned_members": members_returned,
+        "members_truncated": c.members.len() > member_cap,
+    })
+}
+
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
+    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
+    // it, every cluster returns a 20-member preview (`size` still reports the true
+    // count), which made large clusters' membership unretrievable from the tool.
+    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
+    let resolution_arg = args.get("resolution").and_then(|v| v.as_f64());
+
+    // nw-479: an explicit `repos` scope takes a COMPLETELY separate path —
+    // computed on the repo-induced subgraph, never persisted to the clusters
+    // sidecar (a partial-graph partition must never become the last-writer-
+    // wins answer `hub_nodes`/`bridge_nodes`/`blast_radius`/`cluster <id>`
+    // read), and its community ids live in their own `repo_scoped` id space.
+    if let Some(entries) = args.get("repos").and_then(|v| v.as_array()) {
+        let selectors: Vec<String> = bound_identifiers(
+            entries
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            "repos",
+        )?;
+        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)
+            .context("compute_clusters_scoped")?;
+
+        let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
+            .communities
+            .iter()
+            .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
+            .collect();
+        let bounded = Bounded::take(matching, limit)
+            .map(|c| cluster_community_json(c, requested_id, preview_members));
+
+        let symbol_count: usize = scoped.communities.iter().map(|c| c.member_count).sum();
+        let mut payload = json!({
+            "resolution": scoped.resolution,
+            "cluster_count": scoped.communities.len(),
+            "symbol_count": symbol_count,
+            "modularity": scoped.modularity,
+            "limit": limit,
+            "scope": {
+                "repos": scoped.scope.repos,
+                "cross_repo_edges_excluded": scoped.scope.cross_repo_edges_excluded,
+                "id_space": scoped.scope.id_space,
+            },
+        });
+        bounded.merge_into(&mut payload, "clusters");
+        return Ok(payload);
+    }
+
     // F-DC-7: the adaptive default now comes from the engine, so this tool,
     // the `clusters`/`cluster` CLI commands and `summary --level cluster` all
     // partition the graph the same way. They did not: summaries hard-coded
     // resolution 1.0, which put its cluster IDs in a different ID SPACE from
     // the one `cluster <id>` resolves against — 26 of 50 IDs did not resolve.
-    let resolution = args
-        .get("resolution")
-        .and_then(|v| v.as_f64())
-        .unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
-    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
-    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    let resolution =
+        resolution_arg.unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -11407,18 +11514,12 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     // only writes derived cache data to a fixed sidecar path, never graph
     // state, and degrades to warn-only (e.g. on a read-only filesystem).
     if let Ok(db_path) = current_db_path(store)
-        && let Err(e) = nestweaver_engine::save_clusters(&db_path, &output)
+        && let Err(e) =
+            nestweaver_engine::save_clusters(&db_path, &output, store.graph_generation())
     {
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
-    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
-    // it, every cluster returns a 20-member preview (`size` still reports the true
-    // count), which made large clusters' membership unretrievable from the tool.
-    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
-    // Full membership when a specific cluster is requested (bounded so a giant
-    // cluster can't blow the context window), a caller-sized preview otherwise.
-    const FULL_MEMBER_CAP: usize = 2000;
     let matching: Vec<&nestweaver_engine::CommunityInfo> = output
         .communities
         .iter()
@@ -11426,43 +11527,8 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         .collect();
     // Cut BEFORE rendering, and capture the pre-cut total. Rendering the whole
     // corpus for a bounded answer is the other half of this defect class.
-    let bounded = Bounded::take(matching, limit).map(|c| {
-        {
-            let member_cap = if requested_id.is_some() {
-                FULL_MEMBER_CAP
-            } else if preview_members == 0 {
-                c.members.len()
-            } else {
-                preview_members
-            };
-            let members: Vec<Value> = c
-                .members
-                .iter()
-                .take(member_cap)
-                .map(|m| {
-                    json!({
-                        "uid": m.uid,
-                        "name": m.name,
-                        "file_path": m.file_path,
-                        // Include kind so the daemon path renders the same
-                        // member shape as the CLI direct path (ClusterMember).
-                        "kind": m.kind,
-                    })
-                })
-                .collect();
-            let members_returned = members.len();
-            json!({
-                "id": c.id,
-                "name": c.name,
-                "size": c.member_count,
-                "cohesion": c.cohesion,
-                "key_files": c.key_files,
-                "members": members,
-                "returned_members": members_returned,
-                "members_truncated": c.members.len() > member_cap,
-            })
-        }
-    });
+    let bounded = Bounded::take(matching, limit)
+        .map(|c| cluster_community_json(c, requested_id, preview_members));
 
     let symbol_count: usize = output.communities.iter().map(|c| c.member_count).sum();
 
@@ -20885,6 +20951,127 @@ mod arg_alias_tests {
         let store = GraphStore::in_memory().unwrap();
         assert!(tool_hub_nodes(&store, json!({ "top_n": 3 }), None).is_ok());
         assert!(tool_bridge_nodes(&store, json!({ "top_n": 3 }), None).is_ok());
+    }
+
+    // ── nw-479: `clusters` gains a `repos` scope ────────────────────────
+
+    fn cluster_scope_store() -> GraphStore {
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        for repo_uid in ["repo-a", "repo-b"] {
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid.to_string(),
+                    url: format!("https://example.test/{repo_uid}"),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let mk = |uid: &str, repo_uid: &str| Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {uid}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for (uid, repo) in [
+            ("a0", "repo-a"),
+            ("a1", "repo-a"),
+            ("b0", "repo-b"),
+            ("b1", "repo-b"),
+        ] {
+            store.insert_symbol(&mk(uid, repo)).unwrap();
+        }
+        for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: dst.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// A `repos` scope must return ONLY the scoped repo's members — never a
+    /// symbol from a repo outside the scope, even though the global partition
+    /// (see `compute_clusters_scoped`'s doc comment) might otherwise merge
+    /// them into one community.
+    #[test]
+    fn tool_clusters_repo_scope_returns_only_the_scoped_repos_members() {
+        let store = cluster_scope_store();
+        let payload = tool_clusters(&store, json!({ "repos": ["repo-a"], "resolution": 1.0 }))
+            .expect("scoped clusters call must succeed");
+
+        assert_eq!(payload["scope"]["id_space"], json!("repo_scoped"));
+        assert_eq!(payload["scope"]["repos"], json!(["repo-a"]));
+        let clusters = payload["clusters"].as_array().expect("clusters array");
+        assert!(!clusters.is_empty(), "{payload}");
+        for cluster in clusters {
+            for member in cluster["members"].as_array().expect("members array") {
+                let uid = member["uid"].as_str().unwrap();
+                assert!(
+                    uid.starts_with('a'),
+                    "a repo-a scoped call must never return a repo-b symbol: {uid}"
+                );
+            }
+        }
+    }
+
+    /// An unknown repo name in `repos` must ERROR, matching `hub_nodes`/
+    /// `bridge_nodes` — never a silently empty scoped result.
+    #[test]
+    fn tool_clusters_rejects_an_unknown_repo_name() {
+        let store = cluster_scope_store();
+        let err = tool_clusters(&store, json!({ "repos": ["no-such-repo"] }))
+            .expect_err("an unknown repo name must not resolve");
+        assert!(
+            format!("{err:#}").contains("no-such-repo"),
+            "the error must name the unresolved selector: {err:#}"
+        );
+        assert!(
+            err.chain().any(|cause| cause
+                .downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+                .is_some()),
+            "must be the typed RepoFilterUnresolved so the CLI/daemon can classify it: {err:#}"
+        );
+    }
+
+    /// COUNTERWEIGHT: omitting `repos` must produce the SAME shape as before
+    /// this change — no `scope` key, unscoped population.
+    #[test]
+    fn tool_clusters_without_repos_is_unscoped_and_unchanged() {
+        let store = cluster_scope_store();
+        let payload =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("unscoped clusters call");
+        assert!(
+            payload.get("scope").is_none(),
+            "an unscoped call must not carry a scope object: {payload}"
+        );
+        let clusters = payload["clusters"].as_array().expect("clusters array");
+        assert!(!clusters.is_empty(), "{payload}");
     }
 
     #[test]

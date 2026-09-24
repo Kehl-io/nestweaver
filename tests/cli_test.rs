@@ -9206,7 +9206,7 @@ fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_curren
             key_files: vec![],
         }],
     };
-    nestweaver_engine::save_clusters(&db, &stale).unwrap();
+    nestweaver_engine::save_clusters(&db, &stale, 1).unwrap();
 
     let current = nestweaver_engine::ClusteringOutput {
         resolution: 5.0,
@@ -9220,7 +9220,7 @@ fn repair_reclaims_a_stale_resolution_keyed_cluster_sidecar_but_keeps_the_curren
             key_files: vec![],
         }],
     };
-    nestweaver_engine::save_clusters(&db, &current).unwrap();
+    nestweaver_engine::save_clusters(&db, &current, 1).unwrap();
 
     let canonical_path = dir.path().join("scratch.lbug.clusters.json");
     let stale_path = nestweaver_engine::sidecar_path_for_resolution(&db, 0.5);
@@ -9284,7 +9284,7 @@ fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
         modularity: 0.5,
         communities: vec![],
     };
-    nestweaver_engine::save_clusters(&db, &only).unwrap();
+    nestweaver_engine::save_clusters(&db, &only, 1).unwrap();
     let only_path = nestweaver_engine::sidecar_path_for_resolution(&db, 1.0);
     assert!(only_path.exists(), "precondition");
 
@@ -9303,6 +9303,235 @@ fn repair_keeps_the_only_resolution_a_database_has_ever_computed() {
         "the only resolution ever computed must survive: {combined}"
     );
     assert!(!combined.contains("cluster sidecar"), "{combined}");
+}
+
+/// nw-646. A clusters sidecar built at an OLDER graph generation than the
+/// live graph is stale even when its `--resolution` matches — the old gate
+/// checked resolution alone, so `clusters --json` served a cache whose
+/// modularity did not match anything currently on disk. This pins the fix:
+/// a matching generation is a genuine cache hit (the fabricated sidecar's
+/// distinctive modularity comes back verbatim), and advancing the graph
+/// generation without touching resolution forces a fresh compute.
+#[test]
+fn clusters_cache_is_gated_on_graph_generation_not_just_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    let generation_path = std::path::PathBuf::from(format!("{}.generation", db_path.display()));
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    }
+
+    // Fabricate a sidecar with a distinctive modularity, tagged generation 5,
+    // and pin the live graph's persisted generation to the SAME value.
+    let fabricated = nestweaver_engine::ClusteringOutput {
+        resolution: 1.0,
+        modularity: 0.918273,
+        communities: vec![],
+    };
+    nestweaver_engine::save_clusters(&db_path, &fabricated, 5).unwrap();
+    std::fs::write(&generation_path, "5").unwrap();
+
+    // Cache HIT: generation matches (5 == 5), resolution matches (1.0).
+    let hit = nestweaver_cmd()
+        .args(["clusters", "--json", "--resolution", "1.0", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let hit_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&hit.stdout),
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert!(
+        hit_out.contains("Using cached clusters"),
+        "matching generation must reuse the cache: {hit_out}"
+    );
+    assert!(
+        hit_out.contains("0.918273"),
+        "a genuine cache hit must return the SIDECAR's own modularity: {hit_out}"
+    );
+
+    // Advance the graph generation (simulating a reindex) WITHOUT touching
+    // resolution or the sidecar file directly.
+    std::fs::write(&generation_path, "6").unwrap();
+
+    let miss = nestweaver_cmd()
+        .args(["clusters", "--json", "--resolution", "1.0", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let miss_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&miss.stdout),
+        String::from_utf8_lossy(&miss.stderr)
+    );
+    assert!(
+        !miss_out.contains("Using cached clusters"),
+        "a generation mismatch must NOT be reported as a cache hit: {miss_out}"
+    );
+    assert!(
+        !miss_out.contains("0.918273"),
+        "a stale generation must trigger a fresh compute, not replay the fabricated \
+         sidecar's modularity: {miss_out}"
+    );
+
+    // The freshly-computed sidecar must now carry the NEW generation.
+    let (_, saved_generation) = nestweaver_engine::load_clusters_with_generation(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_generation, Some(6));
+}
+
+fn write_two_repo_cluster_fixture(db_path: &std::path::Path) {
+    use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    let store = nestweaver_store::GraphStore::open_or_create(db_path).unwrap();
+    for repo_uid in ["repo-a", "repo-b"] {
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: format!("https://example.test/{repo_uid}"),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+    let mk = |uid: &str, repo_uid: &str| Symbol {
+        uid: uid.to_string(),
+        name: uid.to_string(),
+        kind: SymbolKind::Function,
+        repo_uid: repo_uid.to_string(),
+        file_path: "src/lib.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        signature: format!("fn {uid}()"),
+        summary: None,
+        content_hash: format!("h_{uid}"),
+        embedding: None,
+        pagerank_score: None,
+        is_entry_point: false,
+        entry_point_kind: None,
+        visibility: Visibility::Inferred,
+        type_info: None,
+        framework_hint: None,
+        canonical_id: None,
+    };
+    for (uid, repo) in [
+        ("a0", "repo-a"),
+        ("a1", "repo-a"),
+        ("b0", "repo-b"),
+        ("b1", "repo-b"),
+    ] {
+        store.insert_symbol(&mk(uid, repo)).unwrap();
+    }
+    for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: src.to_string(),
+                target_uid: dst.to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+    }
+}
+
+/// nw-479. `clusters --repo <repo>` must return ONLY that repo's members —
+/// never a symbol from a repo outside the scope.
+#[test]
+fn clusters_cli_repo_scope_returns_only_the_scoped_repos_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args([
+            "clusters",
+            "--repo",
+            "repo-a",
+            "--resolution",
+            "1.0",
+            "--json",
+            "--db",
+        ])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["scope"]["id_space"],
+        serde_json::json!("repo_scoped")
+    );
+    let clusters = payload["clusters"].as_array().expect("clusters array");
+    assert!(!clusters.is_empty(), "{combined}");
+    for cluster in clusters {
+        for member in cluster["members"].as_array().unwrap() {
+            let uid = member["uid"].as_str().unwrap();
+            assert!(
+                uid.starts_with('a'),
+                "a repo-a scoped call must never return a repo-b symbol: {uid}"
+            );
+        }
+    }
+}
+
+/// nw-479. An unknown `--repo` selector is an ERROR (exit 2, named), never a
+/// silent empty scope — matching `hubs --repo`/`bridges --repo`.
+#[test]
+fn clusters_cli_rejects_an_unknown_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["clusters", "--repo", "no-such-repo", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2), "{combined}");
+    assert!(combined.contains("no-such-repo"), "{combined}");
+}
+
+/// COUNTERWEIGHT: omitting `--repo` must leave unscoped `clusters` output
+/// unchanged — no `scope` key, and the command still succeeds.
+#[test]
+fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scratch.lbug");
+    write_two_repo_cluster_fixture(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["clusters", "--resolution", "1.0", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        payload.get("scope").is_none(),
+        "an unscoped call must not carry a scope object: {combined}"
+    );
 }
 
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a

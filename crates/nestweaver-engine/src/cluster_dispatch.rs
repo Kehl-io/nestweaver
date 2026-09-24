@@ -506,14 +506,44 @@ pub fn sidecar_path_for_resolution(db_path: &Path, resolution: f64) -> PathBuf {
     crate::sidecar_path(db_path, &format!(".clusters.{resolution:e}.json"))
 }
 
-/// Atomically write `output` as JSON to `path`.
+/// On-disk shape of a clusters sidecar file: the [`ClusteringOutput`] plus the
+/// [`GraphStore::graph_generation`](nestweaver_store::GraphStore::graph_generation)
+/// the clustering was computed from.
+///
+/// nw-646: the sidecar previously carried no generation marker at all, so a
+/// days-old cache (built before a reindex changed the graph) was served
+/// forever as long as `--resolution` matched — `clusters --json` reported
+/// "Using cached clusters" with a modularity that no longer matched the live
+/// graph. `#[serde(flatten)]` keeps the on-disk JSON's `resolution` /
+/// `modularity` / `communities` keys exactly as they were (an older sidecar
+/// written before this change still parses), while `graph_generation`
+/// defaults to `None` on a read of that older shape — an ABSENT generation
+/// is treated as unknown/stale by every caller that cares, rather than as a
+/// parse error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterSidecarFile {
+    #[serde(flatten)]
+    output: ClusteringOutput,
+    #[serde(default)]
+    graph_generation: Option<u64>,
+}
+
+/// Atomically write `output` (plus its `graph_generation`) as JSON to `path`.
 ///
 /// Writes to a process-unique temp file and renames into place, so a
 /// concurrent reader (e.g. `hub_nodes` racing a `clusters` call) never
 /// observes a partially-written file.
-fn write_clusters_atomic(path: &Path, output: &ClusteringOutput) -> Result<()> {
+fn write_clusters_atomic(
+    path: &Path,
+    output: &ClusteringOutput,
+    graph_generation: Option<u64>,
+) -> Result<()> {
+    let file = ClusterSidecarFile {
+        output: output.clone(),
+        graph_generation,
+    };
     let json =
-        serde_json::to_string_pretty(output).context("failed to serialize clustering output")?;
+        serde_json::to_string_pretty(&file).context("failed to serialize clustering output")?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
     if let Err(e) = fs::rename(&tmp, path) {
@@ -523,7 +553,8 @@ fn write_clusters_atomic(path: &Path, output: &ClusteringOutput) -> Result<()> {
     Ok(())
 }
 
-/// Persist clustering output to the sidecar file(s).
+/// Persist clustering output to the sidecar file(s), tagged with the graph
+/// generation it was computed from.
 ///
 /// nw-401: writes BOTH the canonical last-writer-wins path (unchanged
 /// behavior, for callers that want "whatever was computed most recently") AND
@@ -532,25 +563,37 @@ fn write_clusters_atomic(path: &Path, output: &ClusteringOutput) -> Result<()> {
 /// resolution). Concurrent writers at the SAME resolution still resolve to
 /// last-writer-wins on the keyed path too — acceptable, because the output is
 /// deterministic for a given graph state and resolution.
-pub fn save_clusters(db_path: &Path, output: &ClusteringOutput) -> Result<()> {
-    write_clusters_atomic(&sidecar_path(db_path), output)?;
+///
+/// nw-646: `graph_generation` is `store.graph_generation()` at the time the
+/// output was computed. A caller that has no meaningful generation to record
+/// (e.g. a scoped or in-memory computation not persisted for staleness
+/// tracking) may still pass one — the value is opaque to this function, which
+/// only stores what it is given.
+pub fn save_clusters(
+    db_path: &Path,
+    output: &ClusteringOutput,
+    graph_generation: u64,
+) -> Result<()> {
+    write_clusters_atomic(&sidecar_path(db_path), output, Some(graph_generation))?;
     write_clusters_atomic(
         &sidecar_path_for_resolution(db_path, output.resolution),
         output,
+        Some(graph_generation),
     )?;
     Ok(())
 }
 
-/// Load a clustering output from a specific sidecar file path.
-fn load_clusters_from(path: &Path) -> Result<Option<ClusteringOutput>> {
+/// Load a clustering sidecar file (output + generation marker) from a
+/// specific path.
+fn load_clusters_from(path: &Path) -> Result<Option<ClusterSidecarFile>> {
     if !path.exists() {
         return Ok(None);
     }
     let json =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let output: ClusteringOutput =
+    let file: ClusterSidecarFile =
         serde_json::from_str(&json).context("failed to parse clusters sidecar")?;
-    Ok(Some(output))
+    Ok(Some(file))
 }
 
 /// Load clustering output from the canonical (unkeyed) sidecar file, if it
@@ -559,11 +602,26 @@ fn load_clusters_from(path: &Path) -> Result<Option<ClusteringOutput>> {
 /// Returns `Ok(None)` when the sidecar does not exist (i.e. clusters have
 /// never been computed for this database). This is "whatever was computed
 /// most recently, at whichever resolution" — the same last-writer-wins
-/// semantics this function has always had. Callers that need a SPECIFIC
-/// resolution, immune to a later differently-resolved run, must use
-/// [`load_clusters_for_resolution`] instead.
+/// semantics this function has always had, and it does NOT check the graph
+/// generation — callers that care whether the cache is stale relative to the
+/// current graph must use [`load_clusters_with_generation`] instead. Callers
+/// that need a SPECIFIC resolution, immune to a later differently-resolved
+/// run, must use [`load_clusters_for_resolution`] instead.
 pub fn load_clusters(db_path: &Path) -> Result<Option<ClusteringOutput>> {
-    load_clusters_from(&sidecar_path(db_path))
+    Ok(load_clusters_from(&sidecar_path(db_path))?.map(|f| f.output))
+}
+
+/// Load clustering output from the canonical (unkeyed) sidecar file ALONGSIDE
+/// the graph generation it was computed from, if it exists.
+///
+/// nw-646. The generation is `None` when the sidecar predates this field
+/// (written by an older binary) — a caller must treat that the same as a
+/// generation that does not match the current graph: unknown provenance is
+/// not evidence of freshness.
+pub fn load_clusters_with_generation(
+    db_path: &Path,
+) -> Result<Option<(ClusteringOutput, Option<u64>)>> {
+    Ok(load_clusters_from(&sidecar_path(db_path))?.map(|f| (f.output, f.graph_generation)))
 }
 
 /// Load clustering output computed at EXACTLY `resolution`, if it has ever
@@ -579,7 +637,7 @@ pub fn load_clusters_for_resolution(
     db_path: &Path,
     resolution: f64,
 ) -> Result<Option<ClusteringOutput>> {
-    load_clusters_from(&sidecar_path_for_resolution(db_path, resolution))
+    Ok(load_clusters_from(&sidecar_path_for_resolution(db_path, resolution))?.map(|f| f.output))
 }
 
 #[cfg(test)]
@@ -679,7 +737,7 @@ mod tests {
                 key_files: vec![],
             }],
         };
-        save_clusters(&db_path, &low).unwrap();
+        save_clusters(&db_path, &low, 1).unwrap();
 
         let high = ClusteringOutput {
             resolution: 5.0,
@@ -693,7 +751,7 @@ mod tests {
                 key_files: vec![],
             }],
         };
-        save_clusters(&db_path, &high).unwrap();
+        save_clusters(&db_path, &high, 2).unwrap();
 
         // The keyed load for 0.5 must still see the FIRST run's data, even
         // though the second `save_clusters` ran after it and shares the
@@ -748,10 +806,71 @@ mod tests {
                 "resolution {bad} must be sanitized before storing, got {}",
                 output.resolution
             );
-            save_clusters(&db_path, &output).unwrap();
+            save_clusters(&db_path, &output, store.graph_generation()).unwrap();
             let loaded = load_clusters(&db_path).unwrap().unwrap();
             assert_eq!(loaded.resolution, output.resolution);
         }
+    }
+
+    // ── nw-646: the clusters sidecar carries a graph-generation marker ──────
+
+    /// `save_clusters` persists the generation it is given, and
+    /// `load_clusters_with_generation` returns it back unchanged --
+    /// `load_clusters` (the plain sibling) still returns just the output, so
+    /// existing callers that never cared about staleness are unaffected.
+    #[test]
+    fn load_clusters_with_generation_round_trips_the_stored_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let output = ClusteringOutput {
+            resolution: 0.5,
+            modularity: 0.42,
+            communities: vec![],
+        };
+        save_clusters(&db_path, &output, 331).unwrap();
+
+        let (loaded, generation) = load_clusters_with_generation(&db_path).unwrap().unwrap();
+        assert_eq!(generation, Some(331));
+        assert_eq!(loaded.resolution, output.resolution);
+
+        // COUNTERWEIGHT: the plain `load_clusters` sibling is unaffected --
+        // still just the output, ignoring generation entirely.
+        let plain = load_clusters(&db_path).unwrap().unwrap();
+        assert_eq!(plain.resolution, output.resolution);
+    }
+
+    /// A sidecar written before this field existed (plain `ClusteringOutput`
+    /// JSON, no `graph_generation` key) must parse as generation `None`
+    /// rather than failing to deserialize -- an absent generation is
+    /// "unknown provenance", which every staleness-checking caller must
+    /// treat the same as "stale", not as a parse error.
+    #[test]
+    fn load_clusters_with_generation_treats_a_pre_nw_646_sidecar_as_generation_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let path = sidecar_path(&db_path);
+        let legacy = ClusteringOutput {
+            resolution: 0.5,
+            modularity: 0.1,
+            communities: vec![],
+        };
+        // Write the OLD shape directly -- no wrapper, no `graph_generation`
+        // key -- rather than going through `save_clusters`, which always
+        // writes the new shape.
+        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let (loaded, generation) = load_clusters_with_generation(&db_path).unwrap().unwrap();
+        assert_eq!(
+            generation, None,
+            "a legacy sidecar has no generation marker"
+        );
+        assert_eq!(loaded.resolution, 0.5);
+
+        // COUNTERWEIGHT: the plain loader must still read the legacy shape
+        // fine -- this field being new must not break reading old sidecars
+        // at all.
+        let plain = load_clusters(&db_path).unwrap().unwrap();
+        assert_eq!(plain.resolution, 0.5);
     }
 
     // ── Task 4.7b (nw-479): `clusters --repo` on the repo-induced subgraph ──
@@ -977,7 +1096,7 @@ mod tests {
             // Seed the sidecar with a KNOWN unscoped run first, so "unchanged"
             // is a meaningful assertion rather than "still absent".
             let baseline = compute_clusters(&store, 1.0).unwrap();
-            save_clusters(&db_path, &baseline).unwrap();
+            save_clusters(&db_path, &baseline, store.graph_generation()).unwrap();
             let sidecar = sidecar_path(&db_path);
             let before_bytes = fs::read(&sidecar).unwrap();
             let before_mtime = fs::metadata(&sidecar).unwrap().modified().unwrap();
@@ -1013,7 +1132,7 @@ mod tests {
 
             assert!(!sidecar_path(&db_path).exists());
             let output = compute_clusters(&store, 1.0).unwrap();
-            save_clusters(&db_path, &output).unwrap();
+            save_clusters(&db_path, &output, 1).unwrap();
             assert!(
                 sidecar_path(&db_path).exists(),
                 "the unscoped path must still write the canonical sidecar"

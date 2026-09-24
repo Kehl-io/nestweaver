@@ -107,9 +107,9 @@ use nestweaver_engine::{
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_note_limits,
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
-    list_services, load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at,
-    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -6515,6 +6515,19 @@ enum Commands {
             help = "Maximum members listed per community (0-200; 0 = all, default 20; matches the MCP clusters schema)"
         )]
         members: usize,
+        // nw-479: sibling of `hubs --repo`/`bridges --repo`. Unlike those two
+        // (rank the global graph, then filter rows to the scope), a repo scope
+        // here runs Louvain on the repo-INDUCED SUBGRAPH, so cohesion/
+        // key_files/modularity describe only what was asked about. The result
+        // is a SEPARATE, uncached `repo_scoped` id space -- never written to
+        // the clusters sidecar `hub_nodes`/`bridge_nodes`/`blast_radius`/
+        // `cluster <id>` read.
+        #[arg(
+            long = "repo",
+            value_name = "REPO",
+            help = "Restrict to the repo-induced subgraph of this repo (name or UID; repeat for several). Computed fresh, never cached, and its community ids are NOT comparable to an unscoped run's. An unknown repo name is an error."
+        )]
+        repos: Vec<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -17590,10 +17603,54 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             limit,
             members,
             json,
+            repos,
             db,
             config: config_opt,
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+
+            // nw-479: a `--repo` scope takes a COMPLETELY separate path —
+            // computed on the repo-induced subgraph by the `clusters` tool
+            // itself (via the daemon when one is up, direct dispatch
+            // otherwise — ONE implementation either way, not a second copy
+            // here), never touching the clusters sidecar, and its community
+            // ids live in their own `repo_scoped` id space. This bypasses the
+            // unscoped cache/compute machinery below entirely.
+            if !repos.is_empty() {
+                let mut args = clusters_tool_args(limit, members, resolution);
+                args["repos"] = serde_json::json!(repos);
+                let payload = match try_hybrid_json_rpc_checked(
+                    use_daemon,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "clusters",
+                    args.clone(),
+                ) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                    Ok(Some(value)) => strip_hybrid_meta(value),
+                    Ok(None) => {
+                        let store = open_store(Some(&db_path))?;
+                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                        match nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)
+                        {
+                            Err(error) if error_is_unresolved_repo_filter(&error) => {
+                                return Ok((report_unresolved_repo_filter(&error, json), None));
+                            }
+                            Err(error) => return Err(error),
+                            Ok(value) => value,
+                        }
+                    }
+                };
+                if json {
+                    print_json_payload(&payload)?;
+                } else {
+                    print!("{}", render_scoped_clusters_text(&payload));
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
 
             // ── daemon guard ──────────────────────────────────────
             // The daemon `clusters` tool truncates each community's
@@ -17682,91 +17739,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // cache via the daemon. Two output modes disagreeing about whether a
             // cache exists, with the docs siding with the one that didn't.
             //
-            // Reuse is gated on the resolution MATCHING, because the sidecar
-            // holds whichever resolution was computed last: serving a cache
-            // built at a different resolution would answer a question the caller
-            // did not ask. With an explicit --resolution the check needs no
-            // store at all, which is the fully-instant case the help describes.
-            // nw-157: this gate used to require an EXPLICIT --resolution, so
-            // a bare `clusters` short-circuited the let-chain, missed its own
-            // cache, and recomputed plus rewrote a 65 MB sidecar on every run
-            // (1.89s vs 0.155s with --resolution 0.3 — the same answer, since
-            // the default IS 0.3 on this graph). The cache must be compared
-            // against the EFFECTIVE resolution, not the requested one.
-            //
-            // Deriving the default needs the symbol count, hence the store; an
-            // explicit --resolution still needs no store at all, preserving the
-            // fully-instant case `--help` describes.
-            let cached = load_clusters(&db_path).ok().flatten();
-            let mut opened: Option<std::mem::ManuallyDrop<_>> = None;
-            let mut symbol_count: Option<usize> = None;
-            let effective_resolution = match resolution {
-                Some(requested) => requested,
-                None => {
-                    let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-                    // F-DC-7: ONE rule, shared with the `clusters` tool and
-                    // `generate_cluster_summaries`. Community IDs are
-                    // ASSIGNMENT-dependent, so two runs at different
-                    // resolutions are two different ID SPACES, not two
-                    // orderings of one. Four copies of this 0.3/0.5 rule
-                    // existed and a fifth (`generate_cluster_summaries`, hard
-                    // coded to 1.0) drifted — which is why 26 of 50 IDs from
-                    // `summary --level cluster` did not resolve through
-                    // `cluster <id>`.
-                    let count = store.count_symbols().unwrap_or(0);
-                    let adaptive = nestweaver_engine::default_cluster_resolution(&store);
-                    symbol_count = Some(count);
-                    opened = Some(store);
-                    adaptive
-                }
-            };
+            // nw-646: reuse is gated on the resolution MATCHING *and* the
+            // sidecar's `graph_generation` matching the CURRENT graph's — a
+            // sidecar built before a reindex is stale even when its resolution
+            // happens to match, and the old resolution-only gate served it
+            // anyway (a cached response whose modularity no longer matched
+            // anything on disk). Checking the generation means opening the
+            // store on every call, including an explicit --resolution — this
+            // gives up the previous fully-instant case for that path
+            // (`load_graph_generation` needs a store open) in exchange for the
+            // cache never lying about what it holds. An older sidecar with no
+            // `graph_generation` field (written before this change) parses as
+            // `None`, which never equals `Some(current)` and so is always
+            // treated as stale rather than crashing or silently trusting it.
+            let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
+            let current_generation = store.graph_generation();
+            // F-DC-7: ONE rule, shared with the `clusters` tool and
+            // `generate_cluster_summaries`. Community IDs are
+            // ASSIGNMENT-dependent, so two runs at different
+            // resolutions are two different ID SPACES, not two
+            // orderings of one. Four copies of this 0.3/0.5 rule
+            // existed and a fifth (`generate_cluster_summaries`, hard
+            // coded to 1.0) drifted — which is why 26 of 50 IDs from
+            // `summary --level cluster` did not resolve through
+            // `cluster <id>`.
+            let effective_resolution =
+                resolution.unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(&store));
 
-            // Reuse is gated on the resolution MATCHING, because the sidecar
-            // holds whichever resolution was computed last: serving a cache
-            // built at a different resolution would answer a question the
-            // caller did not ask.
-            if let Some(cached) = cached
-                && (cached.resolution - effective_resolution).abs() < f64::EPSILON
-            {
+            let cached = load_clusters_with_generation(&db_path).ok().flatten();
+            let cache_is_fresh = cached.as_ref().is_some_and(|(cached_output, generation)| {
+                (cached_output.resolution - effective_resolution).abs() < f64::EPSILON
+                    && *generation == Some(current_generation)
+            });
+
+            if cache_is_fresh && let Some((cached_output, _)) = cached {
                 out.status(&format!(
-                    "Using cached clusters (resolution={effective_resolution}) from sidecar."
+                    "Using cached clusters (resolution={effective_resolution}, generation={current_generation}) from sidecar."
                 ));
-                print_clusters_output(&cached, json, limit, members)?;
+                print_clusters_output(&cached_output, json, limit, members)?;
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Compute and save inside a block so the store is dropped
-            // before any output. LadybugDB's connection finaliser can
-            // trigger a panic during WAL checkpoint; wrapping in
-            // catch_unwind prevents the Drop panic from aborting the
-            // process (exit code 101).
-            let output = {
-                let store = match opened {
-                    Some(store) => store,
-                    None => std::mem::ManuallyDrop::new(open_store(Some(&db_path))?),
-                };
-                let sym_count = match symbol_count {
-                    Some(count) => count,
-                    None => store.count_symbols().unwrap_or(0),
-                };
-
-                out.status(&format!(
-                    "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
-                ));
-                let o = compute_clusters(&store, effective_resolution)?;
-                save_clusters(&db_path, &o)?;
-                out.status(&format!(
-                    "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
-                    o.communities.len(),
-                    o.modularity
-                ));
-                // Leak the store intentionally — LadybugDB's Drop can
-                // panic during WAL checkpoint on some platforms, and we
-                // are about to exit anyway.  process::exit (called by
-                // main) terminates without running destructors, so this
-                // is safe.
-                o
-            };
+            // Compute and save. The store stays open (ManuallyDrop, leaked
+            // deliberately below) rather than reopened, since it is already
+            // open from the generation check above.
+            let sym_count = store.count_symbols().unwrap_or(0);
+            out.status(&format!(
+                "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
+            ));
+            let output = compute_clusters(&store, effective_resolution)?;
+            save_clusters(&db_path, &output, current_generation)?;
+            out.status(&format!(
+                "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
+                output.communities.len(),
+                output.modularity
+            ));
+            // Leak the store intentionally — LadybugDB's Drop can
+            // panic during WAL checkpoint on some platforms, and we
+            // are about to exit anyway.  process::exit (called by
+            // main) terminates without running destructors, so this
+            // is safe.
 
             print_clusters_output(&output, json, limit, members)?;
             Ok((EXIT_SUCCESS, None))
@@ -17804,7 +17836,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         ));
                         let store = open_store(Some(&db_path))?;
                         let computed = compute_clusters(&store, pinned)?;
-                        save_clusters(&db_path, &computed)?;
+                        save_clusters(&db_path, &computed, store.graph_generation())?;
                         computed
                     }
                 }
@@ -17824,7 +17856,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // whether their output is addressable at all.
                         let default_res = nestweaver_engine::default_cluster_resolution(&store);
                         let computed = compute_clusters(&store, default_res)?;
-                        save_clusters(&db_path, &computed)?;
+                        save_clusters(&db_path, &computed, store.graph_generation())?;
                         computed
                     }
                 }
@@ -30095,6 +30127,75 @@ fn render_clusters_text(
             "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
             total - take
         );
+    }
+    out
+}
+
+/// Render a `clusters --repo` payload (the `clusters` tool's scoped branch)
+/// as text.
+///
+/// nw-479. Deliberately a separate renderer, not a patch onto
+/// [`render_clusters_text`]: the scoped payload's JSON shape (`size` rather
+/// than `member_count`, plus a `scope` object) is the tool's wire shape, not
+/// the direct-path `ClusteringOutput`/`CommunityInfo` structs, so there is no
+/// shared struct to render from without first reconstructing one — and the
+/// `scope` disclosure (repos, cross-repo edges cut, and the `repo_scoped` id
+/// space warning) has nothing to share with the unscoped renderer anyway.
+fn render_scoped_clusters_text(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    let modularity = payload
+        .get("modularity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let total = payload.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let scope = payload.get("scope");
+    let scope_repos: Vec<String> = scope
+        .and_then(|s| s.get("repos"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let excluded = scope
+        .and_then(|s| s.get("cross_repo_edges_excluded"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Clusters scoped to [{}] ({total}, modularity={modularity:.4}); {excluded} cross-repo edge(s) excluded by the induced subgraph.",
+        scope_repos.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "Community ids are in a SEPARATE 'repo_scoped' id space — not comparable to an unscoped run or another scope.\n"
+    );
+    if let Some(clusters) = payload.get("clusters").and_then(|v| v.as_array()) {
+        if clusters.is_empty() {
+            let _ = writeln!(
+                out,
+                "No communities detected (scope may be empty or fully disconnected)."
+            );
+        }
+        for c in clusters {
+            let id = c.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let size = c.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cohesion = c.get("cohesion").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let _ = writeln!(
+                out,
+                "  [{id:>3}] {name} ({size} members, cohesion={cohesion:.2})"
+            );
+            if let Some(key_files) = c.get("key_files").and_then(|v| v.as_array()) {
+                for f in key_files.iter().filter_map(|v| v.as_str()) {
+                    let _ = writeln!(out, "        {f}");
+                }
+            }
+        }
     }
     out
 }

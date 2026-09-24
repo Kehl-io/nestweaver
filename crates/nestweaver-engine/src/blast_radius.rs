@@ -3852,7 +3852,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("graph.lbug");
-        save_clusters(&db_path, &clustering).expect("write clusters sidecar");
+        save_clusters(&db_path, &clustering, store.graph_generation())
+            .expect("write clusters sidecar");
 
         let result = analyze_blast_radius(
             &store,
