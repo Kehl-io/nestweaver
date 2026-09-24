@@ -13890,6 +13890,38 @@ fn read_symbols_rpc_args(
     args
 }
 
+/// Build the daemon RPC args shared by `investigate-expand` and
+/// `investigate-hydrate` — `bundle_id` plus `root`, sent only when the
+/// caller passed `--root` explicitly. Same reasoning and same shape as
+/// [`read_symbols_rpc_args`]; extracted here (nw-560) because the two call
+/// sites' identical `if let Some(explicit_root) = root.as_deref() { .. }`
+/// block had already been hand-edited twice (nw-340, then nw-560) and
+/// re-diverging a third time was exactly the risk a shared function
+/// removes.
+///
+/// `targets` is `Some` for `investigate-expand` only; `token_budget` is
+/// `Some` for `investigate-hydrate` only. Each caller passes `None` for the
+/// field its own command does not have, rather than this function guessing
+/// which command it was called from.
+fn investigate_rpc_args(
+    bundle_id: &str,
+    targets: Option<&[String]>,
+    token_budget: Option<usize>,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({ "bundle_id": bundle_id });
+    if let Some(targets) = targets {
+        args["targets"] = serde_json::json!(targets);
+    }
+    if let Some(tb) = token_budget {
+        args["token_budget"] = serde_json::json!(tb);
+    }
+    if let Some(root) = root {
+        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+    }
+    args
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn run_with_stdout_boundary<T>(operation: impl FnOnce() -> T) -> Result<T, StdoutWriteFailure> {
@@ -21743,21 +21775,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({
-                    "bundle_id": bundle_id,
-                    "targets": targets,
-                });
-                // nw-560: `root` is sent only when the caller passed
-                // `--root`, mirroring `read_symbols_rpc_args`. Omitting it
-                // lets the daemon resolve each symbol from its own repo
-                // `local_root`; sending the client's cwd here (the old
-                // nw-340 fix) OVERRODE that per-symbol resolution with a
-                // single directory, so a caller running from outside every
-                // indexed repo got empty bodies again regardless of the
-                // daemon-side fix.
-                if let Some(explicit_root) = root.as_deref() {
-                    args["root"] = serde_json::json!(explicit_root.to_string_lossy().into_owned());
-                }
+                // nw-560: `investigate_rpc_args` sends `root` only when the
+                // caller passed `--root`. Omitting it lets the daemon
+                // resolve each symbol from its own repo `local_root`;
+                // sending the client's cwd here (the old nw-340 fix)
+                // OVERRODE that per-symbol resolution with a single
+                // directory, so a caller running from outside every indexed
+                // repo got empty bodies again regardless of the daemon-side
+                // fix.
+                let args = investigate_rpc_args(&bundle_id, Some(&targets), None, root.as_deref());
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
@@ -21831,17 +21857,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({
-                    "bundle_id": bundle_id,
-                    "token_budget": token_budget,
-                });
-                // nw-560: same reasoning as `investigate-expand` above — send
-                // `root` only when the caller explicitly passed `--root`, so
-                // an omission lets the daemon resolve per-symbol local_root
-                // instead of being overridden by the client's cwd.
-                if let Some(explicit_root) = root.as_deref() {
-                    args["root"] = serde_json::json!(explicit_root.to_string_lossy().into_owned());
-                }
+                // nw-560: same `investigate_rpc_args` helper as
+                // `investigate-expand` above — send `root` only when the
+                // caller explicitly passed `--root`, so an omission lets the
+                // daemon resolve per-symbol local_root instead of being
+                // overridden by the client's cwd.
+                let args =
+                    investigate_rpc_args(&bundle_id, None, Some(token_budget), root.as_deref());
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
@@ -40234,6 +40256,78 @@ credential_method = "gh"
             &["greet".to_string()],
             0,
             None,
+            Some(std::path::Path::new("/explicit/repo")),
+        );
+        assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
+    }
+
+    /// nw-560 (extraction follow-up). `investigate_rpc_args` is the ONE
+    /// helper both `investigate-expand` and `investigate-hydrate` call to
+    /// build their daemon args — the identical `if let Some(explicit_root)
+    /// = root.as_deref() { .. }` block that used to live at each call site
+    /// had already been hand-edited twice (nw-340 added a cwd default,
+    /// nw-560 removed it) before this extraction, which is exactly the
+    /// "fixed once, drifted back" pattern a shared function is meant to
+    /// close off. Mirrors `read_symbols_rpc_args_omit_root_when_flag_absent`
+    /// above: an omitted `--root` must omit the `root` key entirely (not
+    /// resend the client's cwd, which is what defeats the daemon's
+    /// per-symbol `local_root` resolution), and an explicit `--root` must
+    /// win outright.
+    ///
+    /// A helper that reintroduced `client_source_root`-style cwd defaulting
+    /// (i.e. `root.unwrap_or_else(|| ...cwd...)` instead of `if let Some`)
+    /// would make the first assertion below fail: `args.get("root")` would
+    /// be `Some(<cwd>)` instead of `None`.
+    #[test]
+    fn investigate_rpc_args_omits_root_when_flag_absent_and_bundles_expand_or_hydrate_fields() {
+        // `investigate-expand` shape: bundle_id + targets, no token_budget.
+        let args = investigate_rpc_args("bndl_1", Some(&["a1".to_string()]), None, None);
+        assert!(
+            args.get("root").is_none(),
+            "omitting --root must omit the field, not send cwd; got {args}"
+        );
+        assert!(
+            args.get("token_budget").is_none(),
+            "investigate-expand has no token_budget arg; got {args}"
+        );
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "bundle_id": "bndl_1",
+                "targets": ["a1"],
+            })
+        );
+
+        let args = investigate_rpc_args(
+            "bndl_1",
+            Some(&["a1".to_string()]),
+            None,
+            Some(std::path::Path::new("/explicit/repo")),
+        );
+        assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
+
+        // `investigate-hydrate` shape: bundle_id + token_budget, no targets.
+        let args = investigate_rpc_args("bndl_2", None, Some(4000), None);
+        assert!(
+            args.get("root").is_none(),
+            "omitting --root must omit the field on the hydrate shape too; got {args}"
+        );
+        assert!(
+            args.get("targets").is_none(),
+            "investigate-hydrate has no targets arg; got {args}"
+        );
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "bundle_id": "bndl_2",
+                "token_budget": 4000,
+            })
+        );
+
+        let args = investigate_rpc_args(
+            "bndl_2",
+            None,
+            Some(4000),
             Some(std::path::Path::new("/explicit/repo")),
         );
         assert_eq!(args["root"], serde_json::json!("/explicit/repo"));
