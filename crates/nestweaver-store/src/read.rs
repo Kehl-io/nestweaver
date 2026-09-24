@@ -3238,6 +3238,69 @@ impl GraphStore {
             .collect())
     }
 
+    /// The top `limit` symbols of `repo_uid` by stored PageRank (ties by
+    /// UID), plus how many symbols the repository holds in all.
+    ///
+    /// nw-609 review: a `repo:` context seed expands to the repository's
+    /// members, and a repository can hold tens of thousands of symbols. The
+    /// seed is bounded BEFORE the walk, exactly as `project_context` bounds a
+    /// project with [`Self::list_project_symbol_uids_by_pagerank`]; the total
+    /// is returned so the caller can disclose the cut. Unlike that twin this
+    /// fails closed -- a query error or a dirty publication is an error, not
+    /// an empty repository.
+    pub fn repo_symbol_seed_candidates(
+        &self,
+        repo_uid: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, usize), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::RankingUnavailable);
+        }
+        let conn = self.conn()?;
+        let mut count_stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $repo RETURN count(s.uid)")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let total = conn
+            .execute(
+                &mut count_stmt,
+                vec![("repo", Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?
+            .next()
+            .map(|row| extract_i64(&row, 0))
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+        if limit == 0 || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let mut stmt = conn
+            .prepare(
+                "MATCH (s:Symbol) WHERE s.repo_uid = $repo \
+                 RETURN s.uid ORDER BY s.pagerank_score DESC, s.uid ASC LIMIT $limit",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("repo", Value::String(repo_uid.to_string())),
+                    ("limit", Value::Int64(limit as i64)),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let mut uids = Vec::new();
+        for row in result {
+            uids.push(extract_string(&row, 0)?);
+        }
+        Ok((uids, total))
+    }
+
     /// Return up to `limit` Symbol UIDs from a project, ranked by PageRank descending.
     ///
     /// Used by `project-context` to seed PPR with the architecturally

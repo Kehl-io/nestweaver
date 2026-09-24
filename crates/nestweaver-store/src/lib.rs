@@ -37,8 +37,9 @@ pub use error::{
 pub use lbug::Connection as DbConnection;
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
-    PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery,
-    SeedResolutionConfig, default_kind_priority, detect_intent, git_activity_multiplier,
+    PPR_MIN_SCORE, PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN,
+    ScopedEdgeQuery, SeedResolutionConfig, default_kind_priority, detect_intent,
+    git_activity_multiplier,
 };
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, ScanIntegrity,

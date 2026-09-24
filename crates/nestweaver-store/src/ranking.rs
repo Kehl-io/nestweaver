@@ -629,6 +629,12 @@ pub struct ScopedEdgeQuery {
     pub edge_type: Option<EdgeType>,
 }
 
+/// The score a NON-seed node must exceed to appear in a personalized
+/// PageRank result (seeds are always returned). Public so a caller that
+/// demotes a seed after the walk (nw-609's container seeds) can hold it to the
+/// same bar every other non-seed already meets.
+pub const PPR_MIN_SCORE: f64 = 1e-4;
+
 /// Describes which slice of the graph PageRank / PPR runs over.
 ///
 /// The algorithm itself is node-type-agnostic — `GraphScope` is what turns
@@ -1307,7 +1313,7 @@ impl GraphStore {
         let config = PprConfig {
             damping: effective_damping,
             max_iterations,
-            min_score: 1e-4,
+            min_score: PPR_MIN_SCORE,
             interaction_scores,
             interaction_bias_weight: 0.05,
         };

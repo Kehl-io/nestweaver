@@ -1863,8 +1863,10 @@ pub struct BrainContextResult {
     /// PPR, and BM25 legs remain usable when semantic retrieval degrades.
     #[serde(default)]
     pub degraded_components: Vec<String>,
-    /// nw-393, brain half. How many symbols the bare-name seed inputs MATCHED
-    /// before [`SEED_NAME_MATCH_LIMIT`] cut them down to the PPR seed set.
+    /// nw-393, brain half. How many candidates the capped seed inputs MATCHED
+    /// before [`SEED_NAME_MATCH_LIMIT`] cut them down to the PPR seed set:
+    /// symbols for a bare name, and (nw-609) a container seed's member notes
+    /// or symbols -- all of them, not only those that entered the walk.
     ///
     /// The twin of [`ContextResult::seed_matches_total`], and it exists
     /// separately because `brain context` / `brain_context` resolve seeds
@@ -2288,7 +2290,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // nw-609: the member lists `vlt:` / `repo:` seeds expanded to, kept apart
     // so the seed set can be cut to each container's most central members
     // once PPR has scored them.
-    let mut container_expansions: Vec<Vec<String>> = Vec::new();
+    let mut container_expansions: Vec<ContainerMembers> = Vec::new();
 
     for raw in inputs {
         let trimmed = raw.trim();
@@ -2320,7 +2322,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             // lone empty-vault seed is the "No seeds resolved" error rather
             // than an empty success.
             if let Some(members) = container_seed_members(store, trimmed)? {
-                if members.is_empty() {
+                if members.uids.is_empty() {
                     unresolved.push(raw.clone());
                 } else {
                     // Joined into `seed_uids` after the loop, so the loop's
@@ -2477,7 +2479,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // node named that way stays a seed however its container's cut falls.
     let directly_named: std::collections::HashSet<String> = seed_uids.iter().cloned().collect();
     for members in &container_expansions {
-        seed_uids.extend(members.iter().cloned());
+        seed_uids.extend(members.uids.iter().cloned());
     }
 
     // Dedupe seeds.
@@ -2624,7 +2626,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // nw-181: this path already carries the daemon's disconnect/timeout flag,
     // so hand it to PPR — the most expensive stage — instead of letting a
     // 193k-node push loop run for a client that is already gone.
-    let ppr = store
+    let mut ppr = store
         .personalized_pagerank_with_intent_cancellable(
             &seed_uids,
             damping,
@@ -2642,19 +2644,20 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // notes, since global PageRank is code-only. The cap is the one seed-resolution cap
     // (`SEED_NAME_MATCH_LIMIT`) and the cut is disclosed through the same
     // `seeds_truncated` / `seed_matches_total` fields a bare name uses.
-    // Demoted members are not dropped: they stay PPR candidates and surface
-    // in `connected` in score order, bounded by the caller's limit/budget.
+    // Demoted members are not dropped outright: one that scores like any
+    // other non-seed stays a candidate and surfaces in `connected` in score
+    // order; the rest never reach fusion or hydration (see below).
     if !container_expansions.is_empty() {
-        let demoted = cap_container_expansions(
+        let cut = cap_container_expansions(
             &container_expansions,
             &ppr,
             &directly_named,
             &mut seed_name_tally,
         );
-        if !demoted.is_empty() {
-            seed_uids.retain(|uid| !demoted.contains(uid));
-            direct_seed_uids.retain(|uid| !demoted.contains(uid));
-        }
+        seed_uids.retain(|uid| !cut.demoted.contains(uid));
+        direct_seed_uids.retain(|uid| !cut.demoted.contains(uid));
+        // nw-609 review: bounded hydration -- see `cap_container_expansions`.
+        ppr.retain(|(uid, _)| !cut.dropped.contains(uid));
     }
 
     // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
@@ -3040,15 +3043,36 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
     Ok(tags.into_iter().find(|t| t.name == needle).map(|t| t.uid))
 }
 
-/// Member UIDs of a container seed, in stable UID order (nw-609): a vault's
-/// notes for `vlt:`, a repository's symbols for `repo:`. `None` for any other
-/// UID form, which seeds PPR as itself.
+/// How many members of one container seed (nw-609) may reach hydration, and
+/// how many symbols a `repo:` seed may put into the walk (its top symbols by
+/// stored PageRank) -- mirroring `project_context`'s
+/// `PROJECT_SYMBOL_SEED_LIMIT`. A repository can hold tens of thousands of
+/// symbols; nw-609's review found every one of them personalizing PPR and
+/// then hydrated, before any limit or budget (nw-322).
+pub const CONTAINER_MEMBER_LIMIT: usize = 100;
+
+/// A container seed's members as they enter the walk, and how many members
+/// the container holds in all (the disclosed `seed_matches_total`).
+struct ContainerMembers {
+    uids: Vec<String>,
+    total: usize,
+}
+
+/// Members of a container seed (nw-609): a vault's notes for `vlt:`, a
+/// repository's top [`CONTAINER_MEMBER_LIMIT`] symbols by stored PageRank for
+/// `repo:`. `None` for any other UID form, which seeds PPR as itself.
 ///
 /// Both containers had the same defect: neither a Vault nor a Repo node is in
 /// any PPR scope, and `render_brain_node` renders neither, so the seed passed
 /// the existence check and then produced nothing. `proj:` is NOT a container
 /// here -- Project nodes and their membership edges are in
 /// `GraphScope::unified()`, so PPR already expands them.
+///
+/// Every vault note enters the walk: notes carry no stored centrality to
+/// pre-rank by (global PageRank is code-only), and the walk itself is what
+/// ranks them. What bounds the cost is the post-walk demotion in
+/// `build_brain_context_hybrid_with_aliases_capped`, which keeps demoted
+/// members out of fusion and hydration unless they score.
 ///
 /// `list_notes_with_integrity` rather than `list_notes_lite`, which swallows
 /// query errors into an empty list: an error here must surface, not
@@ -3057,56 +3081,85 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
 fn container_seed_members(
     store: &GraphStore,
     uid: &str,
-) -> Result<Option<Vec<String>>, anyhow::Error> {
+) -> Result<Option<ContainerMembers>, anyhow::Error> {
     let mut uids: Vec<String> = if uid.starts_with("vlt:") {
         let (notes, _integrity) = store
             .list_notes_with_integrity(Some(uid))
             .map_err(|e| anyhow::anyhow!(e))?;
         notes.into_iter().map(|n| n.uid).collect()
     } else if uid.starts_with("repo:") {
-        store
-            .symbol_lite_by_repo(uid)
-            .map_err(|e| anyhow::anyhow!(e))?
-            .into_iter()
-            .map(|(uid, _, _)| uid)
-            .collect()
+        let (uids, total) = store
+            .repo_symbol_seed_candidates(uid, CONTAINER_MEMBER_LIMIT)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        return Ok(Some(ContainerMembers { uids, total }));
     } else {
         return Ok(None);
     };
     uids.sort_unstable();
     uids.dedup();
-    Ok(Some(uids))
+    let total = uids.len();
+    Ok(Some(ContainerMembers { uids, total }))
 }
 
-/// Keep each container expansion's top [`SEED_NAME_MATCH_LIMIT`] members by PPR
-/// score (ties by UID, so the cut is deterministic) and return the members
-/// that must leave the seed set. Records each expansion in `tally`.
+/// What [`cap_container_expansions`] decided: the members that leave the
+/// seed set, and the subset of those that must also leave the walk's result.
+struct ContainerCut {
+    demoted: std::collections::HashSet<String>,
+    dropped: std::collections::HashSet<String>,
+}
+
+/// Keep each container expansion's top [`SEED_NAME_MATCH_LIMIT`] members by
+/// PPR score (ties by UID, so the cut is deterministic) as seeds. Of the
+/// rest, at most [`CONTAINER_MEMBER_LIMIT`] members in all stay in the result
+/// as non-seed candidates -- the best-scoring ones that clear
+/// `PPR_MIN_SCORE` -- and every other member is dropped from it. Records each
+/// expansion in `tally`.
+///
+/// nw-609 review: the non-seed bar alone does not bound this. Every member
+/// was a seed, so each still holds its own share of the personalization
+/// mass, and a 2000-note vault's members all clear `1e-4`; PPR also returns
+/// every seed regardless of score. Without the hard cap each one reached
+/// fusion and a `render_brain_node` lookup before any limit or budget
+/// (nw-322).
 fn cap_container_expansions(
-    container_expansions: &[Vec<String>],
+    container_expansions: &[ContainerMembers],
     ppr: &[(String, f64)],
     directly_named: &std::collections::HashSet<String>,
     tally: &mut SeedNameMatchTally,
-) -> std::collections::HashSet<String> {
+) -> ContainerCut {
     let score: std::collections::HashMap<&str, f64> =
         ppr.iter().map(|(uid, s)| (uid.as_str(), *s)).collect();
+    let score_of = |uid: &str| score.get(uid).copied().unwrap_or(0.0);
     let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut survivors: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
     for members in container_expansions {
-        let mut ranked: Vec<&String> = members.iter().collect();
-        ranked.sort_by(|a, b| {
-            let sa = score.get(a.as_str()).copied().unwrap_or(0.0);
-            let sb = score.get(b.as_str()).copied().unwrap_or(0.0);
-            sb.total_cmp(&sa).then_with(|| a.cmp(b))
-        });
+        let mut ranked: Vec<&String> = members.uids.iter().collect();
+        ranked.sort_by(|a, b| score_of(b).total_cmp(&score_of(a)).then_with(|| a.cmp(b)));
         let take = ranked.len().min(SEED_NAME_MATCH_LIMIT);
-        tally.record_expansion(ranked.len(), take);
+        // The container's full membership, not what entered the walk: a
+        // repo pre-ranked to its top symbols was cut there too.
+        tally.record_expansion(members.total.max(ranked.len()), take);
         kept.extend(ranked[..take].iter().map(|uid| (*uid).clone()));
+        survivors.extend(
+            ranked[take..]
+                .iter()
+                .filter(|uid| score_of(uid) > nestweaver_store::PPR_MIN_SCORE)
+                .take(CONTAINER_MEMBER_LIMIT.saturating_sub(take))
+                .map(|uid| (*uid).clone()),
+        );
         candidates.extend(ranked[take..].iter().map(|uid| (*uid).clone()));
     }
-    candidates
+    let demoted: std::collections::HashSet<String> = candidates
         .into_iter()
         .filter(|uid| !kept.contains(uid) && !directly_named.contains(uid))
-        .collect()
+        .collect();
+    let dropped = demoted
+        .iter()
+        .filter(|uid| !survivors.contains(*uid))
+        .cloned()
+        .collect();
+    ContainerCut { demoted, dropped }
 }
 
 /// Existence is an identity check, not rendering: rendering may supply
@@ -6467,6 +6520,41 @@ mod vault_seed_tests {
         }
     }
 
+    fn repo(uid: &str) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.com/{uid}"),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: Some(uid.to_string()),
+            root_path: None,
+        }
+    }
+
+    fn symbol(uid: &str, repo: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: "src/f.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: "fn f()".to_string(),
+            summary: None,
+            content_hash: "h".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
     fn run(store: &GraphStore, seed: &str) -> anyhow::Result<super::BrainContextResult> {
         build_brain_context_hybrid_with_aliases(
             store,
@@ -6644,47 +6732,83 @@ mod vault_seed_tests {
     /// either, so `repo:<uid>` was the identical silent no-op.
     #[test]
     fn a_repo_seed_expands_to_its_member_symbols() {
-        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
         let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo("repo:r")).unwrap();
+        store.insert_symbol(&symbol("sym:r:f", "repo:r")).unwrap();
         store
-            .insert_repo(&Repo {
-                uid: "repo:r".to_string(),
-                url: "https://example.com/r".to_string(),
-                indexed_sha: "abc".to_string(),
-                staleness_commits_behind: 0,
-                instance_id: "default".to_string(),
-                name: Some("r".to_string()),
-                root_path: None,
-            })
+            .insert_symbol(&symbol("sym:other:g", "repo:other"))
             .unwrap();
-        for (uid, repo) in [("sym:r:f", "repo:r"), ("sym:other:g", "repo:other")] {
-            store
-                .insert_symbol(&Symbol {
-                    uid: uid.to_string(),
-                    name: uid.to_string(),
-                    kind: SymbolKind::Function,
-                    repo_uid: repo.to_string(),
-                    file_path: "src/f.rs".to_string(),
-                    start_line: 1,
-                    end_line: 2,
-                    signature: "fn f()".to_string(),
-                    summary: None,
-                    content_hash: "h".to_string(),
-                    embedding: None,
-                    pagerank_score: None,
-                    is_entry_point: false,
-                    entry_point_kind: None,
-                    visibility: Visibility::Inferred,
-                    type_info: None,
-                    framework_hint: None,
-                    canonical_id: None,
-                })
-                .unwrap();
-        }
         let result = run(&store, "repo:r").expect("an existing repo must not be a no-op");
         let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
         assert_eq!(seeds, ["sym:r:f"]);
         assert_eq!(result.seeds_truncated, Some(false));
+    }
+
+    /// nw-609 review: every member personalizes PPR, and PPR returns every
+    /// seed regardless of score, so demoted members used to reach fusion and
+    /// hydration -- one `render_brain_node` lookup per member of a
+    /// 2000-note vault, before any limit or budget applied (the nw-322
+    /// hazard). A demoted member now survives only if it scores like any
+    /// other non-seed; everything hydrated is in `seeds` or `connected`.
+    #[test]
+    fn a_large_vault_seed_hydrates_a_bounded_set() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault("vlt:huge")).unwrap();
+        for i in 0..2000 {
+            store
+                .insert_note(&note(
+                    &format!("note:huge:{i:04}"),
+                    "vlt:huge",
+                    &format!("H{i:04}"),
+                ))
+                .unwrap();
+        }
+        let result = run(&store, "vlt:huge").unwrap();
+        assert_eq!(result.seeds.len(), SEED_NAME_MATCH_LIMIT);
+        assert_eq!(result.seed_matches_total, Some(2000));
+        assert_eq!(result.seeds_truncated, Some(true));
+        assert!(
+            result.connected.len() <= super::CONTAINER_MEMBER_LIMIT,
+            "hydrated {} demoted members: demotion must keep them out of \
+             fusion and hydration",
+            result.connected.len()
+        );
+    }
+
+    /// nw-609 review, `repo:` twin: a repository can hold tens of thousands
+    /// of symbols, so its members are pre-ranked by stored PageRank to a
+    /// bounded set BEFORE PPR (as `project_context` does), and the disclosure
+    /// still counts every member.
+    #[test]
+    fn a_large_repo_seed_is_pre_ranked_and_bounded() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo("repo:big")).unwrap();
+        for i in 0..2000 {
+            let mut sym = symbol(&format!("sym:big:{i:04}"), "repo:big");
+            // Highest stored PageRank on the HIGHEST uids, so a UID-order
+            // cut and a PageRank cut disagree.
+            sym.pagerank_score = Some(i as f64);
+            store.insert_symbol(&sym).unwrap();
+        }
+        let result = run(&store, "repo:big").unwrap();
+        assert_eq!(result.seeds.len(), SEED_NAME_MATCH_LIMIT);
+        assert_eq!(result.seed_matches_total, Some(2000));
+        assert_eq!(result.seeds_truncated, Some(true));
+        // Nothing outside the stored-PageRank top 100 entered the walk, so
+        // nothing outside it is hydrated -- seed or connected.
+        for node in result.seeds.iter().chain(&result.connected) {
+            let index: usize = node.uid.rsplit(':').next().unwrap().parse().unwrap();
+            assert!(
+                index >= 1900,
+                "{} is outside the PageRank top 100",
+                node.uid
+            );
+        }
+        assert!(
+            result.connected.len() <= super::CONTAINER_MEMBER_LIMIT,
+            "hydrated {} members",
+            result.connected.len()
+        );
     }
 
     /// COUNTERWEIGHT: `note:` and `tag:` UID seeds still expand exactly as
