@@ -9011,6 +9011,40 @@ fn brain_status_warnings_for(
         }));
     }
 
+    // nw-587: vaults the database was asked to hold that the graph no longer
+    // has — what a WAL move-aside costs when the vault publication was in the
+    // lost tail. Without this the status read "Vaults: 0" and nothing else.
+    //
+    // Re-listed rather than reusing `vaults` above: that one is
+    // `unwrap_or_default()`, and a failed read must not report every
+    // registration as lost.
+    if let Some(db_path) = db_path
+        && let Ok(live_vaults) = store.list_vaults(None)
+    {
+        let live = live_vaults
+            .iter()
+            .map(|v| (v.uid.as_str(), v.root_path.as_str()));
+        match nestweaver_engine::vault_registration::missing(db_path, live) {
+            Ok(missing) => warnings.extend(missing.iter().map(|entry| {
+                json!({
+                    "kind": "vault_registration_missing",
+                    "warning": nestweaver_engine::vault_registration::missing_warning(entry),
+                    "action": nestweaver_engine::vault_registration::readd_command(db_path, entry),
+                    "uid": entry.uid,
+                    "name": entry.name,
+                    "root_path": entry.root_path,
+                    "instance_id": entry.instance_id,
+                })
+            })),
+            Err(error) => warnings.push(json!({
+                "kind": "vault_registrations_unreadable",
+                "warning": format!(
+                    "cannot tell whether any registered vault is missing from the graph: {error:#}"
+                ),
+            })),
+        }
+    }
+
     warnings
 }
 

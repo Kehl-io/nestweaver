@@ -12272,3 +12272,144 @@ fn impact_substring_not_found_carries_did_you_mean_and_text_goes_to_stderr() {
         "a UID miss must carry no did_you_mean key: {uid_payload}"
     );
 }
+
+/// nw-587. The WAL move-aside recovery loses whatever the log held and the
+/// main file did not. Simulated faithfully: snapshot the checkpointed database
+/// while it holds only a code repo, publish a vault, then put the snapshot
+/// back — the graph has lost the vault publication while every sidecar beside
+/// it survives, which is exactly the state the runbook leaves. `brain list`
+/// used to answer `No vaults indexed` with exit 0 and nothing else.
+#[test]
+fn wal_move_aside_that_drops_a_vault_is_disclosed_by_brain_list_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("lostvault");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(repo_dir.join("main.js"), "function keptRepoFn() {}\n").unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Lost note\n\nbody\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let checkpointed = dir.path().join("checkpointed.lbug");
+    std::fs::copy(&db_path, &checkpointed).unwrap();
+    assert!(
+        !sidecar_path(&db_path, ".wal").exists(),
+        "fixture assumes the repo index was fully checkpointed"
+    );
+
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let status_json = || {
+        let output = nestweaver_cmd()
+            .args(["brain", "status", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "brain status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let missing_warnings = |status: &serde_json::Value| -> Vec<serde_json::Value> {
+        status["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| w["kind"] == "vault_registration_missing")
+            .collect()
+    };
+
+    // Counterweight: the healthy database lists its vault and reports nothing
+    // missing.
+    let healthy = status_json();
+    assert_eq!(healthy["vault_count"], 1, "{healthy}");
+    assert!(missing_warnings(&healthy).is_empty(), "{healthy}");
+    let listed = nestweaver_cmd()
+        .args(["brain", "list", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("lostvault"));
+    assert!(
+        !String::from_utf8_lossy(&listed.stderr).contains("not in the graph"),
+        "a healthy list must not warn: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    // The recovery: the graph falls back to its checkpointed state.
+    std::fs::copy(&checkpointed, &db_path).unwrap();
+    let _ = std::fs::remove_file(sidecar_path(&db_path, ".wal"));
+
+    let listed = nestweaver_cmd()
+        .args(["brain", "list", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(stdout.contains("No vaults indexed"), "{stdout}");
+    assert!(
+        stderr.contains("vault 'lostvault'") && stderr.contains("not in the graph"),
+        "brain list must name the dropped vault: {stderr}"
+    );
+    assert!(
+        stderr.contains("nestweaver brain add") && stderr.contains("lostvault --db"),
+        "brain list must print the re-add command: {stderr}"
+    );
+
+    let recovered = status_json();
+    assert_eq!(recovered["vault_count"], 0, "{recovered}");
+    assert_eq!(recovered["repo_count"], 1, "the repo survived: {recovered}");
+    let missing = missing_warnings(&recovered);
+    assert_eq!(missing.len(), 1, "{recovered}");
+    assert_eq!(missing[0]["name"], "lostvault");
+    let action = missing[0]["action"].as_str().unwrap();
+    assert!(
+        action.starts_with("nestweaver brain add ") && action.contains("lostvault"),
+        "{action}"
+    );
+
+    let status_text = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status_text.stdout),
+        String::from_utf8_lossy(&status_text.stderr)
+    );
+    assert!(
+        combined.contains("vault 'lostvault'") && combined.contains("nestweaver brain add"),
+        "brain status text must name the dropped vault and its remedy: {combined}"
+    );
+
+    // Running the remedy clears the disclosure.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let restored = status_json();
+    assert_eq!(restored["vault_count"], 1, "{restored}");
+    assert!(missing_warnings(&restored).is_empty(), "{restored}");
+}

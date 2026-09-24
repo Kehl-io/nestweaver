@@ -815,11 +815,15 @@ fn wal_corruption_runbook(db: &str) -> String {
          {db}.wal\n       {db}.wal.checkpoint\n       {db}.shadow\n       \
          {db}.checkpoint.apply.lock\n       {db}.checkpoint.intent.lock\n  \
          3. Reopen the database. If it opens, the un-checkpointed tail of the \
-         log is lost; the graph already committed is not.\n  \
+         log is lost; the graph already committed is not. That tail can hold \
+         a whole vault publication while the code repos survive.\n  \
          4. Run a full re-index. REQUIRED, not optional: derived edges for \
          unchanged files are not rebuilt by the watcher, and nothing in \
-         `brain status` discloses the deficit.\n\
-         Moving only some of the five fails identically to moving none."
+         `brain status` discloses the deficit.\n  \
+         5. Run `nestweaver brain status --db {quoted}`: it names every vault \
+         the recovery dropped, with the `brain add` command that restores it.\n\
+         Moving only some of the five fails identically to moving none.",
+        quoted = shell_quote(db),
     )
 }
 
@@ -9424,21 +9428,10 @@ enum DbSource {
 /// target is not refused — that target is derived from the source rather than
 /// from the ambient environment.
 ///
-/// Single-quote an argument for a shell only when it needs it.
-///
-/// The refusals below print a command the user is meant to paste. A path with
-/// a space in it that comes back unquoted is an unexecutable remedy, which is
-/// the failure mode this repository has shipped five times.
+/// Single-quote an argument for a shell only when it needs it. Delegates to
+/// the engine's one definition ([`nestweaver_engine::shell_quote`]).
 fn shell_quote(arg: &str) -> String {
-    let safe = !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-,".contains(c));
-    if safe {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
-    }
+    nestweaver_engine::shell_quote(arg)
 }
 
 /// The exact `server init-tls` invocation that WOULD perform the replacement:
@@ -26827,6 +26820,28 @@ fn run_brain(
                     }
                 }
             }
+            // nw-587: a vault this database was asked to hold that the graph
+            // no longer has (a WAL move-aside drops whatever the log held) is
+            // NAMED, with the command that restores it. stderr in both modes,
+            // so the `--json` array keeps its shape. Same engine check
+            // `brain status` forwards as a `vault_registration_missing` warning.
+            let live = rows
+                .iter()
+                .filter_map(|row| Some((row["uid"].as_str()?, row["root_path"].as_str()?)));
+            match nestweaver_engine::vault_registration::missing(&db_path, live) {
+                Ok(missing) => {
+                    for entry in &missing {
+                        eprintln!(
+                            "Warning: {}\n  Run: {}",
+                            nestweaver_engine::vault_registration::missing_warning(entry),
+                            nestweaver_engine::vault_registration::readd_command(&db_path, entry),
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "Warning: cannot tell whether any registered vault is missing from the graph: {error:#}"
+                ),
+            }
             let unavailable = rows.iter().any(|r| r["notes"].is_null());
             Ok((
                 if unavailable {
@@ -28364,6 +28379,20 @@ fn run_brain(
             }
 
             if uids_to_remove.is_empty() {
+                // nw-587: no graph row, but the database may still remember
+                // registering a vault here (one a WAL move-aside dropped).
+                // Removing it on purpose means forgetting that too, or
+                // `brain status` reports it as lost forever. `brain status`
+                // prints this command as the way to say "dropped on purpose".
+                let forgotten =
+                    nestweaver_engine::vault_registration::forget_root(&db_path, &canonical)?;
+                if forgotten > 0 {
+                    println!(
+                        "No vault in the graph at {canon_str}; forgot {forgotten} registration(s) \
+                         it had lost."
+                    );
+                    return Ok((EXIT_SUCCESS, None));
+                }
                 println!("No vault found at {canon_str}; 0 row(s) cleaned.");
                 return Ok((EXIT_NOT_FOUND, None));
             }
@@ -32480,6 +32509,20 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
                  condition acquired three contradictory answers:\n{help}"
             );
         }
+    }
+
+    /// nw-587. The runbook used to say only that "the un-checkpointed tail is
+    /// lost", without naming what that tail can be: a whole vault publication,
+    /// while the code repos survive. It must say so and point at the surface
+    /// that names the dropped vaults.
+    #[test]
+    fn wal_runbook_names_vault_loss_and_the_status_that_discloses_it() {
+        let runbook = wal_corruption_runbook("/tmp/my brain.lbug");
+        assert!(runbook.contains("vault publication"), "{runbook}");
+        assert!(
+            runbook.contains("nestweaver brain status --db '/tmp/my brain.lbug'"),
+            "the pasted command must be quoted: {runbook}"
+        );
     }
 
     /// nw-333. The other half, and what keeps the first from over-correcting:

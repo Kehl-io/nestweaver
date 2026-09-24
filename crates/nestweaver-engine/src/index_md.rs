@@ -1725,6 +1725,9 @@ fn index_markdown_since_with_reader_mode(
         plan.commit(store, true)?;
         publication.finish(true)?
     };
+    // nw-587: the refresh route registers too, so a vault first added by an
+    // older binary is recorded on its next refresh.
+    crate::vault_registration::record_for_store(store, &plan.vault);
 
     // Publication completion reconciles vectors against the committed live graph.
 
@@ -3045,6 +3048,20 @@ where
     }
 
     let publication = graph_publication.finish(true)?;
+    // nw-587: evidence that survives losing the graph's un-checkpointed tail.
+    // Local-directory vaults only: the server-mode path (`record_repo_sha`)
+    // indexes a repo checkout under its URL, which `brain add` cannot re-add.
+    if record_repo_sha.is_none() {
+        crate::vault_registration::record_for_store(
+            store,
+            &Vault {
+                uid: v_uid.clone(),
+                name: vault_name.to_string(),
+                root_path: root_str.clone(),
+                instance_id: instance_id.to_string(),
+            },
+        );
+    }
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();

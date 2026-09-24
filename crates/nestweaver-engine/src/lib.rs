@@ -16,6 +16,25 @@ pub fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Single-quote an argument for a shell only when it needs it.
+///
+/// Printed remedies are meant to be pasted. A path with a space in it that
+/// comes back unquoted is an unexecutable remedy, which is the failure mode
+/// this repository has shipped five times. ONE definition: the CLI calls this
+/// one rather than keeping a twin (nw-587 moved it here so engine-built
+/// remedies quote identically).
+pub fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-,".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
 /// Failure while validating a user-supplied `since` filter value.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -476,6 +495,7 @@ pub mod summaries;
 pub mod summary;
 pub mod tls;
 pub mod user_config;
+pub mod vault_registration;
 pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;

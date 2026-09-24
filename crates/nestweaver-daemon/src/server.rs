@@ -5655,6 +5655,15 @@ fn run_remove_vault_with_projection(
         .delete_vault_cascade_with_outcome(vault_uid)
         .map_err(|error| Status::internal(format!("delete_vault_cascade failed: {error:#}")));
     let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
+    // nw-587: a deliberate removal is not a loss. Forget the registration so
+    // `brain status` / `brain list` do not report this vault as dropped. Also
+    // on a confirmed no-op: the graph proves the uid absent either way.
+    if mutation.is_ok()
+        && let Err(error) =
+            nestweaver_engine::vault_registration::forget_uid(&state.db_path, vault_uid)
+    {
+        tracing::warn!("nw-587: failed to forget vault registration {vault_uid}: {error:#}");
+    }
     let mut failures = Vec::new();
     if !confirmed_noop {
         failures = finalize_node_graph_deletion(state, "remove_vault");
