@@ -215,6 +215,18 @@ use std::path::Path;
 /// the old root-only, unrebased entry list forever and cannot seed the walk
 /// from it no matter which binary asks — only re-indexing (`nestweaver index
 /// --repo <path> --force`) rewrites it.
+///
+/// NOT bumped for nw-453, deliberately. It changes the same persisted
+/// `is_entry_point` column in Vue/Svelte/Astro files, but in two directions
+/// that each leave a stale graph no worse than the binary that wrote it:
+/// (1) route-directory helpers are no longer rooted by the blanket page rule,
+/// so a stale graph OVER-roots them and `dead-code` reports LESS dead -- the
+/// safe direction, exactly the old output; (2) symbols the component markup
+/// uses are newly rooted, so a stale graph still reports template-only
+/// handlers outside route directories as dead -- the same false positive the
+/// old binary already reported. No persisted row becomes newly wrong, so
+/// forcing every user through a `--force` re-index (and making `dead-code`
+/// refuse until then) would buy nothing. Re-indexing a repo picks up both.
 pub const RESOLVER_GENERATION: u32 = 6;
 
 /// An unrecorded repo reads as generation 0, so the current generation must

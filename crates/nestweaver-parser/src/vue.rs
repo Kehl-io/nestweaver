@@ -303,6 +303,10 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
         });
     }
 
+    // nw-453: the template calls what it binds; root it (see `markup.rs`).
+    let used_by_markup = crate::markup::markup_identifiers(source, crate::markup::Dialect::Vue);
+    crate::markup::root_markup_used_symbols(&mut symbols, &used_by_markup);
+
     ParsedFile {
         path: path_str,
         symbols,

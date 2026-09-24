@@ -1476,6 +1476,77 @@ mod tests {
         }
     }
 
+    /// Every allowlisted name, table-driven, so dropping one from
+    /// `SVELTE_ROUTE_EXPORTS`/`ASTRO_ROUTE_EXPORTS` fails a test.
+    #[test]
+    fn every_allowlisted_route_export_is_an_entry_point() {
+        for name in SVELTE_ROUTE_EXPORTS {
+            assert_eq!(
+                detect_entry_point(
+                    name,
+                    "src/routes/x/+page.svelte",
+                    "constant",
+                    None,
+                    "svelte"
+                ),
+                Some(EntryPointKind::HttpHandler),
+                "svelte {name}"
+            );
+        }
+        for name in ASTRO_ROUTE_EXPORTS {
+            assert_eq!(
+                detect_entry_point(name, "src/pages/x.astro", "constant", None, "astro"),
+                Some(EntryPointKind::HttpHandler),
+                "astro {name}"
+            );
+        }
+        for (list, names) in [
+            (
+                SVELTE_ROUTE_EXPORTS,
+                &[
+                    "load",
+                    "actions",
+                    "prerender",
+                    "ssr",
+                    "csr",
+                    "trailingSlash",
+                    "entries",
+                    "config",
+                    "snapshot",
+                    "preload",
+                    "fallback",
+                    "GET",
+                    "POST",
+                    "PUT",
+                    "PATCH",
+                    "DELETE",
+                    "OPTIONS",
+                    "HEAD",
+                ][..],
+            ),
+            (
+                ASTRO_ROUTE_EXPORTS,
+                &[
+                    "getStaticPaths",
+                    "prerender",
+                    "partial",
+                    "ALL",
+                    "GET",
+                    "POST",
+                    "PUT",
+                    "PATCH",
+                    "DELETE",
+                    "OPTIONS",
+                    "HEAD",
+                ][..],
+            ),
+        ] {
+            for name in names {
+                assert!(list.contains(name), "{name} missing from allowlist");
+            }
+        }
+    }
+
     /// COUNTERWEIGHT. The route component ITSELF (`+page.svelte` mints a class
     /// named `+page`) is still the entry point it was under nw-441.
     #[test]

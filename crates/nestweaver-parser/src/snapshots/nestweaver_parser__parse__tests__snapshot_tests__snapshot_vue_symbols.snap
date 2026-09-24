@@ -32,8 +32,8 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   end_line: 27
   signature: "function handleClick() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: EventListener
   visibility: Private
   type_info: ~
   parent_name: ~
