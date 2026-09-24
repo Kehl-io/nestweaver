@@ -1,0 +1,76 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"async.svelte\", &source)"
+---
+- name: async
+  kind: Class
+  start_line: 1
+  end_line: 24
+  signature: "<svelte:component name=\"async\">"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: EventListener
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: load
+  kind: Function
+  start_line: 2
+  end_line: 5
+  signature: "export async function load(event) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: items
+  kind: Variable
+  start_line: 9
+  end_line: 9
+  signature: "export let items = []"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: refresh
+  kind: Function
+  start_line: 11
+  end_line: 13
+  signature: "export async function refresh() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: EventListener
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: fetchItems
+  kind: Function
+  start_line: 15
+  end_line: 17
+  signature: "async function fetchItems() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: count
+  kind: Function
+  start_line: 19
+  end_line: 21
+  signature: "export function count() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: EventListener
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~

@@ -1,0 +1,52 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"async.vue\", &source)"
+---
+- name: loadItems
+  kind: Function
+  start_line: 6
+  end_line: 9
+  signature: "export async function loadItems(api) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: fetchItems
+  kind: Function
+  start_line: 11
+  end_line: 13
+  signature: "async function fetchItems() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: count
+  kind: Function
+  start_line: 15
+  end_line: 17
+  signature: "export function count(items) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: async
+  kind: Class
+  start_line: 19
+  end_line: 25
+  signature: "export default {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: EventListener
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~

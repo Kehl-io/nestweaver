@@ -14,22 +14,6 @@ static RE_SCRIPT_OPEN: LazyLock<Regex> =
 static RE_SCRIPT_CLOSE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)</script\s*>").unwrap());
 
-/// Matches `export <keyword> name`, capturing BOTH the keyword and the name.
-///
-/// nw-364(3): the keyword alternation used to be a NON-capturing group, so the
-/// declaration keyword was matched and then thrown away — the kind literally
-/// could not be discriminated and every named export was minted
-/// `SymbolKind::Function`. `904a2dc4` fixed this exact declaration's SPAN and
-/// left the KIND, and a mis-kinded `Function` is eligible to be chosen as a
-/// fabricated reference source under `87e800c5`'s code-bearing-kinds fallback.
-static RE_EXPORT_NAMED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"export\s+(function|const|let|var|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap()
-});
-
-/// Matches `function name(` (named function declarations).
-static RE_FUNCTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(").unwrap());
-
 /// Matches `import ... from '...'`.
 static RE_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap());
@@ -161,7 +145,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
             // ── symbol detection ───────────────────────────────────────
 
             // Named exports (export function/const/let)
-            if let Some(cap) = RE_EXPORT_NAMED.captures(trimmed) {
+            if let Some(cap) = crate::parse::RE_SFC_EXPORT_NAMED.captures(trimmed) {
                 let kind = crate::parse::export_declaration_kind(&cap[1]);
                 let name = cap[2].to_string();
                 let entry_point = entry_point_of(
@@ -187,7 +171,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
 
             // Named function declarations (non-exported)
             if !trimmed.starts_with("export")
-                && let Some(cap) = RE_FUNCTION.captures(trimmed)
+                && let Some(cap) = crate::parse::RE_SFC_FUNCTION.captures(trimmed)
             {
                 let name = cap[1].to_string();
                 let entry_point = entry_point_of(&name, "function", Some(trimmed));

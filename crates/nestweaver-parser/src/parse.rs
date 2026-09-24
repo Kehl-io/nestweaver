@@ -329,6 +329,36 @@ pub(crate) fn sha256_hex(text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Matches `export [async] <keyword> name` in a regex-parsed SFC script
+/// (Svelte, Vue, Astro), capturing the declaration keyword (group 1, fed to
+/// [`export_declaration_kind`]) and the name (group 2).
+///
+/// nw-665: each of the three parsers carried its own copy of this pattern and
+/// none allowed `async`, so `export async function load()` -- the ordinary
+/// shape of a SvelteKit/Astro route hook -- was minted by nobody: the named-
+/// export pattern did not match it and the private-function pattern is
+/// skipped for any line starting with `export`. One shared pattern means the
+/// next keyword fix cannot land in two parsers and miss the third. The
+/// optional `async` is not restricted to `function` because the regex crate
+/// has no lookahead; `export async const` is a syntax error, so no real
+/// source reaches that combination.
+pub(crate) static RE_SFC_EXPORT_NAMED: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"export\s+(?:async\s+)?(function|const|let|var|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)",
+        )
+        .unwrap()
+    });
+
+/// Matches `function name(` in a regex-parsed SFC script -- the private
+/// (non-exported) declaration. Unanchored, so `async function name(` matches
+/// too (nw-665 pins that with a test). Shared for the same reason as
+/// [`RE_SFC_EXPORT_NAMED`].
+pub(crate) static RE_SFC_FUNCTION: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(").unwrap()
+    });
+
 /// Map a JS declaration keyword to the [`SymbolKind`] it declares.
 ///
 /// nw-364(3). The three regex-parsed SFC formats — Svelte, Vue and Astro —
@@ -5019,6 +5049,101 @@ use crate::config::{Settings, load as load_config};
         }
     }
 
+    /// nw-665. The three regex component parsers minted `export function`
+    /// but not `export async function`, so every async export in a
+    /// `<script>` block or Astro frontmatter was absent from the graph. The
+    /// private `async function` already matched (the private pattern is not
+    /// anchored at the line start); it is asserted here so a future anchor
+    /// cannot silently drop it.
+    #[test]
+    fn component_parsers_mint_exported_and_private_async_functions() {
+        for (fixture_path, file, exported, private) in [
+            (
+                "svelte/async.svelte",
+                "async.svelte",
+                "refresh",
+                "fetchItems",
+            ),
+            ("vue/async.vue", "async.vue", "loadItems", "fetchItems"),
+            (
+                "astro/async.astro",
+                "async.astro",
+                "getStaticPaths",
+                "fetchPosts",
+            ),
+        ] {
+            let source = fixture(fixture_path);
+            let parsed = parse_source(Path::new(file), &source).unwrap();
+            let find = |name: &str| {
+                parsed
+                    .symbols
+                    .iter()
+                    .filter(|s| s.name == name)
+                    .collect::<Vec<_>>()
+            };
+            let exported_hits = find(exported);
+            assert_eq!(
+                exported_hits.len(),
+                1,
+                "{file}: `export async function {exported}` must be minted exactly once; got {:?}",
+                parsed.symbols
+            );
+            assert_eq!(exported_hits[0].kind, SymbolKind::Function, "{file}");
+            assert_eq!(exported_hits[0].visibility, Visibility::Public, "{file}");
+            assert!(
+                exported_hits[0].end_line > exported_hits[0].start_line,
+                "{file}: the async export's span must cover its body"
+            );
+            let private_hits = find(private);
+            assert_eq!(private_hits.len(), 1, "{file}: private async {private}");
+            assert_eq!(private_hits[0].kind, SymbolKind::Function, "{file}");
+            assert_eq!(private_hits[0].visibility, Visibility::Private, "{file}");
+        }
+    }
+
+    /// nw-665 x nw-453. An ASYNC route hook is still a route hook: SvelteKit's
+    /// `load` and Astro's `getStaticPaths` are async in practice, and before
+    /// nw-665 they were not minted at all, so the nw-453 allowlist had
+    /// nothing to root. COUNTERWEIGHT: an async helper the framework does not
+    /// call stays non-entry under the same route directory.
+    #[test]
+    fn async_route_hooks_in_component_files_are_rooted_by_the_allowlist() {
+        let corpus: [(&str, &str, &str, &str); 2] = [
+            (
+                "src/routes/blog/+page.svelte",
+                "<script context=\"module\">\nexport async function load() {\n  return {};\n}\nexport async function fetchDrafts() {\n  return [];\n}\n</script>\n<h1>Blog</h1>\n",
+                "load",
+                "fetchDrafts",
+            ),
+            (
+                "src/pages/blog/[slug].astro",
+                "---\nexport async function getStaticPaths() {\n  return [];\n}\nexport async function summarize(text) {\n  return text;\n}\n---\n<h1>Post</h1>\n",
+                "getStaticPaths",
+                "summarize",
+            ),
+        ];
+        for (path, source, hook, helper) in corpus {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let get = |name: &str| {
+                parsed
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap_or_else(|| {
+                        panic!("{path}: {name} must be minted; got {:?}", parsed.symbols)
+                    })
+            };
+            assert!(
+                get(hook).is_entry_point,
+                "{path}: async route hook {hook} must be rooted"
+            );
+            assert!(
+                !get(helper).is_entry_point,
+                "{path}: async helper {helper} is not a framework hook"
+            );
+        }
+    }
+
     /// COUNTERWEIGHT. Without this the three tests above would also pass if
     /// the parsers flipped `is_entry_point: true` on EVERYTHING -- which
     /// would make `dead-code` report nothing dead in a component corpus, the
@@ -7507,7 +7632,8 @@ void run() {
         }
     }
 
-    /// nw-364(3): the keyword alternation in `RE_EXPORT_NAMED` is a
+    /// nw-364(3): the keyword alternation in `RE_EXPORT_NAMED` (now the shared
+    /// `RE_SFC_EXPORT_NAMED`) was a
     /// NON-capturing group, so the declaration keyword is matched and then
     /// thrown away — every `export let` / `export const` / `export var` /
     /// `export class` was minted `Function`. `904a2dc4` fixed this exact
@@ -8041,6 +8167,30 @@ void run() {
         fn snapshot_astro_references() {
             let source = fixture("astro/simple.astro");
             assert_yaml_snapshot!(parsed_references("simple.astro", &source));
+        }
+
+        // ── nw-665: async functions in component parsers ────────────────
+        //
+        // One fixture per regex parser, so the `simple.*` snapshots above
+        // stay byte-identical (the counterweight) while the async shapes get
+        // their own reviewed baseline.
+
+        #[test]
+        fn snapshot_svelte_async_symbols() {
+            let source = fixture("svelte/async.svelte");
+            assert_yaml_snapshot!(parsed_symbols("async.svelte", &source));
+        }
+
+        #[test]
+        fn snapshot_vue_async_symbols() {
+            let source = fixture("vue/async.vue");
+            assert_yaml_snapshot!(parsed_symbols("async.vue", &source));
+        }
+
+        #[test]
+        fn snapshot_astro_async_symbols() {
+            let source = fixture("astro/async.astro");
+            assert_yaml_snapshot!(parsed_symbols("async.astro", &source));
         }
 
         // ── SystemVerilog ───────────────────────────────────────────────

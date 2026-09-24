@@ -1,0 +1,18 @@
+---
+export async function getStaticPaths() {
+  const posts = await fetchPosts()
+  return posts.map((post) => ({ params: { slug: post.slug } }))
+}
+
+async function fetchPosts() {
+  return []
+}
+
+export function formatDate(d) {
+  return d.toISOString()
+}
+
+const { slug } = Astro.params
+---
+
+<h1>{slug}</h1>

@@ -6,16 +6,6 @@ use std::sync::LazyLock;
 
 // ── compiled patterns ──────────────────────────────────────────────────────
 
-/// Matches `export <keyword> name`, capturing BOTH the keyword and the name.
-/// See `parse::export_declaration_kind` for why the keyword must be captured.
-static RE_EXPORT_NAMED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"export\s+(function|const|let|var|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap()
-});
-
-/// Matches `function name(` (named function declarations).
-static RE_FUNCTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(").unwrap());
-
 /// Matches `import ... from '...'`.
 static RE_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap());
@@ -144,7 +134,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
             // ── symbol detection ───────────────────────────────────────
 
             // Named exports
-            if let Some(cap) = RE_EXPORT_NAMED.captures(trimmed) {
+            if let Some(cap) = crate::parse::RE_SFC_EXPORT_NAMED.captures(trimmed) {
                 // nw-364(3): the keyword decides the kind -- see
                 // `parse::export_declaration_kind`.
                 let kind = crate::parse::export_declaration_kind(&cap[1]);
@@ -172,7 +162,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
 
             // Named function declarations (non-exported)
             if !trimmed.starts_with("export")
-                && let Some(cap) = RE_FUNCTION.captures(trimmed)
+                && let Some(cap) = crate::parse::RE_SFC_FUNCTION.captures(trimmed)
             {
                 let name = cap[1].to_string();
                 let entry_point = entry_point_of(&name, "function", Some(trimmed));
