@@ -579,6 +579,28 @@ impl BrainWatcher {
         if self.stop_flag.load(Ordering::Acquire) {
             anyhow::bail!("brain watcher stopped during startup");
         }
+        // nw-653: replay what changed while no watcher was listening. The
+        // notify subscription above is already live, so a save racing this
+        // scan is queued and reprocessed by the loop; overlap is harmless.
+        // Runs before readiness so "ready" means the graph matches disk.
+        match self.reconcile_startup_drift(&store, tantivy.as_deref(), &v_uid, &on_change) {
+            Ok(_) => {}
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                tracing::info!(
+                    "BrainWatcher startup reconciliation refused during shutdown; exiting"
+                );
+                return Ok(());
+            }
+            // Failing startup here would stop live watching too, and the
+            // supervisor would retry into the same failure. Keep watching and
+            // name the recovery instead.
+            Err(error) => tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %format!("{error:#}"),
+                "BrainWatcher startup reconciliation failed; notes changed while no watcher \
+                 ran may be missing or stale until `nestweaver brain refresh`"
+            ),
+        }
         if let Some(ready) = self.ready_callback.take() {
             ready();
         }
@@ -888,6 +910,38 @@ impl BrainWatcher {
             );
         }
         Ok(())
+    }
+
+    /// nw-653: diff disk against the graph (`index_md::vault_startup_drift`)
+    /// and push the drifted paths through the ordinary batch seam, so lost
+    /// creates, edits and deletes get the same publication marker, BM25,
+    /// embedding and PageRank maintenance as a live event. Returns how many
+    /// paths were replayed; zero means no batch ran.
+    fn reconcile_startup_drift(
+        &self,
+        store: &GraphStore,
+        tantivy: Option<&TantivyIndex>,
+        v_uid: &str,
+        on_change: &Option<Box<dyn Fn() + Send>>,
+    ) -> Result<usize, anyhow::Error> {
+        let drift = crate::index_md::vault_startup_drift(
+            store,
+            &self.vault_root,
+            &self.instance_id,
+            &self.ignore_set,
+            self.note_limits,
+        )?;
+        if drift.is_empty() {
+            return Ok(0);
+        }
+        let replayed = drift.len();
+        tracing::info!(
+            vault = %self.vault_root.display(),
+            notes = replayed,
+            "BrainWatcher startup: reconciling notes changed while no watcher ran"
+        );
+        self.process_batch(store, tantivy, v_uid, drift, on_change)?;
+        Ok(replayed)
     }
 
     /// Mirror the committed note representation, rather than reading the file
@@ -1393,6 +1447,141 @@ mod tests {
                 root_path: Some(root.to_string_lossy().into_owned()),
             })
             .unwrap();
+    }
+
+    /// nw-653: notes created, edited or deleted while no watcher was
+    /// processing events (daemon down, watcher wedged behind a deadlocked
+    /// write gate, launchd crash-looping on a version mismatch) produced
+    /// events nobody received. The next watcher only reacted to NEW events,
+    /// so a created note stayed out of the graph until a full refresh — in
+    /// the live repro, for days. Startup must reconcile disk against graph.
+    #[test]
+    fn watcher_startup_reconciles_notes_changed_while_no_watcher_ran() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\nold body\n"),
+            ("Gone.md", "# Gone\n\nwill be deleted\n"),
+            ("Untouched.md", "# Untouched\n\n[[Alpha]]\n"),
+            (".brainignore", "Ignored.md\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let notes = || -> HashMap<String, nestweaver_schema::Note> {
+            store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .into_iter()
+                .map(|note| (note.file_path.clone(), note))
+                .collect()
+        };
+        let before = notes();
+
+        // The gap: nothing is watching while these land on disk.
+        fs::write(root.join("New.md"), "# New\n\ncreated in the gap\n").unwrap();
+        fs::write(root.join("Ignored.md"), "# Ignored\n\nstays out\n").unwrap();
+        // Over the default note limit: skipped and disclosed by any index,
+        // so replaying it would publish nothing.
+        let huge = format!(
+            "# Huge\n\n{}",
+            "x".repeat(crate::index_limits::DEFAULT_MAX_NOTE_BYTES as usize)
+        );
+        fs::write(root.join("Huge.md"), huge).unwrap();
+        fs::write(root.join("Alpha.md"), "# Alpha\n\nedited in the gap\n").unwrap();
+        // Recorded note mtimes are whole seconds; make the edit observable
+        // even when the test runs inside the index's second.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("Alpha.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        fs::remove_file(root.join("Gone.md")).unwrap();
+
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        // Exactly the drifted paths: never the untouched note (no re-parse),
+        // the brainignored one, or the oversized one.
+        let drift = crate::index_md::vault_startup_drift(
+            &store,
+            &root,
+            "default",
+            &watcher.ignore_set,
+            watcher.note_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            drift,
+            vec![
+                root.join("Alpha.md"),
+                root.join("Gone.md"),
+                root.join("New.md")
+            ]
+        );
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+
+        let after = notes();
+        assert!(
+            after.contains_key("New.md"),
+            "a note created while no watcher ran must be ingested at startup: {:?}",
+            after.keys().collect::<Vec<_>>()
+        );
+        assert_ne!(
+            after["Alpha.md"].content_hash, before["Alpha.md"].content_hash,
+            "an edit made while no watcher ran must be ingested at startup"
+        );
+        assert!(
+            !after.contains_key("Gone.md"),
+            "a note deleted while no watcher ran must leave the graph"
+        );
+        assert!(
+            !after.contains_key("Ignored.md"),
+            "counterweight: a brainignored note stays out"
+        );
+        assert_eq!(
+            after["Untouched.md"].content_hash,
+            before["Untouched.md"].content_hash
+        );
+
+        // Counterweight: once reconciled, the next startup finds no drift and
+        // runs no batch at all — unchanged notes are not re-parsed per start.
+        let restarted = BrainWatcher::new(&db_path, &root, "default", "test");
+        assert_eq!(
+            restarted
+                .reconcile_startup_drift(&store, None, &v_uid, &None)
+                .unwrap(),
+            0
+        );
+        assert!(restarted.last_batch_phase_timings().is_none());
+    }
+
+    /// nw-653 / nw-287 counterweight: an indexed vault whose scan finds no
+    /// notes (unmounted, unreadable) is not evidence that every note was
+    /// deleted, so startup reconciliation must not replay them as deletions.
+    #[test]
+    fn watcher_startup_drift_never_infers_deletions_from_an_empty_scan() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n"), ("Beta.md", "# Beta\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        fs::remove_file(root.join("Alpha.md")).unwrap();
+        fs::remove_file(root.join("Beta.md")).unwrap();
+        let drift = crate::index_md::vault_startup_drift(
+            &store,
+            &root,
+            "default",
+            &GlobSet::empty(),
+            crate::index_limits::NoteLimits::default(),
+        )
+        .unwrap();
+        assert!(drift.is_empty(), "{drift:?}");
     }
 
     #[test]

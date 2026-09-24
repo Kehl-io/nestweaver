@@ -229,6 +229,108 @@ fn path_has_vault_skip_dir(rel_path: &Path, has_file: &dyn Fn(&Path) -> bool) ->
     )
 }
 
+/// Whether a vault-relative path is a note this vault indexes: Markdown, not
+/// under a vault skip dir, and not `.brainignore`d.
+///
+/// nw-653: the incremental refresh and the watcher's startup reconciliation
+/// both answer "which on-disk files belong in the graph"; they call this one
+/// predicate so the two cannot drift apart (CONTRIBUTING, sibling gaps).
+fn is_eligible_vault_note(
+    rel_path: &Path,
+    reader: &dyn ContentReader,
+    ignore_set: &GlobSet,
+) -> bool {
+    if !is_markdown(rel_path) || path_has_vault_skip_dir(rel_path, &|probe| reader.has_file(probe))
+    {
+        return false;
+    }
+    let rel_str = rel_path.to_string_lossy();
+    if crate::brainignore::is_ignored(&rel_str, ignore_set) {
+        tracing::debug!("brainignore: skipping {}", rel_str);
+        return false;
+    }
+    true
+}
+
+/// nw-653: the vault paths whose graph state no longer matches disk, for the
+/// brain watcher to replay as its first batch.
+///
+/// A watcher only learns about changes through filesystem events, and events
+/// that arrive while nothing is processing them are gone: the daemon was
+/// down, the watcher was wedged behind a deadlocked write gate, or launchd was
+/// crash-looping the controller on a version mismatch. In the live repro a
+/// watcher stuck for ~20 hours lost the create events of five notes, and every
+/// later watcher reacted only to new events, so those notes never reached the
+/// graph. Startup therefore diffs disk against the graph:
+///
+/// - an eligible note absent from the graph (a lost create);
+/// - an indexed note whose file mtime differs from the one recorded when it
+///   was ingested (a lost edit) — notes with no recorded mtime are left alone
+///   rather than re-parsed on every start;
+/// - an indexed note whose file no longer exists (a lost delete). Only
+///   inferred when the scan found notes at all: an empty scan of an indexed
+///   vault is an unreadable or unmounted directory, not a deletion (nw-287).
+///
+/// Cheap for large vaults: one directory walk, one `stat` per note and set
+/// lookups. Nothing is read or parsed here, and an unchanged note is never in
+/// the result. Returned paths are absolute, like watcher events.
+pub(crate) fn vault_startup_drift(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    ignore_set: &GlobSet,
+    note_limits: crate::index_limits::NoteLimits,
+) -> Result<Vec<PathBuf>, anyhow::Error> {
+    let v_uid = vault_uid(instance_id, &vault_root.to_string_lossy());
+    let indexed: HashMap<String, Option<String>> = store
+        .list_notes(Some(&v_uid))
+        .context("list indexed vault notes")?
+        .into_iter()
+        .map(|note| (note.file_path, note.modified_at))
+        .collect();
+    let reader = filesystem_note_reader(vault_root, note_limits);
+    let mut seen = HashSet::new();
+    let mut drift = Vec::new();
+    for rel_path in reader.list_files()? {
+        if !is_eligible_vault_note(&rel_path, &reader, ignore_set) {
+            continue;
+        }
+        let rel_str = rel_path.to_string_lossy().into_owned();
+        let abs_path = vault_root.join(&rel_path);
+        let meta = std::fs::metadata(&abs_path).ok();
+        let drifted = match indexed.get(&rel_str) {
+            // An oversized note the graph never held would only be skipped
+            // (and is already disclosed) again; replaying it on every start
+            // would buy a full publication for nothing.
+            None => meta
+                .as_ref()
+                .is_some_and(|meta| meta.len() <= reader.max_source_file_bytes()),
+            Some(Some(recorded)) => meta
+                .and_then(|meta| meta.modified().ok())
+                .and_then(format_system_time)
+                .is_some_and(|on_disk| &on_disk != recorded),
+            Some(None) => false,
+        };
+        if drifted {
+            drift.push(abs_path);
+        }
+        seen.insert(rel_str);
+    }
+    if !seen.is_empty() {
+        for rel_str in indexed.keys().filter(|path| !seen.contains(*path)) {
+            let abs_path = vault_root.join(rel_str);
+            if matches!(
+                std::fs::symlink_metadata(&abs_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                drift.push(abs_path);
+            }
+        }
+    }
+    drift.sort();
+    Ok(drift)
+}
+
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
 /// pasted into a note). Files above this size are skipped with a warning.
 /// Per-file cap on note size. Files larger than this are skipped with a
@@ -1205,30 +1307,27 @@ fn index_markdown_since_with_reader_mode(
     let mut touched_paths: Vec<String> = Vec::new();
 
     for rel_path in all_files {
-        if !is_markdown(&rel_path) {
-            continue;
-        }
-        // Skip vault-specific directories.
-        if path_has_vault_skip_dir(&rel_path, &|probe| reader.has_file(probe)) {
-            continue;
-        }
-        // Apply .brainignore patterns.
-        let rel_str = rel_path.to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_str);
+        if !is_eligible_vault_note(&rel_path, reader, ignore_set) {
             continue;
         }
 
         files_checked += 1;
-        let rel_path_str = rel_str.into_owned();
+        let rel_path_str = rel_path.to_string_lossy().into_owned();
         let n_uid = note_uid(&v_uid, &rel_path_str);
         eligible_note_uids.insert(n_uid.clone());
+        // nw-653: a note the graph has never held is changed by definition,
+        // whatever its mtime. `since` answers "what changed after the graph
+        // last saw this file"; for a file it never saw (its create event was
+        // lost while no watcher was processing) an mtime cutoff skipped it on
+        // every later refresh, forever.
+        let never_indexed = !existing_note_uids.contains(&n_uid);
 
         // Parse changed files now. Unchanged sources are read later only when
         // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta_nanos(&rel_path) {
             Ok(Some((mtime_nanos, file_size))) => {
-                if mtime_nanos >= since_nanos {
+                let changed = mtime_nanos >= since_nanos || never_indexed;
+                if changed {
                     touched_paths.push(rel_path_str.clone());
                     if let Some(near) = maybe_near_limit(&rel_path_str, file_size, note_limit_bytes)
                     {
@@ -1247,7 +1346,7 @@ fn index_markdown_since_with_reader_mode(
                     tracing::warn!("skipping oversized file: {}", rel_path_str);
                     continue;
                 }
-                mtime_nanos >= since_nanos
+                changed
             }
             Ok(None) => true, // bare repo: no mtime, process unconditionally
             Err(error) => {
@@ -6435,6 +6534,53 @@ sub b body
         );
     }
 
+    /// nw-653: a note the graph has NEVER held is not "unchanged" merely
+    /// because its mtime predates `since`. The live repro: notes created while
+    /// the vault watcher was wedged were never ingested, and every later
+    /// cutoff sat past their mtime, so an mtime-only filter skipped them
+    /// forever.
+    #[test]
+    fn since_refresh_ingests_a_never_indexed_note_older_than_since() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\nalpha body\n"),
+            (".brainignore", "ignored.md\n"),
+        ]);
+        let db_path = root.join("brain.lbug");
+        index_markdown_directory(&root, &db_path, "default", "v").unwrap();
+
+        // Created after the full index, but the refresh cutoff has already
+        // advanced past it — exactly the state a lost create event leaves.
+        fs::write(root.join("missed.md"), "# Missed\n\ncreated in the gap\n").unwrap();
+        fs::write(root.join("ignored.md"), "# Ignored\n\nstays out\n").unwrap();
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+
+        let res = index_markdown_directory_since(&root, &db_path, "default", "v", since).unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid(
+            "default",
+            &std::fs::canonicalize(&root).unwrap().to_string_lossy(),
+        );
+        let paths: HashSet<String> = store
+            .list_notes(Some(&v_uid))
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert!(
+            paths.contains("missed.md"),
+            "an eligible on-disk note absent from the graph must be ingested \
+             regardless of mtime: {paths:?}"
+        );
+        // Counterweights: the already-indexed, unchanged note is not
+        // re-parsed (only the missing note counts as updated), and a
+        // brainignored note stays out.
+        assert_eq!(res.notes_updated, 1, "only the missing note is ingested");
+        assert!(
+            !paths.contains("ignored.md"),
+            "brainignore must still apply"
+        );
+    }
+
     #[test]
     fn since_refresh_advances_and_persists_generation_on_in_place_edit() {
         let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
@@ -6905,8 +7051,11 @@ sub b body
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let since = std::time::SystemTime::now();
         fs::write(root.join("note-100.md"), "# Changed leaf\n\nnew body\n").unwrap();
+        // The full index above canonicalized `root`; the reader must name the
+        // same vault. Before nw-653 a non-canonical root here refreshed a
+        // DIFFERENT (empty) vault identity and the mtime cutoff hid it.
         let reader = CountingReader {
-            inner: crate::content_reader::FilesystemReader::new(&root),
+            inner: crate::content_reader::FilesystemReader::new(&fs::canonicalize(&root).unwrap()),
             reads: AtomicUsize::new(0),
         };
         let ignore_set = crate::brainignore::load_brain_ignore(&root, &[]);
@@ -6939,7 +7088,10 @@ sub b body
         );
         assert_eq!(
             store
-                .lookup_vault(&vault_uid("owned", &root.to_string_lossy()))
+                .lookup_vault(&vault_uid(
+                    "owned",
+                    &fs::canonicalize(&root).unwrap().to_string_lossy()
+                ))
                 .unwrap()
                 .name,
             "new"
