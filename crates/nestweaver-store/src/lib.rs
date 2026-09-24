@@ -42,8 +42,8 @@ pub use ranking::{
     git_activity_multiplier,
 };
 pub use read::{
-    BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, ScanIntegrity,
-    SymbolBasic, VAULT_CODE_BRIDGE_RELATIONS, VAULT_RELATIONS, VaultRelation,
+    BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteKeysetPage, NoteLite,
+    ScanIntegrity, SymbolBasic, VAULT_CODE_BRIDGE_RELATIONS, VAULT_RELATIONS, VaultRelation,
 };
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,

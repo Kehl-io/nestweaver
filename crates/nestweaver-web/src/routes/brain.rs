@@ -89,6 +89,16 @@ pub const LIST_NOTES_LIMIT_MAX: usize = 1000;
 /// stays a raw array, matching the sibling brain list routes.
 pub const LIST_NOTES_TOTAL_HEADER: &str = "x-total-count";
 
+/// Response header carrying the `after` cursor for the next page of a cursor
+/// listing (any request without `offset`), form-urlencoded so any uid fits a
+/// header. ABSENT means the listing reached the end.
+///
+/// nw-648 review: the store drops a corrupt row from a page, so a page one
+/// row short is not the end of the vault — a caller that treated a short
+/// page as "done" lost every later note. The cursor is computed from the
+/// rows the scan reached, before any were dropped.
+pub const LIST_NOTES_NEXT_AFTER_HEADER: &str = "x-next-after";
+
 #[derive(Deserialize)]
 pub struct ListNotesParams {
     pub limit: Option<usize>,
@@ -126,6 +136,14 @@ pub async fn list_notes(
     } else {
         limit
     };
+    // nw-648 review: a malformed request is refused before any vault lookup
+    // or count — it is a 400 whatever the vault, not a 404 because the vault
+    // also happens to be unknown.
+    if params.after.is_some() && params.offset.is_some() {
+        return Err(ApiError::bad_request(
+            "`after` and `offset` cannot be combined; page with one or the other",
+        ));
+    }
     let vault = params.vault.as_deref().filter(|uid| !uid.is_empty());
     let total = match vault {
         Some(uid) => {
@@ -143,21 +161,32 @@ pub async fn list_notes(
         }
         None => state.store.count_notes()?,
     };
-    let notes = match params.after.as_deref() {
-        Some(_) if params.offset.is_some() => {
-            return Err(ApiError::bad_request(
-                "`after` and `offset` cannot be combined; page with one or the other",
-            ));
-        }
-        Some(after) => state.store.list_notes_after(vault, Some(after), limit)?,
-        None => state.store.list_notes_page(vault, limit, offset)?,
+    // Without `offset` this is a cursor listing (the first page is simply
+    // `after` = none), which is what lets it hand out the next cursor.
+    let (notes, next_after) = if params.offset.is_some() {
+        (state.store.list_notes_page(vault, limit, offset)?, None)
+    } else {
+        let page = state
+            .store
+            .list_notes_after(vault, params.after.as_deref(), limit)?;
+        (page.notes, page.next_after)
     };
     let json = serde_json::to_value(&notes)?;
     let mut response = Json(json).into_response();
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         LIST_NOTES_TOTAL_HEADER,
         axum::http::HeaderValue::from(total),
     );
+    if let Some(next) = next_after {
+        let encoded: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+        // Form-urlencoded output is visible ASCII, so this cannot fail; if it
+        // somehow did, a missing cursor would read as "end", so fail loudly.
+        let value = axum::http::HeaderValue::from_str(&encoded).map_err(|error| {
+            ApiError::internal(format!("next-page cursor is not a header value: {error}"))
+        })?;
+        headers.insert(LIST_NOTES_NEXT_AFTER_HEADER, value);
+    }
     Ok(response)
 }
 

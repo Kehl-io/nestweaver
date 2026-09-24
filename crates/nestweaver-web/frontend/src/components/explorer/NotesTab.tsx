@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, NOTES_PAGE_SIZE } from "../../api/client";
+import { api } from "../../api/client";
 import type { Note, Tag, Vault } from "../../api/types";
 import { useStore } from "../../stores";
 import { Collapsible } from "../shared/Collapsible";
@@ -58,8 +58,13 @@ interface VaultNotes {
   notes: Note[];
   /** The vault's real note count: vault inventory first, page header second. */
   total: number;
-  /** The server has no notes after the last loaded uid. */
+  /** The server has no notes after the last loaded page. */
   exhausted: boolean;
+  /**
+   * Server-issued cursor for the next page (`X-Next-After`). Not the last
+   * loaded uid: the server drops corrupt rows, so a short page is not the end.
+   */
+  nextAfter: string | null;
   loadingMore: boolean;
   error: string | null;
 }
@@ -108,7 +113,8 @@ export function NotesTab() {
             loaded[vault.uid] = {
               notes: page.notes,
               total: vault.note_count ?? page.total ?? page.notes.length,
-              exhausted: page.notes.length < NOTES_PAGE_SIZE,
+              exhausted: page.nextAfter === null,
+              nextAfter: page.nextAfter,
               loadingMore: false,
               error: null,
             };
@@ -117,6 +123,7 @@ export function NotesTab() {
               notes: [],
               total: vault.note_count ?? 0,
               exhausted: false,
+              nextAfter: null,
               loadingMore: false,
               error: errorMessage(result.reason, "Failed to load this vault's notes"),
             };
@@ -140,7 +147,8 @@ export function NotesTab() {
   const loadMore = (vaultUid: string) => {
     const current = byVault[vaultUid];
     if (!current || current.loadingMore) return;
-    const after = current.notes.at(-1)?.uid;
+    // No cursor yet (the first page failed) retries the first page.
+    const after = current.nextAfter ?? undefined;
     setByVault((prev) => ({
       ...prev,
       [vaultUid]: { ...prev[vaultUid], loadingMore: true, error: null },
@@ -148,13 +156,14 @@ export function NotesTab() {
     api
       .brainNotesPage(vaultUid, after)
       .then((page) => {
-        const exhausted = page.notes.length < NOTES_PAGE_SIZE;
+        const exhausted = page.nextAfter === null;
         setByVault((prev) => ({
           ...prev,
           [vaultUid]: {
             ...prev[vaultUid],
             notes: [...prev[vaultUid].notes, ...page.notes],
             exhausted,
+            nextAfter: page.nextAfter,
             loadingMore: false,
           },
         }));
@@ -261,8 +270,11 @@ export function NotesTab() {
           const loaded = entry?.notes.length ?? 0;
           const total = entry?.total ?? loaded;
           const templatesHidden = entry?.notes.filter(isTemplate).length ?? 0;
+          // nw-648 review: a failed page keeps the button (as "Retry"), even
+          // when it was the FIRST page — hiding it left the rest of the vault
+          // unreachable until a reload. loadMore resumes from the last cursor.
           const canLoadMore =
-            !!entry && !entry.error && !entry.exhausted && loaded > 0 && loaded < total;
+            !!entry && !entry.exhausted && (!!entry.error || loaded < total);
           const unlisted = Math.max(0, total - loaded);
           const statusParts: string[] = [];
           if (unlisted > 0) statusParts.push(`Showing ${loaded} of ${total} notes.`);
@@ -318,13 +330,17 @@ export function NotesTab() {
                   </ul>
                 )}
                 <div
-                  className="flex items-center gap-2 px-4 py-1 text-[10px] text-[var(--color-text-muted)] empty:p-0"
-                  data-testid="notes-vault-status"
+                  className={`flex items-center gap-2 text-[10px] text-[var(--color-text-muted)] ${
+                    statusParts.length > 0 || canLoadMore ? "px-4 py-1" : ""
+                  }`}
                   data-vault-status={vault.uid}
                   tabIndex={-1}
-                  aria-live="polite"
                 >
-                  {statusParts.length > 0 && <span>{statusParts.join(" ")}</span>}
+                  {/* Only the status text is live: wrapping the button made
+                      every "Loading..." / "Load more" flip an announcement. */}
+                  <span data-testid="notes-vault-status" aria-live="polite">
+                    {statusParts.join(" ")}
+                  </span>
                   {canLoadMore && (
                     <button
                       type="button"
@@ -333,7 +349,7 @@ export function NotesTab() {
                       aria-disabled={entry.loadingMore}
                       className="text-[var(--color-graph-selection)] hover:underline aria-disabled:opacity-50"
                     >
-                      {entry.loadingMore ? "Loading..." : "Load more"}
+                      {entry.loadingMore ? "Loading..." : entry.error ? "Retry" : "Load more"}
                     </button>
                   )}
                 </div>

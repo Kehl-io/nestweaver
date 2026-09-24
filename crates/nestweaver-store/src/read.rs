@@ -257,6 +257,18 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// One keyset page of notes from [`GraphStore::list_notes_after`].
+#[derive(Debug, Clone, Default)]
+pub struct NoteKeysetPage {
+    /// Decoded notes, uid-ordered. May be shorter than the requested limit
+    /// even mid-vault: corrupt rows are dropped (and disclosed via tracing).
+    pub notes: Vec<Note>,
+    /// Cursor for the next page — the uid of the last row the scan reached,
+    /// decoded or not. `None` only when the scan returned fewer rows than the
+    /// limit, i.e. there is nothing after this page.
+    pub next_after: Option<String>,
+}
+
 /// What a whole-corpus scan actually covered.
 ///
 /// nw-335 made the whole-corpus scans TOLERATE a corrupt row instead of losing
@@ -1688,14 +1700,19 @@ impl GraphStore {
     /// within one vault. Keyset paging: every page costs one bounded top-k, so
     /// a vault of any size pages to completion — unlike `offset`, whose scan
     /// grows with the skip and is therefore capped by its callers.
+    ///
+    /// The page's [`NoteKeysetPage::next_after`] is computed from the rows the
+    /// scan REACHED, before corrupt ones are dropped (nw-648 review): a full
+    /// scan that decoded one row short is not the end of the vault, and a
+    /// caller that read "short page" as "done" lost every later note.
     pub fn list_notes_after(
         &self,
         vault_uid: Option<&str>,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<Note>, StoreError> {
+    ) -> Result<NoteKeysetPage, StoreError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(NoteKeysetPage::default());
         }
         let conn = self.conn()?;
         let mut clauses = Vec::new();
@@ -1723,7 +1740,21 @@ impl GraphStore {
         let result = conn
             .execute(&mut stmt, params)
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        Ok(collect_tolerating_corrupt(result.map(|row| row_to_note(&row)), "list_notes_after")?.0)
+        let mut scanned = 0usize;
+        let mut last_uid: Option<String> = None;
+        let rows = result.map(|row| {
+            scanned += 1;
+            // The raw uid, NUL check skipped: it only has to be what Cypher
+            // compared in `n.uid > $after`, so the next page resumes after it
+            // even when this row itself is too corrupt to return.
+            if let Some(Value::String(uid)) = row.first() {
+                last_uid = Some(uid.clone());
+            }
+            row_to_note(&row)
+        });
+        let (notes, _integrity) = collect_tolerating_corrupt(rows, "list_notes_after")?;
+        let next_after = if scanned >= limit { last_uid } else { None };
+        Ok(NoteKeysetPage { notes, next_after })
     }
 
     /// nw-648: note count per vault uid, in one aggregate query. The web

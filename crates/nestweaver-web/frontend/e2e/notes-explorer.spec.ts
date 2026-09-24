@@ -30,7 +30,13 @@ function note(vault: { uid: string; name: string }, i: number) {
   };
 }
 
-function fulfillNotes(route: Route) {
+/**
+ * Answers like the server: a FULL scan sends the next cursor in
+ * `x-next-after` (form-urlencoded); a short one is the end and sends none.
+ * `drop` names uids the server "scanned" but dropped as corrupt — the page
+ * comes back short, yet the cursor still points past them.
+ */
+function fulfillNotes(route: Route, drop: ReadonlySet<string> = new Set()) {
   const url = new URL(route.request().url());
   const vaultUid = url.searchParams.get("vault");
   const after = url.searchParams.get("after");
@@ -42,12 +48,15 @@ function fulfillNotes(route: Route) {
   const total = vaultUid ? vault.total : BRAIN.total + DOCS.total;
   const all = Array.from({ length: vault.total }, (_, i) => note(vault, i));
   const start = after === null ? 0 : all.findIndex((n) => n.uid > after);
-  const rows = start < 0 ? [] : all.slice(start, start + limit);
+  const scanned = start < 0 ? [] : all.slice(start, start + limit);
+  const headers: Record<string, string> = { "x-total-count": String(total) };
+  const last = scanned.at(-1);
+  if (last && scanned.length === limit) headers["x-next-after"] = encodeURIComponent(last.uid);
   return route.fulfill({
     status: 200,
     contentType: "application/json",
-    headers: { "x-total-count": String(total) },
-    body: JSON.stringify(rows),
+    headers,
+    body: JSON.stringify(scanned.filter((n) => !drop.has(n.uid))),
   });
 }
 
@@ -74,7 +83,7 @@ test("notes explorer lists every vault with its true count and pages the rest", 
   await page.route("**/api/v1/brain/tags", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
   );
-  await page.route("**/api/v1/brain/notes?**", fulfillNotes);
+  await page.route("**/api/v1/brain/notes?**", (route) => fulfillNotes(route));
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
@@ -94,6 +103,8 @@ test("notes explorer lists every vault with its true count and pages the rest", 
   const status = brain.getByTestId("notes-vault-status");
   await expect(status).toHaveAttribute("aria-live", "polite");
   await expect(status).toContainText(`Showing ${PAGE} of ${BRAIN.total} notes.`);
+  // Only the status text is live — the button is not inside the region.
+  await expect(status.getByRole("button")).toHaveCount(0);
   const loadMore = brain.getByRole("button", { name: "Load more" });
   await loadMore.click();
   await expect(status).toContainText(`Showing ${2 * PAGE} of ${BRAIN.total} notes.`);
@@ -137,6 +148,95 @@ test("one vault failing to load is shown on that vault, not the whole tab", asyn
   const broken = explorer.getByTestId("notes-vault-broken");
   await expect(broken.getByRole("alert")).toContainText("fixture store failure");
   await expect(explorer.getByRole("button", { name: /^▾\s*broken[\s\d]/ })).toContainText("7");
+});
+
+// nw-648 review: a failed page used to hide "Load more", so one transient
+// error left the rest of the vault unreachable until a reload — and a failed
+// FIRST page left the vault with no way to load at all. Both now retry.
+test("a failed page can be retried, including a failed first page", async ({ page }) => {
+  const FLAKY = { uid: "vlt:fixture:flaky", name: "flaky", total: 5 };
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [BRAIN, FLAKY]));
+  await page.route("**/api/v1/brain/tags", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+  );
+  // FLAKY's first page fails once; BRAIN's first cursor page fails once.
+  const failed = new Set<string>();
+  const failOnce = (key: string, route: Route) => {
+    if (failed.has(key)) return false;
+    failed.add(key);
+    void route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: `fixture transient failure (${key})` }),
+    });
+    return true;
+  };
+  await page.route("**/api/v1/brain/notes?**", (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    const vaultUid = params.get("vault");
+    if (vaultUid === FLAKY.uid) {
+      if (failOnce("flaky-first", route)) return;
+      const rows = Array.from({ length: FLAKY.total }, (_, i) => note(FLAKY, i));
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "x-total-count": String(FLAKY.total) },
+        body: JSON.stringify(rows),
+      });
+    }
+    if (params.get("after") !== null && failOnce("brain-more", route)) return;
+    return fulfillNotes(route);
+  });
+
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+
+  const flaky = explorer.getByTestId("notes-vault-flaky");
+  await expect(flaky.getByRole("alert")).toContainText("fixture transient failure (flaky-first)");
+  await flaky.getByRole("button", { name: "Retry" }).click();
+  await expect(flaky.getByRole("listitem")).toHaveCount(FLAKY.total);
+  await expect(flaky.getByRole("alert")).toHaveCount(0);
+  await expect(flaky.getByRole("button", { name: /Retry|Load more/ })).toHaveCount(0);
+
+  const brain = explorer.getByTestId("notes-vault-brain");
+  await brain.getByRole("button", { name: "Load more" }).click();
+  await expect(brain.getByRole("alert")).toContainText("fixture transient failure (brain-more)");
+  await brain.getByRole("button", { name: "Retry" }).click();
+  await expect(brain.getByTestId("notes-vault-status")).toContainText(
+    `Showing ${2 * PAGE} of ${BRAIN.total} notes.`,
+  );
+  await expect(brain.getByRole("alert")).toHaveCount(0);
+  // Retry resumed from the cursor: no page was skipped or repeated.
+  await expect(brain.locator('[data-note-uid="note:brain:1000"]')).toHaveCount(1);
+  await expect(brain.locator('[data-note-uid="note:brain:1999"]')).toHaveCount(1);
+});
+
+// nw-648 review: the server drops a corrupt row from a page, so a full scan
+// can come back one row short. The explorer used to read a short page as the
+// end of the vault; it now follows the server's cursor instead.
+test("a page shortened by a dropped corrupt row is not the end of the vault", async ({
+  page,
+}) => {
+  const dropped = new Set(["note:brain:0500"]);
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [BRAIN]));
+  await page.route("**/api/v1/brain/tags", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+  );
+  await page.route("**/api/v1/brain/notes?**", (route) => fulfillNotes(route, dropped));
+
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  const brain = explorer.getByTestId("notes-vault-brain");
+  await expect(brain.getByTestId("notes-vault-status")).toContainText(
+    `Showing ${PAGE - 1} of ${BRAIN.total} notes.`,
+  );
+  await brain.getByRole("button", { name: "Load more" }).click();
+  await expect(brain.locator('[data-note-uid="note:brain:1000"]')).toHaveCount(1);
+  await brain.getByRole("button", { name: "Load more" }).click();
+  await expect(brain.getByText("brain note 2002")).toBeAttached();
+  await expect(brain.getByRole("listitem")).toHaveCount(BRAIN.total - 1);
 });
 
 // Counterweight: a single vault under one page looks as it always did — its

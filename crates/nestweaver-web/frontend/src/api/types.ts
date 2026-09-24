@@ -149,6 +149,12 @@ export interface NotesPage {
   notes: Note[];
   /** Notes matching the filter, from `X-Total-Count`; null if not sent. */
   total: number | null;
+  /**
+   * Cursor for the next page, from `X-Next-After`; null at the end. Computed
+   * server-side before corrupt rows are dropped, so a short page with a
+   * cursor is NOT the end of the vault.
+   */
+  nextAfter: string | null;
 }
 
 export interface Note {

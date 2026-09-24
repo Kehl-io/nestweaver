@@ -148,7 +148,8 @@ export const api = {
   // page (1000) PER VAULT (nw-648: one unfiltered page held only the first
   // vault) and pages on with the uid cursor `after`, which reaches the end
   // of a vault of any size. The handler still caps omitted `limit` at 20 so
-  // curl/MCP cannot dump the whole vault; `total` comes from `X-Total-Count`.
+  // curl/MCP cannot dump the whole vault; `total` comes from `X-Total-Count`
+  // and the next cursor from `X-Next-After` (absent at the end).
   async brainNotesPage(vaultUid: string, after?: string, limit = NOTES_PAGE_SIZE): Promise<NotesPage> {
     const params = new URLSearchParams({ vault: vaultUid, limit: String(limit) });
     if (after !== undefined) params.set("after", after);
@@ -159,9 +160,13 @@ export const api = {
     }
     const header = res.headers.get("x-total-count");
     const total = header === null ? null : Number.parseInt(header, 10);
+    // The next cursor comes from the server, not from the last row we got:
+    // the server drops corrupt rows, so a short page is not the end.
+    const next = res.headers.get("x-next-after");
     return {
       notes: (await res.json()) as Note[],
       total: total === null || Number.isNaN(total) ? null : total,
+      nextAfter: next === null ? null : decodeURIComponent(next.replace(/\+/g, "%20")),
     };
   },
 

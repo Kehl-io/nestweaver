@@ -1134,6 +1134,136 @@ async fn brain_notes_cursor_pages_a_vault_past_the_offset_ceiling() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// GET returning status, JSON body and the decoded `X-Next-After` cursor.
+async fn get_json_with_next(app: &axum::Router, uri: &str) -> (StatusCode, Value, Option<String>) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let next = response
+        .headers()
+        .get(nestweaver_web::routes::brain::LIST_NOTES_NEXT_AFTER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        // The cursor is form-urlencoded so any uid fits a header.
+        .map(|value| {
+            url::form_urlencoded::parse(format!("a={value}").as_bytes())
+                .map(|(_, decoded)| decoded.into_owned())
+                .collect::<String>()
+        });
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+        next,
+    )
+}
+
+/// nw-648 review (M2): `list_notes_after` drops a corrupt row, so a FULL page
+/// came back one short and the explorer — reading "short page" as "end of
+/// vault" — stopped, leaving every later note unreachable. The server now
+/// hands out the next cursor computed from the rows it SCANNED, before any
+/// were dropped, and omits it only when the scan itself ran out.
+#[tokio::test]
+async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
+    let store = setup_test_store();
+    insert_named_vault_notes(&store, "vlt:big", "big", 6);
+    // uid sorts between note:big:0001 and note:big:0002; NUL title = corrupt.
+    store
+        .insert_note(&Note {
+            uid: "note:big:0001x".to_string(),
+            vault_uid: "vlt:big".to_string(),
+            file_path: "corrupt.md".to_string(),
+            title: "Cor\u{0}rupt".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "hc".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        })
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/test.lbug"),
+    ));
+
+    // Page 1 scans 0000, 0001, 0001x(corrupt) — 2 rows survive, but the scan
+    // was full, so a cursor is owed and it points past the dropped row.
+    let (status, first, next) =
+        get_json_with_next(&app, "/api/v1/brain/notes?vault=vlt:big&limit=3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first.as_array().map(Vec::len), Some(2));
+    assert_eq!(next.as_deref(), Some("note:big:0001x"));
+
+    let mut seen: Vec<String> = first
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["uid"].as_str().unwrap().to_string())
+        .collect();
+    let mut cursor = next;
+    let mut last_next = None;
+    for _ in 0..10 {
+        let Some(after) = cursor.take() else { break };
+        let (status, json, next) = get_json_with_next(
+            &app,
+            &format!("/api/v1/brain/notes?vault=vlt:big&limit=3&after={after}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        seen.extend(
+            json.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["uid"].as_str().unwrap().to_string()),
+        );
+        last_next = next.clone();
+        cursor = next;
+    }
+    assert_eq!(seen.len(), 6, "every clean note is reachable: {seen:?}");
+    assert_eq!(last_next, None, "the end of the vault sends no cursor");
+}
+
+/// Counterweight: a vault that fits in one page sends no cursor, so a caller
+/// does not issue a pointless extra request.
+#[tokio::test]
+async fn brain_notes_short_clean_page_sends_no_next_cursor() {
+    let store = setup_test_store();
+    insert_named_vault_notes(&store, "vlt:small", "small", 4);
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/test.lbug"),
+    ));
+    let (status, json, next) =
+        get_json_with_next(&app, "/api/v1/brain/notes?vault=vlt:small&limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().map(Vec::len), Some(4));
+    assert_eq!(next, None);
+}
+
+/// nw-648 review (M3): `after` + `offset` is a malformed request, and says so
+/// whatever the vault — it is not a 404 because the vault also happens to be
+/// unknown, and it costs no vault lookup or count.
+#[tokio::test]
+async fn brain_notes_after_with_offset_is_rejected_before_the_vault_lookup() {
+    let app = notes_list_app(3);
+    let (status, _) = get_json(
+        &app,
+        "/api/v1/brain/notes?vault=vlt:missing&after=note:x&offset=5",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn brain_vaults_report_each_vaults_true_note_count() {
     let app = two_vault_app();
