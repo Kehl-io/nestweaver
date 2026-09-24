@@ -2266,6 +2266,22 @@ pub(crate) fn disclose_pruned_dir(
             ),
         ));
     }
+    if pruned.reason == crate::content_reader::IGNORE_FILE_ERROR_REASON {
+        // nw-651 review: an ignore file the walk could not apply. Everything
+        // was READ, so this is a policy row (`Ignored`, no coverage gap) and
+        // the remedy is the file, not its permissions.
+        return Some(SkippedFile::new(
+            pruned.path.clone(),
+            SkipReasonCode::Ignored,
+            format!(
+                "ignore file `{path}` could not be applied ({detail}); the rule it \
+                 holds was skipped, so paths it meant to exclude may be indexed — fix \
+                 the pattern (or the file's permissions) and re-run the index",
+                path = pruned.path,
+                detail = pruned.detail.as_deref().unwrap_or("parse error"),
+            ),
+        ));
+    }
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
     }

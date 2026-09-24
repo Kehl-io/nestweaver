@@ -473,6 +473,10 @@ pub struct SkippedDir {
 /// `SKIP_DIRS` BEFORE descending, so an ignored unreadable directory is never
 /// read and never produces a row. (`.brainignore` is applied per note AFTER
 /// the walk, so the vault drain filters these rows against it instead.)
+///
+/// Not every walk error is this row: see `classify_walk_error` — an ignore
+/// file that fails to parse is an [`IGNORE_FILE_ERROR_REASON`] row, and a
+/// path that vanished mid-walk is no row at all.
 pub const UNREADABLE_DIR_REASON: &str = "unreadable during enumeration";
 
 /// The path an `ignore` walk error is about, if it names one.
@@ -491,7 +495,135 @@ fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
     }
 }
 
+/// The `reason` a [`SkippedDir`] carries when an ignore file (`.gitignore`,
+/// `.ignore`, `.git/info/exclude`) could not be read or parsed — the row's
+/// `path` is that FILE, not a directory.
+///
+/// nw-651 review: these reach the walk as errors too, and were first coded
+/// as [`UNREADABLE_DIR_REASON`] with a `chmod` remedy. A malformed glob in an
+/// ANCESTOR's `.gitignore` (a vault inside a git checkout) even pinned that
+/// row to `.`, which read as "nothing under the root was indexed", retained
+/// every note as unobserved and blocked the vault's derivation — for a tree
+/// the walk read in full. Nothing is missing here: the bad pattern alone is
+/// dropped, so the risk is content indexed that was meant to be ignored. It
+/// is still disclosed (the user's ignore rule silently does nothing), as a
+/// POLICY row naming the file, never counted as unread content.
+pub const IGNORE_FILE_ERROR_REASON: &str = "ignore file could not be applied";
+
+/// File names the walker reads ignore rules from; see `list_files`'s
+/// `WalkBuilder` (`.ignore` is on by default).
+fn is_ignore_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+        || path.ends_with(".git/info/exclude")
+}
+
+/// Whether an error (below its path wrappers) came from parsing an ignore
+/// file's lines rather than from reading a directory.
+fn is_ignore_rule_error(err: &ignore::Error) -> bool {
+    match err {
+        ignore::Error::Glob { .. } | ignore::Error::WithLineNumber { .. } => true,
+        ignore::Error::WithPath { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            is_ignore_rule_error(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().any(is_ignore_rule_error),
+        _ => false,
+    }
+}
+
+/// The error below its `WithPath`/`WithDepth` wrappers, whose text does not
+/// repeat the absolute path the row already names.
+fn strip_error_path(err: &ignore::Error) -> &ignore::Error {
+    match err {
+        ignore::Error::WithPath { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            strip_error_path(err)
+        }
+        _ => err,
+    }
+}
+
+/// `path` relative to `root` when inside it (`.` for the root itself), else
+/// as given — an ancestor's ignore file lives outside the walked tree.
+fn walk_row_path(path: Option<&Path>, root: &Path) -> String {
+    match path {
+        Some(path) => match path.strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => path.to_string_lossy().into_owned(),
+        },
+        None => ".".to_string(),
+    }
+}
+
+/// Turn one walk error into the rows it should disclose (nw-651).
+///
+/// BY CAUSE, because the causes need different things from the user:
+/// - an ignore file that could not be read or parsed → an
+///   [`IGNORE_FILE_ERROR_REASON`] row naming that file;
+/// - a path that no longer exists (`NotFound`: a directory deleted between
+///   being listed and being read) → NO row. It is gone, not unreadable; a
+///   deletion is picked up by the next walk like any other;
+/// - anything else (permission denied, a symlink loop, another I/O fault) →
+///   an [`UNREADABLE_DIR_REASON`] row naming the directory. A path-less
+///   error is pinned to `.` rather than dropped, so the loss stays visible.
+///
+/// A `Partial` error is classified member by member.
+fn classify_walk_error(err: &ignore::Error, root: &Path) -> Vec<SkippedDir> {
+    if let ignore::Error::Partial(errs) = strip_error_path(err) {
+        return errs
+            .iter()
+            .flat_map(|err| classify_walk_error(err, root))
+            .collect();
+    }
+    let path = walk_error_path(err);
+    if is_ignore_rule_error(err) || path.is_some_and(is_ignore_file) {
+        return vec![SkippedDir {
+            path: walk_row_path(path, root),
+            reason: IGNORE_FILE_ERROR_REASON.to_string(),
+            matched_pattern: None,
+            detail: Some(strip_error_path(err).to_string()),
+        }];
+    }
+    if err
+        .io_error()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    {
+        tracing::debug!("walk: path vanished mid-walk: {err}");
+        return Vec::new();
+    }
+    // The OS error alone: walkdir's own message repeats the ABSOLUTE path,
+    // which the row already names relatively.
+    let detail = match err.io_error() {
+        Some(io) => io.raw_os_error().map_or_else(
+            || io.kind().to_string(),
+            |code| std::io::Error::from_raw_os_error(code).to_string(),
+        ),
+        None => strip_error_path(err).to_string(),
+    };
+    vec![SkippedDir {
+        path: walk_row_path(path, root),
+        reason: UNREADABLE_DIR_REASON.to_string(),
+        matched_pattern: None,
+        detail: Some(detail),
+    }]
+}
+
 impl FilesystemReader {
+    /// Record walk-error rows (nw-651), once per path and reason.
+    fn record_walk_rows(&self, rows: Vec<SkippedDir>) {
+        let Ok(mut recorded) = self.skipped_dirs.lock() else {
+            return;
+        };
+        for row in rows {
+            if !recorded
+                .iter()
+                .any(|seen| seen.path == row.path && seen.reason == row.reason)
+            {
+                recorded.push(row);
+            }
+        }
+    }
+
     pub fn new(repo_path: &Path) -> Self {
         Self {
             repo_path: repo_path.to_path_buf(),
@@ -983,39 +1115,19 @@ impl ContentReader for FilesystemReader {
                         return Err(anyhow::anyhow!("incomplete source inventory: {err}"));
                     }
                     tracing::warn!("walk error: {err}");
-                    // nw-651: disclose, don't just log. See
-                    // `UNREADABLE_DIR_REASON`. A path-less error (none is
-                    // known to reach here) is pinned to the root rather than
-                    // dropped, so the loss is still visible.
-                    let rel = walk_error_path(&err)
-                        .and_then(|path| path.strip_prefix(&self.repo_path).ok())
-                        .map(|rel| rel.to_string_lossy().into_owned())
-                        .filter(|rel| !rel.is_empty())
-                        .unwrap_or_else(|| ".".to_string());
-                    // The OS error alone: walkdir's own message repeats the
-                    // ABSOLUTE path, which the row already names relatively.
-                    let detail = match err.io_error() {
-                        Some(io) => io.raw_os_error().map_or_else(
-                            || io.kind().to_string(),
-                            |code| std::io::Error::from_raw_os_error(code).to_string(),
-                        ),
-                        None => err.to_string(),
-                    };
-                    if let Ok(mut recorded) = self.skipped_dirs.lock()
-                        && !recorded
-                            .iter()
-                            .any(|row| row.path == rel && row.reason == UNREADABLE_DIR_REASON)
-                    {
-                        recorded.push(SkippedDir {
-                            path: rel,
-                            reason: UNREADABLE_DIR_REASON.to_string(),
-                            matched_pattern: None,
-                            detail: Some(detail),
-                        });
-                    }
+                    // nw-651: disclose, don't just log — classified by cause
+                    // (see `classify_walk_error`).
+                    self.record_walk_rows(classify_walk_error(&err, &self.repo_path));
                     continue;
                 }
             };
+            // nw-651 review: an ignore file in a directory the walk DID read
+            // rides on the `Ok` entry instead of an `Err` item, and was
+            // dropped without a trace. Same classification, same channel.
+            if let Some(err) = entry.error() {
+                tracing::warn!("walk ignore-file error: {err}");
+                self.record_walk_rows(classify_walk_error(err, &self.repo_path));
+            }
             if entry.file_type().is_some_and(|ft| ft.is_file())
                 && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
             {
@@ -3141,6 +3253,131 @@ mod tests {
     /// The contrast case that keeps the nw-287 fix from over-firing: a single
     /// unreadable SUBDIRECTORY is a partial-coverage problem, not an
     /// enumeration failure, so the files that were seen must still be returned.
+    fn ignore_file_rows(reader: &FilesystemReader) -> Vec<SkippedDir> {
+        reader
+            .skipped_dirs()
+            .into_iter()
+            .filter(|row| row.reason == IGNORE_FILE_ERROR_REASON)
+            .collect()
+    }
+
+    fn unreadable_rows(reader: &FilesystemReader) -> Vec<SkippedDir> {
+        reader
+            .skipped_dirs()
+            .into_iter()
+            .filter(|row| row.reason == UNREADABLE_DIR_REASON)
+            .collect()
+    }
+
+    /// nw-651 review: a malformed `.gitignore` in an ANCESTOR of the walk root
+    /// (a vault inside a git checkout) surfaces as an `Err` item carrying the
+    /// ignore file's path. It was coded as an unreadable directory pinned to
+    /// `.` — "nothing beneath the root was indexed, chmod it" — which retained
+    /// every note as unobserved and blocked the vault's derivation, for a
+    /// file the walk read fine. It is an ignore-file row naming the file.
+    #[test]
+    fn a_malformed_ancestor_gitignore_is_an_ignore_file_row_not_an_unreadable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ok.txt\nfoo{a,b\n").unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A\n").unwrap();
+
+        let reader = FilesystemReader::new(&root);
+        let files = reader.list_files().unwrap();
+
+        assert!(files.iter().any(|p| p.ends_with("a.md")), "{files:?}");
+        assert!(
+            unreadable_rows(&reader).is_empty(),
+            "a parse error in an ignore file is not an unreadable directory: {:?}",
+            reader.skipped_dirs()
+        );
+        let rows = ignore_file_rows(&reader);
+        assert_eq!(rows.len(), 1, "{:?}", reader.skipped_dirs());
+        assert!(rows[0].path.ends_with(".gitignore"), "{rows:?}");
+        let detail = rows[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("foo{a,b"), "names the bad glob: {detail}");
+    }
+
+    /// The same parse error in a SUBDIRECTORY's ignore file rides on an `Ok`
+    /// entry (`DirEntry::error`), not an `Err` item, and used to be dropped
+    /// without a trace. It is disclosed the same way, and the directory's
+    /// notes are still listed — the walk read it.
+    #[test]
+    fn a_malformed_subdirectory_gitignore_is_an_ignore_file_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "foo{a,b\n").unwrap();
+        std::fs::write(root.join("sub/b.md"), "# B\n").unwrap();
+
+        let reader = FilesystemReader::new(&root);
+        let files = reader.list_files().unwrap();
+
+        assert!(files.iter().any(|p| p.ends_with("sub/b.md")), "{files:?}");
+        assert!(
+            unreadable_rows(&reader).is_empty(),
+            "{:?}",
+            reader.skipped_dirs()
+        );
+        let rows = ignore_file_rows(&reader);
+        assert_eq!(rows.len(), 1, "{:?}", reader.skipped_dirs());
+        assert_eq!(rows[0].path, "sub/.gitignore");
+    }
+
+    /// Counterweight + the "vanished" population: a path that disappeared
+    /// between being listed and being read (a directory deleted mid-walk) is
+    /// gone, not unreadable — no row, and no chmod remedy. Permission denied
+    /// stays an unreadable-directory row.
+    #[test]
+    fn walk_errors_are_classified_by_cause() {
+        let root = Path::new("/vault");
+        let io_at = |kind: std::io::ErrorKind| ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(ignore::Error::WithPath {
+                path: root.join("sub"),
+                err: Box::new(ignore::Error::Io(std::io::Error::from(kind))),
+            }),
+        };
+
+        assert_eq!(
+            classify_walk_error(&io_at(std::io::ErrorKind::NotFound), root),
+            vec![]
+        );
+        let denied = classify_walk_error(&io_at(std::io::ErrorKind::PermissionDenied), root);
+        assert_eq!(denied.len(), 1, "{denied:?}");
+        assert_eq!(denied[0].path, "sub");
+        assert_eq!(denied[0].reason, UNREADABLE_DIR_REASON);
+    }
+
+    /// The ignore-file row is disclosed as a policy row (`Ignored`, not a
+    /// coverage gap: the walk read everything, a pattern just did not apply)
+    /// and its remedy names the file, not `chmod`.
+    #[test]
+    fn an_ignore_file_row_names_the_file_not_a_permissions_fix() {
+        for caller in [
+            crate::index::SkipDirCaller::Repo,
+            crate::index::SkipDirCaller::Vault,
+        ] {
+            let row = crate::index::disclose_pruned_dir(
+                SkippedDir {
+                    path: "sub/.gitignore".into(),
+                    reason: IGNORE_FILE_ERROR_REASON.into(),
+                    matched_pattern: None,
+                    detail: Some("line 1: error parsing glob 'foo{a,b'".into()),
+                },
+                caller,
+            )
+            .expect("disclosed");
+            assert_eq!(row.reason_code, nestweaver_parser::SkipReasonCode::Ignored);
+            assert!(row.reason.contains("sub/.gitignore"), "{}", row.reason);
+            assert!(row.reason.contains("foo{a,b"), "{}", row.reason);
+            assert!(!row.reason.contains("chmod"), "{}", row.reason);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn list_files_tolerates_one_unreadable_subdirectory() {
