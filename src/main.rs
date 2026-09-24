@@ -18253,6 +18253,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
+                    // nw-544: detect_changes now takes its risk/gate from blast
+                    // radius, which reads the cluster sidecar via this path. The
+                    // daemon sets it; without it here the direct route would drop
+                    // the cluster risk boost and disagree with `blast-radius`.
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
                     nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
                 }
             };

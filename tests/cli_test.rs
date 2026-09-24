@@ -2599,6 +2599,89 @@ fn cli_capability_aliases_execute_mcp_equivalent_contracts() {
     assert_eq!(backlinks["backlinks"][0]["source_note_title"], "Source");
 }
 
+/// nw-544: `detect-changes` and `blast-radius` must return the same risk and
+/// gate for the same changed files — the item's fixture is an unindexed
+/// `Makefile` plus `src/a.js`, whose function has five root callers (five
+/// processes, which the old process-count bucketing read as `high`). Run
+/// through the real CLI so the MCP tool wiring and the direct route's db-path
+/// plumbing (cluster/co-change sidecars) are covered, not just the engine.
+#[test]
+fn detect_changes_and_blast_radius_agree_on_risk_and_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    std::fs::write(repo_dir.join("Makefile"), "all:\n\techo build\n").unwrap();
+    std::fs::write(
+        repo_dir.join("src/a.js"),
+        "export function sharedTarget(x) { return x + 1; }\n",
+    )
+    .unwrap();
+    let mut callers = String::from("import { sharedTarget } from './a.js';\n");
+    for n in 0..5 {
+        callers.push_str(&format!(
+            "export function caller{n}() {{ return sharedTarget({n}); }}\n"
+        ));
+    }
+    std::fs::write(repo_dir.join("src/callers.js"), callers).unwrap();
+    std::fs::write(
+        repo_dir.join("src/leaf.js"),
+        "export function lonelyLeaf() { return 42; }\n",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let run = |command: &str, files: &[&str]| -> serde_json::Value {
+        let mut cmd = nestweaver_cmd();
+        cmd.arg(command);
+        for file in files {
+            cmd.args(["--files", file]);
+        }
+        let output = cmd.args(["--json", "--db"]).arg(&db_path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command} {files:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let cases: [&[&str]; 4] = [
+        &["Makefile", "src/a.js"],
+        &["src/a.js"],
+        &["Makefile"],
+        &["src/leaf.js"],
+    ];
+    for files in cases {
+        let detect = run("detect-changes", files);
+        let blast = run("blast-radius", files);
+        assert_eq!(
+            detect["risk"], blast["risk"],
+            "{files:?}: risk differs\ndetect: {detect}\nblast: {blast}"
+        );
+        assert_eq!(
+            detect["gate_state"], blast["gate_state"],
+            "{files:?}: gate differs\ndetect: {detect}\nblast: {blast}"
+        );
+        if files.contains(&"Makefile") {
+            assert_ne!(detect["gate_state"], "ok", "{files:?}: {detect}");
+            assert_ne!(detect["risk"], "low", "{files:?}: {detect}");
+        }
+    }
+
+    // COUNTERWEIGHT: a genuinely low-risk change still reads low / ok in both.
+    let leaf = run("detect-changes", &["src/leaf.js"]);
+    assert_eq!(leaf["risk"], "low", "{leaf}");
+    assert_eq!(leaf["gate_state"], "ok", "{leaf}");
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])
