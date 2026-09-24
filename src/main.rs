@@ -2985,12 +2985,6 @@ fn render_investigate_text(payload: &serde_json::Value) {
     );
 }
 
-/// Render a `blast-radius` result as text from its JSON payload.
-///
-/// Both the direct and daemon paths render through this, so the two cannot
-/// drift — the rule established when `dead-code` and `investigate` were found
-/// emitting JSON or text depending on whether a daemon happened to be running
-/// (nw-108).
 /// Print a change-impact payload's `notifications` as `[level] message`, the
 /// one renderer shared by `blast-radius` and `detect-changes` (nw-544).
 ///
@@ -3021,6 +3015,12 @@ fn print_change_notifications(payload: &serde_json::Value, indent: &str, show_no
     }
 }
 
+/// Render a `blast-radius` result as text from its JSON payload.
+///
+/// Both the direct and daemon paths render through this, so the two cannot
+/// drift — the rule established when `dead-code` and `investigate` were found
+/// emitting JSON or text depending on whether a daemon happened to be running
+/// (nw-108).
 fn render_blast_radius_text(payload: &serde_json::Value) {
     // nw-454. Every read below is a TOP-LEVEL key, and a two-tier payload has
     // none of them up there -- it carries `tier`, `local_impact` and
