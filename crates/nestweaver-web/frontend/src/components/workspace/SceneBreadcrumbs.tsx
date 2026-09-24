@@ -70,8 +70,8 @@ export function SceneBreadcrumbs() {
           });
           setRepresentationMode("graph");
         }}
-        className="inline-flex h-7 min-w-0 items-center gap-1 rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
-        title="Go to workspace overview"
+        className="inline-flex h-7 min-w-0 items-center gap-1 overflow-hidden rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
+        title={`${workspace?.label ?? "All indexed content"} (go to overview)`}
       >
         <Home className="h-3.5 w-3.5 shrink-0" />
         <span className="min-w-[3rem] max-w-[8rem] truncate">
