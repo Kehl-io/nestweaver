@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.3.0](https://github.com/Kehl-io/nestweaver/compare/v10.2.2...v10.3.0) (2026-09-25)
+
+
+### Features
+
+* batch 5 — precise note-to-code links and project membership ([#434](https://github.com/Kehl-io/nestweaver/issues/434)) ([6434c9c](https://github.com/Kehl-io/nestweaver/commit/6434c9cc8b10ccd03888429297503c9343e63a4a))
+
 ## [10.2.2](https://github.com/Kehl-io/nestweaver/compare/v10.2.1...v10.2.2) (2026-09-24)
 
 
