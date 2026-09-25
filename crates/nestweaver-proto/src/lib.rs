@@ -185,6 +185,27 @@ pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLink
         rules_version: number("rules_version"),
         current_rules_version: number("current_rules_version"),
         last_reconciled_at: text("last_reconciled_at"),
+        notes_changed_since_indexing: links
+            .get("notes_changed_since_indexing")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|row| StaleNotesInVault {
+                vault: row
+                    .get("vault")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                count: row.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            })
+            .collect(),
+        unscoped_projects: links
+            .get("unscoped_projects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
     })
 }
 

@@ -2774,6 +2774,14 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     }
 
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
+    pin_note_seed_code_links(
+        store,
+        &seeds,
+        &mut connected,
+        &direct_seed_uids,
+        &ppr,
+        render_cap.and_then(|cap| cap.admit),
+    )?;
 
     // Cover cancellation after inference/vector work but before the completed
     // result crosses the engine boundary into single-flight/cache publication.
@@ -2869,6 +2877,92 @@ fn pin_direct_seeds_in_connected(
     connected.retain(|node| !direct.contains(node.uid.as_str()));
     pinned.append(connected);
     *connected = pinned;
+}
+
+/// nw-670 re-review F2: at most this many symbols a note/section seed links
+/// to directly are guaranteed a place in `connected`.
+pub(crate) const NOTE_SEED_CODE_LINK_SLOTS: usize = 8;
+
+/// nw-670 re-review F2: put the code a NOTE (or section) seed links to
+/// directly right after the pinned seeds, strongest link first.
+///
+/// Hybrid fusion caps a candidate reached only through PPR at the PPR
+/// weight (0.40 after tanh saturation), while entries that ALSO match BM25
+/// or semantic search score higher — so a note seed's own `ClaimLedger` /
+/// `readCsvRows` links ranked below every section that repeated a query
+/// word, and "context for this note" came back without the code it names.
+/// This narrowly guarantees those links slots, bounded by
+/// [`NOTE_SEED_CODE_LINK_SLOTS`], and leaves the global fusion weights (and
+/// symbol-seeded queries) untouched. `admit` is the caller's scope filter.
+fn pin_note_seed_code_links(
+    store: &GraphStore,
+    seeds: &[BrainNode],
+    connected: &mut Vec<BrainNode>,
+    direct_seed_uids: &[String],
+    ppr: &[(String, f64)],
+    admit: Option<&dyn Fn(&str) -> bool>,
+) -> Result<(), anyhow::Error> {
+    let direct: std::collections::HashSet<&str> =
+        direct_seed_uids.iter().map(String::as_str).collect();
+    let mut note_seeds: Vec<String> = Vec::new();
+    for node in seeds.iter().chain(connected.iter()) {
+        if direct.contains(node.uid.as_str())
+            && (node.uid.starts_with("note:") || node.uid.starts_with("sec:"))
+            && !note_seeds.contains(&node.uid)
+        {
+            note_seeds.push(node.uid.clone());
+        }
+    }
+    if note_seeds.is_empty() {
+        return Ok(());
+    }
+    let ppr_score: std::collections::HashMap<&str, f64> = ppr
+        .iter()
+        .map(|(uid, score)| (uid.as_str(), *score))
+        .collect();
+    let mut edges = store
+        .references_code_edges_from(&note_seeds)
+        .map_err(|e| anyhow::anyhow!("read note seeds' code links: {e}"))?;
+    edges.sort_by(|a, b| {
+        b.2.total_cmp(&a.2).then_with(|| {
+            let score = |uid: &str| ppr_score.get(uid).copied().unwrap_or(0.0);
+            score(&b.1).total_cmp(&score(&a.1))
+        })
+    });
+    let mut linked: Vec<BrainNode> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, symbol, _) in &edges {
+        if linked.len() >= NOTE_SEED_CODE_LINK_SLOTS {
+            break;
+        }
+        if direct.contains(symbol.as_str())
+            || !seen.insert(symbol.clone())
+            || admit.is_some_and(|admit| !admit(symbol))
+        {
+            continue;
+        }
+        let node = match connected.iter().find(|node| &node.uid == symbol) {
+            Some(existing) => Some(existing.clone()),
+            None => render_brain_node(
+                store,
+                symbol,
+                ppr_score.get(symbol.as_str()).copied().unwrap_or(0.0),
+            )?,
+        };
+        linked.extend(node);
+    }
+    if linked.is_empty() {
+        return Ok(());
+    }
+    let pinned: std::collections::HashSet<String> =
+        linked.iter().map(|node| node.uid.clone()).collect();
+    connected.retain(|node| !pinned.contains(&node.uid));
+    let front = connected
+        .iter()
+        .take_while(|node| direct.contains(node.uid.as_str()))
+        .count();
+    connected.splice(front..front, linked);
+    Ok(())
 }
 
 /// Tanh-based score normalization.
@@ -5313,7 +5407,7 @@ mod dedup_heading_section_tests {
 
 #[cfg(test)]
 mod pin_direct_seeds_tests {
-    use super::{BrainNode, pin_direct_seeds_in_connected};
+    use super::{BrainNode, GraphStore, pin_direct_seeds_in_connected, pin_note_seed_code_links};
 
     fn node(uid: &str) -> BrainNode {
         BrainNode {
@@ -5336,6 +5430,28 @@ mod pin_direct_seeds_tests {
         assert_eq!(
             connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
             vec!["sym:Long", "sym:extra1", "sym:extra2"]
+        );
+    }
+
+    /// nw-670 re-review F2 counterweight: only Note/Section seeds pin their
+    /// code links; a symbol seed leaves `connected` exactly as fused.
+    #[test]
+    fn a_symbol_seed_pins_no_code_links() {
+        let store = GraphStore::in_memory().unwrap();
+        let seeds = vec![node("sym:Long")];
+        let mut connected = vec![node("sym:a"), node("sym:b")];
+        pin_note_seed_code_links(
+            &store,
+            &seeds,
+            &mut connected,
+            &["sym:Long".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:a", "sym:b"]
         );
     }
 

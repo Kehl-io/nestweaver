@@ -2490,6 +2490,46 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// The REFERENCES_CODE edges leaving each Note or Section in `from_uids`
+    /// themselves (not a note's sections), as `(from_uid, symbol_uid,
+    /// confidence)`. nw-670 re-review F2: a note seed's directly linked code.
+    pub fn references_code_edges_from(
+        &self,
+        from_uids: &[String],
+    ) -> Result<Vec<(String, String, f64)>, StoreError> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for chunk in from_uids.chunks(256) {
+            let uids = Value::List(
+                lbug::LogicalType::String,
+                chunk.iter().map(|uid| Value::String(uid.clone())).collect(),
+            );
+            for query in [
+                "UNWIND $uids AS u \
+                 MATCH (a:Note {uid: u})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) \
+                 RETURN a.uid, b.uid, r.confidence",
+                "UNWIND $uids AS u \
+                 MATCH (a:Section {uid: u})-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) \
+                 RETURN a.uid, b.uid, r.confidence",
+            ] {
+                let mut stmt = conn
+                    .prepare(query)
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                let rows = conn
+                    .execute(&mut stmt, vec![("uids", uids.clone())])
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                for row in rows {
+                    out.push((
+                        extract_string(&row, 0)?,
+                        extract_string(&row, 1)?,
+                        extract_f64(&row, 2)?,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Every section's `(uid, note_uid, start_line, end_line)`, in one scan.
     /// nw-675: the code-link reconciler attributes mentions to sections by
     /// line; one query instead of one `sections_in_note` per note.
