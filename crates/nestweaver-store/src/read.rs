@@ -2383,25 +2383,6 @@ impl GraphStore {
         Ok((notes, repos))
     }
 
-    /// Whether any REFERENCES_CODE edge exists — an O(1) probe, unlike
-    /// [`Self::count_references_code_edges`], for the rules-migration purge
-    /// (nw-670) that runs against tens of millions of edges.
-    pub fn any_references_code_edges(&self) -> Result<bool, StoreError> {
-        let conn = self.conn()?;
-        for query in [
-            "MATCH ()-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() RETURN 1 LIMIT 1",
-            "MATCH ()-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() RETURN 1 LIMIT 1",
-        ] {
-            let mut rows = conn
-                .query(query)
-                .map_err(|e| StoreError::Query(e.to_string()))?;
-            if rows.next().is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Total count of REFERENCES_CODE edges (note-to-symbol + section-to-symbol).
     /// Useful for status output to confirm cross-domain discovery happened.
     pub fn count_references_code_edges(&self) -> Result<usize, StoreError> {

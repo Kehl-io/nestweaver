@@ -51,25 +51,6 @@ use crate::cross_domain::{
     note_mentions, resolve_note,
 };
 
-/// nw-670: old links the rules migration removes per transaction, per edge
-/// kind. A real pre-nw-670 brain holds ~39 M; one delete of that size would
-/// hold the write lease for as long as it runs.
-const PURGE_BATCH: usize = 50_000;
-
-#[cfg(test)]
-thread_local! {
-    /// Test seam: a smaller purge batch, to see the batching.
-    static PURGE_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-fn purge_batch() -> usize {
-    #[cfg(test)]
-    if let Some(batch) = PURGE_BATCH_OVERRIDE.with(std::cell::Cell::get) {
-        return batch;
-    }
-    PURGE_BATCH
-}
-
 /// `<db>.code_links.json`: the code-link reconciler's durable state.
 pub const CODE_LINKS_SIDECAR: &str = ".code_links.json";
 
@@ -358,10 +339,11 @@ impl CodeLinkReconciler {
     ) -> Result<CodeLinkReconcileReport, anyhow::Error> {
         let mut report = CodeLinkReconcileReport::default();
         if migrating {
-            purge_links(store, lease, should_stop, &mut report)?;
-            if report.stopped {
+            if should_stop() {
+                report.stopped = true;
                 return Ok(report);
             }
+            purge_links(store, lease)?;
         }
         let index = crate::cross_domain::build_symbol_index_with_config(store, &self.config)?;
         if index.is_empty() {
@@ -583,57 +565,32 @@ fn finish_publication(
     written.map(|_| ())
 }
 
-/// nw-670 migration: remove every stored link, [`PURGE_BATCH`] per edge kind
-/// per transaction, each under its own lease and publication, so the old
-/// rules' tens of millions of edges never make one giant transaction and
-/// queued writers get the lease between batches. Progress is disclosed.
-fn purge_links(
-    store: &GraphStore,
-    lease: CodeLinkLease<'_>,
-    should_stop: &dyn Fn() -> bool,
-    report: &mut CodeLinkReconcileReport,
-) -> Result<(), anyhow::Error> {
-    let mut batches = 0usize;
-    while store
-        .any_references_code_edges()
-        .context("probe for links to remove")?
-    {
-        if should_stop() {
-            report.stopped = true;
-            return Ok(());
-        }
-        let (_lease, publication) = begin_publication(store, lease)?;
-        let conn = store
-            .begin_transaction()
-            .map_err(|e| anyhow::anyhow!("begin_transaction for link purge: {e}"));
-        let deleted =
-            conn.and_then(|conn| {
-                match GraphStore::delete_references_code_edges_batch_on(&conn, purge_batch()) {
-                    Ok(()) => store
-                        .commit_transaction(&conn)
-                        .map(|_| true)
-                        .map_err(|e| anyhow::anyhow!("commit_transaction for link purge: {e}")),
-                    Err(error) => {
-                        if let Err(rollback) = store.rollback_transaction(&conn) {
-                            tracing::warn!(%rollback, "link purge rollback failed");
-                        }
-                        Err(anyhow::anyhow!(
-                            "delete_references_code_edges_batch_on: {error}"
-                        ))
-                    }
-                }
-            });
-        finish_publication(publication, deleted)?;
-        batches += 1;
-        record_progress(
-            store.db_path(),
-            format!(
-                "removing links built by the previous rules: {batches} batch(es) of up to \
-                 {} removed",
-                purge_batch()
-            ),
-        );
-    }
+/// nw-670 migration: remove every stored link in ONE step — the two
+/// REFERENCES_CODE tables are dropped and recreated
+/// ([`GraphStore::truncate_references_code_edges`]) inside a single lease
+/// and publication — then the pass relinks note by note.
+///
+/// Review H1: deleting the old rules' ~39 M edges in 50,000-edge batches
+/// meant ~780 publications, each failing ranked reads closed while its
+/// marker stood and each paying a full finalize, plus as many
+/// delete+checkpoint cycles on the REL tables: hours on a real brain. The
+/// truncate is a metadata change whose cost does not grow with the edges.
+fn purge_links(store: &GraphStore, lease: CodeLinkLease<'_>) -> Result<(), anyhow::Error> {
+    let started = std::time::Instant::now();
+    let (_lease, publication) = begin_publication(store, lease)?;
+    let truncated = store
+        .truncate_references_code_edges()
+        .map(|()| true)
+        .map_err(|e| anyhow::anyhow!("truncate_references_code_edges: {e}"));
+    finish_publication(publication, truncated)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "code link rules migration: removed every link built by the previous rules"
+    );
+    record_progress(
+        store.db_path(),
+        "removed every link built by the previous rules; relinking".to_string(),
+    );
     Ok(())
 }
 
@@ -1047,34 +1004,67 @@ mod tests {
         assert_eq!(report.rewritten, vec![note_uid_of(&fx.store, "a.md")]);
     }
 
-    /// The purge is bounded: many old links go in several transactions,
-    /// each disclosed as progress.
+    /// Plant `count` duplicate old-rule edges from note a to one symbol.
+    fn plant_many_old_links(fx: &Fixture, count: usize) {
+        let note = note_uid_of(&fx.store, "a.md");
+        let symbol = fx.store.list_all_symbols_lite().unwrap().remove(0).0;
+        let conn = fx.store.begin_transaction().unwrap();
+        for chunk in (0..count).collect::<Vec<_>>().chunks(10_000) {
+            let rows: Vec<(&str, &str, f32, &str)> = chunk
+                .iter()
+                .map(|_| (note.as_str(), symbol.as_str(), 0.6, "name-match"))
+                .collect();
+            GraphStore::batch_insert_note_to_symbol_edges_on(&conn, &rows).unwrap();
+        }
+        fx.store.commit_transaction(&conn).unwrap();
+    }
+
+    /// Review H1: the migration removes the old links in ONE publication
+    /// whatever their number — it used to take one publication (and one
+    /// fail-closed marker window, one full finalize) per 50,000 edges.
     #[test]
-    fn the_migration_purge_runs_in_bounded_batches() {
+    fn the_migration_purge_is_one_publication_whatever_the_edge_count() {
         let fx = two_widgets();
-        let planted = plant_old_rule_links(&fx);
-        assert!(planted >= 2);
-        PURGE_BATCH_OVERRIDE.with(|batch| batch.set(Some(1)));
-        let progress = std::cell::RefCell::new(Vec::new());
-        let result = CodeLinkReconciler::new(CrossDomainConfig::default()).reconcile(
-            &fx.store,
-            None,
-            &|| {
-                if let Some(pending) = load_code_links_state(&fx.db).pending {
-                    progress.borrow_mut().extend(pending.progress);
+        plant_old_rule_links(&fx);
+        plant_many_old_links(&fx, 120_000);
+        let before = fx.store.graph_generation();
+        let at_relink = std::cell::Cell::new(None);
+        let report = CodeLinkReconciler::new(CrossDomainConfig::default())
+            .reconcile(&fx.store, None, &|| {
+                if edges(&fx.store).is_empty() {
+                    at_relink.set(Some(fx.store.graph_generation()));
+                    return true;
                 }
                 false
-            },
+            })
+            .unwrap();
+        assert!(report.stopped, "stopped at the relink, after the purge");
+        assert_eq!(
+            at_relink.get().map(|after| after - before),
+            Some(1),
+            "the whole purge advanced the generation once"
         );
-        PURGE_BATCH_OVERRIDE.with(|batch| batch.set(None));
-        result.unwrap();
-        let progress = progress.borrow();
-        assert!(
-            progress
-                .iter()
-                .any(|p| p.starts_with("removing links") && p.contains("2 batch")),
-            "{progress:?}"
-        );
+    }
+
+    /// Timing of the H1 purge on a graph with 1,000,000 old edges. Ignored
+    /// by default (it plants a million edges); run with
+    /// `cargo test -p nestweaver-engine --all-features --lib -- --ignored
+    /// migration_purge_timing --nocapture`.
+    #[test]
+    #[ignore]
+    fn migration_purge_timing_on_a_million_edges() {
+        let fx = two_widgets();
+        let planted = std::time::Instant::now();
+        plant_many_old_links(&fx, 1_000_000);
+        eprintln!("planted 1,000,000 edges in {:?}", planted.elapsed());
+        let started = std::time::Instant::now();
+        purge_links(&fx.store, None).unwrap();
+        eprintln!("purged them in {:?}", started.elapsed());
+        assert!(edges(&fx.store).is_empty());
+        let relinked = std::time::Instant::now();
+        reconcile(&fx.store);
+        eprintln!("relinked in {:?}", relinked.elapsed());
+        assert_eq!(edges(&fx.store).len(), 4);
     }
 
     /// An interrupted migration keeps its debt and its old version, and the

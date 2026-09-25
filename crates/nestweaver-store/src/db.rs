@@ -1087,6 +1087,22 @@ fn is_column_already_present(message: &str) -> bool {
     message.contains("already has property") || message.contains("already exists")
 }
 
+/// The two note→code REL tables and their DDL: one definition shared by
+/// schema init and [`GraphStore::truncate_references_code_edges`], so the
+/// recreated tables cannot drift from the originals.
+const REFERENCES_CODE_TABLES: [(&str, &str); 2] = [
+    (
+        "REFERENCES_CODE_NOTE_TO_SYMBOL",
+        "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_NOTE_TO_SYMBOL(\
+            FROM Note TO Symbol, confidence FLOAT, source STRING)",
+    ),
+    (
+        "REFERENCES_CODE_SECTION_TO_SYMBOL",
+        "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_SECTION_TO_SYMBOL(\
+            FROM Section TO Symbol, confidence FLOAT, source STRING)",
+    ),
+];
+
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
@@ -3721,6 +3737,34 @@ impl GraphStore {
         Ok(())
     }
 
+    /// nw-670 (review H1): remove EVERY REFERENCES_CODE edge, note- and
+    /// section-level, in one short transaction by dropping and recreating the
+    /// two REL tables with the same DDL [`Self::init_schema`] uses. Deleting
+    /// ~39 M edges row by row took hundreds of delete+checkpoint cycles; this
+    /// is one metadata change. A crash before the commit leaves the tables as
+    /// they were; `init_schema` recreates a missing one on the next open.
+    pub fn truncate_references_code_edges(&self) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let outcome = (|| -> Result<(), StoreError> {
+            for (table, ddl) in REFERENCES_CODE_TABLES {
+                conn.query(&format!("DROP TABLE {table}"))
+                    .map_err(|e| StoreError::Query(format!("drop {table}: {e}")))?;
+                conn.query(ddl)
+                    .map_err(|e| StoreError::Query(format!("recreate {table}: {e}")))?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                if let Err(rollback) = self.rollback_transaction(&conn) {
+                    tracing::warn!(%rollback, "truncate REFERENCES_CODE rollback failed");
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn init_schema(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
@@ -4023,17 +4067,10 @@ impl GraphStore {
         // section and a code symbol on the same axis when a user query
         // matches either.
 
-        conn.query(
-            "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_NOTE_TO_SYMBOL(\
-                FROM Note TO Symbol, confidence FLOAT, source STRING)",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-
-        conn.query(
-            "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_SECTION_TO_SYMBOL(\
-                FROM Section TO Symbol, confidence FLOAT, source STRING)",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
+        for (_, ddl) in REFERENCES_CODE_TABLES {
+            conn.query(ddl)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+        }
 
         // ── Contract extension (F2-core): API contract graph ────────────────
         //
