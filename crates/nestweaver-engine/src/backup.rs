@@ -61,6 +61,9 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".parsed_cache.bin",
     ".resolution_deps.bin",
     crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    // nw-670: the link-rules version travels with the links it describes, so
+    // a restored pre-upgrade graph is migrated rather than trusted.
+    crate::code_links::CODE_LINKS_SIDECAR,
     ".filemeta.json",
     ".manifests.json",
     ".gitactivity.json",
@@ -3818,6 +3821,7 @@ mod tests {
         assert!(
             SIDECAR_SUFFIXES.contains(&crate::resolver_generation::RESOLVER_GENERATION_SIDECAR)
         );
+        assert!(SIDECAR_SUFFIXES.contains(&crate::code_links::CODE_LINKS_SIDECAR));
     }
 
     #[test]

@@ -2330,6 +2330,78 @@ impl GraphStore {
         Ok(rows)
     }
 
+    /// Every symbol's `(uid, name, kind, repo_uid, file_path)`: what
+    /// note→code link resolution needs (nw-670) — the kind gates plain names,
+    /// the file tells a test definition from a real one and counts defining
+    /// files for the ambiguity cap, the repo decides project scope.
+    #[allow(clippy::type_complexity)]
+    pub fn list_symbols_for_linking(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (s:Symbol) RETURN s.uid, s.name, s.kind, s.repo_uid, s.file_path")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push((
+                extract_string(&row, 0)?,
+                extract_string(&row, 1)?,
+                extract_string(&row, 2)?,
+                extract_string(&row, 3)?,
+                extract_string(&row, 4)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Project membership as note→code link resolution scopes it (nw-670
+    /// R5): every `(note_uid, project_uid)` from `PROJECT_INCLUDES_NOTE`, and
+    /// every distinct `(project_uid, repo_uid)` a project's
+    /// `PROJECT_INCLUDES_SYMBOL` edges reach.
+    #[allow(clippy::type_complexity)]
+    pub fn project_link_scopes(
+        &self,
+    ) -> Result<(Vec<(String, String)>, Vec<(String, String)>), StoreError> {
+        let conn = self.conn()?;
+        let pairs = |query: &str| -> Result<Vec<(String, String)>, StoreError> {
+            let rows = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push((extract_string(&row, 0)?, extract_string(&row, 1)?));
+            }
+            Ok(out)
+        };
+        let notes =
+            pairs("MATCH (p:Project)-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid, p.uid")?;
+        let repos = pairs(
+            "MATCH (p:Project)-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
+             RETURN DISTINCT p.uid, s.repo_uid",
+        )?;
+        Ok((notes, repos))
+    }
+
+    /// Whether any REFERENCES_CODE edge exists — an O(1) probe, unlike
+    /// [`Self::count_references_code_edges`], for the rules-migration purge
+    /// (nw-670) that runs against tens of millions of edges.
+    pub fn any_references_code_edges(&self) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        for query in [
+            "MATCH ()-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() RETURN 1 LIMIT 1",
+            "MATCH ()-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() RETURN 1 LIMIT 1",
+        ] {
+            let mut rows = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            if rows.next().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Total count of REFERENCES_CODE edges (note-to-symbol + section-to-symbol).
     /// Useful for status output to confirm cross-domain discovery happened.
     pub fn count_references_code_edges(&self) -> Result<usize, StoreError> {

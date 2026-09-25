@@ -8286,6 +8286,16 @@ impl NestWeaverDaemon for DaemonService {
                 Some(mutation_factory),
             ) {
                 Ok(result) => {
+                    // nw-670 R5: project membership scopes what a note's
+                    // mentions resolve to, so a membership change owes the
+                    // moved notes new links; the code-link reconciler
+                    // rebuilds exactly the notes whose links now differ.
+                    if result.publication.changed() {
+                        nestweaver_engine::code_links::mark_code_links_pending(
+                            &state.db_path,
+                            "project membership changed",
+                        );
+                    }
                     let _ = tx.blocking_send(Ok(materialize_projects_terminal_progress(&result)));
                 }
                 Err(e) => {

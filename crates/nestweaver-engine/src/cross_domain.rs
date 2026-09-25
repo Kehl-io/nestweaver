@@ -1,41 +1,50 @@
 //! Cross-domain link discovery: notes ↔ code.
 //!
-//! Scans note bodies for occurrences of indexed code symbol names and
-//! emits `REFERENCES_CODE_*` edges. These edges are the architectural
-//! keystone of the brain — once present, a single PPR run over the
-//! unified scope (which now includes them; see `GraphScope::unified`)
-//! ranks "Auth Service Design.md" and `AuthService::authenticate`
-//! together for a query seeded with either.
+//! Finds where a note mentions an indexed code symbol and emits
+//! `REFERENCES_CODE_*` edges. These edges are the architectural keystone of
+//! the brain — once present, a single PPR run over the unified scope (which
+//! includes them; see `GraphScope::unified`) ranks "Auth Service Design.md"
+//! and `AuthService::authenticate` together for a query seeded with either.
 //!
-//! Strategy: name-match with word boundaries. Two passes per note:
+//! nw-670 (ADR "Note-to-code links only for real code mentions"): a note
+//! links to a symbol when the author wrote the name AS CODE (or as an
+//! unmistakable identifier) and the name resolves to that symbol within the
+//! note's project. Ordinary English words never create links. Matching every
+//! word against every symbol name produced ~39 M edges on a real brain at
+//! 2.9 % precision, and the noise split each note's PPR mass so thinly that
+//! the symbols it really named never ranked. The rules, as the ADR numbers
+//! them:
 //!
-//! 1. Whole-note pass — emit `REFERENCES_CODE_NOTE_TO_SYMBOL` for every
-//!    symbol whose name appears anywhere in the body. Coarse but cheap.
-//! 2. Per-section pass — for each Section, look at its specific text
-//!    slice and emit `REFERENCES_CODE_SECTION_TO_SYMBOL` for symbols
-//!    that appear there. Finer-grained.
+//! * R1/R2 — mentions ([`nestweaver_parser::code_mentions`]): a whole inline
+//!   code span that is one identifier; elsewhere in code or prose, a
+//!   DISTINCTIVE identifier (`snake_case`, `camelCase` with two humps) or an
+//!   unqualified call `name(`. Never inside URLs, wikilinks or link targets,
+//!   nor inside string literals in code.
+//! * R3 — a PLAIN name resolves only from a whole code span, to a type or an
+//!   all-caps constant, or from a call, to a function or method; never to a
+//!   module or a value (`Property`, `Variable`, lowercase `Constant`).
+//! * R4 — prefer non-test definitions, then definitions over values.
+//! * R5 — within the repos of the note's projects; a note in no project links
+//!   only distinctive names defined in exactly one file.
+//! * R6 — at most [`MAX_DEFINING_FILES`] distinct defining files, else none.
+//! * R7 — `main` joins the stoplist.
+//! * R8 — each name resolves once per note; sections link it only where
+//!   their own lines mention it.
+//! * R9 — confidence = kind base × evidence (code 1.0, prose 0.85) ÷ the
+//!   number of defining files linked, so an ambiguous name spends one unit
+//!   of PPR mass in total.
 //!
-//! Symbols whose name length is < 4 are skipped — they collide too
-//! easily with English words ("Get", "Set", "id", "ok"). This is the
-//! single most important false-positive filter. The architecture doc
-//! §10.1 has the long-form rationale.
-//!
-//! Confidence scoring:
-//! - Function = 0.9 (most distinctive)
-//! - Class    = 0.8
-//! - Interface = 0.8
-//! - Method   = 0.7 (often generic verbs after the dedup filter)
-//!
-//! Performance: O(notes × avg_body_len + symbols) per discovery pass.
-//! We build a `HashSet<&str>` over symbol names once, then walk each
-//! note body once tokenising on word boundaries and probing the set.
-//! No regex, no Aho-Corasick — string interning + hash lookup beats
-//! both at this graph size.
+//! Names shorter than 4 characters and [`STOPLIST`] words are never
+//! candidates. One implementation serves the bulk pass, the vault watcher
+//! and the code-link reconciler ([`crate::code_links`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
+use nestweaver_parser::MentionFlags;
+use nestweaver_schema::SymbolKind;
 use nestweaver_store::GraphStore;
 
 use crate::config::CrossDomainConfig;
@@ -99,6 +108,9 @@ pub const STOPLIST: &[&str] = &[
     "service", "request", "response", "command", "action", "buffer", "stream", "reader", "writer",
     "parser", "builder", "filter", "logger", "target", "count", "total", "input", "output",
     "format", "cache", "store", "queue", "stack", "array", "batch", "page",
+    // nw-670 R7: the git default branch and every entry point's name. 477
+    // symbols on a real brain, and never the one a note meant.
+    "main",
 ];
 
 /// Discover and persist cross-domain links across the entire graph.
@@ -130,6 +142,17 @@ pub fn discover_cross_domain_links_with_config(
 ) -> Result<CrossDomainResult, anyhow::Error> {
     discover_cross_domain_links_full(store, config, &VaultReaders::new())
 }
+
+/// nw-670: the version of the note→code link rules below. Bump it whenever
+/// a rule change alters which edges a note should have: stored links built
+/// by another version are replaced wholesale by the code-link reconciler
+/// ([`crate::code_links`]), not left to linger until each note is edited.
+///
+/// 1 (implicit, absent) — every word of 4+ characters matched every symbol
+///   of that name, any kind, any repo.
+/// 2 — nw-670: explicit code mentions, kind-gated by shape, project-scoped,
+///   at most [`MAX_DEFINING_FILES`] defining files, `main` stoplisted.
+pub const CROSS_DOMAIN_RULES_VERSION: u32 = 2;
 
 /// Notes flushed per write transaction, by the bulk pass and the vault
 /// watcher alike. Bounds peak transaction memory while amortising the commit
@@ -164,16 +187,9 @@ fn discover_cross_domain_links_full(
     config: &CrossDomainConfig,
     vault_readers: &VaultReaders<'_>,
 ) -> Result<CrossDomainResult, anyhow::Error> {
-    let symbols = store
-        .list_all_symbols_lite()
-        .context("list_all_symbols_lite")?;
-    if symbols.is_empty() {
-        // No code indexed — nothing to bridge to. Not an error.
-        return Ok(CrossDomainResult::default());
-    }
-
-    let index = SymbolIndex::build_with_config(&symbols, config);
+    let index = build_symbol_index_with_config(store, config)?;
     if index.is_empty() {
+        // No code indexed — nothing to bridge to. Not an error.
         return Ok(CrossDomainResult::default());
     }
 
@@ -319,14 +335,20 @@ pub fn build_symbol_index(store: &GraphStore) -> Result<SymbolIndex, anyhow::Err
 }
 
 /// Like `build_symbol_index` but honours the provided `CrossDomainConfig`.
+///
+/// nw-670: also loads project membership, so every route that resolves a
+/// note's mentions (bulk, watcher, reconciler) scopes it the same way.
 pub fn build_symbol_index_with_config(
     store: &GraphStore,
     config: &CrossDomainConfig,
 ) -> Result<SymbolIndex, anyhow::Error> {
     let symbols = store
-        .list_all_symbols_lite()
-        .context("list_all_symbols_lite")?;
-    Ok(SymbolIndex::build_with_config(&symbols, config))
+        .list_symbols_for_linking()
+        .context("list_symbols_for_linking")?;
+    let (note_projects, project_repos) =
+        store.project_link_scopes().context("project_link_scopes")?;
+    Ok(SymbolIndex::build_with_config(&symbols, config)
+        .with_project_scopes(&note_projects, &project_repos))
 }
 
 /// Read-only scan: load the note body, scan for symbol mentions, and
@@ -349,9 +371,9 @@ fn scan_one_note(
 }
 
 /// Pure scan of one note's full source text against `index` (nw-668): the
-/// whole-note pass over `source`, then a per-section pass over each
-/// section's line span of it. No I/O, so the vault watcher runs it with no
-/// write lease held, over the exact text its batch parsed and committed.
+/// note's mentions resolved once, then attributed to the sections whose
+/// line spans hold them. No I/O, so the vault watcher runs it with no write
+/// lease held, over the exact text its batch parsed and committed.
 ///
 /// `sections` must come from parsing `source`: their file-absolute
 /// `start_line`/`end_line` spans index into its lines.
@@ -392,63 +414,111 @@ impl SectionSpan {
     }
 }
 
-/// What a note's text mentions, independent of any symbol index: each
-/// candidate name with the (1-based, sorted, distinct) lines it occurs on.
-/// nw-675: cheap to keep per note, so the reconciler re-resolves a note
-/// against a changed symbol index without re-reading or re-parsing it.
+/// One mentioned name: how it was written anywhere in the note (the union
+/// resolution runs on, R8), and each line it occurs on with how it was
+/// written there (section attribution and evidence, R8/R9).
+#[derive(Debug, Clone)]
+struct MentionedName {
+    name: String,
+    flags: MentionFlags,
+    lines: Vec<(u32, MentionFlags)>,
+}
+
+/// What a note's text mentions as code, independent of any symbol index
+/// (nw-670 R1, [`nestweaver_parser::code_mentions`]). nw-675: cheap to keep
+/// per note, so the reconciler re-resolves a note against a changed symbol
+/// index or project scope without re-reading or re-parsing it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NoteMentions {
-    names: Vec<(String, Vec<u32>)>,
+    names: Vec<MentionedName>,
 }
 
 /// Collect a note's mentions (see [`NoteMentions`]).
 pub(crate) fn note_mentions(source: &str) -> NoteMentions {
-    let mut by_name: HashMap<&str, Vec<u32>> = HashMap::new();
-    for (idx, line) in source.lines().enumerate() {
-        let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
-        for token in tokenize(line) {
-            let lines = by_name.entry(token).or_default();
-            if lines.last() != Some(&line_no) {
-                lines.push(line_no);
-            }
+    let mut by_name: HashMap<String, MentionedName> = HashMap::new();
+    for mention in nestweaver_parser::code_mentions(source) {
+        let entry = by_name
+            .entry(mention.name.clone())
+            .or_insert_with(|| MentionedName {
+                name: mention.name.clone(),
+                flags: MentionFlags::default(),
+                lines: Vec::new(),
+            });
+        entry.flags.merge(mention.flags);
+        match entry
+            .lines
+            .iter_mut()
+            .find(|(line, _)| *line == mention.line)
+        {
+            Some((_, flags)) => flags.merge(mention.flags),
+            None => entry.lines.push((mention.line, mention.flags)),
         }
     }
-    let mut names: Vec<(String, Vec<u32>)> = by_name
-        .into_iter()
-        .map(|(name, lines)| (name.to_string(), lines))
-        .collect();
-    names.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut names: Vec<MentionedName> = by_name.into_values().collect();
+    names.sort_by(|a, b| a.name.cmp(&b.name));
     NoteMentions { names }
+}
+
+/// R9 evidence: a name written as code counts in full; one seen only as
+/// distinctive prose (or a call in prose) slightly less.
+fn evidence(flags: MentionFlags) -> f32 {
+    if flags.is_code() { 1.0 } else { 0.85 }
 }
 
 /// Resolve a note's mentions against `index` into its note-level edges and,
 /// per section, the edges for names mentioned on that section's lines.
+///
+/// nw-670 R8: each name is resolved ONCE per note, on the union of how the
+/// note writes it, so the note and its sections agree on what it means; a
+/// section links a resolved symbol only where its own lines mention the
+/// name, so section edges stay a subset of the note's.
 pub(crate) fn resolve_note(
     note_uid: &str,
     mentions: &NoteMentions,
     sections: &[SectionSpan],
     index: &SymbolIndex,
 ) -> ScannedNote {
+    let scope = index.scope_of(note_uid);
     let mut note_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
     let mut section_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
     let mut note_seen: HashSet<&str> = HashSet::new();
     let mut section_seen: HashSet<(&str, &str)> = HashSet::new();
-    for (name, lines) in &mentions.names {
-        let Some(candidates) = index.by_name.get(name) else {
+    for mentioned in &mentions.names {
+        let Some(resolution) = index.resolve(&mentioned.name, mentioned.flags, scope) else {
             continue;
         };
-        for (uid, conf) in candidates {
-            if note_seen.insert(uid.as_str()) {
-                note_edges.push((note_uid.to_string(), uid.clone(), *conf, "name-match"));
+        let share = resolution.files as f32;
+        let note_evidence = evidence(mentioned.flags);
+        for candidate in &resolution.symbols {
+            if note_seen.insert(candidate.uid.as_str()) {
+                note_edges.push((
+                    note_uid.to_string(),
+                    candidate.uid.clone(),
+                    candidate.kind_base * note_evidence / share,
+                    "name-match",
+                ));
             }
         }
         for section in sections {
-            if !lines.iter().any(|line| section.contains(*line)) {
+            let mut here = MentionFlags::default();
+            let mut present = false;
+            for (line, flags) in &mentioned.lines {
+                if section.contains(*line) {
+                    here.merge(*flags);
+                    present = true;
+                }
+            }
+            if !present {
                 continue;
             }
-            for (uid, conf) in candidates {
-                if section_seen.insert((section.uid.as_str(), uid.as_str())) {
-                    section_edges.push((section.uid.clone(), uid.clone(), *conf, "name-match"));
+            for candidate in &resolution.symbols {
+                if section_seen.insert((section.uid.as_str(), candidate.uid.as_str())) {
+                    section_edges.push((
+                        section.uid.clone(),
+                        candidate.uid.clone(),
+                        candidate.kind_base * evidence(here) / share,
+                        "name-match",
+                    ));
                 }
             }
         }
@@ -481,29 +551,172 @@ impl ScannedNote {
     }
 }
 
-/// Symbol-name → list of (uid, confidence) candidates. Built once per
-/// discovery pass. The HashMap lookup is the inner hot loop.
+/// nw-670 R6: a name links only when its candidates (after R3–R5) come from
+/// at most this many distinct defining files; beyond that no single link is
+/// honest and none is made. A product constant, not a knob: the ADR's
+/// labelled evaluation puts the precision/recall knee here (K=5: 97.1 %
+/// precision, 83.5 % recall; K=8 adds two names for 11 % more edges).
+pub(crate) const MAX_DEFINING_FILES: usize = 5;
+
+/// R5: a note outside every project links only names defined in exactly one
+/// file across the instance — there is no project to disambiguate with.
+const MAX_DEFINING_FILES_UNSCOPED: usize = 1;
+
+/// One symbol a name may resolve to.
+#[derive(Debug, Clone)]
+struct Candidate {
+    uid: String,
+    kind: SymbolKind,
+    repo_uid: Arc<str>,
+    file_path: Arc<str>,
+    /// Defined under a test path (R4 demotes it when a real one exists).
+    in_test: bool,
+    /// A definition rather than a value (R4 prefers definitions).
+    definition: bool,
+    /// R9 `kind_base`.
+    kind_base: f32,
+}
+
+/// What a mentioned name resolved to: the symbols to link and how many
+/// distinct files define them (R9 divides the confidence by it).
+struct Resolution<'a> {
+    symbols: Vec<&'a Candidate>,
+    files: usize,
+}
+
+fn parse_kind(kind: &str) -> Option<SymbolKind> {
+    Some(match kind {
+        "Function" => SymbolKind::Function,
+        "Class" => SymbolKind::Class,
+        "Method" => SymbolKind::Method,
+        "Interface" => SymbolKind::Interface,
+        "Trait" => SymbolKind::Trait,
+        "Enum" => SymbolKind::Enum,
+        "Module" => SymbolKind::Module,
+        "Extension" => SymbolKind::Extension,
+        "Constant" => SymbolKind::Constant,
+        "Property" => SymbolKind::Property,
+        "TypeAlias" => SymbolKind::TypeAlias,
+        "Variable" => SymbolKind::Variable,
+        _ => return None,
+    })
+}
+
+/// R3's type-like kinds: a plain name written as a whole code span may
+/// resolve to these.
+fn is_type_like(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Extension
+    )
+}
+
+/// `TIMEOUT`, `MAX_RETRIES`: an all-caps constant name (R3, R4).
+fn is_screaming(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !name.ends_with('_')
+        && !name.contains("__")
+}
+
+/// R9 `kind_base`.
+fn kind_base(kind: SymbolKind) -> f32 {
+    match kind {
+        SymbolKind::Function => 0.9,
+        SymbolKind::Method | SymbolKind::Module => 0.7,
+        SymbolKind::Constant | SymbolKind::Property | SymbolKind::Variable => 0.6,
+        _ => 0.8,
+    }
+}
+
+/// R4: a definition in tests, fixtures or mocks, demoted when the name also
+/// has a real definition (`tests/`, `__tests__/`, `spec/`, `e2e/`,
+/// `fixtures/`, `__mocks__/`, `*.test.*`, `*_test.*`, `*-spec.*`,
+/// `test_*.py`).
+fn is_test_path(path: &str) -> bool {
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let is_dir = parts.peek().is_some();
+        if is_dir
+            && matches!(
+                part,
+                "test"
+                    | "tests"
+                    | "__tests__"
+                    | "spec"
+                    | "e2e"
+                    | "fixture"
+                    | "fixtures"
+                    | "__mocks__"
+            )
+        {
+            return true;
+        }
+        if !is_dir {
+            let Some((stem, _ext)) = part.rsplit_once('.') else {
+                return false;
+            };
+            return ["test", "spec"].iter().any(|word| {
+                [".", "_", "-"]
+                    .iter()
+                    .any(|sep| stem.ends_with(&format!("{sep}{word}")))
+            }) || (part.starts_with("test_") && part.ends_with(".py"));
+        }
+    }
+    false
+}
+
+/// Symbol name → its candidates, plus each note's project scope. Built once
+/// per discovery pass, watcher batch or reconcile pass.
 pub struct SymbolIndex {
-    by_name: HashMap<String, Vec<(String, f32)>>,
+    by_name: HashMap<String, Vec<Candidate>>,
+    /// Note uid → index into `scopes`, for notes in a project with repos.
+    note_scope: HashMap<String, usize>,
+    /// Each distinct scope: the repo uids of a note's projects.
+    scopes: Vec<HashSet<Arc<str>>>,
 }
 
 impl SymbolIndex {
-    fn build_with_config(symbols: &[(String, String, String)], config: &CrossDomainConfig) -> Self {
+    fn build_with_config(
+        symbols: &[(String, String, String, String, String)],
+        config: &CrossDomainConfig,
+    ) -> Self {
         // Compute effective stoplist: replace entirely or extend the built-in.
-        let effective_stoplist: HashSet<&str> = if let Some(replace) = &config.stoplist_replace {
-            replace.iter().map(|s| s.as_str()).collect()
+        let effective_stoplist: HashSet<String> = if let Some(replace) = &config.stoplist_replace {
+            replace.iter().map(|s| s.to_ascii_lowercase()).collect()
         } else {
-            let mut set: HashSet<&str> = STOPLIST.iter().copied().collect();
-            for word in &config.stoplist_extend {
-                set.insert(word.as_str());
-            }
-            set
+            STOPLIST
+                .iter()
+                .map(|s| (*s).to_string())
+                .chain(
+                    config
+                        .stoplist_extend
+                        .iter()
+                        .map(|s| s.to_ascii_lowercase()),
+                )
+                .collect()
         };
 
         let min_len = config.min_symbol_name_length.unwrap_or(MIN_SYMBOL_NAME_LEN);
 
-        let mut by_name: HashMap<String, Vec<(String, f32)>> = HashMap::new();
-        for (uid, name, kind) in symbols {
+        let mut interned: HashSet<Arc<str>> = HashSet::new();
+        let mut intern = |value: &str| -> Arc<str> {
+            if let Some(existing) = interned.get(value) {
+                return Arc::clone(existing);
+            }
+            let arc: Arc<str> = Arc::from(value);
+            interned.insert(Arc::clone(&arc));
+            arc
+        };
+        let mut by_name: HashMap<String, Vec<Candidate>> = HashMap::new();
+        for (uid, name, kind, repo_uid, file_path) in symbols {
             if name.len() < min_len {
                 continue;
             }
@@ -516,35 +729,136 @@ impl SymbolIndex {
             if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 continue;
             }
-            let conf = match kind.as_str() {
-                "Function" => 0.9_f32,
-                "Class" => 0.8,
-                "Interface" => 0.8,
-                "Method" => 0.7,
-                _ => 0.6,
+            let Some(kind) = parse_kind(kind) else {
+                continue;
             };
-            by_name
-                .entry(name.clone())
-                .or_default()
-                .push((uid.clone(), conf));
+            let definition = matches!(
+                kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Module
+            ) || is_type_like(kind)
+                || (kind == SymbolKind::Constant && is_screaming(name));
+            by_name.entry(name.clone()).or_default().push(Candidate {
+                uid: uid.clone(),
+                kind,
+                in_test: is_test_path(file_path),
+                repo_uid: intern(repo_uid),
+                file_path: intern(file_path),
+                definition,
+                kind_base: kind_base(kind),
+            });
         }
-        Self { by_name }
+        Self {
+            by_name,
+            note_scope: HashMap::new(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Attach project scopes (R5): a note's scope is the repos of every
+    /// project that includes it. A note whose projects reach no repo (a
+    /// notes-only project) is unscoped, like a note in no project.
+    fn with_project_scopes(
+        mut self,
+        note_projects: &[(String, String)],
+        project_repos: &[(String, String)],
+    ) -> Self {
+        let mut repos_of: HashMap<&str, Vec<Arc<str>>> = HashMap::new();
+        for (project, repo) in project_repos {
+            repos_of
+                .entry(project.as_str())
+                .or_default()
+                .push(Arc::from(repo.as_str()));
+        }
+        let mut per_note: HashMap<&str, HashSet<Arc<str>>> = HashMap::new();
+        for (note, project) in note_projects {
+            let repos = per_note.entry(note.as_str()).or_default();
+            if let Some(project_repos) = repos_of.get(project.as_str()) {
+                repos.extend(project_repos.iter().cloned());
+            }
+        }
+        let mut scope_ids: HashMap<Vec<Arc<str>>, usize> = HashMap::new();
+        for (note, repos) in per_note {
+            if repos.is_empty() {
+                continue;
+            }
+            let mut key: Vec<Arc<str>> = repos.iter().cloned().collect();
+            key.sort();
+            let id = *scope_ids.entry(key).or_insert_with(|| {
+                self.scopes.push(repos.clone());
+                self.scopes.len() - 1
+            });
+            self.note_scope.insert(note.to_string(), id);
+        }
+        self
+    }
+
+    fn scope_of(&self, note_uid: &str) -> Option<&HashSet<Arc<str>>> {
+        self.note_scope
+            .get(note_uid)
+            .and_then(|id| self.scopes.get(*id))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
-}
 
-/// Split `text` into identifier-shaped tokens. Word boundary = any
-/// non-alphanumeric, non-underscore character.
-///
-/// We DON'T split on `.` or `::` so that `Foo::bar` or `obj.method` are
-/// tokenised as `Foo`, `bar` / `obj`, `method` — matching how a code
-/// indexer stores symbol names.
-fn tokenize(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty())
+    /// nw-670 R3–R6: what `name`, written as `flags` describes, resolves to
+    /// for a note in `scope` (`None`: in no project). `None` means no link.
+    fn resolve(
+        &self,
+        name: &str,
+        flags: MentionFlags,
+        scope: Option<&HashSet<Arc<str>>>,
+    ) -> Option<Resolution<'_>> {
+        let distinctive = nestweaver_parser::is_distinctive(name);
+        let mut candidates: Vec<&Candidate> = self.by_name.get(name)?.iter().collect();
+        // R3: a plain name could be an English word. It resolves only when
+        // written as a whole code span — to a type, or to an all-caps
+        // constant — or as an unqualified call, to a function or method.
+        // Never to a module or a value.
+        if !distinctive {
+            let all_caps = is_screaming(name);
+            candidates.retain(|candidate| {
+                (flags.span && is_type_like(candidate.kind))
+                    || (flags.span && all_caps && candidate.kind == SymbolKind::Constant)
+                    || (flags.call
+                        && matches!(candidate.kind, SymbolKind::Function | SymbolKind::Method))
+            });
+        }
+        // R4: go-to-definition's preferences — real code over tests, then
+        // definitions over values.
+        if candidates.iter().any(|candidate| !candidate.in_test) {
+            candidates.retain(|candidate| !candidate.in_test);
+        }
+        if candidates.iter().any(|candidate| candidate.definition) {
+            candidates.retain(|candidate| candidate.definition);
+        }
+        // R5: within the note's project scope, or — for a note in none — a
+        // distinctive name only, defined in exactly one file.
+        let cap = match scope {
+            Some(repos) => {
+                candidates.retain(|candidate| repos.contains(&candidate.repo_uid));
+                MAX_DEFINING_FILES
+            }
+            None if distinctive => MAX_DEFINING_FILES_UNSCOPED,
+            None => return None,
+        };
+        if candidates.is_empty() {
+            return None;
+        }
+        // R6: an ambiguous name links nothing.
+        let files: HashSet<(&str, &str)> = candidates
+            .iter()
+            .map(|candidate| (&*candidate.repo_uid, &*candidate.file_path))
+            .collect();
+        if files.len() > cap {
+            return None;
+        }
+        Some(Resolution {
+            symbols: candidates,
+            files: files.len(),
+        })
+    }
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -557,56 +871,413 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    /// Note-level `(symbol_uid, confidence)` hits for `text` — the old
-    /// `SymbolIndex::scan`, now the shared mentions-then-resolve path.
-    fn scan(index: &SymbolIndex, text: &str) -> Vec<(String, f32)> {
-        resolve_note("note:t", &note_mentions(text), &[], index)
+    /// A symbol row as the store lists it for linking.
+    fn sym(uid: &str, name: &str, kind: &str, repo: &str, file: &str) -> SymbolRow {
+        (
+            uid.to_string(),
+            name.to_string(),
+            kind.to_string(),
+            repo.to_string(),
+            file.to_string(),
+        )
+    }
+
+    type SymbolRow = (String, String, String, String, String);
+
+    fn index_of(symbols: &[SymbolRow]) -> SymbolIndex {
+        SymbolIndex::build_with_config(symbols, &CrossDomainConfig::default())
+    }
+
+    /// `index_of`, with note `note:p` in a project over `repos`.
+    fn scoped_index_of(symbols: &[SymbolRow], repos: &[&str]) -> SymbolIndex {
+        let projects: Vec<(String, String)> = repos
+            .iter()
+            .map(|repo| ("proj:p".to_string(), repo.to_string()))
+            .collect();
+        index_of(symbols)
+            .with_project_scopes(&[("note:p".to_string(), "proj:p".to_string())], &projects)
+    }
+
+    /// Note-level `(symbol_uid, confidence)` hits for `text` in note `note`.
+    fn hits_in(index: &SymbolIndex, note: &str, text: &str) -> Vec<(String, f32)> {
+        let mut hits: Vec<(String, f32)> = resolve_note(note, &note_mentions(text), &[], index)
             .note_edges
             .into_iter()
             .map(|(_, uid, conf, _)| (uid, conf))
-            .collect()
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0));
+        hits
     }
 
-    #[test]
-    fn tokenize_splits_on_word_boundaries() {
-        let tokens: Vec<&str> = tokenize("foo bar.baz_qux Class::method").collect();
-        assert_eq!(tokens, vec!["foo", "bar", "baz_qux", "Class", "method"]);
+    /// Hits for an unscoped note (one in no project).
+    fn scan(index: &SymbolIndex, text: &str) -> Vec<(String, f32)> {
+        hits_in(index, "note:t", text)
     }
 
+    /// Hits for a note in a project over repo `r` — the setting where a
+    /// PLAIN name can link at all (R5).
+    fn scan_in_project(symbols: &[SymbolRow], text: &str) -> Vec<(String, f32)> {
+        hits_in(&scoped_index_of(symbols, &["r"]), "note:p", text)
+    }
+
+    fn uids(hits: &[(String, f32)]) -> Vec<&str> {
+        hits.iter().map(|(uid, _)| uid.as_str()).collect()
+    }
+
+    /// nw-670: `Processor` is a plain word, so it links only when written as
+    /// a whole code span (it used to link from bare prose). `Get` is below
+    /// the minimum length and never links.
     #[test]
     fn symbol_index_skips_short_names() {
-        let symbols = vec![
-            (
-                "sym:1".to_string(),
-                "Get".to_string(),
-                "Function".to_string(),
-            ),
-            (
-                "sym:2".to_string(),
-                "Processor".to_string(),
-                "Class".to_string(),
-            ),
+        let symbols = [
+            sym("sym:1", "Get", "Function", "r", "src/a.rs"),
+            sym("sym:2", "Processor", "Class", "r", "src/b.rs"),
         ];
-        let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-        assert!(
-            scan(&idx, "calls Get and Processor")
-                .iter()
-                .any(|(u, _)| u == "sym:2")
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "calls `Get()` and `Processor`")),
+            ["sym:2"]
         );
-        // "Get" is below MIN length and must NOT appear.
-        assert!(!scan(&idx, "Get").iter().any(|(u, _)| u == "sym:1"));
+        assert!(scan_in_project(&symbols, "`Get`").is_empty());
     }
 
     #[test]
     fn symbol_index_dedupes_within_a_text() {
-        let symbols = vec![(
-            "sym:x".to_string(),
-            "Authenticator".to_string(),
-            "Class".to_string(),
-        )];
-        let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-        let hits = scan(&idx, "Authenticator and Authenticator and Authenticator");
+        let idx = index_of(&[sym("sym:x", "AuthenticatorService", "Class", "r", "a.rs")]);
+        let hits = scan(
+            &idx,
+            "AuthenticatorService and `AuthenticatorService` and AuthenticatorService",
+        );
         assert_eq!(hits.len(), 1);
+    }
+
+    /// R1/R2: prose plain words are not mentions — `screen` and `before`
+    /// used to link to every local const and function of those names.
+    /// Counterweight: a distinctive name in the same prose links.
+    #[test]
+    fn plain_prose_words_do_not_link_but_distinctive_ones_do() {
+        let idx = index_of(&[
+            sym("sym:screen", "screen", "Constant", "r", "src/a.ts"),
+            sym("sym:before", "before", "Function", "r", "src/b.ts"),
+            sym("sym:sr", "ScreenRenderer", "Class", "r", "src/c.ts"),
+        ]);
+        assert!(scan(&idx, "the screen renders before layout").is_empty());
+        assert_eq!(
+            uids(&scan(&idx, "the screen renders before ScreenRenderer runs")),
+            ["sym:sr"]
+        );
+    }
+
+    /// R1: URLs, wikilink targets and markdown link targets are never
+    /// mentions. Counterweight: text beside them still is.
+    #[test]
+    fn urls_wikilinks_and_link_targets_are_not_mentions() {
+        let idx = index_of(&[
+            sym("sym:pr", "pull_request_id", "Function", "r", "src/a.rs"),
+            sym("sym:wl", "note_about_things", "Function", "r", "src/b.rs"),
+            sym("sym:lt", "main_module", "Module", "r", "src/c.rs"),
+            sym("sym:ok", "other_widget", "Function", "r", "src/d.rs"),
+        ]);
+        let text = "see https://x.io/pull_request_id and [[note_about_things]] and \
+                    [the doc](src/main_module.rs) then other_widget runs";
+        assert_eq!(uids(&scan(&idx, text)), ["sym:ok"]);
+    }
+
+    /// R1: string literals inside code are data, not code. Counterweight: a
+    /// call in the same kind of span links.
+    #[test]
+    fn string_literals_in_code_are_not_mentions() {
+        let idx = index_of(&[
+            sym("sym:cs", "cleared_state", "Constant", "r", "src/a.ts"),
+            sym("sym:rc", "readCsvRows", "Function", "r", "src/b.ts"),
+        ]);
+        assert!(scan(&idx, "set `status = 'cleared_state'` first").is_empty());
+        assert_eq!(uids(&scan(&idx, "then `readCsvRows(x)`")), ["sym:rc"]);
+    }
+
+    /// R1: a qualified call of a plain name (`Math.round(`) is someone
+    /// else's method. Counterweight: the unqualified call links.
+    #[test]
+    fn a_qualified_plain_call_does_not_link_but_an_unqualified_one_does() {
+        let symbols = [sym("sym:round", "round", "Function", "r", "src/m.ts")];
+        assert!(scan_in_project(&symbols, "uses `Math.round(x)`").is_empty());
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "uses `round(x)`")),
+            ["sym:round"]
+        );
+    }
+
+    /// R3: a plain name never resolves to a value kind — `pending` is a
+    /// status string far more often than a constant. Counterweight: a
+    /// distinctive value name links.
+    #[test]
+    fn a_plain_span_never_resolves_to_a_value() {
+        let symbols = [
+            sym("sym:p", "pending", "Constant", "r", "src/a.ts"),
+            sym("sym:pc", "pending_count", "Property", "r", "src/b.ts"),
+        ];
+        assert!(scan_in_project(&symbols, "status is `pending`").is_empty());
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "see `pending_count`")),
+            ["sym:pc"]
+        );
+    }
+
+    /// R3: a plain whole span resolves to a type, not a function; a
+    /// function needs the call shape.
+    #[test]
+    fn a_plain_span_resolves_to_types_and_a_call_to_functions() {
+        let symbols = [
+            sym("sym:d", "Dashboard", "Class", "r", "src/a.tsx"),
+            sym("sym:r", "review", "Function", "r", "src/b.ts"),
+        ];
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "the `Dashboard` view")),
+            ["sym:d"]
+        );
+        assert!(scan_in_project(&symbols, "needs `review`").is_empty());
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "call `review()`")),
+            ["sym:r"]
+        );
+    }
+
+    /// R3: a plain name never resolves to a module — `watcher` would hit a
+    /// Rust file module. Counterweight: a distinctive module name links.
+    #[test]
+    fn a_plain_span_never_resolves_to_a_module() {
+        let symbols = [
+            sym("sym:w", "watcher", "Module", "r", "src/watcher.rs"),
+            sym(
+                "sym:wc",
+                "watcher_config",
+                "Module",
+                "r",
+                "src/watcher_config.rs",
+            ),
+        ];
+        assert!(scan_in_project(&symbols, "the `watcher`").is_empty());
+        assert_eq!(
+            uids(&scan_in_project(&symbols, "the `watcher_config`")),
+            ["sym:wc"]
+        );
+    }
+
+    /// R3: an all-caps constant links from a whole span. Counterweight: the
+    /// same word in prose is a shout, not code.
+    #[test]
+    fn an_all_caps_span_resolves_to_its_constant_but_prose_does_not() {
+        let symbols = [sym("sym:p", "PASSES", "Constant", "r", "src/a.rs")];
+        assert_eq!(uids(&scan_in_project(&symbols, "see `PASSES`")), ["sym:p"]);
+        assert!(scan_in_project(&symbols, "it PASSES now").is_empty());
+    }
+
+    /// R4: a real definition beats a test one. Counterweight: a name
+    /// defined only in tests still links.
+    #[test]
+    fn test_definitions_give_way_to_real_ones() {
+        let idx = index_of(&[
+            sym("sym:real", "parseLedger", "Function", "r", "src/a.ts"),
+            sym(
+                "sym:test",
+                "parseLedger",
+                "Function",
+                "r",
+                "src/__tests__/a.test.ts",
+            ),
+            sym(
+                "sym:only",
+                "fixtureLedger",
+                "Function",
+                "r",
+                "tests/fixtures.ts",
+            ),
+        ]);
+        assert_eq!(uids(&scan(&idx, "parseLedger")), ["sym:real"]);
+        assert_eq!(uids(&scan(&idx, "fixtureLedger")), ["sym:only"]);
+    }
+
+    /// R4: a definition beats same-named values. Counterweight: a name with
+    /// only values links them.
+    #[test]
+    fn definitions_win_over_same_named_values() {
+        let mut symbols = vec![sym("sym:f", "accountId", "Function", "r", "src/f.ts")];
+        for i in 0..4 {
+            symbols.push(sym(
+                &format!("sym:p{i}"),
+                "accountId",
+                "Property",
+                "r",
+                "src/f.ts",
+            ));
+            symbols.push(sym(
+                &format!("sym:q{i}"),
+                "ledgerRowId",
+                "Property",
+                "r",
+                "src/g.ts",
+            ));
+        }
+        let idx = index_of(&symbols);
+        assert_eq!(uids(&scan(&idx, "accountId")), ["sym:f"]);
+        assert_eq!(
+            uids(&scan(&idx, "ledgerRowId")),
+            ["sym:q0", "sym:q1", "sym:q2", "sym:q3"]
+        );
+    }
+
+    /// R5: a note in a project resolves only within its repos; no guessing
+    /// into another project. Counterweight: the same name defined in the
+    /// project's repo links.
+    #[test]
+    fn a_project_note_links_only_within_its_repos() {
+        let outside = scoped_index_of(
+            &[sym(
+                "sym:x",
+                "requireWrite",
+                "Function",
+                "repo:b",
+                "src/a.ts",
+            )],
+            &["repo:a"],
+        );
+        assert!(hits_in(&outside, "note:p", "requireWrite").is_empty());
+        let inside = scoped_index_of(
+            &[
+                sym("sym:x", "requireWrite", "Function", "repo:b", "src/a.ts"),
+                sym("sym:y", "requireWrite", "Function", "repo:a", "src/a.ts"),
+            ],
+            &["repo:a"],
+        );
+        assert_eq!(uids(&hits_in(&inside, "note:p", "requireWrite")), ["sym:y"]);
+    }
+
+    /// R5: a note in no project links only a distinctive name with exactly
+    /// one defining file. Counterweight: a unique one links.
+    #[test]
+    fn an_unscoped_note_links_only_unique_distinctive_names() {
+        let idx = index_of(&[
+            sym("sym:a", "writeBatch", "Function", "r1", "src/a.ts"),
+            sym("sym:b", "writeBatch", "Function", "r2", "src/b.ts"),
+            sym("sym:c", "claimLedger", "Function", "r1", "src/c.ts"),
+            sym("sym:d", "Dashboard", "Class", "r1", "src/d.tsx"),
+        ]);
+        assert!(scan(&idx, "writeBatch").is_empty());
+        assert_eq!(uids(&scan(&idx, "claimLedger")), ["sym:c"]);
+        assert!(
+            scan(&idx, "the `Dashboard`").is_empty(),
+            "a plain name needs a project to disambiguate it"
+        );
+        let scoped = scoped_index_of(
+            &[sym("sym:d", "Dashboard", "Class", "r1", "src/d.tsx")],
+            &["r1"],
+        );
+        assert_eq!(
+            uids(&hits_in(&scoped, "note:p", "the `Dashboard`")),
+            ["sym:d"]
+        );
+    }
+
+    /// R6: more than 5 defining files is ambiguous and links nothing.
+    /// Counterweight: exactly 5 link all of them. Literal counts, not the
+    /// constant: K is product behaviour (the ADR's measured knee), so a
+    /// change to it must fail here.
+    #[test]
+    fn more_defining_files_than_the_cap_link_nothing() {
+        let files = |n: usize| -> Vec<SymbolRow> {
+            (0..n)
+                .map(|i| {
+                    sym(
+                        &format!("sym:{i}"),
+                        "orgScope",
+                        "Function",
+                        "r",
+                        &format!("src/{i}.ts"),
+                    )
+                })
+                .collect()
+        };
+        let over = scoped_index_of(&files(6), &["r"]);
+        assert!(hits_in(&over, "note:p", "orgScope").is_empty());
+        let at = scoped_index_of(&files(5), &["r"]);
+        assert_eq!(hits_in(&at, "note:p", "orgScope").len(), 5);
+    }
+
+    /// R7: `main` is stoplisted. Counterweight: `main_loop` is not.
+    #[test]
+    fn main_is_stoplisted() {
+        let idx = scoped_index_of(
+            &[
+                sym("sym:m", "main", "Function", "r", "src/main.rs"),
+                sym("sym:ml", "main_loop", "Function", "r", "src/lp.rs"),
+            ],
+            &["r"],
+        );
+        assert!(hits_in(&idx, "note:p", "`main()` on main").is_empty());
+        assert_eq!(uids(&hits_in(&idx, "note:p", "`main_loop`")), ["sym:ml"]);
+    }
+
+    /// R8: a section links a resolved symbol only where its own lines
+    /// mention the name; the note links it once; section edges are a subset
+    /// of the note's.
+    #[test]
+    fn sections_link_only_the_names_their_own_lines_mention() {
+        let idx = index_of(&[
+            sym("sym:a", "AlphaWidget", "Class", "r", "src/a.rs"),
+            sym("sym:b", "BravoWidget", "Class", "r", "src/b.rs"),
+        ]);
+        let text = "# One\n\nuses AlphaWidget\n\n# Two\n\nuses BravoWidget and `AlphaWidget`\n\n# Three\n\nnothing\n";
+        let spans = [
+            SectionSpan {
+                uid: "s1".into(),
+                start_line: 2,
+                end_line: 4,
+            },
+            SectionSpan {
+                uid: "s2".into(),
+                start_line: 6,
+                end_line: 8,
+            },
+            SectionSpan {
+                uid: "s3".into(),
+                start_line: 10,
+                end_line: 11,
+            },
+        ];
+        let scanned = resolve_note("note:t", &note_mentions(text), &spans, &idx);
+        let mut sections: Vec<(&str, &str)> = scanned
+            .section_edges
+            .iter()
+            .map(|(from, to, _, _)| (from.as_str(), to.as_str()))
+            .collect();
+        sections.sort();
+        assert_eq!(
+            sections,
+            [("s1", "sym:a"), ("s2", "sym:a"), ("s2", "sym:b")]
+        );
+        let note: HashSet<&str> = scanned.note_edges.iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(note.len(), 2);
+        assert!(sections.iter().all(|(_, to)| note.contains(to)));
+    }
+
+    /// R9: kind base × evidence ÷ defining files.
+    #[test]
+    fn confidence_is_kind_times_evidence_over_defining_files() {
+        let conf = |hits: Vec<(String, f32)>| -> Vec<f32> {
+            hits.into_iter()
+                .map(|(_, conf)| (conf * 1000.0).round() / 1000.0)
+                .collect()
+        };
+        let two = scoped_index_of(
+            &[
+                sym("sym:a", "syncLedger", "Function", "r", "src/a.ts"),
+                sym("sym:b", "syncLedger", "Function", "r", "src/b.ts"),
+            ],
+            &["r"],
+        );
+        assert_eq!(conf(hits_in(&two, "note:p", "`syncLedger`")), [0.45, 0.45]);
+        let one = index_of(&[sym("sym:a", "syncLedger", "Function", "r", "src/a.ts")]);
+        assert_eq!(conf(scan(&one, "`syncLedger`")), [0.9]);
+        assert_eq!(conf(scan(&one, "syncLedger")), [0.765]);
     }
 
     #[test]
@@ -982,29 +1653,18 @@ mod tests {
 
     #[test]
     fn symbol_index_skips_stoplist_words() {
-        let symbols = vec![
-            (
-                "sym:1".to_string(),
-                "Error".to_string(),
-                "Class".to_string(),
-            ),
-            (
-                "sym:2".to_string(),
-                "AuthService".to_string(),
-                "Class".to_string(),
-            ),
-        ];
-        let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-        let hits = scan(&idx, "Error and AuthService");
-        assert_eq!(hits.len(), 1, "only AuthService should match");
-        assert_eq!(hits[0].0, "sym:2");
+        let idx = index_of(&[
+            sym("sym:1", "Error", "Class", "r", "src/a.rs"),
+            sym("sym:2", "AuthService", "Class", "r", "src/b.rs"),
+        ]);
+        let hits = scan(&idx, "`Error` and AuthService");
+        assert_eq!(uids(&hits), ["sym:2"], "only AuthService should match");
     }
 
     #[test]
     fn stoplist_is_case_insensitive() {
         for name in ["error", "ERROR", "Error", "eRrOr"] {
-            let symbols = vec![("sym:1".to_string(), name.to_string(), "Class".to_string())];
-            let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
+            let idx = index_of(&[sym("sym:1", name, "Class", "r", "src/a.rs")]);
             assert!(idx.is_empty(), "'{name}' should be stopped");
         }
     }

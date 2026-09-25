@@ -4077,6 +4077,24 @@ impl GraphStore {
         Ok(2)
     }
 
+    /// Delete up to `limit` REFERENCES_CODE edges of each kind (note- and
+    /// section-level) on a caller-owned connection. nw-670: the link-rules
+    /// migration clears tens of millions of old edges in bounded batches, one
+    /// short transaction each, instead of one delete the size of the graph.
+    pub fn delete_references_code_edges_batch_on(
+        conn: &lbug::Connection<'_>,
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        for query in [
+            "MATCH ()-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() WITH r LIMIT $n DELETE r",
+            "MATCH ()-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() WITH r LIMIT $n DELETE r",
+        ] {
+            exec_params(conn, query, vec![("n", lbug::Value::Int64(limit))])?;
+        }
+        Ok(())
+    }
+
     /// Delete all Symbol nodes that belong to a specific file (matching both
     /// `repo_uid` AND `file_path`). Uses `DETACH DELETE` so all incident edges
     /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, USES, ACCESSES, MEMBER_OF,

@@ -429,11 +429,9 @@ Tags are vault-scoped: `tag:vlt:work:a3f2...` and `tag:vlt:personal:a3f2...` are
 
 ### 5.4 Cross-domain bridges
 
-`REFERENCES_CODE` connects `Section` nodes to `Symbol` nodes. Three sources, in decreasing confidence (full details in §10):
+`REFERENCES_CODE` connects `Note` and `Section` nodes to `Symbol` nodes. As built (nw-670), a note links to a symbol when the author wrote the name **as code** — a whole backtick span, inside other inline code or a code block, or an identifier-shaped name (`snake_case`, `camelCase`) in prose — **and** the name resolves to that symbol within the note's project. Ordinary English words never link. The rules, the kind gates and the confidence formula are in §10.1; project scoping is §10.2.
 
-1. Explicit `<!-- nw:ref sym:... -->` annotations — 1.0.
-2. Symbol names appearing in fenced code blocks inside the section, scoped to repos that share a `Project` with the section's note — 0.6.
-3. Backtick-quoted names in prose, same scoping — 0.4, off by default.
+Explicit `<!-- nw:ref sym:... -->` annotations (1.0) and heading/title exact matches are not implemented.
 
 `MDLINK_TO_FILE` and `MDLINK_TO_SYMBOL` are produced when standard `[text](url)` URLs point to repository files (relative paths matching a known repo's file structure, or `file://` URLs).
 
@@ -1366,24 +1364,36 @@ If any of these creeps back in during development, treat it as a release-blocker
 
 ### 10.1 The bridge edges
 
-A design doc says "the auth service handles token refresh." A code repo has an `AuthService.refreshToken` method. The brain's job is to know these are linked, so that when the agent asks for context on either, the other appears.
+A design doc says "`AuthService.refreshToken` retries once." A code repo has an `AuthService.refreshToken` method. The brain's job is to know these are linked, so that when the agent asks for context on either, the other appears.
 
-`REFERENCES_CODE` is the bridge. Source confidences:
+`REFERENCES_CODE` is the bridge. As built (nw-670, the ADR "Note-to-code links only for real code mentions"; `crates/nestweaver-engine/src/cross_domain.rs`):
 
-| Source | Confidence | Recall |
-|---|---|---|
-| Explicit `<!-- nw:ref sym:repo:...:abc:42 -->` annotation | 1.0 | Low (must be hand-added) |
-| Symbol name found inside a fenced code block in the section, scoped to repos linked via Project | 0.6 | Medium |
-| Backtick-quoted symbol name in prose, same scoping | 0.4 | High (but noisy) |
-| Section title or heading that exact-matches a unique symbol name in linked repos | 0.7 | Medium |
+**What counts as a mention** (`nestweaver_parser::code_mentions`, one comrak parse per note, frontmatter values included):
 
-The default v1 config enables sources 1, 2, and 4. Source 3 is behind a `--enable-prose-mentions` flag — it's the noisiest and benefits from a user opting in once they understand the tradeoff.
+| Where | Counts when |
+|---|---|
+| Inline code that is exactly one identifier (`` `watcher` ``, `` `ClaimLedger` ``, `` `foo()` ``) | always |
+| Other inline code, fenced or indented code | the name is **distinctive**, or an unqualified call `name(`; string literals skipped |
+| Prose | the name is distinctive, or an unqualified call `name(` |
+| URLs, wikilink targets, markdown link targets | never |
+
+A name is **distinctive** when it has an interior `_` (`snake_case`, `SCREAMING_SNAKE`) or at least two camel humps (`camelCase`, `PascalCase`). Everything else (`screen`, `Processor`, `TIMEOUT`) is **plain**.
+
+**What a mention resolves to:**
+
+1. A plain name resolves only from a whole code span — to a type (Class, Interface, Enum, Trait, TypeAlias, Extension) or an all-caps Constant — or from a call, to a Function or Method. Never to a Module, never to a value (Property, Variable, lowercase Constant).
+2. Non-test definitions win over test ones (`tests/`, `__tests__/`, `*.test.*`, `*_test.*`, …); definitions win over values.
+3. Scope (§10.2): only candidates in the note's projects' repos; a note in no project links only distinctive names defined in exactly one file.
+4. More than 5 distinct defining files (1 outside a project) is ambiguous: no link.
+5. `main` and the other `STOPLIST` words, and names under 4 characters, never link.
+
+Each name resolves once per note; a section links it only where its own lines mention it. Confidence is `kind_base × evidence ÷ n`: Function 0.9, types 0.8, Method/Module 0.7, values 0.6; evidence 1.0 for code, 0.85 for prose only; `n` the defining files linked, so an ambiguous name spends one unit of PPR mass in total.
+
+**Keeping links current.** The rules carry a version (`CROSS_DOMAIN_RULES_VERSION`, recorded in `<db>.code_links.json`). The daemon's code-link reconciler compares every note's links with what its committed text says and rewrites only the notes that differ — after a vault refresh, a code re-index, a project-membership change, or a rules upgrade (which first removes the old links in bounded batches). Owed links are shown by `brain status`.
 
 ### 10.2 Scoping via Project
 
-Without scoping, source 2 would link a section mentioning `User` to every `User` class in every indexed repo. The fix: only emit `REFERENCES_CODE` edges when the section's note belongs to a `Project` that also includes the symbol's repo. This is why `Project` is a first-class node.
-
-A simpler heuristic for users without explicit Projects: same vault ↔ same instance — only link to repos indexed under the same instance ID as the vault. Configurable.
+Without scoping, a section mentioning `User` would link to every `User` class in every indexed repo. A note's scope is the repos of the Projects that include it (`PROJECT_INCLUDES_NOTE`, then the repos its projects' `PROJECT_INCLUDES_SYMBOL` edges reach). Inside a project a name resolves only within that scope — there is no guessing into another project. A note in no project (or only in projects without repos) links only distinctive names with a single defining file across the instance.
 
 ### 10.3 Bi-directionality
 
@@ -1397,8 +1407,8 @@ Edges are directed (`Section → Symbol`), but PPR over the unified graph propag
       └─ [Section: "§3 Error Handling"]
           ├─ TAGGED_WITH → [Tag: #project/pairing]
           ├─ WIKILINK_TO_NOTE → [Note: "Pairing State Machine"]
-          ├─ REFERENCES_CODE → [Symbol: PairingService.handleTimeout]  (confidence 0.6, source: code block)
-          └─ REFERENCES_CODE → [Symbol: ErrorMapper.toUserMessage]      (confidence 0.4, source: prose)
+          ├─ REFERENCES_CODE → [Symbol: PairingService.handleTimeout]  (confidence 0.7, a Method written in code)
+          └─ REFERENCES_CODE → [Symbol: ErrorMapper.toUserMessage]      (confidence 0.6, a Method named in prose)
 
 User asks: "context for working on pairing timeouts"
 Agent: brain_context(seeds=["pairing timeout"], token_budget=3000)

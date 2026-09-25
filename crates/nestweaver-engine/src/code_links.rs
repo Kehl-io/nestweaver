@@ -45,10 +45,30 @@ use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 
 use crate::config::CrossDomainConfig;
+pub use crate::cross_domain::CROSS_DOMAIN_RULES_VERSION;
 use crate::cross_domain::{
     CrossDomainResult, NOTES_PER_TXN, NoteMentions, ScannedNote, SectionSpan, flush_scanned_notes,
     note_mentions, resolve_note,
 };
+
+/// nw-670: old links the rules migration removes per transaction, per edge
+/// kind. A real pre-nw-670 brain holds ~39 M; one delete of that size would
+/// hold the write lease for as long as it runs.
+const PURGE_BATCH: usize = 50_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a smaller purge batch, to see the batching.
+    static PURGE_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn purge_batch() -> usize {
+    #[cfg(test)]
+    if let Some(batch) = PURGE_BATCH_OVERRIDE.with(std::cell::Cell::get) {
+        return batch;
+    }
+    PURGE_BATCH
+}
 
 /// `<db>.code_links.json`: the code-link reconciler's durable state.
 pub const CODE_LINKS_SIDECAR: &str = ".code_links.json";
@@ -68,6 +88,14 @@ pub struct CodeLinksState {
     /// When a pass last completed with the graph in agreement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reconciled_at: Option<String>,
+    /// nw-670: the link-rules version ([`CROSS_DOMAIN_RULES_VERSION`]) the
+    /// stored links were built with; 0 (absent) is the pre-nw-670
+    /// match-every-word rules. A mismatch makes the next pass a migration:
+    /// remove every stored link in bounded batches, then rebuild all of
+    /// them. Recorded only when that pass completes, so an interrupted
+    /// migration starts over on the next pass (the purge is idempotent).
+    #[serde(default)]
+    pub rules_version: u32,
 }
 
 /// Why code links are owed, and how the last attempt to write them went.
@@ -79,6 +107,9 @@ pub struct CodeLinksPending {
     pub last_error: Option<String>,
     #[serde(default)]
     pub failures: u32,
+    /// Where a running pass has got to, when it has something to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 static CODE_LINKS_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -142,12 +173,38 @@ pub fn mark_code_links_pending(db_path: &Path, reason: &str) {
                 state.pending = Some(CodeLinksPending {
                     reason: reason.to_string(),
                     since: now_iso(),
-                    last_error: None,
-                    failures: 0,
+                    ..CodeLinksPending::default()
                 })
             }
         }
         true
+    });
+}
+
+/// Owe links for `reason` WITHOUT counting as a new mark: the pass that
+/// records this is the one that will settle it (the rules migration).
+fn owe_without_mark(db_path: &Path, reason: &str) {
+    update_code_links_state(db_path, |state| {
+        let pending = state.pending.get_or_insert_with(|| CodeLinksPending {
+            since: now_iso(),
+            ..CodeLinksPending::default()
+        });
+        pending.reason = reason.to_string();
+        true
+    });
+}
+
+/// Record how far a running pass has got, when links are owed.
+fn record_progress(db_path: Option<&Path>, progress: String) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    update_code_links_state(db_path, |state| match &mut state.pending {
+        Some(pending) => {
+            pending.progress = Some(progress);
+            true
+        }
+        None => false,
     });
 }
 
@@ -164,6 +221,9 @@ pub(crate) fn code_links_status_row(db_path: &Path) -> Option<(String, String)> 
         "note code links being rebuilt since {} ({})",
         pending.since, pending.reason
     );
+    if let Some(progress) = &pending.progress {
+        reason.push_str(&format!("; {progress}"));
+    }
     if let Some(error) = &pending.last_error {
         reason.push_str(&format!(
             "; last attempt failed ({} time(s)): {error}; retrying",
@@ -238,23 +298,38 @@ impl CodeLinkReconciler {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<CodeLinkReconcileReport, anyhow::Error> {
         let db_path = store.db_path().map(Path::to_path_buf);
-        let marks_at_start = db_path
+        let state_at_start = db_path
             .as_deref()
-            .map(|db| load_code_links_state(db).marks)
+            .map(load_code_links_state)
             .unwrap_or_default();
-        let outcome = self.reconcile_inner(store, lease, should_stop);
+        let migrating =
+            db_path.is_some() && state_at_start.rules_version != CROSS_DOMAIN_RULES_VERSION;
+        if migrating && let Some(db_path) = &db_path {
+            owe_without_mark(
+                db_path,
+                &format!(
+                    "note→code link rules upgraded to v{CROSS_DOMAIN_RULES_VERSION}: replacing \
+                     every note's links"
+                ),
+            );
+        }
+        let outcome = self.reconcile_inner(store, lease, should_stop, migrating);
         let Some(db_path) = db_path else {
             return outcome;
         };
         match &outcome {
             Ok(report) if report.stopped => {}
             Ok(_) => update_code_links_state(&db_path, |state| {
-                if state.marks != marks_at_start {
+                // A completed pass built every checked note's links with
+                // the current rules, whatever else is still owed.
+                state.rules_version = CROSS_DOMAIN_RULES_VERSION;
+                if state.marks == state_at_start.marks {
+                    state.pending = None;
+                    state.last_reconciled_at = Some(now_iso());
+                } else if let Some(pending) = &mut state.pending {
                     // New debt landed mid-pass: the next pass settles it.
-                    return false;
+                    pending.progress = None;
                 }
-                state.pending = None;
-                state.last_reconciled_at = Some(now_iso());
                 true
             }),
             Err(error) => {
@@ -263,8 +338,7 @@ impl CodeLinkReconciler {
                     let pending = state.pending.get_or_insert_with(|| CodeLinksPending {
                         reason: "code links out of date".to_string(),
                         since: now_iso(),
-                        last_error: None,
-                        failures: 0,
+                        ..CodeLinksPending::default()
                     });
                     pending.last_error = Some(message);
                     pending.failures = pending.failures.saturating_add(1);
@@ -280,8 +354,15 @@ impl CodeLinkReconciler {
         store: &GraphStore,
         lease: CodeLinkLease<'_>,
         should_stop: &dyn Fn() -> bool,
+        migrating: bool,
     ) -> Result<CodeLinkReconcileReport, anyhow::Error> {
         let mut report = CodeLinkReconcileReport::default();
+        if migrating {
+            purge_links(store, lease, should_stop, &mut report)?;
+            if report.stopped {
+                return Ok(report);
+            }
+        }
         let index = crate::cross_domain::build_symbol_index_with_config(store, &self.config)?;
         if index.is_empty() {
             // No code indexed: there is nothing to link to, and no link can
@@ -312,10 +393,20 @@ impl CodeLinkReconciler {
         let live: HashSet<&str> = notes.iter().map(|note| note.uid.as_str()).collect();
         self.cache.retain(|uid, _| live.contains(uid.as_str()));
 
-        for chunk in notes.chunks(NOTES_PER_TXN) {
+        let total = notes.len();
+        for (done, chunk) in notes.chunks(NOTES_PER_TXN).enumerate() {
             if should_stop() {
                 report.stopped = true;
                 return Ok(report);
+            }
+            if migrating {
+                record_progress(
+                    store.db_path(),
+                    format!(
+                        "linking notes: {} of {total} checked",
+                        (done * NOTES_PER_TXN).min(total)
+                    ),
+                );
             }
             let mut desired: Vec<(ScannedNote, String)> = Vec::with_capacity(chunk.len());
             for note in chunk {
@@ -409,62 +500,141 @@ impl CodeLinkReconciler {
             .iter()
             .map(|(scanned, _)| scanned.note_uid().to_string())
             .collect();
-        loop {
-            let _lease = lease
-                .map(|factory| factory("code_link_reconcile"))
-                .transpose()?;
-            let current: HashMap<String, String> = store
-                .lookup_notes_by_uids(&uids)
-                .context("re-check notes before rewriting their code links")?
-                .into_iter()
-                .map(|note| (note.uid, note.content_hash))
-                .collect();
-            let Some(publication) = crate::manifest::try_begin_graph_mutation_publication(
-                store,
-                "code link reconciliation",
-            )?
-            else {
-                // A publisher (the vault watcher, mid-batch) owns the
-                // publication and may be waiting for the write lease: yield
-                // it, wait, retry — never block on one while holding the
-                // other.
-                drop(_lease);
-                store.wait_until_index_publication_unowned();
-                continue;
-            };
-            let batch: Vec<ScannedNote> = dirty
-                .into_iter()
-                .filter(|(scanned, hash)| current.get(scanned.note_uid()) == Some(hash))
-                .map(|(scanned, _)| scanned)
-                .collect();
-            let mut result = CrossDomainResult::default();
-            let flushed = flush_scanned_notes(store, &batch, &mut result);
-            let changed = flushed.is_ok() && !batch.is_empty();
-            match publication.finish(changed) {
-                Ok(outcome) => {
-                    for warning in &outcome.warnings {
-                        tracing::warn!(
-                            stage = %warning.stage,
-                            "code link reconciliation publication: {}",
-                            warning.message
-                        );
-                    }
-                }
-                Err(error) => {
-                    if flushed.is_ok() {
-                        return Err(error.context("publish code link reconciliation"));
-                    }
-                    tracing::warn!(%error, "retire code link reconciliation publication");
-                }
+        let (_lease, publication) = begin_publication(store, lease)?;
+        // Re-checked under the lease: a note edited since the scan has newer
+        // text, and is left for the next pass.
+        let current: HashMap<String, String> = store
+            .lookup_notes_by_uids(&uids)
+            .context("re-check notes before rewriting their code links")?
+            .into_iter()
+            .map(|note| (note.uid, note.content_hash))
+            .collect();
+        let batch: Vec<ScannedNote> = dirty
+            .into_iter()
+            .filter(|(scanned, hash)| current.get(scanned.note_uid()) == Some(hash))
+            .map(|(scanned, _)| scanned)
+            .collect();
+        let mut result = CrossDomainResult::default();
+        let flushed = flush_scanned_notes(store, &batch, &mut result).map(|_| !batch.is_empty());
+        finish_publication(publication, flushed)?;
+        report.edges_written += result.note_to_symbol_edges + result.section_to_symbol_edges;
+        report
+            .rewritten
+            .extend(batch.iter().map(|scanned| scanned.note_uid().to_string()));
+        Ok(())
+    }
+}
+
+/// Take the lease, then — without blocking while holding it — the graph
+/// publication: a publisher (the vault watcher, mid-batch) may own the
+/// publication while it waits for the write lease, so on contention the
+/// lease is released, the publication waited for, and both retried.
+#[allow(clippy::type_complexity)]
+fn begin_publication<'s>(
+    store: &'s GraphStore,
+    lease: CodeLinkLease<'_>,
+) -> Result<
+    (
+        Option<Box<dyn crate::watcher::WatchMutationLease>>,
+        crate::manifest::GraphMutationPublicationGuard<'s>,
+    ),
+    anyhow::Error,
+> {
+    loop {
+        let guard = lease
+            .map(|factory| factory("code_link_reconcile"))
+            .transpose()?;
+        if let Some(publication) = crate::manifest::try_begin_graph_mutation_publication(
+            store,
+            "code link reconciliation",
+        )? {
+            return Ok((guard, publication));
+        }
+        drop(guard);
+        store.wait_until_index_publication_unowned();
+    }
+}
+
+/// Publish a write made inside [`begin_publication`]: generation and
+/// PageRank move with the edges, as they do for the watcher's own link
+/// writes. `written` is whether anything changed, or the write's error.
+fn finish_publication(
+    publication: crate::manifest::GraphMutationPublicationGuard<'_>,
+    written: Result<bool, anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let changed = matches!(written, Ok(true));
+    match publication.finish(changed) {
+        Ok(outcome) => {
+            for warning in &outcome.warnings {
+                tracing::warn!(
+                    stage = %warning.stage,
+                    "code link reconciliation publication: {}",
+                    warning.message
+                );
             }
-            flushed?;
-            report.edges_written += result.note_to_symbol_edges + result.section_to_symbol_edges;
-            report
-                .rewritten
-                .extend(batch.iter().map(|scanned| scanned.note_uid().to_string()));
-            return Ok(());
+        }
+        Err(error) => {
+            if written.is_ok() {
+                return Err(error.context("publish code link reconciliation"));
+            }
+            tracing::warn!(%error, "retire code link reconciliation publication");
         }
     }
+    written.map(|_| ())
+}
+
+/// nw-670 migration: remove every stored link, [`PURGE_BATCH`] per edge kind
+/// per transaction, each under its own lease and publication, so the old
+/// rules' tens of millions of edges never make one giant transaction and
+/// queued writers get the lease between batches. Progress is disclosed.
+fn purge_links(
+    store: &GraphStore,
+    lease: CodeLinkLease<'_>,
+    should_stop: &dyn Fn() -> bool,
+    report: &mut CodeLinkReconcileReport,
+) -> Result<(), anyhow::Error> {
+    let mut batches = 0usize;
+    while store
+        .any_references_code_edges()
+        .context("probe for links to remove")?
+    {
+        if should_stop() {
+            report.stopped = true;
+            return Ok(());
+        }
+        let (_lease, publication) = begin_publication(store, lease)?;
+        let conn = store
+            .begin_transaction()
+            .map_err(|e| anyhow::anyhow!("begin_transaction for link purge: {e}"));
+        let deleted =
+            conn.and_then(|conn| {
+                match GraphStore::delete_references_code_edges_batch_on(&conn, purge_batch()) {
+                    Ok(()) => store
+                        .commit_transaction(&conn)
+                        .map(|_| true)
+                        .map_err(|e| anyhow::anyhow!("commit_transaction for link purge: {e}")),
+                    Err(error) => {
+                        if let Err(rollback) = store.rollback_transaction(&conn) {
+                            tracing::warn!(%rollback, "link purge rollback failed");
+                        }
+                        Err(anyhow::anyhow!(
+                            "delete_references_code_edges_batch_on: {error}"
+                        ))
+                    }
+                }
+            });
+        finish_publication(publication, deleted)?;
+        batches += 1;
+        record_progress(
+            store.db_path(),
+            format!(
+                "removing links built by the previous rules: {batches} batch(es) of up to \
+                 {} removed",
+                purge_batch()
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// One complete pass for a caller with exclusive write authority (the
@@ -510,7 +680,20 @@ mod tests {
         crate::index_md::index_markdown_directory(&vault, &db, "default", "vault").unwrap();
         let store = GraphStore::open_or_create(&db).unwrap();
         index_repo(&store, &repo, &db);
+        // Bulk discovery and a first reconcile pass (the rules migration of
+        // an empty link set) build the same links.
         crate::cross_domain::discover_cross_domain_links(&store).unwrap();
+        let discovered = store.list_references_code_edges().unwrap();
+        reconcile_code_links(&store, &CrossDomainConfig::default()).unwrap();
+        assert_eq!(
+            store.list_references_code_edges().unwrap(),
+            discovered,
+            "bulk discovery and the reconciler agree"
+        );
+        assert_eq!(
+            load_code_links_state(&db).rules_version,
+            CROSS_DOMAIN_RULES_VERSION
+        );
         Fixture {
             _dir: dir,
             vault,
@@ -787,6 +970,218 @@ mod tests {
         let report = reconciler.reconcile(&fx.store, None, &|| false).unwrap();
         assert_eq!(report.notes_skipped, 0, "{report:?}");
         assert_eq!(report.notes_checked, 2);
+    }
+
+    /// Write links the way the pre-nw-670 rules did — every word, every
+    /// symbol — and a sidecar that predates the rules version, as an
+    /// upgraded install finds them.
+    fn plant_old_rule_links(fx: &Fixture) -> usize {
+        let note = note_uid_of(&fx.store, "a.md");
+        let symbols: Vec<String> = fx
+            .store
+            .list_all_symbols_lite()
+            .unwrap()
+            .into_iter()
+            .map(|(uid, _, _)| uid)
+            .collect();
+        let rows: Vec<(&str, &str, f32, &str)> = symbols
+            .iter()
+            .map(|uid| (note.as_str(), uid.as_str(), 0.6, "name-match"))
+            .collect();
+        let conn = fx.store.begin_transaction().unwrap();
+        GraphStore::delete_cross_domain_edges_for_notes_on(&conn, &[note.as_str()]).unwrap();
+        GraphStore::batch_insert_note_to_symbol_edges_on(&conn, &rows).unwrap();
+        fx.store.commit_transaction(&conn).unwrap();
+        update_code_links_state(&fx.db, |state| {
+            state.rules_version = 0;
+            true
+        });
+        rows.len()
+    }
+
+    /// nw-670 migration: links built by the old rules are removed and every
+    /// note relinked under the current ones; the new version is recorded and
+    /// the migration was disclosed while it ran.
+    #[test]
+    fn a_rules_upgrade_replaces_old_links_and_records_the_version() {
+        let fx = two_widgets();
+        let current = edges(&fx.store);
+        plant_old_rule_links(&fx);
+        assert_ne!(edges(&fx.store), current, "precondition: old links planted");
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        CodeLinkReconciler::new(CrossDomainConfig::default())
+            .reconcile(&fx.store, None, &|| {
+                seen.borrow_mut().push(status(&fx.db));
+                false
+            })
+            .unwrap();
+        assert_eq!(
+            edges(&fx.store),
+            current,
+            "old links replaced by the rules'"
+        );
+        let state = load_code_links_state(&fx.db);
+        assert_eq!(state.rules_version, CROSS_DOMAIN_RULES_VERSION);
+        assert!(state.pending.is_none(), "{state:?}");
+        let disclosed = seen.borrow();
+        let reason = disclosed[0]["reconciliation_pending_notes"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(reason.contains("rules upgraded"), "{reason}");
+    }
+
+    /// Counterweight: with the version current, the same planted links are
+    /// a note that disagrees with its text and nothing more — only that note
+    /// is rewritten, no purge runs.
+    #[test]
+    fn a_current_rules_version_runs_no_migration() {
+        let fx = two_widgets();
+        plant_old_rule_links(&fx);
+        update_code_links_state(&fx.db, |state| {
+            state.rules_version = CROSS_DOMAIN_RULES_VERSION;
+            true
+        });
+        let report = reconcile(&fx.store);
+        assert_eq!(report.rewritten, vec![note_uid_of(&fx.store, "a.md")]);
+    }
+
+    /// The purge is bounded: many old links go in several transactions,
+    /// each disclosed as progress.
+    #[test]
+    fn the_migration_purge_runs_in_bounded_batches() {
+        let fx = two_widgets();
+        let planted = plant_old_rule_links(&fx);
+        assert!(planted >= 2);
+        PURGE_BATCH_OVERRIDE.with(|batch| batch.set(Some(1)));
+        let progress = std::cell::RefCell::new(Vec::new());
+        let result = CodeLinkReconciler::new(CrossDomainConfig::default()).reconcile(
+            &fx.store,
+            None,
+            &|| {
+                if let Some(pending) = load_code_links_state(&fx.db).pending {
+                    progress.borrow_mut().extend(pending.progress);
+                }
+                false
+            },
+        );
+        PURGE_BATCH_OVERRIDE.with(|batch| batch.set(None));
+        result.unwrap();
+        let progress = progress.borrow();
+        assert!(
+            progress
+                .iter()
+                .any(|p| p.starts_with("removing links") && p.contains("2 batch")),
+            "{progress:?}"
+        );
+    }
+
+    /// An interrupted migration keeps its debt and its old version, and the
+    /// next pass finishes it.
+    #[test]
+    fn an_interrupted_migration_resumes_on_the_next_pass() {
+        let fx = two_widgets();
+        let current = edges(&fx.store);
+        plant_old_rule_links(&fx);
+        let calls = std::cell::Cell::new(0);
+        let report = CodeLinkReconciler::new(CrossDomainConfig::default())
+            .reconcile(&fx.store, None, &|| {
+                calls.set(calls.get() + 1);
+                calls.get() > 1
+            })
+            .unwrap();
+        assert!(report.stopped);
+        let state = load_code_links_state(&fx.db);
+        assert_eq!(
+            state.rules_version, 0,
+            "not recorded until a pass completes"
+        );
+        assert!(state.pending.is_some(), "still disclosed");
+
+        reconcile(&fx.store);
+        assert_eq!(edges(&fx.store), current);
+        assert_eq!(
+            load_code_links_state(&fx.db).rules_version,
+            CROSS_DOMAIN_RULES_VERSION
+        );
+    }
+
+    /// nw-670 R5 + `materialize_projects`: a note that joins a project is
+    /// rescoped, and the next pass relinks it — `SharedWidget` is defined in
+    /// two repos, so the unscoped note links nothing (cap 1), and once its
+    /// project names one repo it links that repo's definition.
+    #[test]
+    fn a_project_membership_change_relinks_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("proj")).unwrap();
+        std::fs::write(vault.join("proj/a.md"), "# A\n\nThe SharedWidget.\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&vault, &db, "default", "vault").unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        for name in ["alpha", "bravo"] {
+            let repo = dir.path().join(name);
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/w.rs"), "pub struct SharedWidget;\n").unwrap();
+            crate::index::index_directory_with_store(
+                &store,
+                &repo,
+                &db,
+                "default",
+                &format!("file:///fixture/{name}"),
+                "sha",
+                false,
+                Some(name),
+            )
+            .unwrap();
+        }
+        reconcile(&store);
+        assert!(edges(&store).is_empty(), "ambiguous for an unscoped note");
+
+        let config = crate::config::InstanceConfig::from_toml_str(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+vault_folder = "proj"
+repos = ["alpha"]
+"#,
+        )
+        .unwrap();
+        crate::project::materialize_projects(&store, &config, "default", &db).unwrap();
+        let report = reconcile(&store);
+        assert_eq!(report.rewritten.len(), 1, "{report:?}");
+        let alpha_repo = nestweaver_schema::repo_uid("default", "file:///fixture/alpha");
+        let linked = edges(&store);
+        assert_eq!(linked.len(), 2, "{linked:?}");
+        let symbols: HashMap<String, String> = store
+            .list_symbols_for_linking()
+            .unwrap()
+            .into_iter()
+            .map(|(uid, _, _, repo, _)| (uid, repo))
+            .collect();
+        assert!(
+            linked.iter().all(|edge| symbols[&edge.1] == alpha_repo),
+            "{linked:?}"
+        );
     }
 
     /// Stand-in for a refresh that recreated the notes' links' absence: drop
