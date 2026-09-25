@@ -240,6 +240,22 @@ pub(crate) fn string_is_corrupt(s: &str) -> bool {
     s.as_bytes().contains(&0)
 }
 
+/// nw-670 re-review N3: a query against a REL table this database does not
+/// have yet (created by a newer schema; read-only opens do not run schema
+/// init) reads as "no rows" rather than failing the caller. Any other error
+/// passes through.
+pub(crate) fn tolerate_missing_table<T: Default>(
+    result: Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    match result {
+        Err(StoreError::Query(message)) if message.contains("does not exist") => {
+            tracing::trace!("query skipped, table not in this database yet: {message}");
+            Ok(T::default())
+        }
+        other => other,
+    }
+}
+
 pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreError> {
     let val = row
         .get(idx)
@@ -2377,9 +2393,12 @@ impl GraphStore {
         let notes =
             pairs("MATCH (p:Project)-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid, p.uid")?;
         // nw-678: member repos (durable), plus the repos any surviving legacy
-        // per-symbol edges reach, for a graph not yet re-materialized.
-        let mut repos =
-            pairs("MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid")?;
+        // per-symbol edges reach, for a graph not yet re-materialized. A
+        // database this binary never opened writable has no repo table yet
+        // (nw-670 re-review N3): no durable membership, not an error.
+        let mut repos = tolerate_missing_table(pairs(
+            "MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid",
+        ))?;
         repos.extend(pairs(
             "MATCH (p:Project)-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
              RETURN DISTINCT p.uid, s.repo_uid",
@@ -3534,18 +3553,24 @@ impl GraphStore {
             "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
              RETURN DISTINCT s.repo_uid",
         ] {
-            let mut stmt = conn
-                .prepare(query)
-                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-            let rows = conn
-                .execute(
-                    &mut stmt,
-                    vec![("uid", Value::String(project_uid.to_string()))],
-                )
-                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-            for row in rows {
-                repos.push(extract_string(&row, 0)?);
-            }
+            let read = (|| -> Result<Vec<String>, StoreError> {
+                let mut stmt = conn
+                    .prepare(query)
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                let rows = conn
+                    .execute(
+                        &mut stmt,
+                        vec![("uid", Value::String(project_uid.to_string()))],
+                    )
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(extract_string(&row, 0)?);
+                }
+                Ok(out)
+            })();
+            // N3: see `project_link_scopes`.
+            repos.extend(tolerate_missing_table(read)?);
         }
         repos.sort();
         repos.dedup();

@@ -446,12 +446,15 @@ pub fn rebuild_project_repo_membership(
             .into_iter()
             .filter(|(project, _)| existing.contains(project))
             .collect();
-    let (_lease, publication) = crate::code_links::begin_publication(store, lease)?;
-    let written = store
-        .replace_project_repo_edges(&configured, &desired)
-        .map_err(|e| anyhow::anyhow!("replace PROJECT_INCLUDES_REPO: {e}"));
-    let changed = matches!(written, Ok(true));
-    crate::code_links::finish_publication(publication, written)?;
+    // nw-670 re-review N4: diff BEFORE taking any lease or publication — a
+    // no-op rebuild (every pass once membership is current) must not open a
+    // publication (ranked reads would fail closed for it; a crash would leave
+    // a dirty marker) or touch the sidecar.
+    let mut current = store
+        .project_repo_edges_of(&configured)
+        .map_err(|e| anyhow::anyhow!("read PROJECT_INCLUDES_REPO: {e}"))?;
+    current.sort();
+    let graph_differs = current != desired;
     let mut ext_store = load_extensions(db_path);
     let mut ext_changed = false;
     for project_cfg in &config.projects {
@@ -467,6 +470,24 @@ pub fn rebuild_project_repo_membership(
             ext_changed = true;
         }
     }
+    if !graph_differs && !ext_changed {
+        return Ok(false);
+    }
+    // One lease for the graph write and the sidecar save (N4).
+    let mut changed = false;
+    let _lease = if graph_differs {
+        let (lease, publication) = crate::code_links::begin_publication(store, lease)?;
+        let written = store
+            .replace_project_repo_edges(&configured, &desired)
+            .map_err(|e| anyhow::anyhow!("replace PROJECT_INCLUDES_REPO: {e}"));
+        changed = matches!(written, Ok(true));
+        crate::code_links::finish_publication(publication, written)?;
+        lease
+    } else {
+        lease
+            .map(|factory| factory("project_repo_membership"))
+            .transpose()?
+    };
     if ext_changed {
         crate::extensions::save_extensions(db_path, &ext_store)?;
     }
@@ -1215,6 +1236,145 @@ repos = [{repos}]
 #[cfg(test)]
 mod repo_membership_tests {
     use super::*;
+
+    fn config_with(instance: &str, repos: &str) -> InstanceConfig {
+        InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "{instance}"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+vault_folder = "proj"
+repos = [{repos}]
+"#
+        ))
+        .unwrap()
+    }
+
+    /// nw-670 re-review N2: when a project's uid changes (instance_id
+    /// change, merge) the stale project is deleted with a plain DELETE after
+    /// its note/symbol/component/parent edges — but its repo membership was
+    /// left, so the DELETE was refused and the whole materialize failed.
+    #[test]
+    fn a_project_uid_change_rematerializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, _repo, _project, _url) = one_repo_project_fixture(dir.path(), "\"alpha\"");
+        materialize_projects(&store, &config_with("other", "\"alpha\""), "other", &db)
+            .expect("the stale project with repo membership is replaced");
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|project| project.uid != project_uid("default", "p"))
+        );
+    }
+
+    /// nw-670 re-review N1: a repo the config declares but that was first
+    /// indexed AFTER the last materialize gets its membership from the
+    /// rebuild (which every code-link pass now runs).
+    #[test]
+    fn the_rebuild_attaches_a_declared_repo_indexed_after_materialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, _repo, project, _url) =
+            one_repo_project_fixture(dir.path(), "\"alpha\", \"bravo\"");
+        assert_eq!(store.project_member_repo_uids(&project).unwrap().len(), 1);
+        let bravo = dir.path().join("bravo");
+        std::fs::create_dir_all(bravo.join("src")).unwrap();
+        std::fs::write(bravo.join("src/lib.rs"), "pub fn bravo_one() {}\n").unwrap();
+        crate::index::index_directory_with_store(
+            &store,
+            &bravo,
+            &db,
+            "default",
+            "file:///fixture/bravo",
+            "sha",
+            false,
+            Some("bravo"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.project_member_repo_uids(&project).unwrap().len(),
+            1,
+            "precondition: indexing alone does not attach it"
+        );
+        let config = config_with("default", "\"alpha\", \"bravo\"");
+        assert!(rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap());
+        assert_eq!(store.project_member_repo_uids(&project).unwrap().len(), 2);
+    }
+
+    /// nw-670 re-review N1: a re-identified repo (same checkout, new
+    /// identity — the old Repo node pruned, a bare new one inserted) is
+    /// re-attached by the rebuild under its new uid.
+    #[test]
+    fn the_rebuild_reattaches_a_reidentified_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, repo, project, url) = one_repo_project_fixture(dir.path(), "\"alpha\"");
+        let old = nestweaver_schema::repo_uid("default", &url);
+        store.delete_repo_node(&old).unwrap();
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            "file:///fixture/alpha-moved",
+            "sha",
+            false,
+            Some("alpha"),
+        )
+        .unwrap();
+        assert!(store.project_member_repo_uids(&project).unwrap().is_empty());
+        let config = config_with("default", "\"alpha\"");
+        assert!(rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap());
+        assert_eq!(
+            store.project_member_repo_uids(&project).unwrap(),
+            vec![nestweaver_schema::repo_uid(
+                "default",
+                "file:///fixture/alpha-moved"
+            )]
+        );
+    }
+
+    /// nw-670 re-review N4: a rebuild with nothing to change takes no lease
+    /// (so opens no publication and writes no sidecar).
+    #[test]
+    fn a_current_repo_membership_rebuild_takes_no_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, _repo, _project, _url) = one_repo_project_fixture(dir.path(), "\"alpha\"");
+        let leases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&leases);
+        let factory: crate::watcher::WatchMutationLeaseFactory =
+            std::sync::Arc::new(move |_label| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(()) as Box<dyn crate::watcher::WatchMutationLease>)
+            });
+        let changed = rebuild_project_repo_membership(
+            &store,
+            &config_with("default", "\"alpha\""),
+            "default",
+            &db,
+            Some(&factory),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(leases.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     fn member_symbols(store: &GraphStore, project: &str) -> Vec<String> {
         store

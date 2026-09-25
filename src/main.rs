@@ -5046,6 +5046,7 @@ mod daemon_status_renderer_tests {
             last_reconciled_at: String::new(),
             notes_changed_since_indexing: Vec::new(),
             unscoped_projects: Vec::new(),
+            notes_changed_as_of: String::new(),
         };
         let status = nestweaver_proto::BrainStatusResponse {
             code_links: Some(owed.clone()),
@@ -9907,8 +9908,15 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
     let mut gaps = Vec::new();
     for stale in &links.notes_changed_since_indexing {
         gaps.push(format!(
-            "{} note(s) in {} changed since indexing have no code links (refresh that vault)",
-            stale.count, stale.vault
+            "{} note(s) in {} changed since indexing have no code links (refresh that vault; \
+             as of the last pass{})",
+            stale.count,
+            stale.vault,
+            if links.notes_changed_as_of.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", links.notes_changed_as_of)
+            }
         ));
     }
     if !links.unscoped_projects.is_empty() {

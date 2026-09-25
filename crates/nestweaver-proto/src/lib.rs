@@ -199,6 +199,7 @@ pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLink
                 count: row.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             })
             .collect(),
+        notes_changed_as_of: text("notes_changed_as_of"),
         unscoped_projects: links
             .get("unscoped_projects")
             .and_then(|v| v.as_array())

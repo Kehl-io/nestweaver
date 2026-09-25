@@ -3998,24 +3998,35 @@ impl GraphStore {
     /// nw-678: replace the PROJECT_INCLUDES_REPO edges of every project in
     /// `projects` with `edges` (`(project_uid, repo_uid)`), in one
     /// transaction. Returns whether anything changed.
+    /// nw-678: the PROJECT_INCLUDES_REPO edges of the projects in
+    /// `projects`, as `(project_uid, repo_uid)`. Read-only.
+    pub fn project_repo_edges_of(
+        &self,
+        projects: &[String],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut existing = Vec::new();
+        for row in rows {
+            let project = crate::read::extract_string(&row, 0)?;
+            if projects.contains(&project) {
+                existing.push((project, crate::read::extract_string(&row, 1)?));
+            }
+        }
+        Ok(existing)
+    }
+
+    /// nw-678: replace the PROJECT_INCLUDES_REPO edges of every project in
+    /// `projects` with `edges`, in one transaction. Returns whether anything
+    /// changed.
     pub fn replace_project_repo_edges(
         &self,
         projects: &[String],
         edges: &[(String, String)],
     ) -> Result<bool, StoreError> {
-        let mut existing: Vec<(String, String)> = Vec::new();
-        {
-            let conn = self.conn()?;
-            let rows = conn
-                .query("MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid")
-                .map_err(|e| StoreError::Query(e.to_string()))?;
-            for row in rows {
-                let project = crate::read::extract_string(&row, 0)?;
-                if projects.contains(&project) {
-                    existing.push((project, crate::read::extract_string(&row, 1)?));
-                }
-            }
-        }
+        let mut existing = self.project_repo_edges_of(projects)?;
         let mut desired = edges.to_vec();
         desired.sort();
         desired.dedup();
@@ -6357,6 +6368,17 @@ impl GraphStore {
                 &obsolete_parent_edges,
             )?;
             for uid in stale_uids {
+                // nw-670 re-review N2: a stale project's repo membership is
+                // not among the obsolete pairs above; clear it, or the plain
+                // DELETE below refuses a node that still has a relationship
+                // and the whole materialization fails (instance_id change,
+                // merge). Plain DELETE stays: any OTHER surviving edge is
+                // still a reason to refuse.
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid})-[r:PROJECT_INCLUDES_REPO]->() DELETE r",
+                    vec![("uid", lbug::Value::String(uid.clone()))],
+                )?;
                 exec_params(
                     &conn,
                     "MATCH (p:Project {uid: $uid}) DELETE p",
@@ -6528,6 +6550,7 @@ impl GraphStore {
             &[
                 "PROJECT_INCLUDES_NOTE",
                 "PROJECT_INCLUDES_SYMBOL",
+                "PROJECT_INCLUDES_REPO",
                 "PROJECT_HAS_COMPONENT",
                 "PROJECT_HAS_PARENT",
             ],

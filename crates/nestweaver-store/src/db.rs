@@ -4368,6 +4368,22 @@ impl GraphStore {
 mod tests {
     use super::*;
 
+    /// nw-670 re-review N3: a database a newer binary never opened writable
+    /// lacks PROJECT_INCLUDES_REPO (read-only opens run no schema init).
+    /// Membership reads treat that as "no durable membership", not an error.
+    #[test]
+    fn project_membership_reads_tolerate_a_missing_repo_table() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("DROP TABLE PROJECT_INCLUDES_REPO")
+            .unwrap();
+        assert!(store.project_member_repo_uids("proj:x").unwrap().is_empty());
+        assert!(store.list_project_symbol_uids("proj:x").unwrap().is_empty());
+        store.project_link_scopes().unwrap();
+    }
+
     /// nw-670 re-review (optional): the REFERENCES_CODE tables recreated by
     /// `truncate_references_code_edges` are durable — they survive a
     /// checkpoint, close and reopen, empty and writable.

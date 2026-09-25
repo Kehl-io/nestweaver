@@ -2958,41 +2958,6 @@ async fn run_code_link_reconciler(
     let reconciler = Arc::new(std::sync::Mutex::new(
         nestweaver_engine::code_links::CodeLinkReconciler::new(config),
     ));
-    // nw-678: before the first pass, bring project repo membership in line
-    // with the config — a graph materialized before PROJECT_INCLUDES_REPO
-    // existed, or a config whose `repos` changed since, would otherwise scope
-    // (and answer project_context) with no code until someone re-ran
-    // materialize-projects.
-    if let Some(config) = state.instance_cfg.clone()
-        && config
-            .projects
-            .iter()
-            .any(|project| !project.repos.is_empty())
-        && let Ok(_admission) = ConnectionGuard::write(&state)
-    {
-        let rebuild_state = Arc::clone(&state);
-        let rebuilt = tokio::task::spawn_blocking(move || {
-            let factory = daemon_mutation_lease_factory(Arc::clone(&rebuild_state));
-            nestweaver_engine::project::rebuild_project_repo_membership(
-                &rebuild_state.store,
-                &config,
-                &rebuild_state.data_instance_id,
-                &rebuild_state.db_path,
-                Some(&factory),
-            )
-        })
-        .await;
-        match rebuilt {
-            Ok(Ok(true)) => tracing::info!("project repo membership rebuilt from config"),
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(error = %format!("{error:#}"), "project repo membership rebuild failed")
-            }
-            Err(join_error) => {
-                tracing::error!(%join_error, "project repo membership rebuild panicked")
-            }
-        }
-    }
     let mut last_generation: Option<u64> = None;
     let mut last_pass: Option<Instant> = None;
     let mut consecutive_failures: u32 = 0;
@@ -3035,6 +3000,25 @@ async fn run_code_link_reconciler(
         let pass_started = Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
             let factory = daemon_mutation_lease_factory(Arc::clone(&pass_state));
+            // nw-678 / nw-670 re-review N1: bring project repo membership in
+            // line with the config before EVERY pass, not only at startup.
+            // Repo nodes are re-created by more paths than any one route can
+            // cover (re-identify, remove then re-add, first index of a repo
+            // the config already declares, instance merge/purge); the
+            // rebuild writes only on a diff, so a current graph pays a read.
+            // Those routes all record debt, which is what runs this pass.
+            if let Some(config) = pass_state.instance_cfg.clone()
+                && config.projects.iter().any(|project| !project.repos.is_empty())
+                && let Err(error) = nestweaver_engine::project::rebuild_project_repo_membership(
+                    &pass_state.store,
+                    &config,
+                    &pass_state.data_instance_id,
+                    &pass_state.db_path,
+                    Some(&factory),
+                )
+            {
+                tracing::warn!(error = %format!("{error:#}"), "project repo membership rebuild failed");
+            }
             let stop = Arc::clone(&pass_state.shutdown_started);
             let mut reconciler = pass_reconciler
                 .lock()
@@ -16906,6 +16890,97 @@ credential_method = "gh"
                 && !nestweaver_engine::code_links::code_links_pending(&state.db_path))
             .await,
             "the coalesced pass lands and settles the debt"
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
+    }
+
+    /// nw-670 re-review N1: repo membership decays on Repo re-create paths
+    /// beyond the two that carry it (re-identify, remove then re-add, a
+    /// first index of a declared repo). The code-link loop now rebuilds it
+    /// from the config before every pass those routes' debt triggers.
+    #[tokio::test]
+    async fn the_code_link_loop_rebuilds_project_repo_membership_on_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("alpha");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn alpha_one() -> i32 { 1 }\n").unwrap();
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+repos = ["alpha"]
+"#,
+        )
+        .unwrap();
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.data_instance_id = "default".to_string();
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        let repo_url = "file:///fixture/alpha";
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            &repo,
+            &state.db_path,
+            "default",
+            repo_url,
+            "sha",
+            false,
+            Some("alpha"),
+        )
+        .unwrap();
+        nestweaver_engine::project::materialize_projects(
+            &state.store,
+            &config,
+            "default",
+            &state.db_path,
+        )
+        .unwrap();
+        let project = nestweaver_schema::project_uid("default", "p");
+        let members = |state: &DaemonState| {
+            state
+                .store
+                .project_member_repo_uids(&project)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(members(&state), 1, "precondition");
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Re-create the Repo node the way remove-then-re-add does.
+        let repo_uid = nestweaver_schema::repo_uid("default", repo_url);
+        let existing = state.store.lookup_repo(&repo_uid).unwrap().unwrap();
+        state.store.delete_repo_node(&repo_uid).unwrap();
+        state.store.insert_repo(&existing).unwrap();
+        assert_eq!(members(&state), 0, "precondition: membership dropped");
+        nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, "repo re-added");
+        assert!(
+            eventually(|| members(&state) == 1).await,
+            "the pass rebuilt it"
         );
 
         let _ = state.shutdown_tx.send(true);

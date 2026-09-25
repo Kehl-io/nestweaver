@@ -2774,14 +2774,24 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     }
 
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
-    pin_note_seed_code_links(
+    // nw-670 re-review N7: only notes/sections the caller NAMED pin their
+    // code — not every member a `vlt:`/`repo:` container seed expanded to.
+    let named_note_seeds = explicitly_named_seeds(&direct_seed_uids, &directly_named);
+    let newly_rendered = pin_note_seed_code_links(
         store,
         &seeds,
         &mut connected,
         &direct_seed_uids,
+        &named_note_seeds,
         &ppr,
         render_cap.and_then(|cap| cap.admit),
     )?;
+    // N7: pins count toward a hydration cap (investigate) and its pre-cap
+    // disclosure like any other admitted candidate.
+    if let Some(cap) = render_cap {
+        admitted_before_cap += newly_rendered;
+        connected.truncate(cap.connected);
+    }
 
     // Cover cancellation after inference/vector work but before the completed
     // result crosses the engine boundary into single-flight/cache publication.
@@ -2879,6 +2889,19 @@ fn pin_direct_seeds_in_connected(
     *connected = pinned;
 }
 
+/// nw-670 re-review N7: the direct seeds the caller NAMED, excluding the
+/// members a `vlt:`/`repo:` container seed expanded to.
+fn explicitly_named_seeds(
+    direct_seed_uids: &[String],
+    directly_named: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    direct_seed_uids
+        .iter()
+        .filter(|uid| directly_named.contains(*uid))
+        .cloned()
+        .collect()
+}
+
 /// nw-670 re-review F2: at most this many symbols a note/section seed links
 /// to directly are guaranteed a place in `connected`.
 pub(crate) const NOTE_SEED_CODE_LINK_SLOTS: usize = 8;
@@ -2894,19 +2917,25 @@ pub(crate) const NOTE_SEED_CODE_LINK_SLOTS: usize = 8;
 /// This narrowly guarantees those links slots, bounded by
 /// [`NOTE_SEED_CODE_LINK_SLOTS`], and leaves the global fusion weights (and
 /// symbol-seeded queries) untouched. `admit` is the caller's scope filter.
+/// Returns how many pinned nodes were hydrated here (not already in
+/// `connected`), for the caller's cap accounting. `named_seed_uids` are the
+/// seeds the caller named explicitly (N7).
 fn pin_note_seed_code_links(
     store: &GraphStore,
     seeds: &[BrainNode],
     connected: &mut Vec<BrainNode>,
     direct_seed_uids: &[String],
+    named_seed_uids: &[String],
     ppr: &[(String, f64)],
     admit: Option<&dyn Fn(&str) -> bool>,
-) -> Result<(), anyhow::Error> {
+) -> Result<usize, anyhow::Error> {
     let direct: std::collections::HashSet<&str> =
         direct_seed_uids.iter().map(String::as_str).collect();
+    let named: std::collections::HashSet<&str> =
+        named_seed_uids.iter().map(String::as_str).collect();
     let mut note_seeds: Vec<String> = Vec::new();
     for node in seeds.iter().chain(connected.iter()) {
-        if direct.contains(node.uid.as_str())
+        if named.contains(node.uid.as_str())
             && (node.uid.starts_with("note:") || node.uid.starts_with("sec:"))
             && !note_seeds.contains(&node.uid)
         {
@@ -2914,7 +2943,7 @@ fn pin_note_seed_code_links(
         }
     }
     if note_seeds.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let ppr_score: std::collections::HashMap<&str, f64> = ppr
         .iter()
@@ -2930,6 +2959,7 @@ fn pin_note_seed_code_links(
         })
     });
     let mut linked: Vec<BrainNode> = Vec::new();
+    let mut hydrated = 0usize;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, symbol, _) in &edges {
         if linked.len() >= NOTE_SEED_CODE_LINK_SLOTS {
@@ -2943,16 +2973,20 @@ fn pin_note_seed_code_links(
         }
         let node = match connected.iter().find(|node| &node.uid == symbol) {
             Some(existing) => Some(existing.clone()),
-            None => render_brain_node(
-                store,
-                symbol,
-                ppr_score.get(symbol.as_str()).copied().unwrap_or(0.0),
-            )?,
+            None => {
+                let node = render_brain_node(
+                    store,
+                    symbol,
+                    ppr_score.get(symbol.as_str()).copied().unwrap_or(0.0),
+                )?;
+                hydrated += usize::from(node.is_some());
+                node
+            }
         };
         linked.extend(node);
     }
     if linked.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let pinned: std::collections::HashSet<String> =
         linked.iter().map(|node| node.uid.clone()).collect();
@@ -2962,7 +2996,7 @@ fn pin_note_seed_code_links(
         .take_while(|node| direct.contains(node.uid.as_str()))
         .count();
     connected.splice(front..front, linked);
-    Ok(())
+    Ok(hydrated)
 }
 
 /// Tanh-based score normalization.
@@ -5407,7 +5441,10 @@ mod dedup_heading_section_tests {
 
 #[cfg(test)]
 mod pin_direct_seeds_tests {
-    use super::{BrainNode, GraphStore, pin_direct_seeds_in_connected, pin_note_seed_code_links};
+    use super::{
+        BrainNode, GraphStore, explicitly_named_seeds, pin_direct_seeds_in_connected,
+        pin_note_seed_code_links,
+    };
 
     fn node(uid: &str) -> BrainNode {
         BrainNode {
@@ -5433,6 +5470,21 @@ mod pin_direct_seeds_tests {
         );
     }
 
+    /// nw-670 re-review N7: a container seed's expanded members are direct
+    /// seeds but not NAMED ones, so they do not pin their code.
+    #[test]
+    fn container_members_are_not_named_seeds() {
+        let direct = vec!["note:named".to_string(), "note:member".to_string()];
+        let named: std::collections::HashSet<String> =
+            ["note:named".to_string(), "vlt:v".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            explicitly_named_seeds(&direct, &named),
+            vec!["note:named".to_string()]
+        );
+    }
+
     /// nw-670 re-review F2 counterweight: only Note/Section seeds pin their
     /// code links; a symbol seed leaves `connected` exactly as fused.
     #[test]
@@ -5444,6 +5496,7 @@ mod pin_direct_seeds_tests {
             &store,
             &seeds,
             &mut connected,
+            &["sym:Long".to_string()],
             &["sym:Long".to_string()],
             &[],
             None,

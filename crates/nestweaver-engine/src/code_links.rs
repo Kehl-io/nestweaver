@@ -73,6 +73,10 @@ pub struct CodeLinksState {
     /// notes changed on disk since indexing, left unlinked until refreshed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub changed_by_vault: std::collections::BTreeMap<String, usize>,
+    /// nw-670 re-review N6: when the pass that counted `changed_by_vault`
+    /// ran — the count is as of then, not live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_as_of: Option<String>,
     /// nw-670 re-review F1: from the last completed pass — projects whose
     /// declared repos resolved to none, so their notes link unscoped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -239,6 +243,7 @@ pub fn code_links_status_json(db_path: Option<&Path>) -> serde_json::Value {
         "last_reconciled_at": state.last_reconciled_at,
         // nw-670 re-review F4: notes changed on disk since indexing have no
         // links until their vault is refreshed.
+        "notes_changed_as_of": state.changed_as_of,
         "notes_changed_since_indexing": state
             .changed_by_vault
             .iter()
@@ -421,7 +426,13 @@ impl CodeLinkReconciler {
                     || state.unscoped_projects != report.unscoped_projects;
                 state.changed_by_vault = report.changed_by_vault.clone();
                 state.unscoped_projects = report.unscoped_projects.clone();
-                differs
+                // N6: only stamp a time when there is a count to date.
+                let as_of = (!report.changed_by_vault.is_empty()).then(now_iso);
+                let stamp_differs = state.changed_as_of.is_some() != as_of.is_some();
+                if differs || stamp_differs {
+                    state.changed_as_of = as_of;
+                }
+                differs || stamp_differs
             });
         }
         match &outcome {
@@ -1551,6 +1562,30 @@ repos = ["alpha"]
             3,
             "the note's three linked symbols are in the top 4: {top:?}"
         );
+
+        // N7: under a hydration cap (investigate), pins count toward it.
+        let capped = crate::query::build_brain_context_hybrid_with_aliases_capped(
+            &fx.store,
+            &["Ingestion engine".to_string()],
+            Some(&tantivy),
+            &crate::query::HybridSearchConfig::default(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(crate::query::RenderCap {
+                seeds: 5,
+                connected: 2,
+                admit: None,
+            }),
+        )
+        .unwrap();
+        assert!(capped.connected.len() <= 2, "{:?}", capped.connected);
+        assert!(
+            capped.admitted_before_cap.unwrap_or(0) >= capped.connected.len(),
+            "{capped:?}"
+        );
     }
 
     /// A vault with `proj/a.md` naming `SharedWidget`, defined in repos
@@ -1676,6 +1711,8 @@ repos = [{repos}]
         let changed = &status["notes_changed_since_indexing"];
         assert_eq!(changed.as_array().map(Vec::len), Some(1), "{status}");
         assert_eq!(changed[0]["count"], 1, "{status}");
+        // nw-670 re-review N6: the count is dated to its pass.
+        assert!(status["notes_changed_as_of"].is_string(), "{status}");
     }
 
     /// Stand-in for a refresh that recreated the notes' links' absence: drop
