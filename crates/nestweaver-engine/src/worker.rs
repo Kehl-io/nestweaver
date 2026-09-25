@@ -107,6 +107,9 @@ pub struct WorkerPool {
     repo_types: Arc<HashMap<String, RepoType>>,
     index_limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
+    /// nw-673: the instance's `[cross_domain]` settings for the discovery
+    /// pass after each vault fetch.
+    cross_domain: Arc<crate::config::CrossDomainConfig>,
     /// Tracks successful incremental code updates so server mode can
     /// periodically force a full refresh and bound graph drift.
     reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
@@ -120,6 +123,7 @@ impl WorkerPool {
             repo_types: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
             note_limits: crate::index_limits::NoteLimits::default(),
+            cross_domain: Arc::new(crate::config::CrossDomainConfig::default()),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
     }
@@ -143,6 +147,13 @@ impl WorkerPool {
     /// Apply the configured markdown-note size limit to vault-repo reads.
     pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
         self.note_limits = limits;
+        self
+    }
+
+    /// Apply the instance's `[cross_domain]` settings to link discovery
+    /// (nw-673).
+    pub fn with_cross_domain_config(mut self, config: crate::config::CrossDomainConfig) -> Self {
+        self.cross_domain = Arc::new(config);
         self
     }
 
@@ -206,6 +217,7 @@ impl WorkerPool {
         let repo_types = self.repo_types.clone();
         let index_limits = self.index_limits;
         let note_limits = self.note_limits;
+        let cross_domain = Arc::clone(&self.cross_domain);
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -316,6 +328,7 @@ impl WorkerPool {
             let write_gate = write_gate.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
+            let cross_domain = Arc::clone(&cross_domain);
             let reindex_tracker = self.reindex_tracker.clone();
 
             tasks.spawn(async move {
@@ -387,6 +400,7 @@ impl WorkerPool {
                                 force_full_reindex,
                                 index_limits,
                                 note_limits,
+                                &cross_domain,
                                 move || {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
@@ -785,10 +799,12 @@ where
         force_full_reindex,
         crate::index_limits::IndexLimits::default(),
         crate::index_limits::NoteLimits::default(),
+        &crate::config::CrossDomainConfig::default(),
         acquire_write_guard,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,
@@ -796,6 +812,7 @@ fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     force_full_reindex: bool,
     limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
+    cross_domain: &crate::config::CrossDomainConfig,
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
@@ -874,9 +891,11 @@ where
                 vault_uid,
                 &reader as &dyn crate::content_reader::ContentReader,
             );
-            if let Err(e) =
-                crate::cross_domain::discover_cross_domain_links_with_readers(store, &vault_readers)
-            {
+            if let Err(e) = crate::cross_domain::discover_cross_domain_links_with_readers_and_config(
+                store,
+                &vault_readers,
+                cross_domain,
+            ) {
                 // `{e:#}` — include the cause chain; `{e}` shows only the
                 // outermost context (a bare function name).
                 tracing::warn!(
@@ -1723,6 +1742,89 @@ mod tests {
             second.is_none(),
             "an unchanged vault must be skipped on the next poll"
         );
+    }
+
+    /// nw-673: the configured `[cross_domain]` stoplist reaches the server
+    /// worker's discovery pass after a vault fetch. Counterweight: the
+    /// default config links the same note.
+    #[test]
+    fn the_configured_stoplist_reaches_worker_discovery() {
+        for (config, expected) in [
+            (
+                crate::config::CrossDomainConfig {
+                    stoplist_extend: vec!["AlphaWidget".to_string()],
+                    ..Default::default()
+                },
+                0,
+            ),
+            (crate::config::CrossDomainConfig::default(), 2),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let src = tmp.path().join("source");
+            create_source_repo(&src, &[("a.md", "# A\n\nuses AlphaWidget\n")]);
+            let url = format!("file://{}", src.display());
+            let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+            let store = nestweaver_store::GraphStore::in_memory().unwrap();
+            let r_uid = nestweaver_schema::repo_uid("test-instance", "https://example.com/code");
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: nestweaver_schema::symbol_uid(&r_uid, "src/w.rs", "AlphaWidget", 1),
+                    name: "AlphaWidget".to_string(),
+                    kind: nestweaver_schema::SymbolKind::Class,
+                    repo_uid: r_uid,
+                    file_path: "src/w.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: "struct AlphaWidget".to_string(),
+                    summary: None,
+                    content_hash: "h".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            let job = IndexJob {
+                id: 1,
+                repo_id: "vault-repo".to_string(),
+                repo_url: url,
+                trigger: JobTrigger::Unindexed,
+                priority: 0,
+                status: crate::jobs::JobStatus::Running,
+                attempt: 1,
+                max_attempts: 4,
+                error_msg: None,
+                branch: None,
+                claimed_by: None,
+                created_at: 0,
+                updated_at: 0,
+                started_at: Some(0),
+                completed_at: None,
+            };
+            let prepared = prepare_job(&job, &ws, &store, "test-instance", None, RepoType::Vault)
+                .unwrap()
+                .unwrap();
+            commit_prepared_job_with_reindex_decision_and_limits(
+                &prepared,
+                &store,
+                "test-instance",
+                false,
+                crate::index_limits::IndexLimits::default(),
+                crate::index_limits::NoteLimits::default(),
+                &config,
+                || Ok::<_, anyhow::Error>(()),
+            )
+            .unwrap();
+            assert_eq!(
+                store.count_references_code_edges().unwrap(),
+                expected,
+                "{config:?}"
+            );
+        }
     }
 
     /// Crash-between-SHA-and-content self-heal: a Repo row whose indexed_sha

@@ -1184,6 +1184,25 @@ repos = ["alpha"]
         );
     }
 
+    /// nw-673: the configured `[cross_domain]` stoplist reaches the
+    /// reconciler (it used to reach no route at all). Counterweight: the
+    /// other note still links.
+    #[test]
+    fn the_configured_stoplist_reaches_the_reconciler() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        let config = crate::config::CrossDomainConfig {
+            stoplist_extend: vec!["AlphaWidget".to_string()],
+            ..Default::default()
+        };
+        reconcile_code_links(&fx.store, &config).unwrap();
+        assert_eq!(
+            edges(&fx.store).len(),
+            2,
+            "only b's links: AlphaWidget is stoplisted"
+        );
+    }
+
     /// Stand-in for a refresh that recreated the notes' links' absence: drop
     /// every code link directly (the vault is gone, so a real refresh would
     /// refuse to empty it).

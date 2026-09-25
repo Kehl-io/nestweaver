@@ -98,7 +98,7 @@ use nestweaver_engine::{
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
+    changed_files_from_git, compute_clusters, compute_cochanges,
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
     filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_summaries,
@@ -27958,6 +27958,11 @@ fn run_brain(
             }
 
             // Respect watch config when --config is provided.
+            // nw-673: taken before `watch_cfg` consumes the config.
+            let cross_domain = instance_cfg
+                .as_ref()
+                .map(|config| config.cross_domain.clone())
+                .unwrap_or_default();
             let watch_cfg = instance_cfg.map(|c| c.watch).unwrap_or_default();
             if !watch_cfg.enabled {
                 out.status(
@@ -28032,6 +28037,7 @@ fn run_brain(
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
                 .with_note_limits(note_limits)
+                .with_cross_domain_config(cross_domain)
                 .with_debounce_ms(watch_cfg.debounce_ms);
             let stop = watcher.shutdown_handle();
 
@@ -38078,7 +38084,10 @@ fn run_publication_rebuild(
                             eprintln!("{summary}");
                         }
                     }
-                    discover_cross_domain_links(&store)?;
+                    nestweaver_engine::discover_cross_domain_links_with_config(
+                        &store,
+                        &config.cross_domain,
+                    )?;
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;

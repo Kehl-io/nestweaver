@@ -135,6 +135,16 @@ pub fn discover_cross_domain_links_with_readers(
     discover_cross_domain_links_full(store, &CrossDomainConfig::default(), vault_readers)
 }
 
+/// [`discover_cross_domain_links_with_readers`] honouring the instance's
+/// `[cross_domain]` settings (nw-673: the server worker's route).
+pub fn discover_cross_domain_links_with_readers_and_config(
+    store: &GraphStore,
+    vault_readers: &VaultReaders<'_>,
+    config: &CrossDomainConfig,
+) -> Result<CrossDomainResult, anyhow::Error> {
+    discover_cross_domain_links_full(store, config, vault_readers)
+}
+
 /// Like `discover_cross_domain_links` but honours the provided `CrossDomainConfig`.
 pub fn discover_cross_domain_links_with_config(
     store: &GraphStore,
@@ -1667,6 +1677,62 @@ mod tests {
             let idx = index_of(&[sym("sym:1", name, "Class", "r", "src/a.rs")]);
             assert!(idx.is_empty(), "'{name}' should be stopped");
         }
+    }
+
+    /// nw-673: the configured stoplist reaches bulk discovery.
+    /// Counterweight: the default config links the same note.
+    #[test]
+    fn the_configured_stoplist_reaches_bulk_discovery() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(vault_root.join("a.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        let db_path = dir.path().join("test.lbug");
+        crate::index_md::index_markdown_directory(&vault_root, &db_path, "default", "vault")
+            .unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid(&r_uid, "src/w.rs", "AlphaWidget", 1),
+                name: "AlphaWidget".to_string(),
+                kind: SymbolKind::Class,
+                repo_uid: r_uid,
+                file_path: "src/w.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "struct AlphaWidget".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        let config = CrossDomainConfig {
+            stoplist_extend: vec!["AlphaWidget".to_string()],
+            ..Default::default()
+        };
+        discover_cross_domain_links_with_config(&store, &config).unwrap();
+        assert_eq!(store.count_references_code_edges().unwrap(), 0);
+        discover_cross_domain_links(&store).unwrap();
+        assert_eq!(store.count_references_code_edges().unwrap(), 2);
     }
 
     #[test]

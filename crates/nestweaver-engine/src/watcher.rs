@@ -280,6 +280,10 @@ pub struct BrainWatcher {
     /// `[indexing].max_note_bytes`. Defaults to 1 MiB so tests and unconfigured
     /// watchers match the markdown indexer.
     note_limits: crate::index_limits::NoteLimits,
+    /// nw-673: the instance's `[cross_domain]` settings (stoplist, minimum
+    /// name length) for the watcher's own link scan, so an edited note is
+    /// linked by the same rules the reconciler and the bulk pass apply.
+    cross_domain: crate::config::CrossDomainConfig,
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
@@ -409,6 +413,7 @@ impl BrainWatcher {
             ignore_set,
             note_limits: crate::index_limits::NoteLimits::default(),
             external_tantivy: None,
+            cross_domain: crate::config::CrossDomainConfig::default(),
             mutation_lease_factory: None,
             ready_callback: None,
             reconcile_retry_base: RECONCILE_RETRY_BASE,
@@ -471,6 +476,13 @@ impl BrainWatcher {
     /// Apply the configured markdown-note size limit to watched vault reads.
     pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
         self.note_limits = limits;
+        self
+    }
+
+    /// Apply the instance's `[cross_domain]` settings to the link scan
+    /// (nw-673). Unset, the built-in defaults apply.
+    pub fn with_cross_domain_config(mut self, config: crate::config::CrossDomainConfig) -> Self {
+        self.cross_domain = config;
         self
     }
 
@@ -989,7 +1001,8 @@ impl BrainWatcher {
         let mut phase_timings = BatchPhaseTimings::default();
 
         let build_symbol_index_started = Instant::now();
-        let symbol_index = crate::cross_domain::build_symbol_index(store).ok();
+        let symbol_index =
+            crate::cross_domain::build_symbol_index_with_config(store, &self.cross_domain).ok();
         phase_timings.build_symbol_index_ms =
             build_symbol_index_started.elapsed().as_millis() as u64;
 
@@ -1424,16 +1437,19 @@ impl BrainWatcher {
         let built_index;
         let index = match symbols {
             Some(index) => Some(index),
-            None => match crate::cross_domain::build_symbol_index(store) {
-                Ok(index) => {
-                    built_index = index;
-                    Some(&built_index)
+            None => {
+                match crate::cross_domain::build_symbol_index_with_config(store, &self.cross_domain)
+                {
+                    Ok(index) => {
+                        built_index = index;
+                        Some(&built_index)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "watcher cross-domain refresh failed");
+                        None
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "watcher cross-domain refresh failed");
-                    None
-                }
-            },
+            }
         }
         // No code indexed: nothing to bridge to, and existing edges are left
         // alone, as the per-note path did.
@@ -3985,6 +4001,35 @@ mod tests {
         assert!(
             large.sidecar_boundary_statements > 0,
             "the counter must see the flush"
+        );
+    }
+
+    /// nw-673: the configured `[cross_domain]` stoplist reaches the
+    /// watcher's link scan. Counterweight: the other edited note links.
+    #[test]
+    fn nw_673_the_configured_stoplist_reaches_the_watcher() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses BravoWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_cross_domain_config(crate::config::CrossDomainConfig {
+                stoplist_extend: vec!["AlphaWidget".to_string()],
+                ..Default::default()
+            });
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+        assert_eq!(
+            fx.store.list_references_code_edges().unwrap().len(),
+            2,
+            "only n001's note + section edge"
         );
     }
 

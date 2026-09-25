@@ -561,6 +561,7 @@ pub use cross_domain::{
     CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
     build_symbol_index_with_config, discover_cross_domain_links,
     discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
+    discover_cross_domain_links_with_readers_and_config,
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,

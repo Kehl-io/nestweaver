@@ -6526,7 +6526,16 @@ impl NestWeaverDaemon for DaemonService {
             nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
-                .with_note_limits(note_limits);
+                .with_note_limits(note_limits)
+                // nw-673: the watcher links edited notes by the same
+                // configured rules as the code-link reconciler.
+                .with_cross_domain_config(
+                    self.state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|config| config.cross_domain.clone())
+                        .unwrap_or_default(),
+                );
 
         // Share the daemon's writer-mode Tantivy handle with the watcher
         // so live edits update BM25 in place. Opening a separate handle
@@ -15037,6 +15046,13 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.note_limits())
                 .unwrap_or_default();
+            // nw-673: the configured `[cross_domain]` settings reach the
+            // server worker's discovery pass too.
+            let worker_cross_domain = state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.cross_domain.clone())
+                .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -15063,7 +15079,8 @@ pub async fn run_server(
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
                     .with_index_limits(worker_index_limits)
-                    .with_note_limits(worker_note_limits);
+                    .with_note_limits(worker_note_limits)
+                    .with_cross_domain_config(worker_cross_domain);
 
                 pool.run_with_drain(
                     worker_job_queue,
