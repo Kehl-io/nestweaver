@@ -1219,7 +1219,7 @@ pub fn code_mentions(source: &str) -> Vec<CodeMention> {
     if let Some(frontmatter) = frontmatter {
         for (idx, line) in frontmatter.lines().enumerate() {
             let line_no = u32::try_from(idx + 2).unwrap_or(u32::MAX);
-            scan_inline_spans(line, line_no, &mut out);
+            scan_inline_spans(frontmatter_value(line), line_no, &mut out);
         }
     }
 
@@ -1260,6 +1260,25 @@ pub fn code_mentions(source: &str) -> Vec<CodeMention> {
 enum Where {
     Code,
     Prose,
+}
+
+/// The value part of a frontmatter line: `key: value` and `- key: value`
+/// yield `value`; any other line (a list item, a folded continuation) is
+/// all value. nw-670 review L9 (ADR R1): YAML KEYS such as `created_at` are
+/// schema, not a mention of code.
+fn frontmatter_value(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+    let key_len = body
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(body.len());
+    if key_len == 0 {
+        return body;
+    }
+    match body[key_len..].strip_prefix(':') {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest,
+        _ => body,
+    }
 }
 
 /// A frontmatter line: backtick spans are inline code, the rest prose.
@@ -1336,8 +1355,15 @@ fn scan_identifiers(text: &str, line_no: u32, place: Where, out: &mut Vec<CodeMe
             continue;
         }
         let name: String = chars[i..end].iter().collect();
-        let qualified = i > 0 && matches!(chars[i - 1], '.' | ':');
-        let call = !qualified && chars.get(end) == Some(&'(');
+        // `obj.name(`, `Type::name(` and `$obj->name(` are someone else's
+        // member (nw-670 review L9 adds `->`).
+        let qualified = i > 0
+            && (matches!(chars[i - 1], '.' | ':')
+                || (chars[i - 1] == '>' && i > 1 && chars[i - 2] == '-'));
+        // `file(s)` and `box(es)` are English plurals, not calls (L9).
+        let plural = chars[end..].starts_with(&['(', 's', ')'])
+            || chars[end..].starts_with(&['(', 'e', 's', ')']);
+        let call = !qualified && !plural && chars.get(end) == Some(&'(');
         if is_distinctive(&name) || call {
             out.push(CodeMention {
                 name,
@@ -1646,6 +1672,22 @@ mod code_mention_tests {
                 ("run_pipeline".to_string(), 3),
                 ("parse_row".to_string(), 8),
             ]
+        );
+    }
+
+    /// nw-670 review L9: plural `(s)`/`(es)` is not a call; `->name(` is
+    /// qualified; frontmatter KEYS are not mentions. Counterweights: a real
+    /// unqualified call, and a distinctive frontmatter VALUE, still count.
+    #[test]
+    fn plurals_arrow_members_and_frontmatter_keys_are_not_mentions() {
+        assert!(just_names("update the widget(s) and the box(es)").is_empty());
+        assert!(just_names("then $this->render(page) runs").is_empty());
+        assert_eq!(just_names("then render(page) runs"), ["render"]);
+        assert_eq!(
+            just_names(
+                "---\ncreated_at: 2026-09-25\n- due_date: soon\nnote_text: uses other_name\n---\nbody\n"
+            ),
+            ["other_name"]
         );
     }
 
