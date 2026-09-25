@@ -2855,6 +2855,14 @@ fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
 /// so the output format tracked whether a daemon was running instead of the
 /// `--json` flag (nw-108).
 fn render_investigate_text(payload: &serde_json::Value) {
+    // nw-670 re-review R1: owed note->code links, stamped by the daemon or
+    // (direct route) just before rendering.
+    if let Some(pending) = code_links_from_wire(payload) {
+        println!(
+            "{}",
+            nestweaver_engine::code_links::code_links_text_note(&pending)
+        );
+    }
     let text = |v: &serde_json::Value, k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -5514,7 +5522,7 @@ enum Commands {
     /// removes the canonical sidecar or the keyed copy matching its current
     /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold twelve sidecar artifacts in total\n(.filemeta.json, .generation, .manifests.json, .pagerank.json,\n.parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold thirteen sidecar artifacts in total\n(.code_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -21946,7 +21954,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             )?;
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
-            let payload = serde_json::to_value(&result)?;
+            let mut payload = serde_json::to_value(&result)?;
+            // nw-670 re-review R1: the direct route stamps what the daemon's
+            // MCP seam would have.
+            nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -30850,6 +30861,12 @@ fn print_brain_context_text(
     if let Some(note) = publication_text_note(upstream.publication.as_ref()) {
         println!("{note}");
     }
+    if let Some(pending) = &upstream.code_links {
+        println!(
+            "{}",
+            nestweaver_engine::code_links::code_links_text_note(pending)
+        );
+    }
     if let Some(detail) = &result.semantic_unavailable {
         println!(
             "Warning: semantic retrieval unavailable ({}). {}",
@@ -34462,6 +34479,11 @@ struct UpstreamContextDisclosure {
     /// `BrainContextResult` decode drops them, or from the local marker on
     /// the direct route.
     publication: Option<nestweaver_engine::index_publication::WatcherBatchDisclosure>,
+    /// nw-670 re-review R1: the `code_links_pending` object while note->code
+    /// links are owed — from the wire (the daemon stamped it), else from the
+    /// local sidecar on the direct route. Same class as nw-503: the typed
+    /// decode would otherwise drop it.
+    code_links: Option<serde_json::Value>,
 }
 
 impl UpstreamContextDisclosure {
@@ -34479,6 +34501,7 @@ impl UpstreamContextDisclosure {
                 .map(|n| n as usize),
             meta: value.get("_meta").cloned(),
             publication: publication_from_wire(value),
+            code_links: code_links_from_wire(value),
         }
     }
 
@@ -34486,6 +34509,9 @@ impl UpstreamContextDisclosure {
         if self.publication.is_none() {
             self.publication =
                 nestweaver_engine::index_publication::status(db_path).watcher_batch_disclosure();
+        }
+        if self.code_links.is_none() {
+            self.code_links = nestweaver_engine::code_links::code_links_pending_json(db_path);
         }
         self
     }
@@ -34601,7 +34627,26 @@ fn brain_context_json_value(
     if let Some(disclosure) = &upstream.publication {
         disclosure.stamp_into(&mut resp);
     }
+    if let Some(pending) = &upstream.code_links {
+        resp["code_links_incomplete"] = serde_json::json!(true);
+        resp["code_links_pending"] = pending.clone();
+    }
     resp
+}
+
+/// nw-670 re-review R1: the `code_links_pending` object a daemon answer
+/// carried, if it said links are owed.
+fn code_links_from_wire(value: &serde_json::Value) -> Option<serde_json::Value> {
+    (value
+        .get("code_links_incomplete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true))
+    .then(|| {
+        value
+            .get("code_links_pending")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
+    })
 }
 
 fn publication_from_wire(
@@ -34746,6 +34791,43 @@ mod context_json_renderer_tests {
         let clean =
             brain_context_json_value(&result, 30, None, &UpstreamContextDisclosure::default());
         assert!(clean.get("publication_in_progress").is_none());
+    }
+
+    /// nw-670 re-review R1: the typed reshape dropped the daemon's
+    /// `code_links_incomplete` / `code_links_pending` keys (the nw-503
+    /// class). They survive from the wire, and the direct route stamps them
+    /// from the local sidecar.
+    #[test]
+    fn brain_context_json_keeps_code_links_disclosure() {
+        let result = degraded_context();
+        let wire = serde_json::json!({
+            "code_links_incomplete": true,
+            "code_links_pending": { "reason": "full index of vault /v" },
+        });
+        let upstream = UpstreamContextDisclosure::from_wire(&wire);
+        let value = brain_context_json_value(&result, 30, None, &upstream);
+        assert_eq!(value["code_links_incomplete"], serde_json::json!(true));
+        assert_eq!(
+            value["code_links_pending"]["reason"],
+            serde_json::json!("full index of vault /v")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let clean = UpstreamContextDisclosure::default().with_local_publication(&db);
+        assert!(
+            brain_context_json_value(&result, 30, None, &clean)
+                .get("code_links_incomplete")
+                .is_none()
+        );
+        nestweaver_engine::code_links::mark_code_links_pending(&db, "refresh of vault /v");
+        let local = UpstreamContextDisclosure::default().with_local_publication(&db);
+        let value = brain_context_json_value(&result, 30, None, &local);
+        assert_eq!(value["code_links_incomplete"], serde_json::json!(true));
+        assert_eq!(
+            value["code_links_pending"]["reason"],
+            serde_json::json!("refresh of vault /v")
+        );
     }
 }
 
