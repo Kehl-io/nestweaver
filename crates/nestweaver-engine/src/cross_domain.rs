@@ -355,32 +355,104 @@ fn scan_one_note(
 ///
 /// `sections` must come from parsing `source`: their file-absolute
 /// `start_line`/`end_line` spans index into its lines.
+///
+/// nw-675: this is [`note_mentions`] then [`resolve_note`] — the split the
+/// code-link reconciler uses to cache a note's mentions across passes. One
+/// implementation behind the bulk pass, the vault watcher and the
+/// reconciler, so the three cannot drift apart.
 pub(crate) fn scan_note_source(
     note_uid: &str,
     source: &str,
     sections: &[nestweaver_schema::Section],
     index: &SymbolIndex,
 ) -> ScannedNote {
-    // Whole-note pass.
-    let note_edges = index
-        .scan(source)
-        .into_iter()
-        .map(|(sym_uid, conf)| (note_uid.to_string(), sym_uid, conf, "name-match"))
-        .collect();
+    let spans: Vec<SectionSpan> = sections.iter().map(SectionSpan::of).collect();
+    resolve_note(note_uid, &note_mentions(source), &spans, index)
+}
 
-    // Per-section pass.
-    let body_lines: Vec<&str> = source.lines().collect();
-    let mut section_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
-    for sec in sections {
-        let text = slice_body_lines(&body_lines, sec.start_line, sec.end_line);
-        if text.trim().is_empty() {
-            continue;
-        }
-        for (sym_uid, conf) in index.scan(&text) {
-            section_edges.push((sec.uid.clone(), sym_uid, conf, "name-match"));
+/// A section's uid and its file-absolute, 1-based inclusive line span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SectionSpan {
+    pub(crate) uid: String,
+    pub(crate) start_line: u32,
+    pub(crate) end_line: u32,
+}
+
+impl SectionSpan {
+    fn of(section: &nestweaver_schema::Section) -> Self {
+        Self {
+            uid: section.uid.clone(),
+            start_line: section.start_line,
+            end_line: section.end_line,
         }
     }
 
+    fn contains(&self, line: u32) -> bool {
+        self.start_line >= 1 && line >= self.start_line && line <= self.end_line
+    }
+}
+
+/// What a note's text mentions, independent of any symbol index: each
+/// candidate name with the (1-based, sorted, distinct) lines it occurs on.
+/// nw-675: cheap to keep per note, so the reconciler re-resolves a note
+/// against a changed symbol index without re-reading or re-parsing it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NoteMentions {
+    names: Vec<(String, Vec<u32>)>,
+}
+
+/// Collect a note's mentions (see [`NoteMentions`]).
+pub(crate) fn note_mentions(source: &str) -> NoteMentions {
+    let mut by_name: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        for token in tokenize(line) {
+            let lines = by_name.entry(token).or_default();
+            if lines.last() != Some(&line_no) {
+                lines.push(line_no);
+            }
+        }
+    }
+    let mut names: Vec<(String, Vec<u32>)> = by_name
+        .into_iter()
+        .map(|(name, lines)| (name.to_string(), lines))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    NoteMentions { names }
+}
+
+/// Resolve a note's mentions against `index` into its note-level edges and,
+/// per section, the edges for names mentioned on that section's lines.
+pub(crate) fn resolve_note(
+    note_uid: &str,
+    mentions: &NoteMentions,
+    sections: &[SectionSpan],
+    index: &SymbolIndex,
+) -> ScannedNote {
+    let mut note_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
+    let mut section_edges: Vec<(String, String, f32, &'static str)> = Vec::new();
+    let mut note_seen: HashSet<&str> = HashSet::new();
+    let mut section_seen: HashSet<(&str, &str)> = HashSet::new();
+    for (name, lines) in &mentions.names {
+        let Some(candidates) = index.by_name.get(name) else {
+            continue;
+        };
+        for (uid, conf) in candidates {
+            if note_seen.insert(uid.as_str()) {
+                note_edges.push((note_uid.to_string(), uid.clone(), *conf, "name-match"));
+            }
+        }
+        for section in sections {
+            if !lines.iter().any(|line| section.contains(*line)) {
+                continue;
+            }
+            for (uid, conf) in candidates {
+                if section_seen.insert((section.uid.as_str(), uid.as_str())) {
+                    section_edges.push((section.uid.clone(), uid.clone(), *conf, "name-match"));
+                }
+            }
+        }
+    }
     ScannedNote {
         note_uid: note_uid.to_string(),
         note_edges,
@@ -393,20 +465,20 @@ impl ScannedNote {
     pub(crate) fn edge_count(&self) -> usize {
         self.note_edges.len() + self.section_edges.len()
     }
-}
 
-/// Concatenate body lines `[start..=end]` (1-based, inclusive). Falls
-/// back to empty string for out-of-range inputs.
-fn slice_body_lines(lines: &[&str], start: u32, end: u32) -> String {
-    if start == 0 || start as usize > lines.len() {
-        return String::new();
+    /// The note this scan belongs to.
+    pub(crate) fn note_uid(&self) -> &str {
+        &self.note_uid
     }
-    let end = (end as usize).min(lines.len());
-    let start = (start - 1) as usize;
-    if start >= end {
-        return String::new();
+
+    /// Every edge this scan would write, note- and section-level together,
+    /// as `(from_uid, symbol_uid, confidence)`.
+    pub(crate) fn edges(&self) -> impl Iterator<Item = (&str, &str, f32)> {
+        self.note_edges
+            .iter()
+            .chain(&self.section_edges)
+            .map(|(from, to, conf, _)| (from.as_str(), to.as_str(), *conf))
     }
-    lines[start..end].join("\n")
 }
 
 /// Symbol-name → list of (uid, confidence) candidates. Built once per
@@ -462,26 +534,6 @@ impl SymbolIndex {
     pub(crate) fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
-
-    /// Walk `text` token-by-token on word boundaries; for each token,
-    /// look up the symbol name set. Returns (sym_uid, confidence) for
-    /// each distinct (uid) hit. A symbol mentioned twice in the same
-    /// text appears once in the output — duplicate edges would inflate
-    /// PPR scores without semantic justification.
-    fn scan(&self, text: &str) -> Vec<(String, f32)> {
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut out: Vec<(String, f32)> = Vec::new();
-        for token in tokenize(text) {
-            if let Some(candidates) = self.by_name.get(token) {
-                for (uid, conf) in candidates {
-                    if seen.insert(uid.as_str()) {
-                        out.push((uid.clone(), *conf));
-                    }
-                }
-            }
-        }
-        out
-    }
 }
 
 /// Split `text` into identifier-shaped tokens. Word boundary = any
@@ -505,6 +557,16 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    /// Note-level `(symbol_uid, confidence)` hits for `text` — the old
+    /// `SymbolIndex::scan`, now the shared mentions-then-resolve path.
+    fn scan(index: &SymbolIndex, text: &str) -> Vec<(String, f32)> {
+        resolve_note("note:t", &note_mentions(text), &[], index)
+            .note_edges
+            .into_iter()
+            .map(|(_, uid, conf, _)| (uid, conf))
+            .collect()
+    }
+
     #[test]
     fn tokenize_splits_on_word_boundaries() {
         let tokens: Vec<&str> = tokenize("foo bar.baz_qux Class::method").collect();
@@ -527,12 +589,12 @@ mod tests {
         ];
         let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
         assert!(
-            idx.scan("calls Get and Processor")
+            scan(&idx, "calls Get and Processor")
                 .iter()
                 .any(|(u, _)| u == "sym:2")
         );
         // "Get" is below MIN length and must NOT appear.
-        assert!(!idx.scan("Get").iter().any(|(u, _)| u == "sym:1"));
+        assert!(!scan(&idx, "Get").iter().any(|(u, _)| u == "sym:1"));
     }
 
     #[test]
@@ -543,7 +605,7 @@ mod tests {
             "Class".to_string(),
         )];
         let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-        let hits = idx.scan("Authenticator and Authenticator and Authenticator");
+        let hits = scan(&idx, "Authenticator and Authenticator and Authenticator");
         assert_eq!(hits.len(), 1);
     }
 
@@ -933,7 +995,7 @@ mod tests {
             ),
         ];
         let idx = SymbolIndex::build_with_config(&symbols, &CrossDomainConfig::default());
-        let hits = idx.scan("Error and AuthService");
+        let hits = scan(&idx, "Error and AuthService");
         assert_eq!(hits.len(), 1, "only AuthService should match");
         assert_eq!(hits[0].0, "sym:2");
     }

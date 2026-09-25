@@ -429,6 +429,7 @@ pub mod circuit_breaker;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod cochange;
+pub mod code_links;
 pub mod config;
 pub mod content_reader;
 pub mod context_graph;

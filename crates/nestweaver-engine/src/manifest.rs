@@ -697,6 +697,37 @@ pub fn begin_graph_mutation_publication<'a>(
     let lease = store
         .acquire_index_publication_lease()
         .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?;
+    begin_graph_mutation_publication_on_lease(store, lease, operation)
+}
+
+/// [`begin_graph_mutation_publication`] without blocking: `Ok(None)` while
+/// another publisher owns the publication lease.
+///
+/// nw-675: for a caller that already holds the daemon's write gate. Blocking
+/// on the publication lease there can deadlock against a publisher (the vault
+/// watcher) that owns the publication and is waiting for the write gate to
+/// finalize it; on `None` the caller releases its gate, waits with
+/// `GraphStore::wait_until_index_publication_unowned`, and retries — the
+/// yield `index.rs` performs for the same reason.
+pub fn try_begin_graph_mutation_publication<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    operation: impl Into<String>,
+) -> Result<Option<GraphMutationPublicationGuard<'a>>, anyhow::Error> {
+    let operation = operation.into();
+    let Some(lease) = store
+        .try_acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?
+    else {
+        return Ok(None);
+    };
+    begin_graph_mutation_publication_on_lease(store, lease, operation).map(Some)
+}
+
+fn begin_graph_mutation_publication_on_lease<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    lease: nestweaver_store::IndexPublicationLease<'a>,
+    operation: String,
+) -> Result<GraphMutationPublicationGuard<'a>, anyhow::Error> {
     lease.ensure_clean_for_snapshot().map_err(|error| {
         anyhow::anyhow!("{operation}: refusing to overwrite a dirty publication: {error}")
     })?;

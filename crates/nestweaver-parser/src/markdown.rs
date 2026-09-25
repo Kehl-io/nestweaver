@@ -476,6 +476,14 @@ pub fn slugify(text: &str) -> String {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
+/// The `content_hash` [`parse_markdown`] records for `source`: SHA-256 of the
+/// file's original bytes. nw-675: the code-link reconciler re-reads a note
+/// from disk and uses this to confirm the text is the one the graph
+/// committed before attributing mentions to the committed sections.
+pub fn note_content_hash(source: &str) -> String {
+    sha256_hex(source)
+}
+
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());

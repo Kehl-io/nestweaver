@@ -2097,6 +2097,9 @@ pub struct DaemonState {
     /// covers each mutation; the retained handle is the second line of
     /// defence that lets teardown await the loop itself after admission closes.
     pub embedding_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// nw-675: the code-link reconcile loop, awaited on teardown like the two
+    /// loops above.
+    pub code_link_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for every watcher task this daemon has spawned.
     ///
     /// Same invariant as the two reconcile loops above, and it was missing for
@@ -2909,6 +2912,131 @@ async fn run_embedding_reconciler(state: Arc<DaemonState>, period: Duration) {
         }
     }
     tracing::debug!("embedding reconcile loop stopped");
+}
+
+/// How often the code-link reconciler looks for work (an O(1) generation
+/// read and a small sidecar read; a pass runs only when one of them moved).
+const CODE_LINK_RECONCILE_TICK: Duration = Duration::from_secs(2);
+
+/// Minimum spacing of passes triggered by graph changes alone, so a burst of
+/// watcher batches costs one pass rather than one each. Recorded debt (a
+/// refresh or re-index said it dropped links) does not wait for it.
+const CODE_LINK_RECONCILE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// nw-675: the code-link reconciler loop. Level-triggered like the two loops
+/// above: it does not rely on each route that drops note->code links (a full
+/// vault refresh, a code re-index) to repair them, only on the graph
+/// generation moving or on durable debt a route recorded. Each pass compares
+/// every note's links with what its committed text says and rewrites only the
+/// notes that differ (`nestweaver_engine::code_links`), scanning with no write
+/// lease held and taking the lease once per chunk that has writes.
+///
+/// The first pass after startup is unconditional: it settles debt recorded
+/// before a restart and whatever changed while the daemon was down.
+async fn run_code_link_reconciler(state: Arc<DaemonState>, tick_period: Duration) {
+    let mut shutdown = state.shutdown_tx.subscribe();
+    let mut tick = tokio::time::interval(tick_period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let config = state
+        .instance_cfg
+        .as_ref()
+        .map(|config| config.cross_domain.clone())
+        .unwrap_or_default();
+    let reconciler = Arc::new(std::sync::Mutex::new(
+        nestweaver_engine::code_links::CodeLinkReconciler::new(config),
+    ));
+    let mut last_generation: Option<u64> = None;
+    let mut last_pass: Option<Instant> = None;
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => break,
+        }
+        if backoff_until.is_some_and(|until| Instant::now() < until) {
+            continue;
+        }
+        let generation = state.store.graph_generation();
+        let owed = nestweaver_engine::code_links::code_links_pending(&state.db_path);
+        if !owed {
+            if last_generation == Some(generation) {
+                continue;
+            }
+            if last_pass.is_some_and(|at| at.elapsed() < CODE_LINK_RECONCILE_MIN_INTERVAL) {
+                continue;
+            }
+        }
+
+        // Admission first, as the other loops do: it makes the pass visible
+        // to the shutdown drain. Each chunk that writes additionally takes
+        // its own admission + write gate through the mutation lease factory,
+        // which refuses once shutdown begins, and `should_stop` ends the pass
+        // between chunks.
+        let Ok(_admission) = ConnectionGuard::write(&state) else {
+            break;
+        };
+        last_pass = Some(Instant::now());
+        let pass_state = Arc::clone(&state);
+        let pass_reconciler = Arc::clone(&reconciler);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let factory = daemon_mutation_lease_factory(Arc::clone(&pass_state));
+            let stop = Arc::clone(&pass_state.shutdown_started);
+            let mut reconciler = pass_reconciler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reconciler.reconcile(&pass_state.store, Some(&factory), &|| {
+                stop.load(Ordering::SeqCst)
+            })
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(report)) => {
+                if report.stopped {
+                    break;
+                }
+                consecutive_failures = 0;
+                backoff_until = None;
+                // The generation read BEFORE the pass: a change that landed
+                // during it triggers another pass.
+                last_generation = Some(generation);
+                if !report.rewritten.is_empty() {
+                    tracing::info!(
+                        notes_rewritten = report.rewritten.len(),
+                        edges_written = report.edges_written,
+                        notes_checked = report.notes_checked,
+                        notes_skipped = report.notes_skipped,
+                        "code link reconcile: rewrote notes whose code links were out of date"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                if error
+                    .downcast_ref::<nestweaver_engine::WatchMutationRefused>()
+                    .is_some()
+                {
+                    break;
+                }
+                // The debt and this error are recorded durably and shown by
+                // `brain status`; retried with backoff.
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until = Some(
+                    Instant::now() + trigram_reconcile_backoff(tick_period, consecutive_failures),
+                );
+                tracing::warn!(error = %format!("{error:#}"), consecutive_failures, "code link reconcile failed");
+            }
+            Err(join_error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until = Some(
+                    Instant::now() + trigram_reconcile_backoff(tick_period, consecutive_failures),
+                );
+                tracing::error!(%join_error, "code link reconcile task panicked");
+            }
+        }
+    }
+    tracing::debug!("code link reconcile loop stopped");
 }
 
 /// The SIGTERM handler task: route every SIGTERM into [`begin_shutdown_drain`].
@@ -7358,6 +7486,17 @@ impl NestWeaverDaemon for DaemonService {
                 &index_opts,
                 Some(&cancel_for_index),
             );
+            // nw-675: a re-index deletes changed files' symbols, and the
+            // cascade takes note links into them. Owed, disclosed, and
+            // rebuilt by the code-link reconciler. Recorded AFTER the write
+            // (whatever its outcome — a failure may still have committed):
+            // a reconcile pass already running when the debt is recorded
+            // must not be the one that settles it. A crash before this line
+            // is covered by the reconciler's unconditional first pass.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("code re-index of {}", repo_path.display()),
+            );
             #[cfg(feature = "release-fixture-hooks")]
             if let Some(scope) = &fixture_scope {
                 let error = index_result
@@ -7673,6 +7812,14 @@ impl NestWeaverDaemon for DaemonService {
                     &extra_patterns,
                     note_limits,
                 );
+            // nw-675: a full vault index recreates every note, and the
+            // cascade takes their code links. Owed, disclosed, and rebuilt
+            // by the code-link reconciler; recorded after the write, as in
+            // IndexRepo.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("full index of vault {}", vault_path.display()),
+            );
 
             match index_result {
                 Ok(result) => {
@@ -7904,7 +8051,7 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
+            let refreshed = nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
                 &state.store,
                 &vault_path,
                 &instance_id,
@@ -7912,7 +8059,14 @@ impl NestWeaverDaemon for DaemonService {
                 since,
                 &extra_patterns,
                 note_limits,
-            ) {
+            );
+            // nw-675: every re-indexed note is recreated without its code
+            // links; recorded after the write, as in IndexVault.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("refresh of vault {}", vault_path.display()),
+            );
+            match refreshed {
                 Ok(result) => {
                     let mutation = indexed_search_mutation(
                         indexed_before,
@@ -13799,6 +13953,7 @@ pub async fn run_server(
         worker_handle: std::sync::Mutex::new(None),
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
+        code_link_reconciler_handle: std::sync::Mutex::new(None),
         manifest_recovery: Arc::new(Default::default()),
         manifest_recovery_handle: std::sync::Mutex::new(None),
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -14030,6 +14185,21 @@ pub async fn run_server(
             .embedding_reconciler_handle
             .lock()
             .expect("embedding_reconciler_handle mutex poisoned") = Some(embedding_handle);
+    }
+
+    // nw-675: note->code links follow the graph whichever route changed it.
+    // Local writable daemons only: server mode reads vault notes from bare
+    // clones, which this loop cannot (the worker rediscovers after each vault
+    // fetch there).
+    if !read_only && !state.server_mode {
+        let code_link_handle = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            CODE_LINK_RECONCILE_TICK,
+        ));
+        *state
+            .code_link_reconciler_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(code_link_handle);
     }
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
@@ -15447,6 +15617,15 @@ pub async fn run_server(
         tracing::info!("draining embedding reconcile loop before exit");
         let _ = handle.await;
     }
+    let code_link_handle = state
+        .code_link_reconciler_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = code_link_handle {
+        tracing::info!("draining code link reconcile loop before exit");
+        let _ = handle.await;
+    }
 
     let manifest_handle = state
         .manifest_recovery_handle
@@ -16373,6 +16552,78 @@ credential_method = "gh"
             progress.push(event.unwrap());
         }
         progress
+    }
+
+    /// Poll until `done` holds, up to 20 s, for a background loop's effect.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        done()
+    }
+
+    /// nw-675: IndexVault — the daemon route of `brain add` and of a full
+    /// `brain refresh` — recreates every note, and the cascade took their
+    /// code links. Nothing rebuilt them; they stayed gone until each note was
+    /// edited. Now the route records the debt (shown by `brain status`) and
+    /// the code-link reconcile loop rebuilds the links and settles it.
+    #[tokio::test]
+    async fn index_vault_owes_code_links_and_the_reconcile_loop_rebuilds_them() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nThe AlphaWidget renders.\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub struct AlphaWidget;\n").unwrap();
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            repo.path(),
+            &state.db_path,
+            &state.data_instance_id,
+            "file:///fixture/repo",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let links = |state: &DaemonState| state.store.count_references_code_edges().unwrap();
+        let owed = |state: &DaemonState| {
+            nestweaver_engine::index_md::skipped_notes_status_json(Some(&state.db_path)).0
+                ["reconciliation_pending"]
+                .as_u64()
+                .unwrap()
+        };
+
+        index_vault_via_rpc(&state, &root).await;
+        assert_eq!(links(&state), 0, "the index itself writes no code links");
+        assert_eq!(owed(&state), 1, "the debt is disclosed in status");
+
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+        ));
+        assert!(
+            eventually(|| links(&state) == 2 && owed(&state) == 0).await,
+            "links {} owed {}",
+            links(&state),
+            owed(&state)
+        );
+
+        // A full refresh drops them again; the loop rebuilds them again.
+        index_vault_via_rpc(&state, &root).await;
+        assert!(
+            eventually(|| links(&state) == 2 && owed(&state) == 0).await,
+            "links {} owed {}",
+            links(&state),
+            owed(&state)
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
     }
 
     fn vault_derivation_record(
@@ -22684,6 +22935,7 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            code_link_reconciler_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -22970,6 +23222,7 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            code_link_reconciler_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),

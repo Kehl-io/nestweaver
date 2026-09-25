@@ -9800,6 +9800,43 @@ fn assert_config_expected_brain(
 /// Returns `None` when no path is given; when a path IS given but fails to
 /// parse, warns and returns `None` — so a typo'd `--config` doesn't silently
 /// disable ranking priors / inline-body tuning.
+/// nw-675: the direct-route (`--no-daemon`, CI-only) twin of the daemon's
+/// code-link reconcile loop. A write that may have dropped note->code links
+/// (a vault index or refresh, a code re-index) records the debt, and one pass
+/// rebuilds exactly the notes whose links no longer match their text before
+/// the command returns. A failed pass is a warning, not the command's
+/// failure: the debt stays recorded, `brain status` shows it, and the next
+/// pass (this route again, or a daemon's first pass) retries it.
+fn reconcile_code_links_direct(
+    db_path: &Path,
+    write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
+    config: Option<&Path>,
+    reason: &str,
+) {
+    nestweaver_engine::code_links::mark_code_links_pending(db_path, reason);
+    let cross_domain = load_instance_config_opt(config)
+        .map(|config| config.cross_domain)
+        .unwrap_or_default();
+    match GraphStore::open_with_authority(db_path, write_lease) {
+        Ok(store) => {
+            match nestweaver_engine::code_links::reconcile_code_links(&store, &cross_domain) {
+                Ok(report) if !report.rewritten.is_empty() => eprintln!(
+                    "Code links: rebuilt for {} note(s) ({} edge(s)).",
+                    report.rewritten.len(),
+                    report.edges_written
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    "code link reconciliation failed; the links stay owed and are retried: {error:#}"
+                ),
+            }
+        }
+        Err(error) => tracing::warn!(
+            "code link reconciliation skipped — cannot open DB for writing; the links stay owed: {error:#}"
+        ),
+    }
+}
+
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
     let p = path?;
     match nestweaver_engine::InstanceConfig::from_file(p) {
@@ -22637,6 +22674,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // single-flight lazy backstop, so this reports the mechanism rather
             // than asserting the sidecar was written on this particular run.
             out.status("PageRank computed at index time (lazy compute is the fallback).");
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("code re-index of {}", repo_path.display()),
+            );
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -26841,30 +26884,14 @@ fn run_brain(
                 );
             }
 
-            // Auto-discover cross-domain (notes ↔ code) bridges if any
-            // code symbols are indexed. Cheap no-op when there's no code.
-            // Needs a read-write store to persist the REFERENCES_CODE edges;
-            // if the DB is locked (e.g. a daemon holds it) skip with a warning
-            // rather than failing the whole `brain add`.
-            {
-                match GraphStore::open_with_authority(&db_path, &write_lease) {
-                    Ok(store_for_discovery) => {
-                        match discover_cross_domain_links(&store_for_discovery) {
-                            Ok(cd) if cd.note_to_symbol_edges + cd.section_to_symbol_edges > 0 => {
-                                println!(
-                                    "Cross-domain: {} note→symbol, {} section→symbol edge(s) created.",
-                                    cd.note_to_symbol_edges, cd.section_to_symbol_edges
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("cross-domain discovery failed: {e:#}"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        "cross-domain discovery skipped — cannot open DB for writing: {e:#}"
-                    ),
-                }
-            }
+            // Link notes to code (nw-675: the same reconciliation the
+            // daemon route relies on, so the two routes cannot drift).
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("index of vault {}", path.display()),
+            );
 
             // Auto-populate Tantivy BM25 index after brain add so that
             // `brain search` works immediately without a manual reindex.
@@ -28387,6 +28414,15 @@ fn run_brain(
                     nestweaver_engine::index_md::format_markdown_refresh_summary(&result)
                 );
             }
+
+            // nw-675: both arms recreate notes, and the cascade took their
+            // code links; rebuild them before returning.
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("refresh of vault {}", path.display()),
+            );
 
             // Auto-populate Tantivy BM25 index after brain refresh so that
             // `brain search` works immediately without a manual reindex.

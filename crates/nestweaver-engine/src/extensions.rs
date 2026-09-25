@@ -2334,7 +2334,7 @@ pub fn get_last_indexed_at(db_path: &Path, vault_uid: &str) -> Option<String> {
 
 /// Render Unix epoch seconds as RFC 3339-ish UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 /// Mirrors `secs_to_ymd_hms` from `index_md.rs`.
-fn format_epoch_secs(secs: i64) -> String {
+pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
     let hour = (secs_of_day / 3600) as u32;

@@ -2386,6 +2386,77 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// The REFERENCES_CODE edges of the notes in `note_uids` — each note's own
+    /// and its sections' — as `(note_uid, from_uid, symbol_uid, confidence)`.
+    /// `from_uid` is the note itself or one of its sections.
+    ///
+    /// nw-675: the code-link reconciler compares these with the edges the
+    /// notes SHOULD have, one bounded chunk of notes at a time, and rewrites
+    /// only the notes that differ. Reading every edge in the graph at once is
+    /// what this avoids.
+    pub fn references_code_edges_for_notes(
+        &self,
+        note_uids: &[String],
+    ) -> Result<Vec<(String, String, String, f64)>, StoreError> {
+        const CHUNK: usize = 256;
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for chunk in note_uids.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let uids = Value::List(
+                lbug::LogicalType::String,
+                chunk.iter().map(|uid| Value::String(uid.clone())).collect(),
+            );
+            for query in [
+                "UNWIND $uids AS u \
+                 MATCH (n:Note {uid: u})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) \
+                 RETURN n.uid, n.uid, b.uid, r.confidence",
+                "UNWIND $uids AS u \
+                 MATCH (n:Note {uid: u})-[:NOTE_HAS_SECTION]->(s:Section)\
+                 -[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) \
+                 RETURN n.uid, s.uid, b.uid, r.confidence",
+            ] {
+                let mut stmt = conn
+                    .prepare(query)
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                let rows = conn
+                    .execute(&mut stmt, vec![("uids", uids.clone())])
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                for row in rows {
+                    out.push((
+                        extract_string(&row, 0)?,
+                        extract_string(&row, 1)?,
+                        extract_string(&row, 2)?,
+                        extract_f64(&row, 3)?,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every section's `(uid, note_uid, start_line, end_line)`, in one scan.
+    /// nw-675: the code-link reconciler attributes mentions to sections by
+    /// line; one query instead of one `sections_in_note` per note.
+    pub fn list_section_spans(&self) -> Result<Vec<(String, String, u32, u32)>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (s:Section) RETURN s.uid, s.note_uid, s.start_line, s.end_line")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push((
+                extract_string(&row, 0)?,
+                extract_string(&row, 1)?,
+                u32::try_from(extract_i64(&row, 2)?).unwrap_or(0),
+                u32::try_from(extract_i64(&row, 3)?).unwrap_or(0),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Count of all wikilink edges (to either Note or Heading). Cheap status
     /// summary — does two separate queries since LadybugDB splits the
     /// logical WIKILINK into two physical REL tables.

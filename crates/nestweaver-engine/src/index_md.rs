@@ -1269,12 +1269,21 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
     // nw-653: `paths` carries no reasons, so an owed reconciliation would read
     // like a brainignored note. The uncapped count and the first few owed
     // notes WITH their reason are reported separately.
-    let pending_notes: Vec<serde_json::Value> = sidecar
-        .reconciliation_pending
-        .values()
-        .flatten()
+    // nw-675: owed note->code links (a full vault refresh or a code
+    // re-index dropped them; the code-link reconciler is rebuilding them)
+    // ride the same channel, first, so the list cap never hides them.
+    let code_links = db_path.and_then(crate::code_links::code_links_status_row);
+    let pending_notes: Vec<serde_json::Value> = code_links
+        .iter()
+        .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
+        .chain(
+            sidecar
+                .reconciliation_pending
+                .values()
+                .flatten()
+                .map(|file| serde_json::json!({ "path": file.path, "reason": file.reason })),
+        )
         .take(RECONCILIATION_PENDING_STATUS_NOTES)
-        .map(|file| serde_json::json!({ "path": file.path, "reason": file.reason }))
         .collect();
     // nw-585: notes indexed without their frontmatter, with the reason, kept
     // apart from `count`/`paths` -- those notes were NOT skipped.
@@ -1292,7 +1301,8 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
             .reconciliation_pending
             .values()
             .map(Vec::len)
-            .sum::<usize>(),
+            .sum::<usize>()
+            + usize::from(code_links.is_some()),
         "reconciliation_pending_notes": pending_notes,
         "frontmatter_unparsed": sidecar.frontmatter_unparsed.len(),
         "frontmatter_unparsed_notes": frontmatter_notes,
