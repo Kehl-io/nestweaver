@@ -12390,24 +12390,24 @@ fn project_member_uid(uid: &str, members: &std::collections::HashSet<String>) ->
         .is_some_and(|(note, _)| members.contains(note))
 }
 
-/// Fit and measure the final compact JSON contract, including its own budget
-/// fields. Retain at most one row when the minimum useful answer cannot fit.
 /// nw-674: attach the declared repos the last materialization could not
-/// attach to this project. Without it a project missing half its code answered
-/// exactly like a complete one — "not a member" read as "ranked low". One
-/// helper for both return paths of `tool_project_context`, so the empty-project
-/// early return cannot drift from the ranked one.
-fn disclose_unresolved_repos(
+/// resolve cleanly for this project. Without it a project missing half its
+/// code answered exactly like a complete one — "not a member" read as "ranked
+/// low". One helper for both return paths of `tool_project_context`, so the
+/// empty-project early return cannot drift from the ranked one.
+fn disclose_repo_issues(
     response: &mut Value,
     ext_store: &nestweaver_engine::extensions::ExtensionStore,
     project_uid: &str,
 ) {
-    let unresolved = nestweaver_engine::recorded_unresolved_repos(ext_store, project_uid);
-    if !unresolved.is_empty() {
-        response["unresolved_repos"] = json!(unresolved);
+    let issues = nestweaver_engine::recorded_repo_issues(ext_store, project_uid);
+    if !issues.is_empty() {
+        response["repo_issues"] = json!(issues);
     }
 }
 
+/// Fit and measure the final compact JSON contract, including its own budget
+/// fields. Retain at most one row when the minimum useful answer cannot fit.
 fn finalize_project_budget(response: &mut Value) -> Result<(), anyhow::Error> {
     let budget = response["token_budget"].as_u64().unwrap_or(0) as usize;
     let available = response["connected"].as_array().map_or(0, Vec::len)
@@ -12668,7 +12668,7 @@ fn tool_project_context(
         }
         // nw-674: THIS is the path a project whose every declared repo failed
         // to resolve takes — the case the disclosure matters most for.
-        disclose_unresolved_repos(
+        disclose_repo_issues(
             &mut response,
             &load_extensions(&current_db_path(store).unwrap_or_default()),
             &project.uid,
@@ -13105,7 +13105,7 @@ fn tool_project_context(
         resp["external_refs"] = external_refs;
     }
 
-    disclose_unresolved_repos(&mut resp, &ext_store, &project.uid);
+    disclose_repo_issues(&mut resp, &ext_store, &project.uid);
 
     // nw-316: state which config answered, on EVERY return path, so a caller
     // comparing two routes can attribute a divergence instead of guessing.
@@ -27463,12 +27463,44 @@ mod nw674_project_context_tests {
         .unwrap()
     }
 
+    fn member_symbol(store: &GraphStore, project_uid: &str, uid: &str) {
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: uid.to_string(),
+                name: uid.replace(':', "_"),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:nw674".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn f()".to_string(),
+                summary: None,
+                content_hash: "hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges(project_uid, &[uid.to_string()], 1.0)
+            .unwrap();
+    }
+
+    /// Both return paths of `tool_project_context`: `gappy` has NO members
+    /// (the early return a project takes when every declared repo failed),
+    /// `ranked` has a member and so takes the PPR path. `complete` is the
+    /// counterweight: members, no recorded issues, no field.
     #[test]
-    fn project_context_discloses_recorded_unresolved_repos() {
+    fn project_context_discloses_recorded_repo_issues() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("nw674.lbug");
         let store = GraphStore::open(&db_path).expect("on-disk store");
-        for name in ["gappy", "complete"] {
+        for name in ["gappy", "ranked", "complete"] {
             store
                 .insert_project(&nestweaver_schema::Project {
                     uid: format!("proj:{name}"),
@@ -27478,28 +27510,42 @@ mod nw674_project_context_tests {
                 })
                 .unwrap();
         }
+        member_symbol(&store, "proj:ranked", "sym:ranked");
+        member_symbol(&store, "proj:complete", "sym:complete");
         let mut ext = nestweaver_engine::load_extensions(&db_path);
-        nestweaver_engine::extensions::set_property(
-            &mut ext,
-            "proj:gappy",
-            nestweaver_engine::UNRESOLVED_REPOS_KEY,
-            json!([nestweaver_engine::UnresolvedProjectRepo {
-                project: "gappy".into(),
-                repo: "shot-insights-web-app".into(),
-                candidates: Vec::new(),
-            }]),
-        );
+        for name in ["gappy", "ranked"] {
+            nestweaver_engine::extensions::set_property(
+                &mut ext,
+                &format!("proj:{name}"),
+                nestweaver_engine::REPO_ISSUES_KEY,
+                json!([nestweaver_engine::ProjectRepoIssue {
+                    project: name.into(),
+                    repo: "shot-insights-web-app".into(),
+                    kind: nestweaver_engine::RepoIssueKind::NoMatch,
+                    candidates: Vec::new(),
+                }]),
+            );
+        }
         nestweaver_engine::extensions::save_extensions(&db_path, &ext).unwrap();
         let _guard = DbPathGuard(CURRENT_DB_PATH.with(|cell| cell.borrow().clone()));
         set_current_db_path(db_path);
 
-        let gappy = context_for(&store, "gappy");
-        assert_eq!(
-            gappy["unresolved_repos"][0]["repo"], "shot-insights-web-app",
-            "{gappy}"
+        for name in ["gappy", "ranked"] {
+            let resp = context_for(&store, name);
+            assert_eq!(
+                resp["repo_issues"][0]["repo"], "shot-insights-web-app",
+                "{name}: {resp}"
+            );
+            assert_eq!(resp["repo_issues"][0]["kind"], "no_match", "{name}: {resp}");
+        }
+        let ranked = context_for(&store, "ranked");
+        assert!(
+            !ranked["note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("No notes or symbols")),
+            "fixture must exercise the ranked path, not the empty early return: {ranked}"
         );
-        // Counterweight: a fully resolved project carries no such field.
         let complete = context_for(&store, "complete");
-        assert!(complete.get("unresolved_repos").is_none(), "{complete}");
+        assert!(complete.get("repo_issues").is_none(), "{complete}");
     }
 }

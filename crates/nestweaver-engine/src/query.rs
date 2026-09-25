@@ -1587,6 +1587,10 @@ pub struct FeatureContextResult {
     pub truncated_by: Option<TruncationCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<usize>,
+    /// nw-674: declared `repos` that did not resolve cleanly, so a feature
+    /// scoped to fewer repos than declared says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_issues: Vec<crate::project::ProjectRepoIssue>,
 }
 
 /// Build a task-focused context for a declared feature bundle.
@@ -1612,18 +1616,20 @@ pub fn build_feature_context(
     // display-name/alias-url match, so `feature.repos = ["shot-insights-web-app"]`
     // (the checkout directory, indexed as `web-app`) scoped entry points to
     // nothing — and an ambiguous generic name is rejected here as there.
-    let feature_repo_uids: std::collections::HashSet<String> = feature
-        .repos
-        .iter()
-        .flat_map(|declared| {
-            match crate::project::resolve_declared_repo(declared, repo_configs, &all_repos) {
-                crate::project::DeclaredRepoMatch::Resolved(matched) => matched,
-                crate::project::DeclaredRepoMatch::Unresolved
-                | crate::project::DeclaredRepoMatch::Ambiguous(_) => Vec::new(),
-            }
-        })
-        .map(|r| r.uid.clone())
-        .collect();
+    let mut feature_repo_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut repo_issues: Vec<crate::project::ProjectRepoIssue> = Vec::new();
+    for declared in &feature.repos {
+        let found = crate::project::resolve_declared_repo(declared, repo_configs, &all_repos);
+        repo_issues.extend(crate::project::ProjectRepoIssue::from_match(
+            &feature.name,
+            declared,
+            &found,
+        ));
+        feature_repo_uids.extend(found.attached().iter().map(|r| r.uid.clone()));
+    }
+    for issue in &repo_issues {
+        tracing::warn!("feature repo did not resolve cleanly: {issue}");
+    }
 
     let mut seed_uids: Vec<String> = Vec::new();
     let mut unmatched_entry_points: Vec<String> = Vec::new();
@@ -1633,8 +1639,10 @@ pub fn build_feature_context(
         let matches = store
             .lookup_symbols_by_name(entry_point)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let scoped: Vec<_> = if feature_repo_uids.is_empty() {
-            // No repos in DB yet — include all matches (graceful degradation).
+        // nw-674: unscoped ONLY when nothing is indexed at all. Keying this on
+        // an empty RESOLVED set meant a feature whose every declared repo
+        // failed to resolve silently widened to every repo in the instance.
+        let scoped: Vec<_> = if all_repos.is_empty() {
             matches
         } else {
             matches
@@ -1664,8 +1672,20 @@ pub fn build_feature_context(
     seed_uids.retain(|uid| seen.insert(uid.clone()));
 
     if seed_uids.is_empty() {
+        let issues = if repo_issues.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; declared repo issues: {}",
+                repo_issues
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         anyhow::bail!(
-            "No symbols found for feature '{}' entry points: {:?}",
+            "No symbols found for feature '{}' entry points: {:?}{issues}",
             feature.name,
             feature.entry_points
         );
@@ -1745,6 +1765,7 @@ pub fn build_feature_context(
         truncated: Some(limit_truncated),
         truncated_by: TruncationCause::resolve(false, limit_truncated),
         token_budget: None,
+        repo_issues,
     })
 }
 

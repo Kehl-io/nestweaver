@@ -5932,30 +5932,22 @@ fn materialize_projects_terminal_progress(
     result: &nestweaver_engine::ProjectMaterializationResult,
 ) -> IndexProgress {
     let degraded = degraded_graph_publication_message("MaterializeProjects", &result.publication);
-    let message = if let Some(message) = &degraded {
+    let mut message = if let Some(message) = &degraded {
         message.clone()
     } else {
-        let mut message = format!(
+        format!(
             "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
             result.projects_created, result.note_edges, result.symbol_edges, result.component_edges,
-        );
-        // nw-674: a declared repo that attached nothing used to vanish from
-        // this line entirely. It stays Phase::Done — the config is the gap,
-        // not the run — but the operator is told which entries to fix.
-        if !result.unresolved_repos.is_empty() {
-            let entries = result
-                .unresolved_repos
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ");
-            message.push_str(&format!(
-                "\nWarning: {} declared project repo(s) attached no symbols: {entries}. Declare them by checkout directory name, path, or a `[[repos]] name` alias.",
-                result.unresolved_repos.len()
-            ));
-        }
-        message
+        )
     };
+    // nw-674: a declared repo that attached nothing used to vanish from this
+    // line entirely. Appended on the degraded line too — a degraded run still
+    // committed the membership, gap included. The phase is unchanged: the
+    // config is the gap, not the run.
+    if let Some(summary) = nestweaver_engine::repo_issues_summary(&result.repo_issues) {
+        message.push('\n');
+        message.push_str(&summary);
+    }
     IndexProgress {
         phase: if degraded.is_some() {
             Phase::Error as i32
@@ -21041,7 +21033,7 @@ credential_method = "gh"
             component_edges: 1,
             wiki_notes_ingested: 0,
             wiki_fetch_errors: 0,
-            unresolved_repos: Vec::new(),
+            repo_issues: Vec::new(),
             publication: GraphMutationPublicationOutcome {
                 disposition: GraphMutationPublicationDisposition::CommittedDegraded,
                 generation_before: 40,
@@ -21073,26 +21065,34 @@ credential_method = "gh"
         assert!(
             !materialize_projects_terminal_progress(&result)
                 .message
-                .contains("attached no symbols"),
-            "a fully resolved config must not print an unresolved-repo warning"
+                .contains("did not resolve cleanly"),
+            "a fully resolved config must not print a declared-repo warning"
         );
 
         // nw-674: an unresolved declared repo is disclosed on the terminal
         // line, without turning a successful run into an error.
-        result.unresolved_repos = vec![nestweaver_engine::UnresolvedProjectRepo {
+        result.repo_issues = vec![nestweaver_engine::ProjectRepoIssue {
             project: "shot-insights".to_string(),
             repo: "shot-insights-web-app".to_string(),
+            kind: nestweaver_engine::RepoIssueKind::NoMatch,
             candidates: Vec::new(),
         }];
+        let expected = "shot-insights/shot-insights-web-app (matches no indexed repo)";
         let terminal = materialize_projects_terminal_progress(&result);
         assert_eq!(terminal.phase, Phase::Done as i32);
-        assert!(
-            terminal
-                .message
-                .contains("shot-insights/shot-insights-web-app (matches no indexed repo)"),
-            "{}",
-            terminal.message
-        );
+        assert!(terminal.message.contains(expected), "{}", terminal.message);
+
+        // ...and on the DEGRADED line too: the membership (gap included) was
+        // committed, so the operator still needs to know about the gap.
+        result.publication.disposition = GraphMutationPublicationDisposition::CommittedDegraded;
+        result.publication.warnings = vec![GraphMutationPublicationWarning {
+            stage: "persist-generation".to_string(),
+            message: "disk full".to_string(),
+        }];
+        let terminal = materialize_projects_terminal_progress(&result);
+        assert_eq!(terminal.phase, Phase::Error as i32);
+        assert!(terminal.message.contains("NOT rolled back"));
+        assert!(terminal.message.contains(expected), "{}", terminal.message);
     }
 
     /// Implicit-project detection is a graph writer on apply, despite its

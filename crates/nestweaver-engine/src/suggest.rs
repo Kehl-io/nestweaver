@@ -617,82 +617,101 @@ pub fn persist_cross_repo_links(
 /// Materialize declared config links as `CROSS_REPO_LINK` graph edges.
 ///
 /// For each `LinkConfig` with `materialize = true`, the function resolves
-/// the `from` and `to` repo names against the Repo nodes in the graph, then
-/// inserts directed `CROSS_REPO_LINK` edges between every (from-symbol,
-/// to-symbol) pair that shares a name across those repos.
+/// the `from` and `to` repo references through
+/// [`crate::project::resolve_declared_repo`] — the resolver project and
+/// feature membership use — then inserts directed `CROSS_REPO_LINK` edges
+/// between every (from-symbol, to-symbol) pair that shares a name.
+///
+/// nw-674: this used a display-name → uid `HashMap`, so two repos both
+/// displayed as `web-app` collapsed to whichever the store listed LAST and the
+/// link silently joined the wrong client's code; a checkout-directory name
+/// resolved to nothing. An endpoint that does not resolve cleanly now skips
+/// the link and is returned in `repo_issues` (`project` = `from -> to`).
 ///
 /// Links without `materialize = true` are silently skipped.
-///
-/// Returns the total number of edges inserted.
 pub fn materialize_declared_links(
     store: &GraphStore,
     links: &[LinkConfig],
-) -> Result<usize, anyhow::Error> {
+    repo_configs: &[crate::config::RepoConfig],
+) -> Result<DeclaredLinksMaterialization, anyhow::Error> {
+    let mut outcome = DeclaredLinksMaterialization::default();
     if links.is_empty() {
-        return Ok(0);
+        return Ok(outcome);
     }
 
-    // Build a map of repo short-name → repo_uid to resolve the from/to names.
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
-    let name_to_uid: HashMap<String, String> = all_repos
-        .iter()
-        .map(|r| (repo_display_name(r), r.uid.clone()))
-        .collect();
 
-    let mut total = 0usize;
     for link in links {
         if !link.materialize {
             continue;
         }
-        let from_uid = match name_to_uid.get(&link.from) {
-            Some(uid) => uid.clone(),
-            None => {
-                tracing::warn!(
-                    "materialize_declared_links: repo '{}' not found in graph, skipping link",
-                    link.from
-                );
-                continue;
+        let label = format!("{} -> {}", link.from, link.to);
+        let mut endpoints: Vec<Vec<String>> = Vec::with_capacity(2);
+        for declared in [&link.from, &link.to] {
+            let found = crate::project::resolve_declared_repo(declared, repo_configs, &all_repos);
+            if let Some(issue) =
+                crate::project::ProjectRepoIssue::from_match(&label, declared, &found)
+            {
+                tracing::warn!("materialize_declared_links: {issue}");
+                outcome.repo_issues.push(issue);
             }
-        };
-        let to_uid = match name_to_uid.get(&link.to) {
-            Some(uid) => uid.clone(),
-            None => {
-                tracing::warn!(
-                    "materialize_declared_links: repo '{}' not found in graph, skipping link",
-                    link.to
-                );
-                continue;
-            }
-        };
-
-        // Find shared symbol names between the two repos.
-        // symbol_lite_by_repo returns (uid, name, kind) triples.
-        let syms_from = store
-            .symbol_lite_by_repo(&from_uid)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let syms_to = store
-            .symbol_lite_by_repo(&to_uid)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        // Build a name → [(uid)] map for the target repo.
-        let mut to_by_name: HashMap<String, Vec<String>> = HashMap::new();
-        for (uid, name, _kind) in &syms_to {
-            to_by_name
-                .entry(name.clone())
-                .or_default()
-                .push(uid.clone());
+            endpoints.push(found.attached().iter().map(|r| r.uid.clone()).collect());
         }
+        if endpoints.iter().any(Vec::is_empty) {
+            continue;
+        }
+        for from_uid in &endpoints[0] {
+            for to_uid in &endpoints[1] {
+                outcome.edges += materialize_link_pair(store, link, from_uid, to_uid)?;
+            }
+        }
+    }
+    Ok(outcome)
+}
 
-        // Insert an edge for every (from-symbol, to-symbol) with a shared name.
-        for (from_sym_uid, name, _kind) in &syms_from {
-            if let Some(to_uids) = to_by_name.get(name) {
-                let conf = 0.9_f32; // declared links have high confidence
-                for to_sym_uid in to_uids {
-                    store
-                        .insert_cross_repo_link(from_sym_uid, to_sym_uid, conf, &link.link_type)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    total += 1;
-                }
+/// Result of [`materialize_declared_links`].
+#[derive(Debug, Default)]
+pub struct DeclaredLinksMaterialization {
+    /// Total `CROSS_REPO_LINK` edges inserted.
+    pub edges: usize,
+    /// Link endpoints that did not resolve cleanly (nw-674).
+    pub repo_issues: Vec<crate::project::ProjectRepoIssue>,
+}
+
+fn materialize_link_pair(
+    store: &GraphStore,
+    link: &LinkConfig,
+    from_uid: &str,
+    to_uid: &str,
+) -> Result<usize, anyhow::Error> {
+    // Find shared symbol names between the two repos.
+    // symbol_lite_by_repo returns (uid, name, kind) triples.
+    let syms_from = store
+        .symbol_lite_by_repo(from_uid)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let syms_to = store
+        .symbol_lite_by_repo(to_uid)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Build a name → [(uid)] map for the target repo.
+    let mut to_by_name: HashMap<String, Vec<String>> = HashMap::new();
+    for (uid, name, _kind) in &syms_to {
+        to_by_name
+            .entry(name.clone())
+            .or_default()
+            .push(uid.clone());
+    }
+
+    // Insert an edge for every (from-symbol, to-symbol) with a shared name.
+    let mut total = 0usize;
+    for (from_sym_uid, name, _kind) in &syms_from {
+        if let Some(to_uids) = to_by_name.get(name) {
+            let conf = 0.9_f32; // declared links have high confidence
+            for to_sym_uid in to_uids {
+                store
+                    .insert_cross_repo_link(from_sym_uid, to_sym_uid, conf, &link.link_type)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                total += 1;
             }
         }
     }

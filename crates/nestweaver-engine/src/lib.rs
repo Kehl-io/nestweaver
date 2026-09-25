@@ -646,10 +646,10 @@ pub use process::{
 };
 pub use project::{
     DeclaredRepoMatch, ImplicitProjectDetectionResult, ProjectMaterializationResult,
-    UNRESOLVED_REPOS_KEY, UnresolvedProjectRepo, detect_implicit_projects,
+    ProjectRepoIssue, REPO_ISSUES_KEY, RepoIssueKind, detect_implicit_projects,
     detect_implicit_projects_with_mode, detect_implicit_projects_with_publication,
-    materialize_projects, materialize_projects_with_lease, recorded_unresolved_repos,
-    resolve_declared_repo,
+    materialize_projects, materialize_projects_with_lease, recorded_repo_issues,
+    repo_issue_warning_lines, repo_issues_summary, resolve_declared_repo,
 };
 pub use publication::*;
 pub use publication_source::*;
@@ -675,8 +675,9 @@ pub use rerank::{
 pub use signature_diff::{BreakKind, BreakTier, BreakingChange, diff_public_api, diff_symbol};
 pub use snapshot::*;
 pub use suggest::{
-    Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
-    materialize_declared_links, persist_cross_repo_links, suggest_links,
+    Confidence, DeclaredLinksMaterialization, SuggestedFeature, SuggestedLink, Suggestions,
+    discover_symbol_level_links, materialize_declared_links, persist_cross_repo_links,
+    suggest_links,
 };
 pub use summaries::{
     DEFAULT_SYMBOL_SUMMARY_CAP, SUMMARY_DEFAULT_TOKEN_BUDGET, Summary, SummaryLevel, SummaryStore,

@@ -21553,15 +21553,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // attach, read from the extension sidecar next to the DB (absent
             // for a remote daemon, in which case nothing is claimed).
             let ext_store = nestweaver_engine::load_extensions(&resolved_db);
-            let unresolved_repos: std::collections::BTreeMap<
-                String,
-                Vec<nestweaver_engine::UnresolvedProjectRepo>,
-            > = materialized
+            let repo_issues: ProjectRepoIssues = materialized
                 .iter()
                 .map(|p| {
                     (
                         p.name.clone(),
-                        nestweaver_engine::recorded_unresolved_repos(&ext_store, &p.uid),
+                        nestweaver_engine::recorded_repo_issues(&ext_store, &p.uid),
                     )
                 })
                 .filter(|(_, entries)| !entries.is_empty())
@@ -21579,58 +21576,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Vec::new()
                 };
 
-            if json {
-                #[derive(serde::Serialize)]
-                struct ListProjectsJson<'a> {
-                    materialized: &'a [nestweaver_schema::Project],
-                    #[serde(
-                        skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty"
-                    )]
-                    declared: &'a [nestweaver_engine::ProjectConfig],
-                    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-                    unresolved_repos: &'a std::collections::BTreeMap<
-                        String,
-                        Vec<nestweaver_engine::UnresolvedProjectRepo>,
-                    >,
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&ListProjectsJson {
-                        materialized: &materialized,
-                        declared: &declared_only,
-                        unresolved_repos: &unresolved_repos,
-                    })?
-                );
-            } else if materialized.is_empty() && declared_only.is_empty() {
-                println!(
-                    "No projects found. Use an instance config with [[projects]] to define them."
-                );
-            } else {
-                if !materialized.is_empty() {
-                    for p in &materialized {
-                        println!("{}", p.name);
-                        println!("  UID:      {}", p.uid);
-                        println!("  Instance: {}", p.instance_id);
-                        if let Some(ref summary) = p.summary {
-                            println!("  Summary:  {summary}");
-                        }
-                        for entry in unresolved_repos.get(&p.name).into_iter().flatten() {
-                            println!("  Warning:  declared repo not a member: {entry}");
-                        }
-                        println!();
-                    }
-                }
-                if !declared_only.is_empty() {
-                    println!("Declared in config (not yet materialized):");
-                    for pc in &declared_only {
-                        println!("  {}", pc.name);
-                        if let Some(ref desc) = pc.description {
-                            println!("    {desc}");
-                        }
-                    }
-                    println!();
-                }
-            }
+            print!(
+                "{}",
+                render_list_projects(&materialized, &declared_only, &repo_issues, json)?
+            );
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -24972,6 +24921,9 @@ fn print_feature_context_text(result: &FeatureContextResult) {
         println!("  {desc}");
     }
     println!("  Repos: {}", result.feature.repos.join(", "));
+    for line in nestweaver_engine::repo_issue_warning_lines(&result.repo_issues) {
+        println!("  {line}");
+    }
 
     if !result.links.is_empty() {
         println!();
@@ -34216,6 +34168,81 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Declared-repo issues per materialized project name (nw-674).
+type ProjectRepoIssues =
+    std::collections::BTreeMap<String, Vec<nestweaver_engine::ProjectRepoIssue>>;
+
+/// The whole `list-projects` stdout, JSON or text. Extracted from the command
+/// arm so the nw-674 disclosure in both formats is unit-testable.
+fn render_list_projects(
+    materialized: &[nestweaver_schema::Project],
+    declared_only: &[nestweaver_engine::ProjectConfig],
+    repo_issues: &ProjectRepoIssues,
+    json: bool,
+) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    if json {
+        #[derive(serde::Serialize)]
+        struct ListProjectsJson<'a> {
+            materialized: &'a [nestweaver_schema::Project],
+            #[serde(skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty")]
+            declared: &'a [nestweaver_engine::ProjectConfig],
+            #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+            repo_issues: &'a ProjectRepoIssues,
+        }
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&ListProjectsJson {
+                materialized,
+                declared: declared_only,
+                repo_issues,
+            })?
+        ));
+    }
+    let mut out = String::new();
+    if materialized.is_empty() && declared_only.is_empty() {
+        writeln!(
+            out,
+            "No projects found. Use an instance config with [[projects]] to define them."
+        )?;
+        return Ok(out);
+    }
+    for p in materialized {
+        writeln!(out, "{}", p.name)?;
+        writeln!(out, "  UID:      {}", p.uid)?;
+        writeln!(out, "  Instance: {}", p.instance_id)?;
+        if let Some(ref summary) = p.summary {
+            writeln!(out, "  Summary:  {summary}")?;
+        }
+        let issues = repo_issues.get(&p.name).map_or(&[][..], Vec::as_slice);
+        for line in nestweaver_engine::repo_issue_warning_lines(issues) {
+            writeln!(out, "  {line}")?;
+        }
+        writeln!(out)?;
+    }
+    if !declared_only.is_empty() {
+        writeln!(out, "Declared in config (not yet materialized):")?;
+        for pc in declared_only {
+            writeln!(out, "  {}", pc.name)?;
+            if let Some(ref desc) = pc.description {
+                writeln!(out, "    {desc}")?;
+            }
+        }
+        writeln!(out)?;
+    }
+    Ok(out)
+}
+
+/// nw-674: the declared-repo warning lines `project-context` text output
+/// prints under the project header, decoded from the tool response.
+fn project_context_repo_issue_lines(value: &serde_json::Value) -> Vec<String> {
+    let issues: Vec<nestweaver_engine::ProjectRepoIssue> = value
+        .get("repo_issues")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    nestweaver_engine::repo_issue_warning_lines(&issues)
+}
+
 /// Render the daemon's `project_context` JSON response (shape produced by
 /// `tool_project_context` in nestweaver-mcp). When `json` is true, emit the
 /// response verbatim; otherwise print a project header followed by the
@@ -34250,12 +34277,8 @@ fn render_project_context_daemon_response(
     }
     // nw-674: declared repos that are NOT members must not read as members
     // that merely ranked low.
-    let unresolved: Vec<nestweaver_engine::UnresolvedProjectRepo> = value
-        .get("unresolved_repos")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    for entry in &unresolved {
-        println!("  Warning: declared repo not a member: {entry}");
+    for line in project_context_repo_issue_lines(value) {
+        println!("  {line}");
     }
     println!();
     let empty = vec![];
@@ -38000,8 +38023,24 @@ fn run_publication_rebuild(
                             "project graph committed but its derived-artifact publication is degraded; refusing to publish the staged brain: {details}"
                         );
                     }
+                    // nw-674: the staged route must disclose declared repos
+                    // that did not resolve, as the daemon route does.
+                    if let Some(summary) =
+                        nestweaver_engine::repo_issues_summary(&projects.repo_issues)
+                    {
+                        eprintln!("{summary}");
+                    }
                     if let Some(links) = config.links.as_deref() {
-                        nestweaver_engine::materialize_declared_links(&store, links)?;
+                        let declared = nestweaver_engine::materialize_declared_links(
+                            &store,
+                            links,
+                            &config.repos,
+                        )?;
+                        if let Some(summary) =
+                            nestweaver_engine::repo_issues_summary(&declared.repo_issues)
+                        {
+                            eprintln!("{summary}");
+                        }
                     }
                     discover_cross_domain_links(&store)?;
                     drop(store);
@@ -46778,3 +46817,93 @@ mod returned_ui_port_tests {
 
 #[cfg(all(test, unix))]
 mod ui_supervision_tests;
+
+/// nw-674: the CLI text/JSON routes disclose declared-repo issues.
+#[cfg(test)]
+mod nw674_repo_issue_render_tests {
+    use super::*;
+
+    fn issue(kind: nestweaver_engine::RepoIssueKind) -> nestweaver_engine::ProjectRepoIssue {
+        nestweaver_engine::ProjectRepoIssue {
+            project: "wavelength-wireless".to_string(),
+            repo: "wavelength-wireless-site".to_string(),
+            kind,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn projects() -> Vec<nestweaver_schema::Project> {
+        ["wavelength-wireless", "siteloom"]
+            .into_iter()
+            .map(|name| nestweaver_schema::Project {
+                uid: format!("proj:{name}"),
+                name: name.to_string(),
+                summary: None,
+                instance_id: "kory-brain".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_projects_discloses_repo_issues_in_json_and_text() {
+        let materialized = projects();
+        let issues: ProjectRepoIssues = [(
+            "wavelength-wireless".to_string(),
+            vec![issue(nestweaver_engine::RepoIssueKind::NoMatch)],
+        )]
+        .into_iter()
+        .collect();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_list_projects(&materialized, &[], &issues, true).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["repo_issues"]["wavelength-wireless"][0]["repo"],
+            "wavelength-wireless-site"
+        );
+        assert_eq!(
+            json["repo_issues"]["wavelength-wireless"][0]["kind"],
+            "no_match"
+        );
+        assert!(json["repo_issues"].get("siteloom").is_none());
+
+        let text = render_list_projects(&materialized, &[], &issues, false).unwrap();
+        let expected = "  Warning: declared repo not a member: \
+                        wavelength-wireless/wavelength-wireless-site (matches no indexed repo)";
+        assert!(text.contains(expected), "{text}");
+        // The warning sits under ITS project, not the next one.
+        let siteloom = text.split("siteloom\n").nth(1).unwrap();
+        assert!(!siteloom.contains("Warning"), "{text}");
+    }
+
+    #[test]
+    fn list_projects_without_issues_is_unchanged() {
+        let materialized = projects();
+        let clean = ProjectRepoIssues::new();
+        let json: serde_json::Value =
+            serde_json::from_str(&render_list_projects(&materialized, &[], &clean, true).unwrap())
+                .unwrap();
+        assert!(json.get("repo_issues").is_none(), "{json}");
+        let text = render_list_projects(&materialized, &[], &clean, false).unwrap();
+        assert!(!text.contains("Warning"), "{text}");
+        assert!(text.starts_with("wavelength-wireless\n  UID:      proj:wavelength-wireless\n"));
+    }
+
+    #[test]
+    fn project_context_text_warns_per_issue_kind() {
+        let value = serde_json::json!({
+            "project": "wavelength-wireless",
+            "repo_issues": [
+                issue(nestweaver_engine::RepoIssueKind::NoMatch),
+                issue(nestweaver_engine::RepoIssueKind::SubstringMatch),
+            ],
+        });
+        let lines = project_context_repo_issue_lines(&value);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("Warning: declared repo not a member: "));
+        assert!(lines[1].starts_with("Warning: declared repo matched loosely: "));
+        assert!(lines[1].contains("resolved only by URL substring"));
+        // Counterweight: no field, no warning.
+        assert!(project_context_repo_issue_lines(&serde_json::json!({"project": "x"})).is_empty());
+    }
+}
