@@ -355,10 +355,45 @@ pub fn build_symbol_index_with_config(
     let symbols = store
         .list_symbols_for_linking()
         .context("list_symbols_for_linking")?;
-    let (note_projects, project_repos) =
+    let (note_projects, mut project_repos) =
         store.project_link_scopes().context("project_link_scopes")?;
-    Ok(SymbolIndex::build_with_config(&symbols, config)
-        .with_project_scopes(&note_projects, &project_repos))
+    // nw-670 re-review F1: the repos each project's DECLARED `repos` resolve
+    // to, recorded by `materialize_projects`, scope its notes whether or not
+    // its PROJECT_INCLUDES_SYMBOL edges exist (they were empty for every
+    // project on a real brain, nw-678, so no note was ever scoped).
+    let mut unscoped_projects = Vec::new();
+    if let Some(db_path) = store.db_path() {
+        let with_notes: HashSet<&str> = note_projects.iter().map(|(_, p)| p.as_str()).collect();
+        let extensions = crate::extensions::load_extensions(db_path);
+        let mut projects: Vec<&String> = extensions.keys().collect();
+        projects.sort();
+        for project in projects {
+            let properties = &extensions[project];
+            let Some(repos) = properties
+                .get(crate::project::LINKING_REPOS_KEY)
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            project_repos.extend(
+                repos
+                    .iter()
+                    .filter_map(|repo| repo.as_str())
+                    .map(|repo| (project.clone(), repo.to_string())),
+            );
+            let declared = properties
+                .get(crate::project::DECLARED_REPO_COUNT_KEY)
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if declared > 0 && repos.is_empty() && with_notes.contains(project.as_str()) {
+                unscoped_projects.push(project.clone());
+            }
+        }
+    }
+    let mut index = SymbolIndex::build_with_config(&symbols, config)
+        .with_project_scopes(&note_projects, &project_repos);
+    index.unscoped_projects = unscoped_projects;
+    Ok(index)
 }
 
 /// Read-only scan: load the note body, scan for symbol mentions, and
@@ -691,6 +726,10 @@ pub struct SymbolIndex {
     note_scope: HashMap<String, usize>,
     /// Each distinct scope: the repo uids of a note's projects.
     scopes: Vec<HashSet<Arc<str>>>,
+    /// nw-670 re-review F1: projects that include notes and DECLARE repos,
+    /// none of which resolved — their notes link as if in no project. The
+    /// code-link reconciler discloses them.
+    pub(crate) unscoped_projects: Vec<String>,
 }
 
 impl SymbolIndex {
@@ -761,6 +800,7 @@ impl SymbolIndex {
             by_name,
             note_scope: HashMap::new(),
             scopes: Vec::new(),
+            unscoped_projects: Vec::new(),
         }
     }
 

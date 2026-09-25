@@ -40,6 +40,18 @@ pub struct ProjectMaterializationResult {
 /// them without re-resolving against the graph (nw-674).
 pub const REPO_ISSUES_KEY: &str = "repo_issues";
 
+/// nw-670 re-review F1: the repo uids a project's declared `repos` resolve
+/// to (the nw-674 resolver), recorded by `materialize_projects` for
+/// note→code link scoping. Independent of `PROJECT_INCLUDES_SYMBOL`, which
+/// can be empty for a project whose repos did resolve (nw-678) — scoping
+/// read only that, so every project note was linked as if in no project.
+pub const LINKING_REPOS_KEY: &str = "linking_repos";
+
+/// nw-670 re-review F1: how many repos the project DECLARES, so a project
+/// whose declared repos all failed to resolve is disclosed rather than
+/// silently linking its notes as unscoped.
+pub const DECLARED_REPO_COUNT_KEY: &str = "declared_repo_count";
+
 /// Why a declared repo reference did not resolve cleanly (nw-674).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -531,6 +543,7 @@ pub fn materialize_projects_with_lease(
     let mut parent_edges: Vec<(String, String)> = Vec::new();
     let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
     let mut repo_issues: Vec<ProjectRepoIssue> = Vec::new();
+    let mut linking_repos: HashMap<String, Vec<String>> = HashMap::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -583,6 +596,10 @@ pub fn materialize_projects_with_lease(
                 &found,
             ));
             for repo in found.attached().iter().copied() {
+                linking_repos
+                    .entry(uid.clone())
+                    .or_default()
+                    .push(repo.uid.clone());
                 let repo_symbols = match symbols_by_repo.get(&repo.uid) {
                     Some(symbols) => symbols,
                     None => {
@@ -662,6 +679,25 @@ pub fn materialize_projects_with_lease(
                 serde_json::json!(&project_cfg.external_refs),
             );
         }
+
+        // 5a. nw-670 re-review F1: the resolved repos scope the project's
+        // notes' code links; the declared count lets status disclose a
+        // project whose declared repos resolved to none.
+        let mut resolved = linking_repos.remove(&uid).unwrap_or_default();
+        resolved.sort();
+        resolved.dedup();
+        set_property(
+            &mut ext_store,
+            &uid,
+            LINKING_REPOS_KEY,
+            serde_json::json!(resolved),
+        );
+        set_property(
+            &mut ext_store,
+            &uid,
+            DECLARED_REPO_COUNT_KEY,
+            serde_json::json!(project_cfg.repos.len()),
+        );
 
         // 5b. nw-674: record (or clear) declared-repo issues. Unlike the
         // keys around it this one must be REMOVED once the repo resolves, or

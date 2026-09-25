@@ -69,6 +69,14 @@ pub struct CodeLinksState {
     /// When a pass last completed with the graph in agreement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reconciled_at: Option<String>,
+    /// nw-670 re-review F4: from the last completed pass — per vault root,
+    /// notes changed on disk since indexing, left unlinked until refreshed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub changed_by_vault: std::collections::BTreeMap<String, usize>,
+    /// nw-670 re-review F1: from the last completed pass — projects whose
+    /// declared repos resolved to none, so their notes link unscoped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unscoped_projects: Vec<String>,
     /// nw-670: the link-rules version ([`CROSS_DOMAIN_RULES_VERSION`]) the
     /// stored links were built with; 0 (absent) is the pre-nw-670
     /// match-every-word rules. A mismatch makes the next pass a migration:
@@ -229,6 +237,15 @@ pub fn code_links_status_json(db_path: Option<&Path>) -> serde_json::Value {
         "rules_version": state.rules_version,
         "current_rules_version": CROSS_DOMAIN_RULES_VERSION,
         "last_reconciled_at": state.last_reconciled_at,
+        // nw-670 re-review F4: notes changed on disk since indexing have no
+        // links until their vault is refreshed.
+        "notes_changed_since_indexing": state
+            .changed_by_vault
+            .iter()
+            .map(|(vault, count)| serde_json::json!({ "vault": vault, "count": count }))
+            .collect::<Vec<_>>(),
+        // nw-670 re-review F1: projects whose declared repos resolved to none.
+        "unscoped_projects": state.unscoped_projects,
     })
 }
 
@@ -308,6 +325,12 @@ pub struct CodeLinkReconcileReport {
     /// notes the pass OWES links and could not check: the debt stays and is
     /// disclosed with them rather than settled as done.
     pub unreadable: Vec<String>,
+    /// nw-670 re-review F4: per vault root, notes whose file changed (or
+    /// vanished) since the graph indexed them. After a rules migration they
+    /// have NO links until a refresh re-indexes them; disclosed, not owed.
+    pub changed_by_vault: std::collections::BTreeMap<String, usize>,
+    /// nw-670 re-review F1: projects whose declared repos resolved to none.
+    pub unscoped_projects: Vec<String>,
 }
 
 /// How many unreadable notes a pass names (the count is uncapped).
@@ -388,6 +411,19 @@ impl CodeLinkReconciler {
         let Some(db_path) = db_path else {
             return outcome;
         };
+        // Every completed pass (settled or not) refreshes what it found about
+        // stale notes and unscoped projects (nw-670 re-review F1/F4).
+        if let Ok(report) = &outcome
+            && !report.stopped
+        {
+            update_code_links_state(&db_path, |state| {
+                let differs = state.changed_by_vault != report.changed_by_vault
+                    || state.unscoped_projects != report.unscoped_projects;
+                state.changed_by_vault = report.changed_by_vault.clone();
+                state.unscoped_projects = report.unscoped_projects.clone();
+                differs
+            });
+        }
         match &outcome {
             Ok(report) if report.stopped => {}
             Ok(report) if !report.unreadable.is_empty() => {
@@ -462,6 +498,7 @@ impl CodeLinkReconciler {
             purge_links(store, lease)?;
         }
         let index = crate::cross_domain::build_symbol_index_with_config(store, &self.config)?;
+        report.unscoped_projects = index.unscoped_projects.clone();
         if index.is_empty() {
             // No code indexed: there is nothing to link to, and no link can
             // exist (every edge ends at a Symbol).
@@ -510,8 +547,17 @@ impl CodeLinkReconciler {
             for note in chunk {
                 let mentions = match self.mentions_for(note, &roots) {
                     NoteText::Mentions(mentions) => mentions,
-                    NoteText::NotLocal | NoteText::Changed => {
+                    NoteText::NotLocal => {
                         report.notes_skipped += 1;
+                        continue;
+                    }
+                    NoteText::Changed => {
+                        report.notes_skipped += 1;
+                        let vault = roots
+                            .get(&note.vault_uid)
+                            .map(|root| root.display().to_string())
+                            .unwrap_or_else(|| note.vault_uid.clone());
+                        *report.changed_by_vault.entry(vault).or_default() += 1;
                         continue;
                     }
                     NoteText::Unreadable(why) => {
@@ -1435,6 +1481,187 @@ repos = ["alpha"]
         record_rules_version(&fx.db);
         let report = reconcile(&fx.store);
         assert_eq!(report.rewritten, vec![note_uid_of(&fx.store, "a.md")]);
+    }
+
+    /// nw-670 re-review F2: a NOTE seed's own code links come right after
+    /// the seed in `connected`. Hybrid fusion capped a symbol reached only
+    /// through PPR below every section and note that also matched BM25, so
+    /// "context for this note" came back without the code it names.
+    /// Counterweight: `a_symbol_seed_pins_no_code_links` (query.rs).
+    #[test]
+    fn a_note_seed_returns_the_code_it_links_first() {
+        let mut notes: Vec<(String, String)> = vec![(
+            "ingestion.md".to_string(),
+            "# Ingestion engine\n\nThe ingestion engine uses `ClaimLedger`, `readCsvRows()` \
+             and `runPipeline()`.\n\n## Ingestion flow\n\ningestion engine ingestion engine\n"
+                .to_string(),
+        )];
+        for i in 0..20 {
+            notes.push((
+                format!("other{i}.md"),
+                format!("# Ingestion engine notes {i}\n\ningestion engine ingestion engine {i}\n"),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let fx = fixture(
+            &borrowed,
+            &[(
+                "src/lib.rs",
+                "pub struct ClaimLedger;\npub fn readCsvRows() {}\npub fn runPipeline() {}\n",
+            )],
+        );
+        let tantivy_path = fx.db.with_extension("tantivy");
+        let tantivy = nestweaver_store::TantivyIndex::open_or_create(&tantivy_path).unwrap();
+        tantivy.reindex_from_store(&fx.store).unwrap();
+        let linked: HashSet<String> = fx
+            .store
+            .list_symbols_for_linking()
+            .unwrap()
+            .into_iter()
+            .map(|(uid, _, _, _, _)| uid)
+            .collect();
+        assert_eq!(
+            edges(&fx.store)
+                .iter()
+                .filter(|e| e.0.starts_with("note:"))
+                .count(),
+            3
+        );
+
+        let result = crate::query::build_brain_context_hybrid(
+            &fx.store,
+            &["Ingestion engine".to_string()],
+            Some(&tantivy),
+            &crate::query::HybridSearchConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let top: Vec<&str> = result
+            .connected
+            .iter()
+            .take(4)
+            .map(|node| node.uid.as_str())
+            .collect();
+        assert_eq!(
+            top.iter().filter(|uid| linked.contains(**uid)).count(),
+            3,
+            "the note's three linked symbols are in the top 4: {top:?}"
+        );
+    }
+
+    /// A vault with `proj/a.md` naming `SharedWidget`, defined in repos
+    /// `alpha` and `bravo`, and a config whose project `p` covers `proj`
+    /// and declares `repos`.
+    fn shared_widget_project(repos: &str) -> (tempfile::TempDir, PathBuf, PathBuf, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("proj")).unwrap();
+        std::fs::write(vault.join("proj/a.md"), "# A\n\nThe SharedWidget.\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&vault, &db, "default", "vault").unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        for name in ["alpha", "bravo"] {
+            let repo = dir.path().join(name);
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/w.rs"), "pub struct SharedWidget;\n").unwrap();
+            crate::index::index_directory_with_store(
+                &store,
+                &repo,
+                &db,
+                "default",
+                &format!("file:///fixture/{name}"),
+                "sha",
+                false,
+                Some(name),
+            )
+            .unwrap();
+        }
+        let config = crate::config::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+vault_folder = "proj"
+repos = [{repos}]
+"#
+        ))
+        .unwrap();
+        crate::project::materialize_projects(&store, &config, "default", &db).unwrap();
+        (dir, vault, db, store)
+    }
+
+    /// nw-670 re-review F1: scoping read a project's repos only from its
+    /// PROJECT_INCLUDES_SYMBOL edges, which were empty for every project on
+    /// a real brain (nw-678), so every project note linked as unscoped. The
+    /// declared repos (resolved by `materialize_projects`) scope it anyway.
+    #[test]
+    fn a_project_without_symbol_membership_still_scopes_its_notes() {
+        let (_dir, _vault, _db, store) = shared_widget_project("\"alpha\"");
+        let conn = store.begin_transaction().unwrap();
+        conn.query("MATCH (:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(:Symbol) DELETE r")
+            .unwrap();
+        store.commit_transaction(&conn).unwrap();
+        reconcile(&store);
+        let alpha_repo = nestweaver_schema::repo_uid("default", "file:///fixture/alpha");
+        let symbols: HashMap<String, String> = store
+            .list_symbols_for_linking()
+            .unwrap()
+            .into_iter()
+            .map(|(uid, _, _, repo, _)| (uid, repo))
+            .collect();
+        let linked = edges(&store);
+        assert_eq!(linked.len(), 2, "scoped to alpha: {linked:?}");
+        assert!(linked.iter().all(|edge| symbols[&edge.1] == alpha_repo));
+    }
+
+    /// nw-670 re-review F1: a project whose declared repos resolve to none
+    /// is disclosed, not silently linked unscoped.
+    #[test]
+    fn a_project_whose_declared_repos_resolve_to_none_is_disclosed() {
+        let (_dir, _vault, db, store) = shared_widget_project("\"no-such-repo\"");
+        reconcile(&store);
+        let status = code_links_status_json(Some(&db));
+        let project = nestweaver_schema::project_uid("default", "p");
+        assert_eq!(
+            status["unscoped_projects"],
+            serde_json::json!([project]),
+            "{status}"
+        );
+    }
+
+    /// nw-670 re-review F4: notes changed on disk since indexing are left
+    /// unlinked (their committed text is not on disk to scan); the count per
+    /// vault is disclosed with the remedy.
+    #[test]
+    fn notes_changed_since_indexing_are_disclosed_per_vault() {
+        let fx = two_widgets();
+        std::fs::write(fx.vault.join("a.md"), "# A\n\nedited, not re-indexed\n").unwrap();
+        reconcile(&fx.store);
+        let status = code_links_status_json(Some(&fx.db));
+        let changed = &status["notes_changed_since_indexing"];
+        assert_eq!(changed.as_array().map(Vec::len), Some(1), "{status}");
+        assert_eq!(changed[0]["count"], 1, "{status}");
     }
 
     /// Stand-in for a refresh that recreated the notes' links' absence: drop
