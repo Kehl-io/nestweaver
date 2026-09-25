@@ -429,6 +429,7 @@ pub mod circuit_breaker;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod cochange;
+pub mod code_links;
 pub mod config;
 pub mod content_reader;
 pub mod context_graph;
@@ -560,6 +561,7 @@ pub use cross_domain::{
     CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
     build_symbol_index_with_config, discover_cross_domain_links,
     discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
+    discover_cross_domain_links_with_readers_and_config,
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
@@ -645,9 +647,11 @@ pub use process::{
     detect_changes_impact, trace_processes,
 };
 pub use project::{
-    ImplicitProjectDetectionResult, ProjectMaterializationResult, detect_implicit_projects,
+    DeclaredRepoMatch, ImplicitProjectDetectionResult, ProjectMaterializationResult,
+    ProjectRepoIssue, REPO_ISSUES_KEY, RepoIssueKind, detect_implicit_projects,
     detect_implicit_projects_with_mode, detect_implicit_projects_with_publication,
-    materialize_projects, materialize_projects_with_lease,
+    materialize_projects, materialize_projects_with_lease, recorded_repo_issues,
+    repo_issue_warning_lines, repo_issues_summary, resolve_declared_repo,
 };
 pub use publication::*;
 pub use publication_source::*;
@@ -673,8 +677,9 @@ pub use rerank::{
 pub use signature_diff::{BreakKind, BreakTier, BreakingChange, diff_public_api, diff_symbol};
 pub use snapshot::*;
 pub use suggest::{
-    Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
-    materialize_declared_links, persist_cross_repo_links, suggest_links,
+    Confidence, DeclaredLinksMaterialization, SuggestedFeature, SuggestedLink, Suggestions,
+    discover_symbol_level_links, materialize_declared_links, persist_cross_repo_links,
+    suggest_links,
 };
 pub use summaries::{
     DEFAULT_SYMBOL_SUMMARY_CAP, SUMMARY_DEFAULT_TOKEN_BUDGET, Summary, SummaryLevel, SummaryStore,

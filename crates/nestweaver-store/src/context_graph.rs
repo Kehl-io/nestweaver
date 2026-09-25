@@ -63,6 +63,9 @@ fn relations() -> Vec<Relation> {
         ("SERVICE_HAS_SYMBOL", "Service", "Symbol", false, false),
         ("PROJECT_INCLUDES_NOTE", "Project", "Note", true, false),
         ("PROJECT_INCLUDES_SYMBOL", "Project", "Symbol", true, false),
+        // nw-678: durable code membership; symbols are reached via the
+        // repo's files.
+        ("PROJECT_INCLUDES_REPO", "Project", "Repo", true, false),
         ("PROJECT_HAS_COMPONENT", "Project", "Project", true, false),
         ("PROJECT_HAS_PARENT", "Project", "Project", true, false),
         ("IMPLEMENTS_CONTRACT", "Symbol", "Contract", true, true),

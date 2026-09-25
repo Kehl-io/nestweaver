@@ -1587,15 +1587,18 @@ pub struct FeatureContextResult {
     pub truncated_by: Option<TruncationCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<usize>,
+    /// nw-674: declared `repos` that did not resolve cleanly, so a feature
+    /// scoped to fewer repos than declared says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_issues: Vec<crate::project::ProjectRepoIssue>,
 }
 
 /// Build a task-focused context for a declared feature bundle.
 ///
-/// 1. Loads all repos and resolves feature.repos names to repo_uids. Matching
-///    accepts either the DB Repo display name or an `[[repos]]` config alias
-///    (`name = "..."`) whose URL matches an indexed repo — so a feature can
-///    refer to a repo by a friendly name even if it was indexed under its
-///    URL basename.
+/// 1. Loads all repos and resolves feature.repos names to repo_uids through
+///    [`crate::project::resolve_declared_repo`] — the resolver project
+///    membership uses (alias, path/url, stored name, checkout directory,
+///    URL basename).
 /// 2. Resolves all `feature.entry_points` using exact name match, filtered to feature repos.
 /// 3. Runs Personalized PageRank from those seeds.
 /// 4. Returns seeds, connected symbols, declared links, and any unmatched entry points.
@@ -1609,25 +1612,24 @@ pub fn build_feature_context(
 ) -> Result<FeatureContextResult, anyhow::Error> {
     // Resolve feature repo names to repo_uids.
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
-    // URL allow-list derived from `[[repos]] name = ...` aliases declared by
-    // the feature. Lets `feature.repos = ["redrock"]` resolve to a DB repo
-    // indexed under a different display name when the config aliases it.
-    let alias_urls: std::collections::HashSet<&str> = repo_configs
-        .iter()
-        .filter(|rc| {
-            rc.name
-                .as_deref()
-                .is_some_and(|n| feature.repos.iter().any(|fr| fr == n))
-        })
-        .map(|rc| rc.url.as_str())
-        .collect();
-    let feature_repo_uids: std::collections::HashSet<String> = all_repos
-        .iter()
-        .filter(|r| {
-            feature.repos.contains(&repo_display_name(r)) || alias_urls.contains(r.url.as_str())
-        })
-        .map(|r| r.uid.clone())
-        .collect();
+    // nw-674: the SAME resolver project membership uses. This had its own
+    // display-name/alias-url match, so `feature.repos = ["shot-insights-web-app"]`
+    // (the checkout directory, indexed as `web-app`) scoped entry points to
+    // nothing — and an ambiguous generic name is rejected here as there.
+    let mut feature_repo_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut repo_issues: Vec<crate::project::ProjectRepoIssue> = Vec::new();
+    for declared in &feature.repos {
+        let found = crate::project::resolve_declared_repo(declared, repo_configs, &all_repos);
+        repo_issues.extend(crate::project::ProjectRepoIssue::from_match(
+            &feature.name,
+            declared,
+            &found,
+        ));
+        feature_repo_uids.extend(found.attached().iter().map(|r| r.uid.clone()));
+    }
+    for issue in &repo_issues {
+        tracing::warn!("feature repo did not resolve cleanly: {issue}");
+    }
 
     let mut seed_uids: Vec<String> = Vec::new();
     let mut unmatched_entry_points: Vec<String> = Vec::new();
@@ -1637,8 +1639,10 @@ pub fn build_feature_context(
         let matches = store
             .lookup_symbols_by_name(entry_point)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let scoped: Vec<_> = if feature_repo_uids.is_empty() {
-            // No repos in DB yet — include all matches (graceful degradation).
+        // nw-674: unscoped ONLY when nothing is indexed at all. Keying this on
+        // an empty RESOLVED set meant a feature whose every declared repo
+        // failed to resolve silently widened to every repo in the instance.
+        let scoped: Vec<_> = if all_repos.is_empty() {
             matches
         } else {
             matches
@@ -1668,8 +1672,20 @@ pub fn build_feature_context(
     seed_uids.retain(|uid| seen.insert(uid.clone()));
 
     if seed_uids.is_empty() {
+        let issues = if repo_issues.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; declared repo issues: {}",
+                repo_issues
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         anyhow::bail!(
-            "No symbols found for feature '{}' entry points: {:?}",
+            "No symbols found for feature '{}' entry points: {:?}{issues}",
             feature.name,
             feature.entry_points
         );
@@ -1749,6 +1765,7 @@ pub fn build_feature_context(
         truncated: Some(limit_truncated),
         truncated_by: TruncationCause::resolve(false, limit_truncated),
         token_budget: None,
+        repo_issues,
     })
 }
 
@@ -2757,6 +2774,24 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     }
 
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
+    // nw-670 re-review N7: only notes/sections the caller NAMED pin their
+    // code — not every member a `vlt:`/`repo:` container seed expanded to.
+    let named_note_seeds = explicitly_named_seeds(&direct_seed_uids, &directly_named);
+    let newly_rendered = pin_note_seed_code_links(
+        store,
+        &seeds,
+        &mut connected,
+        &direct_seed_uids,
+        &named_note_seeds,
+        &ppr,
+        render_cap.and_then(|cap| cap.admit),
+    )?;
+    // N7: pins count toward a hydration cap (investigate) and its pre-cap
+    // disclosure like any other admitted candidate.
+    if let Some(cap) = render_cap {
+        admitted_before_cap += newly_rendered;
+        connected.truncate(cap.connected);
+    }
 
     // Cover cancellation after inference/vector work but before the completed
     // result crosses the engine boundary into single-flight/cache publication.
@@ -2852,6 +2887,116 @@ fn pin_direct_seeds_in_connected(
     connected.retain(|node| !direct.contains(node.uid.as_str()));
     pinned.append(connected);
     *connected = pinned;
+}
+
+/// nw-670 re-review N7: the direct seeds the caller NAMED, excluding the
+/// members a `vlt:`/`repo:` container seed expanded to.
+fn explicitly_named_seeds(
+    direct_seed_uids: &[String],
+    directly_named: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    direct_seed_uids
+        .iter()
+        .filter(|uid| directly_named.contains(*uid))
+        .cloned()
+        .collect()
+}
+
+/// nw-670 re-review F2: at most this many symbols a note/section seed links
+/// to directly are guaranteed a place in `connected`.
+pub(crate) const NOTE_SEED_CODE_LINK_SLOTS: usize = 8;
+
+/// nw-670 re-review F2: put the code a NOTE (or section) seed links to
+/// directly right after the pinned seeds, strongest link first.
+///
+/// Hybrid fusion caps a candidate reached only through PPR at the PPR
+/// weight (0.40 after tanh saturation), while entries that ALSO match BM25
+/// or semantic search score higher — so a note seed's own `ClaimLedger` /
+/// `readCsvRows` links ranked below every section that repeated a query
+/// word, and "context for this note" came back without the code it names.
+/// This narrowly guarantees those links slots, bounded by
+/// [`NOTE_SEED_CODE_LINK_SLOTS`], and leaves the global fusion weights (and
+/// symbol-seeded queries) untouched. `admit` is the caller's scope filter.
+/// Returns how many pinned nodes were hydrated here (not already in
+/// `connected`), for the caller's cap accounting. `named_seed_uids` are the
+/// seeds the caller named explicitly (N7).
+fn pin_note_seed_code_links(
+    store: &GraphStore,
+    seeds: &[BrainNode],
+    connected: &mut Vec<BrainNode>,
+    direct_seed_uids: &[String],
+    named_seed_uids: &[String],
+    ppr: &[(String, f64)],
+    admit: Option<&dyn Fn(&str) -> bool>,
+) -> Result<usize, anyhow::Error> {
+    let direct: std::collections::HashSet<&str> =
+        direct_seed_uids.iter().map(String::as_str).collect();
+    let named: std::collections::HashSet<&str> =
+        named_seed_uids.iter().map(String::as_str).collect();
+    let mut note_seeds: Vec<String> = Vec::new();
+    for node in seeds.iter().chain(connected.iter()) {
+        if named.contains(node.uid.as_str())
+            && (node.uid.starts_with("note:") || node.uid.starts_with("sec:"))
+            && !note_seeds.contains(&node.uid)
+        {
+            note_seeds.push(node.uid.clone());
+        }
+    }
+    if note_seeds.is_empty() {
+        return Ok(0);
+    }
+    let ppr_score: std::collections::HashMap<&str, f64> = ppr
+        .iter()
+        .map(|(uid, score)| (uid.as_str(), *score))
+        .collect();
+    let mut edges = store
+        .references_code_edges_from(&note_seeds)
+        .map_err(|e| anyhow::anyhow!("read note seeds' code links: {e}"))?;
+    edges.sort_by(|a, b| {
+        b.2.total_cmp(&a.2).then_with(|| {
+            let score = |uid: &str| ppr_score.get(uid).copied().unwrap_or(0.0);
+            score(&b.1).total_cmp(&score(&a.1))
+        })
+    });
+    let mut linked: Vec<BrainNode> = Vec::new();
+    let mut hydrated = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, symbol, _) in &edges {
+        if linked.len() >= NOTE_SEED_CODE_LINK_SLOTS {
+            break;
+        }
+        if direct.contains(symbol.as_str())
+            || !seen.insert(symbol.clone())
+            || admit.is_some_and(|admit| !admit(symbol))
+        {
+            continue;
+        }
+        let node = match connected.iter().find(|node| &node.uid == symbol) {
+            Some(existing) => Some(existing.clone()),
+            None => {
+                let node = render_brain_node(
+                    store,
+                    symbol,
+                    ppr_score.get(symbol.as_str()).copied().unwrap_or(0.0),
+                )?;
+                hydrated += usize::from(node.is_some());
+                node
+            }
+        };
+        linked.extend(node);
+    }
+    if linked.is_empty() {
+        return Ok(0);
+    }
+    let pinned: std::collections::HashSet<String> =
+        linked.iter().map(|node| node.uid.clone()).collect();
+    connected.retain(|node| !pinned.contains(&node.uid));
+    let front = connected
+        .iter()
+        .take_while(|node| direct.contains(node.uid.as_str()))
+        .count();
+    connected.splice(front..front, linked);
+    Ok(hydrated)
 }
 
 /// Tanh-based score normalization.
@@ -5296,7 +5441,10 @@ mod dedup_heading_section_tests {
 
 #[cfg(test)]
 mod pin_direct_seeds_tests {
-    use super::{BrainNode, pin_direct_seeds_in_connected};
+    use super::{
+        BrainNode, GraphStore, explicitly_named_seeds, pin_direct_seeds_in_connected,
+        pin_note_seed_code_links,
+    };
 
     fn node(uid: &str) -> BrainNode {
         BrainNode {
@@ -5319,6 +5467,44 @@ mod pin_direct_seeds_tests {
         assert_eq!(
             connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
             vec!["sym:Long", "sym:extra1", "sym:extra2"]
+        );
+    }
+
+    /// nw-670 re-review N7: a container seed's expanded members are direct
+    /// seeds but not NAMED ones, so they do not pin their code.
+    #[test]
+    fn container_members_are_not_named_seeds() {
+        let direct = vec!["note:named".to_string(), "note:member".to_string()];
+        let named: std::collections::HashSet<String> =
+            ["note:named".to_string(), "vlt:v".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            explicitly_named_seeds(&direct, &named),
+            vec!["note:named".to_string()]
+        );
+    }
+
+    /// nw-670 re-review F2 counterweight: only Note/Section seeds pin their
+    /// code links; a symbol seed leaves `connected` exactly as fused.
+    #[test]
+    fn a_symbol_seed_pins_no_code_links() {
+        let store = GraphStore::in_memory().unwrap();
+        let seeds = vec![node("sym:Long")];
+        let mut connected = vec![node("sym:a"), node("sym:b")];
+        pin_note_seed_code_links(
+            &store,
+            &seeds,
+            &mut connected,
+            &["sym:Long".to_string()],
+            &["sym:Long".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            connected.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>(),
+            vec!["sym:a", "sym:b"]
         );
     }
 

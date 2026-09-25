@@ -172,8 +172,11 @@ impl IndexPublicationStatus {
     /// with disclosure, as opposed to a full `index` run's window, which
     /// stays fail-closed exactly as before.
     pub fn is_watcher_batch(&self) -> bool {
-        self.writer_reason.as_deref()
-            == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH)
+        // nw-670 live eval #2: a code-link reconcile chunk is served the same
+        // way (see `MARKER_REASON_CODE_LINKS`).
+        nestweaver_store::index_publication::is_serve_with_disclosure_reason(
+            self.writer_reason.as_deref(),
+        )
     }
 
     /// nw-475 honesty half: a non-wedged *young* watcher-batch marker is

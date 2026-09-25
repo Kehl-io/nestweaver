@@ -476,6 +476,14 @@ pub fn slugify(text: &str) -> String {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
+/// The `content_hash` [`parse_markdown`] records for `source`: SHA-256 of the
+/// file's original bytes. nw-675: the code-link reconciler re-reads a note
+/// from disk and uses this to confirm the text is the one the graph
+/// committed before attributing mentions to the committed sections.
+pub fn note_content_hash(source: &str) -> String {
+    sha256_hex(source)
+}
+
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -1125,6 +1133,335 @@ fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
     out
 }
 
+// ── code mentions (nw-670) ─────────────────────────────────────────────────
+
+/// How a name was written where a note mentions it. Several can hold for
+/// one name; see [`code_mentions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MentionFlags {
+    /// The whole inline code span is this identifier (`` `ClaimLedger` ``,
+    /// `` `review()` ``).
+    pub span: bool,
+    /// Inside other inline code or a code block.
+    pub code: bool,
+    /// Written as an unqualified call, `name(`.
+    pub call: bool,
+    /// In ordinary text (including frontmatter values).
+    pub prose: bool,
+}
+
+impl MentionFlags {
+    /// Union `other` into `self`.
+    pub fn merge(&mut self, other: MentionFlags) {
+        self.span |= other.span;
+        self.code |= other.code;
+        self.call |= other.call;
+        self.prose |= other.prose;
+    }
+
+    /// Written as code (a span or inside code), not only in prose.
+    pub fn is_code(&self) -> bool {
+        self.span || self.code
+    }
+}
+
+/// One explicit code mention: `name` on file-absolute, 1-based `line`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeMention {
+    pub name: String,
+    pub line: u32,
+    pub flags: MentionFlags,
+}
+
+/// Whether `name` is DISTINCTIVE: `snake_case`/`SCREAMING_SNAKE` (an interior
+/// `_`) or `camelCase`/`PascalCase` with at least two humps (a lowercase
+/// letter or digit followed by an uppercase one). Everything else —
+/// `screen`, `Processor`, `TIMEOUT` — is PLAIN and could be an English word.
+///
+/// nw-670 R2: this shape is what lets a name in prose count as a code
+/// mention at all; plain names count only when written as code.
+pub fn is_distinctive(name: &str) -> bool {
+    let core = name.trim_matches('_');
+    if core.contains('_') && core.chars().any(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    name.as_bytes()
+        .windows(2)
+        .any(|w| (w[0].is_ascii_lowercase() || w[0].is_ascii_digit()) && w[1].is_ascii_uppercase())
+}
+
+/// Every explicit code mention in a note's `source` (nw-670 R1):
+///
+/// * inline code that is exactly one identifier, optionally `()` — always
+///   (`span`, plus `call` for `name()`);
+/// * other inline code and code blocks — a distinctive identifier or an
+///   unqualified call `name(` (`code`); string literals are skipped;
+/// * prose, frontmatter values included — a distinctive identifier or an
+///   unqualified call (`prose`);
+/// * never inside a URL, a wikilink `[[…]]` or a markdown link target.
+///
+/// A token must start on an identifier boundary (not after a letter, digit
+/// or `_`); `Math.round(` and `.join(` are qualified, so they count only
+/// when the name is distinctive, and then not as calls. Lines are those of
+/// the note as `parse_markdown` numbers them (Obsidian `%%…%%` comments
+/// removed, file-absolute), so they index into its sections' spans.
+pub fn code_mentions(source: &str) -> Vec<CodeMention> {
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
+
+    let stripped = strip_obsidian_comments(source);
+    let stripped = crate::parse::strip_nul_bytes(&stripped).into_owned();
+    let (frontmatter, body) = split_frontmatter(&stripped);
+    let shift = u32::try_from(stripped.lines().count() - body.lines().count()).unwrap_or(0);
+    let mut out = Vec::new();
+
+    // Frontmatter (Backlog.md items live there): prose with backtick spans.
+    // Its first line is file line 2, after the opening `---`.
+    if let Some(frontmatter) = frontmatter {
+        for (idx, line) in frontmatter.lines().enumerate() {
+            let line_no = u32::try_from(idx + 2).unwrap_or(u32::MAX);
+            scan_inline_spans(frontmatter_value(line), line_no, &mut out);
+        }
+    }
+
+    let arena = Arena::new();
+    let root = parse_document(&arena, body, &Options::default());
+    let mut prose_lines: std::collections::BTreeMap<u32, String> = Default::default();
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        let line = u32::try_from(data.sourcepos.start.line).unwrap_or(0) + shift;
+        match &data.value {
+            NodeValue::Code(code) => scan_code_span(&code.literal, line, &mut out),
+            NodeValue::CodeBlock(block) => {
+                let first = if block.fenced { line + 1 } else { line };
+                for (idx, text) in block.literal.lines().enumerate() {
+                    let line_no = first + u32::try_from(idx).unwrap_or(u32::MAX);
+                    scan_identifiers(
+                        &blank_strings(&blank_links(text)),
+                        line_no,
+                        Where::Code,
+                        &mut out,
+                    );
+                }
+            }
+            // A line's text pieces are joined first: comrak splits `[[x]]`
+            // into several Text nodes, and the wikilink is only visible
+            // whole.
+            NodeValue::Text(text) => prose_lines.entry(line).or_default().push_str(text),
+            _ => {}
+        }
+    }
+    for (line, text) in prose_lines {
+        scan_identifiers(&blank_links(&text), line, Where::Prose, &mut out);
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum Where {
+    Code,
+    Prose,
+}
+
+/// The value part of a frontmatter line: `key: value` and `- key: value`
+/// yield `value`; any other line (a list item, a folded continuation) is
+/// all value. nw-670 review L9 (ADR R1): YAML KEYS such as `created_at` are
+/// schema, not a mention of code.
+fn frontmatter_value(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+    let key_len = body
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(body.len());
+    if key_len == 0 {
+        return body;
+    }
+    match body[key_len..].strip_prefix(':') {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest,
+        _ => body,
+    }
+}
+
+/// A frontmatter line: backtick spans are inline code, the rest prose.
+fn scan_inline_spans(line: &str, line_no: u32, out: &mut Vec<CodeMention>) {
+    let mut prose = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        prose.push_str(&rest[..open]);
+        prose.push(' ');
+        let after = &rest[open + 1..];
+        match after.find('`') {
+            Some(close) => {
+                scan_code_span(&after[..close], line_no, out);
+                rest = &after[close + 1..];
+            }
+            None => rest = after,
+        }
+    }
+    prose.push_str(rest);
+    scan_identifiers(&blank_links(&prose), line_no, Where::Prose, out);
+}
+
+/// One inline code span: a whole-identifier span, else scanned as code.
+fn scan_code_span(literal: &str, line_no: u32, out: &mut Vec<CodeMention>) {
+    let trimmed = literal.trim();
+    let (name, call) = match trimmed.strip_suffix("()") {
+        Some(name) => (name, true),
+        None => (trimmed, false),
+    };
+    let is_identifier = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_identifier {
+        out.push(CodeMention {
+            name: name.to_string(),
+            line: line_no,
+            flags: MentionFlags {
+                span: true,
+                call,
+                ..MentionFlags::default()
+            },
+        });
+        return;
+    }
+    scan_identifiers(
+        &blank_strings(&blank_links(literal)),
+        line_no,
+        Where::Code,
+        out,
+    );
+}
+
+/// Emit each distinctive identifier or unqualified call in `text`.
+fn scan_identifiers(text: &str, line_no: u32, place: Where, out: &mut Vec<CodeMention>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts = (c.is_ascii_alphabetic() || c == '_')
+            && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        // A token running into a non-ASCII letter is part of a longer word.
+        if end < chars.len() && chars[end].is_alphanumeric() {
+            i = end + 1;
+            continue;
+        }
+        let name: String = chars[i..end].iter().collect();
+        // `obj.name(`, `Type::name(` and `$obj->name(` are someone else's
+        // member (nw-670 review L9 adds `->`).
+        let qualified = i > 0
+            && (matches!(chars[i - 1], '.' | ':')
+                || (chars[i - 1] == '>' && i > 1 && chars[i - 2] == '-'));
+        // `file(s)` and `box(es)` are English plurals, not calls (L9).
+        let plural = chars[end..].starts_with(&['(', 's', ')'])
+            || chars[end..].starts_with(&['(', 'e', 's', ')']);
+        let call = !qualified && !plural && chars.get(end) == Some(&'(');
+        if is_distinctive(&name) || call {
+            out.push(CodeMention {
+                name,
+                line: line_no,
+                flags: MentionFlags {
+                    code: matches!(place, Where::Code),
+                    prose: matches!(place, Where::Prose),
+                    call,
+                    span: false,
+                },
+            });
+        }
+        i = end;
+    }
+}
+
+/// Blank URLs, wikilinks `[[…]]` and markdown link targets `](…)`: nothing
+/// in them is a code mention.
+fn blank_links(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = vec![true; chars.len()];
+    let mut i = 0;
+    while i < chars.len() {
+        // Wikilink / embed.
+        if chars[i] == '['
+            && chars.get(i + 1) == Some(&'[')
+            && let Some(close) = (i + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == ']' && chars[j + 1] == ']')
+        {
+            keep[i..close + 2].iter_mut().for_each(|k| *k = false);
+            i = close + 2;
+            continue;
+        }
+        // Markdown link target.
+        if chars[i] == ']'
+            && chars.get(i + 1) == Some(&'(')
+            && let Some(close) = (i + 2..chars.len()).find(|&j| chars[j] == ')')
+        {
+            keep[i + 1..=close].iter_mut().for_each(|k| *k = false);
+            i = close + 1;
+            continue;
+        }
+        // `scheme://…` and `www.…` up to the next whitespace.
+        let url_start = if chars[i] == ':'
+            && chars.get(i + 1) == Some(&'/')
+            && chars.get(i + 2) == Some(&'/')
+        {
+            let mut start = i;
+            while start > 0
+                && (chars[start - 1].is_ascii_alphanumeric()
+                    || matches!(chars[start - 1], '+' | '.' | '-'))
+            {
+                start -= 1;
+            }
+            (start < i).then_some(start)
+        } else if chars[i..].starts_with(&['w', 'w', 'w', '.'])
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+        {
+            Some(i)
+        } else {
+            None
+        };
+        if let Some(start) = url_start {
+            let mut end = i;
+            while end < chars.len() && !chars[end].is_whitespace() {
+                end += 1;
+            }
+            keep[start..end].iter_mut().for_each(|k| *k = false);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    chars
+        .iter()
+        .zip(keep)
+        .map(|(c, k)| if k { *c } else { ' ' })
+        .collect()
+}
+
+/// Blank `"…"` and `'…'` string literals on one line of code.
+fn blank_strings(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], '"' | '\'')
+            && let Some(close) = (i + 1..chars.len()).find(|&j| chars[j] == chars[i])
+        {
+            out[i..=close].iter_mut().for_each(|c| *c = ' ');
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
 // ── Obsidian-native helpers ────────────────────────────────────────────────
 
 /// Extract the Obsidian callout type from a section's text.
@@ -1227,6 +1564,149 @@ fn strip_obsidian_comments(text: &str) -> String {
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod code_mention_tests {
+    use super::*;
+
+    fn names(source: &str) -> Vec<(String, u32, MentionFlags)> {
+        let mut out: Vec<_> = code_mentions(source)
+            .into_iter()
+            .map(|m| (m.name, m.line, m.flags))
+            .collect();
+        out.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        out
+    }
+
+    fn just_names(source: &str) -> Vec<String> {
+        names(source).into_iter().map(|(name, _, _)| name).collect()
+    }
+
+    const SPAN: MentionFlags = MentionFlags {
+        span: true,
+        code: false,
+        call: false,
+        prose: false,
+    };
+
+    #[test]
+    fn distinctive_shapes() {
+        for name in [
+            "snake_case",
+            "SCREAMING_SNAKE",
+            "camelCase",
+            "PascalCase",
+            "v2Api",
+            "_private_x",
+        ] {
+            assert!(is_distinctive(name), "{name}");
+        }
+        for name in ["screen", "Processor", "TIMEOUT", "_private", "x_", "__"] {
+            assert!(!is_distinctive(name), "{name}");
+        }
+    }
+
+    /// R1: plain prose words are not mentions; distinctive ones and
+    /// unqualified calls are.
+    #[test]
+    fn prose_counts_distinctive_names_and_calls_only() {
+        assert!(just_names("the screen renders before layout").is_empty());
+        assert_eq!(
+            just_names("the ScreenRenderer calls render(x) and Math.round(y)"),
+            ["ScreenRenderer", "render"]
+        );
+    }
+
+    /// R1: a whole-identifier span always counts, `()` marks a call; other
+    /// spans are scanned as code.
+    #[test]
+    fn whole_identifier_spans_always_count() {
+        let found = names("see `pending` and `review()` and `readCsvRows(x)`\n");
+        // Sorted by (line, name): pending, readCsvRows, review.
+        assert_eq!(found[0], ("pending".into(), 1, SPAN));
+        assert_eq!(
+            found[2],
+            ("review".into(), 1, MentionFlags { call: true, ..SPAN })
+        );
+        assert_eq!(
+            found[1],
+            (
+                "readCsvRows".into(),
+                1,
+                MentionFlags {
+                    code: true,
+                    call: true,
+                    ..MentionFlags::default()
+                }
+            )
+        );
+    }
+
+    /// R1: nothing inside URLs, wikilinks, link targets or string literals.
+    #[test]
+    fn urls_wikilinks_link_targets_and_strings_are_skipped() {
+        assert_eq!(
+            just_names(
+                "see https://x.io/pull_request_id, www.site.io/some_path, [[note_about_things]], \
+                 ![[embed_this_one]], [the doc](src/main_module.rs) and other_widget\n\n\
+                 `status = 'cleared_state'`\n"
+            ),
+            ["other_widget"]
+        );
+    }
+
+    /// Code blocks: distinctive names and calls, strings skipped, each on
+    /// its own file line; frontmatter is scanned as prose with spans, and
+    /// every line is file-absolute.
+    #[test]
+    fn code_blocks_and_frontmatter_report_file_lines() {
+        let source = "---\ntitle: x\nnote: uses `ClaimLedger` and run_pipeline\n---\n\
+                      # Heading\n\n```rust\nlet a = parse_row(\"text_value\");\nplain.call();\n```\n";
+        assert_eq!(
+            names(source)
+                .into_iter()
+                .map(|(name, line, _)| (name, line))
+                .collect::<Vec<_>>(),
+            [
+                ("ClaimLedger".to_string(), 3),
+                ("run_pipeline".to_string(), 3),
+                ("parse_row".to_string(), 8),
+            ]
+        );
+    }
+
+    /// nw-670 review L9: plural `(s)`/`(es)` is not a call; `->name(` is
+    /// qualified; frontmatter KEYS are not mentions. Counterweights: a real
+    /// unqualified call, and a distinctive frontmatter VALUE, still count.
+    #[test]
+    fn plurals_arrow_members_and_frontmatter_keys_are_not_mentions() {
+        assert!(just_names("update the widget(s) and the box(es)").is_empty());
+        assert!(just_names("then $this->render(page) runs").is_empty());
+        assert_eq!(just_names("then render(page) runs"), ["render"]);
+        assert_eq!(
+            just_names(
+                "---\ncreated_at: 2026-09-25\n- due_date: soon\nnote_text: uses other_name\n---\nbody\n"
+            ),
+            ["other_name"]
+        );
+    }
+
+    /// Lines match `parse_markdown`'s section spans, which are computed
+    /// after Obsidian comments are removed.
+    #[test]
+    fn lines_follow_the_comment_stripped_text() {
+        let source = "# A\n%% a\nmulti-line comment with hidden_name %%\nthen visible_name\n";
+        let parsed = parse_markdown("a.md", source).unwrap();
+        let found = names(source);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "visible_name");
+        let section = &parsed.sections[0];
+        assert!(
+            found[0].1 >= section.start_line && found[0].1 <= section.end_line,
+            "{found:?} {section:?}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -756,6 +756,16 @@ impl GraphScope {
             query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN p.uid, n.uid, r.confidence".to_string(),
             edge_type: Some(EdgeType::ProjectIncludesNote),
         });
+        // nw-678: symbol membership derived from Project -> Repo at load
+        // time, so it cannot decay with re-indexing; the legacy per-symbol
+        // edges still count until a re-materialize replaces them.
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_REPO]->(repo:Repo) \
+                    MATCH (s:Symbol) WHERE s.repo_uid = repo.uid \
+                    RETURN p.uid, s.uid, r.confidence"
+                .to_string(),
+            edge_type: Some(EdgeType::ProjectIncludesSymbol),
+        });
         scope.edge_queries.push(ScopedEdgeQuery {
             query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence".to_string(),
             edge_type: Some(EdgeType::ProjectIncludesSymbol),
@@ -2179,6 +2189,52 @@ mod tests {
             store.pagerank_generation(),
             clean_pagerank_generation + 1,
             "the first clean access must perform the only retained recompute"
+        );
+    }
+
+    /// nw-670 live eval #2: a code-link reconcile publication rewrites only
+    /// derived note->code links, chunk by chunk, for minutes during a rules
+    /// migration. Ranked reads failed closed for most of it. Like a watcher
+    /// batch, a young, held one now lets ranked reads answer (with the
+    /// publication disclosure). Counterweight: an unattributed (full index)
+    /// publication still fails closed.
+    #[test]
+    fn a_code_link_reconcile_publication_does_not_block_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        let _writer_authority = crate::acquire_db_write_lease(&db_path).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                Some("code link reconciliation"),
+            ),
+        )
+        .unwrap();
+        assert!(
+            !store.index_publication_blocks_ranking(),
+            "a young held code-link publication must not block ranking"
+        );
+        store
+            .pagerank_scores()
+            .expect("ranked reads answer through a code-link publication");
+
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(std::process::id(), nanos, None),
+        )
+        .unwrap();
+        assert!(
+            store.index_publication_blocks_ranking(),
+            "counterweight: a full index publication still fails closed"
         );
     }
 

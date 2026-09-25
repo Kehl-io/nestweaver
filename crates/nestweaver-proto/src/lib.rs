@@ -160,6 +160,56 @@ fn path_reason_notes(value: &serde_json::Value, key: &str) -> Vec<PendingReconci
         .unwrap_or_default()
 }
 
+/// nw-670 review M3: map `brain_status`'s `code_links` object onto the typed
+/// status RPC. `None` when the payload has none (an older producer).
+pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLinksStatus> {
+    let links = value.get("code_links")?;
+    let text = |key: &str| {
+        links
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let number = |key: &str| links.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Some(CodeLinksStatus {
+        pending: links
+            .get("pending")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        reason: text("reason"),
+        since: text("since"),
+        progress: text("progress"),
+        last_error: text("last_error"),
+        failures: number("failures"),
+        rules_version: number("rules_version"),
+        current_rules_version: number("current_rules_version"),
+        last_reconciled_at: text("last_reconciled_at"),
+        notes_changed_since_indexing: links
+            .get("notes_changed_since_indexing")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|row| StaleNotesInVault {
+                vault: row
+                    .get("vault")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                count: row.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            })
+            .collect(),
+        notes_changed_as_of: text("notes_changed_as_of"),
+        unscoped_projects: links
+            .get("unscoped_projects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    })
+}
+
 /// Map the JSON `brain_status` sidecar disclosure onto the typed status RPC.
 /// A live daemon always returns `Some`, including empty counts.
 pub fn skipped_notes_from_status_json(

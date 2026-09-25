@@ -297,14 +297,9 @@ fn brain_context_request(params: &Value) -> nestweaver_proto::BrainContextReques
             .to_string(),
         tags: json_str_array(params, "tags"),
         exclude_tags: json_str_array(params, "exclude_tags"),
-        weight_ppr: params
-            .get("weight_ppr")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
-        weight_bm25: params
-            .get("weight_bm25")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
+        // nw-670 re-review F3: presence, not zero-as-unset.
+        weight_ppr: params.get("weight_ppr").and_then(|v| v.as_f64()),
+        weight_bm25: params.get("weight_bm25").and_then(|v| v.as_f64()),
         intent: params
             .get("intent")
             .and_then(|v| v.as_str())

@@ -280,6 +280,10 @@ pub struct BrainWatcher {
     /// `[indexing].max_note_bytes`. Defaults to 1 MiB so tests and unconfigured
     /// watchers match the markdown indexer.
     note_limits: crate::index_limits::NoteLimits,
+    /// nw-673: the instance's `[cross_domain]` settings (stoplist, minimum
+    /// name length) for the watcher's own link scan, so an edited note is
+    /// linked by the same rules the reconciler and the bulk pass apply.
+    cross_domain: crate::config::CrossDomainConfig,
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
@@ -409,6 +413,7 @@ impl BrainWatcher {
             ignore_set,
             note_limits: crate::index_limits::NoteLimits::default(),
             external_tantivy: None,
+            cross_domain: crate::config::CrossDomainConfig::default(),
             mutation_lease_factory: None,
             ready_callback: None,
             reconcile_retry_base: RECONCILE_RETRY_BASE,
@@ -471,6 +476,13 @@ impl BrainWatcher {
     /// Apply the configured markdown-note size limit to watched vault reads.
     pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
         self.note_limits = limits;
+        self
+    }
+
+    /// Apply the instance's `[cross_domain]` settings to the link scan
+    /// (nw-673). Unset, the built-in defaults apply.
+    pub fn with_cross_domain_config(mut self, config: crate::config::CrossDomainConfig) -> Self {
+        self.cross_domain = config;
         self
     }
 
@@ -989,7 +1001,8 @@ impl BrainWatcher {
         let mut phase_timings = BatchPhaseTimings::default();
 
         let build_symbol_index_started = Instant::now();
-        let symbol_index = crate::cross_domain::build_symbol_index(store).ok();
+        let symbol_index =
+            crate::cross_domain::build_symbol_index_with_config(store, &self.cross_domain).ok();
         phase_timings.build_symbol_index_ms =
             build_symbol_index_started.elapsed().as_millis() as u64;
 
@@ -1424,16 +1437,19 @@ impl BrainWatcher {
         let built_index;
         let index = match symbols {
             Some(index) => Some(index),
-            None => match crate::cross_domain::build_symbol_index(store) {
-                Ok(index) => {
-                    built_index = index;
-                    Some(&built_index)
+            None => {
+                match crate::cross_domain::build_symbol_index_with_config(store, &self.cross_domain)
+                {
+                    Ok(index) => {
+                        built_index = index;
+                        Some(&built_index)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "watcher cross-domain refresh failed");
+                        None
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "watcher cross-domain refresh failed");
-                    None
-                }
-            },
+            }
         }
         // No code indexed: nothing to bridge to, and existing edges are left
         // alone, as the per-note path did.
@@ -3878,6 +3894,36 @@ mod tests {
         }
     }
 
+    /// nw-670 R5: put every note of the fixture in one project over `repos`,
+    /// so a name defined in more than one file can still link (an unscoped
+    /// note links only single-definition names).
+    fn nw_670_project_over(fx: &Nw668Fixture, repos: &[&str]) {
+        let project = nestweaver_schema::Project {
+            uid: "proj:nw670".to_string(),
+            name: "nw670".to_string(),
+            summary: None,
+            instance_id: "default".to_string(),
+        };
+        let notes: Vec<(String, String)> = fx
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| (project.uid.clone(), note.uid))
+            .collect();
+        let symbols: Vec<(String, String)> = fx
+            .store
+            .list_symbols_for_linking()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, repo, _)| repos.contains(&repo.as_str()))
+            .map(|(uid, _, _, _, _)| (project.uid.clone(), uid))
+            .collect();
+        fx.store
+            .replace_materialized_projects(&[project], &notes, &symbols, &[], &[])
+            .unwrap();
+    }
+
     /// Mentions every name in the whole note and once more in a second
     /// section, so each edited note yields `k` note edges and `k + 1`
     /// section edges.
@@ -3958,6 +4004,35 @@ mod tests {
         );
     }
 
+    /// nw-673: the configured `[cross_domain]` stoplist reaches the
+    /// watcher's link scan. Counterweight: the other edited note links.
+    #[test]
+    fn nw_673_the_configured_stoplist_reaches_the_watcher() {
+        let _guard = serial_watcher_test();
+        let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
+        fs::write(fx.root.join("n000.md"), "# A\n\nuses AlphaWidget\n").unwrap();
+        fs::write(fx.root.join("n001.md"), "# B\n\nuses BravoWidget\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test")
+            .with_cross_domain_config(crate::config::CrossDomainConfig {
+                stoplist_extend: vec!["AlphaWidget".to_string()],
+                ..Default::default()
+            });
+        watcher
+            .process_batch(
+                &fx.store,
+                None,
+                &fx.v_uid,
+                vec![fx.root.join("n000.md"), fx.root.join("n001.md")],
+                &None,
+            )
+            .unwrap();
+        assert_eq!(
+            fx.store.list_references_code_edges().unwrap().len(),
+            2,
+            "only n001's note + section edge"
+        );
+    }
+
     /// nw-668: the lease was taken once PER NOTE and held across the scan.
     /// The scan (tokenising bodies against a 200K-symbol index) is read-only
     /// and must run with no lease held; the flush takes one lease per
@@ -4032,9 +4107,10 @@ mod tests {
     /// and a trailing empty section. Pinned twice: against the literal set
     /// the pre-nw-668 path produced (characterised on that code), and
     /// against the bulk `discover_cross_domain_links` pass over the same
-    /// files. The `@b` rows (one name defined in two repos links to both)
-    /// were added after the characterisation run; they follow the index's
-    /// all-candidates rule and are pinned against the bulk pass.
+    /// files. The `@b` rows (one name defined in two repos of the notes'
+    /// project links to both, nw-670 R5/R6) are pinned against the bulk
+    /// pass. nw-670 re-pinned the literal set under its rules; the bulk
+    /// comparison is the parity check that must never be re-pinned.
     #[test]
     fn nw_668_watcher_edges_equal_the_pre_change_and_bulk_edge_sets() {
         let _guard = serial_watcher_test();
@@ -4052,8 +4128,10 @@ mod tests {
             "NeverMentioned",
         ];
         let fx = nw_668_fixture(&[], 2, &symbols);
-        // The same name in a second repo: a mention links to BOTH symbols.
+        // The same name in a second repo of the notes' project: a mention
+        // links to BOTH symbols, each at half the confidence (nw-670 R9).
         nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
+        nw_670_project_over(&fx, &["repo:nw668", "repo:nw668b"]);
         fs::write(
             fx.root.join("n000.md"),
             "---\nrelated: FrontThing\n---\nPreambleThing intro\n\n\
@@ -4122,32 +4200,38 @@ mod tests {
             out
         };
         let watched = render(&fx.store);
+        // Re-pinned for nw-670's rules. Against the pre-nw-668 set: UrlThing
+        // is gone (a URL is never a mention, R1); every mention here is
+        // distinctive prose, so confidence is 0.9 × 0.85 (R9, shown as 0.8);
+        // BodyThing's two definitions split one unit of mass (0.4 each).
+        // The rest — frontmatter, heading, preamble, link text, setext,
+        // repeated and stoplisted/short names, the empty section — is as
+        // before.
         let expected: Vec<String> = vec![
-            "n000.md -> BodyThing (0.9, name-match)",
-            "n000.md -> BodyThing@b (0.9, name-match)",
-            "n000.md -> FrontThing (0.9, name-match)",
-            "n000.md -> HeadThing (0.9, name-match)",
-            "n000.md -> LinkThing (0.9, name-match)",
-            "n000.md -> PreambleThing (0.9, name-match)",
-            "n000.md -> SetextThing (0.9, name-match)",
-            "n000.md -> TwiceThing (0.9, name-match)",
-            "n000.md -> UrlThing (0.9, name-match)",
-            "n000.md:11 -> TwiceThing (0.9, name-match)",
-            "n000.md:4 -> PreambleThing (0.9, name-match)",
-            "n000.md:7 -> BodyThing (0.9, name-match)",
-            "n000.md:7 -> BodyThing@b (0.9, name-match)",
-            "n000.md:7 -> TwiceThing (0.9, name-match)",
-            "n001.md -> BodyThing (0.9, name-match)",
-            "n001.md -> BodyThing@b (0.9, name-match)",
-            "n001.md:2 -> BodyThing (0.9, name-match)",
-            "n001.md:2 -> BodyThing@b (0.9, name-match)",
+            "n000.md -> BodyThing (0.4, name-match)",
+            "n000.md -> BodyThing@b (0.4, name-match)",
+            "n000.md -> FrontThing (0.8, name-match)",
+            "n000.md -> HeadThing (0.8, name-match)",
+            "n000.md -> LinkThing (0.8, name-match)",
+            "n000.md -> PreambleThing (0.8, name-match)",
+            "n000.md -> SetextThing (0.8, name-match)",
+            "n000.md -> TwiceThing (0.8, name-match)",
+            "n000.md:11 -> TwiceThing (0.8, name-match)",
+            "n000.md:4 -> PreambleThing (0.8, name-match)",
+            "n000.md:7 -> BodyThing (0.4, name-match)",
+            "n000.md:7 -> BodyThing@b (0.4, name-match)",
+            "n000.md:7 -> TwiceThing (0.8, name-match)",
+            "n001.md -> BodyThing (0.4, name-match)",
+            "n001.md -> BodyThing@b (0.4, name-match)",
+            "n001.md:2 -> BodyThing (0.4, name-match)",
+            "n001.md:2 -> BodyThing@b (0.4, name-match)",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
         assert_eq!(
             watched, expected,
-            "watcher edge set drifted from pre-nw-668"
+            "watcher edge set drifted from the pinned nw-670 set"
         );
 
         crate::cross_domain::discover_cross_domain_links(&fx.store).unwrap();
@@ -4241,6 +4325,7 @@ mod tests {
         let notes = crate::cross_domain::NOTES_PER_TXN + 1;
         let fx = nw_668_fixture(&[], notes, &["AlphaWidget", "BodyThing"]);
         nw_668_insert_symbol(&fx.store, "repo:nw668b", "BodyThing", 1);
+        nw_670_project_over(&fx, &["repo:nw668", "repo:nw668b"]);
         let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
         let mut paths = Vec::new();
         for i in 0..notes {

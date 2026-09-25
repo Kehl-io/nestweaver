@@ -1087,6 +1087,22 @@ fn is_column_already_present(message: &str) -> bool {
     message.contains("already has property") || message.contains("already exists")
 }
 
+/// The two note→code REL tables and their DDL: one definition shared by
+/// schema init and [`GraphStore::truncate_references_code_edges`], so the
+/// recreated tables cannot drift from the originals.
+const REFERENCES_CODE_TABLES: [(&str, &str); 2] = [
+    (
+        "REFERENCES_CODE_NOTE_TO_SYMBOL",
+        "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_NOTE_TO_SYMBOL(\
+            FROM Note TO Symbol, confidence FLOAT, source STRING)",
+    ),
+    (
+        "REFERENCES_CODE_SECTION_TO_SYMBOL",
+        "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_SECTION_TO_SYMBOL(\
+            FROM Section TO Symbol, confidence FLOAT, source STRING)",
+    ),
+];
+
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
@@ -3721,6 +3737,34 @@ impl GraphStore {
         Ok(())
     }
 
+    /// nw-670 (review H1): remove EVERY REFERENCES_CODE edge, note- and
+    /// section-level, in one short transaction by dropping and recreating the
+    /// two REL tables with the same DDL [`Self::init_schema`] uses. Deleting
+    /// ~39 M edges row by row took hundreds of delete+checkpoint cycles; this
+    /// is one metadata change. A crash before the commit leaves the tables as
+    /// they were; `init_schema` recreates a missing one on the next open.
+    pub fn truncate_references_code_edges(&self) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let outcome = (|| -> Result<(), StoreError> {
+            for (table, ddl) in REFERENCES_CODE_TABLES {
+                conn.query(&format!("DROP TABLE {table}"))
+                    .map_err(|e| StoreError::Query(format!("drop {table}: {e}")))?;
+                conn.query(ddl)
+                    .map_err(|e| StoreError::Query(format!("recreate {table}: {e}")))?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                if let Err(rollback) = self.rollback_transaction(&conn) {
+                    tracing::warn!(%rollback, "truncate REFERENCES_CODE rollback failed");
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn init_schema(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
@@ -4006,6 +4050,18 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // nw-678: project code membership as Project -> Repo. Repo nodes
+        // survive every re-index (only files and symbols are replaced), so
+        // unlike the per-symbol PROJECT_INCLUDES_SYMBOL fan-out — dropped by
+        // every symbol DETACH DELETE and never re-materialized — membership
+        // cannot decay. A project's member symbols are those whose
+        // `repo_uid` is a member repo, computed when read.
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_REPO(\
+                FROM Project TO Repo, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS PROJECT_HAS_COMPONENT(\
                 FROM Project TO Project, confidence FLOAT)",
@@ -4023,17 +4079,10 @@ impl GraphStore {
         // section and a code symbol on the same axis when a user query
         // matches either.
 
-        conn.query(
-            "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_NOTE_TO_SYMBOL(\
-                FROM Note TO Symbol, confidence FLOAT, source STRING)",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-
-        conn.query(
-            "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_SECTION_TO_SYMBOL(\
-                FROM Section TO Symbol, confidence FLOAT, source STRING)",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
+        for (_, ddl) in REFERENCES_CODE_TABLES {
+            conn.query(ddl)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+        }
 
         // ── Contract extension (F2-core): API contract graph ────────────────
         //
@@ -4318,6 +4367,47 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-670 re-review N3: a database a newer binary never opened writable
+    /// lacks PROJECT_INCLUDES_REPO (read-only opens run no schema init).
+    /// Membership reads treat that as "no durable membership", not an error.
+    #[test]
+    fn project_membership_reads_tolerate_a_missing_repo_table() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("DROP TABLE PROJECT_INCLUDES_REPO")
+            .unwrap();
+        assert!(store.project_member_repo_uids("proj:x").unwrap().is_empty());
+        assert!(store.list_project_symbol_uids("proj:x").unwrap().is_empty());
+        store.project_link_scopes().unwrap();
+    }
+
+    /// nw-670 re-review (optional): the REFERENCES_CODE tables recreated by
+    /// `truncate_references_code_edges` are durable — they survive a
+    /// checkpoint, close and reopen, empty and writable.
+    #[test]
+    fn truncated_references_code_tables_survive_checkpoint_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.truncate_references_code_edges().unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open(&db).unwrap();
+        assert_eq!(reopened.count_references_code_edges().unwrap(), 0);
+        assert!(
+            reopened
+                .references_code_edges_for_notes(&["note:none".to_string()])
+                .unwrap()
+                .is_empty(),
+            "both tables are queryable after reopen"
+        );
+        reopened.truncate_references_code_edges().unwrap();
+        assert!(reopened.list_references_code_edges().unwrap().is_empty());
+    }
 
     #[test]
     fn scoped_read_deadline_bounds_rust_row_collection_and_restores() {

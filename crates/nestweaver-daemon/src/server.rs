@@ -2097,6 +2097,9 @@ pub struct DaemonState {
     /// covers each mutation; the retained handle is the second line of
     /// defence that lets teardown await the loop itself after admission closes.
     pub embedding_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// nw-675: the code-link reconcile loop, awaited on teardown like the two
+    /// loops above.
+    pub code_link_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for every watcher task this daemon has spawned.
     ///
     /// Same invariant as the two reconcile loops above, and it was missing for
@@ -2909,6 +2912,197 @@ async fn run_embedding_reconciler(state: Arc<DaemonState>, period: Duration) {
         }
     }
     tracing::debug!("embedding reconcile loop stopped");
+}
+
+/// How often the code-link reconciler looks for work (an O(1) generation
+/// read and a small sidecar read; a pass runs only when one of them moved).
+const CODE_LINK_RECONCILE_TICK: Duration = Duration::from_secs(2);
+
+/// nw-670 review M4: a backstop pass after the graph changed without any
+/// recorded debt, at most this often. Passes are otherwise driven by debt
+/// the routes that change code, projects or whole vaults record — NOT by
+/// every generation change: the vault watcher links the notes it re-indexes
+/// itself, and the reconciler's own writes move the generation too.
+const CODE_LINK_RECONCILE_BACKSTOP: Duration = Duration::from_secs(3600);
+
+/// nw-670 re-review R4: minimum spacing between passes, except a link-rules
+/// migration. Active coding records debt on every code-watcher batch; without
+/// this each ~2 s tick ran a full pass and ranked reads flickered
+/// `code_links_incomplete`. Debt recorded meanwhile is coalesced into the
+/// next pass.
+const CODE_LINK_RECONCILE_MIN_SPACING: Duration = Duration::from_secs(10);
+
+/// nw-675: the code-link reconciler loop. Level-triggered like the two loops
+/// above: it does not rely on each route that drops note->code links (a full
+/// vault refresh, a code re-index) to repair them, only on the graph
+/// generation moving or on durable debt a route recorded. Each pass compares
+/// every note's links with what its committed text says and rewrites only the
+/// notes that differ (`nestweaver_engine::code_links`), scanning with no write
+/// lease held and taking the lease once per chunk that has writes.
+///
+/// The first pass after startup is unconditional: it settles debt recorded
+/// before a restart and whatever changed while the daemon was down.
+async fn run_code_link_reconciler(
+    state: Arc<DaemonState>,
+    tick_period: Duration,
+    min_spacing: Duration,
+) {
+    let mut shutdown = state.shutdown_tx.subscribe();
+    let mut tick = tokio::time::interval(tick_period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let config = state
+        .instance_cfg
+        .as_ref()
+        .map(|config| config.cross_domain.clone())
+        .unwrap_or_default();
+    let reconciler = Arc::new(std::sync::Mutex::new(
+        nestweaver_engine::code_links::CodeLinkReconciler::new(config),
+    ));
+    let mut last_generation: Option<u64> = None;
+    let mut last_pass: Option<Instant> = None;
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => break,
+        }
+        if backoff_until.is_some_and(|until| Instant::now() < until) {
+            continue;
+        }
+        let generation = state.store.graph_generation();
+        let owed = nestweaver_engine::code_links::code_links_pending(&state.db_path);
+        // Owed debt, the first pass after startup, or the hourly backstop
+        // when the graph moved with nothing recorded.
+        let backstop = last_generation != Some(generation)
+            && last_pass.is_none_or(|at| at.elapsed() >= CODE_LINK_RECONCILE_BACKSTOP);
+        if !owed && !backstop {
+            continue;
+        }
+        if last_pass.is_some_and(|at| at.elapsed() < min_spacing)
+            && !nestweaver_engine::code_links::code_links_migration_owed(&state.db_path)
+        {
+            continue;
+        }
+
+        // Admission first, as the other loops do: it makes the pass visible
+        // to the shutdown drain. Each chunk that writes additionally takes
+        // its own admission + write gate through the mutation lease factory,
+        // which refuses once shutdown begins, and `should_stop` ends the pass
+        // between chunks.
+        let Ok(_admission) = ConnectionGuard::write(&state) else {
+            break;
+        };
+        last_pass = Some(Instant::now());
+        let pass_state = Arc::clone(&state);
+        let pass_reconciler = Arc::clone(&reconciler);
+        let pass_started = Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let factory = daemon_mutation_lease_factory(Arc::clone(&pass_state));
+            // nw-678 / nw-670 re-review N1: bring project repo membership in
+            // line with the config before EVERY pass, not only at startup.
+            // Repo nodes are re-created by more paths than any one route can
+            // cover (re-identify, remove then re-add, first index of a repo
+            // the config already declares, instance merge/purge); the
+            // rebuild writes only on a diff, so a current graph pays a read.
+            // Those routes all record debt, which is what runs this pass.
+            if let Some(config) = pass_state.instance_cfg.clone()
+                && config.projects.iter().any(|project| !project.repos.is_empty())
+                && let Err(error) = nestweaver_engine::project::rebuild_project_repo_membership(
+                    &pass_state.store,
+                    &config,
+                    &pass_state.data_instance_id,
+                    &pass_state.db_path,
+                    Some(&factory),
+                )
+            {
+                tracing::warn!(error = %format!("{error:#}"), "project repo membership rebuild failed");
+            }
+            let stop = Arc::clone(&pass_state.shutdown_started);
+            let mut reconciler = pass_reconciler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reconciler.reconcile(&pass_state.store, Some(&factory), &|| {
+                stop.load(Ordering::SeqCst)
+            })
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(report)) => {
+                // nw-670 review M4: every pass is logged with its duration;
+                // a pass that rewrote nothing only at debug (R4).
+                if report.rewritten.is_empty() && report.unreadable.is_empty() {
+                    tracing::debug!(
+                        elapsed_ms = pass_started.elapsed().as_millis() as u64,
+                        owed,
+                        notes_checked = report.notes_checked,
+                        notes_skipped = report.notes_skipped,
+                        stopped = report.stopped,
+                        "code link reconcile pass: nothing to rewrite"
+                    );
+                } else {
+                    tracing::info!(
+                        elapsed_ms = pass_started.elapsed().as_millis() as u64,
+                        owed,
+                        notes_checked = report.notes_checked,
+                        notes_skipped = report.notes_skipped,
+                        notes_unreadable = report.unreadable.len(),
+                        notes_rewritten = report.rewritten.len(),
+                        edges_written = report.edges_written,
+                        stopped = report.stopped,
+                        "code link reconcile pass"
+                    );
+                }
+                if report.stopped {
+                    break;
+                }
+                // Read BEFORE the pass: a change that landed during it is
+                // caught by the next debt or backstop.
+                last_generation = Some(generation);
+                if report.unreadable.is_empty() {
+                    consecutive_failures = 0;
+                    backoff_until = None;
+                } else {
+                    // nw-670 review M5: the debt stands (disclosed with the
+                    // notes); retry on the failure backoff, not every tick.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    backoff_until = Some(
+                        Instant::now()
+                            + trigram_reconcile_backoff(tick_period, consecutive_failures),
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                if error
+                    .downcast_ref::<nestweaver_engine::WatchMutationRefused>()
+                    .is_some()
+                {
+                    break;
+                }
+                // The debt and this error are recorded durably and shown by
+                // `brain status`; retried with backoff.
+                tracing::info!(
+                    elapsed_ms = pass_started.elapsed().as_millis() as u64,
+                    "code link reconcile pass failed"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until = Some(
+                    Instant::now() + trigram_reconcile_backoff(tick_period, consecutive_failures),
+                );
+                tracing::warn!(error = %format!("{error:#}"), consecutive_failures, "code link reconcile failed");
+            }
+            Err(join_error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until = Some(
+                    Instant::now() + trigram_reconcile_backoff(tick_period, consecutive_failures),
+                );
+                tracing::error!(%join_error, "code link reconcile task panicked");
+            }
+        }
+    }
+    tracing::debug!("code link reconcile loop stopped");
 }
 
 /// The SIGTERM handler task: route every SIGTERM into [`begin_shutdown_drain`].
@@ -5932,14 +6126,26 @@ fn materialize_projects_terminal_progress(
     result: &nestweaver_engine::ProjectMaterializationResult,
 ) -> IndexProgress {
     let degraded = degraded_graph_publication_message("MaterializeProjects", &result.publication);
-    let message = if let Some(message) = &degraded {
+    let mut message = if let Some(message) = &degraded {
         message.clone()
     } else {
         format!(
-            "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
-            result.projects_created, result.note_edges, result.symbol_edges, result.component_edges,
+            "Done — {} projects, {} note edges, {} member repos ({} symbols), {} component edges",
+            result.projects_created,
+            result.note_edges,
+            result.repo_edges,
+            result.symbol_edges,
+            result.component_edges,
         )
     };
+    // nw-674: a declared repo that attached nothing used to vanish from this
+    // line entirely. Appended on the degraded line too — a degraded run still
+    // committed the membership, gap included. The phase is unchanged: the
+    // config is the gap, not the run.
+    if let Some(summary) = nestweaver_engine::repo_issues_summary(&result.repo_issues) {
+        message.push('\n');
+        message.push_str(&summary);
+    }
     IndexProgress {
         phase: if degraded.is_some() {
             Phase::Error as i32
@@ -5998,11 +6204,13 @@ fn brain_context_args_from_request(req: &BrainContextRequest) -> serde_json::Val
     if !req.exclude_tags.is_empty() {
         args["exclude_tags"] = serde_json::json!(req.exclude_tags);
     }
-    if req.weight_ppr != 0.0 {
-        args["weight_ppr"] = serde_json::json!(req.weight_ppr);
+    // nw-670 re-review F3: an explicit 0.0 (`--weight-ppr 0`) is a weight,
+    // not "unset"; only an absent one falls back to the tool's default.
+    if let Some(weight_ppr) = req.weight_ppr {
+        args["weight_ppr"] = serde_json::json!(weight_ppr);
     }
-    if req.weight_bm25 != 0.0 {
-        args["weight_bm25"] = serde_json::json!(req.weight_bm25);
+    if let Some(weight_bm25) = req.weight_bm25 {
+        args["weight_bm25"] = serde_json::json!(weight_bm25);
     }
     if !req.intent.is_empty() {
         args["intent"] = serde_json::json!(req.intent);
@@ -6164,8 +6372,8 @@ mod context_request_args_tests {
             path_prefix: String::new(),
             tags: vec![],
             exclude_tags: vec![],
-            weight_ppr: 0.0,
-            weight_bm25: 0.0,
+            weight_ppr: None,
+            weight_bm25: None,
             intent: String::new(),
             include_seeds: false,
             include_bodies: false,
@@ -6195,6 +6403,25 @@ mod context_request_args_tests {
              this replaced could not tell an explicit 0.0 from an absent one, so \
              the caller's disable was silently dropped"
         );
+
+        // nw-670 re-review F3: the same presence rule for the PPR and BM25
+        // weights — an explicit zero reaches the tool, an absent one does
+        // not.
+        assert!(
+            brain_context_args_from_request(&req)
+                .get("weight_ppr")
+                .is_none()
+        );
+        assert!(
+            brain_context_args_from_request(&req)
+                .get("weight_bm25")
+                .is_none()
+        );
+        req.weight_ppr = Some(0.0);
+        req.weight_bm25 = Some(0.0);
+        let args = brain_context_args_from_request(&req);
+        assert_eq!(args["weight_ppr"], serde_json::json!(0.0));
+        assert_eq!(args["weight_bm25"], serde_json::json!(0.0));
     }
 }
 
@@ -6390,7 +6617,16 @@ impl NestWeaverDaemon for DaemonService {
             nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
-                .with_note_limits(note_limits);
+                .with_note_limits(note_limits)
+                // nw-673: the watcher links edited notes by the same
+                // configured rules as the code-link reconciler.
+                .with_cross_domain_config(
+                    self.state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|config| config.cross_domain.clone())
+                        .unwrap_or_default(),
+                );
 
         // Share the daemon's writer-mode Tantivy handle with the watcher
         // so live edits update BM25 in place. Opening a separate handle
@@ -7350,6 +7586,17 @@ impl NestWeaverDaemon for DaemonService {
                 &index_opts,
                 Some(&cancel_for_index),
             );
+            // nw-675: a re-index deletes changed files' symbols, and the
+            // cascade takes note links into them. Owed, disclosed, and
+            // rebuilt by the code-link reconciler. Recorded AFTER the write
+            // (whatever its outcome — a failure may still have committed):
+            // a reconcile pass already running when the debt is recorded
+            // must not be the one that settles it. A crash before this line
+            // is covered by the reconciler's unconditional first pass.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("code re-index of {}", repo_path.display()),
+            );
             #[cfg(feature = "release-fixture-hooks")]
             if let Some(scope) = &fixture_scope {
                 let error = index_result
@@ -7665,6 +7912,14 @@ impl NestWeaverDaemon for DaemonService {
                     &extra_patterns,
                     note_limits,
                 );
+            // nw-675: a full vault index recreates every note, and the
+            // cascade takes their code links. Owed, disclosed, and rebuilt
+            // by the code-link reconciler; recorded after the write, as in
+            // IndexRepo.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("full index of vault {}", vault_path.display()),
+            );
 
             match index_result {
                 Ok(result) => {
@@ -7896,7 +8151,7 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
+            let refreshed = nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
                 &state.store,
                 &vault_path,
                 &instance_id,
@@ -7904,7 +8159,14 @@ impl NestWeaverDaemon for DaemonService {
                 since,
                 &extra_patterns,
                 note_limits,
-            ) {
+            );
+            // nw-675: every re-indexed note is recreated without its code
+            // links; recorded after the write, as in IndexVault.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("refresh of vault {}", vault_path.display()),
+            );
+            match refreshed {
                 Ok(result) => {
                     let mutation = indexed_search_mutation(
                         indexed_before,
@@ -8124,6 +8386,16 @@ impl NestWeaverDaemon for DaemonService {
                 Some(mutation_factory),
             ) {
                 Ok(result) => {
+                    // nw-670 R5: project membership scopes what a note's
+                    // mentions resolve to, so a membership change owes the
+                    // moved notes new links; the code-link reconciler
+                    // rebuilds exactly the notes whose links now differ.
+                    if result.publication.changed() {
+                        nestweaver_engine::code_links::mark_code_links_pending(
+                            &state.db_path,
+                            "project membership changed",
+                        );
+                    }
                     let _ = tx.blocking_send(Ok(materialize_projects_terminal_progress(&result)));
                 }
                 Err(e) => {
@@ -8175,7 +8447,7 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let state = self.state.clone();
         self.run_unary_mutation("remove_repo", move || {
-            run_remove_repo_with(
+            let removed = run_remove_repo_with(
                 &state,
                 &req.repo_uid,
                 |store, uid| {
@@ -8188,7 +8460,14 @@ impl NestWeaverDaemon for DaemonService {
                         .delete_repo_node(uid)
                         .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))
                 },
-            )
+            );
+            // nw-670 review M4: removing a repo's symbols changes what the
+            // remaining notes' mentions resolve to (and drops links into it).
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("repo {} removed", req.repo_uid),
+            );
+            removed
         })
         .await
         .map(Response::new)
@@ -8206,14 +8485,21 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let state = self.state.clone();
         self.run_unary_mutation("remove_project", move || {
-            run_remove_project_with(
+            let removed = run_remove_project_with(
                 &state,
                 &req.project_uid,
                 |store, uid| store.delete_project_cascade_with_outcome(uid),
                 |store, uid| store.project_exists(uid),
                 nestweaver_engine::remove_extension_uid_durable,
                 finalize_node_graph_deletion,
-            )
+            );
+            // nw-670 re-review R3: the project's notes lose their scope, so
+            // what their mentions resolve to changes.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("project {} removed", req.project_uid),
+            );
+            removed
         })
         .await
         .map(Response::new)
@@ -8231,7 +8517,7 @@ impl NestWeaverDaemon for DaemonService {
         let _req = request.into_inner();
         let state = self.state.clone();
         self.run_unary_mutation("prune_stale", move || {
-            run_prune_stale_with(
+            let pruned = run_prune_stale_with(
                 &state,
                 delete_repo_cascade,
                 |store, vault| {
@@ -8241,7 +8527,13 @@ impl NestWeaverDaemon for DaemonService {
                         .map_err(|e| anyhow::anyhow!("delete_vault_cascade failed: {e:#}"))
                 },
                 rebuild_tantivy_after_mutation,
-            )
+            );
+            // nw-670 review M4: see remove_repo.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                "stale repos or vaults pruned",
+            );
+            pruned
         })
         .await
         .map(Response::new)
@@ -8363,7 +8655,14 @@ impl NestWeaverDaemon for DaemonService {
                         .map_err(|e| anyhow::anyhow!("{e:#}"))
                 },
                 rebuild_tantivy_after_mutation,
-            )?;
+            );
+            // nw-670 re-review R3: merging instances moves notes, symbols and
+            // projects together, changing scopes and ambiguity.
+            nestweaver_engine::code_links::mark_code_links_pending(
+                &state.db_path,
+                &format!("instance {from_id} merged into {to_id}"),
+            );
+            let result = result?;
 
             let discarded_vaults = result
                 .discarded
@@ -8433,6 +8732,12 @@ impl NestWeaverDaemon for DaemonService {
                 rebuild_tantivy_after_mutation,
             ) {
                 Ok(result) => {
+                    // nw-670 re-review R3: purged symbols and projects change
+                    // what the remaining notes' mentions resolve to.
+                    nestweaver_engine::code_links::mark_code_links_pending(
+                        &state.db_path,
+                        &format!("instance {instance_id} purged"),
+                    );
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
                         message: format!(
@@ -8981,6 +9286,7 @@ impl NestWeaverDaemon for DaemonService {
             supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
             skipped_notes,
             notes_near_size_limit,
+            code_links: nestweaver_proto::code_links_from_status_json(&value),
         }))
     }
 
@@ -10088,6 +10394,14 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|error| {
                 Status::internal(format!("detect_implicit_projects failed: {error:#}"))
             })?;
+            // nw-670 re-review R3: new implicit-project membership rescopes
+            // the notes it covers.
+            if !dry_run && detected.publication.changed() {
+                nestweaver_engine::code_links::mark_code_links_pending(
+                    &state.db_path,
+                    "implicit project membership changed",
+                );
+            }
             let disposition = match detected.publication.disposition {
                 nestweaver_engine::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange => {
                     "confirmed_no_change"
@@ -13791,6 +14105,7 @@ pub async fn run_server(
         worker_handle: std::sync::Mutex::new(None),
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
+        code_link_reconciler_handle: std::sync::Mutex::new(None),
         manifest_recovery: Arc::new(Default::default()),
         manifest_recovery_handle: std::sync::Mutex::new(None),
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -14022,6 +14337,22 @@ pub async fn run_server(
             .embedding_reconciler_handle
             .lock()
             .expect("embedding_reconciler_handle mutex poisoned") = Some(embedding_handle);
+    }
+
+    // nw-675: note->code links follow the graph whichever route changed it.
+    // Local writable daemons only: server mode reads vault notes from bare
+    // clones, which this loop cannot (the worker rediscovers after each vault
+    // fetch there).
+    if !read_only && !state.server_mode {
+        let code_link_handle = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            CODE_LINK_RECONCILE_TICK,
+            CODE_LINK_RECONCILE_MIN_SPACING,
+        ));
+        *state
+            .code_link_reconciler_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(code_link_handle);
     }
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
@@ -14849,6 +15180,13 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.note_limits())
                 .unwrap_or_default();
+            // nw-673: the configured `[cross_domain]` settings reach the
+            // server worker's discovery pass too.
+            let worker_cross_domain = state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.cross_domain.clone())
+                .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -14875,7 +15213,8 @@ pub async fn run_server(
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
                     .with_index_limits(worker_index_limits)
-                    .with_note_limits(worker_note_limits);
+                    .with_note_limits(worker_note_limits)
+                    .with_cross_domain_config(worker_cross_domain);
 
                 pool.run_with_drain(
                     worker_job_queue,
@@ -15437,6 +15776,15 @@ pub async fn run_server(
         .and_then(|mut guard| guard.take());
     if let Some(handle) = embedding_handle {
         tracing::info!("draining embedding reconcile loop before exit");
+        let _ = handle.await;
+    }
+    let code_link_handle = state
+        .code_link_reconciler_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = code_link_handle {
+        tracing::info!("draining code link reconcile loop before exit");
         let _ = handle.await;
     }
 
@@ -16365,6 +16713,278 @@ credential_method = "gh"
             progress.push(event.unwrap());
         }
         progress
+    }
+
+    /// Poll until `done` holds, up to 20 s, for a background loop's effect.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        done()
+    }
+
+    /// nw-675: IndexVault — the daemon route of `brain add` and of a full
+    /// `brain refresh` — recreates every note, and the cascade took their
+    /// code links. Nothing rebuilt them; they stayed gone until each note was
+    /// edited. Now the route records the debt (shown by `brain status`) and
+    /// the code-link reconcile loop rebuilds the links and settles it.
+    #[tokio::test]
+    async fn index_vault_owes_code_links_and_the_reconcile_loop_rebuilds_them() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nThe AlphaWidget renders.\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub struct AlphaWidget;\n").unwrap();
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            repo.path(),
+            &state.db_path,
+            &state.data_instance_id,
+            "file:///fixture/repo",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let links = |state: &DaemonState| state.store.count_references_code_edges().unwrap();
+        // nw-670 review M3: owed links are reported in `code_links`.
+        let owed = |state: &DaemonState| {
+            u64::from(
+                nestweaver_engine::code_links::code_links_status_json(Some(&state.db_path))
+                    ["pending"]
+                    .as_bool()
+                    .unwrap(),
+            )
+        };
+
+        index_vault_via_rpc(&state, &root).await;
+        assert_eq!(links(&state), 0, "the index itself writes no code links");
+        assert_eq!(owed(&state), 1, "the debt is disclosed in status");
+
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        assert!(
+            eventually(|| links(&state) == 2 && owed(&state) == 0).await,
+            "links {} owed {}",
+            links(&state),
+            owed(&state)
+        );
+
+        // A full refresh drops them again; the loop rebuilds them again.
+        index_vault_via_rpc(&state, &root).await;
+        assert!(
+            eventually(|| links(&state) == 2 && owed(&state) == 0).await,
+            "links {} owed {}",
+            links(&state),
+            owed(&state)
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
+    }
+
+    /// nw-670 review M4: the loop runs on recorded debt, not on every graph
+    /// generation change. A generation bump with nothing owed leaves a
+    /// deliberately unlinked note alone; recording the debt relinks it.
+    #[tokio::test]
+    async fn the_code_link_loop_runs_on_debt_not_on_every_generation_change() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nThe AlphaWidget renders.\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub struct AlphaWidget;\n").unwrap();
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            repo.path(),
+            &state.db_path,
+            &state.data_instance_id,
+            "file:///fixture/repo",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        index_vault_via_rpc(&state, &root).await;
+        let links = |state: &DaemonState| state.store.count_references_code_edges().unwrap();
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        assert!(eventually(|| links(&state) == 2).await, "first pass links");
+
+        // Drop the links behind the reconciler's back and move the
+        // generation with nothing recorded: no pass may run.
+        let note = state.store.list_notes(None).unwrap().remove(0).uid;
+        let conn = state.store.begin_transaction().unwrap();
+        GraphStore::delete_cross_domain_edges_for_notes_on(&conn, &[note.as_str()]).unwrap();
+        state.store.commit_transaction(&conn).unwrap();
+        state.store.try_bump_graph_generation().unwrap();
+        // Past the 10 s minimum spacing the pre-review loop applied to
+        // generation-triggered passes, so a generation trigger would fire.
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        assert_eq!(links(&state), 0, "a generation change alone runs no pass");
+
+        nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, "test debt");
+        assert!(
+            eventually(|| links(&state) == 2).await,
+            "recorded debt relinks"
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
+    }
+
+    /// nw-670 re-review R4: debt recorded within the minimum spacing of the
+    /// last pass waits for it (coalesced), then lands.
+    #[tokio::test]
+    async fn code_link_passes_are_spaced_and_coalesce_debt() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nThe AlphaWidget renders.\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub struct AlphaWidget;\n").unwrap();
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            repo.path(),
+            &state.db_path,
+            &state.data_instance_id,
+            "file:///fixture/repo",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        index_vault_via_rpc(&state, &root).await;
+        let links = |state: &DaemonState| state.store.count_references_code_edges().unwrap();
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Duration::from_secs(3),
+        ));
+        assert!(eventually(|| links(&state) == 2).await, "first pass links");
+
+        let note = state.store.list_notes(None).unwrap().remove(0).uid;
+        let conn = state.store.begin_transaction().unwrap();
+        GraphStore::delete_cross_domain_edges_for_notes_on(&conn, &[note.as_str()]).unwrap();
+        state.store.commit_transaction(&conn).unwrap();
+        nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, "burst 1");
+        nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, "burst 2");
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(links(&state), 0, "within the spacing, no pass yet");
+        // Links land inside the pass; the debt settles as it returns.
+        assert!(
+            eventually(|| links(&state) == 2
+                && !nestweaver_engine::code_links::code_links_pending(&state.db_path))
+            .await,
+            "the coalesced pass lands and settles the debt"
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
+    }
+
+    /// nw-670 re-review N1: repo membership decays on Repo re-create paths
+    /// beyond the two that carry it (re-identify, remove then re-add, a
+    /// first index of a declared repo). The code-link loop now rebuilds it
+    /// from the config before every pass those routes' debt triggers.
+    #[tokio::test]
+    async fn the_code_link_loop_rebuilds_project_repo_membership_on_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("alpha");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn alpha_one() -> i32 { 1 }\n").unwrap();
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+repos = ["alpha"]
+"#,
+        )
+        .unwrap();
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.data_instance_id = "default".to_string();
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        let repo_url = "file:///fixture/alpha";
+        nestweaver_engine::index::index_directory_with_store(
+            &state.store,
+            &repo,
+            &state.db_path,
+            "default",
+            repo_url,
+            "sha",
+            false,
+            Some("alpha"),
+        )
+        .unwrap();
+        nestweaver_engine::project::materialize_projects(
+            &state.store,
+            &config,
+            "default",
+            &state.db_path,
+        )
+        .unwrap();
+        let project = nestweaver_schema::project_uid("default", "p");
+        let members = |state: &DaemonState| {
+            state
+                .store
+                .project_member_repo_uids(&project)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(members(&state), 1, "precondition");
+        let reconciler = tokio::spawn(run_code_link_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Re-create the Repo node the way remove-then-re-add does.
+        let repo_uid = nestweaver_schema::repo_uid("default", repo_url);
+        let existing = state.store.lookup_repo(&repo_uid).unwrap().unwrap();
+        state.store.delete_repo_node(&repo_uid).unwrap();
+        state.store.insert_repo(&existing).unwrap();
+        assert_eq!(members(&state), 0, "precondition: membership dropped");
+        nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, "repo re-added");
+        assert!(
+            eventually(|| members(&state) == 1).await,
+            "the pass rebuilt it"
+        );
+
+        let _ = state.shutdown_tx.send(true);
+        reconciler.await.unwrap();
     }
 
     fn vault_derivation_record(
@@ -21022,9 +21642,11 @@ credential_method = "gh"
             projects_created: 2,
             note_edges: 3,
             symbol_edges: 5,
+            repo_edges: 1,
             component_edges: 1,
             wiki_notes_ingested: 0,
             wiki_fetch_errors: 0,
+            repo_issues: Vec::new(),
             publication: GraphMutationPublicationOutcome {
                 disposition: GraphMutationPublicationDisposition::CommittedDegraded,
                 generation_before: 40,
@@ -21053,6 +21675,37 @@ credential_method = "gh"
             materialize_projects_terminal_progress(&result).phase,
             Phase::Done as i32
         );
+        assert!(
+            !materialize_projects_terminal_progress(&result)
+                .message
+                .contains("did not resolve cleanly"),
+            "a fully resolved config must not print a declared-repo warning"
+        );
+
+        // nw-674: an unresolved declared repo is disclosed on the terminal
+        // line, without turning a successful run into an error.
+        result.repo_issues = vec![nestweaver_engine::ProjectRepoIssue {
+            project: "shot-insights".to_string(),
+            repo: "shot-insights-web-app".to_string(),
+            kind: nestweaver_engine::RepoIssueKind::NoMatch,
+            candidates: Vec::new(),
+        }];
+        let expected = "shot-insights/shot-insights-web-app (matches no indexed repo)";
+        let terminal = materialize_projects_terminal_progress(&result);
+        assert_eq!(terminal.phase, Phase::Done as i32);
+        assert!(terminal.message.contains(expected), "{}", terminal.message);
+
+        // ...and on the DEGRADED line too: the membership (gap included) was
+        // committed, so the operator still needs to know about the gap.
+        result.publication.disposition = GraphMutationPublicationDisposition::CommittedDegraded;
+        result.publication.warnings = vec![GraphMutationPublicationWarning {
+            stage: "persist-generation".to_string(),
+            message: "disk full".to_string(),
+        }];
+        let terminal = materialize_projects_terminal_progress(&result);
+        assert_eq!(terminal.phase, Phase::Error as i32);
+        assert!(terminal.message.contains("NOT rolled back"));
+        assert!(terminal.message.contains(expected), "{}", terminal.message);
     }
 
     /// Implicit-project detection is a graph writer on apply, despite its
@@ -22644,6 +23297,7 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            code_link_reconciler_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -22930,6 +23584,7 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            code_link_reconciler_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -26545,6 +27200,34 @@ external_model = "unavailable-test-model"
         })
         .await
         .expect("cancelled remove-project worker must finish after gate release");
+    }
+
+    /// nw-670 re-review R3: removing a project rescopes its notes, so the
+    /// route records note->code link debt for the reconciler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_records_code_link_debt() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:test:scope".to_string(),
+                name: "scope".to_string(),
+                summary: None,
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        assert!(!nestweaver_engine::code_links::code_links_pending(
+            &state.db_path
+        ));
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RemoveProjectRequest {
+            project_uid: "proj:test:scope".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        service.remove_project(request).await.unwrap();
+        assert!(nestweaver_engine::code_links::code_links_pending(
+            &state.db_path
+        ));
     }
 
     /// The admin `set_extension` RPC does a read-modify-write of the

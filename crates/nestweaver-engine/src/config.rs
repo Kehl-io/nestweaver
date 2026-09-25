@@ -1106,6 +1106,44 @@ fn normalize_repo_ref(value: &str) -> &str {
         .trim_end_matches('/')
 }
 
+/// Whether a declared repo reference — a `[[repos]] url`, or a path/URL
+/// written directly into `[[projects]] repos` — names the indexed repo with
+/// this identity `repo_url` and local checkout `repo_path`.
+///
+/// Matches EITHER the identity url or the checkout path, lexically and (for
+/// existing absolute paths) canonically, because the same repo is spelled
+/// three ways in practice: `brain-setup.sh` indexes by path, the graph records
+/// the git origin, and vault entries use a `file://` url. macOS additionally
+/// spells temporary roots through both /var and /private/var.
+///
+/// nw-674: `pub` so project membership resolves a `[[repos]]` alias exactly as
+/// `exclude`/`unskip` do. Membership had its own url-only comparison, so an
+/// alias whose `url` was a checkout path matched here and silently matched
+/// nothing there.
+pub fn repo_ref_identifies(declared: &str, repo_url: &str, repo_path: Option<&Path>) -> bool {
+    fn canonical_local(value: &str) -> Option<std::path::PathBuf> {
+        let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
+        if path.is_absolute() {
+            path.canonicalize().ok()
+        } else {
+            None
+        }
+    }
+    let normalized = normalize_repo_ref(declared);
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized == normalize_repo_ref(repo_url)
+        || repo_path.is_some_and(|path| normalized == normalize_repo_ref(&path.to_string_lossy()))
+    {
+        return true;
+    }
+    canonical_local(declared).is_some_and(|declared| {
+        canonical_local(repo_url).as_ref() == Some(&declared)
+            || repo_path.and_then(|path| path.canonicalize().ok()).as_ref() == Some(&declared)
+    })
+}
+
 impl InstanceConfig {
     /// Exclude globs declared for a repo by a `[[repos]]` entry, or an empty
     /// slice when it declares none — the common case, and why this returns a
@@ -1137,31 +1175,9 @@ impl InstanceConfig {
         if self.repos.is_empty() {
             return None;
         }
-        // Keep lexical matching for remotes and unavailable local paths, but
-        // also recognize aliases of an existing local checkout. In particular,
-        // macOS spells temporary roots through both /var and /private/var.
-        fn canonical_local(value: &str) -> Option<std::path::PathBuf> {
-            let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
-            if path.is_absolute() {
-                path.canonicalize().ok()
-            } else {
-                None
-            }
-        }
-        let path_str = repo_path.map(|path| path.to_string_lossy());
-        let canonical_url = canonical_local(repo_url);
-        let canonical_path = repo_path.and_then(|path| path.canonicalize().ok());
-        self.repos.iter().find(|repo| {
-            let declared = normalize_repo_ref(&repo.url);
-            declared == normalize_repo_ref(repo_url)
-                || path_str
-                    .as_deref()
-                    .is_some_and(|path| declared == normalize_repo_ref(path))
-                || canonical_local(&repo.url).is_some_and(|declared| {
-                    canonical_url.as_ref() == Some(&declared)
-                        || canonical_path.as_ref() == Some(&declared)
-                })
-        })
+        self.repos
+            .iter()
+            .find(|repo| repo_ref_identifies(&repo.url, repo_url, repo_path))
     }
 
     /// The DB path declared by this instance, if any.

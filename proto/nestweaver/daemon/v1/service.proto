@@ -600,6 +600,43 @@ message BrainStatusResponse {
   // Indexed notes above 50% of the configured note-size limit. Absence vs
   // `count: 0` follows `skipped_notes`.
   NotesNearSizeLimit notes_near_size_limit = 22;
+  // nw-670 review M3: note->code link reconciliation. Absence means an older
+  // daemon; a live daemon always sets it, `pending: false` when nothing is
+  // owed.
+  CodeLinksStatus code_links = 23;
+}
+
+message CodeLinksStatus {
+  // Links are owed: a vault refresh, code re-index, membership change or
+  // link-rules migration dropped or invalidated some, and the reconciler has
+  // not finished rebuilding them.
+  bool pending = 1;
+  string reason = 2;
+  string since = 3;
+  // How far a running pass has got; empty when it has nothing to say.
+  string progress = 4;
+  // The last failed attempt; empty when none. Retried with backoff.
+  string last_error = 5;
+  uint32 failures = 6;
+  // The link-rules version the stored links were built with, and the one
+  // this daemon applies. A mismatch is a migration still owed.
+  uint32 rules_version = 7;
+  uint32 current_rules_version = 8;
+  string last_reconciled_at = 9;
+  // nw-670 re-review F4: per vault, notes changed on disk since indexing,
+  // left without code links until that vault is refreshed.
+  repeated StaleNotesInVault notes_changed_since_indexing = 10;
+  // nw-670 re-review F1: projects whose declared repos resolved to none, so
+  // their notes link as if in no project.
+  repeated string unscoped_projects = 11;
+  // nw-670 re-review N6: when the pass that counted
+  // `notes_changed_since_indexing` ran (the count is as of then).
+  string notes_changed_as_of = 12;
+}
+
+message StaleNotesInVault {
+  string vault = 1;
+  uint32 count = 2;
 }
 
 message SkippedNotesStatus {
@@ -696,8 +733,12 @@ message BrainContextRequest {
   string path_prefix = 7;
   repeated string tags = 8;
   repeated string exclude_tags = 9;
-  double weight_ppr = 10;
-  double weight_bm25 = 11;
+  // nw-670 re-review F3: `optional`, like `weight_semantic` below — a plain
+  // proto3 double cannot tell an explicit 0.0 (`--weight-ppr 0`) from unset,
+  // so the daemon replaced the caller's zero with the default.
+  // Wire-compatible: same field numbers and base type.
+  optional double weight_ppr = 10;
+  optional double weight_bm25 = 11;
   string intent = 12;
   bool include_seeds = 13;
   bool include_bodies = 14;

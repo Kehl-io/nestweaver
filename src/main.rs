@@ -98,7 +98,7 @@ use nestweaver_engine::{
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
+    changed_files_from_git, compute_clusters, compute_cochanges,
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
     filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_summaries,
@@ -2855,6 +2855,14 @@ fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
 /// so the output format tracked whether a daemon was running instead of the
 /// `--json` flag (nw-108).
 fn render_investigate_text(payload: &serde_json::Value) {
+    // nw-670 re-review R1: owed note->code links, stamped by the daemon or
+    // (direct route) just before rendering.
+    if let Some(pending) = code_links_from_wire(payload) {
+        println!(
+            "{}",
+            nestweaver_engine::code_links::code_links_text_note(&pending)
+        );
+    }
     let text = |v: &serde_json::Value, k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -4912,6 +4920,14 @@ fn format_daemon_status_response(
                     lines.push(format!("  - {}: {}", note.path, note.reason));
                 }
             }
+            // nw-670 review M3: owed note->code links, on their own line.
+            if let Some(line) = status
+                .code_links
+                .as_ref()
+                .and_then(format_code_links_status)
+            {
+                lines.push(line);
+            }
             // nw-585: indexed, but without their frontmatter -- not skipped.
             if let Some(skipped) = status.skipped_notes.as_ref()
                 && skipped.frontmatter_unparsed > 0
@@ -5012,6 +5028,50 @@ mod daemon_status_renderer_tests {
         ));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
+    }
+
+    /// nw-670 review M3: owed note->code links render on their own line,
+    /// not as a "file" under watcher reconciliation; nothing when current.
+    #[test]
+    fn owed_code_links_render_on_their_own_status_line() {
+        let owed = nestweaver_proto::CodeLinksStatus {
+            pending: true,
+            reason: "full index of vault /v".to_string(),
+            since: "2026-09-25T00:00:00Z".to_string(),
+            progress: "linking notes: 100 of 200 checked".to_string(),
+            last_error: "disk full".to_string(),
+            failures: 2,
+            rules_version: 2,
+            current_rules_version: 2,
+            last_reconciled_at: String::new(),
+            notes_changed_since_indexing: Vec::new(),
+            unscoped_projects: Vec::new(),
+            notes_changed_as_of: String::new(),
+        };
+        let status = nestweaver_proto::BrainStatusResponse {
+            code_links: Some(owed.clone()),
+            ..Default::default()
+        };
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(
+            output.contains("Note→code links: being rebuilt (full index of vault /v"),
+            "{output}"
+        );
+        assert!(output.contains("100 of 200 checked"), "{output}");
+        assert!(
+            output.contains("last attempt failed (2 time(s)): disk full"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("Watcher reconciliation pending"),
+            "{output}"
+        );
+
+        let current = nestweaver_proto::CodeLinksStatus {
+            pending: false,
+            ..owed
+        };
+        assert_eq!(format_code_links_status(&current), None);
     }
 
     #[test]
@@ -5465,7 +5525,7 @@ enum Commands {
     /// removes the canonical sidecar or the keyed copy matching its current
     /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold twelve sidecar artifacts in total\n(.filemeta.json, .generation, .manifests.json, .pagerank.json,\n.parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold thirteen sidecar artifacts in total\n(.code_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -9800,6 +9860,100 @@ fn assert_config_expected_brain(
 /// Returns `None` when no path is given; when a path IS given but fails to
 /// parse, warns and returns `None` — so a typo'd `--config` doesn't silently
 /// disable ranking priors / inline-body tuning.
+/// nw-675: the direct-route (`--no-daemon`, CI-only) twin of the daemon's
+/// code-link reconcile loop. A write that may have dropped note->code links
+/// (a vault index or refresh, a code re-index) records the debt, and one pass
+/// rebuilds exactly the notes whose links no longer match their text before
+/// the command returns. A failed pass is a warning, not the command's
+/// failure: the debt stays recorded, `brain status` shows it, and the next
+/// pass (this route again, or a daemon's first pass) retries it.
+fn reconcile_code_links_direct(
+    db_path: &Path,
+    write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
+    config: Option<&Path>,
+    reason: &str,
+) {
+    nestweaver_engine::code_links::mark_code_links_pending(db_path, reason);
+    let cross_domain = load_instance_config_opt(config)
+        .map(|config| config.cross_domain)
+        .unwrap_or_default();
+    match GraphStore::open_with_authority(db_path, write_lease) {
+        Ok(store) => {
+            match nestweaver_engine::code_links::reconcile_code_links(&store, &cross_domain) {
+                Ok(report) if !report.rewritten.is_empty() => eprintln!(
+                    "Code links: rebuilt for {} note(s) ({} edge(s)).",
+                    report.rewritten.len(),
+                    report.edges_written
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    "code link reconciliation failed; the links stay owed and are retried: {error:#}"
+                ),
+            }
+        }
+        Err(error) => tracing::warn!(
+            "code link reconciliation skipped — cannot open DB for writing; the links stay owed: {error:#}"
+        ),
+    }
+}
+
+/// nw-670 review M3: the one `brain status` line for owed note->code links,
+/// shared by the typed (daemon) and JSON (direct) renderers. `None` when
+/// nothing is owed and the stored links match this binary's rules.
+fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option<String> {
+    let migration_owed =
+        links.current_rules_version != 0 && links.rules_version != links.current_rules_version;
+    // nw-670 re-review F1/F4: gaps that are not owed work but still leave
+    // notes without the links they should have.
+    let mut gaps = Vec::new();
+    for stale in &links.notes_changed_since_indexing {
+        gaps.push(format!(
+            "{} note(s) in {} changed since indexing have no code links (refresh that vault; \
+             as of the last pass{})",
+            stale.count,
+            stale.vault,
+            if links.notes_changed_as_of.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", links.notes_changed_as_of)
+            }
+        ));
+    }
+    if !links.unscoped_projects.is_empty() {
+        gaps.push(format!(
+            "project(s) {} declare repos that resolve to none, so their notes link unscoped",
+            links.unscoped_projects.join(", ")
+        ));
+    }
+    if !links.pending && !migration_owed {
+        return (!gaps.is_empty()).then(|| format!("Note→code links: {}", gaps.join("; ")));
+    }
+    let mut line = format!("Note→code links: being rebuilt ({}", links.reason);
+    if !links.since.is_empty() {
+        line.push_str(&format!(", since {}", links.since));
+    }
+    line.push(')');
+    if migration_owed {
+        line.push_str(&format!(
+            "; stored links use rules v{}, this build applies v{}",
+            links.rules_version, links.current_rules_version
+        ));
+    }
+    if !links.progress.is_empty() {
+        line.push_str(&format!("; {}", links.progress));
+    }
+    if !links.last_error.is_empty() {
+        line.push_str(&format!(
+            "; last attempt failed ({} time(s)): {}; retrying",
+            links.failures, links.last_error
+        ));
+    }
+    for gap in gaps {
+        line.push_str(&format!("; {gap}"));
+    }
+    Some(line)
+}
+
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
     let p = path?;
     match nestweaver_engine::InstanceConfig::from_file(p) {
@@ -21549,6 +21703,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // When --config is provided, also surface declared projects from
             // [[projects]] that haven't been materialized into the store yet.
+            // nw-674: declared repos the last materialization could not
+            // attach, read from the extension sidecar next to the DB (absent
+            // for a remote daemon, in which case nothing is claimed).
+            let ext_store = nestweaver_engine::load_extensions(&resolved_db);
+            let repo_issues: ProjectRepoIssues = materialized
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        nestweaver_engine::recorded_repo_issues(&ext_store, &p.uid),
+                    )
+                })
+                .filter(|(_, entries)| !entries.is_empty())
+                .collect();
+
             let declared_only: Vec<nestweaver_engine::ProjectConfig> =
                 if let Some(ref cfg_path) = config {
                     let instance_config = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
@@ -21561,49 +21730,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Vec::new()
                 };
 
-            if json {
-                #[derive(serde::Serialize)]
-                struct ListProjectsJson<'a> {
-                    materialized: &'a [nestweaver_schema::Project],
-                    #[serde(
-                        skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty"
-                    )]
-                    declared: &'a [nestweaver_engine::ProjectConfig],
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&ListProjectsJson {
-                        materialized: &materialized,
-                        declared: &declared_only,
-                    })?
-                );
-            } else if materialized.is_empty() && declared_only.is_empty() {
-                println!(
-                    "No projects found. Use an instance config with [[projects]] to define them."
-                );
-            } else {
-                if !materialized.is_empty() {
-                    for p in &materialized {
-                        println!("{}", p.name);
-                        println!("  UID:      {}", p.uid);
-                        println!("  Instance: {}", p.instance_id);
-                        if let Some(ref summary) = p.summary {
-                            println!("  Summary:  {summary}");
-                        }
-                        println!();
-                    }
-                }
-                if !declared_only.is_empty() {
-                    println!("Declared in config (not yet materialized):");
-                    for pc in &declared_only {
-                        println!("  {}", pc.name);
-                        if let Some(ref desc) = pc.description {
-                            println!("    {desc}");
-                        }
-                    }
-                    println!();
-                }
-            }
+            print!(
+                "{}",
+                render_list_projects(&materialized, &declared_only, &repo_issues, json)?
+            );
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -21852,7 +21982,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             )?;
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
-            let payload = serde_json::to_value(&result)?;
+            let mut payload = serde_json::to_value(&result)?;
+            // nw-670 re-review R1: the direct route stamps what the daemon's
+            // MCP seam would have.
+            nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -22661,6 +22794,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // single-flight lazy backstop, so this reports the mechanism rather
             // than asserting the sidecar was written on this particular run.
             out.status("PageRank computed at index time (lazy compute is the fallback).");
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("code re-index of {}", repo_path.display()),
+            );
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -24945,6 +25084,9 @@ fn print_feature_context_text(result: &FeatureContextResult) {
         println!("  {desc}");
     }
     println!("  Repos: {}", result.feature.repos.join(", "));
+    for line in nestweaver_engine::repo_issue_warning_lines(&result.repo_issues) {
+        println!("  {line}");
+    }
 
     if !result.links.is_empty() {
         println!();
@@ -26862,30 +27004,14 @@ fn run_brain(
                 );
             }
 
-            // Auto-discover cross-domain (notes ↔ code) bridges if any
-            // code symbols are indexed. Cheap no-op when there's no code.
-            // Needs a read-write store to persist the REFERENCES_CODE edges;
-            // if the DB is locked (e.g. a daemon holds it) skip with a warning
-            // rather than failing the whole `brain add`.
-            {
-                match GraphStore::open_with_authority(&db_path, &write_lease) {
-                    Ok(store_for_discovery) => {
-                        match discover_cross_domain_links(&store_for_discovery) {
-                            Ok(cd) if cd.note_to_symbol_edges + cd.section_to_symbol_edges > 0 => {
-                                println!(
-                                    "Cross-domain: {} note→symbol, {} section→symbol edge(s) created.",
-                                    cd.note_to_symbol_edges, cd.section_to_symbol_edges
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("cross-domain discovery failed: {e:#}"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        "cross-domain discovery skipped — cannot open DB for writing: {e:#}"
-                    ),
-                }
-            }
+            // Link notes to code (nw-675: the same reconciliation the
+            // daemon route relies on, so the two routes cannot drift).
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("index of vault {}", path.display()),
+            );
 
             // Auto-populate Tantivy BM25 index after brain add so that
             // `brain search` works immediately without a manual reindex.
@@ -27169,6 +27295,13 @@ fn run_brain(
                                 println!("    - {}: {}", field("path"), field("reason"));
                             }
                         }
+                    }
+                    // nw-670 review M3: the same line as the typed render.
+                    if let Some(line) = nestweaver_proto::code_links_from_status_json(&value)
+                        .as_ref()
+                        .and_then(format_code_links_status)
+                    {
+                        println!("  {line}");
                     }
                     if let Some(near) = value.get("notes_near_size_limit") {
                         let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -27952,6 +28085,11 @@ fn run_brain(
             }
 
             // Respect watch config when --config is provided.
+            // nw-673: taken before `watch_cfg` consumes the config.
+            let cross_domain = instance_cfg
+                .as_ref()
+                .map(|config| config.cross_domain.clone())
+                .unwrap_or_default();
             let watch_cfg = instance_cfg.map(|c| c.watch).unwrap_or_default();
             if !watch_cfg.enabled {
                 out.status(
@@ -28026,6 +28164,7 @@ fn run_brain(
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
                 .with_note_limits(note_limits)
+                .with_cross_domain_config(cross_domain)
                 .with_debounce_ms(watch_cfg.debounce_ms);
             let stop = watcher.shutdown_handle();
 
@@ -28408,6 +28547,15 @@ fn run_brain(
                     nestweaver_engine::index_md::format_markdown_refresh_summary(&result)
                 );
             }
+
+            // nw-675: both arms recreate notes, and the cascade took their
+            // code links; rebuild them before returning.
+            reconcile_code_links_direct(
+                &db_path,
+                &write_lease,
+                config.as_deref(),
+                &format!("refresh of vault {}", path.display()),
+            );
 
             // Auto-populate Tantivy BM25 index after brain refresh so that
             // `brain search` works immediately without a manual reindex.
@@ -29011,8 +29159,10 @@ fn run_brain(
                         "path_prefix": path_prefix.clone().unwrap_or_default(),
                         "tags": tags,
                         "exclude_tags": exclude_tags,
-                        "weight_ppr": weight_ppr.unwrap_or(0.0),
-                        "weight_bm25": weight_bm25.unwrap_or(0.0),
+                        // nw-670 re-review F3: null when unset, so an
+                        // explicit `--weight-ppr 0` is not mistaken for it.
+                        "weight_ppr": weight_ppr,
+                        "weight_bm25": weight_bm25,
                         "intent": intent.clone().unwrap_or_default(),
                         "include_seeds": true,
                         "include_bodies": inline_bodies,
@@ -30740,6 +30890,12 @@ fn print_brain_context_text(
 ) {
     if let Some(note) = publication_text_note(upstream.publication.as_ref()) {
         println!("{note}");
+    }
+    if let Some(pending) = &upstream.code_links {
+        println!(
+            "{}",
+            nestweaver_engine::code_links::code_links_text_note(pending)
+        );
     }
     if let Some(detail) = &result.semantic_unavailable {
         println!(
@@ -34189,6 +34345,81 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Declared-repo issues per materialized project name (nw-674).
+type ProjectRepoIssues =
+    std::collections::BTreeMap<String, Vec<nestweaver_engine::ProjectRepoIssue>>;
+
+/// The whole `list-projects` stdout, JSON or text. Extracted from the command
+/// arm so the nw-674 disclosure in both formats is unit-testable.
+fn render_list_projects(
+    materialized: &[nestweaver_schema::Project],
+    declared_only: &[nestweaver_engine::ProjectConfig],
+    repo_issues: &ProjectRepoIssues,
+    json: bool,
+) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    if json {
+        #[derive(serde::Serialize)]
+        struct ListProjectsJson<'a> {
+            materialized: &'a [nestweaver_schema::Project],
+            #[serde(skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty")]
+            declared: &'a [nestweaver_engine::ProjectConfig],
+            #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+            repo_issues: &'a ProjectRepoIssues,
+        }
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&ListProjectsJson {
+                materialized,
+                declared: declared_only,
+                repo_issues,
+            })?
+        ));
+    }
+    let mut out = String::new();
+    if materialized.is_empty() && declared_only.is_empty() {
+        writeln!(
+            out,
+            "No projects found. Use an instance config with [[projects]] to define them."
+        )?;
+        return Ok(out);
+    }
+    for p in materialized {
+        writeln!(out, "{}", p.name)?;
+        writeln!(out, "  UID:      {}", p.uid)?;
+        writeln!(out, "  Instance: {}", p.instance_id)?;
+        if let Some(ref summary) = p.summary {
+            writeln!(out, "  Summary:  {summary}")?;
+        }
+        let issues = repo_issues.get(&p.name).map_or(&[][..], Vec::as_slice);
+        for line in nestweaver_engine::repo_issue_warning_lines(issues) {
+            writeln!(out, "  {line}")?;
+        }
+        writeln!(out)?;
+    }
+    if !declared_only.is_empty() {
+        writeln!(out, "Declared in config (not yet materialized):")?;
+        for pc in declared_only {
+            writeln!(out, "  {}", pc.name)?;
+            if let Some(ref desc) = pc.description {
+                writeln!(out, "    {desc}")?;
+            }
+        }
+        writeln!(out)?;
+    }
+    Ok(out)
+}
+
+/// nw-674: the declared-repo warning lines `project-context` text output
+/// prints under the project header, decoded from the tool response.
+fn project_context_repo_issue_lines(value: &serde_json::Value) -> Vec<String> {
+    let issues: Vec<nestweaver_engine::ProjectRepoIssue> = value
+        .get("repo_issues")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    nestweaver_engine::repo_issue_warning_lines(&issues)
+}
+
 /// Render the daemon's `project_context` JSON response (shape produced by
 /// `tool_project_context` in nestweaver-mcp). When `json` is true, emit the
 /// response verbatim; otherwise print a project header followed by the
@@ -34220,6 +34451,11 @@ fn render_project_context_daemon_response(
     println!("Project: {project}  ({project_uid})");
     if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
         println!("  {note}");
+    }
+    // nw-674: declared repos that are NOT members must not read as members
+    // that merely ranked low.
+    for line in project_context_repo_issue_lines(value) {
+        println!("  {line}");
     }
     println!();
     let empty = vec![];
@@ -34273,6 +34509,11 @@ struct UpstreamContextDisclosure {
     /// `BrainContextResult` decode drops them, or from the local marker on
     /// the direct route.
     publication: Option<nestweaver_engine::index_publication::WatcherBatchDisclosure>,
+    /// nw-670 re-review R1: the `code_links_pending` object while note->code
+    /// links are owed — from the wire (the daemon stamped it), else from the
+    /// local sidecar on the direct route. Same class as nw-503: the typed
+    /// decode would otherwise drop it.
+    code_links: Option<serde_json::Value>,
 }
 
 impl UpstreamContextDisclosure {
@@ -34290,6 +34531,7 @@ impl UpstreamContextDisclosure {
                 .map(|n| n as usize),
             meta: value.get("_meta").cloned(),
             publication: publication_from_wire(value),
+            code_links: code_links_from_wire(value),
         }
     }
 
@@ -34297,6 +34539,9 @@ impl UpstreamContextDisclosure {
         if self.publication.is_none() {
             self.publication =
                 nestweaver_engine::index_publication::status(db_path).watcher_batch_disclosure();
+        }
+        if self.code_links.is_none() {
+            self.code_links = nestweaver_engine::code_links::code_links_pending_json(db_path);
         }
         self
     }
@@ -34412,7 +34657,26 @@ fn brain_context_json_value(
     if let Some(disclosure) = &upstream.publication {
         disclosure.stamp_into(&mut resp);
     }
+    if let Some(pending) = &upstream.code_links {
+        resp["code_links_incomplete"] = serde_json::json!(true);
+        resp["code_links_pending"] = pending.clone();
+    }
     resp
+}
+
+/// nw-670 re-review R1: the `code_links_pending` object a daemon answer
+/// carried, if it said links are owed.
+fn code_links_from_wire(value: &serde_json::Value) -> Option<serde_json::Value> {
+    (value
+        .get("code_links_incomplete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true))
+    .then(|| {
+        value
+            .get("code_links_pending")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
+    })
 }
 
 fn publication_from_wire(
@@ -34557,6 +34821,43 @@ mod context_json_renderer_tests {
         let clean =
             brain_context_json_value(&result, 30, None, &UpstreamContextDisclosure::default());
         assert!(clean.get("publication_in_progress").is_none());
+    }
+
+    /// nw-670 re-review R1: the typed reshape dropped the daemon's
+    /// `code_links_incomplete` / `code_links_pending` keys (the nw-503
+    /// class). They survive from the wire, and the direct route stamps them
+    /// from the local sidecar.
+    #[test]
+    fn brain_context_json_keeps_code_links_disclosure() {
+        let result = degraded_context();
+        let wire = serde_json::json!({
+            "code_links_incomplete": true,
+            "code_links_pending": { "reason": "full index of vault /v" },
+        });
+        let upstream = UpstreamContextDisclosure::from_wire(&wire);
+        let value = brain_context_json_value(&result, 30, None, &upstream);
+        assert_eq!(value["code_links_incomplete"], serde_json::json!(true));
+        assert_eq!(
+            value["code_links_pending"]["reason"],
+            serde_json::json!("full index of vault /v")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let clean = UpstreamContextDisclosure::default().with_local_publication(&db);
+        assert!(
+            brain_context_json_value(&result, 30, None, &clean)
+                .get("code_links_incomplete")
+                .is_none()
+        );
+        nestweaver_engine::code_links::mark_code_links_pending(&db, "refresh of vault /v");
+        let local = UpstreamContextDisclosure::default().with_local_publication(&db);
+        let value = brain_context_json_value(&result, 30, None, &local);
+        assert_eq!(value["code_links_incomplete"], serde_json::json!(true));
+        assert_eq!(
+            value["code_links_pending"]["reason"],
+            serde_json::json!("refresh of vault /v")
+        );
     }
 }
 
@@ -37964,10 +38265,32 @@ fn run_publication_rebuild(
                             "project graph committed but its derived-artifact publication is degraded; refusing to publish the staged brain: {details}"
                         );
                     }
-                    if let Some(links) = config.links.as_deref() {
-                        nestweaver_engine::materialize_declared_links(&store, links)?;
+                    // nw-674: the staged route must disclose declared repos
+                    // that did not resolve, as the daemon route does.
+                    if let Some(summary) =
+                        nestweaver_engine::repo_issues_summary(&projects.repo_issues)
+                    {
+                        eprintln!("{summary}");
                     }
-                    discover_cross_domain_links(&store)?;
+                    if let Some(links) = config.links.as_deref() {
+                        let declared = nestweaver_engine::materialize_declared_links(
+                            &store,
+                            links,
+                            &config.repos,
+                        )?;
+                        if let Some(summary) =
+                            nestweaver_engine::repo_issues_summary(&declared.repo_issues)
+                        {
+                            eprintln!("{summary}");
+                        }
+                    }
+                    nestweaver_engine::discover_cross_domain_links_with_config(
+                        &store,
+                        &config.cross_domain,
+                    )?;
+                    // nw-670 review L7: every note of this fresh graph was
+                    // just linked by the current rules.
+                    nestweaver_engine::code_links::record_rules_version(&target_db);
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;
@@ -46742,3 +47065,93 @@ mod returned_ui_port_tests {
 
 #[cfg(all(test, unix))]
 mod ui_supervision_tests;
+
+/// nw-674: the CLI text/JSON routes disclose declared-repo issues.
+#[cfg(test)]
+mod nw674_repo_issue_render_tests {
+    use super::*;
+
+    fn issue(kind: nestweaver_engine::RepoIssueKind) -> nestweaver_engine::ProjectRepoIssue {
+        nestweaver_engine::ProjectRepoIssue {
+            project: "wavelength-wireless".to_string(),
+            repo: "wavelength-wireless-site".to_string(),
+            kind,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn projects() -> Vec<nestweaver_schema::Project> {
+        ["wavelength-wireless", "siteloom"]
+            .into_iter()
+            .map(|name| nestweaver_schema::Project {
+                uid: format!("proj:{name}"),
+                name: name.to_string(),
+                summary: None,
+                instance_id: "kory-brain".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_projects_discloses_repo_issues_in_json_and_text() {
+        let materialized = projects();
+        let issues: ProjectRepoIssues = [(
+            "wavelength-wireless".to_string(),
+            vec![issue(nestweaver_engine::RepoIssueKind::NoMatch)],
+        )]
+        .into_iter()
+        .collect();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_list_projects(&materialized, &[], &issues, true).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["repo_issues"]["wavelength-wireless"][0]["repo"],
+            "wavelength-wireless-site"
+        );
+        assert_eq!(
+            json["repo_issues"]["wavelength-wireless"][0]["kind"],
+            "no_match"
+        );
+        assert!(json["repo_issues"].get("siteloom").is_none());
+
+        let text = render_list_projects(&materialized, &[], &issues, false).unwrap();
+        let expected = "  Warning: declared repo not a member: \
+                        wavelength-wireless/wavelength-wireless-site (matches no indexed repo)";
+        assert!(text.contains(expected), "{text}");
+        // The warning sits under ITS project, not the next one.
+        let siteloom = text.split("siteloom\n").nth(1).unwrap();
+        assert!(!siteloom.contains("Warning"), "{text}");
+    }
+
+    #[test]
+    fn list_projects_without_issues_is_unchanged() {
+        let materialized = projects();
+        let clean = ProjectRepoIssues::new();
+        let json: serde_json::Value =
+            serde_json::from_str(&render_list_projects(&materialized, &[], &clean, true).unwrap())
+                .unwrap();
+        assert!(json.get("repo_issues").is_none(), "{json}");
+        let text = render_list_projects(&materialized, &[], &clean, false).unwrap();
+        assert!(!text.contains("Warning"), "{text}");
+        assert!(text.starts_with("wavelength-wireless\n  UID:      proj:wavelength-wireless\n"));
+    }
+
+    #[test]
+    fn project_context_text_warns_per_issue_kind() {
+        let value = serde_json::json!({
+            "project": "wavelength-wireless",
+            "repo_issues": [
+                issue(nestweaver_engine::RepoIssueKind::NoMatch),
+                issue(nestweaver_engine::RepoIssueKind::SubstringMatch),
+            ],
+        });
+        let lines = project_context_repo_issue_lines(&value);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("Warning: declared repo not a member: "));
+        assert!(lines[1].starts_with("Warning: declared repo matched loosely: "));
+        assert!(lines[1].contains("resolved only by URL substring"));
+        // Counterweight: no field, no warning.
+        assert!(project_context_repo_issue_lines(&serde_json::json!({"project": "x"})).is_empty());
+    }
+}

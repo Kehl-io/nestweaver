@@ -25,8 +25,8 @@ pub use entry_points::{
 pub use frameworks::detect_frameworks;
 pub use language::{detect_language, is_markdown};
 pub use markdown::{
-    MarkdownParseError, ParsedNote, RawHeading, RawSection, RawTag, RawWikilink, TagSource,
-    parse_markdown,
+    CodeMention, MarkdownParseError, MentionFlags, ParsedNote, RawHeading, RawSection, RawTag,
+    RawWikilink, TagSource, code_mentions, is_distinctive, note_content_hash, parse_markdown,
 };
 pub use mermaid::{MermaidDiagram, MermaidEdge, MermaidNode, parse_mermaid};
 pub use parse::{

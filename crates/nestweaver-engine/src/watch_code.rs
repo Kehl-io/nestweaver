@@ -1068,6 +1068,13 @@ impl CodeWatcher {
         );
         self.finalize_graph_publication_with_io(publication, epilogue_io)
             .map_err(anyhow::Error::from)?;
+        // nw-670 review M4: changed symbols change what notes' mentions
+        // resolve to (and the cascade dropped links into the changed files):
+        // owed to the code-link reconciler.
+        crate::code_links::mark_code_links_pending(
+            &self.db_path,
+            &format!("code watcher batch in {repo_url}"),
+        );
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 
@@ -1950,6 +1957,41 @@ mod tests {
         ) -> Result<(), anyhow::Error> {
             crate::index::FileSystemIndexEpilogueIo.save_pagerank(lease, path)
         }
+    }
+
+    /// nw-678: a code-watcher batch replaces the saved file's symbols
+    /// (DETACH DELETE, then insert) and used to drop their project
+    /// membership with them. Membership is the repo now.
+    #[test]
+    fn project_code_membership_survives_a_watcher_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, repo, project, repo_url) =
+            crate::project::one_repo_project_fixture(dir.path(), "\"alpha\"");
+        let members = |store: &GraphStore| {
+            store
+                .list_project_symbol_uids_by_pagerank(&project, 50, None, None)
+                .unwrap()
+        };
+        assert_eq!(members(&store).len(), 2, "precondition");
+        let file = repo.join("src/lib.rs");
+        std::fs::write(
+            &file,
+            "// shifted\npub fn alpha_one() -> i32 { 1 }\npub fn alpha_two() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "default");
+        let r_uid = nestweaver_schema::repo_uid("default", &repo_url);
+        watcher
+            .process_batch_with_io(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[root.join("src/lib.rs")],
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .unwrap();
+        assert_eq!(members(&store).len(), 2);
     }
 
     #[test]
