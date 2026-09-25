@@ -850,6 +850,15 @@ pub(crate) fn finish_publication(
 /// delete+checkpoint cycles on the REL tables: hours on a real brain. The
 /// truncate is a metadata change whose cost does not grow with the edges.
 fn purge_links(store: &GraphStore, lease: CodeLinkLease<'_>) -> Result<(), anyhow::Error> {
+    // A graph with no links (a new brain, or one with no notes) has nothing
+    // to purge: no lease, no publication, no generation bump — a boot where
+    // nothing changes must not publish (the daemon's boot recovery contract).
+    if !store
+        .has_references_code_edges()
+        .map_err(|e| anyhow::anyhow!("probe for links to remove: {e}"))?
+    {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     let (_lease, publication) = begin_publication(store, lease)?;
     let truncated = store
@@ -1828,6 +1837,30 @@ repos = [{repos}]
                 Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS.to_string());
                 2
             ]
+        );
+    }
+
+    /// The daemon's boot contract: a pass with nothing to change publishes
+    /// nothing — including the rules migration of a graph that has no
+    /// links at all (a new brain), whose version is recorded without a
+    /// publication.
+    #[test]
+    fn a_migration_of_a_graph_without_links_publishes_nothing() {
+        let fx = fixture(
+            &[("a.md", "# A\n\nplain words only\n")],
+            &[("src/a.rs", "pub struct AlphaWidget;\n")],
+        );
+        update_code_links_state(&fx.db, |state| {
+            state.rules_version = 0;
+            true
+        });
+        assert!(edges(&fx.store).is_empty(), "precondition: no links");
+        let generation = fx.store.graph_generation();
+        reconcile(&fx.store);
+        assert_eq!(fx.store.graph_generation(), generation);
+        assert_eq!(
+            load_code_links_state(&fx.db).rules_version,
+            CROSS_DOMAIN_RULES_VERSION
         );
     }
 

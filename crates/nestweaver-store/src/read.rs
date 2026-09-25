@@ -2408,6 +2408,25 @@ impl GraphStore {
         Ok((notes, repos))
     }
 
+    /// Whether any REFERENCES_CODE edge exists — an O(1) probe (the rules
+    /// migration skips its purge publication on a graph with none).
+    pub fn has_references_code_edges(&self) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        for query in [
+            "MATCH ()-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() RETURN 1 LIMIT 1",
+            "MATCH ()-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() RETURN 1 LIMIT 1",
+        ] {
+            let found = conn
+                .query(query)
+                .map(|mut rows| rows.next().is_some())
+                .map_err(|e| StoreError::Query(e.to_string()));
+            if tolerate_missing_table(found)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Total count of REFERENCES_CODE edges (note-to-symbol + section-to-symbol).
     /// Useful for status output to confirm cross-domain discovery happened.
     pub fn count_references_code_edges(&self) -> Result<usize, StoreError> {
@@ -3543,35 +3562,31 @@ impl GraphStore {
     }
 
     /// A project's member repo uids (nw-678): its PROJECT_INCLUDES_REPO
-    /// targets, plus the repos any surviving legacy PROJECT_INCLUDES_SYMBOL
-    /// edges reach (a graph not yet re-materialized). Sorted, distinct.
+    /// targets. Legacy per-symbol PROJECT_INCLUDES_SYMBOL edges are NOT
+    /// widened to their repos here: a legacy membership names individual
+    /// symbols, and the symbol readers union those edges as they are.
     pub fn project_member_repo_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.conn()?;
-        let mut repos = Vec::new();
-        for query in [
-            "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN r.uid",
-            "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
-             RETURN DISTINCT s.repo_uid",
-        ] {
-            let read = (|| -> Result<Vec<String>, StoreError> {
-                let mut stmt = conn
-                    .prepare(query)
-                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-                let rows = conn
-                    .execute(
-                        &mut stmt,
-                        vec![("uid", Value::String(project_uid.to_string()))],
-                    )
-                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(extract_string(&row, 0)?);
-                }
-                Ok(out)
-            })();
-            // N3: see `project_link_scopes`.
-            repos.extend(tolerate_missing_table(read)?);
-        }
+        let read = (|| -> Result<Vec<String>, StoreError> {
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN r.uid",
+                )
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![("uid", Value::String(project_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(extract_string(&row, 0)?);
+            }
+            Ok(out)
+        })();
+        // N3: see `project_link_scopes`.
+        let mut repos = tolerate_missing_table(read)?;
         repos.sort();
         repos.dedup();
         Ok(repos)
@@ -3581,31 +3596,88 @@ impl GraphStore {
     /// member repos (nw-678 — computed at read time from Project -> Repo, so
     /// a re-index cannot drop them).
     pub fn list_project_symbol_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
-        let repos = self.project_member_repo_uids(project_uid)?;
-        if repos.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare("MATCH (s:Symbol) WHERE s.repo_uid IN $repos RETURN s.uid")
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let rows = conn
-            .execute(
-                &mut stmt,
-                vec![(
-                    "repos",
-                    Value::List(
-                        lbug::LogicalType::String,
-                        repos.into_iter().map(Value::String).collect(),
-                    ),
-                )],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let mut uids = Vec::new();
-        for row in rows {
-            uids.push(extract_string(&row, 0)?);
-        }
+        let mut uids: Vec<String> = self
+            .project_symbol_rows(
+                project_uid,
+                "",
+                Vec::new(),
+                "RETURN s.uid, s.pagerank_score",
+            )?
+            .into_iter()
+            .map(|(uid, _)| uid)
+            .collect();
+        uids.sort();
+        uids.dedup();
         Ok(uids)
+    }
+
+    /// A project's member symbols as `(uid, pagerank_score)`, from both
+    /// sources (nw-678): every symbol of its PROJECT_INCLUDES_REPO repos,
+    /// and every symbol a legacy PROJECT_INCLUDES_SYMBOL edge names (not
+    /// widened to that symbol's repo). `extra_where` is ANDed onto both
+    /// (empty for none), `tail` is the RETURN/ORDER/LIMIT clause.
+    fn project_symbol_rows(
+        &self,
+        project_uid: &str,
+        extra_where: &str,
+        extra_params: Vec<(&str, Value)>,
+        tail: &str,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        let member_repos = self.project_member_repo_uids(project_uid)?;
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        let and_extra = if extra_where.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {extra_where}")
+        };
+        let mut queries: Vec<(String, Vec<(&str, Value)>)> = Vec::new();
+        if !member_repos.is_empty() {
+            let mut params = extra_params.clone();
+            params.push((
+                "member_repos",
+                Value::List(
+                    lbug::LogicalType::String,
+                    member_repos.into_iter().map(Value::String).collect(),
+                ),
+            ));
+            queries.push((
+                format!("MATCH (s:Symbol) WHERE s.repo_uid IN $member_repos{and_extra} {tail}"),
+                params,
+            ));
+        }
+        let mut legacy_params = extra_params;
+        legacy_params.push(("uid", Value::String(project_uid.to_string())));
+        let legacy_where = if extra_where.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {extra_where}")
+        };
+        queries.push((
+            format!(
+                "MATCH (p:Project {{uid: $uid}})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol)\
+                 {legacy_where} {tail}"
+            ),
+            legacy_params,
+        ));
+        for (query, params) in queries {
+            let read = (|| -> Result<Vec<(String, f64)>, StoreError> {
+                let mut stmt = conn
+                    .prepare(&query)
+                    .map_err(|e| StoreError::Query(format!("prepare project symbols: {e}")))?;
+                let rows = conn
+                    .execute(&mut stmt, params)
+                    .map_err(|e| StoreError::Query(format!("execute project symbols: {e}")))?;
+                let mut found = Vec::new();
+                for row in rows {
+                    found.push((extract_string(&row, 0)?, extract_f64(&row, 1)?));
+                }
+                Ok(found)
+            })();
+            // N3: see `project_link_scopes`.
+            out.extend(tolerate_missing_table(read)?);
+        }
+        Ok(out)
     }
 
     /// The top `limit` symbols of `repo_uid` by stored PageRank (ties by
@@ -3737,43 +3809,14 @@ impl GraphStore {
         if limit == 0 {
             return Ok(vec![]);
         }
-        let member_repos = self.project_member_repo_uids(project_uid)?;
-        if member_repos.is_empty() {
-            return Ok(vec![]);
-        }
-        let conn = self.conn()?;
-        let mut predicates: Vec<&str> = vec!["s.repo_uid IN $member_repos"];
-        if path_prefix.is_some() {
-            predicates.push("s.file_path STARTS WITH $path_prefix");
-        }
-        if repos.is_some() {
-            predicates.push("s.repo_uid IN $repos");
-        }
-        let where_clause = format!(" WHERE {} ", predicates.join(" AND "));
-        let q = format!(
-            "MATCH (s:Symbol) \
-             {where_clause} \
-             RETURN s.uid, s.pagerank_score \
-             ORDER BY s.pagerank_score DESC \
-             LIMIT $limit"
-        );
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare project symbols: {e}")))?;
-        let mut params = vec![
-            (
-                "member_repos",
-                Value::List(
-                    lbug::LogicalType::String,
-                    member_repos.into_iter().map(Value::String).collect(),
-                ),
-            ),
-            ("limit", Value::Int64(limit as i64)),
-        ];
+        let mut predicates: Vec<&str> = Vec::new();
+        let mut params: Vec<(&str, Value)> = vec![("limit", Value::Int64(limit as i64))];
         if let Some(prefix) = path_prefix {
+            predicates.push("s.file_path STARTS WITH $path_prefix");
             params.push(("path_prefix", Value::String(prefix.to_string())));
         }
         if let Some(repo_uids) = repos {
+            predicates.push("s.repo_uid IN $repos");
             params.push((
                 "repos",
                 Value::List(
@@ -3782,14 +3825,20 @@ impl GraphStore {
                 ),
             ));
         }
-        let result = conn
-            .execute(&mut stmt, params)
-            .map_err(|e| StoreError::Query(format!("execute project symbols: {e}")))?;
-        Ok(result
-            .filter_map(|row| match row.first() {
-                Some(Value::String(s)) => Some(s.clone()),
-                _ => None,
-            })
+        let mut rows = self.project_symbol_rows(
+            project_uid,
+            &predicates.join(" AND "),
+            params,
+            "RETURN s.uid, s.pagerank_score ORDER BY s.pagerank_score DESC LIMIT $limit",
+        )?;
+        // Merge the two sources: best score first, each symbol once.
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut seen = std::collections::HashSet::new();
+        Ok(rows
+            .into_iter()
+            .filter(|(uid, _)| seen.insert(uid.clone()))
+            .map(|(uid, _)| uid)
+            .take(limit)
             .collect())
     }
 
