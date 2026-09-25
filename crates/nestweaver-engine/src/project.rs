@@ -23,7 +23,11 @@ use crate::repo_display_name;
 pub struct ProjectMaterializationResult {
     pub projects_created: usize,
     pub note_edges: usize,
+    /// nw-678: symbols in the projects' member repos (membership is now
+    /// computed from Project -> Repo, so no per-symbol edge is written).
     pub symbol_edges: usize,
+    /// nw-678: PROJECT_INCLUDES_REPO edges written.
+    pub repo_edges: usize,
     pub component_edges: usize,
     pub wiki_notes_ingested: usize,
     pub wiki_fetch_errors: usize,
@@ -39,13 +43,6 @@ pub struct ProjectMaterializationResult {
 /// recorded, so read routes (`project_context`, `list-projects`) can disclose
 /// them without re-resolving against the graph (nw-674).
 pub const REPO_ISSUES_KEY: &str = "repo_issues";
-
-/// nw-670 re-review F1: the repo uids a project's declared `repos` resolve
-/// to (the nw-674 resolver), recorded by `materialize_projects` for
-/// note→code link scoping. Independent of `PROJECT_INCLUDES_SYMBOL`, which
-/// can be empty for a project whose repos did resolve (nw-678) — scoping
-/// read only that, so every project note was linked as if in no project.
-pub const LINKING_REPOS_KEY: &str = "linking_repos";
 
 /// nw-670 re-review F1: how many repos the project DECLARES, so a project
 /// whose declared repos all failed to resolve is disclosed rather than
@@ -393,6 +390,92 @@ fn looks_like_fetch_error(content: &str) -> bool {
     ERROR_PATTERNS.iter().any(|p| content.contains(p))
 }
 
+/// nw-678: each configured project's member repos — its declared `repos`
+/// resolved by the nw-674 resolver — as `(project_uid, repo_uid)` pairs,
+/// sorted and distinct. One planner behind `materialize_projects` and the
+/// daemon's startup [`rebuild_project_repo_membership`].
+pub fn declared_repo_edges(
+    config: &InstanceConfig,
+    instance_id: &str,
+    all_repos: &[nestweaver_schema::Repo],
+) -> Vec<(String, String)> {
+    let mut edges = Vec::new();
+    for project_cfg in &config.projects {
+        let uid = project_uid(instance_id, &project_cfg.name);
+        for repo_name in &project_cfg.repos {
+            let found = resolve_declared_repo(repo_name, &config.repos, all_repos);
+            edges.extend(
+                found
+                    .attached()
+                    .iter()
+                    .map(|repo| (uid.clone(), repo.uid.clone())),
+            );
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    edges
+}
+
+/// nw-678: bring every configured, materialized project's PROJECT_INCLUDES_REPO
+/// membership (and its declared-repo count) in line with `config`, without
+/// the rest of a materialization (no note, wiki or MCP work). The daemon runs
+/// it at startup, so a graph materialized before the membership existed —
+/// or a config whose `repos` changed since — gets its code membership back
+/// with no operator action. Returns whether the graph changed.
+pub fn rebuild_project_repo_membership(
+    store: &GraphStore,
+    config: &InstanceConfig,
+    instance_id: &str,
+    db_path: &Path,
+    lease: Option<&crate::watcher::WatchMutationLeaseFactory>,
+) -> Result<bool, anyhow::Error> {
+    let existing: HashSet<String> = store
+        .list_projects()?
+        .into_iter()
+        .map(|project| project.uid)
+        .collect();
+    let configured: Vec<String> = config
+        .projects
+        .iter()
+        .map(|project| project_uid(instance_id, &project.name))
+        .filter(|uid| existing.contains(uid))
+        .collect();
+    let desired: Vec<(String, String)> =
+        declared_repo_edges(config, instance_id, &store.list_repos(None)?)
+            .into_iter()
+            .filter(|(project, _)| existing.contains(project))
+            .collect();
+    let (_lease, publication) = crate::code_links::begin_publication(store, lease)?;
+    let written = store
+        .replace_project_repo_edges(&configured, &desired)
+        .map_err(|e| anyhow::anyhow!("replace PROJECT_INCLUDES_REPO: {e}"));
+    let changed = matches!(written, Ok(true));
+    crate::code_links::finish_publication(publication, written)?;
+    let mut ext_store = load_extensions(db_path);
+    let mut ext_changed = false;
+    for project_cfg in &config.projects {
+        let uid = project_uid(instance_id, &project_cfg.name);
+        if !existing.contains(&uid) {
+            continue;
+        }
+        let count = serde_json::json!(project_cfg.repos.len());
+        if crate::extensions::get_property(&ext_store, &uid, DECLARED_REPO_COUNT_KEY)
+            != Some(&count)
+        {
+            set_property(&mut ext_store, &uid, DECLARED_REPO_COUNT_KEY, count);
+            ext_changed = true;
+        }
+    }
+    if ext_changed {
+        crate::extensions::save_extensions(db_path, &ext_store)?;
+    }
+    if changed {
+        crate::code_links::mark_code_links_pending(db_path, "project repo membership rebuilt");
+    }
+    Ok(changed)
+}
+
 /// Materialize explicit `[[projects]]` declared in an `InstanceConfig`.
 ///
 /// For each project entry the function:
@@ -535,15 +618,19 @@ pub fn materialize_projects_with_lease(
     // intentionally loaded once rather than once per project/repo.
     let all_notes = store.list_notes(None)?;
     let all_repos = store.list_repos(None)?;
-    let mut symbols_by_repo: HashMap<String, Vec<String>> = HashMap::new();
     let mut projects = Vec::with_capacity(config.projects.len());
     let mut note_edges: Vec<(String, String)> = Vec::new();
-    let mut symbol_edges: Vec<(String, String)> = Vec::new();
+    // nw-678: no per-symbol PROJECT_INCLUDES_SYMBOL fan-out any more — it
+    // was dropped by every re-index and never re-materialized. Replacing
+    // with an empty set also clears the legacy edges of these projects.
+    let symbol_edges: Vec<(String, String)> = Vec::new();
+    // nw-678: the shared planner, so this and the daemon's startup rebuild
+    // cannot disagree about a project's member repos.
+    let repo_edges = declared_repo_edges(config, instance_id, &all_repos);
     let mut component_edges: Vec<(String, String)> = Vec::new();
     let mut parent_edges: Vec<(String, String)> = Vec::new();
     let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
     let mut repo_issues: Vec<ProjectRepoIssue> = Vec::new();
-    let mut linking_repos: HashMap<String, Vec<String>> = HashMap::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -587,7 +674,6 @@ pub fn materialize_projects_with_lease(
             }
         }
 
-        let mut project_symbol_uids = Vec::new();
         for repo_name in &project_cfg.repos {
             let found = resolve_declared_repo(repo_name, &config.repos, &all_repos);
             repo_issues.extend(ProjectRepoIssue::from_match(
@@ -595,35 +681,7 @@ pub fn materialize_projects_with_lease(
                 repo_name,
                 &found,
             ));
-            for repo in found.attached().iter().copied() {
-                linking_repos
-                    .entry(uid.clone())
-                    .or_default()
-                    .push(repo.uid.clone());
-                let repo_symbols = match symbols_by_repo.get(&repo.uid) {
-                    Some(symbols) => symbols,
-                    None => {
-                        let symbols = store
-                            .symbol_lite_by_repo(&repo.uid)?
-                            .into_iter()
-                            .map(|(symbol_uid, _, _)| symbol_uid)
-                            .collect();
-                        symbols_by_repo.insert(repo.uid.clone(), symbols);
-                        symbols_by_repo
-                            .get(&repo.uid)
-                            .expect("just inserted repository symbol inventory")
-                    }
-                };
-                project_symbol_uids.extend(repo_symbols.iter().cloned());
-            }
         }
-        project_symbol_uids.sort();
-        project_symbol_uids.dedup();
-        symbol_edges.extend(
-            project_symbol_uids
-                .into_iter()
-                .map(|symbol_uid| (uid.clone(), symbol_uid)),
-        );
 
         for component_name in &project_cfg.components {
             let child_uid = project_uid(instance_id, component_name);
@@ -658,10 +716,25 @@ pub fn materialize_projects_with_lease(
         ),
     )?;
     let mut graph_changed = replacement.changed();
+    let project_uids: Vec<String> = projects.iter().map(|project| project.uid.clone()).collect();
+    match store.replace_project_repo_edges(&project_uids, &repo_edges) {
+        Ok(changed) => graph_changed |= changed,
+        Err(error) => {
+            // The Project subgraph committed; retire the publication as
+            // changed so readers do not trust pre-mutation derived state.
+            let _ = graph_publication.finish(true);
+            return Err(anyhow::anyhow!("replace PROJECT_INCLUDES_REPO: {error}"));
+        }
+    }
+    let member_repo_uids: Vec<String> = repo_edges.iter().map(|(_, repo)| repo.clone()).collect();
+    let member_symbols = store
+        .count_symbols_in_repos(&member_repo_uids)
+        .unwrap_or_default();
 
     let projects_created = projects.len();
     let total_note_edges = note_edges.len();
-    let total_symbol_edges = symbol_edges.len();
+    let total_symbol_edges = member_symbols;
+    let total_repo_edges = repo_edges.len();
     let total_component_edges = component_edges.len();
     let mut total_wiki_notes_ingested = 0usize;
     let mut wiki_mutation_errors = Vec::new();
@@ -680,18 +753,9 @@ pub fn materialize_projects_with_lease(
             );
         }
 
-        // 5a. nw-670 re-review F1: the resolved repos scope the project's
-        // notes' code links; the declared count lets status disclose a
-        // project whose declared repos resolved to none.
-        let mut resolved = linking_repos.remove(&uid).unwrap_or_default();
-        resolved.sort();
-        resolved.dedup();
-        set_property(
-            &mut ext_store,
-            &uid,
-            LINKING_REPOS_KEY,
-            serde_json::json!(resolved),
-        );
+        // 5a. nw-670 re-review F1 / nw-678: the declared repo count lets
+        // status and project_context disclose a project whose declared repos
+        // resolved to none (its notes then link unscoped, and it has no code).
         set_property(
             &mut ext_store,
             &uid,
@@ -912,6 +976,7 @@ pub fn materialize_projects_with_lease(
         projects_created,
         note_edges: total_note_edges,
         symbol_edges: total_symbol_edges,
+        repo_edges: total_repo_edges,
         component_edges: total_component_edges,
         wiki_notes_ingested: total_wiki_notes_ingested,
         wiki_fetch_errors: total_wiki_fetch_errors,
@@ -1074,6 +1139,182 @@ fn detect_in_container(
     }
 
     Ok(())
+}
+
+/// nw-678 test fixture: a vault note under `proj/`, a Rust repo `alpha` with
+/// two functions, and a config whose project `p` covers `proj` and declares
+/// `repos`; materialized. Returns `(store, db, repo_root, project_uid,
+/// repo_url)`.
+#[cfg(test)]
+pub(crate) fn one_repo_project_fixture(
+    dir: &Path,
+    repos: &str,
+) -> (
+    GraphStore,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+    String,
+) {
+    let vault = dir.join("vault");
+    std::fs::create_dir_all(vault.join("proj")).unwrap();
+    std::fs::write(vault.join("proj/a.md"), "# A\n\nnotes\n").unwrap();
+    let db = dir.join("brain.lbug");
+    crate::index_md::index_markdown_directory(&vault, &db, "default", "vault").unwrap();
+    let store = GraphStore::open_or_create(&db).unwrap();
+    let repo = dir.join("alpha");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn alpha_one() -> i32 { 1 }\npub fn alpha_two() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    let repo_url = "file:///fixture/alpha".to_string();
+    crate::index::index_directory_with_store(
+        &store,
+        &repo,
+        &db,
+        "default",
+        &repo_url,
+        "sha",
+        false,
+        Some("alpha"),
+    )
+    .unwrap();
+    let config = InstanceConfig::from_toml_str(&format!(
+        r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+vault_folder = "proj"
+repos = [{repos}]
+"#
+    ))
+    .unwrap();
+    materialize_projects(&store, &config, "default", &db).unwrap();
+    (store, db, repo, project_uid("default", "p"), repo_url)
+}
+
+#[cfg(test)]
+mod repo_membership_tests {
+    use super::*;
+
+    fn member_symbols(store: &GraphStore, project: &str) -> Vec<String> {
+        store
+            .list_project_symbol_uids_by_pagerank(project, 50, None, None)
+            .unwrap()
+    }
+
+    /// nw-678: a forced re-index DETACH-deleted every symbol, taking its
+    /// PROJECT_INCLUDES_SYMBOL edge along, and nothing re-materialized it —
+    /// project_context then returned no code for the project. Membership is
+    /// now the repo, read at query time.
+    #[test]
+    fn project_code_membership_survives_a_forced_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, repo, project, repo_url) =
+            one_repo_project_fixture(dir.path(), "\"alpha\"");
+        assert_eq!(member_symbols(&store, &project).len(), 2, "precondition");
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            &repo_url,
+            "sha2",
+            true,
+            Some("alpha"),
+        )
+        .unwrap();
+        assert_eq!(member_symbols(&store, &project).len(), 2);
+    }
+
+    /// nw-678: the incremental twin — a line-shift edit re-creates the
+    /// file's symbols under new uids.
+    #[test]
+    fn project_code_membership_survives_an_incremental_line_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, repo, project, repo_url) =
+            one_repo_project_fixture(dir.path(), "\"alpha\"");
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "// shifted\npub fn alpha_one() -> i32 { 1 }\npub fn alpha_two() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            &repo_url,
+            "sha2",
+            false,
+            Some("alpha"),
+        )
+        .unwrap();
+        let members = member_symbols(&store, &project);
+        assert_eq!(members.len(), 2, "{members:?}");
+    }
+
+    /// nw-678: the daemon's startup rebuild restores repo membership a graph
+    /// lacks (materialized before it existed) and is a no-op once current.
+    #[test]
+    fn the_repo_membership_rebuild_restores_and_then_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, _repo, project, _url) = one_repo_project_fixture(dir.path(), "\"alpha\"");
+        let conn = store.begin_transaction().unwrap();
+        conn.query("MATCH (:Project)-[r:PROJECT_INCLUDES_REPO]->(:Repo) DELETE r")
+            .unwrap();
+        store.commit_transaction(&conn).unwrap();
+        assert!(member_symbols(&store, &project).is_empty(), "precondition");
+        let config = InstanceConfig::from_toml_str(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "p"
+vault_folder = "proj"
+repos = ["alpha"]
+"#,
+        )
+        .unwrap();
+        assert!(rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap());
+        assert_eq!(member_symbols(&store, &project).len(), 2);
+        assert!(!rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap());
+    }
 }
 
 #[cfg(test)]

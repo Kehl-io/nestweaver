@@ -2958,6 +2958,41 @@ async fn run_code_link_reconciler(
     let reconciler = Arc::new(std::sync::Mutex::new(
         nestweaver_engine::code_links::CodeLinkReconciler::new(config),
     ));
+    // nw-678: before the first pass, bring project repo membership in line
+    // with the config — a graph materialized before PROJECT_INCLUDES_REPO
+    // existed, or a config whose `repos` changed since, would otherwise scope
+    // (and answer project_context) with no code until someone re-ran
+    // materialize-projects.
+    if let Some(config) = state.instance_cfg.clone()
+        && config
+            .projects
+            .iter()
+            .any(|project| !project.repos.is_empty())
+        && let Ok(_admission) = ConnectionGuard::write(&state)
+    {
+        let rebuild_state = Arc::clone(&state);
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            let factory = daemon_mutation_lease_factory(Arc::clone(&rebuild_state));
+            nestweaver_engine::project::rebuild_project_repo_membership(
+                &rebuild_state.store,
+                &config,
+                &rebuild_state.data_instance_id,
+                &rebuild_state.db_path,
+                Some(&factory),
+            )
+        })
+        .await;
+        match rebuilt {
+            Ok(Ok(true)) => tracing::info!("project repo membership rebuilt from config"),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %format!("{error:#}"), "project repo membership rebuild failed")
+            }
+            Err(join_error) => {
+                tracing::error!(%join_error, "project repo membership rebuild panicked")
+            }
+        }
+    }
     let mut last_generation: Option<u64> = None;
     let mut last_pass: Option<Instant> = None;
     let mut consecutive_failures: u32 = 0;
@@ -6111,8 +6146,12 @@ fn materialize_projects_terminal_progress(
         message.clone()
     } else {
         format!(
-            "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
-            result.projects_created, result.note_edges, result.symbol_edges, result.component_edges,
+            "Done — {} projects, {} note edges, {} member repos ({} symbols), {} component edges",
+            result.projects_created,
+            result.note_edges,
+            result.repo_edges,
+            result.symbol_edges,
+            result.component_edges,
         )
     };
     // nw-674: a declared repo that attached nothing used to vanish from this
@@ -21528,6 +21567,7 @@ credential_method = "gh"
             projects_created: 2,
             note_edges: 3,
             symbol_edges: 5,
+            repo_edges: 1,
             component_edges: 1,
             wiki_notes_ingested: 0,
             wiki_fetch_errors: 0,

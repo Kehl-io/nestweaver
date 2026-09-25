@@ -12407,12 +12407,36 @@ fn project_member_uid(uid: &str, members: &std::collections::HashSet<String>) ->
 /// empty-project early return cannot drift from the ranked one.
 fn disclose_repo_issues(
     response: &mut Value,
+    store: &GraphStore,
     ext_store: &nestweaver_engine::extensions::ExtensionStore,
     project_uid: &str,
 ) {
     let issues = nestweaver_engine::recorded_repo_issues(ext_store, project_uid);
     if !issues.is_empty() {
         response["repo_issues"] = json!(issues);
+    }
+    // nw-678: a project that declares repos but has no member repo answers
+    // with no code at all — say so rather than look like a notes-only
+    // project.
+    let declared = nestweaver_engine::extensions::get_property(
+        ext_store,
+        project_uid,
+        nestweaver_engine::project::DECLARED_REPO_COUNT_KEY,
+    )
+    .and_then(Value::as_u64)
+    .unwrap_or(0);
+    if declared > 0
+        && store
+            .project_member_repo_uids(project_uid)
+            .is_ok_and(|repos| repos.is_empty())
+    {
+        response["code_membership_gap"] = json!({
+            "declared_repos": declared,
+            "member_repos": 0,
+            "remedy": "none of the project's declared repos is a member: check `repo_issues`, \
+                       then run `nestweaver materialize-projects --config <path>` (the daemon \
+                       also rebuilds repo membership from its config at startup)",
+        });
     }
 }
 
@@ -12680,6 +12704,7 @@ fn tool_project_context(
         // to resolve takes — the case the disclosure matters most for.
         disclose_repo_issues(
             &mut response,
+            store,
             &load_extensions(&current_db_path(store).unwrap_or_default()),
             &project.uid,
         );
@@ -13115,7 +13140,7 @@ fn tool_project_context(
         resp["external_refs"] = external_refs;
     }
 
-    disclose_repo_issues(&mut resp, &ext_store, &project.uid);
+    disclose_repo_issues(&mut resp, store, &ext_store, &project.uid);
 
     // nw-316: state which config answered, on EVERY return path, so a caller
     // comparing two routes can attribute a divergence instead of guessing.

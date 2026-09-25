@@ -4050,6 +4050,18 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // nw-678: project code membership as Project -> Repo. Repo nodes
+        // survive every re-index (only files and symbols are replaced), so
+        // unlike the per-symbol PROJECT_INCLUDES_SYMBOL fan-out — dropped by
+        // every symbol DETACH DELETE and never re-materialized — membership
+        // cannot decay. A project's member symbols are those whose
+        // `repo_uid` is a member repo, computed when read.
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_REPO(\
+                FROM Project TO Repo, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS PROJECT_HAS_COMPONENT(\
                 FROM Project TO Project, confidence FLOAT)",

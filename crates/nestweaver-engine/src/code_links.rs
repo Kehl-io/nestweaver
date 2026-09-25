@@ -700,7 +700,7 @@ impl CodeLinkReconciler {
 /// publication while it waits for the write lease, so on contention the
 /// lease is released, the publication waited for, and both retried.
 #[allow(clippy::type_complexity)]
-fn begin_publication<'s>(
+pub(crate) fn begin_publication<'s>(
     store: &'s GraphStore,
     lease: CodeLinkLease<'_>,
 ) -> Result<
@@ -728,7 +728,7 @@ fn begin_publication<'s>(
 /// Publish a write made inside [`begin_publication`]: generation and
 /// PageRank move with the edges, as they do for the watcher's own link
 /// writes. `written` is whether anything changed, or the write's error.
-fn finish_publication(
+pub(crate) fn finish_publication(
     publication: crate::manifest::GraphMutationPublicationGuard<'_>,
     written: Result<bool, anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
@@ -1646,6 +1646,20 @@ repos = [{repos}]
         assert_eq!(
             status["unscoped_projects"],
             serde_json::json!([project]),
+            "{status}"
+        );
+    }
+
+    /// Counterweight: a project that declares no repos (a notes-only
+    /// project) is not a gap.
+    #[test]
+    fn a_project_that_declares_no_repos_is_not_disclosed() {
+        let (_dir, _vault, db, store) = shared_widget_project("");
+        reconcile(&store);
+        let status = code_links_status_json(Some(&db));
+        assert_eq!(
+            status["unscoped_projects"],
+            serde_json::json!([]),
             "{status}"
         );
     }

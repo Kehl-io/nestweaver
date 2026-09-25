@@ -2376,10 +2376,16 @@ impl GraphStore {
         };
         let notes =
             pairs("MATCH (p:Project)-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid, p.uid")?;
-        let repos = pairs(
+        // nw-678: member repos (durable), plus the repos any surviving legacy
+        // per-symbol edges reach, for a graph not yet re-materialized.
+        let mut repos =
+            pairs("MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid")?;
+        repos.extend(pairs(
             "MATCH (p:Project)-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
              RETURN DISTINCT p.uid, s.repo_uid",
-        )?;
+        )?);
+        repos.sort();
+        repos.dedup();
         Ok((notes, repos))
     }
 
@@ -2528,6 +2534,36 @@ impl GraphStore {
             }
         }
         Ok(out)
+    }
+
+    /// How many symbols the repos in `repo_uids` hold (nw-678: a project's
+    /// derived member-symbol count).
+    pub fn count_symbols_in_repos(&self, repo_uids: &[String]) -> Result<usize, StoreError> {
+        if repo_uids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid IN $repos RETURN count(s)")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut rows = conn
+            .execute(
+                &mut stmt,
+                vec![(
+                    "repos",
+                    Value::List(
+                        lbug::LogicalType::String,
+                        repo_uids.iter().cloned().map(Value::String).collect(),
+                    ),
+                )],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        Ok(rows
+            .next()
+            .map(|row| extract_i64(&row, 0))
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize)
     }
 
     /// Every section's `(uid, note_uid, start_line, end_line)`, in one scan.
@@ -3487,37 +3523,64 @@ impl GraphStore {
             .collect())
     }
 
-    /// List Symbol UIDs that belong to a project via PROJECT_INCLUDES_SYMBOL edges.
-    pub fn list_project_symbol_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+    /// A project's member repo uids (nw-678): its PROJECT_INCLUDES_REPO
+    /// targets, plus the repos any surviving legacy PROJECT_INCLUDES_SYMBOL
+    /// edges reach (a graph not yet re-materialized). Sorted, distinct.
+    pub fn project_member_repo_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.conn()?;
-        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN s.uid";
-        let mut stmt = match conn.prepare(q) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::trace!(
-                    "list_project_symbol_uids: query skipped (table may not exist): {e}"
-                );
-                return Ok(vec![]);
+        let mut repos = Vec::new();
+        for query in [
+            "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN r.uid",
+            "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
+             RETURN DISTINCT s.repo_uid",
+        ] {
+            let mut stmt = conn
+                .prepare(query)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![("uid", Value::String(project_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in rows {
+                repos.push(extract_string(&row, 0)?);
             }
-        };
-        let result = match conn.execute(
-            &mut stmt,
-            vec![("uid", Value::String(project_uid.to_string()))],
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::trace!(
-                    "list_project_symbol_uids: query skipped (table may not exist): {e}"
-                );
-                return Ok(vec![]);
-            }
-        };
-        Ok(result
-            .filter_map(|row| match row.first() {
-                Some(Value::String(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect())
+        }
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
+    }
+
+    /// List the Symbol UIDs that belong to a project: every symbol of its
+    /// member repos (nw-678 — computed at read time from Project -> Repo, so
+    /// a re-index cannot drop them).
+    pub fn list_project_symbol_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+        let repos = self.project_member_repo_uids(project_uid)?;
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid IN $repos RETURN s.uid")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![(
+                    "repos",
+                    Value::List(
+                        lbug::LogicalType::String,
+                        repos.into_iter().map(Value::String).collect(),
+                    ),
+                )],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let mut uids = Vec::new();
+        for row in rows {
+            uids.push(extract_string(&row, 0)?);
+        }
+        Ok(uids)
     }
 
     /// The top `limit` symbols of `repo_uid` by stored PageRank (ties by
@@ -3638,45 +3701,48 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.is_index_publication_dirty() {
+        // nw-678: a dirty publication used to return Ok(vec![]) here, and a
+        // project answered with no code at all, indistinguishable from a
+        // project that has none. Refuse like every other ranked read (the
+        // watcher-batch exception included).
+        if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
-            return Ok(vec![]);
+            return Err(StoreError::RankingUnavailable);
         }
         if limit == 0 {
             return Ok(vec![]);
         }
+        let member_repos = self.project_member_repo_uids(project_uid)?;
+        if member_repos.is_empty() {
+            return Ok(vec![]);
+        }
         let conn = self.conn()?;
-        let mut predicates: Vec<&str> = Vec::new();
+        let mut predicates: Vec<&str> = vec!["s.repo_uid IN $member_repos"];
         if path_prefix.is_some() {
             predicates.push("s.file_path STARTS WITH $path_prefix");
         }
         if repos.is_some() {
             predicates.push("s.repo_uid IN $repos");
         }
-        let where_clause = if predicates.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {} ", predicates.join(" AND "))
-        };
+        let where_clause = format!(" WHERE {} ", predicates.join(" AND "));
         let q = format!(
-            "MATCH (p:Project {{uid: $uid}})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
+            "MATCH (s:Symbol) \
              {where_clause} \
              RETURN s.uid, s.pagerank_score \
              ORDER BY s.pagerank_score DESC \
              LIMIT $limit"
         );
-        let mut stmt = match conn.prepare(&q) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::trace!(
-                    "list_project_symbol_uids_by_pagerank: query skipped \
-                     (table may not exist): {e}"
-                );
-                return Ok(vec![]);
-            }
-        };
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare project symbols: {e}")))?;
         let mut params = vec![
-            ("uid", Value::String(project_uid.to_string())),
+            (
+                "member_repos",
+                Value::List(
+                    lbug::LogicalType::String,
+                    member_repos.into_iter().map(Value::String).collect(),
+                ),
+            ),
             ("limit", Value::Int64(limit as i64)),
         ];
         if let Some(prefix) = path_prefix {
@@ -3691,16 +3757,9 @@ impl GraphStore {
                 ),
             ));
         }
-        let result = match conn.execute(&mut stmt, params) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::trace!(
-                    "list_project_symbol_uids_by_pagerank: query skipped \
-                     (table may not exist): {e}"
-                );
-                return Ok(vec![]);
-            }
-        };
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(format!("execute project symbols: {e}")))?;
         Ok(result
             .filter_map(|row| match row.first() {
                 Some(Value::String(s)) => Some(s.clone()),

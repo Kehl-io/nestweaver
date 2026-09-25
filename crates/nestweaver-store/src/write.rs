@@ -3995,6 +3995,78 @@ impl GraphStore {
         })
     }
 
+    /// nw-678: replace the PROJECT_INCLUDES_REPO edges of every project in
+    /// `projects` with `edges` (`(project_uid, repo_uid)`), in one
+    /// transaction. Returns whether anything changed.
+    pub fn replace_project_repo_edges(
+        &self,
+        projects: &[String],
+        edges: &[(String, String)],
+    ) -> Result<bool, StoreError> {
+        let mut existing: Vec<(String, String)> = Vec::new();
+        {
+            let conn = self.conn()?;
+            let rows = conn
+                .query("MATCH (p:Project)-[:PROJECT_INCLUDES_REPO]->(r:Repo) RETURN p.uid, r.uid")
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in rows {
+                let project = crate::read::extract_string(&row, 0)?;
+                if projects.contains(&project) {
+                    existing.push((project, crate::read::extract_string(&row, 1)?));
+                }
+            }
+        }
+        let mut desired = edges.to_vec();
+        desired.sort();
+        desired.dedup();
+        existing.sort();
+        if existing == desired {
+            return Ok(false);
+        }
+        let conn = self.begin_transaction()?;
+        let outcome = (|| -> Result<(), StoreError> {
+            exec_params(
+                &conn,
+                "UNWIND $projects AS u \
+                 MATCH (:Project {uid: u})-[r:PROJECT_INCLUDES_REPO]->() DELETE r",
+                vec![(
+                    "projects",
+                    lbug::Value::List(
+                        lbug::LogicalType::String,
+                        projects
+                            .iter()
+                            .map(|uid| lbug::Value::String(uid.clone()))
+                            .collect(),
+                    ),
+                )],
+            )?;
+            for (project, repo) in &desired {
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $p}), (r:Repo {uid: $r}) \
+                     CREATE (p)-[:PROJECT_INCLUDES_REPO {confidence: 1.0}]->(r)",
+                    vec![
+                        ("p", lbug::Value::String(project.clone())),
+                        ("r", lbug::Value::String(repo.clone())),
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                self.commit_transaction(&conn)?;
+                Ok(true)
+            }
+            Err(error) => {
+                if let Err(rollback) = self.rollback_transaction(&conn) {
+                    tracing::warn!(%rollback, "PROJECT_INCLUDES_REPO rollback failed");
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Insert REFERENCES_CODE edges from Note → Symbol on a caller-owned
     /// connection (normally inside `begin_transaction`). Each tuple is
     /// `(note_uid, symbol_uid, confidence, source)` where `source` is a short
@@ -4275,6 +4347,59 @@ impl GraphStore {
     // transaction, failing the whole incremental index on any parseable
     // rename. A rename re-keys symbols; delete and re-insert them.
 
+    /// nw-678: the projects a repo is a member of, as `(project_uid,
+    /// confidence)`, read before a Repo node is re-created.
+    fn project_repo_memberships_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        let mut stmt = conn
+            .prepare(
+                "MATCH (p:Project)-[e:PROJECT_INCLUDES_REPO]->(r:Repo {uid: $uid}) \
+                 RETURN p.uid, e.confidence",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare project membership: {e}")))?;
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("read project membership: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let project = crate::read::extract_string(&row, 0)?;
+            let confidence = match row.get(1) {
+                Some(lbug::Value::Float(value)) => f64::from(*value),
+                Some(lbug::Value::Double(value)) => *value,
+                _ => 1.0,
+            };
+            out.push((project, confidence));
+        }
+        Ok(out)
+    }
+
+    /// nw-678: re-attach memberships read by
+    /// [`Self::project_repo_memberships_on`] to the re-created Repo node.
+    fn restore_project_repo_memberships_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        memberships: &[(String, f64)],
+    ) -> Result<(), StoreError> {
+        for (project, confidence) in memberships {
+            exec_params(
+                conn,
+                "MATCH (p:Project {uid: $p}), (r:Repo {uid: $r}) \
+                 CREATE (p)-[:PROJECT_INCLUDES_REPO {confidence: $c}]->(r)",
+                vec![
+                    ("p", lbug::Value::String(project.clone())),
+                    ("r", lbug::Value::String(repo_uid.to_string())),
+                    ("c", lbug::Value::Double(*confidence)),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Update the `indexed_sha` field of a Repo node.
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {
         let txn = self.begin_transaction()?;
@@ -4327,6 +4452,9 @@ impl GraphStore {
             _ => String::new(),
         };
 
+        // nw-678: the DETACH DELETE below would drop the repo's project
+        // membership; carry it across the re-create.
+        let membership = Self::project_repo_memberships_on(conn, &uid)?;
         exec_params(
             conn,
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
@@ -4339,7 +4467,7 @@ impl GraphStore {
              staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
              root_path: $root_path})",
             vec![
-                ("uid", lbug::Value::String(uid)),
+                ("uid", lbug::Value::String(uid.clone())),
                 ("url", lbug::Value::String(url)),
                 ("sha", lbug::Value::String(new_sha.to_string())),
                 ("scb", lbug::Value::Int64(staleness)),
@@ -4348,6 +4476,7 @@ impl GraphStore {
                 ("root_path", lbug::Value::String(root_path)),
             ],
         )?;
+        Self::restore_project_repo_memberships_on(conn, &uid, &membership)?;
 
         Ok(())
     }
@@ -4399,6 +4528,8 @@ impl GraphStore {
                 _ => String::new(),
             };
 
+            // nw-678: see `update_repo_sha_on`.
+            let membership = Self::project_repo_memberships_on(conn, &uid)?;
             exec_params(
                 conn,
                 "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
@@ -4411,7 +4542,7 @@ impl GraphStore {
                  staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
                  root_path: $root_path})",
                 vec![
-                    ("uid", lbug::Value::String(uid)),
+                    ("uid", lbug::Value::String(uid.clone())),
                     ("url", lbug::Value::String(url)),
                     ("sha", lbug::Value::String(sha)),
                     ("scb", lbug::Value::Int64(staleness)),
@@ -4420,6 +4551,7 @@ impl GraphStore {
                     ("root_path", lbug::Value::String(root_path.to_string())),
                 ],
             )?;
+            Self::restore_project_repo_memberships_on(conn, &uid, &membership)?;
         }
         self.commit_transaction(&txn)?;
         Ok(())

@@ -756,6 +756,16 @@ impl GraphScope {
             query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN p.uid, n.uid, r.confidence".to_string(),
             edge_type: Some(EdgeType::ProjectIncludesNote),
         });
+        // nw-678: symbol membership derived from Project -> Repo at load
+        // time, so it cannot decay with re-indexing; the legacy per-symbol
+        // edges still count until a re-materialize replaces them.
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_REPO]->(repo:Repo) \
+                    MATCH (s:Symbol) WHERE s.repo_uid = repo.uid \
+                    RETURN p.uid, s.uid, r.confidence"
+                .to_string(),
+            edge_type: Some(EdgeType::ProjectIncludesSymbol),
+        });
         scope.edge_queries.push(ScopedEdgeQuery {
             query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence".to_string(),
             edge_type: Some(EdgeType::ProjectIncludesSymbol),
