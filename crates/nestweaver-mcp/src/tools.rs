@@ -15410,8 +15410,10 @@ fn dispatch_via_daemon_inner(
                     path_prefix: str_field("path_prefix"),
                     tags: str_array("tags"),
                     exclude_tags: str_array("exclude_tags"),
-                    weight_ppr: f64_field("weight_ppr"),
-                    weight_bm25: f64_field("weight_bm25"),
+                    // nw-670 re-review F3: presence, so an explicit 0.0
+                    // survives the hop.
+                    weight_ppr: args.get("weight_ppr").and_then(Value::as_f64),
+                    weight_bm25: args.get("weight_bm25").and_then(Value::as_f64),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
                     include_bodies: bool_field("include_bodies"),

@@ -623,6 +623,17 @@ message CodeLinksStatus {
   uint32 rules_version = 7;
   uint32 current_rules_version = 8;
   string last_reconciled_at = 9;
+  // nw-670 re-review F4: per vault, notes changed on disk since indexing,
+  // left without code links until that vault is refreshed.
+  repeated StaleNotesInVault notes_changed_since_indexing = 10;
+  // nw-670 re-review F1: projects whose declared repos resolved to none, so
+  // their notes link as if in no project.
+  repeated string unscoped_projects = 11;
+}
+
+message StaleNotesInVault {
+  string vault = 1;
+  uint32 count = 2;
 }
 
 message SkippedNotesStatus {
@@ -719,8 +730,12 @@ message BrainContextRequest {
   string path_prefix = 7;
   repeated string tags = 8;
   repeated string exclude_tags = 9;
-  double weight_ppr = 10;
-  double weight_bm25 = 11;
+  // nw-670 re-review F3: `optional`, like `weight_semantic` below — a plain
+  // proto3 double cannot tell an explicit 0.0 (`--weight-ppr 0`) from unset,
+  // so the daemon replaced the caller's zero with the default.
+  // Wire-compatible: same field numbers and base type.
+  optional double weight_ppr = 10;
+  optional double weight_bm25 = 11;
   string intent = 12;
   bool include_seeds = 13;
   bool include_bodies = 14;

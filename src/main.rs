@@ -5044,6 +5044,8 @@ mod daemon_status_renderer_tests {
             rules_version: 2,
             current_rules_version: 2,
             last_reconciled_at: String::new(),
+            notes_changed_since_indexing: Vec::new(),
+            unscoped_projects: Vec::new(),
         };
         let status = nestweaver_proto::BrainStatusResponse {
             code_links: Some(owed.clone()),
@@ -9900,8 +9902,23 @@ fn reconcile_code_links_direct(
 fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option<String> {
     let migration_owed =
         links.current_rules_version != 0 && links.rules_version != links.current_rules_version;
+    // nw-670 re-review F1/F4: gaps that are not owed work but still leave
+    // notes without the links they should have.
+    let mut gaps = Vec::new();
+    for stale in &links.notes_changed_since_indexing {
+        gaps.push(format!(
+            "{} note(s) in {} changed since indexing have no code links (refresh that vault)",
+            stale.count, stale.vault
+        ));
+    }
+    if !links.unscoped_projects.is_empty() {
+        gaps.push(format!(
+            "project(s) {} declare repos that resolve to none, so their notes link unscoped",
+            links.unscoped_projects.join(", ")
+        ));
+    }
     if !links.pending && !migration_owed {
-        return None;
+        return (!gaps.is_empty()).then(|| format!("Note→code links: {}", gaps.join("; ")));
     }
     let mut line = format!("Note→code links: being rebuilt ({}", links.reason);
     if !links.since.is_empty() {
@@ -9922,6 +9939,9 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
             "; last attempt failed ({} time(s)): {}; retrying",
             links.failures, links.last_error
         ));
+    }
+    for gap in gaps {
+        line.push_str(&format!("; {gap}"));
     }
     Some(line)
 }
@@ -29131,8 +29151,10 @@ fn run_brain(
                         "path_prefix": path_prefix.clone().unwrap_or_default(),
                         "tags": tags,
                         "exclude_tags": exclude_tags,
-                        "weight_ppr": weight_ppr.unwrap_or(0.0),
-                        "weight_bm25": weight_bm25.unwrap_or(0.0),
+                        // nw-670 re-review F3: null when unset, so an
+                        // explicit `--weight-ppr 0` is not mistaken for it.
+                        "weight_ppr": weight_ppr,
+                        "weight_bm25": weight_bm25,
                         "intent": intent.clone().unwrap_or_default(),
                         "include_seeds": true,
                         "include_bodies": inline_bodies,

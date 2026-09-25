@@ -6181,11 +6181,13 @@ fn brain_context_args_from_request(req: &BrainContextRequest) -> serde_json::Val
     if !req.exclude_tags.is_empty() {
         args["exclude_tags"] = serde_json::json!(req.exclude_tags);
     }
-    if req.weight_ppr != 0.0 {
-        args["weight_ppr"] = serde_json::json!(req.weight_ppr);
+    // nw-670 re-review F3: an explicit 0.0 (`--weight-ppr 0`) is a weight,
+    // not "unset"; only an absent one falls back to the tool's default.
+    if let Some(weight_ppr) = req.weight_ppr {
+        args["weight_ppr"] = serde_json::json!(weight_ppr);
     }
-    if req.weight_bm25 != 0.0 {
-        args["weight_bm25"] = serde_json::json!(req.weight_bm25);
+    if let Some(weight_bm25) = req.weight_bm25 {
+        args["weight_bm25"] = serde_json::json!(weight_bm25);
     }
     if !req.intent.is_empty() {
         args["intent"] = serde_json::json!(req.intent);
@@ -6347,8 +6349,8 @@ mod context_request_args_tests {
             path_prefix: String::new(),
             tags: vec![],
             exclude_tags: vec![],
-            weight_ppr: 0.0,
-            weight_bm25: 0.0,
+            weight_ppr: None,
+            weight_bm25: None,
             intent: String::new(),
             include_seeds: false,
             include_bodies: false,
@@ -6378,6 +6380,25 @@ mod context_request_args_tests {
              this replaced could not tell an explicit 0.0 from an absent one, so \
              the caller's disable was silently dropped"
         );
+
+        // nw-670 re-review F3: the same presence rule for the PPR and BM25
+        // weights — an explicit zero reaches the tool, an absent one does
+        // not.
+        assert!(
+            brain_context_args_from_request(&req)
+                .get("weight_ppr")
+                .is_none()
+        );
+        assert!(
+            brain_context_args_from_request(&req)
+                .get("weight_bm25")
+                .is_none()
+        );
+        req.weight_ppr = Some(0.0);
+        req.weight_bm25 = Some(0.0);
+        let args = brain_context_args_from_request(&req);
+        assert_eq!(args["weight_ppr"], serde_json::json!(0.0));
+        assert_eq!(args["weight_bm25"], serde_json::json!(0.0));
     }
 }
 
