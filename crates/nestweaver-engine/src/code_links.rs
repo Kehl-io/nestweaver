@@ -200,6 +200,12 @@ pub fn record_rules_version(db_path: &Path) {
     });
 }
 
+/// Whether the stored links were built by other link rules — a migration
+/// the next pass owes (nw-670 re-review R4: never delayed by pass spacing).
+pub fn code_links_migration_owed(db_path: &Path) -> bool {
+    load_code_links_state(db_path).rules_version != CROSS_DOMAIN_RULES_VERSION
+}
+
 /// Whether code links are currently owed.
 pub fn code_links_pending(db_path: &Path) -> bool {
     load_code_links_state(db_path).pending.is_some()
@@ -226,6 +232,33 @@ pub fn code_links_status_json(db_path: Option<&Path>) -> serde_json::Value {
     })
 }
 
+/// The `code_links_pending` disclosure object (`reason`, `since`,
+/// `progress`) while links are owed; `None` when nothing is.
+pub fn code_links_pending_json(db_path: &Path) -> Option<serde_json::Value> {
+    let pending = load_code_links_state(db_path).pending?;
+    Some(serde_json::json!({
+        "reason": pending.reason,
+        "since": pending.since,
+        "progress": pending.progress,
+    }))
+}
+
+/// One human line for a `code_links_pending` object: the CLI text
+/// renderers' twin of the JSON keys (nw-670 re-review R1).
+pub fn code_links_text_note(pending: &serde_json::Value) -> String {
+    let reason = pending
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("owed");
+    let mut note = format!(
+        "Note: note→code links are being rebuilt ({reason}); results may miss links notes should have"
+    );
+    if let Some(progress) = pending.get("progress").and_then(|v| v.as_str()) {
+        note.push_str(&format!(" ({progress})"));
+    }
+    note
+}
+
 /// Ranked reads whose answers lean on note→code links (nw-670 review M2).
 pub const CODE_LINK_RANKED_TOOLS: &[&str] = &["brain_context", "project_context", "investigate"];
 
@@ -238,17 +271,10 @@ pub fn stamp_code_links_disclosure(db_path: &Path, value: &mut serde_json::Value
     let serde_json::Value::Object(map) = value else {
         return;
     };
-    match load_code_links_state(db_path).pending {
+    match code_links_pending_json(db_path) {
         Some(pending) => {
             map.insert("code_links_incomplete".to_string(), serde_json::json!(true));
-            map.insert(
-                "code_links_pending".to_string(),
-                serde_json::json!({
-                    "reason": pending.reason,
-                    "since": pending.since,
-                    "progress": pending.progress,
-                }),
-            );
+            map.insert("code_links_pending".to_string(), pending);
         }
         None => {
             map.remove("code_links_incomplete");
@@ -292,10 +318,11 @@ enum NoteText {
     Mentions(Arc<NoteMentions>),
     /// No local vault directory: linked elsewhere (server worker) or never.
     NotLocal,
-    /// The file no longer holds the committed text: an edit the watcher or
-    /// a refresh will index; the next pass links it.
+    /// The file no longer holds the committed text, or is gone: an edit or
+    /// deletion the watcher or a refresh will index.
     Changed,
-    /// The file of a local vault could not be read (`path: error`).
+    /// The file of a local vault exists but could not be read (permission,
+    /// invalid UTF-8): `path: error`.
     Unreadable(String),
 }
 
@@ -558,6 +585,14 @@ impl CodeLinkReconciler {
         let path = root.join(&note.file_path);
         let source = match std::fs::read_to_string(&path) {
             Ok(source) => source,
+            // nw-670 re-review R2: a note deleted on disk but still in the
+            // graph is a stale index (the watcher or the next refresh removes
+            // it), exactly like an edited one — not links the pass owes.
+            // Treating it as unreadable kept the debt open forever and
+            // stamped every ranked read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return NoteText::Changed;
+            }
             Err(error) => return NoteText::Unreadable(format!("{}: {error}", path.display())),
         };
         if nestweaver_parser::note_content_hash(&source) != note.content_hash {
@@ -1328,8 +1363,13 @@ repos = ["alpha"]
         let fx = two_widgets();
         full_vault_refresh(&fx);
         mark_code_links_pending(&fx.db, "full vault refresh");
-        let text = std::fs::read_to_string(fx.vault.join("a.md")).unwrap();
-        std::fs::remove_file(fx.vault.join("a.md")).unwrap();
+        let file = fx.vault.join("a.md");
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        if std::fs::read_to_string(&file).is_ok() {
+            // Running as root: permissions cannot make the file unreadable.
+            return;
+        }
 
         let report = reconcile(&fx.store);
         assert_eq!(report.unreadable.len(), 1, "{report:?}");
@@ -1343,10 +1383,26 @@ repos = ["alpha"]
             "{owed}"
         );
 
-        std::fs::write(fx.vault.join("a.md"), text).unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
         reconcile(&fx.store);
         assert_eq!(code_links_status_json(Some(&fx.db))["pending"], false);
         assert_eq!(edges(&fx.store).len(), 4);
+    }
+
+    /// nw-670 re-review R2: a note deleted on disk but still in the graph
+    /// is a stale index, skipped like an edited one; the debt settles rather
+    /// than staying open until someone refreshes.
+    #[test]
+    fn a_note_deleted_on_disk_does_not_hold_the_debt_open() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        mark_code_links_pending(&fx.db, "full vault refresh");
+        std::fs::remove_file(fx.vault.join("a.md")).unwrap();
+        let report = reconcile(&fx.store);
+        assert!(report.unreadable.is_empty(), "{report:?}");
+        assert_eq!(report.notes_skipped, 1, "{report:?}");
+        assert_eq!(code_links_status_json(Some(&fx.db))["pending"], false);
     }
 
     /// nw-670 review L8: a lease refused because the daemon is shutting

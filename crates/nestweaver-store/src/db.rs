@@ -4356,6 +4356,31 @@ impl GraphStore {
 mod tests {
     use super::*;
 
+    /// nw-670 re-review (optional): the REFERENCES_CODE tables recreated by
+    /// `truncate_references_code_edges` are durable — they survive a
+    /// checkpoint, close and reopen, empty and writable.
+    #[test]
+    fn truncated_references_code_tables_survive_checkpoint_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.truncate_references_code_edges().unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open(&db).unwrap();
+        assert_eq!(reopened.count_references_code_edges().unwrap(), 0);
+        assert!(
+            reopened
+                .references_code_edges_for_notes(&["note:none".to_string()])
+                .unwrap()
+                .is_empty(),
+            "both tables are queryable after reopen"
+        );
+        reopened.truncate_references_code_edges().unwrap();
+        assert!(reopened.list_references_code_edges().unwrap().is_empty());
+    }
+
     #[test]
     fn scoped_read_deadline_bounds_rust_row_collection_and_restores() {
         let store = GraphStore::in_memory().unwrap();
