@@ -1754,3 +1754,88 @@ async fn export_html_returns_html() {
         "body should contain HTML doctype"
     );
 }
+
+async fn get_with_headers(app: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+    let mut req = Request::builder().uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_non_loopback_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for host in [
+        "evil.example",
+        "evil.example:9377",
+        "127.0.0.1.nip.io:9377",
+        "192.168.1.5:9377",
+    ] {
+        assert_eq!(
+            get_with_headers(&app, "/api/v1/version", &[("host", host)]).await,
+            StatusCode::FORBIDDEN,
+            "Host {host} must be refused (DNS rebinding)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hardened_router_admits_loopback_hosts_and_absent_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for host in [
+        "127.0.0.1:9377",
+        "localhost:9377",
+        "localhost",
+        "[::1]:9377",
+        "127.0.0.1",
+    ] {
+        assert_eq!(
+            get_with_headers(&app, "/api/v1/version", &[("host", host)]).await,
+            StatusCode::OK,
+            "loopback Host {host} must be served"
+        );
+    }
+    // Non-browser clients (and axum oneshot tests) may omit Host; a browser never does.
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[]).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_cross_site_origin_even_with_loopback_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for origin in [
+        "https://evil.example",
+        "null",
+        "http://127.0.0.1.evil.example",
+    ] {
+        assert_eq!(
+            get_with_headers(
+                &app,
+                "/api/v1/version",
+                &[("host", "127.0.0.1:9377"), ("origin", origin)]
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "Origin {origin} must be refused (CSRF / text/plain POST)"
+        );
+    }
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:9377")
+            ]
+        )
+        .await,
+        StatusCode::OK
+    );
+}

@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod error;
 pub mod gaps_cache;
+pub mod hardening;
 pub mod rank_events;
 pub mod routes;
 pub mod state;
@@ -339,6 +340,7 @@ pub async fn start_server_with_router(
     port: u16,
     open_browser: bool,
 ) -> anyhow::Result<()> {
+    let app = crate::hardening::harden(app);
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("nestweaver-web listening on http://{addr}");
