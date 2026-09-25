@@ -3063,6 +3063,13 @@ pub fn dispatch_cancellable(
                 db_path, &mut value,
             );
         }
+        // nw-670 review M2: a ranked answer while note->code links are owed
+        // says so, the same way.
+        if nestweaver_engine::code_links::CODE_LINK_RANKED_TOOLS.contains(&name)
+            && let Some(db_path) = store.db_path()
+        {
+            nestweaver_engine::code_links::stamp_code_links_disclosure(db_path, &mut value);
+        }
         provenance_seam::stamp(Unstamped::new(value))
     });
 
@@ -8747,6 +8754,8 @@ pub fn brain_status_json(
     let (unavailable, counts_complete) = counts_disclosure(unavailable, vault_count_failures);
     let (skipped_notes, notes_near_size_limit) =
         nestweaver_engine::index_md::skipped_notes_status_json(db_path.as_deref());
+    // nw-670 review M3: owed note->code links, in their own object.
+    let code_links = nestweaver_engine::code_links::code_links_status_json(db_path.as_deref());
 
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
@@ -8821,6 +8830,7 @@ pub fn brain_status_json(
         // nw-469: skipped / near-limit notes, read from `<db>.skipped_notes.json`
         // (no vault walk). Always present so callers can key on `count: 0`.
         "skipped_notes": skipped_notes,
+        "code_links": code_links,
         "notes_near_size_limit": notes_near_size_limit,
         // The `brain_search` precedent: always present, empty unless a
         // component was bypassed. The direct fallback sets
@@ -19324,6 +19334,26 @@ mod cache_dispatch_tests {
              configured budget: waited {elapsed:?}"
         );
         set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    /// nw-670 review M2: while note->code links are owed, a ranked read
+    /// (`brain_context`) discloses it; a non-ranked one does not.
+    #[test]
+    fn ranked_reads_disclose_owed_code_links() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "seeds": ["greet"] });
+        let before = dispatch(&store, None, "brain_context", args.clone(), None).unwrap();
+        assert!(before.get("code_links_incomplete").is_none(), "{before}");
+
+        nestweaver_engine::code_links::mark_code_links_pending(&db_path, "full vault refresh");
+        let during = dispatch(&store, None, "brain_context", args, None).unwrap();
+        assert_eq!(during["code_links_incomplete"], json!(true), "{during}");
+        let status = dispatch(&store, None, "brain_status", json!({}), None).unwrap();
+        assert!(status.get("code_links_incomplete").is_none());
+        assert_eq!(status["code_links"]["pending"], json!(true), "{status}");
     }
 
     /// A brain-watcher batch's marker (reason ==

@@ -194,24 +194,56 @@ pub fn code_links_pending(db_path: &Path) -> bool {
     load_code_links_state(db_path).pending.is_some()
 }
 
-/// The `brain status` row for owed code links, if any: `(path, reason)` in
-/// the shape of the skipped-notes `reconciliation_pending_notes` rows.
-pub(crate) fn code_links_status_row(db_path: &Path) -> Option<(String, String)> {
-    let pending = load_code_links_state(db_path).pending?;
-    let mut reason = format!(
-        "note code links being rebuilt since {} ({})",
-        pending.since, pending.reason
-    );
-    if let Some(progress) = &pending.progress {
-        reason.push_str(&format!("; {progress}"));
+/// The `code_links` object of `brain_status` (nw-670 review M3): whether
+/// note→code links are owed, why, how far a running pass has got, the last
+/// failure, and the link-rules version the stored links were built with
+/// against the one this binary applies. Its own object, not rows in the
+/// file-shaped skipped-notes channel: the debt is about links, not files.
+pub fn code_links_status_json(db_path: Option<&Path>) -> serde_json::Value {
+    let state = db_path.map(load_code_links_state).unwrap_or_default();
+    let pending = state.pending.as_ref();
+    serde_json::json!({
+        "pending": pending.is_some(),
+        "reason": pending.map(|p| p.reason.clone()),
+        "since": pending.map(|p| p.since.clone()),
+        "progress": pending.and_then(|p| p.progress.clone()),
+        "last_error": pending.and_then(|p| p.last_error.clone()),
+        "failures": pending.map(|p| p.failures).unwrap_or(0),
+        "rules_version": state.rules_version,
+        "current_rules_version": CROSS_DOMAIN_RULES_VERSION,
+        "last_reconciled_at": state.last_reconciled_at,
+    })
+}
+
+/// Ranked reads whose answers lean on note→code links (nw-670 review M2).
+pub const CODE_LINK_RANKED_TOOLS: &[&str] = &["brain_context", "project_context", "investigate"];
+
+/// nw-670 review M2: while note→code links are owed (a rules migration or a
+/// relink after a refresh or re-index), a ranked answer may be missing links
+/// its notes should have. Stamp `code_links_incomplete` (and why) onto the
+/// response, like the watcher batch's `publication_in_progress`; remove it
+/// when nothing is owed, so a cached answer never carries a stale one.
+pub fn stamp_code_links_disclosure(db_path: &Path, value: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    match load_code_links_state(db_path).pending {
+        Some(pending) => {
+            map.insert("code_links_incomplete".to_string(), serde_json::json!(true));
+            map.insert(
+                "code_links_pending".to_string(),
+                serde_json::json!({
+                    "reason": pending.reason,
+                    "since": pending.since,
+                    "progress": pending.progress,
+                }),
+            );
+        }
+        None => {
+            map.remove("code_links_incomplete");
+            map.remove("code_links_pending");
+        }
     }
-    if let Some(error) = &pending.last_error {
-        reason.push_str(&format!(
-            "; last attempt failed ({} time(s)): {error}; retrying",
-            pending.failures
-        ));
-    }
-    Some(("note→code links".to_string(), reason))
 }
 
 /// Acquired around each chunk that rewrites edges; `None` on direct routes,
@@ -837,43 +869,66 @@ mod tests {
     }
 
     fn status(db: &Path) -> serde_json::Value {
-        crate::index_md::skipped_notes_status_json(Some(db)).0
+        code_links_status_json(Some(db))
+    }
+
+    fn skipped_rows(db: &Path) -> serde_json::Value {
+        crate::index_md::skipped_notes_status_json(Some(db)).0["reconciliation_pending"].clone()
     }
 
     /// Owed links are disclosed from the moment a route records them until a
     /// complete pass lands them; a failed pass keeps the debt and says why.
+    /// Review M3: in their own `code_links` object — never as a pseudo-file
+    /// row in the skipped-notes reconciliation count.
     #[test]
     fn owed_code_links_are_disclosed_until_a_pass_lands_them() {
         let fx = two_widgets();
-        assert_eq!(status(&fx.db)["reconciliation_pending"], 0);
+        assert_eq!(status(&fx.db)["pending"], false);
 
         full_vault_refresh(&fx);
         mark_code_links_pending(&fx.db, "full vault refresh");
         let owed = status(&fx.db);
-        assert_eq!(owed["reconciliation_pending"], 1, "{owed}");
-        let reason = owed["reconciliation_pending_notes"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(reason.contains("full vault refresh"), "{reason}");
+        assert_eq!(owed["pending"], true, "{owed}");
+        assert_eq!(owed["reason"], "full vault refresh", "{owed}");
+        assert_eq!(skipped_rows(&fx.db), 0, "not a file row");
 
         crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(1));
         let failed = reconcile_code_links(&fx.store, &CrossDomainConfig::default());
         crate::cross_domain::FAIL_CROSS_DOMAIN_FLUSHES.with(|fail| fail.set(0));
         assert!(failed.is_err());
         let still = status(&fx.db);
-        assert_eq!(still["reconciliation_pending"], 1, "{still}");
-        let reason = still["reconciliation_pending_notes"][0]["reason"]
-            .as_str()
-            .unwrap();
+        assert_eq!(still["pending"], true, "{still}");
         assert!(
-            reason.contains("last attempt failed") && reason.contains("injected"),
-            "{reason}"
+            still["last_error"].as_str().unwrap().contains("injected"),
+            "{still}"
         );
+        assert_eq!(still["failures"], 1);
 
         reconcile(&fx.store);
-        assert_eq!(status(&fx.db)["reconciliation_pending"], 0);
+        let settled = status(&fx.db);
+        assert_eq!(settled["pending"], false, "{settled}");
+        assert_eq!(settled["rules_version"], CROSS_DOMAIN_RULES_VERSION);
         assert_eq!(edges(&fx.store).len(), 4);
+    }
+
+    /// Review M2: a ranked answer carries `code_links_incomplete` while links
+    /// are owed, and loses it (even a cached copy) once they land.
+    #[test]
+    fn ranked_answers_disclose_owed_code_links() {
+        let fx = two_widgets();
+        let mut answer = serde_json::json!({ "results": [] });
+        stamp_code_links_disclosure(&fx.db, &mut answer);
+        assert!(answer.get("code_links_incomplete").is_none(), "{answer}");
+
+        mark_code_links_pending(&fx.db, "full vault refresh");
+        stamp_code_links_disclosure(&fx.db, &mut answer);
+        assert_eq!(answer["code_links_incomplete"], true);
+        assert_eq!(answer["code_links_pending"]["reason"], "full vault refresh");
+
+        reconcile(&fx.store);
+        stamp_code_links_disclosure(&fx.db, &mut answer);
+        assert!(answer.get("code_links_incomplete").is_none(), "{answer}");
+        assert!(answer.get("code_links_pending").is_none(), "{answer}");
     }
 
     /// A route that drops links while a pass is running records debt the
@@ -982,10 +1037,7 @@ mod tests {
         assert_eq!(state.rules_version, CROSS_DOMAIN_RULES_VERSION);
         assert!(state.pending.is_none(), "{state:?}");
         let disclosed = seen.borrow();
-        let reason = disclosed[0]["reconciliation_pending_notes"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let reason = disclosed[0]["reason"].as_str().unwrap().to_string();
         assert!(reason.contains("rules upgraded"), "{reason}");
     }
 

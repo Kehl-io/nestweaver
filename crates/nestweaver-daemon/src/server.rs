@@ -9162,6 +9162,7 @@ impl NestWeaverDaemon for DaemonService {
             supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
             skipped_notes,
             notes_near_size_limit,
+            code_links: nestweaver_proto::code_links_from_status_json(&value),
         }))
     }
 

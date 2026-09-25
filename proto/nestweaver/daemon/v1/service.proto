@@ -600,6 +600,29 @@ message BrainStatusResponse {
   // Indexed notes above 50% of the configured note-size limit. Absence vs
   // `count: 0` follows `skipped_notes`.
   NotesNearSizeLimit notes_near_size_limit = 22;
+  // nw-670 review M3: note->code link reconciliation. Absence means an older
+  // daemon; a live daemon always sets it, `pending: false` when nothing is
+  // owed.
+  CodeLinksStatus code_links = 23;
+}
+
+message CodeLinksStatus {
+  // Links are owed: a vault refresh, code re-index, membership change or
+  // link-rules migration dropped or invalidated some, and the reconciler has
+  // not finished rebuilding them.
+  bool pending = 1;
+  string reason = 2;
+  string since = 3;
+  // How far a running pass has got; empty when it has nothing to say.
+  string progress = 4;
+  // The last failed attempt; empty when none. Retried with backoff.
+  string last_error = 5;
+  uint32 failures = 6;
+  // The link-rules version the stored links were built with, and the one
+  // this daemon applies. A mismatch is a migration still owed.
+  uint32 rules_version = 7;
+  uint32 current_rules_version = 8;
+  string last_reconciled_at = 9;
 }
 
 message SkippedNotesStatus {

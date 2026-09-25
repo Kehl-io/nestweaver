@@ -4912,6 +4912,14 @@ fn format_daemon_status_response(
                     lines.push(format!("  - {}: {}", note.path, note.reason));
                 }
             }
+            // nw-670 review M3: owed note->code links, on their own line.
+            if let Some(line) = status
+                .code_links
+                .as_ref()
+                .and_then(format_code_links_status)
+            {
+                lines.push(line);
+            }
             // nw-585: indexed, but without their frontmatter -- not skipped.
             if let Some(skipped) = status.skipped_notes.as_ref()
                 && skipped.frontmatter_unparsed > 0
@@ -5012,6 +5020,47 @@ mod daemon_status_renderer_tests {
         ));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
+    }
+
+    /// nw-670 review M3: owed note->code links render on their own line,
+    /// not as a "file" under watcher reconciliation; nothing when current.
+    #[test]
+    fn owed_code_links_render_on_their_own_status_line() {
+        let owed = nestweaver_proto::CodeLinksStatus {
+            pending: true,
+            reason: "full index of vault /v".to_string(),
+            since: "2026-09-25T00:00:00Z".to_string(),
+            progress: "linking notes: 100 of 200 checked".to_string(),
+            last_error: "disk full".to_string(),
+            failures: 2,
+            rules_version: 2,
+            current_rules_version: 2,
+            last_reconciled_at: String::new(),
+        };
+        let status = nestweaver_proto::BrainStatusResponse {
+            code_links: Some(owed.clone()),
+            ..Default::default()
+        };
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(
+            output.contains("Note→code links: being rebuilt (full index of vault /v"),
+            "{output}"
+        );
+        assert!(output.contains("100 of 200 checked"), "{output}");
+        assert!(
+            output.contains("last attempt failed (2 time(s)): disk full"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("Watcher reconciliation pending"),
+            "{output}"
+        );
+
+        let current = nestweaver_proto::CodeLinksStatus {
+            pending: false,
+            ..owed
+        };
+        assert_eq!(format_code_links_status(&current), None);
     }
 
     #[test]
@@ -9835,6 +9884,38 @@ fn reconcile_code_links_direct(
             "code link reconciliation skipped — cannot open DB for writing; the links stay owed: {error:#}"
         ),
     }
+}
+
+/// nw-670 review M3: the one `brain status` line for owed note->code links,
+/// shared by the typed (daemon) and JSON (direct) renderers. `None` when
+/// nothing is owed and the stored links match this binary's rules.
+fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option<String> {
+    let migration_owed =
+        links.current_rules_version != 0 && links.rules_version != links.current_rules_version;
+    if !links.pending && !migration_owed {
+        return None;
+    }
+    let mut line = format!("Note→code links: being rebuilt ({}", links.reason);
+    if !links.since.is_empty() {
+        line.push_str(&format!(", since {}", links.since));
+    }
+    line.push(')');
+    if migration_owed {
+        line.push_str(&format!(
+            "; stored links use rules v{}, this build applies v{}",
+            links.rules_version, links.current_rules_version
+        ));
+    }
+    if !links.progress.is_empty() {
+        line.push_str(&format!("; {}", links.progress));
+    }
+    if !links.last_error.is_empty() {
+        line.push_str(&format!(
+            "; last attempt failed ({} time(s)): {}; retrying",
+            links.failures, links.last_error
+        ));
+    }
+    Some(line)
 }
 
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
@@ -27175,6 +27256,13 @@ fn run_brain(
                                 println!("    - {}: {}", field("path"), field("reason"));
                             }
                         }
+                    }
+                    // nw-670 review M3: the same line as the typed render.
+                    if let Some(line) = nestweaver_proto::code_links_from_status_json(&value)
+                        .as_ref()
+                        .and_then(format_code_links_status)
+                    {
+                        println!("  {line}");
                     }
                     if let Some(near) = value.get("notes_near_size_limit") {
                         let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
