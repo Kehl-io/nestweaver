@@ -1068,6 +1068,13 @@ impl CodeWatcher {
         );
         self.finalize_graph_publication_with_io(publication, epilogue_io)
             .map_err(anyhow::Error::from)?;
+        // nw-670 review M4: changed symbols change what notes' mentions
+        // resolve to (and the cascade dropped links into the changed files):
+        // owed to the code-link reconciler.
+        crate::code_links::mark_code_links_pending(
+            &self.db_path,
+            &format!("code watcher batch in {repo_url}"),
+        );
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 

@@ -38176,6 +38176,9 @@ fn run_publication_rebuild(
                         &store,
                         &config.cross_domain,
                     )?;
+                    // nw-670 review L7: every note of this fresh graph was
+                    // just linked by the current rules.
+                    nestweaver_engine::code_links::record_rules_version(&target_db);
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;

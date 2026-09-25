@@ -2010,6 +2010,15 @@ fn backup_artifact_contract(
                 1,
                 "nestweaver-resolver-generation-v1",
             ),
+            // nw-670 review L7: the link-rules version the stored links were
+            // built with, plus any owed-link debt. A compatibility stamp like
+            // the resolver generation: it describes how the graph's edges
+            // were built, so it travels with them.
+            Some(crate::code_links::CODE_LINKS_SIDECAR) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-code-links-v1",
+            ),
             Some(".filemeta.json") => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
             }
@@ -3822,6 +3831,54 @@ mod tests {
             SIDECAR_SUFFIXES.contains(&crate::resolver_generation::RESOLVER_GENERATION_SIDECAR)
         );
         assert!(SIDECAR_SUFFIXES.contains(&crate::code_links::CODE_LINKS_SIDECAR));
+    }
+
+    /// nw-670 review L7: `<db>.code_links.json` (the link-rules version and
+    /// owed-link debt) is a compatibility stamp that travels with the graph.
+    /// ba906d10 listed it for backup without a contract, so any backup of a
+    /// brain the reconciler had touched was refused as "unclassified", and a
+    /// publication slot holding it could not be sealed. Both must now carry
+    /// it, described.
+    #[test]
+    fn the_code_links_stamp_is_backed_up_and_sealed_with_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let db_path = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+        drop(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        crate::code_links::mark_code_links_pending(&db_path, "test");
+        let stamp = format!(
+            "{}{}",
+            crate::publication::PUBLICATION_GRAPH_FILE,
+            crate::code_links::CODE_LINKS_SIDECAR
+        );
+
+        let bundle = seal_publication_slot(&db_path, &slot)
+            .expect("a slot holding the code-links stamp must seal");
+        assert!(
+            bundle.artifacts.iter().any(|a| a.path == stamp
+                && a.kind == crate::publication::ArtifactKind::CompatibilityStamp)
+        );
+
+        // Then an archive backup (which leaves the writer anchor behind).
+        let output = dir.path().join("b.nwsnap.zst");
+        let backup = backup_save(&BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output,
+            include_clones: false,
+            instance_id: "default".to_string(),
+            workspace_path: None,
+        })
+        .expect("a backup must accept the code-links stamp");
+        assert!(
+            backup
+                .manifest
+                .checksums
+                .keys()
+                .any(|path| path.ends_with(&stamp)),
+            "{:?}",
+            backup.manifest.checksums.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

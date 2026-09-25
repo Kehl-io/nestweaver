@@ -189,6 +189,17 @@ fn record_progress(db_path: Option<&Path>, progress: String) {
     });
 }
 
+/// nw-670 review L7: record that the stored links were built by the current
+/// rules — for a caller that just linked EVERY note of a fresh graph with
+/// bulk discovery (the staged publication), so the daemon's first pass does
+/// not purge and rebuild links that are already current.
+pub fn record_rules_version(db_path: &Path) {
+    update_code_links_state(db_path, |state| {
+        state.rules_version = CROSS_DOMAIN_RULES_VERSION;
+        true
+    });
+}
+
 /// Whether code links are currently owed.
 pub fn code_links_pending(db_path: &Path) -> bool {
     load_code_links_state(db_path).pending.is_some()
@@ -266,6 +277,26 @@ pub struct CodeLinkReconcileReport {
     pub edges_written: usize,
     /// The pass stopped early (shutdown); the debt stays.
     pub stopped: bool,
+    /// nw-670 review M5: notes of a local vault whose file could not be read
+    /// (`path: error`, the first few). Unlike `notes_skipped`, these are
+    /// notes the pass OWES links and could not check: the debt stays and is
+    /// disclosed with them rather than settled as done.
+    pub unreadable: Vec<String>,
+}
+
+/// How many unreadable notes a pass names (the count is uncapped).
+const UNREADABLE_DISCLOSED: usize = 5;
+
+/// What the reconciler could learn about a note's committed text.
+enum NoteText {
+    Mentions(Arc<NoteMentions>),
+    /// No local vault directory: linked elsewhere (server worker) or never.
+    NotLocal,
+    /// The file no longer holds the committed text: an edit the watcher or
+    /// a refresh will index; the next pass links it.
+    Changed,
+    /// The file of a local vault could not be read (`path: error`).
+    Unreadable(String),
 }
 
 /// One note's cached mentions, valid while its content hash is unchanged.
@@ -332,6 +363,26 @@ impl CodeLinkReconciler {
         };
         match &outcome {
             Ok(report) if report.stopped => {}
+            Ok(report) if !report.unreadable.is_empty() => {
+                // nw-670 review M5: not done — some notes could not be read.
+                let message = format!(
+                    "{} note(s) could not be read, e.g. {}",
+                    report.unreadable.len(),
+                    report.unreadable.join("; ")
+                );
+                update_code_links_state(&db_path, |state| {
+                    state.rules_version = CROSS_DOMAIN_RULES_VERSION;
+                    let pending = state.pending.get_or_insert_with(|| CodeLinksPending {
+                        reason: "code links out of date".to_string(),
+                        since: now_iso(),
+                        ..CodeLinksPending::default()
+                    });
+                    pending.progress = None;
+                    pending.last_error = Some(message);
+                    pending.failures = pending.failures.saturating_add(1);
+                    true
+                });
+            }
             Ok(_) => update_code_links_state(&db_path, |state| {
                 // A completed pass built every checked note's links with
                 // the current rules, whatever else is still owed.
@@ -345,6 +396,12 @@ impl CodeLinkReconciler {
                 }
                 true
             }),
+            // nw-670 review L8: a lease refused because the daemon is
+            // shutting down is a stop, not a failure to disclose.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::watcher::WatchMutationRefused>()
+                    .is_some() => {}
             Err(error) => {
                 let message = format!("{error:#}");
                 update_code_links_state(&db_path, |state| {
@@ -424,9 +481,19 @@ impl CodeLinkReconciler {
             }
             let mut desired: Vec<(ScannedNote, String)> = Vec::with_capacity(chunk.len());
             for note in chunk {
-                let Some(mentions) = self.mentions_for(note, &roots) else {
-                    report.notes_skipped += 1;
-                    continue;
+                let mentions = match self.mentions_for(note, &roots) {
+                    NoteText::Mentions(mentions) => mentions,
+                    NoteText::NotLocal | NoteText::Changed => {
+                        report.notes_skipped += 1;
+                        continue;
+                    }
+                    NoteText::Unreadable(why) => {
+                        report.notes_skipped += 1;
+                        if report.unreadable.len() < UNREADABLE_DISCLOSED {
+                            report.unreadable.push(why);
+                        }
+                        continue;
+                    }
                 };
                 report.notes_checked += 1;
                 let note_spans = spans.get(&note.uid).map(Vec::as_slice).unwrap_or(&[]);
@@ -476,17 +543,25 @@ impl CodeLinkReconciler {
         &mut self,
         note: &nestweaver_schema::Note,
         roots: &HashMap<String, PathBuf>,
-    ) -> Option<Arc<NoteMentions>> {
+    ) -> NoteText {
         if let Some(cached) = self.cache.get(&note.uid)
             && cached.content_hash == note.content_hash
         {
-            return Some(Arc::clone(&cached.mentions));
+            return NoteText::Mentions(Arc::clone(&cached.mentions));
         }
         self.cache.remove(&note.uid);
-        let root = roots.get(&note.vault_uid)?;
-        let source = std::fs::read_to_string(root.join(&note.file_path)).ok()?;
+        // A note with no local vault directory (a wiki note, a server-mode
+        // bare clone) is not this reconciler's to link.
+        let Some(root) = roots.get(&note.vault_uid).filter(|root| root.is_dir()) else {
+            return NoteText::NotLocal;
+        };
+        let path = root.join(&note.file_path);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => return NoteText::Unreadable(format!("{}: {error}", path.display())),
+        };
         if nestweaver_parser::note_content_hash(&source) != note.content_hash {
-            return None;
+            return NoteText::Changed;
         }
         let mentions = Arc::new(note_mentions(&source));
         self.cache.insert(
@@ -496,7 +571,7 @@ impl CodeLinkReconciler {
                 mentions: Arc::clone(&mentions),
             },
         );
-        Some(mentions)
+        NoteText::Mentions(mentions)
     }
 
     /// Rewrite one chunk's differing notes: under the lease, in one
@@ -1243,6 +1318,67 @@ repos = ["alpha"]
             2,
             "only b's links: AlphaWidget is stoplisted"
         );
+    }
+
+    /// nw-670 review M5: a note of a local vault whose file cannot be read
+    /// is owed links the pass could not check. It is disclosed and the debt
+    /// is NOT settled as done. Counterweight: once readable, a pass settles.
+    #[test]
+    fn an_unreadable_note_keeps_the_debt_and_is_disclosed() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        mark_code_links_pending(&fx.db, "full vault refresh");
+        let text = std::fs::read_to_string(fx.vault.join("a.md")).unwrap();
+        std::fs::remove_file(fx.vault.join("a.md")).unwrap();
+
+        let report = reconcile(&fx.store);
+        assert_eq!(report.unreadable.len(), 1, "{report:?}");
+        let owed = code_links_status_json(Some(&fx.db));
+        assert_eq!(owed["pending"], true, "{owed}");
+        assert!(
+            owed["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("could not be read"),
+            "{owed}"
+        );
+
+        std::fs::write(fx.vault.join("a.md"), text).unwrap();
+        reconcile(&fx.store);
+        assert_eq!(code_links_status_json(Some(&fx.db))["pending"], false);
+        assert_eq!(edges(&fx.store).len(), 4);
+    }
+
+    /// nw-670 review L8: a lease refused because the daemon is shutting
+    /// down stops the pass without recording a failure.
+    #[test]
+    fn a_shutdown_refusal_is_not_recorded_as_a_failure() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        mark_code_links_pending(&fx.db, "full vault refresh");
+        let refuse: crate::watcher::WatchMutationLeaseFactory =
+            Arc::new(|_label| Err(anyhow::Error::new(crate::watcher::WatchMutationRefused)));
+        let outcome = CodeLinkReconciler::new(CrossDomainConfig::default()).reconcile(
+            &fx.store,
+            Some(&refuse),
+            &|| false,
+        );
+        assert!(outcome.is_err());
+        let state = load_code_links_state(&fx.db);
+        let pending = state.pending.expect("the debt stays");
+        assert_eq!(pending.last_error, None, "{pending:?}");
+        assert_eq!(pending.failures, 0);
+    }
+
+    /// nw-670 review L7: a graph just linked in full by bulk discovery
+    /// records the current rules, so the next pass runs no migration.
+    #[test]
+    fn a_recorded_rules_version_skips_the_migration() {
+        let fx = two_widgets();
+        plant_old_rule_links(&fx);
+        record_rules_version(&fx.db);
+        let report = reconcile(&fx.store);
+        assert_eq!(report.rewritten, vec![note_uid_of(&fx.store, "a.md")]);
     }
 
     /// Stand-in for a refresh that recreated the notes' links' absence: drop
