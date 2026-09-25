@@ -1,6 +1,6 @@
 {
   "name": "nestweaver-linux-arm64",
-  "version": "10.2.1",
+  "version": "10.2.2",
   "description": "NestWeaver prebuilt binary for Linux aarch64 (glibc). Not meant to be installed directly -- installed automatically as an optional dependency of the `nestweaver` package.",
   "os": [
     "linux"
