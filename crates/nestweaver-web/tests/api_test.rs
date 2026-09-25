@@ -1839,3 +1839,124 @@ async fn hardened_router_refuses_cross_site_origin_even_with_loopback_host() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn hardened_router_requires_origin_and_host_authority_to_match_exactly() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    // Host and Origin both loopback, but different ports: a rebound page
+    // listening on :3000 must not pass just because both are "loopback".
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:3000")
+            ]
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:9377")
+            ]
+        )
+        .await,
+        StatusCode::OK
+    );
+    // Origin present, Host absent: falls back to the loopback allowlist.
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[("origin", "http://localhost:9377")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[("origin", "https://evil.example")]
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_absolute_form_uri_with_bad_authority_and_no_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://evil.example:9377/api/v1/version")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn harden_with_allowed_hosts_admits_normalized_extra_hostnames() {
+    let app = nestweaver_web::hardening::harden_with_allowed_hosts(
+        make_app(),
+        vec!["proxy.local:8080".to_string()],
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "proxy.local:8080")]).await,
+        StatusCode::OK,
+        "extra host should be normalized (port stripped) and admitted"
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "other.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_cross_site_origin_on_post_routes() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/context")
+        .header("host", "127.0.0.1:9377")
+        .header("origin", "https://evil.example")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_bad_host_on_spa_fallback_path() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    assert_eq!(
+        get_with_headers(&app, "/some/route", &[("host", "evil.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_host_case_and_trailing_dot_edge_cases() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "LOCALHOST:9377")]).await,
+        StatusCode::OK,
+        "Host matching must be case-insensitive"
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "0.0.0.0:9377")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "localhost.:9377")]).await,
+        StatusCode::FORBIDDEN,
+        "trailing-dot DNS canonicalization must not bypass the allowlist"
+    );
+}
