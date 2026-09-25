@@ -21549,6 +21549,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // When --config is provided, also surface declared projects from
             // [[projects]] that haven't been materialized into the store yet.
+            // nw-674: declared repos the last materialization could not
+            // attach, read from the extension sidecar next to the DB (absent
+            // for a remote daemon, in which case nothing is claimed).
+            let ext_store = nestweaver_engine::load_extensions(&resolved_db);
+            let unresolved_repos: std::collections::BTreeMap<
+                String,
+                Vec<nestweaver_engine::UnresolvedProjectRepo>,
+            > = materialized
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        nestweaver_engine::recorded_unresolved_repos(&ext_store, &p.uid),
+                    )
+                })
+                .filter(|(_, entries)| !entries.is_empty())
+                .collect();
+
             let declared_only: Vec<nestweaver_engine::ProjectConfig> =
                 if let Some(ref cfg_path) = config {
                     let instance_config = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
@@ -21569,12 +21587,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty"
                     )]
                     declared: &'a [nestweaver_engine::ProjectConfig],
+                    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+                    unresolved_repos: &'a std::collections::BTreeMap<
+                        String,
+                        Vec<nestweaver_engine::UnresolvedProjectRepo>,
+                    >,
                 }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&ListProjectsJson {
                         materialized: &materialized,
                         declared: &declared_only,
+                        unresolved_repos: &unresolved_repos,
                     })?
                 );
             } else if materialized.is_empty() && declared_only.is_empty() {
@@ -21589,6 +21613,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  Instance: {}", p.instance_id);
                         if let Some(ref summary) = p.summary {
                             println!("  Summary:  {summary}");
+                        }
+                        for entry in unresolved_repos.get(&p.name).into_iter().flatten() {
+                            println!("  Warning:  declared repo not a member: {entry}");
                         }
                         println!();
                     }
@@ -34220,6 +34247,15 @@ fn render_project_context_daemon_response(
     println!("Project: {project}  ({project_uid})");
     if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
         println!("  {note}");
+    }
+    // nw-674: declared repos that are NOT members must not read as members
+    // that merely ranked low.
+    let unresolved: Vec<nestweaver_engine::UnresolvedProjectRepo> = value
+        .get("unresolved_repos")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    for entry in &unresolved {
+        println!("  Warning: declared repo not a member: {entry}");
     }
     println!();
     let empty = vec![];

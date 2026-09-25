@@ -645,9 +645,11 @@ pub use process::{
     detect_changes_impact, trace_processes,
 };
 pub use project::{
-    ImplicitProjectDetectionResult, ProjectMaterializationResult, detect_implicit_projects,
+    DeclaredRepoMatch, ImplicitProjectDetectionResult, ProjectMaterializationResult,
+    UNRESOLVED_REPOS_KEY, UnresolvedProjectRepo, detect_implicit_projects,
     detect_implicit_projects_with_mode, detect_implicit_projects_with_publication,
-    materialize_projects, materialize_projects_with_lease,
+    materialize_projects, materialize_projects_with_lease, recorded_unresolved_repos,
+    resolve_declared_repo,
 };
 pub use publication::*;
 pub use publication_source::*;

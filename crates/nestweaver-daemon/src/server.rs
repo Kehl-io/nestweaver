@@ -5935,10 +5935,26 @@ fn materialize_projects_terminal_progress(
     let message = if let Some(message) = &degraded {
         message.clone()
     } else {
-        format!(
+        let mut message = format!(
             "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
             result.projects_created, result.note_edges, result.symbol_edges, result.component_edges,
-        )
+        );
+        // nw-674: a declared repo that attached nothing used to vanish from
+        // this line entirely. It stays Phase::Done — the config is the gap,
+        // not the run — but the operator is told which entries to fix.
+        if !result.unresolved_repos.is_empty() {
+            let entries = result
+                .unresolved_repos
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            message.push_str(&format!(
+                "\nWarning: {} declared project repo(s) attached no symbols: {entries}. Declare them by checkout directory name, path, or a `[[repos]] name` alias.",
+                result.unresolved_repos.len()
+            ));
+        }
+        message
     };
     IndexProgress {
         phase: if degraded.is_some() {
@@ -21025,6 +21041,7 @@ credential_method = "gh"
             component_edges: 1,
             wiki_notes_ingested: 0,
             wiki_fetch_errors: 0,
+            unresolved_repos: Vec::new(),
             publication: GraphMutationPublicationOutcome {
                 disposition: GraphMutationPublicationDisposition::CommittedDegraded,
                 generation_before: 40,
@@ -21052,6 +21069,29 @@ credential_method = "gh"
         assert_eq!(
             materialize_projects_terminal_progress(&result).phase,
             Phase::Done as i32
+        );
+        assert!(
+            !materialize_projects_terminal_progress(&result)
+                .message
+                .contains("attached no symbols"),
+            "a fully resolved config must not print an unresolved-repo warning"
+        );
+
+        // nw-674: an unresolved declared repo is disclosed on the terminal
+        // line, without turning a successful run into an error.
+        result.unresolved_repos = vec![nestweaver_engine::UnresolvedProjectRepo {
+            project: "shot-insights".to_string(),
+            repo: "shot-insights-web-app".to_string(),
+            candidates: Vec::new(),
+        }];
+        let terminal = materialize_projects_terminal_progress(&result);
+        assert_eq!(terminal.phase, Phase::Done as i32);
+        assert!(
+            terminal
+                .message
+                .contains("shot-insights/shot-insights-web-app (matches no indexed repo)"),
+            "{}",
+            terminal.message
         );
     }
 

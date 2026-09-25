@@ -27,7 +27,160 @@ pub struct ProjectMaterializationResult {
     pub component_edges: usize,
     pub wiki_notes_ingested: usize,
     pub wiki_fetch_errors: usize,
+    /// nw-674: declared `[[projects]] repos` entries that attached NO symbols
+    /// — nothing indexed matched, or the name matched several unrelated repos.
+    /// Previously these were dropped without a word, so a project could lose
+    /// half its code and still report success.
+    pub unresolved_repos: Vec<UnresolvedProjectRepo>,
     pub publication: GraphMutationPublicationOutcome,
+}
+
+/// Extension-sidecar key under which a project's unresolved declared repos
+/// are recorded, so read routes (`project_context`, `list-projects`) can
+/// disclose them without re-resolving against the graph (nw-674).
+pub const UNRESOLVED_REPOS_KEY: &str = "unresolved_repos";
+
+/// A declared project repo that did not resolve to exactly one indexed repo
+/// identity (nw-674).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnresolvedProjectRepo {
+    pub project: String,
+    /// The reference exactly as written in `[[projects]] repos`.
+    pub repo: String,
+    /// Display names + roots of the unrelated repos an ambiguous name matched.
+    /// Empty means nothing indexed matched at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
+}
+
+impl std::fmt::Display for UnresolvedProjectRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.candidates.is_empty() {
+            write!(
+                f,
+                "{}/{} (matches no indexed repo)",
+                self.project, self.repo
+            )
+        } else {
+            write!(
+                f,
+                "{}/{} (ambiguous: {})",
+                self.project,
+                self.repo,
+                self.candidates.join(", ")
+            )
+        }
+    }
+}
+
+/// The unresolved declared repos last recorded for `project_uid` by
+/// materialization. Undecodable sidecar content reads as none rather than
+/// failing a read route over a disclosure field.
+pub fn recorded_unresolved_repos(
+    ext_store: &crate::extensions::ExtensionStore,
+    project_uid: &str,
+) -> Vec<UnresolvedProjectRepo> {
+    crate::extensions::get_property(ext_store, project_uid, UNRESOLVED_REPOS_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Outcome of resolving one declared repo reference against indexed repos.
+#[derive(Debug)]
+pub enum DeclaredRepoMatch<'a> {
+    Resolved(Vec<&'a nestweaver_schema::Repo>),
+    Unresolved,
+    Ambiguous(Vec<&'a nestweaver_schema::Repo>),
+}
+
+/// Resolve a repo reference declared in `[[projects]] repos` (or
+/// `[[features]] repos`) to the indexed repos it names.
+///
+/// nw-674: membership used to be `display_name == declared ||
+/// alias url == repo.url || repo.url.contains(declared)`, all OR'd. The
+/// display name of a repo indexed without `--name` is its URL basename, so
+/// `Shot-Insights/web-app.git` checked out at `.../shot-insights-web-app` was
+/// `web-app` and never matched the directory basename the instance config
+/// documents as a repo's identity — six declared repos in the live brain were
+/// silently not members. Worse, the OR'd substring clause made a generic name
+/// like `website` claim every `.../website.git` in the instance.
+///
+/// Resolution is now a precedence of tiers; the first tier that matches wins:
+/// 1. a `[[repos]]` entry whose `name` is the reference — its `url` matched
+///    against identity url OR checkout path ([`crate::config::repo_ref_identifies`]);
+/// 2. the reference itself as an identity url or checkout path;
+/// 3. an explicitly stored repo name (`index --name`, `[[repos]] name`);
+/// 4. the checkout directory basename;
+/// 5. the URL-derived basename of an unnamed repo;
+/// 6. (legacy) a substring of the identity url.
+///
+/// Tiers 1-2 are explicit identities, so several matches (linked worktrees of
+/// one remote) are all members. Tiers 3-6 are derived names: if they match
+/// repos with more than one distinct identity url the reference is
+/// [`DeclaredRepoMatch::Ambiguous`] and attaches nothing — two client sites
+/// both named `website` must not merge into one project.
+pub fn resolve_declared_repo<'a>(
+    declared: &str,
+    repo_configs: &[crate::config::RepoConfig],
+    repos: &'a [nestweaver_schema::Repo],
+) -> DeclaredRepoMatch<'a> {
+    use crate::config::repo_ref_identifies;
+    let identifies = |repo: &nestweaver_schema::Repo, reference: &str| {
+        repo_ref_identifies(reference, &repo.url, repo.local_root().map(Path::new))
+    };
+    let explicit = |matched: Vec<&'a nestweaver_schema::Repo>| {
+        (!matched.is_empty()).then_some(DeclaredRepoMatch::Resolved(matched))
+    };
+
+    let aliases: Vec<&str> = repo_configs
+        .iter()
+        .filter(|config| config.name.as_deref() == Some(declared))
+        .map(|config| config.url.as_str())
+        .collect();
+    if let Some(found) = explicit(
+        repos
+            .iter()
+            .filter(|repo| aliases.iter().any(|url| identifies(repo, url)))
+            .collect(),
+    ) {
+        return found;
+    }
+    if let Some(found) = explicit(
+        repos
+            .iter()
+            .filter(|repo| identifies(repo, declared))
+            .collect(),
+    ) {
+        return found;
+    }
+
+    let derived_tiers: [&dyn Fn(&nestweaver_schema::Repo) -> bool; 4] = [
+        &|repo| repo.name.as_deref() == Some(declared),
+        &|repo| {
+            repo.local_root()
+                .and_then(|root| Path::new(root).file_name())
+                .is_some_and(|base| base == declared)
+        },
+        &|repo| repo.name.is_none() && crate::pull::repo_name_from_url(&repo.url) == declared,
+        &|repo| !declared.is_empty() && repo.url.contains(declared),
+    ];
+    for tier in derived_tiers {
+        let matched: Vec<&nestweaver_schema::Repo> =
+            repos.iter().filter(|repo| tier(repo)).collect();
+        if matched.is_empty() {
+            continue;
+        }
+        let identities: HashSet<&str> = matched
+            .iter()
+            .map(|repo| repo.url.trim_end_matches('/'))
+            .collect();
+        return if identities.len() > 1 {
+            DeclaredRepoMatch::Ambiguous(matched)
+        } else {
+            DeclaredRepoMatch::Resolved(matched)
+        };
+    }
+    DeclaredRepoMatch::Unresolved
 }
 
 pub struct ImplicitProjectDetectionResult {
@@ -246,6 +399,7 @@ pub fn materialize_projects_with_lease(
     let mut component_edges: Vec<(String, String)> = Vec::new();
     let mut parent_edges: Vec<(String, String)> = Vec::new();
     let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut unresolved_repos: Vec<UnresolvedProjectRepo> = Vec::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -291,18 +445,37 @@ pub fn materialize_projects_with_lease(
 
         let mut project_symbol_uids = Vec::new();
         for repo_name in &project_cfg.repos {
-            let cfg_url_for_name = config
-                .repos
-                .iter()
-                .find(|repo| repo.name.as_deref() == Some(repo_name.as_str()))
-                .map(|repo| repo.url.as_str());
-            for repo in all_repos.iter().filter(|repo| {
-                repo_display_name(repo) == *repo_name
-                    || cfg_url_for_name.is_some_and(|url| {
-                        repo.url.trim_end_matches('/') == url.trim_end_matches('/')
-                    })
-                    || repo.url.contains(repo_name.as_str())
-            }) {
+            let matched = match resolve_declared_repo(repo_name, &config.repos, &all_repos) {
+                DeclaredRepoMatch::Resolved(matched) => matched,
+                DeclaredRepoMatch::Unresolved => {
+                    unresolved_repos.push(UnresolvedProjectRepo {
+                        project: project_cfg.name.clone(),
+                        repo: repo_name.clone(),
+                        candidates: Vec::new(),
+                    });
+                    continue;
+                }
+                DeclaredRepoMatch::Ambiguous(candidates) => {
+                    unresolved_repos.push(UnresolvedProjectRepo {
+                        project: project_cfg.name.clone(),
+                        repo: repo_name.clone(),
+                        candidates: candidates
+                            .iter()
+                            .map(|repo| {
+                                format!(
+                                    "{} @ {}",
+                                    repo_display_name(repo),
+                                    repo.local_root().unwrap_or(repo.url.as_str())
+                                )
+                            })
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                    });
+                    continue;
+                }
+            };
+            for repo in matched {
                 let repo_symbols = match symbols_by_repo.get(&repo.uid) {
                     Some(symbols) => symbols,
                     None => {
@@ -380,6 +553,34 @@ pub fn materialize_projects_with_lease(
                 &uid,
                 "external_refs",
                 serde_json::json!(&project_cfg.external_refs),
+            );
+        }
+
+        // 5b. nw-674: record (or clear) unresolved declared repos. Unlike the
+        // keys around it this one must be REMOVED once the repo resolves, or
+        // a fixed config would keep disclosing a gap that no longer exists.
+        let project_unresolved: Vec<&UnresolvedProjectRepo> = unresolved_repos
+            .iter()
+            .filter(|entry| entry.project == project_cfg.name)
+            .collect();
+        if project_unresolved.is_empty() {
+            if let Some(properties) = ext_store.get_mut(&uid) {
+                properties.remove(UNRESOLVED_REPOS_KEY);
+            }
+        } else {
+            for entry in &project_unresolved {
+                tracing::warn!(
+                    project = entry.project,
+                    repo = entry.repo,
+                    candidates = ?entry.candidates,
+                    "declared project repo attached no symbols"
+                );
+            }
+            set_property(
+                &mut ext_store,
+                &uid,
+                UNRESOLVED_REPOS_KEY,
+                serde_json::json!(project_unresolved),
             );
         }
 
@@ -576,6 +777,7 @@ pub fn materialize_projects_with_lease(
         component_edges: total_component_edges,
         wiki_notes_ingested: total_wiki_notes_ingested,
         wiki_fetch_errors: total_wiki_fetch_errors,
+        unresolved_repos,
         publication,
     })
 }
@@ -1309,5 +1511,360 @@ timeout_secs = 5
             "expected no Projects dir in a fresh temp dir"
         );
         let _ = store_path; // ensure it's not compiled away
+    }
+
+    // ── nw-674: declared repo -> indexed Repo resolution ────────────────────
+
+    const NW674_HEADER: &str = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+
+    /// One indexed repo with exactly one symbol, shaped like the live brain:
+    /// `name` is only `Some` when the repo was indexed with an explicit name,
+    /// otherwise its display name is the URL-derived basename.
+    fn nw674_repo(
+        store: &nestweaver_store::GraphStore,
+        key: &str,
+        url: &str,
+        root: &str,
+        name: Option<&str>,
+    ) -> String {
+        let repo_uid = format!("repo:test-instance:{key}");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.clone(),
+                url: url.to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test-instance".to_string(),
+                name: name.map(str::to_string),
+                root_path: Some(root.to_string()),
+            })
+            .unwrap();
+        let symbol_uid = format!("sym:{key}");
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: symbol_uid.clone(),
+                name: format!("{key}_fn"),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid,
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {key}_fn()"),
+                summary: None,
+                content_hash: "hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        symbol_uid
+    }
+
+    /// The live-brain shape from nw-674: two unrelated repos whose remotes are
+    /// both `.../website.git` (so both derive the display name `website`), a
+    /// `web-app.git` checked out under a project-prefixed directory, and two
+    /// counterweight repos that already matched by name before the fix.
+    fn nw674_fixture(
+        extra_toml: &str,
+    ) -> (
+        nestweaver_store::GraphStore,
+        tempfile::TempDir,
+        crate::config::InstanceConfig,
+    ) {
+        let config =
+            crate::config::InstanceConfig::from_toml_str(&format!("{NW674_HEADER}{extra_toml}"))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = nestweaver_store::GraphStore::create(&dir.path().join("brain.lbug")).unwrap();
+        nw674_repo(
+            &store,
+            "kehl",
+            "git@github.com:Kehl-io/website.git",
+            "/w/kehl-io-website",
+            None,
+        );
+        nw674_repo(
+            &store,
+            "wave",
+            "git@github.com:Wavelength-Wireless/website.git",
+            "/w/wavelength-wireless-site",
+            None,
+        );
+        nw674_repo(
+            &store,
+            "siweb",
+            "git@github.com:Shot-Insights/web-app.git",
+            "/w/shot-insights/shot-insights-web-app",
+            None,
+        );
+        nw674_repo(
+            &store,
+            "bxweb",
+            "git@github.com:Ballistic-X/web-app.git",
+            "/w/ballistic-x/ballisticx-web",
+            None,
+        );
+        nw674_repo(
+            &store,
+            "fpserver",
+            "git@github.com:FreeplayApp/freeplay-server.git",
+            "/w/freeplay/freeplay-server",
+            None,
+        );
+        nw674_repo(
+            &store,
+            "coyoteweb",
+            "git@github.com:Coyote-Measurement/website.git",
+            "/w/coyote-measurement/website",
+            Some("coyote-website"),
+        );
+        (store, dir, config)
+    }
+
+    fn nw674_members(store: &nestweaver_store::GraphStore, project: &str) -> Vec<String> {
+        let mut members = store
+            .list_project_symbol_uids(&nestweaver_schema::project_uid("test-instance", project))
+            .unwrap();
+        members.sort();
+        members
+    }
+
+    #[test]
+    fn nw674_same_derived_basename_repos_land_in_their_own_projects() {
+        let (store, dir, config) = nw674_fixture(
+            r#"
+[[projects]]
+name = "kehl-io-website"
+repos = ["kehl-io-website"]
+
+[[projects]]
+name = "wavelength-wireless"
+repos = ["wavelength-wireless-site"]
+
+[[projects]]
+name = "shot-insights"
+repos = ["shot-insights-web-app"]
+
+[[projects]]
+name = "ballistic-x"
+repos = ["ballisticx-web"]
+"#,
+        );
+        super::materialize_projects(
+            &store,
+            &config,
+            "test-instance",
+            &dir.path().join("brain.lbug"),
+        )
+        .unwrap();
+
+        assert_eq!(nw674_members(&store, "kehl-io-website"), vec!["sym:kehl"]);
+        assert_eq!(
+            nw674_members(&store, "wavelength-wireless"),
+            vec!["sym:wave"]
+        );
+        assert_eq!(nw674_members(&store, "shot-insights"), vec!["sym:siweb"]);
+        assert_eq!(nw674_members(&store, "ballistic-x"), vec!["sym:bxweb"]);
+    }
+
+    #[test]
+    fn nw674_declared_repo_resolves_by_checkout_path_and_by_path_alias() {
+        let (store, dir, config) = nw674_fixture(
+            r#"
+[[repos]]
+url = "/w/shot-insights/shot-insights-web-app"
+name = "si-web"
+
+[[projects]]
+name = "by-alias"
+repos = ["si-web"]
+
+[[projects]]
+name = "by-path"
+repos = ["/w/wavelength-wireless-site"]
+"#,
+        );
+        super::materialize_projects(
+            &store,
+            &config,
+            "test-instance",
+            &dir.path().join("brain.lbug"),
+        )
+        .unwrap();
+
+        assert_eq!(nw674_members(&store, "by-alias"), vec!["sym:siweb"]);
+        assert_eq!(nw674_members(&store, "by-path"), vec!["sym:wave"]);
+    }
+
+    #[test]
+    fn nw674_ambiguous_derived_name_attaches_nothing_instead_of_both_web_apps() {
+        // The live collision: `Shot-Insights/web-app.git` and
+        // `Ballistic-X/web-app.git` both derive the display name `web-app`.
+        // Before nw-674 declaring `web-app` silently merged two clients' code
+        // into one project.
+        let (store, dir, config) = nw674_fixture(
+            r#"
+[[projects]]
+name = "which-web-app"
+repos = ["web-app"]
+"#,
+        );
+        let result = super::materialize_projects(
+            &store,
+            &config,
+            "test-instance",
+            &dir.path().join("brain.lbug"),
+        )
+        .unwrap();
+
+        assert!(nw674_members(&store, "which-web-app").is_empty());
+        assert_eq!(result.unresolved_repos.len(), 1);
+        let entry = &result.unresolved_repos[0];
+        assert_eq!(
+            (entry.project.as_str(), entry.repo.as_str()),
+            ("which-web-app", "web-app")
+        );
+        assert_eq!(
+            entry.candidates,
+            vec![
+                "web-app @ /w/ballistic-x/ballisticx-web".to_string(),
+                "web-app @ /w/shot-insights/shot-insights-web-app".to_string(),
+            ],
+            "the ambiguity must name the colliding repos so the operator can pick one"
+        );
+    }
+
+    #[test]
+    fn nw674_unresolvable_declared_repo_is_disclosed_and_cleared_once_fixed() {
+        let broken = r#"
+[[projects]]
+name = "site"
+repos = ["freeplay-server", "no-such-checkout"]
+"#;
+        let (store, dir, config) = nw674_fixture(broken);
+        let db_path = dir.path().join("brain.lbug");
+        let project = nestweaver_schema::project_uid("test-instance", "site");
+
+        let result =
+            super::materialize_projects(&store, &config, "test-instance", &db_path).unwrap();
+        let expected = vec![super::UnresolvedProjectRepo {
+            project: "site".to_string(),
+            repo: "no-such-checkout".to_string(),
+            candidates: Vec::new(),
+        }];
+        assert_eq!(result.unresolved_repos, expected);
+        assert_eq!(
+            expected[0].to_string(),
+            "site/no-such-checkout (matches no indexed repo)"
+        );
+        // Read routes disclose it from the sidecar without re-resolving.
+        assert_eq!(
+            super::recorded_unresolved_repos(
+                &crate::extensions::load_extensions(&db_path),
+                &project
+            ),
+            expected
+        );
+        // The resolvable sibling is still a member.
+        assert_eq!(nw674_members(&store, "site"), vec!["sym:fpserver"]);
+
+        // Fixing the config must retract the disclosure, not leave it stale.
+        let fixed = crate::config::InstanceConfig::from_toml_str(&format!(
+            "{NW674_HEADER}{}",
+            broken.replace("no-such-checkout", "kehl-io-website")
+        ))
+        .unwrap();
+        let result =
+            super::materialize_projects(&store, &fixed, "test-instance", &db_path).unwrap();
+        assert!(result.unresolved_repos.is_empty());
+        assert!(
+            super::recorded_unresolved_repos(
+                &crate::extensions::load_extensions(&db_path),
+                &project
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            nw674_members(&store, "site"),
+            vec!["sym:fpserver", "sym:kehl"]
+        );
+    }
+
+    #[test]
+    fn nw674_counterweight_name_matched_repos_are_unchanged() {
+        let (store, dir, config) = nw674_fixture(
+            r#"
+[[projects]]
+name = "named"
+repos = ["freeplay-server", "coyote-website"]
+"#,
+        );
+        let result = super::materialize_projects(
+            &store,
+            &config,
+            "test-instance",
+            &dir.path().join("brain.lbug"),
+        )
+        .unwrap();
+
+        assert!(result.unresolved_repos.is_empty());
+        assert_eq!(
+            nw674_members(&store, "named"),
+            vec!["sym:coyoteweb", "sym:fpserver"]
+        );
+    }
+
+    #[test]
+    fn nw674_feature_repos_resolve_through_the_same_resolver() {
+        // Sibling of project membership: `[[features]] repos` had its own
+        // display-name match, so a checkout-directory name scoped the
+        // feature's entry points to nothing. `freeplay-server` is declared too
+        // so the old "no repo resolved -> include everything" fallback cannot
+        // mask the miss.
+        let (store, _dir, config) = nw674_fixture(
+            r#"
+[[features]]
+name = "si"
+repos = ["shot-insights-web-app", "freeplay-server"]
+entry_points = ["siweb_fn"]
+"#,
+        );
+        let result = crate::query::build_feature_context(
+            &store,
+            &config.features.as_ref().unwrap()[0],
+            &[],
+            &config.repos,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.unmatched_entry_points.is_empty(),
+            "entry point in a directory-named repo must resolve, unmatched: {:?}",
+            result.unmatched_entry_points
+        );
     }
 }
