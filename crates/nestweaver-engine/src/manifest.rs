@@ -697,7 +697,7 @@ pub fn begin_graph_mutation_publication<'a>(
     let lease = store
         .acquire_index_publication_lease()
         .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?;
-    begin_graph_mutation_publication_on_lease(store, lease, operation)
+    begin_graph_mutation_publication_on_lease(store, lease, operation, None)
 }
 
 /// [`begin_graph_mutation_publication`] without blocking: `Ok(None)` while
@@ -713,6 +713,18 @@ pub fn try_begin_graph_mutation_publication<'a>(
     store: &'a nestweaver_store::GraphStore,
     operation: impl Into<String>,
 ) -> Result<Option<GraphMutationPublicationGuard<'a>>, anyhow::Error> {
+    try_begin_graph_mutation_publication_with_reason(store, operation, None)
+}
+
+/// [`try_begin_graph_mutation_publication`] stamping `reason` into the
+/// marker payload (nw-670 live eval #2: a code-link chunk records
+/// `MARKER_REASON_CODE_LINKS`, which ranked reads answer through with
+/// disclosure).
+pub fn try_begin_graph_mutation_publication_with_reason<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    operation: impl Into<String>,
+    reason: Option<&'static str>,
+) -> Result<Option<GraphMutationPublicationGuard<'a>>, anyhow::Error> {
     let operation = operation.into();
     let Some(lease) = store
         .try_acquire_index_publication_lease()
@@ -720,13 +732,14 @@ pub fn try_begin_graph_mutation_publication<'a>(
     else {
         return Ok(None);
     };
-    begin_graph_mutation_publication_on_lease(store, lease, operation).map(Some)
+    begin_graph_mutation_publication_on_lease(store, lease, operation, reason).map(Some)
 }
 
 fn begin_graph_mutation_publication_on_lease<'a>(
     store: &'a nestweaver_store::GraphStore,
     lease: nestweaver_store::IndexPublicationLease<'a>,
     operation: String,
+    reason: Option<&'static str>,
 ) -> Result<GraphMutationPublicationGuard<'a>, anyhow::Error> {
     lease.ensure_clean_for_snapshot().map_err(|error| {
         anyhow::anyhow!("{operation}: refusing to overwrite a dirty publication: {error}")
@@ -743,7 +756,7 @@ fn begin_graph_mutation_publication_on_lease<'a>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos(),
-            None,
+            reason,
         );
         store
             .with_index_publication_rank_barrier(|| {

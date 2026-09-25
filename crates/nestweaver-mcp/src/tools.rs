@@ -19428,6 +19428,43 @@ mod cache_dispatch_tests {
         assert_eq!(result["in_flight_note_paths_truncated"], json!(false));
     }
 
+    /// nw-670 live eval #2: during a code-link relink, ranked reads answered
+    /// "publication window did not finish" for minutes. A code-link chunk's
+    /// publication now serves them with the publication disclosure — and,
+    /// with links owed, `code_links_incomplete`.
+    #[test]
+    fn ranked_read_during_code_link_publication_answers_with_disclosure() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let _writer_authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        nestweaver_engine::code_links::mark_code_links_pending(&db_path, "rules migration");
+        fs::write(
+            nestweaver_engine::sidecar_path(&db_path, ".index-dirty"),
+            nestweaver_store::index_publication::format_marker_payload(
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
+            ),
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+        let result = dispatch(
+            &store,
+            None,
+            "brain_context",
+            json!({ "seeds": ["greet"] }),
+            None,
+        )
+        .expect("a code-link publication must not fail ranked reads closed");
+        assert_eq!(result["publication_in_progress"], json!(true), "{result}");
+        assert_eq!(result["code_links_incomplete"], json!(true), "{result}");
+    }
+
     /// COUNTERWEIGHT: a marker with no reason at all (an ordinary `index`
     /// run's shape) must still fail closed exactly as before — the
     /// exception is scoped to the ONE reason a watcher batch stamps.

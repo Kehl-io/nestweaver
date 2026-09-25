@@ -56,10 +56,29 @@ pub const MARKER_REASON_WATCHER_BATCH: &str = "brain watcher batch";
 /// age is fail-closed too: "cannot tell" is not "still a debounce".
 pub const WATCHER_BATCH_EXCEPTION_MAX_AGE: Duration = Duration::from_secs(60);
 
-/// True when this record is a *young* watcher-batch publication that ranked
-/// reads may answer through (lease liveness is checked by the caller).
+/// Marker payload reason recorded by a code-link reconcile publication
+/// (nw-670 live eval #2): one short chunk rewriting only derived note->code
+/// links (REFERENCES_CODE) or project repo membership — never code or note
+/// structure. Like a watcher batch, ranked reads answer through it with
+/// disclosure instead of failing closed; a rules migration's relink is many
+/// such chunks over minutes, and every read failed closed through it.
+pub const MARKER_REASON_CODE_LINKS: &str = "code link reconciliation";
+
+/// Whether `reason` names a publication ranked reads may answer through
+/// with disclosure (a young one, with the writer lease held): a watcher
+/// batch or a code-link reconcile chunk. Everything else fails closed.
+pub fn is_serve_with_disclosure_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(MARKER_REASON_WATCHER_BATCH) | Some(MARKER_REASON_CODE_LINKS)
+    )
+}
+
+/// True when this record is a *young* watcher-batch or code-link publication
+/// that ranked reads may answer through (lease liveness is checked by the
+/// caller).
 pub fn watcher_batch_ranking_exception_applies(record: &MarkerRecord) -> bool {
-    if record.reason.as_deref() != Some(MARKER_REASON_WATCHER_BATCH) {
+    if !is_serve_with_disclosure_reason(record.reason.as_deref()) {
         return false;
     }
     matches!(record.age(), Some(age) if age <= WATCHER_BATCH_EXCEPTION_MAX_AGE)

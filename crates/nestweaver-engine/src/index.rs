@@ -729,8 +729,9 @@ fn finalize_code_graph_deletion_with_io(
 fn reclassify_leftover_watcher_batch_marker(db_path: &Path) {
     match nestweaver_store::index_publication::read_marker(db_path) {
         nestweaver_store::index_publication::MarkerState::Present(record)
-            if record.reason.as_deref()
-                == Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH) =>
+            if nestweaver_store::index_publication::is_serve_with_disclosure_reason(
+                record.reason.as_deref(),
+            ) =>
         {
             let marker_path = crate::sidecar_path(db_path, ".index-dirty");
             if let Err(error) = FileSystemIndexEpilogueIo.establish_marker(&marker_path) {

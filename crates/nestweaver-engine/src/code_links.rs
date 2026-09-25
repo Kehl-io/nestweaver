@@ -338,6 +338,55 @@ pub struct CodeLinkReconcileReport {
     pub unscoped_projects: Vec<String>,
 }
 
+/// nw-670 live eval #2: at most this many edges written under one lease and
+/// one publication (a single note with more still goes alone).
+const MAX_EDGES_PER_PUBLICATION: usize = 1_500;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a smaller per-publication edge budget.
+    static MAX_EDGES_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test probe: the marker reason of each relink publication while open.
+    static OPEN_MARKER_REASONS: std::cell::RefCell<Vec<Option<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn max_edges_per_publication() -> usize {
+    #[cfg(test)]
+    if let Some(max) = MAX_EDGES_OVERRIDE.with(std::cell::Cell::get) {
+        return max;
+    }
+    MAX_EDGES_PER_PUBLICATION
+}
+
+/// Split `dirty` into consecutive groups of at most `budget` edges each
+/// (every group holds at least one note).
+fn group_by_edge_budget(
+    dirty: Vec<(ScannedNote, String)>,
+    budget: usize,
+) -> Vec<Vec<(ScannedNote, String)>> {
+    let mut groups: Vec<Vec<(ScannedNote, String)>> = Vec::new();
+    let mut current: Vec<(ScannedNote, String)> = Vec::new();
+    let mut edges = 0usize;
+    for item in dirty {
+        let count = item.0.edge_count();
+        if !current.is_empty() && edges + count > budget {
+            groups.push(std::mem::take(&mut current));
+            edges = 0;
+        }
+        edges += count;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 /// How many unreadable notes a pass names (the count is uncapped).
 const UNREADABLE_DISCLOSED: usize = 5;
 
@@ -614,7 +663,18 @@ impl CodeLinkReconciler {
             if dirty.is_empty() {
                 continue;
             }
-            self.rewrite(store, lease, dirty, &mut report)?;
+            // nw-670 live eval #2: a 100-note chunk of ~70 edges each held
+            // the lease and its publication for seconds. Publish in groups
+            // of at most MAX_EDGES_PER_PUBLICATION edges, releasing the write
+            // gate between groups so queued writers (embedding/trigram
+            // reconcilers, the watcher) get their turn.
+            for group in group_by_edge_budget(dirty, max_edges_per_publication()) {
+                if should_stop() {
+                    report.stopped = true;
+                    return Ok(report);
+                }
+                self.rewrite(store, lease, group, &mut report)?;
+            }
         }
         Ok(report)
     }
@@ -682,6 +742,16 @@ impl CodeLinkReconciler {
             .map(|(scanned, _)| scanned.note_uid().to_string())
             .collect();
         let (_lease, publication) = begin_publication(store, lease)?;
+        #[cfg(test)]
+        if let Some(db_path) = store.db_path() {
+            OPEN_MARKER_REASONS.with(|seen| {
+                if let nestweaver_store::index_publication::MarkerState::Present(record) =
+                    nestweaver_store::index_publication::read_marker(db_path)
+                {
+                    seen.borrow_mut().push(record.reason);
+                }
+            });
+        }
         // Re-checked under the lease: a note edited since the scan has newer
         // text, and is left for the next pass.
         let current: HashMap<String, String> = store
@@ -725,10 +795,15 @@ pub(crate) fn begin_publication<'s>(
         let guard = lease
             .map(|factory| factory("code_link_reconcile"))
             .transpose()?;
-        if let Some(publication) = crate::manifest::try_begin_graph_mutation_publication(
-            store,
-            "code link reconciliation",
-        )? {
+        // nw-670 live eval #2: stamped as a code-link chunk, so ranked reads
+        // answer through it with disclosure instead of failing closed.
+        if let Some(publication) =
+            crate::manifest::try_begin_graph_mutation_publication_with_reason(
+                store,
+                "code link reconciliation",
+                Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
+            )?
+        {
             return Ok((guard, publication));
         }
         drop(guard);
@@ -1713,6 +1788,47 @@ repos = [{repos}]
         assert_eq!(changed[0]["count"], 1, "{status}");
         // nw-670 re-review N6: the count is dated to its pass.
         assert!(status["notes_changed_as_of"].is_string(), "{status}");
+    }
+
+    /// nw-670 live eval #2: relink writes go out in groups bounded by an
+    /// edge budget, each under its own lease (released in between) and its
+    /// own serve-with-disclosure publication.
+    #[test]
+    fn relink_publications_are_bounded_by_an_edge_budget() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        let leases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&leases);
+        let factory: crate::watcher::WatchMutationLeaseFactory =
+            std::sync::Arc::new(move |_label| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(()) as Box<dyn crate::watcher::WatchMutationLease>)
+            });
+        OPEN_MARKER_REASONS.with(|seen| seen.borrow_mut().clear());
+        MAX_EDGES_OVERRIDE.with(|max| max.set(Some(2)));
+        let report = CodeLinkReconciler::new(CrossDomainConfig::default()).reconcile(
+            &fx.store,
+            Some(&factory),
+            &|| false,
+        );
+        MAX_EDGES_OVERRIDE.with(|max| max.set(None));
+        let report = report.unwrap();
+        assert_eq!(report.rewritten.len(), 2);
+        assert_eq!(
+            leases.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "two notes of 2 edges each, budget 2: two leases"
+        );
+        assert_eq!(edges(&fx.store).len(), 4);
+        // Each open relink publication is a serve-with-disclosure one.
+        let reasons = OPEN_MARKER_REASONS.with(|seen| seen.take());
+        assert_eq!(
+            reasons,
+            vec![
+                Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS.to_string());
+                2
+            ]
+        );
     }
 
     /// Stand-in for a refresh that recreated the notes' links' absence: drop

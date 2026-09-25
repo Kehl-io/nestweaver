@@ -2192,6 +2192,52 @@ mod tests {
         );
     }
 
+    /// nw-670 live eval #2: a code-link reconcile publication rewrites only
+    /// derived note->code links, chunk by chunk, for minutes during a rules
+    /// migration. Ranked reads failed closed for most of it. Like a watcher
+    /// batch, a young, held one now lets ranked reads answer (with the
+    /// publication disclosure). Counterweight: an unattributed (full index)
+    /// publication still fails closed.
+    #[test]
+    fn a_code_link_reconcile_publication_does_not_block_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        let _writer_authority = crate::acquire_db_write_lease(&db_path).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                Some("code link reconciliation"),
+            ),
+        )
+        .unwrap();
+        assert!(
+            !store.index_publication_blocks_ranking(),
+            "a young held code-link publication must not block ranking"
+        );
+        store
+            .pagerank_scores()
+            .expect("ranked reads answer through a code-link publication");
+
+        std::fs::write(
+            &marker_path,
+            crate::index_publication::format_marker_payload(std::process::id(), nanos, None),
+        )
+        .unwrap();
+        assert!(
+            store.index_publication_blocks_ranking(),
+            "counterweight: a full index publication still fails closed"
+        );
+    }
+
     /// nw-475 (Task 5.2, review fix): `compute_pagerank_warm_inner`'s
     /// MID-COMPUTE re-check (after PPR iterates, before scores are cached)
     /// must also honour the watcher-batch exception — not just the ENTRY
