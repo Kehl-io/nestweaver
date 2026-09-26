@@ -5,7 +5,7 @@ use nestweaver_schema::{
 };
 use rayon::prelude::*;
 
-use crate::imports::{ImportGraph, build_import_graph};
+use crate::imports::{ImportGraph, build_import_graph_with_languages};
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
 
@@ -76,7 +76,36 @@ pub fn resolve_references_with_context(
     _type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
     resolve_only: Option<&std::collections::HashSet<String>>,
 ) -> Vec<ResolvedEdge> {
-    let graph = build_import_graph(files, language, workspace_ctx);
+    resolve_references_with_file_languages(
+        files,
+        language,
+        repo_uid,
+        workspace_ctx,
+        _type_envs,
+        resolve_only,
+        None,
+    )
+}
+
+/// Resolve a mixed-language repository using the language of each source file.
+/// The fallback preserves the single-language API for callers without a file map.
+pub fn resolve_references_with_file_languages(
+    files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    fallback_language: Language,
+    repo_uid: &str,
+    workspace_ctx: &WorkspaceContext,
+    _type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
+    resolve_only: Option<&std::collections::HashSet<String>>,
+    file_languages: Option<&std::collections::HashMap<String, Language>>,
+) -> Vec<ResolvedEdge> {
+    let language_for = |file: &str| {
+        file_languages
+            .and_then(|languages| languages.get(file))
+            .copied()
+            .unwrap_or(fallback_language)
+    };
+    let graph =
+        build_import_graph_with_languages(files, fallback_language, file_languages, workspace_ctx);
 
     // Pre-sort symbols per file so find_enclosing_symbol's binary search invariant holds.
     // Tree-sitter guarantees sorted output in production, but callers (e.g. property tests)
@@ -152,6 +181,7 @@ pub fn resolve_references_with_context(
                 return Vec::new();
             }
             let mut local_edges = Vec::new();
+            let language = language_for(file_path);
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
                     file_path,
@@ -218,7 +248,7 @@ pub fn resolve_references_with_context(
         if let (Some(src), Some(tgt)) = (src_sym, tgt_sym) {
             let source_uid = symbol_uid(repo_uid, src_file, &src.name, src.start_line);
             let target_uid = symbol_uid(repo_uid, tgt_file, &tgt.name, tgt.start_line);
-            let confidence = confidence_score(MatchType::ImportResolved, language);
+            let confidence = confidence_score(MatchType::ImportResolved, language_for(src_file));
             edges.push(ResolvedEdge {
                 source_uid,
                 target_uid,
@@ -339,7 +369,7 @@ pub fn resolve_references_with_context(
                 None => visible,
             };
 
-            let confidence = confidence_score(MatchType::ImportResolved, language);
+            let confidence = confidence_score(MatchType::ImportResolved, language_for(file_path));
 
             for target_sym in &exported {
                 let target_uid = symbol_uid(
