@@ -7886,6 +7886,18 @@ impl NestWeaverDaemon for DaemonService {
                 ..Default::default()
             }));
 
+            // nw-684 review: an unreadable or invalid `.brainignore` refuses
+            // the index by name BEFORE any sidecar is written — no search
+            // debt, no code-link debt for an index that never ran.
+            if let Err(error) = nestweaver_engine::load_brain_ignore(&vault_path, &extra_patterns) {
+                let _ = tx.blocking_send(Ok(IndexProgress {
+                    phase: Phase::Error as i32,
+                    message: format!("IndexVault refused: {error:#}"),
+                    ..Default::default()
+                }));
+                return;
+            }
+
             let indexed_before = indexed_search_rows_before(&state);
             let search_admission = match establish_search_reconciliation_debt(&state, "index_vault")
             {
@@ -8116,6 +8128,18 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
                 ..Default::default()
             }));
+
+            // nw-684 review: name an unreadable or invalid `.brainignore`
+            // before the derivation gate (which would only report an
+            // anonymous record I/O failure) and before any sidecar write.
+            if let Err(error) = nestweaver_engine::load_brain_ignore(&vault_path, &extra_patterns) {
+                let _ = tx.blocking_send(Ok(IndexProgress {
+                    phase: Phase::Error as i32,
+                    message: format!("RefreshVaultSince refused: {error:#}"),
+                    ..Default::default()
+                }));
+                return;
+            }
 
             if let Err(error) = vault_derivation::ensure_current(
                 &state,
@@ -17378,6 +17402,77 @@ repos = ["alpha"]
             vault_derivation_record(&state).phase,
             DerivationPhase::Current
         );
+    }
+
+    /// nw-684 review: an unreadable `.brainignore` must refuse IndexVault AND
+    /// RefreshVaultSince with a message naming the file, before either route
+    /// writes a sidecar. RefreshVaultSince used to surface the derivation
+    /// gate's "Markdown derivation record I/O failed (PermissionDenied)" with
+    /// no file named, and IndexVault established search debt and marked code
+    /// links owed for an index it never ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vault_rpcs_refuse_an_unreadable_brainignore_by_name_before_any_sidecar_write() {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+        std::fs::write(root.join("secret.md"), "# Secret\n\ncredentials\n").unwrap();
+        std::fs::write(root.join("ok.md"), "# Ok\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(
+            first.last().unwrap().phase,
+            Phase::Done as i32,
+            "precondition"
+        );
+
+        let sidecars = |state: &DaemonState| {
+            (
+                nestweaver_engine::code_links::load_code_links_state(&state.db_path).marks,
+                std::fs::read(search_reconciliation_debt_path(&state.db_path)).ok(),
+            )
+        };
+        let before = sidecars(&state);
+        let restore = lock_dir(&root.join(".brainignore"));
+        let index = index_vault_via_rpc(&state, &root).await;
+        let index_sidecars = sidecars(&state);
+        let refresh = refresh_vault_since_via_rpc(&state, &root).await;
+        let refresh_sidecars = sidecars(&state);
+        drop(restore);
+
+        for (route, progress, after) in [
+            ("IndexVault", index, index_sidecars),
+            ("RefreshVaultSince", refresh, refresh_sidecars),
+        ] {
+            let last = progress.last().expect("streamed progress");
+            assert_eq!(last.phase, Phase::Error as i32, "{route}: {}", last.message);
+            assert!(
+                last.message.contains(".brainignore"),
+                "{route} must name the file: {}",
+                last.message
+            );
+            assert_eq!(
+                after, before,
+                "{route} must not write the code-link or search-debt sidecar"
+            );
+        }
+        let notes: Vec<String> = state
+            .store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert_eq!(notes, vec!["ok.md".to_string()]);
+
+        // Counterweight: readable again, the refresh runs.
+        let again = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = again.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
     }
 
     /// nw-651 counterweight: a brainignored unreadable subdirectory is policy,
