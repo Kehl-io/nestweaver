@@ -93,14 +93,46 @@ pub fn load_brain_ignore_from_reader(
 ) -> anyhow::Result<GlobSet> {
     let rel = Path::new(".brainignore");
     let ignore_file = reader.root().join(rel);
-    let content = reader.read_optional_file(rel).with_context(|| {
-        format!(
-            "cannot read {} — refusing to index this vault until it is readable, \
-             because indexing without it would expose notes it excludes",
-            ignore_file.display()
-        )
+    // nw-684 Task 5c: one context per cause, so the message names the real
+    // fix — "until it is readable" is wrong for a readable non-UTF-8 file and
+    // for a committed symlink, which no amount of waiting makes readable.
+    let content = reader.read_optional_file(rel).map_err(|error| {
+        let context = if error
+            .chain()
+            .any(|cause| cause.is::<crate::content_reader::NotARegularFile>())
+        {
+            format!(
+                "{} is not a regular file — server mode only reads a committed regular-file \
+                 .brainignore; symlinks are not supported. Refusing to index this vault, \
+                 because indexing without it would expose notes it excludes",
+                ignore_file.display()
+            )
+        } else if error.chain().any(is_utf8_error) {
+            format!(
+                "{} is not valid UTF-8 — refusing to index this vault until it is saved as \
+                 UTF-8, because indexing without it would expose notes it excludes",
+                ignore_file.display()
+            )
+        } else {
+            format!(
+                "cannot read {} — refusing to index this vault until it is readable, \
+                 because indexing without it would expose notes it excludes",
+                ignore_file.display()
+            )
+        };
+        error.context(context)
     })?;
     build_ignore_set(&ignore_file, content.as_deref(), extra_patterns)
+}
+
+/// Whether `cause` is a UTF-8 decode failure, typed or as an I/O
+/// `InvalidData` (what `read_to_string` reports).
+fn is_utf8_error(cause: &(dyn std::error::Error + 'static)) -> bool {
+    cause.is::<std::string::FromUtf8Error>()
+        || cause.is::<std::str::Utf8Error>()
+        || cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
 }
 
 /// Build the ignore set from a `.brainignore`'s `content` (`None`: absent, so
@@ -366,6 +398,124 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("until it is readable"), "{msg}");
+    }
+
+    /// A bare clone whose single commit holds `.brainignore` as `kind`
+    /// (built by `make` in the source tree), for [`load_brain_ignore_from_reader`].
+    #[cfg(unix)]
+    fn bare_clone_with(
+        make: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, crate::content_reader::GitBareReader) {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src_repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "test@test.com"]);
+        git(&src, &["config", "user.name", "Test"]);
+        std::fs::write(src.join("secret.md"), "# Secret\n").unwrap();
+        make(&src);
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        let bare = tmp.path().join("repo.git");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ],
+        );
+        let sha = git(&bare, &["rev-parse", "HEAD"]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        (tmp, reader)
+    }
+
+    /// nw-684 Task 5c: a committed `.brainignore` that is not a regular file
+    /// is not "unreadable until it is readable" — server mode only ever reads
+    /// a committed regular file, so the message must say so.
+    #[cfg(unix)]
+    #[test]
+    fn bare_clone_non_regular_brainignore_says_why() {
+        let (_dir_tmp, dir_reader) = bare_clone_with(|src| {
+            std::fs::create_dir(src.join(".brainignore")).unwrap();
+            std::fs::write(src.join(".brainignore/keep"), "x\n").unwrap();
+        });
+        let (_link_tmp, link_reader) = bare_clone_with(|src| {
+            std::fs::write(src.join("policy"), "secret.md\n").unwrap();
+            std::os::unix::fs::symlink("policy", src.join(".brainignore")).unwrap();
+        });
+        for (case, reader, kind) in [
+            ("directory", &dir_reader, "a directory"),
+            ("symlink", &link_reader, "a symlink"),
+        ] {
+            let msg = format!(
+                "{:#}",
+                load_brain_ignore_from_reader(reader, &[]).expect_err(case)
+            );
+            for needle in [
+                ".brainignore",
+                kind,
+                "server mode only reads a committed regular-file .brainignore",
+                "symlinks are not supported",
+            ] {
+                assert!(msg.contains(needle), "{case}: missing {needle:?}: {msg}");
+            }
+            assert!(!msg.contains("until it is readable"), "{case}: {msg}");
+        }
+    }
+
+    /// nw-684 Task 5c counterweight: a committed non-UTF-8 `.brainignore`
+    /// says so, and a regular one is honoured.
+    #[cfg(unix)]
+    #[test]
+    fn bare_clone_brainignore_messages_per_cause() {
+        let (_bad_tmp, bad) = bare_clone_with(|src| {
+            std::fs::write(src.join(".brainignore"), b"secret\xff.md\n").unwrap();
+        });
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore_from_reader(&bad, &[]).expect_err("non-UTF-8")
+        );
+        assert!(
+            msg.contains(".brainignore") && msg.contains("is not valid UTF-8"),
+            "{msg}"
+        );
+        assert!(!msg.contains("until it is readable"), "{msg}");
+        assert!(!msg.contains("regular-file"), "{msg}");
+
+        let (_ok_tmp, ok) = bare_clone_with(|src| {
+            std::fs::write(src.join(".brainignore"), "secret.md\n").unwrap();
+        });
+        let gs = load_brain_ignore_from_reader(&ok, &[]).unwrap();
+        assert!(is_ignored("secret.md", &gs));
+    }
+
+    /// Counterweight: a plain read failure keeps the "until it is readable"
+    /// wording — it is the accurate one there.
+    #[test]
+    fn reader_read_failure_keeps_the_readable_wording() {
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore_from_reader(
+                &FailingReader(std::io::ErrorKind::PermissionDenied),
+                &[]
+            )
+            .expect_err("must fail closed")
+        );
+        assert!(msg.contains("until it is readable"), "{msg}");
+        assert!(!msg.contains("regular-file"), "{msg}");
     }
 
     #[test]

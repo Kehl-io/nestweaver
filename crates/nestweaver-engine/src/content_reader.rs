@@ -37,6 +37,18 @@ pub struct BinarySource {
     pub path: String,
 }
 
+/// An OPTIONAL file ([`ContentReader::read_optional_file`]) exists but is not
+/// a regular file — a directory, or in a git tree a symlink or submodule
+/// entry (nw-684 Task 5c). Typed so a caller can explain the real fix instead
+/// of reporting a generic read failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{path} is {kind}, not a regular file")]
+pub struct NotARegularFile {
+    pub path: String,
+    /// Human-readable entry kind, e.g. `"a symlink"` or `"a directory"`.
+    pub kind: String,
+}
+
 /// Maximum time to wait for a single `git cat-file --batch` response.
 ///
 /// A hung-but-alive git process (e.g. a wedged pack read on a corrupt or
@@ -929,13 +941,36 @@ impl ContentReader for FilesystemReader {
 
     /// `read_file` reports a stat failure as text, so absence is decided here
     /// from a typed `NotFound`; any other stat failure is an error.
+    ///
+    /// Decoded STRICTLY (nw-684 Task 5c): this reads policy files such as
+    /// `.brainignore`, where `read_file`'s lossy decode (right for source,
+    /// nw-190) would silently turn an invalid byte into U+FFFD and change a
+    /// pattern. Invalid UTF-8 is an error carrying a typed
+    /// [`std::string::FromUtf8Error`].
     fn read_optional_file(&self, rel_path: &Path) -> Result<Option<String>> {
         let abs = self.repo_path.join(rel_path);
-        match std::fs::metadata(&abs) {
-            Ok(_) => self.read_file(rel_path).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("stat {}", abs.display())),
+        let metadata = match std::fs::metadata(&abs) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", abs.display()));
+            }
+        };
+        if !metadata.is_file() {
+            return Err(NotARegularFile {
+                path: rel_path.display().to_string(),
+                kind: if metadata.is_dir() {
+                    "a directory".to_string()
+                } else {
+                    "a special file".to_string()
+                },
+            }
+            .into());
         }
+        let bytes = std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .with_context(|| format!("non-utf8 content in {}", rel_path.display()))
     }
 
     /// This reader's OWN blocklist (nw-436: it may be the vault list), not
@@ -1757,12 +1792,17 @@ impl ContentReader for GitBareReader {
         };
         let mode = record.split(|&b| b == b' ').next().unwrap_or(&[]);
         if mode != b"100644" && mode != b"100755" {
-            anyhow::bail!(
-                "{} at {} is not a regular file (mode {})",
-                rel_path.display(),
-                self.sha,
-                String::from_utf8_lossy(mode)
-            );
+            let kind = match mode {
+                b"120000" => "a symlink".to_string(),
+                b"160000" => "a submodule".to_string(),
+                b"040000" => "a directory".to_string(),
+                other => format!("a mode-{} entry", String::from_utf8_lossy(other)),
+            };
+            return Err(NotARegularFile {
+                path: format!("{} at {}", rel_path.display(), self.sha),
+                kind,
+            }
+            .into());
         }
         self.read_file(rel_path).map(Some)
     }
@@ -1961,6 +2001,34 @@ mod tests {
             .unwrap();
         assert_ne!(original, a.eligibility_fingerprint());
         assert_eq!(a.eligibility_fingerprint(), b.eligibility_fingerprint());
+    }
+
+    /// nw-684 Task 5c: an optional POLICY file (`.brainignore`) is decoded
+    /// strictly. `read_file` decodes lossily (nw-190, right for source), which
+    /// turned an invalid byte into U+FFFD and silently changed a pattern.
+    #[test]
+    fn filesystem_reader_read_optional_file_is_strict_utf8() {
+        let dir = TempDir::new().unwrap();
+        let reader = FilesystemReader::new(dir.path());
+        assert_eq!(
+            reader.read_optional_file(Path::new("absent")).unwrap(),
+            None
+        );
+        std::fs::write(dir.path().join("ok"), "secret.md\n").unwrap();
+        assert_eq!(
+            reader.read_optional_file(Path::new("ok")).unwrap(),
+            Some("secret.md\n".to_string())
+        );
+        std::fs::write(dir.path().join("bad"), b"secret\xff.md\n").unwrap();
+        let error = reader
+            .read_optional_file(Path::new("bad"))
+            .expect_err("invalid UTF-8 must be an error, not U+FFFD");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<std::string::FromUtf8Error>()),
+            "{error:#}"
+        );
     }
 
     #[test]
