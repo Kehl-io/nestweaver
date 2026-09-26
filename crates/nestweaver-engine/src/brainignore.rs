@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use anyhow::Context;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// Default patterns applied when no `.brainignore` file is present.
@@ -31,53 +32,71 @@ const DEFAULT_PATTERNS: &[&str] = &[
 ];
 
 /// Load ignore patterns from a `.brainignore` file in the vault root.
-/// Falls back to [`DEFAULT_PATTERNS`] when no file exists.
+/// Falls back to [`DEFAULT_PATTERNS`] only when no file exists.
 ///
 /// Additional patterns from the `--ignore` CLI flag can be appended via
 /// `extra_patterns`.
-pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> GlobSet {
+///
+/// # Errors
+///
+/// Fails closed (nw-684): a `.brainignore` that exists but cannot be read, an
+/// invalid glob (reported with its line number), or a pattern set that cannot
+/// be built is an error naming the file. Callers must abort before writing
+/// anything, because indexing without the user's exclusions would expose the
+/// notes they excluded.
+pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> anyhow::Result<GlobSet> {
     let ignore_file = vault_path.join(".brainignore");
-    let file_patterns: Vec<String> = if ignore_file.exists() {
-        match std::fs::read_to_string(&ignore_file) {
-            Ok(content) => parse_ignore_file(&content),
-            Err(e) => {
-                tracing::warn!(
-                    path = %ignore_file.display(),
-                    error = %e,
-                    "failed to read .brainignore; using defaults"
-                );
-                default_ignore_patterns()
-            }
+    // nw-684: an unreadable ignore file must never silently widen what is
+    // indexed — the user wrote it to keep notes (credentials, private
+    // folders) OUT of the graph. Only a truly absent file means defaults.
+    let file_patterns: Vec<(Option<usize>, String)> = match std::fs::read_to_string(&ignore_file) {
+        Ok(content) => parse_ignore_file(&content)
+            .into_iter()
+            .map(|(n, p)| (Some(n), p))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_ignore_patterns()
+            .into_iter()
+            .map(|p| (None, p))
+            .collect(),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "cannot read {} — refusing to index this vault until it is readable, \
+                     because indexing without it would expose notes it excludes",
+                    ignore_file.display()
+                )
+            });
         }
-    } else {
-        default_ignore_patterns()
     };
 
     let mut builder = GlobSetBuilder::new();
-    for pattern in file_patterns.iter().chain(extra_patterns.iter()) {
-        match Glob::new(pattern) {
-            Ok(glob) => {
-                builder.add(glob);
-            }
-            Err(e) => {
-                tracing::warn!(pattern = %pattern, error = %e, "invalid brainignore glob pattern");
-            }
-        }
+    for (line, pattern) in file_patterns
+        .into_iter()
+        .chain(extra_patterns.iter().map(|p| (None, p.clone())))
+    {
+        let glob = Glob::new(&pattern).with_context(|| match line {
+            Some(n) => format!(
+                "invalid pattern on line {n} of {}: {pattern:?}",
+                ignore_file.display()
+            ),
+            None => format!("invalid ignore pattern {pattern:?}"),
+        })?;
+        builder.add(glob);
     }
-    builder.build().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to build brainignore GlobSet; no patterns active");
-        GlobSet::empty()
-    })
+    builder
+        .build()
+        .with_context(|| format!("build ignore pattern set for {}", ignore_file.display()))
 }
 
-/// Parse a `.brainignore` file's content into a list of glob patterns.
+/// Parse a `.brainignore` file's content into `(1-based line, pattern)` pairs.
 /// Skips blank lines and lines starting with `#`.
-fn parse_ignore_file(content: &str) -> Vec<String> {
+fn parse_ignore_file(content: &str) -> Vec<(usize, String)> {
     content
         .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.to_string())
+        .enumerate()
+        .map(|(i, line)| (i + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .map(|(n, line)| (n, line.to_string()))
         .collect()
 }
 
@@ -93,6 +112,39 @@ pub fn is_ignored(rel_path: &str, ignore_set: &GlobSet) -> bool {
     ignore_set.is_match(rel_path)
 }
 
+/// Test helpers shared by the indexer and watcher `.brainignore` tests.
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// Restores a file's mode on drop, so a failing assertion never leaves an
+    /// unreadable file behind.
+    pub(crate) struct RestoreMode(PathBuf);
+
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    /// `chmod 000` the file. Returns `None` (after restoring it) when the
+    /// file is still readable — running as root reads a 0o000 file anyway,
+    /// so the caller must skip rather than pass hollow.
+    pub(crate) fn make_unreadable(path: &Path) -> Option<RestoreMode> {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = RestoreMode(path.to_path_buf());
+        if std::fs::read(path).is_ok() {
+            eprintln!(
+                "skipping: 0o000 {} is still readable (root?)",
+                path.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -103,12 +155,18 @@ mod tests {
     fn parse_ignore_file_skips_comments_and_blanks() {
         let content = "# comment\n\n*.backup.*\n  \n# another comment\nsnapshots/**\n";
         let patterns = parse_ignore_file(content);
-        assert_eq!(patterns, vec!["*.backup.*", "snapshots/**"]);
+        assert_eq!(
+            patterns,
+            vec![
+                (3, "*.backup.*".to_string()),
+                (6, "snapshots/**".to_string())
+            ]
+        );
     }
 
     #[test]
     fn default_patterns_match_expected_dirs() {
-        let gs = load_brain_ignore(Path::new("/nonexistent"), &[]);
+        let gs = load_brain_ignore(Path::new("/nonexistent"), &[]).unwrap();
         assert!(is_ignored(".obsidian/workspace.json", &gs));
         assert!(is_ignored("node_modules/foo/bar.md", &gs));
         assert!(is_ignored(".git/HEAD", &gs));
@@ -131,7 +189,7 @@ mod tests {
         )
         .unwrap();
 
-        let gs = load_brain_ignore(vault, &[]);
+        let gs = load_brain_ignore(vault, &[]).unwrap();
         assert!(is_ignored("notes.backup.20260527/real.md", &gs));
         assert!(is_ignored("mirror/sub/file.md", &gs));
         // Default patterns should NOT be active when a custom file exists.
@@ -145,17 +203,60 @@ mod tests {
         std::fs::write(vault.join(".brainignore"), "archive/**\n").unwrap();
 
         let extra = vec!["drafts/**".to_string()];
-        let gs = load_brain_ignore(vault, &extra);
+        let gs = load_brain_ignore(vault, &extra).unwrap();
         assert!(is_ignored("archive/old.md", &gs));
         assert!(is_ignored("drafts/wip.md", &gs));
     }
 
     #[test]
     fn extra_patterns_combined_with_defaults() {
-        let gs = load_brain_ignore(Path::new("/nonexistent"), &["custom/**".to_string()]);
+        let gs = load_brain_ignore(Path::new("/nonexistent"), &["custom/**".to_string()]).unwrap();
         // Default still active.
         assert!(is_ignored(".obsidian/workspace.json", &gs));
         // Extra also active.
         assert!(is_ignored("custom/stuff.md", &gs));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_brainignore_is_an_error_not_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".brainignore");
+        std::fs::write(&f, "secret.md\n").unwrap();
+        // Skips (returns None) when the 0o000 file is still readable, e.g.
+        // running as root in a CI container: the precondition cannot exist.
+        let Some(_restore) = test_support::make_unreadable(&f) else {
+            return;
+        };
+        let err = load_brain_ignore(dir.path(), &[]).expect_err("must fail closed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(".brainignore"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_glob_is_an_error_naming_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".brainignore"), "ok/**\nfoo{a,b\n").unwrap();
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore(dir.path(), &[]).expect_err("invalid glob")
+        );
+        assert!(msg.contains("line 2") && msg.contains("foo{a,b"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_extra_pattern_is_an_error() {
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore(Path::new("/nonexistent"), &["bad{x".to_string()])
+                .expect_err("invalid extra pattern")
+        );
+        assert!(msg.contains("bad{x"), "{msg}");
+    }
+
+    #[test]
+    fn missing_file_still_means_defaults() {
+        let gs = load_brain_ignore(Path::new("/nonexistent"), &[]).unwrap();
+        assert!(is_ignored(".obsidian/workspace.json", &gs));
     }
 }

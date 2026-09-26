@@ -16,7 +16,7 @@ fn migration_ignore(root: &Path) -> anyhow::Result<GlobSet> {
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(crate::brainignore::load_brain_ignore(root, &[]));
+            return crate::brainignore::load_brain_ignore(root, &[]);
         }
         Err(error) => return Err(error).context("read vault derivation ignore policy"),
     };

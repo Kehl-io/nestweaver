@@ -1580,7 +1580,7 @@ pub fn index_markdown_directory_with_store_and_deletion_count_and_note_limits(
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
     let reader = filesystem_note_reader(&canonical, note_limits);
-    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns)?;
     let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
     let aliases = load_taxonomy_aliases(reader.root());
@@ -1633,7 +1633,7 @@ pub fn index_markdown_directory_in_memory(
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
     let reader = filesystem_note_reader(&canonical, crate::index_limits::NoteLimits::default());
-    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[])?;
     let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result.index, store))
 }
@@ -1654,7 +1654,7 @@ pub fn index_markdown_with_reader(
     instance_id: &str,
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[])?;
     index_into_store(reader, store, instance_id, vault_name, &ignore_set).map(|result| result.index)
 }
 
@@ -1679,7 +1679,7 @@ pub fn index_markdown_with_reader_and_write_gate<G, F>(
 where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
-    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[])?;
     let result = index_into_store_with_write_gate(
         reader,
         store,
@@ -1914,7 +1914,7 @@ pub fn index_markdown_directory_since_with_store_and_ignore_and_note_limits(
     // (notes the user wrote) vanished from the graph the same way a code
     // repo's `.claude/` tooling config is meant to.
     let reader = filesystem_note_reader(&canonical, note_limits);
-    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns)?;
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
 
@@ -5674,6 +5674,70 @@ mod tests {
         );
     }
 
+    /// nw-684: an unreadable `.brainignore` used to fall back to the default
+    /// patterns, so a full refresh or `--since` refresh indexed exactly the
+    /// notes the user excluded (QA: `chmod 000 .brainignore` + `brain refresh`
+    /// made `secret.md` searchable). Both routes must fail before writing.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_brainignore_fails_every_refresh_route_before_writing() {
+        let (_dir, root) = make_vault(&[
+            (".brainignore", "secret.md\n"),
+            ("secret.md", "# Secret\n\ncredentials\n"),
+            ("ok.md", "# Ok\n\npublic\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        let paths = |store: &GraphStore| -> Vec<String> {
+            let mut paths: Vec<String> = store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .map(|note| note.file_path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
+        assert_eq!(paths(&store), vec!["ok.md".to_string()], "precondition");
+
+        let Some(restore) =
+            crate::brainignore::test_support::make_unreadable(&root.join(".brainignore"))
+        else {
+            return;
+        };
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let full =
+            index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]);
+        let incremental = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "v",
+            since,
+            &[],
+        );
+        drop(restore);
+
+        for (route, result) in [
+            ("full refresh", full.map(|_| ())),
+            ("--since refresh", incremental.map(|_| ())),
+        ] {
+            let message = format!("{:#}", result.expect_err(route));
+            assert!(message.contains(".brainignore"), "{route}: {message}");
+        }
+        assert_eq!(
+            paths(&store),
+            vec!["ok.md".to_string()],
+            "an unreadable .brainignore must neither expose secret.md nor drop ok.md"
+        );
+
+        // Counterweight: once readable again the refresh succeeds and the
+        // exclusion still holds.
+        index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
+        assert_eq!(paths(&store), vec!["ok.md".to_string()]);
+    }
+
     /// Restores a directory's mode on drop, so a failing assertion cannot
     /// leave an unreadable directory behind for `TempDir` to trip over.
     #[cfg(unix)]
@@ -8488,7 +8552,7 @@ sub b body
             inner: crate::content_reader::FilesystemReader::new(&fs::canonicalize(&root).unwrap()),
             reads: AtomicUsize::new(0),
         };
-        let ignore_set = crate::brainignore::load_brain_ignore(&root, &[]);
+        let ignore_set = crate::brainignore::load_brain_ignore(&root, &[]).unwrap();
         let result =
             index_markdown_since_with_reader(&store, &reader, "owned", "new", since, &ignore_set)
                 .unwrap();
