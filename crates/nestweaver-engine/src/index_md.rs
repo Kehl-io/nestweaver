@@ -1459,6 +1459,9 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
     extra_ignore_patterns: &[String],
     note_limits: crate::index_limits::NoteLimits,
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    // nw-684 review: acquiring the lease creates the database file, so a
+    // refusal over the `.brainignore` must come first.
+    validate_vault_ignore(vault_root, extra_ignore_patterns)?;
     let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
         anyhow::anyhow!(
             "cannot index markdown database {}: {error:?}",
@@ -1508,6 +1511,9 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_a
     note_limits: crate::index_limits::NoteLimits,
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    // nw-684 review: refuse over an unloadable `.brainignore` BEFORE the
+    // store is opened, so a refused first `brain add` leaves no empty DB.
+    validate_vault_ignore(vault_root, extra_ignore_patterns)?;
     let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_with_store_and_deletion_count_and_note_limits(
@@ -1519,6 +1525,17 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_a
         extra_ignore_patterns,
         note_limits,
     )
+}
+
+/// Load the vault's ignore set only to prove it loads — the same canonical
+/// root the indexer resolves — so an entry point that opens or creates a
+/// store can refuse first. The indexer loads it again for real.
+fn validate_vault_ignore(
+    vault_root: &Path,
+    extra_ignore_patterns: &[String],
+) -> anyhow::Result<()> {
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns).map(|_| ())
 }
 
 /// Index a markdown vault using an existing GraphStore (for daemon mode).
@@ -1809,6 +1826,9 @@ pub fn index_markdown_directory_since_with_ignore(
     since: std::time::SystemTime,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
+    // nw-684 review: acquiring the lease creates the database file, so a
+    // refusal over the `.brainignore` must come first.
+    validate_vault_ignore(vault_root, extra_ignore_patterns)?;
     let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
         anyhow::anyhow!(
             "cannot refresh markdown database {}: {error:?}",
@@ -1862,6 +1882,8 @@ pub fn index_markdown_directory_since_with_ignore_and_write_lease_and_note_limit
     note_limits: crate::index_limits::NoteLimits,
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
+    // nw-684 review: see the full route.
+    validate_vault_ignore(vault_root, extra_ignore_patterns)?;
     let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_since_with_store_and_ignore_and_note_limits(
@@ -5736,6 +5758,44 @@ mod tests {
         // exclusion still holds.
         index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
         assert_eq!(paths(&store), vec!["ok.md".to_string()]);
+    }
+
+    /// nw-684 review: a direct `brain add` refused over an invalid
+    /// `.brainignore` must not leave an empty database behind -- the ignore
+    /// set is loaded before the store is opened or created. Both the full
+    /// and the `--since` route.
+    #[test]
+    fn refused_direct_add_over_an_invalid_brainignore_creates_no_database() {
+        let (dir, root) = make_vault(&[(".brainignore", "foo{a,b\n"), ("ok.md", "# Ok\n")]);
+        let full_db = dir.path().join("full.lbug");
+        let full = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &full_db,
+            "default",
+            "v",
+            &[],
+        );
+        let since_db = dir.path().join("since.lbug");
+        let since = index_markdown_directory_since_with_ignore(
+            &root,
+            &since_db,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        );
+        for (route, result, db) in [
+            ("full", full.map(|_| ()), &full_db),
+            ("--since", since.map(|_| ()), &since_db),
+        ] {
+            let message = format!("{:#}", result.expect_err(route));
+            assert!(message.contains(".brainignore"), "{route}: {message}");
+            assert!(
+                !db.exists(),
+                "{route}: refused add created {}",
+                db.display()
+            );
+        }
     }
 
     /// Restores a directory's mode on drop, so a failing assertion cannot

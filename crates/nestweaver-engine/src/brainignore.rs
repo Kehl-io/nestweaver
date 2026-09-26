@@ -52,6 +52,17 @@ pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> anyhow
     let content = match std::fs::read_to_string(&ignore_file) {
         Ok(content) => Some(content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // Readable, but not text: "until it is readable" would point at the
+        // wrong fix.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(e).with_context(|| {
+                format!(
+                    "{} is not valid UTF-8 — refusing to index this vault until it is \
+                     saved as UTF-8, because indexing without it would expose notes it excludes",
+                    ignore_file.display()
+                )
+            });
+        }
         Err(e) => {
             return Err(e).with_context(|| {
                 format!(
@@ -95,7 +106,7 @@ pub fn load_brain_ignore_from_reader(
 /// Build the ignore set from a `.brainignore`'s `content` (`None`: absent, so
 /// the defaults) plus `extra_patterns`. Every invalid glob is an error naming
 /// `ignore_file` and its line.
-fn build_ignore_set(
+pub(crate) fn build_ignore_set(
     ignore_file: &Path,
     content: Option<&str>,
     extra_patterns: &[String],
@@ -121,7 +132,7 @@ fn build_ignore_set(
                 "invalid pattern on line {n} of {}: {pattern:?}",
                 ignore_file.display()
             ),
-            None => format!("invalid ignore pattern {pattern:?}"),
+            None => format!("invalid --ignore pattern {pattern:?}"),
         })?;
         builder.add(glob);
     }
@@ -132,7 +143,7 @@ fn build_ignore_set(
 
 /// Parse a `.brainignore` file's content into `(1-based line, pattern)` pairs.
 /// Skips blank lines and lines starting with `#`.
-fn parse_ignore_file(content: &str) -> Vec<(usize, String)> {
+pub(crate) fn parse_ignore_file(content: &str) -> Vec<(usize, String)> {
     content
         .lines()
         .enumerate()
@@ -293,7 +304,10 @@ mod tests {
             load_brain_ignore(Path::new("/nonexistent"), &["bad{x".to_string()])
                 .expect_err("invalid extra pattern")
         );
-        assert!(msg.contains("bad{x"), "{msg}");
+        assert!(
+            msg.contains("invalid --ignore pattern") && msg.contains("bad{x"),
+            "{msg}"
+        );
     }
 
     /// A reader over content with no working tree (nw-684 review). Only a
@@ -335,6 +349,23 @@ mod tests {
         let gs = load_brain_ignore_from_reader(&FailingReader(std::io::ErrorKind::NotFound), &[])
             .unwrap();
         assert!(is_ignored(".obsidian/workspace.json", &gs));
+    }
+
+    /// nw-684 review: a non-UTF-8 `.brainignore` is readable; telling the
+    /// user to wait "until it is readable" points at the wrong fix.
+    #[test]
+    fn non_utf8_brainignore_says_it_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".brainignore"), b"secret\xff.md\n").unwrap();
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore(dir.path(), &[]).expect_err("must fail closed")
+        );
+        assert!(
+            msg.contains(".brainignore") && msg.contains("is not valid UTF-8"),
+            "{msg}"
+        );
+        assert!(!msg.contains("until it is readable"), "{msg}");
     }
 
     #[test]

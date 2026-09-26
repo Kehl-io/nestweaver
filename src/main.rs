@@ -19738,11 +19738,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 db_path.display()
             );
             if let Err(e) = watcher.run_with_write_lease(&write_lease) {
+                // nw-684 review: EVERY failure removes the PID hint written
+                // above (e.g. a watcher refusing an unreadable
+                // `.brainignore`), or readers keep treating the database as
+                // watched by a process that has exited.
+                let _ = std::fs::remove_file(&lock_path);
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
-                    let _ = std::fs::remove_file(&lock_path);
                     eprintln!("Error: code watcher: {msg}\nhint: {hint}");
                     return Ok((EXIT_ERROR, None));
                 }
@@ -26959,6 +26963,10 @@ fn run_brain(
             // Direct-write fallback (`--no-daemon`). It writes the graph and
             // the Tantivy index; neither checked for a live daemon holding the
             // same database.
+            // nw-684 review: acquiring the write lease creates the database
+            // file, so refuse over an unloadable `.brainignore` first -- a
+            // refused first add must not leave an empty database behind.
+            nestweaver_engine::load_brain_ignore(&path, &extra_patterns)?;
             let write_lease = require_exclusive_store_access(&db_path, "add a vault")?;
             let result = index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
                 &path,
@@ -28245,11 +28253,15 @@ fn run_brain(
                 db_path.display()
             ));
             if let Err(e) = watcher.run_with_write_lease(&write_lease) {
+                // nw-684 review: EVERY failure removes the PID hint written
+                // above (e.g. a watcher refusing an unreadable
+                // `.brainignore`), or readers keep treating the database as
+                // watched by a process that has exited.
+                let _ = std::fs::remove_file(&lock_path);
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
-                    let _ = std::fs::remove_file(&lock_path);
                     eprintln!("Error: watcher: {msg}\nhint: {hint}");
                     return Ok((EXIT_ERROR, None));
                 }
