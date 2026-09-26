@@ -17464,6 +17464,10 @@ repos = ["alpha"]
             (
                 nestweaver_engine::code_links::load_code_links_state(&state.db_path).marks,
                 std::fs::read(search_reconciliation_debt_path(&state.db_path)).ok(),
+                std::fs::read(nestweaver_engine::markdown_derivation::record_path(
+                    &state.db_path,
+                ))
+                .ok(),
             )
         };
         let before = sidecars(&state);
@@ -17531,6 +17535,10 @@ repos = ["alpha"]
             (
                 nestweaver_engine::code_links::load_code_links_state(&state.db_path).marks,
                 std::fs::read(search_reconciliation_debt_path(&state.db_path)).ok(),
+                std::fs::read(nestweaver_engine::markdown_derivation::record_path(
+                    &state.db_path,
+                ))
+                .ok(),
             )
         };
         let notes = |state: &DaemonState| -> Vec<String> {

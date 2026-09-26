@@ -1,4 +1,5 @@
-import { ApiError, api } from "./client";
+import { api } from "./client";
+import { ApiError } from "./errors";
 import type { Repo, SymbolCandidate } from "./types";
 
 /**

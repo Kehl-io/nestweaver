@@ -213,8 +213,9 @@ fn request_allowed(
                 // otherwise a rebound page listening on :3000 could pass an
                 // Origin whose port differs from the Host it is actually
                 // talking to.
-                if origin_authority.trim().to_ascii_lowercase()
-                    != host_authority.trim().to_ascii_lowercase()
+                if !origin_authority
+                    .trim()
+                    .eq_ignore_ascii_case(host_authority.trim())
                 {
                     return Err(Refusal::Origin(origin.to_string()));
                 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { apiErrorFromBody } from "../api/client";
+import { apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
 import { sharedRepoUid } from "../api/source";
 import type {

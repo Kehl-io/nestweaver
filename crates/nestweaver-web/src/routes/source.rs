@@ -164,7 +164,7 @@ pub async fn source(
         Ok(None) => return not_found("repo_not_found", "no indexed repo has this uid", &file),
         Err(e) => return internal(e),
     };
-    if !indexing.iter().any(|r| *r == repo_uid) {
+    if !indexing.contains(&repo_uid) {
         return not_found("source_not_indexed", NOT_INDEXED, &file);
     }
     // Only repos with a known local working tree can serve source from disk.

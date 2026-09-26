@@ -967,7 +967,28 @@ impl ContentReader for FilesystemReader {
             }
             .into());
         }
-        let bytes = std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
+        let limit = self.limits.max_source_file_bytes();
+        if metadata.len() > limit {
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes: metadata.len(),
+                limit_bytes: limit,
+            }
+            .into());
+        }
+        let file = std::fs::File::open(&abs).with_context(|| format!("open {}", abs.display()))?;
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", abs.display()))?;
+        if bytes.len() as u64 > limit {
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes: bytes.len() as u64,
+                limit_bytes: limit,
+            }
+            .into());
+        }
         String::from_utf8(bytes)
             .map(Some)
             .with_context(|| format!("non-utf8 content in {}", rel_path.display()))
@@ -2027,6 +2048,25 @@ mod tests {
             error
                 .chain()
                 .any(|cause| cause.is::<std::string::FromUtf8Error>()),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_reader_read_optional_file_rejects_oversized_policy() {
+        let dir = TempDir::new().unwrap();
+        let reader = FilesystemReader::new(dir.path());
+        let limit = reader.limits.max_source_file_bytes();
+        std::fs::write(
+            dir.path().join(".brainignore"),
+            vec![b'a'; limit as usize + 1],
+        )
+        .unwrap();
+        let error = reader
+            .read_optional_file(Path::new(".brainignore"))
+            .expect_err("optional policy must be bounded before allocation");
+        assert!(
+            error.chain().any(|cause| cause.is::<SourceTooLarge>()),
             "{error:#}"
         );
     }

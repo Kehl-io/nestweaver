@@ -1,4 +1,4 @@
-import { apiErrorFromBody } from "./client";
+import { apiErrorFromBody } from "./errors";
 import type {
   ResultState,
   SceneMetadata,

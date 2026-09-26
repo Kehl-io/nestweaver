@@ -1581,6 +1581,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_UI_ALLOWED_HOSTS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_UPSTREAM",
         role: EnvRole::Configures,
     },

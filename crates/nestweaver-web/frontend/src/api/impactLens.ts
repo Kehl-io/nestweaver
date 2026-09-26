@@ -1,4 +1,4 @@
-import { apiErrorFromBody } from "./client";
+import { apiErrorFromBody } from "./errors";
 import type { SceneMetadata } from "./p1Types";
 
 export interface ImpactSourceEvidence {
