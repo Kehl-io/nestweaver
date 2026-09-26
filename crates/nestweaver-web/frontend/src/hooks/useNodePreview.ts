@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { apiErrorFromBody } from "../api/client";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
 import { sharedRepoUid } from "../api/source";
 import type {
@@ -29,7 +30,7 @@ async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || response.statusText);
+    throw apiErrorFromBody(response.status, body, response.statusText);
   }
   return response.json() as Promise<T>;
 }

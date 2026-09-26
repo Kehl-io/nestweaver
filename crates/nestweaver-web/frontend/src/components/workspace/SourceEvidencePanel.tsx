@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
 import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
-import { sharedRepoUid, sourceErrorText } from "../../api/source";
+import { ambiguousCandidates, sharedRepoUid, sourceErrorText } from "../../api/source";
 import type { NoteDetail, SourceResponse, SymbolCandidate, SymbolDetail } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { CodePreview } from "../detail/CodePreview";
+import { RepoPicker } from "../detail/RepoPicker";
 import { KindBadge } from "../shared/KindBadge";
 
 interface SourceEvidencePanelProps {
@@ -24,6 +25,13 @@ function isSymbolLike(uid: string | null, kind: string | null): boolean {
 
 function isFileLike(uid: string | null, kind: string | null): boolean {
   return isFileSelection(uid, kind);
+}
+
+/** nw-683: the repos sharing a selected file path, and the one picked. */
+interface FileRepoChoice {
+  path: string;
+  candidates: string[];
+  repo?: string;
 }
 
 function noteSnippet(body: string): string {
@@ -46,6 +54,10 @@ export function SourceEvidencePanel({
   const [fileSource, setFileSource] = useState<SourceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Kept across the refetch a pick triggers; applies only to its own path.
+  const [repoChoice, setRepoChoice] = useState<FileRepoChoice | null>(null);
+  const fileChoice = repoChoice && repoChoice.path === selectedNodeId ? repoChoice : null;
+  const pickedRepo = fileChoice?.repo;
 
   const graphEvidence = useMemo(() => {
     if (!selectedNodeId || !graphInstance?.hasNode(selectedNodeId)) return null;
@@ -132,15 +144,19 @@ export function SourceEvidencePanel({
     if (isFileLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
       // nw-683: the symbols name the repo, so fetch them first and request
-      // that repo's copy of the file; a path several repos index is a 409.
+      // that repo's copy of the file; a path several repos index is a 409
+      // until the user picks one, and then only that repo's symbols show.
       const path = selectedNodeId;
       let sourceError: unknown = null;
       api
         .symbolsInFile(path)
         .catch(() => [] as SymbolCandidate[])
-        .then(async (symbols) => {
+        .then(async (allSymbols) => {
+          const symbols = pickedRepo
+            ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
+            : allSymbols;
           const source = await api
-            .source(path, 1, 12, { signal: controller.signal }, sharedRepoUid(symbols))
+            .source(path, 1, 12, { signal: controller.signal }, pickedRepo ?? sharedRepoUid(symbols))
             .catch((e: unknown) => {
               sourceError = e;
               return null;
@@ -151,6 +167,8 @@ export function SourceEvidencePanel({
           if (controller.signal.aborted) return;
           setFileSymbols(symbols);
           setFileSource(source);
+          const ambiguous = ambiguousCandidates(sourceError);
+          if (ambiguous) setRepoChoice({ path, candidates: ambiguous });
           if (symbols.length === 0 && (!source || !source.lines?.length)) {
             setError(sourceErrorText(sourceError, path, "File evidence is unavailable."));
           }
@@ -168,7 +186,21 @@ export function SourceEvidencePanel({
 
     setLoading(false);
     return () => controller.abort();
-  }, [selectedNodeId, selectedNodeKind]);
+  }, [selectedNodeId, selectedNodeKind, pickedRepo]);
+
+  const pickRepo = (uid: string, candidates: string[]) => {
+    if (selectedNodeId) setRepoChoice({ path: selectedNodeId, candidates, repo: uid });
+  };
+  const repoPicker = fileChoice ? (
+    <div className="mb-2">
+      <RepoPicker
+        filePath={fileChoice.path}
+        candidates={fileChoice.candidates}
+        selected={pickedRepo}
+        onPick={(uid) => pickRepo(uid, fileChoice.candidates)}
+      />
+    </div>
+  ) : null;
 
   const symbol =
     symbolDetail?.symbol.uid === selectedNodeId ? symbolDetail.symbol : undefined;
@@ -230,6 +262,15 @@ export function SourceEvidencePanel({
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3 text-xs text-[var(--color-text-muted)]">
             Loading evidence...
           </div>
+        ) : error && fileChoice ? (
+          <div>
+            {pickedRepo && (
+              <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-200">
+                {error}
+              </div>
+            )}
+            {repoPicker}
+          </div>
         ) : error ? (
           <div className="rounded border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-200">
             {error}
@@ -280,12 +321,16 @@ export function SourceEvidencePanel({
                 {fileSymbols.length} symbol{fileSymbols.length === 1 ? "" : "s"} in file
               </p>
             )}
-            <CodePreview
-              filePath={selectedNodeId}
-              line={line ?? 1}
-              repoUid={fileSource?.repo ?? sharedRepoUid(fileSymbols)}
-              context={compact ? 5 : 10}
-            />
+            {repoPicker}
+            {(!fileChoice || pickedRepo) && (
+              <CodePreview
+                filePath={selectedNodeId}
+                line={line ?? 1}
+                repoUid={pickedRepo ?? fileSource?.repo ?? sharedRepoUid(fileSymbols)}
+                context={compact ? 5 : 10}
+                onPickRepo={pickRepo}
+              />
+            )}
           </div>
         ) : note && noteDetail ? (
           <div

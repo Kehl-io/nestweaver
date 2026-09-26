@@ -1,4 +1,4 @@
-import { ApiError } from "./client";
+import { apiErrorFromBody } from "./client";
 import type {
   ResultState,
   SceneMetadata,
@@ -11,7 +11,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new ApiError(res.status, body.error || res.statusText);
+    throw apiErrorFromBody(res.status, body, res.statusText);
   }
   return res.json() as Promise<T>;
 }

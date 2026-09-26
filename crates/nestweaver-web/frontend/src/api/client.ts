@@ -49,7 +49,7 @@ export class ApiError extends Error {
  * `{ error: <code>, message: <human text> }` contract surface both; older
  * routes that send only `error` keep it as the message.
  */
-function apiErrorFromBody(status: number, body: unknown, statusText: string): ApiError {
+export function apiErrorFromBody(status: number, body: unknown, statusText: string): ApiError {
   const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
   const code = typeof b.error === "string" && b.error ? b.error : undefined;
   const message =
@@ -178,7 +178,7 @@ export const api = {
     const res = await fetch(`/api/v1/brain/notes?${params}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));
-      throw new ApiError(res.status, body.error || res.statusText);
+      throw apiErrorFromBody(res.status, body, res.statusText);
     }
     const header = res.headers.get("x-total-count");
     const total = header === null ? null : Number.parseInt(header, 10);

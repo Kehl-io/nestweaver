@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
-import { sharedRepoUid, sourceErrorText } from "../../api/source";
+import { ambiguousCandidates, sharedRepoUid, sourceErrorText } from "../../api/source";
 import type { SourceResponse, SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { KindBadge } from "../shared/KindBadge";
 import { CodePreview } from "./CodePreview";
+import { RepoPicker } from "./RepoPicker";
 
 interface FileDetailProps {
   path: string;
@@ -18,6 +19,15 @@ export function FileDetail({ path }: FileDetailProps) {
   const [source, setSource] = useState<SourceResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // nw-683: the repos sharing this path (from a 409) and the one the user
+  // picked. DetailPanel keys this component by path, so both reset per path.
+  const [candidates, setCandidates] = useState<string[] | null>(null);
+  const [pickedRepo, setPickedRepo] = useState<string | undefined>(undefined);
+
+  const pickRepo = (uid: string, options: string[]) => {
+    setCandidates(options);
+    setPickedRepo(uid);
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -27,14 +37,18 @@ export function FileDetail({ path }: FileDetailProps) {
     setError(null);
 
     // nw-683: the symbols name the repo, so fetch them first and request
-    // that repo's copy of the file; a path several repos index is a 409.
+    // that repo's copy of the file; a path several repos index is a 409
+    // until the user picks one, and then only that repo's symbols show.
     let sourceError: unknown = null;
     api
       .symbolsInFile(path)
       .catch(() => [] as SymbolCandidate[])
-      .then(async (fileSymbols) => {
+      .then(async (allSymbols) => {
+        const fileSymbols = pickedRepo
+          ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
+          : allSymbols;
         const fileSource = await api
-          .source(path, 1, 12, { signal: controller.signal }, sharedRepoUid(fileSymbols))
+          .source(path, 1, 12, { signal: controller.signal }, pickedRepo ?? sharedRepoUid(fileSymbols))
           .catch((e: unknown) => {
             sourceError = e;
             return null;
@@ -45,6 +59,8 @@ export function FileDetail({ path }: FileDetailProps) {
         if (controller.signal.aborted) return;
         setSymbols(fileSymbols);
         setSource(fileSource);
+        const ambiguous = ambiguousCandidates(sourceError);
+        if (ambiguous) setCandidates(ambiguous);
         if (fileSymbols.length === 0 && (!fileSource || !fileSource.lines?.length)) {
           setError(sourceErrorText(sourceError, path, "File evidence is unavailable."));
         }
@@ -59,12 +75,27 @@ export function FileDetail({ path }: FileDetailProps) {
       });
 
     return () => controller.abort();
-  }, [path]);
+  }, [path, pickedRepo]);
 
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading file...
+      </div>
+    );
+  }
+
+  if (error && candidates) {
+    // Ambiguous path: let the user pick (or re-pick) the repo to show.
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-4">
+        {pickedRepo && <p className="text-sm text-red-500">{error}</p>}
+        <RepoPicker
+          filePath={path}
+          candidates={candidates}
+          selected={pickedRepo}
+          onPick={(uid) => pickRepo(uid, candidates)}
+        />
       </div>
     );
   }
@@ -134,12 +165,25 @@ export function FileDetail({ path }: FileDetailProps) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
           Source Evidence
         </h3>
-        <CodePreview
-          filePath={path}
-          line={line}
-          repoUid={source?.repo ?? sharedRepoUid(symbols)}
-          ariaLabel={`Source evidence for ${path}`}
-        />
+        {candidates && (
+          <div className="mb-2">
+            <RepoPicker
+              filePath={path}
+              candidates={candidates}
+              selected={pickedRepo}
+              onPick={(uid) => pickRepo(uid, candidates)}
+            />
+          </div>
+        )}
+        {(!candidates || pickedRepo) && (
+          <CodePreview
+            filePath={path}
+            line={line}
+            repoUid={pickedRepo ?? source?.repo ?? sharedRepoUid(symbols)}
+            ariaLabel={`Source evidence for ${path}`}
+            onPickRepo={pickRepo}
+          />
+        )}
       </div>
     </div>
   );
