@@ -123,14 +123,16 @@ Run `nestweaver --help` for the full command list. Most commands support `--json
 
 ## Upgrading — re-index before you trust a ranking
 
-**`RESOLVER_GENERATION` is 6. Every graph indexed by an earlier release must be
+**`RESOLVER_GENERATION` is 7. Every graph indexed by an earlier release must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
 9.0.0 took it from 3 to 4, and generations 5 and 6 followed. The 9.0.0 bump
 changed edge SHAPE; 5 and 6 changed which symbols are persisted as ENTRY
-POINTS, which is what `dead-code` walks from. Both kinds of staleness have the
-same remedy and the same symptom list. Until you re-index:
+POINTS, which is what `dead-code` walks from. Generation 7 (nw-687) adds
+missing CALLS/definition edges for CommonJS `module.exports.X`/`exports.X`
+function definitions, which a stale graph is missing entirely. Both kinds of
+staleness have the same remedy and the same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
   PageRank-ordered result are computed over edges the old resolver wrote.
