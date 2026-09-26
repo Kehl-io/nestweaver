@@ -972,19 +972,46 @@ pub fn investigate(
                     &injected,
                 )
             } else {
-                // `vault` / `repo:` / `all`: unchanged from before nw-476.
-                // The seed partition here is small (a handful of
-                // exact-name/title/UID resolutions), so the merge-then-
-                // truncate bug this fix addresses never manifests, and the
-                // owner decision does not authorize touching this path's
-                // ordering. See `investigate_vault_scope_exact_symbol_match_is_not_pinned`.
-                let mut nodes = ctx.seeds;
-                nodes.extend(
-                    ctx.connected
+                // nw-529: a longer substring name is not an intentional seed
+                // when the query also resolved an exact symbol. Keep it in
+                // the connected partition so it can still be explored by
+                // relevance. This does not pin or boost either match, and
+                // `matched_query` remains project-scope-only (nw-476).
+                let (exact_uids, partial_uids) =
+                    resolve_query_symbol_matches(store, query, &config.seed_resolution);
+                let has_exact_seed = ctx.seeds.iter().any(|node| exact_uids.contains(&node.uid));
+                if !has_exact_seed {
+                    let mut nodes = ctx.seeds;
+                    nodes.extend(
+                        ctx.connected
+                            .into_iter()
+                            .filter(|node| !seed_uids.contains(&node.uid)),
+                    );
+                    nodes
+                } else {
+                    let (mut seeds, demoted): (Vec<BrainNode>, Vec<BrainNode>) =
+                        ctx.seeds.into_iter().partition(|node| {
+                            !partial_uids.contains(&node.uid) || exact_uids.contains(&node.uid)
+                        });
+                    let demoted_uids: std::collections::HashSet<String> =
+                        demoted.iter().map(|node| node.uid.clone()).collect();
+                    seed_uids.retain(|uid| !demoted_uids.contains(uid));
+                    let mut rest: Vec<BrainNode> = ctx
+                        .connected
                         .into_iter()
-                        .filter(|n| !seed_uids.contains(&n.uid)),
-                );
-                nodes
+                        .filter(|node| {
+                            !seed_uids.contains(&node.uid) && !demoted_uids.contains(&node.uid)
+                        })
+                        .chain(demoted)
+                        .collect();
+                    rest.sort_by(|a, b| {
+                        b.relevance
+                            .partial_cmp(&a.relevance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    seeds.extend(rest);
+                    seeds
+                }
             }
         }
         Err(e) => {
@@ -5492,6 +5519,75 @@ mod tests {
                 "{scope}: connected entries must stay in the pre-existing non-increasing \
                  fused-score order, never re-sorted by a boost: {connected_relevances:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unscoped_exact_name_does_not_seed_longer_partial_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("a.js"),
+            "function start() { return 1; }\nfunction start2() { return start(); }\nfunction main() { return start2(); }\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        for scope in ["all", "repo:test"] {
+            let result = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "start",
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap();
+            let exact = result
+                .entries
+                .iter()
+                .find(|entry| entry.title == "start")
+                .unwrap();
+            assert!(exact.is_seed, "{scope}: exact match must remain a seed");
+            if let Some(partial) = result.entries.iter().find(|entry| entry.title == "start2") {
+                assert!(
+                    !partial.is_seed,
+                    "{scope}: longer partial match must be connected, not a seed: {partial:?}"
+                );
+            }
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .all(|entry| entry.matched_query.is_none())
+            );
+
+            let partial_query = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "sta",
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap();
+            for name in ["start", "start2"] {
+                let match_entry = partial_query
+                    .entries
+                    .iter()
+                    .find(|entry| entry.title == name)
+                    .unwrap();
+                assert!(
+                    match_entry.is_seed,
+                    "{scope}: {name} must stay a seed without an exact match"
+                );
+            }
         }
     }
 
