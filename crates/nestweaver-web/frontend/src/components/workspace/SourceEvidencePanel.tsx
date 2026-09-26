@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
 import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
+import { sharedRepoUid, sourceErrorText } from "../../api/source";
 import type { NoteDetail, SourceResponse, SymbolCandidate, SymbolDetail } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
@@ -130,16 +131,28 @@ export function SourceEvidencePanel({
 
     if (isFileLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
-      Promise.all([
-        api.symbolsInFile(selectedNodeId).catch(() => [] as SymbolCandidate[]),
-        api.source(selectedNodeId, 1, 12).catch(() => null),
-      ])
+      // nw-683: the symbols name the repo, so fetch them first and request
+      // that repo's copy of the file; a path several repos index is a 409.
+      const path = selectedNodeId;
+      let sourceError: unknown = null;
+      api
+        .symbolsInFile(path)
+        .catch(() => [] as SymbolCandidate[])
+        .then(async (symbols) => {
+          const source = await api
+            .source(path, 1, 12, { signal: controller.signal }, sharedRepoUid(symbols))
+            .catch((e: unknown) => {
+              sourceError = e;
+              return null;
+            });
+          return [symbols, source] as const;
+        })
         .then(([symbols, source]) => {
           if (controller.signal.aborted) return;
           setFileSymbols(symbols);
           setFileSource(source);
           if (symbols.length === 0 && (!source || !source.lines?.length)) {
-            setError("File evidence is unavailable.");
+            setError(sourceErrorText(sourceError, path, "File evidence is unavailable."));
           }
         })
         .catch((e) => {
@@ -240,7 +253,12 @@ export function SourceEvidencePanel({
                 <code>{symbol.signature}</code>
               </pre>
             )}
-            <CodePreview filePath={filePath} line={line} context={compact ? 5 : 10} />
+            <CodePreview
+              filePath={filePath}
+              line={line}
+              repoUid={symbol.repo_uid}
+              context={compact ? 5 : 10}
+            />
           </div>
         ) : hasFileEvidence && selectedNodeId ? (
           <div
@@ -265,6 +283,7 @@ export function SourceEvidencePanel({
             <CodePreview
               filePath={selectedNodeId}
               line={line ?? 1}
+              repoUid={fileSource?.repo ?? sharedRepoUid(fileSymbols)}
               context={compact ? 5 : 10}
             />
           </div>

@@ -31,11 +31,33 @@ export const NOTES_PAGE_SIZE = 1000;
 
 export class ApiError extends Error {
   status: number;
+  /** Machine code from the body's `error` field (e.g. `ambiguous_file`). */
+  code?: string;
+  /** Repo uids an ambiguous `/source` path matched (409 `ambiguous_file`). */
+  candidates?: string[];
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string, candidates?: string[]) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.candidates = candidates;
   }
+}
+
+/**
+ * Build an `ApiError` from a non-2xx JSON body. Routes that follow the
+ * `{ error: <code>, message: <human text> }` contract surface both; older
+ * routes that send only `error` keep it as the message.
+ */
+function apiErrorFromBody(status: number, body: unknown, statusText: string): ApiError {
+  const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const code = typeof b.error === "string" && b.error ? b.error : undefined;
+  const message =
+    (typeof b.message === "string" && b.message) || code || statusText;
+  const candidates = Array.isArray(b.candidates)
+    ? b.candidates.filter((c): c is string => typeof c === "string")
+    : undefined;
+  return new ApiError(status, message, code, candidates);
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -45,7 +67,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new ApiError(res.status, body.error || res.statusText);
+    throw apiErrorFromBody(res.status, body, res.statusText);
   }
   return res.json() as Promise<T>;
 }
@@ -206,8 +228,11 @@ export const api = {
     );
   },
 
-  source(file: string, line?: number, context?: number, init?: RequestInit) {
+  source(file: string, line?: number, context?: number, init?: RequestInit, repo?: string) {
     let url = `/api/v1/source?file=${encodeURIComponent(file)}`;
+    // nw-683: several repos can index the same path; without `repo` the
+    // server answers 409 `ambiguous_file` for such a path.
+    if (repo) url += `&repo=${encodeURIComponent(repo)}`;
     if (line != null) url += `&line=${line}`;
     if (context != null) url += `&context=${context}`;
     return get<SourceResponse>(url, init);

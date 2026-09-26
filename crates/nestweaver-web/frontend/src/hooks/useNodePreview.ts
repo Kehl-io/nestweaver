@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
+import { sharedRepoUid } from "../api/source";
 import type {
   NoteDetail,
   SourceResponse,
@@ -45,8 +46,10 @@ function symbolsInFileUrl(path: string): string {
   return `/api/v1/symbols/file?path=${encodeURIComponent(path)}`;
 }
 
-function sourceUrl(file: string, line?: number, context?: number): string {
+function sourceUrl(file: string, line?: number, context?: number, repo?: string): string {
   let url = `/api/v1/source?file=${encodeURIComponent(file)}`;
+  // nw-683: name the repo so a path indexed by several repos is not a 409.
+  if (repo) url += `&repo=${encodeURIComponent(repo)}`;
   if (line != null) url += `&line=${line}`;
   if (context != null) url += `&context=${context}`;
   return url;
@@ -125,7 +128,7 @@ export function useNodePreview(
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(
-              sourceUrl(nodeId, symbols[0]?.start_line ?? 1, 12),
+              sourceUrl(nodeId, symbols[0]?.start_line ?? 1, 12, sharedRepoUid(symbols)),
               controller.signal,
             );
             sourceLines = source.lines ?? [];
@@ -143,7 +146,12 @@ export function useNodePreview(
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(
-              sourceUrl(detail.symbol.file_path, detail.symbol.start_line, 5),
+              sourceUrl(
+                detail.symbol.file_path,
+                detail.symbol.start_line,
+                5,
+                detail.symbol.repo_uid,
+              ),
               controller.signal,
             );
             sourceLines = source.lines ?? [];

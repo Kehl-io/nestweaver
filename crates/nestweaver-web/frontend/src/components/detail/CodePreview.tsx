@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
+import { sourceErrorText } from "../../api/source";
 import type { SourceResponse } from "../../api/types";
 
 interface CodePreviewProps {
@@ -7,6 +8,8 @@ interface CodePreviewProps {
   line: number;
   context?: number;
   ariaLabel?: string;
+  /** Repo whose copy of `filePath` to show; required when several repos index it (nw-683). */
+  repoUid?: string;
 }
 
 export function CodePreview({
@@ -14,6 +17,7 @@ export function CodePreview({
   line,
   context = 10,
   ariaLabel,
+  repoUid,
 }: CodePreviewProps) {
   const [source, setSource] = useState<SourceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -23,15 +27,17 @@ export function CodePreview({
     setSource(null);
     setError(null);
     api
-      .source(filePath, line, context, { signal: controller.signal })
+      .source(filePath, line, context, { signal: controller.signal }, repoUid)
       .then((data) => {
         if (!controller.signal.aborted) setSource(data);
       })
-      .catch(() => {
-        if (!controller.signal.aborted) setError(`Source not available: ${filePath}:${line}`);
+      .catch((e: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(sourceErrorText(e, filePath, `Source not available: ${filePath}:${line}`));
+        }
       });
     return () => controller.abort();
-  }, [context, filePath, line]);
+  }, [context, filePath, line, repoUid]);
 
   if (error) {
     return (

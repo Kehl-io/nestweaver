@@ -241,11 +241,12 @@ export interface PathResult {
 
 export interface SourceResponse {
   file: string;
+  /** Uid of the repo whose copy of `file` was served. */
+  repo?: string;
   start_line?: number;
   end_line?: number;
   lines?: string[];
   total_lines?: number;
-  error?: string;
 }
 
 export interface BrainStatus {

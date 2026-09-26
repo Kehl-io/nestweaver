@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { configureTextBuilder } from "troika-three-text";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import "@fontsource-variable/inter/index.css";
 import "@fontsource/michroma/index.css";
@@ -14,6 +15,12 @@ import { Queue } from "./pages/admin/Queue";
 import { DeadLetter } from "./pages/admin/DeadLetter";
 import { Settings } from "./pages/admin/Settings";
 import { DeviceApprove } from "./pages/admin/DeviceApprove";
+
+// nw-625: the UI server's CSP (`script-src 'self' 'wasm-unsafe-eval'`)
+// refuses troika-three-text's blob-worker `importScripts`, so graph labels
+// (drei <Text>) would never typeset. Typeset on the main thread instead. This
+// must run before the first <Text> requests a font; troika ignores it after.
+configureTextBuilder({ useWorker: false });
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

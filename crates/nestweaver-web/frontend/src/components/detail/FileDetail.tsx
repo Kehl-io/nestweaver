@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
+import { sharedRepoUid, sourceErrorText } from "../../api/source";
 import type { SourceResponse, SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
@@ -25,16 +26,27 @@ export function FileDetail({ path }: FileDetailProps) {
     setLoading(true);
     setError(null);
 
-    Promise.all([
-      api.symbolsInFile(path).catch(() => [] as SymbolCandidate[]),
-      api.source(path, 1, 12).catch(() => null),
-    ])
+    // nw-683: the symbols name the repo, so fetch them first and request
+    // that repo's copy of the file; a path several repos index is a 409.
+    let sourceError: unknown = null;
+    api
+      .symbolsInFile(path)
+      .catch(() => [] as SymbolCandidate[])
+      .then(async (fileSymbols) => {
+        const fileSource = await api
+          .source(path, 1, 12, { signal: controller.signal }, sharedRepoUid(fileSymbols))
+          .catch((e: unknown) => {
+            sourceError = e;
+            return null;
+          });
+        return [fileSymbols, fileSource] as const;
+      })
       .then(([fileSymbols, fileSource]) => {
         if (controller.signal.aborted) return;
         setSymbols(fileSymbols);
         setSource(fileSource);
         if (fileSymbols.length === 0 && (!fileSource || !fileSource.lines?.length)) {
-          setError("File evidence is unavailable.");
+          setError(sourceErrorText(sourceError, path, "File evidence is unavailable."));
         }
       })
       .catch((e) => {
@@ -122,7 +134,12 @@ export function FileDetail({ path }: FileDetailProps) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
           Source Evidence
         </h3>
-        <CodePreview filePath={path} line={line} ariaLabel={`Source evidence for ${path}`} />
+        <CodePreview
+          filePath={path}
+          line={line}
+          repoUid={source?.repo ?? sharedRepoUid(symbols)}
+          ariaLabel={`Source evidence for ${path}`}
+        />
       </div>
     </div>
   );
