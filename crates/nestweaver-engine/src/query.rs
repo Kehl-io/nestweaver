@@ -2345,12 +2345,16 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
                     // Joined into `seed_uids` after the loop, so the loop's
                     // own seeds can be told apart from container sweep-ins.
                     container_expansions.push(members);
-                    resolved_inputs.push(trimmed.to_string());
+                    if let Some(text) = brain_seed_query_text(store, trimmed)? {
+                        resolved_inputs.push(text);
+                    }
                 }
                 continue;
             }
             seed_uids.push(trimmed.to_string());
-            resolved_inputs.push(trimmed.to_string());
+            if let Some(text) = brain_seed_query_text(store, trimmed)? {
+                resolved_inputs.push(text);
+            }
             continue;
         }
 
@@ -2552,86 +2556,92 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         && store_has_embeddings(store)
     {
         let query_text = resolved_inputs.join(" ");
-        ensure_brain_context_not_cancelled(cancel)?;
-        let query_embedding = model.embed_query(&query_text);
-        // Inference is a synchronous, potentially long-running boundary. A
-        // timeout/disconnect can arrive while it is blocked, including on an
-        // inference error. Preserve cancellation as an incomplete query rather
-        // than degrading that error into a cacheable semantic miss.
-        ensure_brain_context_not_cancelled(cancel)?;
-        semantic_reason = "query_inference_failed";
-        if let Ok(query_emb) = query_embedding {
-            semantic_reason = "vector_search_failed";
-            if store
-                .embedding_index_dimension()
-                .is_some_and(|d| d != query_emb.len())
-            {
-                semantic_reason = "dimension_mismatch";
-            }
+        // nw-686: an all-UID seed set whose nodes carry no usable label
+        // (unknown prefix, or empty/whitespace text) leaves `query_text`
+        // empty. Embedding the empty string used to stand in for the raw
+        // UID; skip the leg cleanly instead, the same as "no hits".
+        if !query_text.trim().is_empty() {
+            ensure_brain_context_not_cancelled(cancel)?;
+            let query_embedding = model.embed_query(&query_text);
+            // Inference is a synchronous, potentially long-running boundary. A
+            // timeout/disconnect can arrive while it is blocked, including on an
+            // inference error. Preserve cancellation as an incomplete query rather
+            // than degrading that error into a cacheable semantic miss.
+            ensure_brain_context_not_cancelled(cancel)?;
+            semantic_reason = "query_inference_failed";
+            if let Ok(query_emb) = query_embedding {
+                semantic_reason = "vector_search_failed";
+                if store
+                    .embedding_index_dimension()
+                    .is_some_and(|d| d != query_emb.len())
+                {
+                    semantic_reason = "dimension_mismatch";
+                }
 
-            let pipeline = model.pipeline_for_dimension(query_emb.len());
-            let mismatch = match pipeline {
-                Ok(pipeline) if pipeline.provider != "opaque-runtime" => {
-                    store.embedding_pipeline_mismatch(&pipeline)?
-                }
-                Ok(_) => None,
-                Err(_) => {
-                    semantic_reason = "pipeline_unavailable";
-                    None
-                }
-            };
-            let search = if let Some(diagnostic) = mismatch {
-                semantic_reason = "pipeline_mismatch";
-                semantic_detail = Some(diagnostic);
-                Err(anyhow::anyhow!("pipeline mismatch"))
-            } else if semantic_reason == "pipeline_unavailable" {
-                Err(anyhow::anyhow!("query pipeline unavailable"))
-            } else if semantic_reason == "dimension_mismatch" {
-                Err(anyhow::anyhow!("query dimension mismatch"))
-            } else {
-                crate::vector_search::vector_knn_all_cancellable(
-                    store,
-                    &query_emb,
-                    config.semantic_limit,
-                    cancel,
-                )
-            };
-            match search {
-                Ok(hits) => {
-                    semantic_applied = true;
-                    if config.always_blend_semantic {
-                        // Same antipattern as the fusion dedup below (nw-322):
-                        // `seed_uids.contains` is O(seeds) per semantic hit, and
-                        // `project:` scope makes `seeds` corpus-sized. `seen` is
-                        // already the dedup witness for this exact vector.
-                        for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
-                            if seen.insert(uid.clone()) {
-                                seed_uids.push(uid.clone());
-                                // nw-102: remember these are nearest-neighbour
-                                // guesses, not resolutions of the query text.
-                                semantic_seed_count += 1;
+                let pipeline = model.pipeline_for_dimension(query_emb.len());
+                let mismatch = match pipeline {
+                    Ok(pipeline) if pipeline.provider != "opaque-runtime" => {
+                        store.embedding_pipeline_mismatch(&pipeline)?
+                    }
+                    Ok(_) => None,
+                    Err(_) => {
+                        semantic_reason = "pipeline_unavailable";
+                        None
+                    }
+                };
+                let search = if let Some(diagnostic) = mismatch {
+                    semantic_reason = "pipeline_mismatch";
+                    semantic_detail = Some(diagnostic);
+                    Err(anyhow::anyhow!("pipeline mismatch"))
+                } else if semantic_reason == "pipeline_unavailable" {
+                    Err(anyhow::anyhow!("query pipeline unavailable"))
+                } else if semantic_reason == "dimension_mismatch" {
+                    Err(anyhow::anyhow!("query dimension mismatch"))
+                } else {
+                    crate::vector_search::vector_knn_all_cancellable(
+                        store,
+                        &query_emb,
+                        config.semantic_limit,
+                        cancel,
+                    )
+                };
+                match search {
+                    Ok(hits) => {
+                        semantic_applied = true;
+                        if config.always_blend_semantic {
+                            // Same antipattern as the fusion dedup below (nw-322):
+                            // `seed_uids.contains` is O(seeds) per semantic hit, and
+                            // `project:` scope makes `seeds` corpus-sized. `seen` is
+                            // already the dedup witness for this exact vector.
+                            for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                                if seen.insert(uid.clone()) {
+                                    seed_uids.push(uid.clone());
+                                    // nw-102: remember these are nearest-neighbour
+                                    // guesses, not resolutions of the query text.
+                                    semantic_seed_count += 1;
+                                }
                             }
                         }
+                        semantic_hits = hits;
                     }
-                    semantic_hits = hits;
-                }
-                // A cancelled query (timeout / disconnect) is incomplete, not a
-                // benign miss: propagate it so the caller returns an error the
-                // cache refuses to store — never a truncated-but-"complete" Ok.
-                // Other embedding/search failures still degrade gracefully to no
-                // semantic signal (the original tolerant behavior).
-                Err(e)
-                    if e.downcast_ref::<nestweaver_store::StoreError>()
-                        .is_some_and(|s| s.is_cancelled()) =>
-                {
-                    return Err(e);
-                }
-                Err(error) => {
-                    if matches!(
-                        error.downcast_ref::<nestweaver_store::StoreError>(),
-                        Some(nestweaver_store::StoreError::EmbeddingArtifactCorrupt)
-                    ) {
-                        semantic_reason = "vector_artifact_corrupt";
+                    // A cancelled query (timeout / disconnect) is incomplete, not a
+                    // benign miss: propagate it so the caller returns an error the
+                    // cache refuses to store — never a truncated-but-"complete" Ok.
+                    // Other embedding/search failures still degrade gracefully to no
+                    // semantic signal (the original tolerant behavior).
+                    Err(e)
+                        if e.downcast_ref::<nestweaver_store::StoreError>()
+                            .is_some_and(|s| s.is_cancelled()) =>
+                    {
+                        return Err(e);
+                    }
+                    Err(error) => {
+                        if matches!(
+                            error.downcast_ref::<nestweaver_store::StoreError>(),
+                            Some(nestweaver_store::StoreError::EmbeddingArtifactCorrupt)
+                        ) {
+                            semantic_reason = "vector_artifact_corrupt";
+                        }
                     }
                 }
             }
@@ -2687,7 +2697,12 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
         let bm25_query = resolved_inputs.join(" ");
-        let bm25_hits = if config.prf {
+        // nw-686: same empty-label case as the semantic leg above -- an
+        // all-UID seed set with no usable text skips BM25 cleanly (as "no
+        // hits") instead of searching Tantivy for the empty string.
+        let bm25_hits = if bm25_query.trim().is_empty() {
+            Vec::new()
+        } else if config.prf {
             match tantivy.search_prf(&bm25_query, config.bm25_limit, nestweaver_store_stoplist()) {
                 Ok((hits, terms)) => {
                     expansion_terms = terms;
@@ -3375,6 +3390,42 @@ fn brain_seed_uid_exists(store: &GraphStore, uid: &str) -> Result<bool, anyhow::
     match exists {
         Ok(exists) => Ok(exists),
         Err(nestweaver_store::StoreError::NotFound) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// nw-686: the retrieval text a UID seed stands for. Embedding or BM25-
+/// searching the raw UID matched hash-heavy headings instead of the node
+/// itself. `Ok(None)` means "no label to search with" (unknown prefix, or a
+/// node whose label is empty/whitespace) -- callers must skip the leg
+/// cleanly in that case rather than feed it an empty string.
+fn brain_seed_query_text(store: &GraphStore, uid: &str) -> Result<Option<String>, anyhow::Error> {
+    let text = match uid.split_once(':').map(|(prefix, _)| prefix) {
+        Some("sym") => store.lookup_symbol(uid).map(|s| Some(s.name)),
+        Some("note") => store.lookup_note(uid).map(|n| Some(n.title)),
+        Some("head") => store.lookup_heading(uid).map(|h| Some(h.text)),
+        Some("sec") => store.lookup_section(uid).and_then(|s| match s.heading_uid {
+            Some(h) => store.lookup_heading(&h).map(|h| Some(h.text)),
+            None => store.lookup_note(&s.note_uid).map(|n| Some(n.title)),
+        }),
+        Some("tag") => store.lookup_tag(uid).map(|t| Some(t.name)),
+        Some("vlt") => store.lookup_vault(uid).map(|v| Some(v.name)),
+        Some("repo") => store
+            .lookup_repo(uid)
+            .map(|r| r.map(|r| r.name.unwrap_or(r.url))),
+        // nw-686: no uid-keyed getter exists for Project (only
+        // `lookup_project_by_name` and `project_exists`); `list_projects`
+        // is the one already-established "cheap" fallback in this file
+        // (`lookup_repo` above does the identical list-then-find scan for
+        // Repo), so reuse that pattern rather than add a new query path.
+        Some("proj") => store
+            .list_projects()
+            .map(|projects| projects.into_iter().find(|p| p.uid == uid).map(|p| p.name)),
+        _ => Ok(None),
+    };
+    match text {
+        Ok(t) => Ok(t.filter(|t: &String| !t.trim().is_empty())),
+        Err(nestweaver_store::StoreError::NotFound) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -6056,6 +6107,87 @@ mod semantic_leg_tests {
             error
                 .downcast_ref::<nestweaver_store::StoreError>()
                 .is_some_and(nestweaver_store::StoreError::is_cancelled)
+        );
+    }
+
+    #[test]
+    fn uid_seed_embeds_the_nodes_name_not_the_uid() {
+        struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
+        impl EmbedQueryFn for RecordingEmbed {
+            fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let model = RecordingEmbed(std::sync::Mutex::new(Vec::new()));
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["sym:payment".into()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            None,
+        )
+        .unwrap();
+        assert!(result.semantic_applied);
+        assert_eq!(
+            *model.0.lock().unwrap(),
+            ["Payment"],
+            "the semantic leg must embed the label"
+        );
+    }
+
+    #[test]
+    fn note_uid_seed_embeds_the_notes_title_not_the_uid() {
+        struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
+        impl EmbedQueryFn for RecordingEmbed {
+            fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let note = nestweaver_schema::Note {
+            uid: "note:code-link-reconciler".to_string(),
+            vault_uid: "vault:test".to_string(),
+            file_path: "notes/code-link-reconciler.md".to_string(),
+            title: "Code link reconciler".to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 100,
+            content_hash: "abc".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store.insert_note(&note).unwrap();
+        assert!(store.add_embedding("note:code-link-reconciler", vec![1.0, 0.0, 0.0, 0.0]));
+        let model = RecordingEmbed(std::sync::Mutex::new(Vec::new()));
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["note:code-link-reconciler".into()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            None,
+        )
+        .unwrap();
+        assert!(result.semantic_applied);
+        assert_eq!(
+            *model.0.lock().unwrap(),
+            ["Code link reconciler"],
+            "the semantic leg must embed the note's title, not its uid"
         );
     }
 
