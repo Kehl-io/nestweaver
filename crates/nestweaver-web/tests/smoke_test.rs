@@ -178,6 +178,7 @@ async fn all_endpoints_respond() {
     );
 
     // ── Source ────────────────────────────────────────────────────────────────
+    // nw-682: an unindexed path is 404, never read from disk
     assert_eq!(
         check(
             &app,
@@ -186,7 +187,7 @@ async fn all_endpoints_respond() {
             None
         )
         .await,
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
 
     // ── Paths ────────────────────────────────────────────────────────────────

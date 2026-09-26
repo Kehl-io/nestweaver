@@ -455,7 +455,7 @@ fn target_graph_node(symbol: &Symbol) -> ImpactGraphNode {
         confidence: 1.0,
         impact_score: 1.0,
         edge_type: None,
-        source: source_evidence(&symbol.file_path, symbol.start_line),
+        source: source_evidence(&symbol.file_path, symbol.start_line, &symbol.uid),
     }
 }
 
@@ -470,13 +470,19 @@ fn impact_graph_node(node: &ImpactNode) -> ImpactGraphNode {
         confidence: node.confidence,
         impact_score: node.impact_score,
         edge_type: Some(node.edge_type.clone()),
-        source: source_evidence(&node.file_path, node.start_line),
+        source: source_evidence(&node.file_path, node.start_line, &node.uid),
     }
 }
 
-fn source_evidence(file_path: &str, start_line: u32) -> ImpactSourceEvidence {
+/// nw-683: the link names the symbol's repo so `/source` serves that repo's
+/// copy of `file_path` instead of 409ing on (or guessing between) repos that
+/// share the path.
+fn source_evidence(file_path: &str, start_line: u32, symbol_uid: &str) -> ImpactSourceEvidence {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("file", file_path);
+    if let Some(repo) = nestweaver_schema::repo_uid_of_symbol_uid(symbol_uid) {
+        serializer.append_pair("repo", repo);
+    }
     serializer.append_pair("line", &start_line.to_string());
     ImpactSourceEvidence {
         file_path: file_path.to_string(),
@@ -535,4 +541,20 @@ fn target_repo_is_stale(state: &Arc<AppState>, target: &Symbol) -> Result<bool, 
         .into_iter()
         .find(|repo| repo.uid == target.repo_uid)
         .is_some_and(|repo| repo.staleness_commits_behind > 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_evidence_names_the_symbol_repo() {
+        let repo = "repo:kory-brain:c8f000561246";
+        let uid = nestweaver_schema::symbol_uid(repo, "src/App.tsx", "App", 3);
+        let ev = source_evidence("src/App.tsx", 3, &uid);
+        assert_eq!(
+            ev.url,
+            "/api/v1/source?file=src%2FApp.tsx&repo=repo%3Akory-brain%3Ac8f000561246&line=3"
+        );
+    }
 }

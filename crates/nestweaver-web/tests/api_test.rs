@@ -2092,3 +2092,110 @@ async fn hardened_router_sets_security_headers_on_forbidden_responses_too() {
     assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
 }
+
+// ── /api/v1/source: repo-addressed and graph-gated (nw-682, nw-683) ─────────
+
+/// Two repos with on-disk roots, both indexing `src/App.tsx`, plus an
+/// unindexed `.env` secret in each working tree.
+fn two_repo_source_app() -> (tempfile::TempDir, axum::Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GraphStore::in_memory().unwrap();
+    for (name, body) in [
+        ("a", "export const A = 1;\nexport function a() {}\n"),
+        ("b", "B\nB\nB\n"),
+    ] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("src/App.tsx"), body).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=hunter2\n").unwrap();
+        std::fs::write(root.join(".git/config"), "SECRET=hunter2\n").unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: format!("repo:{name}"),
+                url: format!("file://{}", root.display()),
+                indexed_sha: "x".into(),
+                staleness_commits_behind: 0,
+                instance_id: String::new(),
+                name: Some(name.into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:{name}"),
+                path: "src/App.tsx".into(),
+                repo_uid: format!("repo:{name}"),
+                content_hash: "h".into(),
+            })
+            .unwrap();
+    }
+    let db_path = dir.path().join("t.lbug");
+    (dir, create_router(AppState::new(store, None, db_path)))
+}
+
+#[tokio::test]
+async fn source_serves_only_the_named_repo() {
+    let (_d, app) = two_repo_source_app();
+    for (repo, first) in [("repo:b", "B"), ("repo:a", "export const A = 1;")] {
+        let uri = format!("/api/v1/source?file=src/App.tsx&repo={repo}&line=1&context=0");
+        let (s, j) = get_json(&app, &uri).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(j["lines"][0], first, "{uri}");
+        assert_eq!(j["repo"], repo, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn source_without_repo_is_409_when_path_is_ambiguous() {
+    let (_d, app) = two_repo_source_app();
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/App.tsx&line=1").await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(j["error"], "ambiguous_file");
+    assert_eq!(j["candidates"], json!(["repo:a", "repo:b"]));
+}
+
+#[tokio::test]
+async fn source_refuses_files_the_graph_never_indexed() {
+    let (_d, app) = two_repo_source_app();
+    for uri in [
+        "/api/v1/source?file=.env&repo=repo:a",
+        "/api/v1/source?file=.env",
+        "/api/v1/source?file=.git/config&repo=repo:a",
+    ] {
+        let (s, j) = get_json(&app, uri).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(j["error"], "source_not_indexed", "{uri}");
+        assert_ne!(
+            j["lines"],
+            json!(["SECRET=hunter2"]),
+            "{uri} leaked an unindexed file"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_rejects_nul_and_clamps_past_eof() {
+    let (_d, app) = two_repo_source_app();
+    let (s, _) = get_json(&app, "/api/v1/source?file=src/App.tsx%00&repo=repo:a").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, j) = get_json(
+        &app,
+        "/api/v1/source?file=src/App.tsx&repo=repo:a&line=999&context=2",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        j["start_line"].as_u64().unwrap() <= j["end_line"].as_u64().unwrap(),
+        "{j}"
+    );
+    assert_eq!(j["end_line"], 2);
+}
+
+#[tokio::test]
+async fn source_unknown_repo_is_404() {
+    let (_d, app) = two_repo_source_app();
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/App.tsx&repo=repo:nope").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(j["error"], "repo_not_found");
+}

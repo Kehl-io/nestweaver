@@ -2887,6 +2887,21 @@ impl GraphStore {
             .collect()
     }
 
+    /// nw-683: every repo uid holding a `File` node at exactly `path`,
+    /// sorted and de-duplicated.
+    pub fn repos_indexing_file(&self, path: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let q =
+            "MATCH (f:File) WHERE f.path = $path RETURN DISTINCT f.repo_uid ORDER BY f.repo_uid";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![("path", Value::String(path.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| extract_string(&row, 0)).collect()
+    }
+
     /// Every File node of `repo_uid` as `(file_path, content_hash)`.
     ///
     /// nw-664: the code watcher's startup reconciliation compares disk
@@ -5178,5 +5193,37 @@ mod project_symbol_pagerank_scope_tests {
             "an empty IN list must match zero rows, not error out to an \
              empty result via a different path"
         );
+    }
+}
+
+#[cfg(test)]
+mod repos_indexing_file_tests {
+    use super::*;
+    use nestweaver_schema::File;
+
+    fn insert(store: &GraphStore, repo_uid: &str, path: &str) {
+        store
+            .insert_file(&File {
+                uid: format!("file:{repo_uid}:{path}"),
+                path: path.into(),
+                repo_uid: repo_uid.into(),
+                content_hash: "h".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn repos_indexing_file_lists_exact_path_matches() {
+        let store = GraphStore::in_memory().unwrap();
+        insert(&store, "repo:b", "src/App.tsx");
+        insert(&store, "repo:a", "src/App.tsx");
+        insert(&store, "repo:c", "src/App.tsx.bak");
+        assert_eq!(
+            store.repos_indexing_file("src/App.tsx").unwrap(),
+            vec!["repo:a".to_string(), "repo:b".to_string()]
+        );
+        assert!(store.repos_indexing_file(".env").unwrap().is_empty());
+        // Exact match only: no prefix/suffix matching.
+        assert!(store.repos_indexing_file("src/App").unwrap().is_empty());
     }
 }
