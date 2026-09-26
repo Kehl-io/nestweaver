@@ -9874,18 +9874,36 @@ fn reconcile_code_links_direct(
     reason: &str,
 ) {
     nestweaver_engine::code_links::mark_code_links_pending(db_path, reason);
-    let cross_domain = load_instance_config_opt(config)
+    let instance_config = load_instance_config_opt(config);
+    let folders = instance_config
+        .as_ref()
+        .map(|config| nestweaver_engine::project::project_folders(config, &config.instance_id))
+        .unwrap_or_default();
+    let cross_domain = instance_config
         .map(|config| config.cross_domain)
         .unwrap_or_default();
     match GraphStore::open_with_authority(db_path, write_lease) {
         Ok(store) => {
-            match nestweaver_engine::code_links::reconcile_code_links(&store, &cross_domain) {
-                Ok(report) if !report.rewritten.is_empty() => eprintln!(
-                    "Code links: rebuilt for {} note(s) ({} edge(s)).",
-                    report.rewritten.len(),
-                    report.edges_written
-                ),
-                Ok(_) => {}
+            match nestweaver_engine::code_links::reconcile_code_links_with_folders(
+                &store,
+                &cross_domain,
+                folders,
+            ) {
+                Ok(report) => {
+                    if report.memberships_added > 0 {
+                        eprintln!(
+                            "Project membership: added {} note(s) under vault_folder.",
+                            report.memberships_added
+                        );
+                    }
+                    if !report.rewritten.is_empty() {
+                        eprintln!(
+                            "Code links: rebuilt for {} note(s) ({} edge(s)).",
+                            report.rewritten.len(),
+                            report.edges_written
+                        );
+                    }
+                }
                 Err(error) => tracing::warn!(
                     "code link reconciliation failed; the links stay owed and are retried: {error:#}"
                 ),

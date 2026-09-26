@@ -49,6 +49,32 @@ pub const REPO_ISSUES_KEY: &str = "repo_issues";
 /// silently linking its notes as unscoped.
 pub const DECLARED_REPO_COUNT_KEY: &str = "declared_repo_count";
 
+/// A configured project's vault folder, used to keep membership current as
+/// new notes are indexed after materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFolder {
+    pub project_uid: String,
+    pub folder: String,
+}
+
+pub fn project_folders(config: &InstanceConfig, instance_id: &str) -> Vec<ProjectFolder> {
+    config
+        .projects
+        .iter()
+        .filter_map(|project| {
+            project.vault_folder.as_ref().map(|folder| ProjectFolder {
+                project_uid: project_uid(instance_id, &project.name),
+                folder: folder.trim_end_matches('/').to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Match a note path at a folder boundary, not a similarly named sibling.
+pub fn note_in_folder(note_path: &str, folder: &str) -> bool {
+    note_path == folder || note_path.starts_with(&format!("{folder}/"))
+}
+
 /// Why a declared repo reference did not resolve cleanly (nw-674).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -663,15 +689,11 @@ pub fn materialize_projects_with_lease(
         });
 
         if let Some(folder) = &project_cfg.vault_folder {
-            let prefix = if folder.ends_with('/') {
-                folder.clone()
-            } else {
-                format!("{folder}/")
-            };
+            let folder = folder.trim_end_matches('/');
             note_edges.extend(
                 all_notes
                     .iter()
-                    .filter(|note| note.file_path.starts_with(&prefix) || note.file_path == *folder)
+                    .filter(|note| note_in_folder(&note.file_path, folder))
                     .map(|note| (uid.clone(), note.uid.clone())),
             );
         }

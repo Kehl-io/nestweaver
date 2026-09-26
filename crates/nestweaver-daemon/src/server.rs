@@ -2955,8 +2955,14 @@ async fn run_code_link_reconciler(
         .as_ref()
         .map(|config| config.cross_domain.clone())
         .unwrap_or_default();
+    let folders = state
+        .instance_cfg
+        .as_ref()
+        .map(|config| nestweaver_engine::project::project_folders(config, &state.data_instance_id))
+        .unwrap_or_default();
     let reconciler = Arc::new(std::sync::Mutex::new(
-        nestweaver_engine::code_links::CodeLinkReconciler::new(config),
+        nestweaver_engine::code_links::CodeLinkReconciler::new(config)
+            .with_project_folders(folders),
     ));
     let mut last_generation: Option<u64> = None;
     let mut last_pass: Option<Instant> = None;
