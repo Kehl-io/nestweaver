@@ -3603,39 +3603,90 @@ class Config:
     // ── nw-687 (review): CommonJS exports are exports ──────────────────────
 
     /// A `module.exports.X = function` definition must be `Visibility::Public`
-    /// and root exactly like the equivalent ES export -- not a hard-coded
-    /// kind, whatever `detect_entry_point` would assign an ES export of the
-    /// same name/file/kind. `lambda.js`/`handler` is file-name-driven
-    /// (`LambdaHandler`), so both controls land on the SAME concrete kind,
-    /// proving parity rather than two independent `None`s.
+    /// in parity with the equivalent ES export -- on a NEUTRAL path/name pair
+    /// (`src/util.js`/`formatDate`) that `detect_entry_point` does not root by
+    /// filename, unlike `src/lambda.js`/`handler` (which lands on
+    /// `LambdaHandler` via the filename alone regardless of visibility, so it
+    /// cannot tell an implemented `is_commonjs_export_assignment` from a
+    /// deleted one). This exercises ONLY `is_commonjs_export_assignment`:
+    /// disabling it flips the CommonJS side to `Private` while the ES control
+    /// stays `Public`, breaking parity.
     #[test]
-    fn commonjs_export_is_public_and_matches_es_exports_entry_point_kind() {
+    fn commonjs_direct_export_matches_es_export_visibility_and_entry_point() {
         let cjs_source =
-            "module.exports.handler = async function handler(evt) {\n  return evt;\n};\n";
-        let cjs = parse_source(Path::new("src/lambda.js"), cjs_source).unwrap();
-        let cjs_handler = cjs
+            "module.exports.formatDate = function formatDate(d) {\n  return d;\n};\n";
+        let cjs = parse_source(Path::new("src/util.js"), cjs_source).unwrap();
+        let cjs_fn = cjs
             .symbols
             .iter()
-            .find(|s| s.name == "handler")
+            .find(|s| s.name == "formatDate")
             .expect("commonjs export must be captured as a definition");
-        assert_eq!(cjs_handler.visibility, Visibility::Public);
 
-        let es_source = "export async function handler(evt) {\n  return evt;\n}\n";
-        let es = parse_source(Path::new("src/lambda.js"), es_source).unwrap();
-        let es_handler = es
+        let es_source = "export function formatDate(d) {\n  return d;\n}\n";
+        let es = parse_source(Path::new("src/util.js"), es_source).unwrap();
+        let es_fn = es
             .symbols
             .iter()
-            .find(|s| s.name == "handler")
+            .find(|s| s.name == "formatDate")
             .expect("ES export must be captured as a definition");
-        assert_eq!(es_handler.visibility, Visibility::Public);
 
         assert_eq!(
-            cjs_handler.entry_point_kind, es_handler.entry_point_kind,
-            "a CommonJS export must root exactly like the equivalent ES export: \
-             commonjs={:?} es={:?}",
-            cjs_handler.entry_point_kind, es_handler.entry_point_kind
+            (cjs_fn.visibility, cjs_fn.is_entry_point, cjs_fn.entry_point_kind),
+            (es_fn.visibility, es_fn.is_entry_point, es_fn.entry_point_kind),
+            "a direct CommonJS export must match the equivalent ES export's \
+             (visibility, is_entry_point, entry_point_kind) triple: \
+             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
+            cjs_fn.visibility,
+            cjs_fn.is_entry_point,
+            cjs_fn.entry_point_kind,
+            es_fn.visibility,
+            es_fn.is_entry_point,
+            es_fn.entry_point_kind
         );
-        assert!(cjs_handler.is_entry_point);
+        assert_eq!(cjs_fn.visibility, Visibility::Public);
+    }
+
+    /// `module.exports.formatDate = formatDate;` (bare-identifier re-export)
+    /// must mark the LOCAL `function formatDate` exported in parity with
+    /// `export { formatDate };` on the same neutral path/name pair -- this
+    /// exercises ONLY `collect_commonjs_reexport_names` (the direct-export
+    /// path above never applies, since the RHS here is an identifier, not a
+    /// function). Disabling it drops the CommonJS side back to
+    /// `Private`/`None` while the ES control stays `Public`/`Main`.
+    #[test]
+    fn commonjs_reexport_matches_es_export_clause_visibility_and_entry_point() {
+        let cjs_source =
+            "function formatDate(d) {\n  return d;\n}\nmodule.exports.formatDate = formatDate;\n";
+        let cjs = parse_source(Path::new("src/util.js"), cjs_source).unwrap();
+        let cjs_fn = cjs
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("the local declaration must still be captured");
+
+        let es_source = "function formatDate(d) {\n  return d;\n}\nexport { formatDate };\n";
+        let es = parse_source(Path::new("src/util.js"), es_source).unwrap();
+        let es_fn = es
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("the local declaration must still be captured");
+
+        assert_eq!(
+            (cjs_fn.visibility, cjs_fn.is_entry_point, cjs_fn.entry_point_kind),
+            (es_fn.visibility, es_fn.is_entry_point, es_fn.entry_point_kind),
+            "a CommonJS bare-identifier re-export must match `export {{ name }}`'s \
+             (visibility, is_entry_point, entry_point_kind) triple: \
+             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
+            cjs_fn.visibility,
+            cjs_fn.is_entry_point,
+            cjs_fn.entry_point_kind,
+            es_fn.visibility,
+            es_fn.is_entry_point,
+            es_fn.entry_point_kind
+        );
+        assert_eq!(cjs_fn.visibility, Visibility::Public);
+        assert_eq!(cjs_fn.entry_point_kind, Some(EntryPointKind::Main));
     }
 
     /// `module.exports.listen = listen;` (bare-identifier re-export) mints no
