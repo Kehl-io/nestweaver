@@ -2011,9 +2011,27 @@ async fn hardened_router_admits_uri_authority_only_with_matching_origin() {
 }
 
 #[tokio::test]
+async fn hardened_router_refuses_uri_authority_only_with_mismatched_origin() {
+    // Negative half of the test above: no Host header, a loopback URI
+    // authority, and an Origin naming a different loopback port.
+    let app = nestweaver_web::hardening::harden(make_app());
+    for origin in ["http://127.0.0.1:1234", "https://evil.example"] {
+        let req = Request::builder()
+            .uri("http://127.0.0.1:9377/api/v1/version")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "Origin {origin}");
+    }
+}
+
+#[tokio::test]
 async fn hardened_router_sets_security_headers_on_spa_and_api() {
     let app = nestweaver_web::hardening::harden(make_app());
-    for uri in ["/", "/api/v1/version"] {
+    // `/fonts/inter-500.ttf` is an embedded static asset (the rust_embed
+    // branch, not the index.html shell), so the headers must cover it too.
+    for uri in ["/", "/api/v1/version", "/fonts/inter-500.ttf"] {
         let resp = app
             .clone()
             .oneshot(
@@ -2025,7 +2043,15 @@ async fn hardened_router_sets_security_headers_on_spa_and_api() {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         let h = resp.headers();
+        if uri.ends_with(".ttf") {
+            assert_ne!(
+                h.get("content-type").and_then(|v| v.to_str().ok()),
+                Some("text/html; charset=utf-8"),
+                "{uri} must be the embedded asset, not the SPA shell"
+            );
+        }
         let csp = h
             .get("content-security-policy")
             .and_then(|v| v.to_str().ok())

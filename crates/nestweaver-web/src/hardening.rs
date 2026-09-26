@@ -67,8 +67,7 @@ pub fn harden_with_allowed_hosts(router: Router, extra: Vec<String>) -> Router {
         // loopback_only is added first (innermost, closest to the routes).
         // security_headers is added last -> outermost, so it wraps
         // loopback_only too and stamps its 403s with the same security
-        // headers as every other response (Task 2 fills the headers in;
-        // this file only fixes the layer order).
+        // headers as every other response.
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let extra = Arc::clone(&extra);
             async move { loopback_only(req, next, extra).await }
