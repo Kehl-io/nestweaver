@@ -1,6 +1,11 @@
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    os::fd::{AsRawFd, FromRawFd},
+};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -62,6 +67,12 @@ enum Read {
 }
 
 fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
+    read_indexed_file_with_hook(repo_root, file, || {})
+}
+
+// The hook makes the gap between validation and opening deterministic in the
+// race test. Production always passes a no-op.
+fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl FnOnce()) -> Read {
     let (Ok(canon_root), Ok(canon_path)) = (
         std::fs::canonicalize(repo_root),
         std::fs::canonicalize(repo_root.join(file)),
@@ -84,9 +95,19 @@ fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
     // Bounded read: never pull more than the cap (plus one byte to detect
     // overflow) into memory, whatever the metadata said or however the file
     // grows between checks.
-    let Ok(f) = std::fs::File::open(&canon_path) else {
+    before_open();
+    // Open each component relative to a pinned directory descriptor. A path
+    // swapped for a symlink after canonicalization must never be followed.
+    #[cfg(unix)]
+    let opened = open_without_symlinks(&canon_path);
+    #[cfg(not(unix))]
+    let opened: std::io::Result<std::fs::File> = Err(std::io::ErrorKind::Unsupported.into());
+    let Ok(f) = opened else {
         return Read::NotAvailable;
     };
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
+        return Read::NotAvailable;
+    }
     // Read raw bytes and check the size BEFORE decoding: the cap can cut a
     // multi-byte character, and an oversized file must report TooLarge, not
     // the UTF-8 error that cut produces.
@@ -98,6 +119,89 @@ fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
             Err(_) => Read::NotAvailable,
         },
         Err(_) => Read::NotAvailable,
+    }
+}
+
+#[cfg(unix)]
+fn open_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
+    let root = CString::new("/").expect("constant path");
+    // SAFETY: the C string is NUL terminated; a successful fd is owned by File.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: open returned a new owned fd.
+    let mut dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    for (i, part) in components.iter().enumerate() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = CString::new(part.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if i + 1 < components.len() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: dir is open, name is NUL terminated, and the returned fd is
+        // transferred into File before dir is dropped.
+        let next = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned fd.
+        dir = unsafe { std::fs::File::from_raw_fd(next) };
+    }
+    Ok(dir)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_path_swap_cannot_read_an_unindexed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/config.ts"), "indexed\n").unwrap();
+        std::fs::write(temp.path().join("secret"), "secret\n").unwrap();
+        let read = read_indexed_file_with_hook(&repo, "src/config.ts", || {
+            std::fs::remove_file(repo.join("src/config.ts")).unwrap();
+            std::os::unix::fs::symlink(temp.path().join("secret"), repo.join("src/config.ts"))
+                .unwrap();
+        });
+        assert!(matches!(read, Read::NotAvailable));
+    }
+
+    #[test]
+    fn source_directory_swap_cannot_read_an_unindexed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("src/config.ts"), "indexed\n").unwrap();
+        std::fs::write(outside.join("config.ts"), "secret\n").unwrap();
+        let read = read_indexed_file_with_hook(&repo, "src/config.ts", || {
+            std::fs::rename(repo.join("src"), repo.join("old-src")).unwrap();
+            std::os::unix::fs::symlink(&outside, repo.join("src")).unwrap();
+        });
+        assert!(matches!(read, Read::NotAvailable));
     }
 }
 
