@@ -1420,11 +1420,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let source_bytes = source.as_bytes();
     let exported_locals = if matches!(lang, Language::JavaScript | Language::TypeScript) {
         let mut names = collect_export_clause_names(tree.root_node(), source_bytes);
-        // nw-687 (review): `module.exports.X = identifier` / `exports.X =
-        // identifier` re-exports a local binding exactly like `export {
-        // identifier }` does -- union the two so the local declaration below
-        // picks up the same Public-visibility/entry-point treatment either
-        // way.
+        // CommonJS assignments to `module.exports` (with or without a
+        // property) and `exports.X` re-export local bindings.
         names.extend(collect_commonjs_reexport_names(
             lang,
             tree.root_node(),
@@ -2141,7 +2138,8 @@ fn is_commonjs_export_assignment(
 }
 
 /// nw-687 (review): names re-exported via a bare-identifier CommonJS
-/// assignment -- `module.exports.X = identifier` / `exports.X = identifier`
+/// assignment -- `module.exports = identifier`,
+/// `module.exports.X = identifier`, or `exports.X = identifier`
 /// -- mirroring `collect_export_clause_names`'s ES `export { name }`
 /// collection one level down (this walks top-level `expression_statement`s
 /// instead of `export_statement`s, since a CommonJS re-export has no
@@ -2198,7 +2196,24 @@ fn collect_commonjs_reexport_names_from<'a>(
             let Some(assignment) = statement.named_child(0) else {
                 return;
             };
-            if !is_commonjs_export_assignment(lang, assignment, source_bytes) {
+            let direct_module_export = assignment.kind() == "assignment_expression"
+                && assignment
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "member_expression")
+                    .and_then(|left| {
+                        Some((
+                            left.child_by_field_name("object")?,
+                            left.child_by_field_name("property")?,
+                        ))
+                    })
+                    .is_some_and(|(object, property)| {
+                        object.kind() == "identifier"
+                            && object.utf8_text(source_bytes) == Ok("module")
+                            && property.utf8_text(source_bytes) == Ok("exports")
+                    });
+            if !direct_module_export
+                && !is_commonjs_export_assignment(lang, assignment, source_bytes)
+            {
                 return;
             }
             if let Some(right) = assignment.child_by_field_name("right")
@@ -3784,6 +3799,34 @@ class Config:
             .expect("the local declaration must still be captured");
         assert_eq!(listen.visibility, Visibility::Public);
         assert_eq!(listen.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn commonjs_module_export_of_local_function_is_an_entry_point() {
+        let source = "async function context(req) { return req; }\nmodule.exports = context;\n";
+        for path in ["src/graphql/context.js", "src/graphql/context.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let context = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "context")
+                .expect("the local function must be captured");
+            assert_eq!(context.visibility, Visibility::Public, "{path}");
+            assert_eq!(
+                context.entry_point_kind,
+                Some(EntryPointKind::Main),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigning_unrelated_exports_property_does_not_export_local_function() {
+        let source = "function context() {}\nother.exports = context;\nexports = context;\n";
+        let parsed = parse_source(Path::new("src/graphql/context.js"), source).unwrap();
+        let context = parsed.symbols.iter().find(|s| s.name == "context").unwrap();
+        assert_eq!(context.visibility, Visibility::Private);
+        assert!(!context.is_entry_point);
     }
 
     /// Counterweight: an ordinary, unexported local function must NOT pick up
