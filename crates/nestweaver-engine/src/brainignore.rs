@@ -49,28 +49,38 @@ pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> anyhow
     // nw-684: an unreadable ignore file must never silently widen what is
     // indexed — the user wrote it to keep notes (credentials, private
     // folders) OUT of the graph. Only a truly absent file means defaults.
-    let content = match std::fs::read_to_string(&ignore_file) {
-        Ok(content) => Some(content),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        // Readable, but not text: "until it is readable" would point at the
-        // wrong fix.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            return Err(e).with_context(|| {
-                format!(
-                    "{} is not valid UTF-8 — refusing to index this vault until it is \
-                     saved as UTF-8, because indexing without it would expose notes it excludes",
-                    ignore_file.display()
-                )
-            });
+    let present = match std::fs::symlink_metadata(&ignore_file) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", ignore_file.display()));
         }
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "cannot read {} — refusing to index this vault until it is readable, \
+    };
+    let content = if !present {
+        None
+    } else {
+        match std::fs::read_to_string(&ignore_file) {
+            Ok(content) => Some(content),
+            // Readable, but not text: "until it is readable" would point at the
+            // wrong fix.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "{} is not valid UTF-8 — refusing to index this vault until it is \
+                     saved as UTF-8, because indexing without it would expose notes it excludes",
+                        ignore_file.display()
+                    )
+                });
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot read {} — refusing to index this vault until it is readable, \
                      because indexing without it would expose notes it excludes",
-                    ignore_file.display()
-                )
-            });
+                        ignore_file.display()
+                    )
+                });
+            }
         }
     };
     build_ignore_set(&ignore_file, content.as_deref(), extra_patterns)
@@ -316,6 +326,25 @@ mod tests {
         let err = load_brain_ignore(dir.path(), &[]).expect_err("must fail closed");
         let msg = format!("{err:#}");
         assert!(msg.contains(".brainignore"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_brainignore_symlink_is_an_error_not_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing-policy", dir.path().join(".brainignore")).unwrap();
+        let error = load_brain_ignore(dir.path(), &[]).expect_err("policy entry exists");
+        assert!(format!("{error:#}").contains(".brainignore"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_brainignore_symlink_still_applies_its_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("policy"), "secret.md\n").unwrap();
+        std::os::unix::fs::symlink("policy", dir.path().join(".brainignore")).unwrap();
+        let ignored = load_brain_ignore(dir.path(), &[]).unwrap();
+        assert!(is_ignored("secret.md", &ignored));
     }
 
     #[test]

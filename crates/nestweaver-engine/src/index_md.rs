@@ -5754,8 +5754,33 @@ mod tests {
             "an unreadable .brainignore must neither expose secret.md nor drop ok.md"
         );
 
+        // A dangling policy symlink also returns NotFound from read_to_string,
+        // but its directory entry exists and must never select defaults.
+        std::fs::remove_file(root.join(".brainignore")).unwrap();
+        std::os::unix::fs::symlink("missing-policy", root.join(".brainignore")).unwrap();
+        let full =
+            index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]);
+        let incremental = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "v",
+            since,
+            &[],
+        );
+        for (route, result) in [
+            ("full refresh/dangling symlink", full.map(|_| ())),
+            ("--since refresh/dangling symlink", incremental.map(|_| ())),
+        ] {
+            let message = format!("{:#}", result.expect_err(route));
+            assert!(message.contains(".brainignore"), "{route}: {message}");
+        }
+        assert_eq!(paths(&store), vec!["ok.md".to_string()]);
+
         // Counterweight: once readable again the refresh succeeds and the
         // exclusion still holds.
+        std::fs::remove_file(root.join(".brainignore")).unwrap();
+        std::fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
         index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
         assert_eq!(paths(&store), vec!["ok.md".to_string()]);
     }

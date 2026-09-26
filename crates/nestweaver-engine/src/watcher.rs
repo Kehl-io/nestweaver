@@ -3151,6 +3151,15 @@ mod tests {
         );
         assert_eq!(paths(), vec!["ok.md".to_string()]);
 
+        fs::remove_file(root.join(".brainignore")).unwrap();
+        std::os::unix::fs::symlink("missing-policy", root.join(".brainignore")).unwrap();
+        let dangling = run(BrainWatcher::new(&db_path, &root, "default", "test"));
+        let message = format!("{:#}", dangling.expect_err("dangling .brainignore"));
+        assert!(message.contains(".brainignore"), "{message}");
+        assert_eq!(paths(), vec!["ok.md".to_string()]);
+        fs::remove_file(root.join(".brainignore")).unwrap();
+        fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+
         // An invalid `--ignore` pattern is refused the same way.
         let invalid = run(BrainWatcher::new(&db_path, &root, "default", "test")
             .with_extra_ignore_patterns(&["bad{x".to_string()]));
