@@ -77,7 +77,10 @@ export function FileDetail({ path }: FileDetailProps) {
     return () => controller.abort();
   }, [path, pickedRepo]);
 
-  if (loading) {
+  // nw-683: once a repo is picked, keep the header + picker mounted across
+  // the refetch (only the symbols/source area below reflects the loading
+  // state) so the pressed picker button doesn't lose focus.
+  if (loading && !(candidates && pickedRepo)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading file...

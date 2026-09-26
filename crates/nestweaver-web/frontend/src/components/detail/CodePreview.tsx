@@ -75,14 +75,6 @@ export function CodePreview({
     );
   }
 
-  if (error) {
-    return (
-      <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2 text-xs text-[var(--color-text-muted)]">
-        {error}
-      </div>
-    );
-  }
-
   const picker = pick ? (
     <div className="mb-2">
       <RepoPicker
@@ -93,6 +85,19 @@ export function CodePreview({
       />
     </div>
   ) : null;
+
+  if (error) {
+    // nw-683: keep the picker mounted so a failed local pick can be changed
+    // rather than dead-ending on the error text.
+    return (
+      <>
+        {picker}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2 text-xs text-[var(--color-text-muted)]">
+          {error}
+        </div>
+      </>
+    );
+  }
 
   if (!source || !source.lines) {
     return (

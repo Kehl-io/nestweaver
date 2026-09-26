@@ -87,6 +87,13 @@ export function SourceEvidencePanel({
     };
   }, [graphInstance, selectedNodeId, selectedNodeKind]);
 
+  // nw-683: a pick belongs to the path it was made for. Clear it whenever
+  // the selection changes so revisiting the same path later doesn't
+  // silently reapply a stale pick without a fresh ambiguity check.
+  useEffect(() => {
+    setRepoChoice(null);
+  }, [selectedNodeId]);
+
   useEffect(() => {
     const controller = new AbortController();
     setSymbolDetail(null);
@@ -257,6 +264,15 @@ export function SourceEvidencePanel({
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3 text-xs leading-5 text-[var(--color-text-muted)]">
             Select a node to inspect source spans, note excerpts, or an explicit
             no-evidence state.
+          </div>
+        ) : loading && fileChoice ? (
+          // nw-683: keep the picker mounted during the refetch a pick
+          // triggers so the pressed button doesn't lose focus.
+          <div>
+            {repoPicker}
+            <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3 text-xs text-[var(--color-text-muted)]">
+              Loading evidence...
+            </div>
           </div>
         ) : loading ? (
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3 text-xs text-[var(--color-text-muted)]">
