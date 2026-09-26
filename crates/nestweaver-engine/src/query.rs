@@ -2548,6 +2548,13 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     };
     let mut semantic_seed_count: usize = 0;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
+    // nw-686: set when the semantic leg was requested (weight > 0), had a
+    // model and a healthy vector store to search, but every resolved seed
+    // lacked a usable label -- there was no query text to embed at all. This
+    // is "the leg did not apply to this query", not a degraded/unavailable
+    // store, so it must not surface as `degraded_components: ["semantic"]`
+    // or a `semantic_unavailable` disclosure for an otherwise-healthy store.
+    let mut semantic_no_query_text = false;
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
         // No vectors in the store → the semantic leg can contribute
@@ -2560,7 +2567,9 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         // (unknown prefix, or empty/whitespace text) leaves `query_text`
         // empty. Embedding the empty string used to stand in for the raw
         // UID; skip the leg cleanly instead, the same as "no hits".
-        if !query_text.trim().is_empty() {
+        if query_text.trim().is_empty() {
+            semantic_no_query_text = true;
+        } else {
             ensure_brain_context_not_cancelled(cancel)?;
             let query_embedding = model.embed_query(&query_text);
             // Inference is a synchronous, potentially long-running boundary. A
@@ -2817,7 +2826,11 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         unresolved_seeds: unresolved,
         expansion_terms,
         semantic_applied,
-        semantic_unavailable: (semantic_requested && !semantic_applied).then(|| serde_json::json!({
+        // nw-686: a label-less UID seed set (`semantic_no_query_text`) is
+        // excluded here -- the leg simply had nothing to embed, which is not
+        // an unavailable/degraded vector store and would otherwise misreport
+        // a healthy store as `vectors_unavailable` for every such query.
+        semantic_unavailable: (semantic_requested && !semantic_applied && !semantic_no_query_text).then(|| serde_json::json!({
             "component": "semantic", "reason": semantic_reason, "pipeline": semantic_detail,
             "stage": match semantic_reason {
                 "model_unavailable" => "model_load",
@@ -2829,7 +2842,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             "remediation": "verify the configured embedding model and vector artifacts, then retry or rebuild embeddings"
         })),
         semantic_seed_count,
-        degraded_components: if semantic_requested && !semantic_applied {
+        degraded_components: if semantic_requested && !semantic_applied && !semantic_no_query_text {
             vec!["semantic".to_string()]
         } else {
             Vec::new()
@@ -6233,6 +6246,68 @@ mod semantic_leg_tests {
         );
         assert!(result.semantic_applied);
         assert!(result.degraded_components.is_empty());
+    }
+
+    #[test]
+    fn uid_seed_with_no_label_is_not_reported_as_degraded_semantic() {
+        // nw-686: a `proj:` uid whose project name is blank resolves (it
+        // exists) but yields no usable label -- `brain_seed_query_text`
+        // returns `None` for it, so `resolved_inputs` stays empty and the
+        // joined query text is empty. The store otherwise has healthy
+        // embeddings. This must read as "the semantic leg didn't apply to
+        // this query", not as a degraded/unavailable vector store.
+        struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
+        impl EmbedQueryFn for RecordingEmbed {
+            fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:blank".to_string(),
+                name: "   ".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        let model = RecordingEmbed(std::sync::Mutex::new(Vec::new()));
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["proj:blank".into()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            model.0.lock().unwrap().is_empty(),
+            "a label-less uid seed must not embed the empty string"
+        );
+        assert!(!result.semantic_applied);
+        assert!(
+            result.degraded_components.is_empty(),
+            "a healthy store must not report semantic as degraded just because this \
+             particular seed set had no text: {:?}",
+            result.degraded_components
+        );
+        assert!(
+            result.semantic_unavailable.is_none(),
+            "no alarming disclosure for a leg that simply did not apply: {:?}",
+            result.semantic_unavailable
+        );
     }
 
     /// Review finding: the error tells operators to re-embed, so re-embedding
