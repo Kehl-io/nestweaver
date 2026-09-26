@@ -25040,7 +25040,7 @@ mod repo_visibility_coverage_tests {
             file_path: file.to_string(),
             start_line: line,
             end_line: line,
-            signature: format!("fn {name}()"),
+            signature: format!("def {name}():"),
             summary: None,
             content_hash: format!("h_{uid}"),
             embedding: None,
@@ -25492,12 +25492,12 @@ mod repo_visibility_coverage_tests {
         let visible = only_alpha();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
-        // The canary line DEFINES the symbol: nw-689 withholds a span that no
-        // longer names its symbol, and this test is about the root reaching
-        // the body path, not about drift.
+        // Use a parsable definition with the canary in its body: nw-689
+        // verifies current parser spans, and this test is about the root
+        // reaching the body path, not about drift.
         std::fs::write(
             root.path().join("src/alpha.py"),
-            format!("def alphaPublicHelper(): pass  # {CANARY}\n"),
+            format!("def alphaPublicHelper():\n    pass  # {CANARY}\n"),
         )
         .unwrap();
 

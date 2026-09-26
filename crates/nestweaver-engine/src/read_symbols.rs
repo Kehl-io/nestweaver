@@ -6,6 +6,7 @@
 //! (`neighbors`) and is token-budget aware. Comment stripping is a planned
 //! follow-up (default-off; deferred to avoid false-elision risk).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use nestweaver_schema::Symbol;
@@ -36,8 +37,9 @@ pub struct SymbolWindow {
     /// `body_available` is false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale_span: bool,
-    /// nw-689: the stored span had drifted; the body was re-located to the
-    /// symbol's unique definition line. This is the originally stored start.
+    /// nw-689: the current parsed span differs from the indexed start or end.
+    /// This is the originally stored start (which may equal `start_line` when
+    /// only the end changed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relocated_from_line: Option<u32>,
 }
@@ -85,9 +87,8 @@ pub struct BudgetOverrun {
     pub note: String,
 }
 
-/// Read lines `start..=end` (1-based, inclusive) from `file_path` via the reader.
-fn read_span(reader: &dyn ContentReader, file_path: &str, start: u32, end: u32) -> Option<String> {
-    let text = reader.read_file(Path::new(file_path)).ok()?;
+/// Read lines `start..=end` (1-based, inclusive) from one already-read file.
+fn read_span(text: &str, start: u32, end: u32) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if start == 0 || start as usize > lines.len() {
         return None;
@@ -130,9 +131,9 @@ const HEADER_LINES: usize = 5;
 /// symbol `name`? A `false` means the file changed since indexing and the span
 /// now holds some other code.
 ///
-/// The rule is "the name appears as a whole word in the first
-/// [`HEADER_LINES`] lines", widened for spans that are correct but do not
-/// have the name there:
+/// The rule is "the name appears as a whole word in the declaration header,
+/// within [`HEADER_LINES`] lines after any annotation block", widened for
+/// spans whose declaration puts the name elsewhere:
 ///
 /// - a leading annotation/decorator/attribute block (Java and Dart fold
 ///   annotations INTO the declaration node, and a multi-line `@GetMapping(...)`
@@ -154,43 +155,26 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
         return true;
     }
     let lines: Vec<&str> = body.lines().collect();
-    // The indexed signature starts at the indexed span's first line. A short
-    // insertion can leave the symbol's name inside the old window while
-    // moving its declaration down. In that case returning the old window
-    // silently omits the end of the symbol. Folded annotations append the
-    // declaration to the signature, so their first source line is a prefix.
-    let first = lines.first().map(|line| line.trim()).unwrap_or("");
-    let signature = signature.trim();
-    if !signature.is_empty()
-        && (first.is_empty()
-            || !(signature == first
-                || signature.starts_with(first)
-                || first.starts_with(signature)))
-    {
-        return false;
-    }
+    // The parser has already identified the current declaration and its
+    // exact extent. The indexed signature may include an old one-line body,
+    // so comparing it to the current first line would reject a valid edit.
     // An Options API component is named after its .vue file. Its real
     // declaration says `export default`, never the component name.
     if file_component {
         return true;
     }
-    if lines
-        .iter()
-        .take(HEADER_LINES)
-        .any(|l| names_symbol(l, name))
-    {
-        return true;
-    }
     let decl = declaration_start(&lines);
-    if lines
-        .iter()
-        .skip(decl)
-        .take(HEADER_LINES)
-        .any(|l| names_symbol(l, name))
-    {
-        return true;
+    // Inspect the declaration header only. A call or comment inside the body
+    // can mention the old name while this span now belongs to another method.
+    for line in lines.iter().skip(decl).take(HEADER_LINES) {
+        if names_symbol(line, name) {
+            return true;
+        }
+        if line.contains('{') || line.contains(';') || line.contains("=>") {
+            break;
+        }
     }
-    lines.last().is_some_and(|l| names_symbol(l, name))
+    signature.starts_with("typedef") && lines.last().is_some_and(|l| names_symbol(l, name))
 }
 
 fn file_stem(file_path: &str) -> &str {
@@ -303,6 +287,46 @@ fn relocate(text: &str, name: &str, len: u32) -> Option<(u32, u32)> {
     Some((start, start + len.max(1) - 1))
 }
 
+/// Re-parse the current file to verify the symbol's actual start and end.
+/// The indexed line count is not safe after a file edit: a shorter definition
+/// can pull the next symbol into the window, and a longer one is truncated.
+fn verified_current_span(
+    text: &str,
+    parsed: &nestweaver_parser::ParsedFile,
+    sym: &Symbol,
+) -> Option<(u32, u32, String)> {
+    let candidates: Vec<_> = parsed
+        .symbols
+        .iter()
+        .filter(|raw| raw.name == sym.name && raw.kind == sym.kind)
+        .collect();
+    let hash_matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|raw| raw.content_hash == sym.content_hash)
+        .collect();
+    let raw = match hash_matches.as_slice() {
+        [only] => *only,
+        many if many.len() > 1 => *many.iter().find(|raw| raw.start_line == sym.start_line)?,
+        _ => match candidates.as_slice() {
+            [only] => *only,
+            _ => return None,
+        },
+    };
+    if raw.start_line != sym.start_line {
+        let old_len = sym.end_line.max(sym.start_line) - sym.start_line + 1;
+        if relocate(text, &sym.name, old_len).map(|(start, _)| start) != Some(raw.start_line) {
+            return None;
+        }
+    }
+    let body = read_span(text, raw.start_line, raw.end_line)?;
+    span_holds_symbol(&body, &sym.name, &sym.file_path, &sym.signature).then_some((
+        raw.start_line,
+        raw.end_line,
+        body,
+    ))
+}
+
 /// Resolve a spec (`sym:` UID, bare name, or dotted/`::` FQN) to candidate symbols.
 fn resolve(store: &GraphStore, spec: &str) -> Vec<Symbol> {
     if spec.starts_with("sym:") {
@@ -395,35 +419,42 @@ pub fn read_symbols_budgeted(
 
     // 3. Build windows, honoring the token budget (input order).
     let mut used = 0usize;
+    // Neighbor windows commonly share a file. Parse it once per call.
+    let mut file_cache: HashMap<String, Option<(String, Option<nestweaver_parser::ParsedFile>)>> =
+        HashMap::new();
     for (sym, is_neighbor) in ordered {
         let mut start_line = sym.start_line;
         let mut end_line = sym.end_line;
         let mut stale_span = false;
         let mut relocated_from_line = None;
-        let mut body_opt = read_span(reader, &sym.file_path, start_line, end_line);
-        // nw-689: the file may have changed since indexing, leaving the stored
-        // span over different code. Re-locate to the unique definition, or say
-        // the span is stale — never return another symbol's body as this one's.
-        if let Some(body) = &body_opt
-            && !span_holds_symbol(body, &sym.name, &sym.file_path, &sym.signature)
-        {
-            let len = end_line.max(start_line) - start_line + 1;
-            let relocated = reader
+        let current = file_cache.entry(sym.file_path.clone()).or_insert_with(|| {
+            reader
                 .read_file(Path::new(&sym.file_path))
                 .ok()
-                .and_then(|text| relocate(&text, &sym.name, len));
-            match relocated {
-                Some((s, e)) => {
-                    relocated_from_line = Some(start_line);
-                    (start_line, end_line) = (s, e);
-                    body_opt = read_span(reader, &sym.file_path, s, e);
+                .map(|text| {
+                    let parsed =
+                        nestweaver_parser::parse_source(Path::new(&sym.file_path), &text).ok();
+                    (text, parsed)
+                })
+        });
+        let body_opt = current.as_ref().and_then(|(text, parsed)| {
+            match parsed
+                .as_ref()
+                .and_then(|parsed| verified_current_span(text, parsed, &sym))
+            {
+                Some((current_start, current_end, body)) => {
+                    if current_start != start_line || current_end != end_line {
+                        relocated_from_line = Some(start_line);
+                        (start_line, end_line) = (current_start, current_end);
+                    }
+                    Some(body)
                 }
                 None => {
                     stale_span = true;
-                    body_opt = None;
+                    None
                 }
             }
-        }
+        });
         let body_available = body_opt.is_some();
         let body = body_opt.unwrap_or_default();
         let cost = window_cost(&body);
@@ -839,6 +870,57 @@ mod tests {
         assert_eq!(w.relocated_from_line, Some(3), "{w:?}");
         assert_eq!(w.start_line, 4, "{w:?}");
         assert!(w.body.starts_with("pub fn target()"), "{w:?}");
+    }
+
+    #[test]
+    fn repeated_annotation_with_a_call_does_not_validate_the_wrong_method() {
+        let src =
+            "class Api {\n    @Deprecated\n    public void target() {\n        work();\n    }\n}\n";
+        let (dir, store) = fixture_file("src/Api.java", src);
+        fs::write(
+            dir.path().join("src/Api.java"),
+            "class Api {\n    @Deprecated\n    public void other() {\n        target();\n    }\n    @Deprecated\n    public void target() {\n        work();\n    }\n}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(!w.body.contains("void other()"), "{w:?}");
+        assert!(w.stale_span || w.body.contains("void target()"), "{w:?}");
+    }
+
+    #[test]
+    fn relocated_shorter_definition_does_not_include_the_next_function() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn other() {}\npub fn target() {}\npub fn after() {}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.body, "pub fn target() {}", "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (2, 2), "{w:?}");
+    }
+
+    #[test]
+    fn relocated_longer_definition_keeps_its_end() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn other() {}\npub fn target() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(w.body.ends_with("}"), "{w:?}");
+        assert!(w.body.contains("x + y"), "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (2, 6), "{w:?}");
+    }
+
+    #[test]
+    fn edited_one_line_body_keeps_the_same_definition_available() {
+        let (dir, store) = fixture_with("pub fn target() { 1 }\n");
+        fs::write(dir.path().join("src/lib.rs"), "pub fn target() { 2 }\n").unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.body, "pub fn target() { 2 }", "{w:?}");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
     }
 
     /// nw-689: no unique definition to re-locate to -> say the span is stale
