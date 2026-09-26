@@ -241,7 +241,11 @@ use std::path::Path;
 ///     nowhere and make live code look DEAD, the same "previously-indexed
 ///     repos yield different (wrong) analysis" shape as generations 2 and 4.
 ///     Same remedy as every other bump in this file: `nestweaver index --repo
-///     <path> --force`.
+///     <path> --force`. Folded into the same bump (review, same PR): those
+///     definitions, and a same-file function they bare-identifier re-export
+///     (`module.exports.f = f`), are now `Visibility::Public` and root like
+///     an equivalent ES export instead of parsing `Private`/non-entry, the
+///     same persisted-column shape as generations 5/6 above.
 pub const RESOLVER_GENERATION: u32 = 7;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
