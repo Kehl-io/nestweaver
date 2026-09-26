@@ -1,5 +1,47 @@
 # Changelog
 
+## [10.3.1](https://github.com/Kehl-io/nestweaver/compare/v10.3.0...v10.3.1) (2026-09-26)
+
+
+### Bug Fixes
+
+* batch 6 — web/vault exposure and silent wrong answers ([9163d71](https://github.com/Kehl-io/nestweaver/commit/9163d71b6a035d3959ee39a27a99451f5a5a8285))
+* bound /source reads and pin symlinked repo roots (nw-682) ([da52940](https://github.com/Kehl-io/nestweaver/commit/da529408d4f053ddfe5a379c51da72542607d0d6))
+* **brain:** honour a committed .brainignore when indexing a vault from a bare clone (nw-684) ([26fc5b9](https://github.com/Kehl-io/nestweaver/commit/26fc5b9094a1af5d4e9684bdf0e6e15e1e6a148c))
+* **brain:** name the real cause when a server-mode .brainignore is refused (nw-684) ([ccd2714](https://github.com/Kehl-io/nestweaver/commit/ccd27142e9e2aaad192607c4e18535a091d2ec86))
+* **brain:** pin invalid .brainignore refusals on the daemon routes (nw-684) ([f2d5b37](https://github.com/Kehl-io/nestweaver/commit/f2d5b37264834d60e59bc1da259013828f8332f9))
+* **brain:** refuse to index a vault whose .brainignore is unreadable or invalid (nw-684) ([ec53ec5](https://github.com/Kehl-io/nestweaver/commit/ec53ec5104ff81f49fcaa6663cf0322af423bbfe))
+* **brain:** reject dangling brainignore policy links (nw-684) ([ed5e11d](https://github.com/Kehl-io/nestweaver/commit/ed5e11dcfb8951c458e8a4a7d05f737c512ea8b0))
+* **brain:** tighten .brainignore refusal messages and leave no state behind (nw-684) ([0430fa6](https://github.com/Kehl-io/nestweaver/commit/0430fa6423d9713b9c8350ba8ca4b614f1e6d14d))
+* close batch 6 validation gaps ([ea759e5](https://github.com/Kehl-io/nestweaver/commit/ea759e547c1cc5199a77b64d5ca00604de9530f2))
+* **context:** do not report semantic as degraded when a uid seed has no label (nw-686) ([1d999f2](https://github.com/Kehl-io/nestweaver/commit/1d999f279bacb8f450e90e4218e913f7ed29c05e))
+* **context:** search a uid seed by its label, not the uid string (nw-686) ([8521610](https://github.com/Kehl-io/nestweaver/commit/8521610e3d745475e44981b91d0124311980be02))
+* **daemon:** name an unreadable .brainignore before any vault sidecar write (nw-684) ([150bdb3](https://github.com/Kehl-io/nestweaver/commit/150bdb301d2e04641905c22293973ba1d2a2125c))
+* drop malformed hosts instead of mapping them to a sentinel (nw-682) ([4bc56f6](https://github.com/Kehl-io/nestweaver/commit/4bc56f64e638af123882717242c7227c7313f3fd))
+* **engine:** detect drifted read_symbols spans (nw-689) ([6f23a95](https://github.com/Kehl-io/nestweaver/commit/6f23a958f1815f9524002e6d7cdfdff47965a8c6))
+* **engine:** keep vault_folder project membership current for new notes (nw-679) ([1f3bbf7](https://github.com/Kehl-io/nestweaver/commit/1f3bbf71ada69aa00fba509535ecea5697a7367f))
+* **engine:** scope note links to the project before preferring definitions (nw-685) ([4659145](https://github.com/Kehl-io/nestweaver/commit/465914536a1bee86c1f8e2a4e9e4d50748dc5437))
+* **engine:** verify read_symbols spans against indexed signatures (nw-689) ([5c4df06](https://github.com/Kehl-io/nestweaver/commit/5c4df06f4dddc6dc42ac3ed1d9e6823ebcfd4262))
+* harden /source reads — size cap, symlink redirects, empty files (nw-682) ([85f8f3f](https://github.com/Kehl-io/nestweaver/commit/85f8f3f2bd69316147f372ff2a44dbd92f3c2840))
+* **investigate:** do not seed longer partial matches when the exact name resolved (nw-529) ([092fbdb](https://github.com/Kehl-io/nestweaver/commit/092fbdb09e9dbecda5d4e64030ff384d247ff157))
+* keep the repo picker usable after errors and preserve focus (nw-683) ([db1f3ec](https://github.com/Kehl-io/nestweaver/commit/db1f3ec629796efb8b8f960cb5af16c0b2d338df))
+* let the UI pick a repo when a file path is shared (nw-683) ([8901f32](https://github.com/Kehl-io/nestweaver/commit/8901f329275f781130176904df0601f1f6ec1079))
+* **parser:** recurse UMD guards for CommonJS re-exports, gate on lang (nw-687) ([3e3e11f](https://github.com/Kehl-io/nestweaver/commit/3e3e11f66d9d90574953c454b28ac9e73f773e02))
+* **parser:** root direct CommonJS function exports (nw-687) ([8490715](https://github.com/Kehl-io/nestweaver/commit/849071568a47c6a4b00df28a59e593cad7a3ef95))
+* **parser:** treat CommonJS exports as exported, like ES exports (nw-687) ([4aac2e1](https://github.com/Kehl-io/nestweaver/commit/4aac2e1e9093bb1ab78c268710514f9088d7e2fb))
+* **queries:** define CommonJS module.exports functions in JS and TS (nw-687) ([7abe922](https://github.com/Kehl-io/nestweaver/commit/7abe922b1184ebb6b8425bdc6e82974eecd5411c))
+* **read-symbols:** use current parsed boundaries for stale spans (nw-689) ([472cedd](https://github.com/Kehl-io/nestweaver/commit/472ceddeebbcf7e97ac1467c924977468e1dc3d5))
+* refuse non-loopback Host and Origin on the UI server (nw-682) ([fa4222a](https://github.com/Kehl-io/nestweaver/commit/fa4222a34587a95ac707ab72f458d4b93a544a1b))
+* report oversized non-UTF-8 boundaries as too large in /source (nw-682) ([6c050c1](https://github.com/Kehl-io/nestweaver/commit/6c050c12154719141083d288e67c3a65ab58be47))
+* request source by repo and explain ambiguous paths in the UI (nw-683) ([89257ec](https://github.com/Kehl-io/nestweaver/commit/89257ec3a9af17aaf0f7e15085719e7d5f965d0d))
+* require same-origin and check the URI authority in the UI host guard (nw-682) ([8a24da8](https://github.com/Kehl-io/nestweaver/commit/8a24da864df4346b362f5416ad47720c1cb128ef))
+* **resolver:** bump resolver generation to 7 for CommonJS definitions (nw-687) ([886fb5c](https://github.com/Kehl-io/nestweaver/commit/886fb5c961d96cbe14f2997a85eaa9c5a6739d14))
+* **resolver:** resolve mixed-language repositories per file ([019d576](https://github.com/Kehl-io/nestweaver/commit/019d576a60aff962780e60add22bf974f5cf580c))
+* send CSP, nosniff and frame-deny headers from the UI server (nw-625) ([6eb35fc](https://github.com/Kehl-io/nestweaver/commit/6eb35fcf2e3f63b9a4255c1cba10d9e80503eca1))
+* serve /source only for indexed files of a named repo (nw-682, nw-683) ([4ee9168](https://github.com/Kehl-io/nestweaver/commit/4ee9168868b7bdfe8536e731b01cbbd34834c195))
+* **web:** pin source path components during open (nw-682) ([1f5e893](https://github.com/Kehl-io/nestweaver/commit/1f5e893901819f1da45d0d307339759c3fc923d7))
+* **web:** resolve file source ownership before choosing a repo (nw-683) ([fad93c6](https://github.com/Kehl-io/nestweaver/commit/fad93c62437f72249707700a5471317df82b5e42))
+
 ## [10.3.0](https://github.com/Kehl-io/nestweaver/compare/v10.2.2...v10.3.0) (2026-09-25)
 
 
