@@ -141,15 +141,39 @@ const HEADER_LINES: usize = 5;
 /// - the LAST line of the span may carry the name (C `typedef struct { ... }
 ///   Name;`);
 /// - a file-level component symbol (Svelte/Vue/Astro) is named after the file
-///   stem, starts at line 1 and never names itself in its source.
-fn span_holds_symbol(body: &str, name: &str, file_path: &str, start_line: u32) -> bool {
+///   stem and may never name itself in its source.
+fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -> bool {
     if !is_identifier(name) {
         return true;
     }
-    if start_line == 1 && file_stem(file_path) == name {
+    let file_component = file_stem(file_path) == name
+        && ["vue", "svelte", "astro"].contains(&file_path.rsplit('.').next().unwrap_or(""));
+    // Script-setup and file-level component signatures are synthetic; they
+    // have no literal declaration line to compare against the source.
+    if file_component && signature.starts_with('<') {
         return true;
     }
     let lines: Vec<&str> = body.lines().collect();
+    // The indexed signature starts at the indexed span's first line. A short
+    // insertion can leave the symbol's name inside the old window while
+    // moving its declaration down. In that case returning the old window
+    // silently omits the end of the symbol. Folded annotations append the
+    // declaration to the signature, so their first source line is a prefix.
+    let first = lines.first().map(|line| line.trim()).unwrap_or("");
+    let signature = signature.trim();
+    if !signature.is_empty()
+        && (first.is_empty()
+            || !(signature == first
+                || signature.starts_with(first)
+                || first.starts_with(signature)))
+    {
+        return false;
+    }
+    // An Options API component is named after its .vue file. Its real
+    // declaration says `export default`, never the component name.
+    if file_component {
+        return true;
+    }
     if lines
         .iter()
         .take(HEADER_LINES)
@@ -381,7 +405,7 @@ pub fn read_symbols_budgeted(
         // span over different code. Re-locate to the unique definition, or say
         // the span is stale — never return another symbol's body as this one's.
         if let Some(body) = &body_opt
-            && !span_holds_symbol(body, &sym.name, &sym.file_path, start_line)
+            && !span_holds_symbol(body, &sym.name, &sym.file_path, &sym.signature)
         {
             let len = end_line.max(start_line) - start_line + 1;
             let relocated = reader
@@ -803,6 +827,20 @@ mod tests {
         assert!(w.body_available);
     }
 
+    /// A short insertion can leave the original name inside the old window.
+    /// The declaration moved even though a name-only check would accept it.
+    #[test]
+    fn short_drift_relocates_even_when_name_remains_in_window() {
+        let (dir, store) = fixture_with("pub fn other() {}\n\npub fn target() {\n    1\n}\n");
+        let path = dir.path().join("src/lib.rs");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("// inserted\n{text}")).unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.relocated_from_line, Some(3), "{w:?}");
+        assert_eq!(w.start_line, 4, "{w:?}");
+        assert!(w.body.starts_with("pub fn target()"), "{w:?}");
+    }
+
     /// nw-689: no unique definition to re-locate to -> say the span is stale
     /// rather than returning another symbol's body as this one's.
     #[test]
@@ -874,30 +912,52 @@ mod tests {
     }
 
     #[test]
+    fn vue_options_api_component_is_not_drift() {
+        let src = "<script>\nexport default {\n  data() { return { count: 0 }; }\n}\n</script>\n";
+        let (dir, store) = fixture_file("src/Counter.vue", src);
+        let w = read_one(&dir, &store, "Counter");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+        assert!(w.body.starts_with("export default"), "{w:?}");
+    }
+
+    #[test]
+    fn go_const_group_member_is_not_drift() {
+        let src = "package p\nconst (\n    Answer = 42\n    Other = 9\n)\n";
+        let (dir, store) = fixture_file("src/values.go", src);
+        let w = read_one(&dir, &store, "Answer");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+    }
+
+    #[test]
     fn span_holds_symbol_accepts_legitimate_shapes() {
         // Name on the last line (C `typedef struct { ... } Name;`).
         let typedef = "typedef struct {\n int a;\n int b;\n int c;\n int d;\n int e;\n} Point;";
-        assert!(span_holds_symbol(typedef, "Point", "src/p.h", 1));
+        assert!(span_holds_symbol(
+            typedef,
+            "Point",
+            "src/p.h",
+            "typedef struct {"
+        ));
         // Whole-word only: `target_x` does not name `target`.
         assert!(!span_holds_symbol(
             "fn target_x() {}",
             "target",
             "src/lib.rs",
-            3
+            "fn target() {}"
         ));
         // Non-identifier names (test blocks, FQNs) are never checked.
         assert!(span_holds_symbol(
             "fn a() {}",
             "renders the list",
             "src/a.ts",
-            3
+            ""
         ));
         // Go receiver method.
         assert!(span_holds_symbol(
             "func (s *Server) Handle(w http.ResponseWriter) {\n}",
             "Handle",
             "srv.go",
-            9
+            "func (s *Server) Handle(w http.ResponseWriter) {"
         ));
     }
 
