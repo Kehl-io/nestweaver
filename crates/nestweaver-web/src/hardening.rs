@@ -21,7 +21,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::Request,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -242,8 +242,37 @@ async fn loopback_only(request: Request, next: Next, extra: Arc<Vec<String>>) ->
     }
 }
 
+/// nw-625. `script-src` needs `'wasm-unsafe-eval'` for `?engine=wasm`;
+/// `style-src 'unsafe-inline'` covers the R3F/troika runtime style tags;
+/// `worker-src blob:` covers Vite/three workers. No remote origins: the
+/// troika jsDelivr font fallback (nw-538) is blocked by design.
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; \
+connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; \
+frame-ancestors 'none'; form-action 'self'";
+
+/// Outermost layer (see [`harden_with_allowed_hosts`]): stamps every
+/// response -- including a 403 from [`loopback_only`] -- with the same
+/// security headers, since the audience for a refused request (a browser
+/// that got rebound or is trying to iframe the UI) is exactly who these
+/// headers protect against.
 async fn security_headers(request: Request, next: Next) -> Response {
-    next.run(request).await // Task 2 fills this in; kept as a pass-through here.
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 #[cfg(test)]

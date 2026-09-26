@@ -1756,6 +1756,14 @@ async fn export_html_returns_html() {
 }
 
 async fn get_with_headers(app: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+    get_with_headers_full(app, uri, headers).await.status()
+}
+
+async fn get_with_headers_full(
+    app: &axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
     let mut req = Request::builder().uri(uri);
     for (k, v) in headers {
         req = req.header(*k, *v);
@@ -1764,7 +1772,6 @@ async fn get_with_headers(app: &axum::Router, uri: &str, headers: &[(&str, &str)
         .oneshot(req.body(Body::empty()).unwrap())
         .await
         .unwrap()
-        .status()
 }
 
 #[tokio::test]
@@ -2001,4 +2008,61 @@ async fn hardened_router_admits_uri_authority_only_with_matching_origin() {
         .unwrap();
     let status = app.clone().oneshot(req).await.unwrap().status();
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn hardened_router_sets_security_headers_on_spa_and_api() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for uri in ["/", "/api/v1/version"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "127.0.0.1:9377")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let h = resp.headers();
+        let csp = h
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            csp.contains("default-src 'self'"),
+            "{uri}: CSP missing: {csp:?}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp:?}");
+        assert!(
+            csp.contains("'wasm-unsafe-eval'"),
+            "{uri}: ?engine=wasm must keep working: {csp:?}"
+        );
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff", "{uri}");
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY", "{uri}");
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn hardened_router_sets_security_headers_on_forbidden_responses_too() {
+    // security_headers is the outer layer (nw-682 layer-order fix), so a
+    // 403 from the Host/Origin guard must carry the same security headers
+    // as every other response -- an attacker's rebound page is exactly the
+    // audience that needs CSP/X-Frame-Options on the page it *did* get.
+    let app = nestweaver_web::hardening::harden(make_app());
+    let resp = get_with_headers_full(&app, "/api/v1/version", &[("host", "evil.example")]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let h = resp.headers();
+    assert!(
+        h.get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("default-src 'self'"),
+        "403 response missing CSP: {:?}",
+        h.get("content-security-policy")
+    );
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
 }
