@@ -25986,6 +25986,21 @@ fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -
         "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
         w.name, w.kind, w.path, w.start_line, w.end_line, tag
     );
+    // nw-689: the span drifted since indexing. Checked before
+    // `body_available` so a stale span is not blamed on the working directory.
+    if w.stale_span {
+        return format!(
+            "{header}\n   source changed since indexing: {} no longer holds `{}` at lines {}-{} \
+             \u{2014} re-index the repo (`nestweaver index --repo <path>`)",
+            w.path, w.name, w.start_line, w.end_line
+        );
+    }
+    if let Some(old) = w.relocated_from_line {
+        return format!(
+            "{header}  (moved from line {old} since indexing)\n{}",
+            w.body
+        );
+    }
     if w.body_available {
         format!("{header}\n{}", w.body)
     } else {
@@ -41091,6 +41106,8 @@ credential_method = "gh"
             body: String::new(),
             body_available: false,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let out = read_symbols_window_text(&w);
         assert!(
@@ -41101,6 +41118,53 @@ credential_method = "gh"
             out.contains("--root"),
             "the remedy must be named, not implied: {out:?}"
         );
+    }
+
+    /// nw-689: a stale span says the source changed and names the remedy
+    /// (re-index), not the nw-340 "pass --root" advice for an unreadable file.
+    #[test]
+    fn read_symbols_window_reports_a_stale_span() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 10,
+            end_line: 14,
+            body: String::new(),
+            body_available: false,
+            is_neighbor: false,
+            stale_span: true,
+            relocated_from_line: None,
+        };
+        let out = read_symbols_window_text(&w);
+        assert!(out.contains("source changed since indexing"), "{out:?}");
+        assert!(out.contains("re-index"), "{out:?}");
+        assert!(
+            !out.contains("--root"),
+            "not a working-directory problem: {out:?}"
+        );
+    }
+
+    /// nw-689: a re-located body is printed, and the move is disclosed.
+    #[test]
+    fn read_symbols_window_discloses_a_relocated_span() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 13,
+            end_line: 15,
+            body: "fn greet() {\n    hello();\n}".into(),
+            body_available: true,
+            is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: Some(10),
+        };
+        let out = read_symbols_window_text(&w);
+        assert!(out.contains("moved from line 10 since indexing"), "{out:?}");
+        assert!(out.contains("fn greet() {"), "{out:?}");
     }
 
     /// nw-340's own pinning assertion, quoted from the item: "for a symbol
@@ -41118,6 +41182,8 @@ credential_method = "gh"
             body: "fn greet() {\n    hello();\n}".into(),
             body_available: true,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let text = read_symbols_window_text(&w);
         let body: Vec<&str> = text.lines().skip(1).collect();
@@ -41146,6 +41212,8 @@ credential_method = "gh"
             body: String::new(),
             body_available: false,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
             symbols: vec![unreadable("greet")],

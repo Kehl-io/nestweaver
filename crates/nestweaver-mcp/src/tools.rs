@@ -4223,22 +4223,39 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     // that looks identical to a genuinely empty symbol. Surface an honest note so
     // an agent in the wrong cwd knows to pass `root` instead of trusting "".
     if !is_server_mode() {
-        let unreadable = value
-            .get("symbols")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter(|s| s.get("body_available").and_then(|b| b.as_bool()) == Some(false))
-                    .count()
-            })
-            .unwrap_or(0);
+        let count = |pred: &dyn Fn(&serde_json::Value) -> bool| {
+            value
+                .get("symbols")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter(|s| pred(s)).count())
+                .unwrap_or(0)
+        };
+        // nw-689: a drifted span also has `body_available: false`, but its
+        // file WAS read — it just no longer holds the symbol. Blaming the
+        // working directory for it would be wrong advice.
+        let is_stale = |s: &serde_json::Value| s.get("stale_span") == Some(&json!(true));
+        let stale = count(&is_stale);
+        let unreadable = count(&|s| {
+            s.get("body_available").and_then(|b| b.as_bool()) == Some(false) && !is_stale(s)
+        });
+        let mut notes = Vec::new();
         if unreadable > 0 {
-            value["note"] = serde_json::json!(format!(
+            notes.push(format!(
                 "{unreadable} symbol(s) returned an empty body because their source file could \
                  not be read from the owning repo's local_root or the working directory ({}). \
                  Pass `root` (the repo path) or run from the repo root to get source spans.",
                 fallback_root.display()
             ));
+        }
+        if stale > 0 {
+            notes.push(format!(
+                "{stale} symbol(s) have `stale_span: true`: the source changed since indexing, \
+                 the stored lines no longer hold the symbol and it could not be re-located, so \
+                 no body is returned. Re-index the repo to refresh the spans."
+            ));
+        }
+        if !notes.is_empty() {
+            value["note"] = serde_json::json!(notes.join(" "));
         }
     }
 
@@ -25475,7 +25492,14 @@ mod repo_visibility_coverage_tests {
         let visible = only_alpha();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
-        std::fs::write(root.path().join("src/alpha.py"), format!("{CANARY}\n")).unwrap();
+        // The canary line DEFINES the symbol: nw-689 withholds a span that no
+        // longer names its symbol, and this test is about the root reaching
+        // the body path, not about drift.
+        std::fs::write(
+            root.path().join("src/alpha.py"),
+            format!("def alphaPublicHelper(): pass  # {CANARY}\n"),
+        )
+        .unwrap();
 
         let read_args = json!({
             "targets": ["sym:alpha:public"],
@@ -26230,6 +26254,69 @@ mod request_bound_tests {
         assert!(
             body.contains("function greet"),
             "expected greet span from repo root, got: {body:?}"
+        );
+    }
+
+    /// nw-689: a span that drifted since indexing comes back `stale_span`
+    /// with `body_available: false`. The note must say the SOURCE CHANGED —
+    /// not the nw-478 "could not be read, pass `root`" advice, which sends
+    /// the agent chasing a working-directory problem it does not have.
+    #[test]
+    fn read_symbols_note_distinguishes_a_stale_span_from_an_unreadable_file() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        // The index said `greet` is at 1-3; the file now holds other code.
+        std::fs::write(
+            src.join("main.js"),
+            "function a() {}\nfunction b() {}\nfunction c() {}\n",
+        )
+        .unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:t:abc".into(),
+                url: format!("file://{}", src.display()),
+                indexed_sha: "local".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: Some("t".into()),
+                root_path: Some(src.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:repo:t:abc:greet".into(),
+                name: "greet".into(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:t:abc".into(),
+                file_path: "main.js".into(),
+                start_line: 1,
+                end_line: 3,
+                signature: "function greet(name)".into(),
+                summary: None,
+                content_hash: "hash-greet".into(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let resp = tool_read_symbols(&store, json!({ "targets": ["greet"] })).unwrap();
+        let symbols = resp["symbols"].as_array().expect("symbols");
+        assert_eq!(symbols[0]["stale_span"], true, "{resp}");
+        assert_eq!(symbols[0]["body_available"], false, "{resp}");
+        let note = resp["note"].as_str().unwrap_or_default();
+        assert!(note.contains("changed since indexing"), "{resp}");
+        assert!(
+            !note.contains("could not be read"),
+            "a stale span is not an unreadable file: {note}"
         );
     }
 

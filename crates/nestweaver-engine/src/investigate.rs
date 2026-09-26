@@ -2055,6 +2055,11 @@ pub enum BodyUnavailable {
     /// (explicit or a genuinely recorded repo `local_root`) was tried and
     /// still didn't contain the file.
     NoRecordedLocalRoot { path: String },
+    /// nw-689: the file WAS read, but it changed since indexing and the stored
+    /// span no longer holds the symbol (and it could not be re-located).
+    /// Distinct from `SourceUnreadable`: a different `root` will not help;
+    /// re-indexing will.
+    StaleSpan { path: String },
     /// The node exists and its body is genuinely empty.
     Empty,
     /// No such node in the graph (a stale bundle, or a UID from another graph).
@@ -2077,6 +2082,12 @@ impl BodyUnavailable {
                 format!(
                     "no recorded local_root for this symbol's repo; tried the server's \
                      working directory and could not read: {path}"
+                )
+            }
+            BodyUnavailable::StaleSpan { path } => {
+                format!(
+                    "source changed since indexing; the stored span no longer holds this \
+                     symbol (re-index the repo): {path}"
                 )
             }
             BodyUnavailable::Empty => "the node's body is empty".to_string(),
@@ -2200,6 +2211,9 @@ fn fetch_full_body(
                 // a different, more actionable fact than a real root (given
                 // explicitly, or resolved from a genuine repo `local_root`)
                 // simply not containing the file.
+                Some(window) if window.stale_span => {
+                    Err(BodyUnavailable::StaleSpan { path: window.path })
+                }
                 Some(window) if !window.body_available => Err(match resolved_root {
                     SymbolRootSource::FallbackCwd(_) => {
                         BodyUnavailable::NoRecordedLocalRoot { path: window.path }
@@ -6409,6 +6423,69 @@ mod tests {
         assert!(
             entry.inline_body.as_deref().is_some_and(|b| !b.is_empty()),
             "hydrate must be able to retry an entry expand could not read"
+        );
+    }
+
+    /// nw-689: a span that drifted since indexing is a STALE span, not an
+    /// unreadable root — the reason must say re-index, not "pass a root".
+    #[test]
+    fn investigate_expand_reports_a_drifted_span_as_stale() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        // The repo changed since indexing: line 1 no longer holds `greet`.
+        fs::write(
+            src.join("greet").join("main.js"),
+            "function other(x) { return x; }\nfunction hello(name) { return name; }",
+        )
+        .unwrap();
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_stale".to_string(),
+            Bundle {
+                bundle_id: "bndl_stale".to_string(),
+                created_at: now_epoch(),
+                query: "q".to_string(),
+                scope: "vault".to_string(),
+                entries: vec![BundleEntry {
+                    asset_id: "a_greet".to_string(),
+                    uid: greet_uid,
+                    kind: "Symbol".to_string(),
+                    title: "greet".to_string(),
+                    location: "greet/main.js:1".to_string(),
+                    summary: None,
+                    inline_body: None,
+                    body_complete: true,
+                    expanded: false,
+                    unavailable_reason: None,
+                    is_seed: false,
+                    matched_query: None,
+                    relevance: 1.0,
+                }],
+            },
+        );
+        save_bundle_store(&db_path, &bundle_store).unwrap();
+
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            Some(&src),
+            "bndl_stale",
+            &["a_greet".to_string()],
+        )
+        .unwrap();
+        let entry = &expanded.expanded[0];
+        assert!(entry.inline_body.is_none(), "{entry:?}");
+        let reason = entry.unavailable_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("changed since indexing"),
+            "a drifted span must be reported as stale, got: {reason:?}"
         );
     }
 
