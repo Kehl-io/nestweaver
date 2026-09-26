@@ -2274,6 +2274,50 @@ async fn source_refuses_files_over_the_size_cap() {
     assert!(j["message"].is_string(), "{j}");
 }
 
+/// nw-682: an oversized file of multi-byte UTF-8 whose cap (plus the one
+/// overflow byte) cuts mid-character is still "too large", not "not
+/// available". The size check must come before UTF-8 validation.
+#[tokio::test]
+async fn source_oversized_file_cut_mid_character_is_too_large() {
+    use std::io::Write as _;
+    let (_d, app) = solo_source_app(
+        |root| {
+            // 64 KiB of `é` (2 bytes each) x 128 = exactly 8 MiB, plus one
+            // more `é`: 8 MiB + 2 bytes. The bounded read takes 8 MiB + 1
+            // bytes, which ends on the first byte of the last `é`. The
+            // tempdir (and this ~8 MiB file) is removed when `_d` drops.
+            let chunk = "é".repeat(32 * 1024);
+            let mut f = std::io::BufWriter::new(
+                std::fs::File::create(root.join("src/accents.txt")).unwrap(),
+            );
+            for _ in 0..128 {
+                f.write_all(chunk.as_bytes()).unwrap();
+            }
+            f.write_all("é".as_bytes()).unwrap();
+            f.flush().unwrap();
+        },
+        &["src/accents.txt"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/accents.txt&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(j["error"], "source_too_large", "{j}");
+}
+
+/// Counterweight: a file under the cap that is not UTF-8 is still "not
+/// available", not served lossily and not "too large".
+#[tokio::test]
+async fn source_small_non_utf8_file_is_not_available() {
+    let (_d, app) = solo_source_app(
+        |root| {
+            std::fs::write(root.join("src/latin1.txt"), [b'c', b'a', b'f', 0xE9, b'\n']).unwrap()
+        },
+        &["src/latin1.txt"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/latin1.txt&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(j["error"], "source_not_available", "{j}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn source_refuses_an_indexed_symlink_that_redirects_inside_the_repo() {

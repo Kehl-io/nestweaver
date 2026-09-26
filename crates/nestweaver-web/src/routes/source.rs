@@ -87,10 +87,16 @@ fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
     let Ok(f) = std::fs::File::open(&canon_path) else {
         return Read::NotAvailable;
     };
-    let mut content = String::new();
-    match f.take(MAX_SOURCE_BYTES + 1).read_to_string(&mut content) {
+    // Read raw bytes and check the size BEFORE decoding: the cap can cut a
+    // multi-byte character, and an oversized file must report TooLarge, not
+    // the UTF-8 error that cut produces.
+    let mut bytes = Vec::new();
+    match f.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut bytes) {
         Ok(n) if n as u64 > MAX_SOURCE_BYTES => Read::TooLarge,
-        Ok(_) => Read::Content(content),
+        Ok(_) => match String::from_utf8(bytes) {
+            Ok(content) => Read::Content(content),
+            Err(_) => Read::NotAvailable,
+        },
         Err(_) => Read::NotAvailable,
     }
 }
