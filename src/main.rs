@@ -28330,6 +28330,13 @@ fn run_brain(
                     })
                 })
                 .transpose()?;
+            // nw-684 Task 5c: on the direct path (`--no-daemon`) refuse over
+            // an unloadable `.brainignore` before registration discovery opens
+            // the store and before the write lease is taken, mirroring the
+            // `brain add` pre-check. The daemon routes check it themselves.
+            if !use_daemon {
+                nestweaver_engine::load_brain_ignore(&path, &extra_patterns)?;
+            }
 
             // nw-098: resolve the instance from any EXISTING registration for this
             // root before falling back to flag > config > "default".
