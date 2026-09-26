@@ -8,8 +8,13 @@
 //!
 //! An absent Host/authority is admitted: HTTP/1.1 browsers always send a
 //! Host, and local non-browser clients and in-process tests may not send
-//! either. `NESTWEAVER_UI_ALLOWED_HOSTS` (comma-separated host names, no
-//! ports) adds names for a deliberate local reverse proxy.
+//! either. `NESTWEAVER_UI_ALLOWED_HOSTS` (comma-separated hostnames) adds
+//! names for a deliberate local reverse proxy; a `:port` on an entry is
+//! stripped (ports are never part of the comparison), so `proxy.local:8080`
+//! and `proxy.local` are equivalent. Because Origin must equal Host exactly
+//! when both are present, that proxy must forward the browser's original
+//! Host header unchanged rather than rewriting it to its own upstream
+//! address -- e.g. nginx needs `proxy_set_header Host $host;`.
 
 use std::sync::Arc;
 
@@ -22,13 +27,6 @@ use axum::{
 };
 
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
-
-/// Sentinel returned by [`host_of`] for a malformed bracketed authority
-/// (e.g. `[::1]evil`, `[::1]:x`). Contains a NUL byte, which
-/// `HeaderValue::to_str()` never yields for a header we accepted, so this
-/// value can never equal a legitimately parsed Host/Origin/URI authority
-/// and therefore never passes [`host_allowed`].
-const UNMATCHABLE_HOST: &str = "\u{0}unmatchable";
 
 /// Wrap every route of `router` in the Host/Origin allowlist (reading
 /// `NESTWEAVER_UI_ALLOWED_HOSTS` once) and the security response headers.
@@ -44,8 +42,26 @@ pub fn harden(router: Router) -> Router {
 /// exercise the allowlist path without mutating process-global env state.
 pub fn harden_with_allowed_hosts(router: Router, extra: Vec<String>) -> Router {
     // Normalise once, up front: host_of() also strips a port, so an entry
-    // like "proxy.local:8080" in the list still matches a bare Host.
-    let extra: Arc<Vec<String>> = Arc::new(extra.iter().map(|h| host_of(h)).collect());
+    // like "proxy.local:8080" in the list still matches a bare Host. A
+    // malformed entry is dropped rather than mapped to a shared
+    // placeholder: collapsing distinct malformed strings into one
+    // "unmatchable" value would make them match *each other* through this
+    // very allowlist, which defeats the point of rejecting them.
+    let extra: Arc<Vec<String>> = Arc::new(
+        extra
+            .iter()
+            .filter_map(|h| match host_of(h) {
+                Some(normalized) => Some(normalized),
+                None => {
+                    tracing::warn!(
+                        raw_entry = %h,
+                        "nestweaver-web: ignoring malformed NESTWEAVER_UI_ALLOWED_HOSTS entry (nw-682)"
+                    );
+                    None
+                }
+            })
+            .collect(),
+    );
 
     router
         // loopback_only is added first (innermost, closest to the routes).
@@ -73,38 +89,43 @@ fn extra_allowed_hosts_from_env() -> Vec<String> {
 }
 
 /// The host part of an authority (`host[:port]`, `[v6]:port`), lowercased.
-/// A bracketed host with trailing text that is neither empty nor a valid
-/// `:port` (e.g. `[::1]evil`) is rejected via [`UNMATCHABLE_HOST`] rather
-/// than silently truncated to `[::1]`.
-fn host_of(authority: &str) -> String {
+/// `None` means the authority is malformed and must be refused outright: an
+/// unclosed `[`, or a bracketed host followed by trailing text that is
+/// neither empty nor a valid `:port` (e.g. `[::1]evil`, `[::1]:x`). Such
+/// input is never mapped to a placeholder string -- two different
+/// malformed authorities must never compare equal to each other.
+fn host_of(authority: &str) -> Option<String> {
     let authority = authority.trim().to_ascii_lowercase();
     if let Some(rest) = authority.strip_prefix('[') {
-        return match rest.find(']') {
-            Some(end) => {
-                let after = &rest[end + 1..];
-                let port_ok = after.is_empty()
-                    || (after.starts_with(':')
-                        && !after[1..].is_empty()
-                        && after[1..].chars().all(|c| c.is_ascii_digit()));
-                if port_ok {
-                    format!("[{}]", &rest[..end])
-                } else {
-                    UNMATCHABLE_HOST.to_string()
-                }
-            }
-            None => UNMATCHABLE_HOST.to_string(),
-        };
+        let end = rest.find(']')?;
+        let after = &rest[end + 1..];
+        let port_ok = after.is_empty()
+            || (after.starts_with(':')
+                && !after[1..].is_empty()
+                && after[1..].chars().all(|c| c.is_ascii_digit()));
+        return port_ok.then(|| format!("[{}]", &rest[..end]));
     }
-    match authority.rsplit_once(':') {
+    Some(match authority.rsplit_once(':') {
         Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
             host.to_string()
         }
         _ => authority,
-    }
+    })
 }
 
 fn host_allowed(host: &str, extra: &[String]) -> bool {
     LOOPBACK_HOSTS.contains(&host) || extra.iter().any(|h| h == host)
+}
+
+/// Parse `authority` and check it against the loopback/extra allowlist in
+/// one step. A malformed authority (`host_of` returns `None`) is always
+/// refused -- it never falls back to the allowlist for `None` itself, only
+/// for a successfully parsed host.
+fn authority_allowed(authority: &str, extra: &[String]) -> bool {
+    match host_of(authority) {
+        Some(host) => host_allowed(&host, extra),
+        None => false,
+    }
 }
 
 /// Why a request was refused, and the header/authority value that triggered
@@ -127,7 +148,7 @@ impl Refusal {
             "nestweaver-web: refused non-loopback request (nw-682)"
         );
         let body = format!(
-            r#"{{"error":"{code}","message":"The NestWeaver UI only answers loopback hosts (localhost, 127.0.0.1, [::1]) with a matching Origin, if one is sent. Set NESTWEAVER_UI_ALLOWED_HOSTS to admit a local reverse-proxy name."}}"#
+            r#"{{"error":"{code}","message":"The NestWeaver UI only answers loopback hosts (localhost, 127.0.0.1, [::1]) with a matching Origin, if one is sent. Set NESTWEAVER_UI_ALLOWED_HOSTS to admit a local reverse-proxy name -- the proxy must forward the browser's original Host header unchanged (e.g. nginx's `proxy_set_header Host $host;`), since Origin must equal Host exactly."}}"#
         );
         (
             StatusCode::FORBIDDEN,
@@ -158,14 +179,14 @@ fn request_allowed(
         let Ok(host) = host.to_str() else {
             return Err(Refusal::Host("<unparseable>".to_string()));
         };
-        if !host_allowed(&host_of(host), extra) {
+        if !authority_allowed(host, extra) {
             return Err(Refusal::Host(host.to_string()));
         }
         host_authority = Some(host.to_string());
     }
 
     if let Some(uri_authority) = uri_authority {
-        if !host_allowed(&host_of(uri_authority), extra) {
+        if !authority_allowed(uri_authority, extra) {
             return Err(Refusal::Host(uri_authority.to_string()));
         }
         if host_authority.is_none() {
@@ -203,7 +224,7 @@ fn request_allowed(
                 // No Host header and no URI authority (in-process test, or
                 // a non-browser client that only sent Origin): fall back to
                 // the loopback allowlist for the Origin alone.
-                if !host_allowed(&host_of(origin_authority), extra) {
+                if !authority_allowed(origin_authority, extra) {
                     return Err(Refusal::Origin(origin.to_string()));
                 }
             }
@@ -231,18 +252,32 @@ mod tests {
 
     #[test]
     fn host_of_strips_ports_and_keeps_v6_brackets() {
-        assert_eq!(host_of("127.0.0.1:9377"), "127.0.0.1");
-        assert_eq!(host_of("LOCALHOST"), "localhost");
-        assert_eq!(host_of("[::1]:9377"), "[::1]");
-        assert_eq!(host_of("evil.example:9377"), "evil.example");
+        assert_eq!(host_of("127.0.0.1:9377"), Some("127.0.0.1".to_string()));
+        assert_eq!(host_of("LOCALHOST"), Some("localhost".to_string()));
+        assert_eq!(host_of("[::1]:9377"), Some("[::1]".to_string()));
+        assert_eq!(
+            host_of("evil.example:9377"),
+            Some("evil.example".to_string())
+        );
     }
 
     #[test]
-    fn host_of_rejects_malformed_bracketed_authority() {
-        // Trailing garbage after `]` that isn't a valid `:port` must not be
-        // silently truncated down to a loopback-looking host.
-        assert!(!host_allowed(&host_of("[::1]evil"), &[]));
-        assert!(!host_allowed(&host_of("[::1]:x"), &[]));
-        assert!(host_allowed(&host_of("[::1]:9377"), &[]));
+    fn host_of_returns_none_for_malformed_authority() {
+        // Trailing garbage after `]` that isn't a valid `:port`, or an
+        // unclosed `[`, must not be silently truncated down to a
+        // loopback-looking host -- and must not collapse to a shared
+        // placeholder either, since that would make two different
+        // malformed authorities compare equal to each other.
+        assert_eq!(host_of("[bad"), None);
+        assert_eq!(host_of("[::1]evil"), None);
+        assert_eq!(host_of("[::1]:x"), None);
+        assert_eq!(host_of("[::1]:9377"), Some("[::1]".to_string()));
+    }
+
+    #[test]
+    fn authority_allowed_refuses_malformed_authorities_outright() {
+        assert!(!authority_allowed("[::1]evil", &[]));
+        assert!(!authority_allowed("[::1]:x", &[]));
+        assert!(authority_allowed("[::1]:9377", &[]));
     }
 }

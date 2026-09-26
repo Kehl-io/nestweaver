@@ -1960,3 +1960,45 @@ async fn hardened_router_host_case_and_trailing_dot_edge_cases() {
         "trailing-dot DNS canonicalization must not bypass the allowlist"
     );
 }
+
+#[tokio::test]
+async fn harden_with_allowed_hosts_drops_malformed_entries_and_still_refuses_malformed_hosts() {
+    // A malformed allowlist entry ("[bad", unclosed bracket) must not
+    // silently become an equivalence class that admits other malformed
+    // Host values -- it must be dropped, not normalized to a shared
+    // placeholder that then matches anything else equally malformed.
+    let app =
+        nestweaver_web::hardening::harden_with_allowed_hosts(make_app(), vec!["[bad".to_string()]);
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "[evil")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "[::1]evil")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_when_uri_authority_disagrees_with_host_header() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://evil.example/api/v1/version")
+        .header("host", "localhost:9377")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hardened_router_admits_uri_authority_only_with_matching_origin() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://127.0.0.1:9377/api/v1/version")
+        .header("origin", "http://127.0.0.1:9377")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::OK);
+}
