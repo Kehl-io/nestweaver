@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
 import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
-import { ambiguousCandidates, sharedRepoUid, sourceErrorText } from "../../api/source";
+import { ambiguousCandidates, sourceErrorText } from "../../api/source";
 import type { NoteDetail, SourceResponse, SymbolCandidate, SymbolDetail } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
@@ -150,9 +150,8 @@ export function SourceEvidencePanel({
 
     if (isFileLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
-      // nw-683: the symbols name the repo, so fetch them first and request
-      // that repo's copy of the file; a path several repos index is a 409
-      // until the user picks one, and then only that repo's symbols show.
+      // Symbols populate the list; /source resolves path ownership, including
+      // repos that index the file without finding any symbols in it.
       const path = selectedNodeId;
       let sourceError: unknown = null;
       api
@@ -163,7 +162,7 @@ export function SourceEvidencePanel({
             ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
             : allSymbols;
           const source = await api
-            .source(path, 1, 12, { signal: controller.signal }, pickedRepo ?? sharedRepoUid(symbols))
+            .source(path, 1, 12, { signal: controller.signal }, pickedRepo)
             .catch((e: unknown) => {
               sourceError = e;
               return null;
@@ -342,7 +341,7 @@ export function SourceEvidencePanel({
               <CodePreview
                 filePath={selectedNodeId}
                 line={line ?? 1}
-                repoUid={pickedRepo ?? fileSource?.repo ?? sharedRepoUid(fileSymbols)}
+                repoUid={pickedRepo ?? fileSource?.repo}
                 context={compact ? 5 : 10}
                 onPickRepo={pickRepo}
               />

@@ -1,17 +1,6 @@
 import { api } from "./client";
 import { ApiError } from "./errors";
-import type { Repo, SymbolCandidate } from "./types";
-
-/**
- * The repo uid every symbol in a file list shares, or `undefined` when the
- * list is empty or spans more than one repo (nw-683). With no shared repo the
- * caller omits `repo` and lets the server answer 409 for an ambiguous path.
- */
-export function sharedRepoUid(symbols: SymbolCandidate[]): string | undefined {
-  const first = symbols[0]?.repo_uid;
-  if (!first) return undefined;
-  return symbols.every((s) => s.repo_uid === first) ? first : undefined;
-}
+import type { Repo } from "./types";
 
 /**
  * Human text for a failed `/api/v1/source` request. Known machine codes get

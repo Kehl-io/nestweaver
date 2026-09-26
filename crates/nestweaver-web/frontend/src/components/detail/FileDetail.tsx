@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
-import { ambiguousCandidates, sharedRepoUid, sourceErrorText } from "../../api/source";
+import { ambiguousCandidates, sourceErrorText } from "../../api/source";
 import type { SourceResponse, SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
@@ -36,9 +36,8 @@ export function FileDetail({ path }: FileDetailProps) {
     setLoading(true);
     setError(null);
 
-    // nw-683: the symbols name the repo, so fetch them first and request
-    // that repo's copy of the file; a path several repos index is a 409
-    // until the user picks one, and then only that repo's symbols show.
+    // Fetch symbols for the list, but let /source resolve path ownership.
+    // A repo with no symbols may still index the same file.
     let sourceError: unknown = null;
     api
       .symbolsInFile(path)
@@ -48,7 +47,7 @@ export function FileDetail({ path }: FileDetailProps) {
           ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
           : allSymbols;
         const fileSource = await api
-          .source(path, 1, 12, { signal: controller.signal }, pickedRepo ?? sharedRepoUid(fileSymbols))
+          .source(path, 1, 12, { signal: controller.signal }, pickedRepo)
           .catch((e: unknown) => {
             sourceError = e;
             return null;
@@ -182,7 +181,7 @@ export function FileDetail({ path }: FileDetailProps) {
           <CodePreview
             filePath={path}
             line={line}
-            repoUid={pickedRepo ?? source?.repo ?? sharedRepoUid(symbols)}
+            repoUid={pickedRepo ?? source?.repo}
             ariaLabel={`Source evidence for ${path}`}
             onPickRepo={pickRepo}
           />

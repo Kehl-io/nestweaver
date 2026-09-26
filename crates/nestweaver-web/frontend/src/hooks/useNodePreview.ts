@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { apiErrorFromBody } from "../api/errors";
+import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
-import { sharedRepoUid } from "../api/source";
 import type {
   NoteDetail,
   SourceResponse,
@@ -129,12 +128,17 @@ export function useNodePreview(
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(
-              sourceUrl(nodeId, symbols[0]?.start_line ?? 1, 12, sharedRepoUid(symbols)),
+              sourceUrl(nodeId, symbols[0]?.start_line ?? 1, 12),
               controller.signal,
             );
             sourceLines = source.lines ?? [];
           } catch (sourceError) {
             if (controller.signal.aborted) throw sourceError;
+            // An ambiguous file needs a deliberate repo choice in the detail
+            // view; showing one repo's symbols as its source would mislead.
+            if (sourceError instanceof ApiError && sourceError.code === "ambiguous_file") {
+              throw sourceError;
+            }
           }
           if (symbols.length === 0 && sourceLines.length === 0) {
             throw new Error("File evidence is unavailable.");
