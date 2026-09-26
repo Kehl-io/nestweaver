@@ -2390,3 +2390,42 @@ async fn source_error_bodies_carry_code_and_message() {
         );
     }
 }
+
+/// nw-682: a repo registered through a symlinked root (e.g. `~/dev` linking
+/// to another volume) still serves its indexed files. Both the root and the
+/// file are canonicalized before the containment check, so the link must not
+/// make every file look like it escapes the root.
+#[cfg(unix)]
+#[tokio::test]
+async fn source_serves_indexed_files_under_a_symlinked_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    std::fs::write(real.join("src/main.ts"), "hello\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:linked".into(),
+            url: format!("file://{}", link.display()),
+            indexed_sha: "x".into(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: Some("linked".into()),
+            root_path: Some(link.display().to_string()),
+        })
+        .unwrap();
+    store
+        .insert_file(&nestweaver_schema::File {
+            uid: "file:linked:src/main.ts".into(),
+            path: "src/main.ts".into(),
+            repo_uid: "repo:linked".into(),
+            content_hash: "h".into(),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(store, None, dir.path().join("t.lbug")));
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/main.ts&repo=repo:linked").await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["lines"], json!(["hello"]));
+}

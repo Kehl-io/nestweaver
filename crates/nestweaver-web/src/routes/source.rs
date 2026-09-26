@@ -1,3 +1,4 @@
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,13 +58,13 @@ enum Read {
     NotAvailable,
     Escapes,
     Redirected,
-    TooLarge(u64),
+    TooLarge,
 }
 
-fn read_indexed_file(repo_root: &str, file: &str) -> Read {
+fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
     let (Ok(canon_root), Ok(canon_path)) = (
         std::fs::canonicalize(repo_root),
-        std::fs::canonicalize(Path::new(repo_root).join(file)),
+        std::fs::canonicalize(repo_root.join(file)),
     ) else {
         return Read::NotAvailable;
     };
@@ -80,14 +81,16 @@ fn read_indexed_file(repo_root: &str, file: &str) -> Read {
     if canon_path.strip_prefix(&canon_root) != Ok(Path::new(file)) {
         return Read::Redirected;
     }
-    let Ok(meta) = std::fs::metadata(&canon_path) else {
+    // Bounded read: never pull more than the cap (plus one byte to detect
+    // overflow) into memory, whatever the metadata said or however the file
+    // grows between checks.
+    let Ok(f) = std::fs::File::open(&canon_path) else {
         return Read::NotAvailable;
     };
-    if meta.len() > MAX_SOURCE_BYTES {
-        return Read::TooLarge(meta.len());
-    }
-    match std::fs::read_to_string(&canon_path) {
-        Ok(content) => Read::Content(content),
+    let mut content = String::new();
+    match f.take(MAX_SOURCE_BYTES + 1).read_to_string(&mut content) {
+        Ok(n) if n as u64 > MAX_SOURCE_BYTES => Read::TooLarge,
+        Ok(_) => Read::Content(content),
         Err(_) => Read::NotAvailable,
     }
 }
@@ -169,8 +172,7 @@ pub async fn source(
 
     let read = {
         let file = file.clone();
-        tokio::task::spawn_blocking(move || read_indexed_file(&repo_root.to_string_lossy(), &file))
-            .await
+        tokio::task::spawn_blocking(move || read_indexed_file(&repo_root, &file)).await
     };
     let content = match read {
         Err(join) => return internal(join),
@@ -191,10 +193,10 @@ pub async fn source(
             );
         }
         Ok(Read::Redirected) => return not_found("source_not_indexed", NOT_INDEXED, &file),
-        Ok(Read::TooLarge(len)) => {
+        Ok(Read::TooLarge) => {
             return not_found(
                 "source_too_large",
-                &format!("file is {len} bytes; the limit is {MAX_SOURCE_BYTES}"),
+                &format!("file is larger than the {MAX_SOURCE_BYTES}-byte preview limit"),
                 &file,
             );
         }
