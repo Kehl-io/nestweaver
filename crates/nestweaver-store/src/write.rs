@@ -5809,6 +5809,43 @@ impl GraphStore {
         )
     }
 
+    /// Which configured project-note memberships are still absent. A caller
+    /// can use this read-only probe to avoid taking a write lease on a no-op.
+    pub fn missing_project_note_memberships(
+        &self,
+        desired: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let existing = self.list_project_edge_pairs("PROJECT_INCLUDES_NOTE")?;
+        Ok(desired
+            .iter()
+            .filter(|pair| !existing.contains(*pair))
+            .cloned()
+            .collect())
+    }
+
+    /// Add only missing memberships in one transaction. Returns the number
+    /// added, so a reconciler can publish only when the graph changed.
+    pub fn add_project_note_memberships(
+        &self,
+        desired: &[(String, String)],
+    ) -> Result<usize, StoreError> {
+        let missing = self.missing_project_note_memberships(desired)?;
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.begin_transaction()?;
+        match Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_NOTE", &missing, 1.0) {
+            Ok(()) => {
+                self.commit_transaction(&conn)?;
+                Ok(missing.len())
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
+    }
+
     /// Atomically reconcile Projects discovered from vault folders and only
     /// their note memberships.
     ///
@@ -11474,6 +11511,56 @@ mod tests {
             }
         }
         assert_eq!(seen, uids.into_iter().collect());
+    }
+
+    #[test]
+    fn add_project_note_memberships_is_idempotent_and_reports_only_missing() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:p".into(),
+                name: "p".into(),
+                summary: None,
+                instance_id: "test".into(),
+            })
+            .unwrap();
+        for uid in ["note:a", "note:b"] {
+            store
+                .insert_note(&Note {
+                    uid: uid.into(),
+                    vault_uid: "vault:test".into(),
+                    file_path: format!("{uid}.md"),
+                    title: uid.into(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: uid.into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        let desired = vec![
+            ("proj:p".to_string(), "note:a".to_string()),
+            ("proj:p".to_string(), "note:b".to_string()),
+        ];
+        assert_eq!(
+            store.missing_project_note_memberships(&desired).unwrap(),
+            desired
+        );
+        assert_eq!(store.add_project_note_memberships(&desired).unwrap(), 2);
+        assert!(
+            store
+                .missing_project_note_memberships(&desired)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.add_project_note_memberships(&desired).unwrap(), 0);
     }
 
     #[test]

@@ -277,6 +277,12 @@ pub struct BrainWatcher {
     /// Compiled `.brainignore` glob patterns. Loaded once at construction
     /// from the vault root's `.brainignore` file (or built-in defaults).
     ignore_set: GlobSet,
+    /// nw-684: why `.brainignore` could not be loaded. When set, `ignore_set`
+    /// is an unused placeholder and every `run*` entry refuses to start —
+    /// watching without the user's exclusions would index the notes they
+    /// excluded. Never replaced by a match-everything set, which would mark
+    /// every note ignored and delete it from the graph.
+    ignore_error: Option<String>,
     /// `[indexing].max_note_bytes`. Defaults to 1 MiB so tests and unconfigured
     /// watchers match the markdown indexer.
     note_limits: crate::index_limits::NoteLimits,
@@ -400,7 +406,7 @@ impl BrainWatcher {
         // (indexer, watcher) pairs.
         let vault_root: PathBuf = vault_root.into();
         let vault_root = std::fs::canonicalize(&vault_root).unwrap_or(vault_root);
-        let ignore_set = crate::brainignore::load_brain_ignore(&vault_root, &[]);
+        let (ignore_set, ignore_error) = load_ignore_or_error(&vault_root, &[]);
         Self {
             db_path: db_path.into(),
             vault_root,
@@ -411,6 +417,7 @@ impl BrainWatcher {
             manifests_path: None,
             debounce_ms: 200,
             ignore_set,
+            ignore_error,
             note_limits: crate::index_limits::NoteLimits::default(),
             external_tantivy: None,
             cross_domain: crate::config::CrossDomainConfig::default(),
@@ -606,7 +613,7 @@ impl BrainWatcher {
     /// file (or defaults) combined with `extra`.
     pub fn with_extra_ignore_patterns(mut self, extra: &[String]) -> Self {
         if !extra.is_empty() {
-            self.ignore_set = crate::brainignore::load_brain_ignore(&self.vault_root, extra);
+            (self.ignore_set, self.ignore_error) = load_ignore_or_error(&self.vault_root, extra);
         }
         self
     }
@@ -626,6 +633,7 @@ impl BrainWatcher {
     /// Opens its own `GraphStore` from `self.db_path`. For sharing a store
     /// with the web server, use `run_with_store` instead.
     pub fn run(self) -> Result<(), anyhow::Error> {
+        self.ensure_ignore_loaded()?;
         // nw-C1: this watcher is a writer, so it reconciles an abandoned
         // publication left by a crashed indexer instead of inheriting the wedge.
         let authority =
@@ -645,6 +653,7 @@ impl BrainWatcher {
         self,
         authority: &nestweaver_store::DbWriteLease,
     ) -> Result<(), anyhow::Error> {
+        self.ensure_ignore_loaded()?;
         let store = Arc::new(crate::index::open_store_for_writing_with_authority(
             &self.db_path,
             authority,
@@ -661,7 +670,17 @@ impl BrainWatcher {
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
+        self.ensure_ignore_loaded()?;
         self.run_inner(store, on_change)
+    }
+
+    /// nw-684: refuse to start, before any scan or reconciliation, when the
+    /// vault's `.brainignore` could not be loaded.
+    fn ensure_ignore_loaded(&self) -> Result<(), anyhow::Error> {
+        if let Some(error) = &self.ignore_error {
+            anyhow::bail!("vault watcher refused to start: {error}");
+        }
+        Ok(())
     }
 
     /// Shared implementation used by both `run` and `run_with_store`.
@@ -2006,6 +2025,16 @@ fn tombstone_vault_embeddings_after_commit(
     }
 }
 
+/// nw-684: load the vault's ignore set, or keep the load error for the
+/// watcher's `run*` entries to refuse on. The placeholder set on error is
+/// empty and is never consulted, because the watcher will not start.
+fn load_ignore_or_error(vault_root: &Path, extra: &[String]) -> (GlobSet, Option<String>) {
+    match crate::brainignore::load_brain_ignore(vault_root, extra) {
+        Ok(set) => (set, None),
+        Err(error) => (GlobSet::empty(), Some(format!("{error:#}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3070,6 +3099,78 @@ mod tests {
             .process_batch(&store, None, &v_uid, paths, &None)
             .unwrap();
         assert!(store.list_notes(Some(&v_uid)).unwrap().is_empty());
+    }
+
+    /// nw-684: a watcher whose `.brainignore` cannot be read (or whose
+    /// `--ignore` pattern is invalid) must refuse to start, naming the cause,
+    /// instead of reconciling the vault with the exclusions missing.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_refuses_to_start_without_a_loadable_brainignore() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            (".brainignore", "secret.md\n"),
+            ("ok.md", "# Ok\n\npublic\n"),
+        ]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        // Lands while nothing watches: startup reconciliation would publish it
+        // if the watcher ran without the exclusions.
+        fs::write(root.join("secret.md"), "# Secret\n\ncredentials\n").unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let paths = || -> Vec<String> {
+            let mut paths: Vec<String> = store
+                .list_notes(Some(&v_uid))
+                .unwrap()
+                .into_iter()
+                .map(|note| note.file_path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let run = |watcher: BrainWatcher| {
+            let stop = watcher.shutdown_handle();
+            watcher
+                .with_ready_callback(move || stop.stop())
+                .run_with_store(store.clone(), None)
+        };
+
+        let Some(restore) =
+            crate::brainignore::test_support::make_unreadable(&root.join(".brainignore"))
+        else {
+            return;
+        };
+        let refused = run(BrainWatcher::new(&db_path, &root, "default", "test"));
+        drop(restore);
+        let message = format!("{:#}", refused.expect_err("unreadable .brainignore"));
+        assert!(
+            message.contains("refused to start") && message.contains(".brainignore"),
+            "{message}"
+        );
+        assert_eq!(paths(), vec!["ok.md".to_string()]);
+
+        fs::remove_file(root.join(".brainignore")).unwrap();
+        std::os::unix::fs::symlink("missing-policy", root.join(".brainignore")).unwrap();
+        let dangling = run(BrainWatcher::new(&db_path, &root, "default", "test"));
+        let message = format!("{:#}", dangling.expect_err("dangling .brainignore"));
+        assert!(message.contains(".brainignore"), "{message}");
+        assert_eq!(paths(), vec!["ok.md".to_string()]);
+        fs::remove_file(root.join(".brainignore")).unwrap();
+        fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+
+        // An invalid `--ignore` pattern is refused the same way.
+        let invalid = run(BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_extra_ignore_patterns(&["bad{x".to_string()]));
+        let message = format!("{:#}", invalid.expect_err("invalid --ignore pattern"));
+        assert!(message.contains("bad{x"), "{message}");
+        assert_eq!(paths(), vec!["ok.md".to_string()]);
+
+        // Counterweight: readable again, the watcher starts and the
+        // exclusion holds.
+        run(BrainWatcher::new(&db_path, &root, "default", "test")).unwrap();
+        assert_eq!(paths(), vec!["ok.md".to_string()]);
     }
 
     #[test]

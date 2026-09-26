@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod error;
 pub mod gaps_cache;
+pub mod hardening;
 pub mod rank_events;
 pub mod routes;
 pub mod state;
@@ -317,6 +318,8 @@ pub fn degraded_router() -> Router {
 /// Serve [`degraded_router`] on `port` until `shutdown` resolves. Returning
 /// `Ok` therefore always means a requested shutdown; a bind or serve failure
 /// is the `Err` case and carries the underlying cause.
+/// Deliberately unhardened (nw-682): every response is a static 503 with no
+/// graph data, so there is nothing here for a DNS-rebinding page to read.
 pub async fn start_degraded_server(
     port: u16,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -339,6 +342,7 @@ pub async fn start_server_with_router(
     port: u16,
     open_browser: bool,
 ) -> anyhow::Result<()> {
+    let app = crate::hardening::harden(app);
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("nestweaver-web listening on http://{addr}");

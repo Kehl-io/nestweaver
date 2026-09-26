@@ -1,3 +1,4 @@
+import { apiErrorFromBody } from "./errors";
 import type { SceneMetadata } from "./p1Types";
 
 export interface ImpactSourceEvidence {
@@ -101,7 +102,7 @@ async function request<T>(url: string, signal?: AbortSignal): Promise<T> {
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || response.statusText);
+    throw apiErrorFromBody(response.status, body, response.statusText);
   }
   return response.json() as Promise<T>;
 }

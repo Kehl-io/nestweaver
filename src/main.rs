@@ -1581,6 +1581,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_UI_ALLOWED_HOSTS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_UPSTREAM",
         role: EnvRole::Configures,
     },
@@ -9874,18 +9878,36 @@ fn reconcile_code_links_direct(
     reason: &str,
 ) {
     nestweaver_engine::code_links::mark_code_links_pending(db_path, reason);
-    let cross_domain = load_instance_config_opt(config)
+    let instance_config = load_instance_config_opt(config);
+    let folders = instance_config
+        .as_ref()
+        .map(|config| nestweaver_engine::project::project_folders(config, &config.instance_id))
+        .unwrap_or_default();
+    let cross_domain = instance_config
         .map(|config| config.cross_domain)
         .unwrap_or_default();
     match GraphStore::open_with_authority(db_path, write_lease) {
         Ok(store) => {
-            match nestweaver_engine::code_links::reconcile_code_links(&store, &cross_domain) {
-                Ok(report) if !report.rewritten.is_empty() => eprintln!(
-                    "Code links: rebuilt for {} note(s) ({} edge(s)).",
-                    report.rewritten.len(),
-                    report.edges_written
-                ),
-                Ok(_) => {}
+            match nestweaver_engine::code_links::reconcile_code_links_with_folders(
+                &store,
+                &cross_domain,
+                folders,
+            ) {
+                Ok(report) => {
+                    if report.memberships_added > 0 {
+                        eprintln!(
+                            "Project membership: added {} note(s) under vault_folder.",
+                            report.memberships_added
+                        );
+                    }
+                    if !report.rewritten.is_empty() {
+                        eprintln!(
+                            "Code links: rebuilt for {} note(s) ({} edge(s)).",
+                            report.rewritten.len(),
+                            report.edges_written
+                        );
+                    }
+                }
                 Err(error) => tracing::warn!(
                     "code link reconciliation failed; the links stay owed and are retried: {error:#}"
                 ),
@@ -19738,11 +19760,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 db_path.display()
             );
             if let Err(e) = watcher.run_with_write_lease(&write_lease) {
+                // nw-684 review: EVERY failure removes the PID hint written
+                // above (e.g. a watcher refusing an unreadable
+                // `.brainignore`), or readers keep treating the database as
+                // watched by a process that has exited.
+                let _ = std::fs::remove_file(&lock_path);
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
-                    let _ = std::fs::remove_file(&lock_path);
                     eprintln!("Error: code watcher: {msg}\nhint: {hint}");
                     return Ok((EXIT_ERROR, None));
                 }
@@ -25982,6 +26008,21 @@ fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -
         "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
         w.name, w.kind, w.path, w.start_line, w.end_line, tag
     );
+    // nw-689: the span drifted since indexing. Checked before
+    // `body_available` so a stale span is not blamed on the working directory.
+    if w.stale_span {
+        return format!(
+            "{header}\n   source changed since indexing: {} no longer holds `{}` at lines {}-{} \
+             \u{2014} re-index the repo (`nestweaver index --repo <path>`)",
+            w.path, w.name, w.start_line, w.end_line
+        );
+    }
+    if let Some(old) = w.relocated_from_line {
+        return format!(
+            "{header}  (moved from line {old} since indexing)\n{}",
+            w.body
+        );
+    }
     if w.body_available {
         format!("{header}\n{}", w.body)
     } else {
@@ -26959,6 +27000,10 @@ fn run_brain(
             // Direct-write fallback (`--no-daemon`). It writes the graph and
             // the Tantivy index; neither checked for a live daemon holding the
             // same database.
+            // nw-684 review: acquiring the write lease creates the database
+            // file, so refuse over an unloadable `.brainignore` first -- a
+            // refused first add must not leave an empty database behind.
+            nestweaver_engine::load_brain_ignore(&path, &extra_patterns)?;
             let write_lease = require_exclusive_store_access(&db_path, "add a vault")?;
             let result = index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
                 &path,
@@ -28245,11 +28290,15 @@ fn run_brain(
                 db_path.display()
             ));
             if let Err(e) = watcher.run_with_write_lease(&write_lease) {
+                // nw-684 review: EVERY failure removes the PID hint written
+                // above (e.g. a watcher refusing an unreadable
+                // `.brainignore`), or readers keep treating the database as
+                // watched by a process that has exited.
+                let _ = std::fs::remove_file(&lock_path);
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
-                    let _ = std::fs::remove_file(&lock_path);
                     eprintln!("Error: watcher: {msg}\nhint: {hint}");
                     return Ok((EXIT_ERROR, None));
                 }
@@ -28318,6 +28367,13 @@ fn run_brain(
                     })
                 })
                 .transpose()?;
+            // nw-684 Task 5c: on the direct path (`--no-daemon`) refuse over
+            // an unloadable `.brainignore` before registration discovery opens
+            // the store and before the write lease is taken, mirroring the
+            // `brain add` pre-check. The daemon routes check it themselves.
+            if !use_daemon {
+                nestweaver_engine::load_brain_ignore(&path, &extra_patterns)?;
+            }
 
             // nw-098: resolve the instance from any EXISTING registration for this
             // root before falling back to flag > config > "default".
@@ -41072,6 +41128,8 @@ credential_method = "gh"
             body: String::new(),
             body_available: false,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let out = read_symbols_window_text(&w);
         assert!(
@@ -41082,6 +41140,53 @@ credential_method = "gh"
             out.contains("--root"),
             "the remedy must be named, not implied: {out:?}"
         );
+    }
+
+    /// nw-689: a stale span says the source changed and names the remedy
+    /// (re-index), not the nw-340 "pass --root" advice for an unreadable file.
+    #[test]
+    fn read_symbols_window_reports_a_stale_span() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 10,
+            end_line: 14,
+            body: String::new(),
+            body_available: false,
+            is_neighbor: false,
+            stale_span: true,
+            relocated_from_line: None,
+        };
+        let out = read_symbols_window_text(&w);
+        assert!(out.contains("source changed since indexing"), "{out:?}");
+        assert!(out.contains("re-index"), "{out:?}");
+        assert!(
+            !out.contains("--root"),
+            "not a working-directory problem: {out:?}"
+        );
+    }
+
+    /// nw-689: a re-located body is printed, and the move is disclosed.
+    #[test]
+    fn read_symbols_window_discloses_a_relocated_span() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 13,
+            end_line: 15,
+            body: "fn greet() {\n    hello();\n}".into(),
+            body_available: true,
+            is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: Some(10),
+        };
+        let out = read_symbols_window_text(&w);
+        assert!(out.contains("moved from line 10 since indexing"), "{out:?}");
+        assert!(out.contains("fn greet() {"), "{out:?}");
     }
 
     /// nw-340's own pinning assertion, quoted from the item: "for a symbol
@@ -41099,6 +41204,8 @@ credential_method = "gh"
             body: "fn greet() {\n    hello();\n}".into(),
             body_available: true,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let text = read_symbols_window_text(&w);
         let body: Vec<&str> = text.lines().skip(1).collect();
@@ -41127,6 +41234,8 @@ credential_method = "gh"
             body: String::new(),
             body_available: false,
             is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
         };
         let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
             symbols: vec![unreadable("greet")],

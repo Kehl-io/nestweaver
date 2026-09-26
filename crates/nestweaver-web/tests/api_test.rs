@@ -1754,3 +1754,722 @@ async fn export_html_returns_html() {
         "body should contain HTML doctype"
     );
 }
+
+async fn get_with_headers(app: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+    get_with_headers_full(app, uri, headers).await.status()
+}
+
+async fn get_with_headers_full(
+    app: &axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut req = Request::builder().uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_non_loopback_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for host in [
+        "evil.example",
+        "evil.example:9377",
+        "127.0.0.1.nip.io:9377",
+        "192.168.1.5:9377",
+    ] {
+        assert_eq!(
+            get_with_headers(&app, "/api/v1/version", &[("host", host)]).await,
+            StatusCode::FORBIDDEN,
+            "Host {host} must be refused (DNS rebinding)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hardened_router_admits_loopback_hosts_and_absent_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for host in [
+        "127.0.0.1:9377",
+        "localhost:9377",
+        "localhost",
+        "[::1]:9377",
+        "127.0.0.1",
+    ] {
+        assert_eq!(
+            get_with_headers(&app, "/api/v1/version", &[("host", host)]).await,
+            StatusCode::OK,
+            "loopback Host {host} must be served"
+        );
+    }
+    // Non-browser clients (and axum oneshot tests) may omit Host; a browser never does.
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[]).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_cross_site_origin_even_with_loopback_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    for origin in [
+        "https://evil.example",
+        "null",
+        "http://127.0.0.1.evil.example",
+    ] {
+        assert_eq!(
+            get_with_headers(
+                &app,
+                "/api/v1/version",
+                &[("host", "127.0.0.1:9377"), ("origin", origin)]
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "Origin {origin} must be refused (CSRF / text/plain POST)"
+        );
+    }
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:9377")
+            ]
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_requires_origin_and_host_authority_to_match_exactly() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    // Host and Origin both loopback, but different ports: a rebound page
+    // listening on :3000 must not pass just because both are "loopback".
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:3000")
+            ]
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[
+                ("host", "127.0.0.1:9377"),
+                ("origin", "http://127.0.0.1:9377")
+            ]
+        )
+        .await,
+        StatusCode::OK
+    );
+    // Origin present, Host absent: falls back to the loopback allowlist.
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[("origin", "http://localhost:9377")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_with_headers(
+            &app,
+            "/api/v1/version",
+            &[("origin", "https://evil.example")]
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_absolute_form_uri_with_bad_authority_and_no_host() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://evil.example:9377/api/v1/version")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn harden_with_allowed_hosts_admits_normalized_extra_hostnames() {
+    let app = nestweaver_web::hardening::harden_with_allowed_hosts(
+        make_app(),
+        vec!["proxy.local:8080".to_string()],
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "proxy.local:8080")]).await,
+        StatusCode::OK,
+        "extra host should be normalized (port stripped) and admitted"
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "other.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_cross_site_origin_on_post_routes() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/context")
+        .header("host", "127.0.0.1:9377")
+        .header("origin", "https://evil.example")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_bad_host_on_spa_fallback_path() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    assert_eq!(
+        get_with_headers(&app, "/some/route", &[("host", "evil.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_host_case_and_trailing_dot_edge_cases() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "LOCALHOST:9377")]).await,
+        StatusCode::OK,
+        "Host matching must be case-insensitive"
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "0.0.0.0:9377")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "localhost.:9377")]).await,
+        StatusCode::FORBIDDEN,
+        "trailing-dot DNS canonicalization must not bypass the allowlist"
+    );
+}
+
+#[tokio::test]
+async fn harden_with_allowed_hosts_drops_malformed_entries_and_still_refuses_malformed_hosts() {
+    // A malformed allowlist entry ("[bad", unclosed bracket) must not
+    // silently become an equivalence class that admits other malformed
+    // Host values -- it must be dropped, not normalized to a shared
+    // placeholder that then matches anything else equally malformed.
+    let app =
+        nestweaver_web::hardening::harden_with_allowed_hosts(make_app(), vec!["[bad".to_string()]);
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "[evil")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_with_headers(&app, "/api/v1/version", &[("host", "[::1]evil")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_when_uri_authority_disagrees_with_host_header() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://evil.example/api/v1/version")
+        .header("host", "localhost:9377")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hardened_router_admits_uri_authority_only_with_matching_origin() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    let req = Request::builder()
+        .uri("http://127.0.0.1:9377/api/v1/version")
+        .header("origin", "http://127.0.0.1:9377")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn hardened_router_refuses_uri_authority_only_with_mismatched_origin() {
+    // Negative half of the test above: no Host header, a loopback URI
+    // authority, and an Origin naming a different loopback port.
+    let app = nestweaver_web::hardening::harden(make_app());
+    for origin in ["http://127.0.0.1:1234", "https://evil.example"] {
+        let req = Request::builder()
+            .uri("http://127.0.0.1:9377/api/v1/version")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "Origin {origin}");
+    }
+}
+
+#[tokio::test]
+async fn hardened_router_sets_security_headers_on_spa_and_api() {
+    let app = nestweaver_web::hardening::harden(make_app());
+    // `/fonts/inter-500.ttf` is an embedded static asset (the rust_embed
+    // branch, not the index.html shell), so the headers must cover it too.
+    for uri in ["/", "/api/v1/version", "/fonts/inter-500.ttf"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "127.0.0.1:9377")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let h = resp.headers();
+        if uri.ends_with(".ttf") {
+            assert_ne!(
+                h.get("content-type").and_then(|v| v.to_str().ok()),
+                Some("text/html; charset=utf-8"),
+                "{uri} must be the embedded asset, not the SPA shell"
+            );
+        }
+        let csp = h
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            csp.contains("default-src 'self'"),
+            "{uri}: CSP missing: {csp:?}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp:?}");
+        assert!(
+            csp.contains("'wasm-unsafe-eval'"),
+            "{uri}: ?engine=wasm must keep working: {csp:?}"
+        );
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff", "{uri}");
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY", "{uri}");
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn hardened_router_sets_security_headers_on_forbidden_responses_too() {
+    // security_headers is the outer layer (nw-682 layer-order fix), so a
+    // 403 from the Host/Origin guard must carry the same security headers
+    // as every other response -- an attacker's rebound page is exactly the
+    // audience that needs CSP/X-Frame-Options on the page it *did* get.
+    let app = nestweaver_web::hardening::harden(make_app());
+    let resp = get_with_headers_full(&app, "/api/v1/version", &[("host", "evil.example")]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let h = resp.headers();
+    assert!(
+        h.get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("default-src 'self'"),
+        "403 response missing CSP: {:?}",
+        h.get("content-security-policy")
+    );
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+}
+
+// ── /api/v1/source: repo-addressed and graph-gated (nw-682, nw-683) ─────────
+
+/// Two repos with on-disk roots, both indexing `src/App.tsx`, plus an
+/// unindexed `.env` secret in each working tree.
+fn two_repo_source_app() -> (tempfile::TempDir, axum::Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GraphStore::in_memory().unwrap();
+    for (name, body) in [
+        ("a", "export const A = 1;\nexport function a() {}\n"),
+        ("b", "B\nB\nB\n"),
+    ] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("src/App.tsx"), body).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=hunter2\n").unwrap();
+        std::fs::write(root.join(".git/config"), "SECRET=hunter2\n").unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: format!("repo:{name}"),
+                url: format!("file://{}", root.display()),
+                indexed_sha: "x".into(),
+                staleness_commits_behind: 0,
+                instance_id: String::new(),
+                name: Some(name.into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:{name}"),
+                path: "src/App.tsx".into(),
+                repo_uid: format!("repo:{name}"),
+                content_hash: "h".into(),
+            })
+            .unwrap();
+    }
+    let db_path = dir.path().join("t.lbug");
+    (dir, create_router(AppState::new(store, None, db_path)))
+}
+
+#[tokio::test]
+async fn source_serves_only_the_named_repo() {
+    let (_d, app) = two_repo_source_app();
+    for (repo, first) in [("repo:b", "B"), ("repo:a", "export const A = 1;")] {
+        let uri = format!("/api/v1/source?file=src/App.tsx&repo={repo}&line=1&context=0");
+        let (s, j) = get_json(&app, &uri).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(j["lines"][0], first, "{uri}");
+        assert_eq!(j["repo"], repo, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn source_without_repo_is_409_when_path_is_ambiguous() {
+    let (_d, app) = two_repo_source_app();
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/App.tsx&line=1").await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(j["error"], "ambiguous_file");
+    assert_eq!(j["candidates"], json!(["repo:a", "repo:b"]));
+}
+
+#[tokio::test]
+async fn source_refuses_files_the_graph_never_indexed() {
+    let (_d, app) = two_repo_source_app();
+    for uri in [
+        "/api/v1/source?file=.env&repo=repo:a",
+        "/api/v1/source?file=.env",
+        "/api/v1/source?file=.git/config&repo=repo:a",
+    ] {
+        let (s, j) = get_json(&app, uri).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(j["error"], "source_not_indexed", "{uri}");
+        assert_ne!(
+            j["lines"],
+            json!(["SECRET=hunter2"]),
+            "{uri} leaked an unindexed file"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_rejects_nul_and_clamps_past_eof() {
+    let (_d, app) = two_repo_source_app();
+    let (s, _) = get_json(&app, "/api/v1/source?file=src/App.tsx%00&repo=repo:a").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, j) = get_json(
+        &app,
+        "/api/v1/source?file=src/App.tsx&repo=repo:a&line=999&context=2",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        j["start_line"].as_u64().unwrap() <= j["end_line"].as_u64().unwrap(),
+        "{j}"
+    );
+    assert_eq!(j["end_line"], 2);
+}
+
+#[tokio::test]
+async fn source_unknown_repo_is_404() {
+    let (_d, app) = two_repo_source_app();
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/App.tsx&repo=repo:nope").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(j["error"], "repo_not_found");
+}
+
+/// One repo (`repo:solo`) rooted at `<tmp>/solo` with an unindexed `.env`
+/// secret at its root and `<tmp>/outside.txt` holding a secret outside it.
+/// `setup` lays out files under the root; `indexed` are the File nodes.
+fn solo_source_app(
+    setup: impl FnOnce(&std::path::Path),
+    indexed: &[&str],
+) -> (tempfile::TempDir, axum::Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("solo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(dir.path().join("outside.txt"), "SECRET=hunter2\n").unwrap();
+    setup(&root);
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:solo".into(),
+            url: format!("file://{}", root.display()),
+            indexed_sha: "x".into(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: Some("solo".into()),
+            root_path: Some(root.display().to_string()),
+        })
+        .unwrap();
+    for path in indexed {
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:solo:{path}"),
+                path: (*path).into(),
+                repo_uid: "repo:solo".into(),
+                content_hash: "h".into(),
+            })
+            .unwrap();
+    }
+    let db_path = dir.path().join("t.lbug");
+    (dir, create_router(AppState::new(store, None, db_path)))
+}
+
+#[tokio::test]
+async fn source_empty_file_returns_an_empty_zero_window() {
+    let (_d, app) = solo_source_app(
+        |root| std::fs::write(root.join("src/empty.ts"), "").unwrap(),
+        &["src/empty.ts"],
+    );
+    for uri in [
+        "/api/v1/source?file=src/empty.ts&repo=repo:solo",
+        "/api/v1/source?file=src/empty.ts&repo=repo:solo&line=50&context=3",
+    ] {
+        let (s, j) = get_json(&app, uri).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(j["start_line"], 0, "{uri}: {j}");
+        assert_eq!(j["end_line"], 0, "{uri}: {j}");
+        assert_eq!(j["lines"], json!([]), "{uri}");
+        assert_eq!(j["total_lines"], 0, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn source_refuses_files_over_the_size_cap() {
+    let (_d, app) = solo_source_app(
+        |root| {
+            // Sparse: set_len allocates no blocks, so this costs no disk.
+            let f = std::fs::File::create(root.join("src/big.ts")).unwrap();
+            f.set_len(8 * 1024 * 1024 + 1).unwrap();
+        },
+        &["src/big.ts"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/big.ts&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(j["error"], "source_too_large");
+    assert!(j["message"].is_string(), "{j}");
+}
+
+/// nw-682: an oversized file of multi-byte UTF-8 whose cap (plus the one
+/// overflow byte) cuts mid-character is still "too large", not "not
+/// available". The size check must come before UTF-8 validation.
+#[tokio::test]
+async fn source_oversized_file_cut_mid_character_is_too_large() {
+    use std::io::Write as _;
+    let (_d, app) = solo_source_app(
+        |root| {
+            // 64 KiB of `é` (2 bytes each) x 128 = exactly 8 MiB, plus one
+            // more `é`: 8 MiB + 2 bytes. The bounded read takes 8 MiB + 1
+            // bytes, which ends on the first byte of the last `é`. The
+            // tempdir (and this ~8 MiB file) is removed when `_d` drops.
+            let chunk = "é".repeat(32 * 1024);
+            let mut f = std::io::BufWriter::new(
+                std::fs::File::create(root.join("src/accents.txt")).unwrap(),
+            );
+            for _ in 0..128 {
+                f.write_all(chunk.as_bytes()).unwrap();
+            }
+            f.write_all("é".as_bytes()).unwrap();
+            f.flush().unwrap();
+        },
+        &["src/accents.txt"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/accents.txt&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(j["error"], "source_too_large", "{j}");
+}
+
+/// Counterweight: a file under the cap that is not UTF-8 is still "not
+/// available", not served lossily and not "too large".
+#[tokio::test]
+async fn source_small_non_utf8_file_is_not_available() {
+    let (_d, app) = solo_source_app(
+        |root| {
+            std::fs::write(root.join("src/latin1.txt"), [b'c', b'a', b'f', 0xE9, b'\n']).unwrap()
+        },
+        &["src/latin1.txt"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/latin1.txt&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(j["error"], "source_not_available", "{j}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_refuses_an_indexed_symlink_that_redirects_inside_the_repo() {
+    let (_d, app) = solo_source_app(
+        |root| std::os::unix::fs::symlink("../.env", root.join("src/config.ts")).unwrap(),
+        &["src/config.ts"],
+    );
+    let resp = get_with_headers_full(
+        &app,
+        "/api/v1/source?file=src/config.ts&repo=repo:solo",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("hunter2"), "symlink leaked .env: {text}");
+    let j: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["error"], "source_not_indexed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_refuses_an_indexed_symlink_escaping_the_repo_root() {
+    let (_d, app) = solo_source_app(
+        |root| std::os::unix::fs::symlink("../../outside.txt", root.join("src/escape.ts")).unwrap(),
+        &["src/escape.ts"],
+    );
+    let resp = get_with_headers_full(
+        &app,
+        "/api/v1/source?file=src/escape.ts&repo=repo:solo",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("hunter2"));
+}
+
+#[tokio::test]
+async fn source_parent_dir_check_is_per_component_not_substring() {
+    let (_d, app) = solo_source_app(
+        |root| std::fs::write(root.join("src/foo..bar.ts"), "ok\n").unwrap(),
+        &["src/foo..bar.ts"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/foo..bar.ts&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["lines"], json!(["ok"]));
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/../x&repo=repo:solo").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
+}
+
+#[tokio::test]
+async fn source_without_repo_serves_the_single_indexing_repo() {
+    let (_d, app) = solo_source_app(
+        |root| std::fs::write(root.join("src/one.ts"), "one\n").unwrap(),
+        &["src/one.ts"],
+    );
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/one.ts").await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["repo"], "repo:solo");
+    assert_eq!(j["lines"], json!(["one"]));
+}
+
+#[tokio::test]
+async fn source_case_variant_path_is_not_indexed() {
+    let (_d, app) = two_repo_source_app();
+    let (s, j) = get_json(&app, "/api/v1/source?file=SRC/App.tsx&repo=repo:a").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(j["error"], "source_not_indexed");
+}
+
+#[tokio::test]
+async fn source_error_bodies_carry_code_and_message() {
+    let (_d, app) = two_repo_source_app();
+    for (uri, status, code) in [
+        ("/api/v1/source", StatusCode::BAD_REQUEST, "file_required"),
+        (
+            "/api/v1/source?file=src/../x",
+            StatusCode::BAD_REQUEST,
+            "invalid_file_path",
+        ),
+        (
+            "/api/v1/source?file=src/App.tsx%00",
+            StatusCode::BAD_REQUEST,
+            "invalid_file_path",
+        ),
+        (
+            "/api/v1/source?file=src/App.tsx&repo=repo:nope",
+            StatusCode::NOT_FOUND,
+            "repo_not_found",
+        ),
+        (
+            "/api/v1/source?file=.env",
+            StatusCode::NOT_FOUND,
+            "source_not_indexed",
+        ),
+        (
+            "/api/v1/source?file=src/App.tsx",
+            StatusCode::CONFLICT,
+            "ambiguous_file",
+        ),
+    ] {
+        let (s, j) = get_json(&app, uri).await;
+        assert_eq!(s, status, "{uri}: {j}");
+        assert_eq!(j["error"], code, "{uri}: {j}");
+        assert!(
+            j["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "{uri}: missing message: {j}"
+        );
+    }
+}
+
+/// nw-682: a repo registered through a symlinked root (e.g. `~/dev` linking
+/// to another volume) still serves its indexed files. Both the root and the
+/// file are canonicalized before the containment check, so the link must not
+/// make every file look like it escapes the root.
+#[cfg(unix)]
+#[tokio::test]
+async fn source_serves_indexed_files_under_a_symlinked_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    std::fs::write(real.join("src/main.ts"), "hello\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:linked".into(),
+            url: format!("file://{}", link.display()),
+            indexed_sha: "x".into(),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: Some("linked".into()),
+            root_path: Some(link.display().to_string()),
+        })
+        .unwrap();
+    store
+        .insert_file(&nestweaver_schema::File {
+            uid: "file:linked:src/main.ts".into(),
+            path: "src/main.ts".into(),
+            repo_uid: "repo:linked".into(),
+            content_hash: "h".into(),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(store, None, dir.path().join("t.lbug")));
+    let (s, j) = get_json(&app, "/api/v1/source?file=src/main.ts&repo=repo:linked").await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["lines"], json!(["hello"]));
+}

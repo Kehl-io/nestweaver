@@ -15,9 +15,17 @@ SOURCES = {
     "scripts/tool.swift": "#!/usr/bin/env swift\nfunc shebangHelper() {}\nfunc shebangUnused() {}\nshebangHelper()\n",
     "run.sh": "trap cleanup EXIT\ntrap 'quoted_cleanup' INT TERM\ntrap 'rm -f x' EXIT\ncleanup() { :; }\nquoted_cleanup() { :; }\nunused_shell() { :; }\n",
     "main.rs": "struct Used;\nimpl Used {\n    fn called() { rust_leaf(); }\n}\nstruct Unused;\nimpl Unused {\n    fn uncalled() {}\n}\nfn rust_leaf() {}\nfn main() { Used::called(); }\n",
+    # nw-687: a CommonJS `module.exports.X = function` export with no local
+    # caller must read LIVE (it might be consumed externally, exactly like an
+    # ES export), while a genuinely private, uncalled function in the same
+    # file must still read DEAD -- end-to-end proof that
+    # is_commonjs_export_assignment/collect_commonjs_reexport_names actually
+    # change what release dead-code reports, not just what parse_source sees.
+    "index.js": "const h = require('./helpers');\nh.listen();\n",
+    "helpers.js": "module.exports.listen = function listen() {\n  return context();\n};\nfunction context() {}\nfunction unused() {}\n",
 }
-LIVE = {"swiftHelper", "AppDelegate", "shebangHelper", "cleanup", "quoted_cleanup", "rust_leaf"}
-DEAD = {"swiftUnused", "nonMainHelper", "shebangUnused", "unused_shell"}
+LIVE = {"swiftHelper", "AppDelegate", "shebangHelper", "cleanup", "quoted_cleanup", "rust_leaf", "listen", "context"}
+DEAD = {"swiftUnused", "nonMainHelper", "shebangUnused", "unused_shell", "unused"}
 
 
 def cases(fixture):

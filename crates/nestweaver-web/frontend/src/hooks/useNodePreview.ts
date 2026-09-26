@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
 import type {
   NoteDetail,
@@ -28,7 +29,7 @@ async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || response.statusText);
+    throw apiErrorFromBody(response.status, body, response.statusText);
   }
   return response.json() as Promise<T>;
 }
@@ -45,8 +46,10 @@ function symbolsInFileUrl(path: string): string {
   return `/api/v1/symbols/file?path=${encodeURIComponent(path)}`;
 }
 
-function sourceUrl(file: string, line?: number, context?: number): string {
+function sourceUrl(file: string, line?: number, context?: number, repo?: string): string {
   let url = `/api/v1/source?file=${encodeURIComponent(file)}`;
+  // nw-683: name the repo so a path indexed by several repos is not a 409.
+  if (repo) url += `&repo=${encodeURIComponent(repo)}`;
   if (line != null) url += `&line=${line}`;
   if (context != null) url += `&context=${context}`;
   return url;
@@ -131,6 +134,11 @@ export function useNodePreview(
             sourceLines = source.lines ?? [];
           } catch (sourceError) {
             if (controller.signal.aborted) throw sourceError;
+            // An ambiguous file needs a deliberate repo choice in the detail
+            // view; showing one repo's symbols as its source would mislead.
+            if (sourceError instanceof ApiError && sourceError.code === "ambiguous_file") {
+              throw sourceError;
+            }
           }
           if (symbols.length === 0 && sourceLines.length === 0) {
             throw new Error("File evidence is unavailable.");
@@ -143,7 +151,12 @@ export function useNodePreview(
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(
-              sourceUrl(detail.symbol.file_path, detail.symbol.start_line, 5),
+              sourceUrl(
+                detail.symbol.file_path,
+                detail.symbol.start_line,
+                5,
+                detail.symbol.repo_uid,
+              ),
               controller.signal,
             );
             sourceLines = source.lines ?? [];

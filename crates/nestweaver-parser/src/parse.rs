@@ -1419,7 +1419,15 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
     let exported_locals = if matches!(lang, Language::JavaScript | Language::TypeScript) {
-        collect_export_clause_names(tree.root_node(), source_bytes)
+        let mut names = collect_export_clause_names(tree.root_node(), source_bytes);
+        // CommonJS assignments to `module.exports` (with or without a
+        // property) and `exports.X` re-export local bindings.
+        names.extend(collect_commonjs_reexport_names(
+            lang,
+            tree.root_node(),
+            source_bytes,
+        ));
+        names
     } else {
         std::collections::HashSet::new()
     };
@@ -1669,7 +1677,12 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     lang,
                     has_export_ancestor(&node)
                         || (exported_locals.contains(name.as_str())
-                            && is_local_runtime_declaration(node)),
+                            && is_local_runtime_declaration(node))
+                        // nw-687 (review): `module.exports.X = function` /
+                        // `exports.X = function` definitions have no
+                        // `export_statement` ancestor at all (CommonJS has no
+                        // `export` keyword), so they need their own check.
+                        || is_commonjs_export_assignment(lang, node, source_bytes),
                 );
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
@@ -2066,6 +2079,166 @@ fn collect_export_clause_names<'a>(
         }
     }
     names
+}
+
+/// nw-687 (review): whether `node` is `module.exports.X = ...` or
+/// `exports.X = ...` -- the exact left-hand-side shapes
+/// `queries/javascript.scm`/`queries/typescript.scm`'s CommonJS export rules
+/// match. Used to grant `Visibility::Public` to the `Function` definitions
+/// those rules mint (7abe922b), in parity with `has_export_ancestor` for an
+/// ES `export` declaration -- otherwise a CommonJS library's entire public
+/// API parsed `Private`, and `dead-code` treated every export with no local
+/// caller as HIGH-confidence dead rather than "might be consumed
+/// externally". Only the left side is checked: this is called on nodes the
+/// query already filtered to function/arrow right-hand sides, so the RHS
+/// shape needs no re-checking here.
+///
+/// nw-687 (review, item 4): gated explicitly on `lang` rather than trusting
+/// `"assignment_expression"`/`"member_expression"` node-kind names alone --
+/// tree-sitter-rust names a plain `x = y` assignment `assignment_expression`
+/// too, so a non-JS/TS grammar could in principle produce the same node
+/// kinds this walks and be coincidentally granted CommonJS visibility.
+fn is_commonjs_export_assignment(
+    lang: Language,
+    node: tree_sitter::Node,
+    source_bytes: &[u8],
+) -> bool {
+    if !matches!(lang, Language::JavaScript | Language::TypeScript) {
+        return false;
+    }
+    if node.kind() != "assignment_expression" {
+        return false;
+    }
+    let Some(left) = node.child_by_field_name("left") else {
+        return false;
+    };
+    if left.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = left.child_by_field_name("object") else {
+        return false;
+    };
+    match object.kind() {
+        // `exports.X = ...`
+        "identifier" => object.utf8_text(source_bytes) == Ok("exports"),
+        // `module.exports.X = ...`
+        "member_expression" => {
+            let Some(inner_object) = object.child_by_field_name("object") else {
+                return false;
+            };
+            let Some(inner_property) = object.child_by_field_name("property") else {
+                return false;
+            };
+            inner_object.kind() == "identifier"
+                && inner_object.utf8_text(source_bytes) == Ok("module")
+                && inner_property.utf8_text(source_bytes) == Ok("exports")
+        }
+        _ => false,
+    }
+}
+
+/// nw-687 (review): names re-exported via a bare-identifier CommonJS
+/// assignment -- `module.exports = identifier`,
+/// `module.exports.X = identifier`, or `exports.X = identifier`
+/// -- mirroring `collect_export_clause_names`'s ES `export { name }`
+/// collection one level down (this walks top-level `expression_statement`s
+/// instead of `export_statement`s, since a CommonJS re-export has no
+/// `export` keyword at all). The exported name is the LOCAL identifier on
+/// the RIGHT, which may differ from the property name on the left, exactly
+/// like `export { local as alias }` keeps the local name. A function-valued
+/// right side is a NEW definition already handled by
+/// `is_commonjs_export_assignment` above and must not double-count here.
+///
+/// nw-687 (review, item 3): also collects re-exports nested inside `if`/
+/// `else` guard blocks -- the UMD shape `if (typeof module !== 'undefined')
+/// { module.exports.foo = foo; }` -- by recursing through `statement_block`/
+/// `else_clause`/`if_statement` wrappers. It does NOT descend into function
+/// or arrow bodies, so a re-export written inside a callback (which does not
+/// run at parse time / module-evaluation time in the same way) is still out
+/// of scope. Whether the named identifier actually roots as `Main` still
+/// depends entirely on `is_local_runtime_declaration` gating the TOP-LEVEL
+/// declaration it names, at the call site in `parse_source` -- this function
+/// only widens WHERE the assignment itself may be found.
+///
+/// nw-687 (review, item 4): gated explicitly on `lang`, matching
+/// `is_commonjs_export_assignment` -- see that function's doc comment for why
+/// node-kind names alone are not a safe enough gate across grammars.
+fn collect_commonjs_reexport_names<'a>(
+    lang: Language,
+    root: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<&'a str> {
+    let mut names = std::collections::HashSet::new();
+    if !matches!(lang, Language::JavaScript | Language::TypeScript) {
+        return names;
+    }
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        collect_commonjs_reexport_names_from(lang, statement, source_bytes, &mut names);
+    }
+    names
+}
+
+/// Helper for `collect_commonjs_reexport_names`: visits one statement node,
+/// recursing into the handful of statement-shaped wrappers a UMD guard uses
+/// (`if_statement`, `else_clause`, `statement_block`) so a re-export nested
+/// arbitrarily many guard levels deep is still found. Anything else (function
+/// bodies, loops, switch statements, ...) is left alone -- see the module
+/// evaluation-time reasoning on `collect_commonjs_reexport_names` above.
+fn collect_commonjs_reexport_names_from<'a>(
+    lang: Language,
+    statement: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+    names: &mut std::collections::HashSet<&'a str>,
+) {
+    match statement.kind() {
+        "expression_statement" => {
+            let Some(assignment) = statement.named_child(0) else {
+                return;
+            };
+            let direct_module_export = assignment.kind() == "assignment_expression"
+                && assignment
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "member_expression")
+                    .and_then(|left| {
+                        Some((
+                            left.child_by_field_name("object")?,
+                            left.child_by_field_name("property")?,
+                        ))
+                    })
+                    .is_some_and(|(object, property)| {
+                        object.kind() == "identifier"
+                            && object.utf8_text(source_bytes) == Ok("module")
+                            && property.utf8_text(source_bytes) == Ok("exports")
+                    });
+            if !direct_module_export
+                && !is_commonjs_export_assignment(lang, assignment, source_bytes)
+            {
+                return;
+            }
+            if let Some(right) = assignment.child_by_field_name("right")
+                && right.kind() == "identifier"
+                && let Ok(name) = right.utf8_text(source_bytes)
+            {
+                names.insert(name);
+            }
+        }
+        "statement_block" | "else_clause" => {
+            let mut cursor = statement.walk();
+            for child in statement.named_children(&mut cursor) {
+                collect_commonjs_reexport_names_from(lang, child, source_bytes, names);
+            }
+        }
+        "if_statement" => {
+            if let Some(consequence) = statement.child_by_field_name("consequence") {
+                collect_commonjs_reexport_names_from(lang, consequence, source_bytes, names);
+            }
+            if let Some(alternative) = statement.child_by_field_name("alternative") {
+                collect_commonjs_reexport_names_from(lang, alternative, source_bytes, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Rust macros that REGISTER functions as harness entry points, whose argument
@@ -3413,6 +3586,284 @@ class Config:
             .collect();
         assert!(imports.contains(&"./a.js"), "got: {imports:?}");
         assert!(imports.contains(&"./b.js"), "got: {imports:?}");
+    }
+
+    // ── nw-687: CommonJS export definitions ────────────────────────────────
+
+    #[test]
+    fn js_commonjs_export_functions_are_definitions() {
+        // `module.exports.X = function` / `exports.X = arrow` minted no symbol,
+        // so a CommonJS codebase (freeplay-server) had no callers/callees for
+        // them and dead-code flagged everything they call as unreachable.
+        // Lines: 1-3 listen, 4 stop, 5 the rewriteError re-export.
+        let source = "module.exports.listen = async function listen(app) {\n  return start(app);\n};\n\
+                      exports.stop = (server) => server.close();\n\
+                      module.exports.rewriteError = rewriteError;\n";
+        let parsed = parse_source(Path::new("src/helpers/initialize.js"), source).unwrap();
+        let fns: Vec<(&str, u32)> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| (s.name.as_str(), s.start_line))
+            .collect();
+        assert!(fns.contains(&("listen", 1)), "got {fns:?}");
+        assert!(fns.contains(&("stop", 4)), "got {fns:?}");
+        // Re-exporting an existing binding is not a new definition.
+        assert!(
+            !fns.iter().any(|(n, _)| *n == "rewriteError"),
+            "got {fns:?}"
+        );
+        // The call inside the exported function attaches to it.
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "start"),
+            "got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Counterweight: an arbitrary object property assignment is not a definition.
+    #[test]
+    fn js_plain_member_assignment_is_not_a_definition() {
+        // Each line defeats exactly one predicate: `exports` object (line 1),
+        // `module` root (line 2), `exports` property under `module` (line 3).
+        let source = "handlers.onClick = function onClick() {};\nobj.exports.x = () => 1;\n\
+                      module.helpers.y = () => 2;\n";
+        let parsed = parse_source(Path::new("src/ui.js"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .all(|s| s.name != "onClick" && s.name != "x" && s.name != "y"),
+            "{:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ts_commonjs_export_functions_are_definitions() {
+        let source = "exports.handler = async function handler(evt: unknown) { return evt; };\n\
+                      module.exports.close = (s: Server) => s.close();\n";
+        let parsed = parse_source(Path::new("src/lambda.ts"), source).unwrap();
+        let fns: Vec<(&str, u32)> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| (s.name.as_str(), s.start_line))
+            .collect();
+        assert!(fns.contains(&("handler", 1)), "got {fns:?}");
+        assert!(fns.contains(&("close", 2)), "got {fns:?}");
+    }
+
+    /// Counterweight (TS): the same member-assignment shapes stay non-definitions.
+    #[test]
+    fn ts_plain_member_assignment_is_not_a_definition() {
+        // Each line defeats exactly one predicate: `exports` object (line 1),
+        // `module` root (line 2), `exports` property under `module` (line 3).
+        let source = "handlers.onClick = function onClick() {};\nobj.exports.x = () => 1;\n\
+                      module.helpers.y = () => 2;\n";
+        let parsed = parse_source(Path::new("src/ui.ts"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .all(|s| s.name != "onClick" && s.name != "x" && s.name != "y"),
+            "{:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── nw-687 (review): CommonJS exports are exports ──────────────────────
+
+    /// A `module.exports.X = function` definition must be `Visibility::Public`
+    /// in parity with the equivalent ES export -- on a NEUTRAL path/name pair
+    /// (`src/util.js`/`formatDate`) that `detect_entry_point` does not root by
+    /// filename, unlike `src/lambda.js`/`handler` (which lands on
+    /// `LambdaHandler` via the filename alone regardless of visibility, so it
+    /// cannot tell an implemented `is_commonjs_export_assignment` from a
+    /// deleted one). This exercises ONLY `is_commonjs_export_assignment`:
+    /// disabling it flips the CommonJS side to `Private` while the ES control
+    /// stays `Public`, breaking parity.
+    #[test]
+    fn commonjs_direct_export_matches_es_export_visibility_and_entry_point() {
+        let cjs_source = "module.exports.formatDate = function formatDate(d) {\n  return d;\n};\n";
+        let cjs = parse_source(Path::new("src/util.js"), cjs_source).unwrap();
+        let cjs_fn = cjs
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("commonjs export must be captured as a definition");
+
+        let es_source = "export function formatDate(d) {\n  return d;\n}\n";
+        let es = parse_source(Path::new("src/util.js"), es_source).unwrap();
+        let es_fn = es
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("ES export must be captured as a definition");
+
+        assert_eq!(
+            (
+                cjs_fn.visibility,
+                cjs_fn.is_entry_point,
+                cjs_fn.entry_point_kind
+            ),
+            (
+                es_fn.visibility,
+                es_fn.is_entry_point,
+                es_fn.entry_point_kind
+            ),
+            "a direct CommonJS export must match the equivalent ES export's \
+             (visibility, is_entry_point, entry_point_kind) triple: \
+             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
+            cjs_fn.visibility,
+            cjs_fn.is_entry_point,
+            cjs_fn.entry_point_kind,
+            es_fn.visibility,
+            es_fn.is_entry_point,
+            es_fn.entry_point_kind
+        );
+        assert_eq!(cjs_fn.visibility, Visibility::Public);
+    }
+
+    /// `module.exports.formatDate = formatDate;` (bare-identifier re-export)
+    /// must mark the LOCAL `function formatDate` exported in parity with
+    /// `export { formatDate };` on the same neutral path/name pair -- this
+    /// exercises ONLY `collect_commonjs_reexport_names` (the direct-export
+    /// path above never applies, since the RHS here is an identifier, not a
+    /// function). Disabling it drops the CommonJS side back to
+    /// `Private`/`None` while the ES control stays `Public`/`Main`.
+    #[test]
+    fn commonjs_reexport_matches_es_export_clause_visibility_and_entry_point() {
+        let cjs_source =
+            "function formatDate(d) {\n  return d;\n}\nmodule.exports.formatDate = formatDate;\n";
+        let cjs = parse_source(Path::new("src/util.js"), cjs_source).unwrap();
+        let cjs_fn = cjs
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("the local declaration must still be captured");
+
+        let es_source = "function formatDate(d) {\n  return d;\n}\nexport { formatDate };\n";
+        let es = parse_source(Path::new("src/util.js"), es_source).unwrap();
+        let es_fn = es
+            .symbols
+            .iter()
+            .find(|s| s.name == "formatDate")
+            .expect("the local declaration must still be captured");
+
+        assert_eq!(
+            (
+                cjs_fn.visibility,
+                cjs_fn.is_entry_point,
+                cjs_fn.entry_point_kind
+            ),
+            (
+                es_fn.visibility,
+                es_fn.is_entry_point,
+                es_fn.entry_point_kind
+            ),
+            "a CommonJS bare-identifier re-export must match `export {{ name }}`'s \
+             (visibility, is_entry_point, entry_point_kind) triple: \
+             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
+            cjs_fn.visibility,
+            cjs_fn.is_entry_point,
+            cjs_fn.entry_point_kind,
+            es_fn.visibility,
+            es_fn.is_entry_point,
+            es_fn.entry_point_kind
+        );
+        assert_eq!(cjs_fn.visibility, Visibility::Public);
+        assert_eq!(cjs_fn.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    /// `module.exports.listen = listen;` (bare-identifier re-export) mints no
+    /// new symbol -- see `js_commonjs_export_functions_are_definitions` -- but
+    /// the LOCAL `function listen` it names must become Public and rooted,
+    /// exactly like `export { listen }` already does via
+    /// `collect_export_clause_names`.
+    #[test]
+    fn commonjs_bare_reexport_marks_local_function_exported() {
+        let source = "function listen(app) {\n  return app;\n}\nmodule.exports.listen = listen;\n";
+        let parsed = parse_source(Path::new("src/server.js"), source).unwrap();
+        let listen = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "listen")
+            .expect("the local declaration must still be captured");
+        assert_eq!(listen.visibility, Visibility::Public);
+        assert_eq!(listen.entry_point_kind, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn commonjs_module_export_of_local_function_is_an_entry_point() {
+        let source = "async function context(req) { return req; }\nmodule.exports = context;\n";
+        for path in ["src/graphql/context.js", "src/graphql/context.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let context = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "context")
+                .expect("the local function must be captured");
+            assert_eq!(context.visibility, Visibility::Public, "{path}");
+            assert_eq!(
+                context.entry_point_kind,
+                Some(EntryPointKind::Main),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigning_unrelated_exports_property_does_not_export_local_function() {
+        let source = "function context() {}\nother.exports = context;\nexports = context;\n";
+        let parsed = parse_source(Path::new("src/graphql/context.js"), source).unwrap();
+        let context = parsed.symbols.iter().find(|s| s.name == "context").unwrap();
+        assert_eq!(context.visibility, Visibility::Private);
+        assert!(!context.is_entry_point);
+    }
+
+    /// Counterweight: an ordinary, unexported local function must NOT pick up
+    /// the new CommonJS-export treatment just because SOME other assignment in
+    /// the file is a plain (non-exports) member assignment.
+    #[test]
+    fn commonjs_unrelated_assignment_does_not_export_a_plain_local_function() {
+        let source =
+            "handlers.onClick = function onClick() {};\nfunction helper() {\n  return 1;\n}\n";
+        let parsed = parse_source(Path::new("src/ui.js"), source).unwrap();
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("the plain local function must still be captured");
+        assert_eq!(helper.visibility, Visibility::Private);
+        assert!(!helper.is_entry_point);
+    }
+
+    /// nw-687 (review, item 3): a UMD guard (`if (typeof module !==
+    /// 'undefined') { module.exports.foo = foo; }`) nests the re-export one
+    /// block deep. `collect_commonjs_reexport_names` must still find it and
+    /// mark the local declaration exported, exactly like the un-nested
+    /// bare-identifier re-export (`commonjs_bare_reexport_marks_local_function_exported`).
+    #[test]
+    fn commonjs_reexport_nested_in_umd_guard_marks_local_function_exported() {
+        let source = "function factory(app) {\n  return app;\n}\n\
+                       if (typeof module !== 'undefined') {\n  \
+                       module.exports.factory = factory;\n}\n";
+        let parsed = parse_source(Path::new("src/umd.js"), source).unwrap();
+        let factory = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "factory")
+            .expect("the local declaration must still be captured");
+        assert_eq!(factory.visibility, Visibility::Public);
+        assert_eq!(factory.entry_point_kind, Some(EntryPointKind::Main));
     }
 
     #[test]

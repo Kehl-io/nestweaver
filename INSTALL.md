@@ -170,12 +170,16 @@ open target/release/NestWeaver.app
 
 ## Upgrading to this release — re-index every graph
 
-**This release bumps `RESOLVER_GENERATION` to 6.** Installing the new binary
+**This release bumps `RESOLVER_GENERATION` to 7.** Installing the new binary
 does not repair a graph already on disk. Until each repo is re-indexed, its
 rankings, edges and `dead-code` results are computed from data the old resolver
 wrote, and `dead-code` refuses outright rather than reporting from it.
 
-What generation 6 changes is which symbols are ENTRY POINTS, and
+Generation 7 (nw-687) adds definitions and call edges for CommonJS
+`module.exports.X` and `exports.X` functions in JavaScript and TypeScript.
+An older graph is missing those edges, so `dead-code` may call their live
+callees unreachable until the repo is re-indexed. Generation 6 changed which
+symbols are ENTRY POINTS, and
 `is_entry_point`/`entry_point_kind` are persisted per-symbol columns read
 straight off disk rather than re-derived at query time — so a symbol indexed
 before this release keeps `is_entry_point: false` forever, no matter which
@@ -218,7 +222,7 @@ ladder was SHA-vs-HEAD only, so a generation-3 graph exited 0):
 nestweaver stale-check                 # status: outdated_resolver, exit 2
 nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
 # or read the sidecar directly — any repo whose generation DIFFERS from the
-# running binary's `RESOLVER_GENERATION` (6 in this release) needs a re-index.
+# running binary's `RESOLVER_GENERATION` (7 in this release) needs a re-index.
 # As of 9.1.0 compatibility is an exact match, not a floor: a graph written by
 # a NEWER resolver than the running binary understands is just as untrustworthy
 # as an older one, so it reads as stale too.

@@ -162,7 +162,10 @@ pub fn discover_cross_domain_links_with_config(
 ///   of that name, any kind, any repo.
 /// 2 — nw-670: explicit code mentions, kind-gated by shape, project-scoped,
 ///   at most [`MAX_DEFINING_FILES`] defining files, `main` stoplisted.
-pub const CROSS_DOMAIN_RULES_VERSION: u32 = 2;
+/// 3 (10.4.x) — nw-685: R5 project scoping runs before R4 go-to-definition
+///   preferences, so an out-of-project definition can no longer suppress an
+///   in-scope test-only helper or an in-scope value/property.
+pub const CROSS_DOMAIN_RULES_VERSION: u32 = 3; // nw-685: scope before preferences
 
 /// Notes flushed per write transaction, by the bulk pass and the vault
 /// watcher alike. Bounds peak transaction memory while amortising the commit
@@ -878,16 +881,12 @@ impl SymbolIndex {
                         && matches!(candidate.kind, SymbolKind::Function | SymbolKind::Method))
             });
         }
-        // R4: go-to-definition's preferences — real code over tests, then
-        // definitions over values.
-        if candidates.iter().any(|candidate| !candidate.in_test) {
-            candidates.retain(|candidate| !candidate.in_test);
-        }
-        if candidates.iter().any(|candidate| candidate.definition) {
-            candidates.retain(|candidate| candidate.definition);
-        }
         // R5: within the note's project scope, or — for a note in none — a
-        // distinctive name only, defined in exactly one file.
+        // distinctive name only, defined in exactly one file. This runs
+        // BEFORE R4 (nw-685): scoping first means an out-of-project
+        // definition can never out-rank, and so delete, an in-scope
+        // candidate that R4's preferences alone would have discarded (an
+        // in-scope test-only helper, or an in-scope value/property).
         let cap = match scope {
             Some(repos) => {
                 candidates.retain(|candidate| repos.contains(&candidate.repo_uid));
@@ -896,6 +895,14 @@ impl SymbolIndex {
             None if distinctive => MAX_DEFINING_FILES_UNSCOPED,
             None => return None,
         };
+        // R4: go-to-definition's preferences — real code over tests, then
+        // definitions over values. Applied only within the scoped set.
+        if candidates.iter().any(|candidate| !candidate.in_test) {
+            candidates.retain(|candidate| !candidate.in_test);
+        }
+        if candidates.iter().any(|candidate| candidate.definition) {
+            candidates.retain(|candidate| candidate.definition);
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -975,6 +982,89 @@ mod tests {
 
     fn uids(hits: &[(String, f32)]) -> Vec<&str> {
         hits.iter().map(|(uid, _)| uid.as_str()).collect()
+    }
+
+    /// nw-685: another project's non-test definition must not delete an
+    /// in-scope test-only one. R5 (scope) runs before R4 (preferences).
+    #[test]
+    fn another_projects_definition_does_not_suppress_an_in_scope_test_helper() {
+        let idx = scoped_index_of(
+            &[
+                sym(
+                    "sym:mine",
+                    "computeTotals",
+                    "Function",
+                    "r",
+                    "tests/totals.test.ts",
+                ),
+                sym(
+                    "sym:theirs",
+                    "computeTotals",
+                    "Function",
+                    "other",
+                    "src/totals.ts",
+                ),
+            ],
+            &["r"],
+        );
+        assert_eq!(
+            uids(&hits_in(&idx, "note:p", "call `computeTotals()`")),
+            ["sym:mine"]
+        );
+    }
+
+    /// Same for R4's definition-over-value preference.
+    #[test]
+    fn another_projects_function_does_not_suppress_an_in_scope_property() {
+        assert!(
+            nestweaver_parser::is_distinctive("sessionUserId"),
+            "fixture must be distinctive"
+        );
+        let idx = scoped_index_of(
+            &[
+                sym(
+                    "sym:prop",
+                    "sessionUserId",
+                    "Property",
+                    "r",
+                    "src/session.ts",
+                ),
+                sym("sym:fn", "sessionUserId", "Function", "other", "src/x.ts"),
+            ],
+            &["r"],
+        );
+        assert_eq!(
+            uids(&hits_in(&idx, "note:p", "the `sessionUserId` field")),
+            ["sym:prop"]
+        );
+    }
+
+    /// Counterweight: WITHIN scope, R4 still prefers real code over tests.
+    #[test]
+    fn in_scope_preferences_still_apply() {
+        let idx = scoped_index_of(
+            &[
+                sym(
+                    "sym:test",
+                    "computeTotals",
+                    "Function",
+                    "r",
+                    "tests/totals.test.ts",
+                ),
+                sym(
+                    "sym:real",
+                    "computeTotals",
+                    "Function",
+                    "r",
+                    "src/totals.ts",
+                ),
+            ],
+            &["r"],
+        );
+        assert_eq!(
+            uids(&hits_in(&idx, "note:p", "call `computeTotals()`")),
+            ["sym:real"]
+        );
     }
 
     /// nw-670: `Processor` is a plain word, so it links only when written as

@@ -227,7 +227,26 @@ use std::path::Path;
 /// old binary already reported. No persisted row becomes newly wrong, so
 /// forcing every user through a `--force` re-index (and making `dead-code`
 /// refuse until then) would buy nothing. Re-indexing a repo picks up both.
-pub const RESOLVER_GENERATION: u32 = 6;
+///
+/// 7 — nw-687: 7abe922b adds CALLS/definition edges for CommonJS
+///     `module.exports.X = function ...` and `exports.X = function ...`
+///     function definitions in JS/TS, which previously produced no `Function`
+///     symbol at all. A graph indexed before this fix is missing exactly
+///     those symbols AND the edges from their callers to them, so
+///     `dead-code`'s reachability walk — which reads persisted symbols and
+///     edges straight off disk rather than re-deriving them — reports every
+///     live callee reached only through one of these definitions as
+///     unreachable. Unlike nw-453 (NOT bumped, above), a stale graph here has
+///     no safe reading: the missing symbol and edge make dead code look ALIVE
+///     nowhere and make live code look DEAD, the same "previously-indexed
+///     repos yield different (wrong) analysis" shape as generations 2 and 4.
+///     Same remedy as every other bump in this file: `nestweaver index --repo
+///     <path> --force`. Folded into the same bump (review, same PR): those
+///     definitions, and a same-file function they bare-identifier re-export
+///     (`module.exports.f = f`), are now `Visibility::Public` and root like
+///     an equivalent ES export instead of parsing `Private`/non-entry, the
+///     same persisted-column shape as generations 5/6 above.
+pub const RESOLVER_GENERATION: u32 = 7;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

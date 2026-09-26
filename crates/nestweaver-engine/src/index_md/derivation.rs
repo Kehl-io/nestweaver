@@ -16,27 +16,27 @@ fn migration_ignore(root: &Path) -> anyhow::Result<GlobSet> {
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(crate::brainignore::load_brain_ignore(root, &[]));
+            return crate::brainignore::load_brain_ignore(root, &[]);
         }
-        Err(error) => return Err(error).context("read vault derivation ignore policy"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read vault derivation ignore policy {}", path.display())
+            });
+        }
     };
     let mut content = String::new();
     (&mut file)
         .take(64 * 1024 + 1)
-        .read_to_string(&mut content)?;
+        .read_to_string(&mut content)
+        .with_context(|| format!("read vault derivation ignore policy {}", path.display()))?;
     anyhow::ensure!(
         content.len() <= 64 * 1024,
-        "vault ignore policy exceeds migration budget"
+        "vault ignore policy {} exceeds migration budget",
+        path.display()
     );
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        builder.add(globset::Glob::new(pattern).context("invalid vault ignore policy")?);
-    }
-    Ok(builder.build()?)
+    // nw-684 review: the indexer's parser and error contexts (file + line),
+    // so the migration and the index can never read one file two ways.
+    crate::brainignore::build_ignore_set(&path, Some(&content), &[])
 }
 
 struct CapturedNotes {
@@ -213,6 +213,32 @@ pub fn refresh_indexed_markdown_derivation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-684 review: the derivation migration's `.brainignore` parse used
+    /// its own loop and an anonymous "invalid vault ignore policy"; it now
+    /// shares the indexer's parser and names the file and line.
+    #[test]
+    fn migration_ignore_names_the_file_and_line_of_an_invalid_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".brainignore");
+        std::fs::write(&file, "# private\nok/**\nfoo{a,b\n").unwrap();
+        let message = format!(
+            "{:#}",
+            migration_ignore(dir.path()).expect_err("invalid glob")
+        );
+        assert!(
+            message.contains("line 3")
+                && message.contains("foo{a,b")
+                && message.contains(&file.display().to_string()),
+            "{message}"
+        );
+
+        // Counterweight: a valid file still excludes what it names, and only that.
+        std::fs::write(&file, "# private\nok/**\n").unwrap();
+        let set = migration_ignore(dir.path()).unwrap();
+        assert!(set.is_match("ok/a.md"));
+        assert!(!set.is_match(".obsidian/a.md"));
+    }
 
     #[test]
     fn legacy_capture_rejects_noncanonical_and_excluded_paths() {

@@ -228,12 +228,17 @@ async fn p1_impact_returns_layered_envelope_with_tests_evidence_and_meta() {
     assert_eq!(json["target"]["uid"], "sym:impact:target");
     assert_eq!(json["target"]["layer"], 0);
     assert_eq!(json["target"]["source"]["file_path"], "src/target.rs");
+    let url = json["target"]["source"]["url"]
+        .as_str()
+        .expect("target source url should be present");
     assert!(
-        json["target"]["source"]["url"]
-            .as_str()
-            .expect("target source url should be present")
-            .contains("/api/v1/source?file=src%2Ftarget.rs&line=10"),
-        "target should include a source evidence link"
+        url.contains("/api/v1/source?file=src%2Ftarget.rs"),
+        "target should include a source evidence link: {url}"
+    );
+    assert!(url.contains("line=10"), "{url}");
+    assert!(
+        !url.contains("repo="),
+        "a non-canonical symbol uid must not invent a repo: {url}"
     );
 
     let nodes = json["nodes"].as_array().expect("nodes should be an array");

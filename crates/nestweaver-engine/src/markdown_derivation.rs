@@ -154,6 +154,18 @@ pub enum RecordError {
     IncompletePublication,
     #[error("Markdown derivation record I/O failed ({0:?})")]
     Io(std::io::ErrorKind),
+    /// nw-684: the vault's `.brainignore` exists but cannot be read. Named so
+    /// the operator can fix it; admission still reports the path-free
+    /// `RecordUnavailable`.
+    #[error(
+        "cannot read {} ({kind:?}) — make it readable (or remove it to use the defaults) \
+         before this vault can be indexed or admitted",
+        path.display()
+    )]
+    IgnorePolicyUnreadable {
+        path: std::path::PathBuf,
+        kind: std::io::ErrorKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -208,7 +220,9 @@ impl DerivationUnavailable {
                 RecordError::FutureVersion(_) => AdmissionReason::FutureVersion,
                 RecordError::UnsupportedProvider => AdmissionReason::UnsupportedProvider,
                 RecordError::LimitExceeded => AdmissionReason::RecordLimit,
-                RecordError::Io(_) => AdmissionReason::RecordUnavailable,
+                RecordError::Io(_) | RecordError::IgnorePolicyUnreadable { .. } => {
+                    AdmissionReason::RecordUnavailable
+                }
                 _ => AdmissionReason::RecordInvalid,
             },
             retryable: false,
@@ -731,11 +745,17 @@ pub fn coverage_identity(
         .collect();
     extra.sort();
     extra.dedup();
-    let brainignore = match std::fs::read(root.join(".brainignore")) {
+    let ignore_path = root.join(".brainignore");
+    let brainignore = match std::fs::read(&ignore_path) {
         Ok(bytes) if bytes.len() <= 64 * 1024 => blake3::hash(&bytes).to_hex().to_string(),
         Ok(_) => return Err(RecordError::LimitExceeded),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
-        Err(error) => return Err(RecordError::Io(error.kind())),
+        Err(error) => {
+            return Err(RecordError::IgnorePolicyUnreadable {
+                path: ignore_path,
+                kind: error.kind(),
+            });
+        }
     };
     let payload = serde_json::json!({
         "extra_ignore_patterns": extra,
@@ -835,6 +855,31 @@ mod tests {
 
     fn identity() -> PublicationIdentity {
         PublicationIdentity::new_brain()
+    }
+
+    /// nw-684 review: the derivation gate reads `.brainignore` for its policy
+    /// digest; an unreadable one must name the file and the remedy, not
+    /// report an anonymous "record I/O failed (PermissionDenied)". The
+    /// admission code stays the path-free `RecordUnavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_brainignore_in_coverage_identity_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".brainignore");
+        std::fs::write(&file, "secret.md\n").unwrap();
+        let Some(_restore) = crate::brainignore::test_support::make_unreadable(&file) else {
+            return;
+        };
+        let error = coverage_identity(dir.path(), &[], 1024, CoverageScope::FullRegisteredPolicy)
+            .expect_err("unreadable policy");
+        let message = error.to_string();
+        assert!(
+            message.contains(&file.display().to_string()) && message.contains("readable"),
+            "{message}"
+        );
+        let admission = DerivationUnavailable::from_record_error(&error);
+        assert_eq!(admission.reason, AdmissionReason::RecordUnavailable);
+        assert!(!admission.to_string().contains(".brainignore"));
     }
 
     #[test]

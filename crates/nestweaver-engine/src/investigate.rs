@@ -972,19 +972,46 @@ pub fn investigate(
                     &injected,
                 )
             } else {
-                // `vault` / `repo:` / `all`: unchanged from before nw-476.
-                // The seed partition here is small (a handful of
-                // exact-name/title/UID resolutions), so the merge-then-
-                // truncate bug this fix addresses never manifests, and the
-                // owner decision does not authorize touching this path's
-                // ordering. See `investigate_vault_scope_exact_symbol_match_is_not_pinned`.
-                let mut nodes = ctx.seeds;
-                nodes.extend(
-                    ctx.connected
+                // nw-529: a longer substring name is not an intentional seed
+                // when the query also resolved an exact symbol. Keep it in
+                // the connected partition so it can still be explored by
+                // relevance. This does not pin or boost either match, and
+                // `matched_query` remains project-scope-only (nw-476).
+                let (exact_uids, partial_uids) =
+                    resolve_query_symbol_matches(store, query, &config.seed_resolution);
+                let has_exact_seed = ctx.seeds.iter().any(|node| exact_uids.contains(&node.uid));
+                if !has_exact_seed {
+                    let mut nodes = ctx.seeds;
+                    nodes.extend(
+                        ctx.connected
+                            .into_iter()
+                            .filter(|node| !seed_uids.contains(&node.uid)),
+                    );
+                    nodes
+                } else {
+                    let (mut seeds, demoted): (Vec<BrainNode>, Vec<BrainNode>) =
+                        ctx.seeds.into_iter().partition(|node| {
+                            !partial_uids.contains(&node.uid) || exact_uids.contains(&node.uid)
+                        });
+                    let demoted_uids: std::collections::HashSet<String> =
+                        demoted.iter().map(|node| node.uid.clone()).collect();
+                    seed_uids.retain(|uid| !demoted_uids.contains(uid));
+                    let mut rest: Vec<BrainNode> = ctx
+                        .connected
                         .into_iter()
-                        .filter(|n| !seed_uids.contains(&n.uid)),
-                );
-                nodes
+                        .filter(|node| {
+                            !seed_uids.contains(&node.uid) && !demoted_uids.contains(&node.uid)
+                        })
+                        .chain(demoted)
+                        .collect();
+                    rest.sort_by(|a, b| {
+                        b.relevance
+                            .partial_cmp(&a.relevance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    seeds.extend(rest);
+                    seeds
+                }
             }
         }
         Err(e) => {
@@ -2055,6 +2082,11 @@ pub enum BodyUnavailable {
     /// (explicit or a genuinely recorded repo `local_root`) was tried and
     /// still didn't contain the file.
     NoRecordedLocalRoot { path: String },
+    /// nw-689: the file WAS read, but it changed since indexing and the stored
+    /// span no longer holds the symbol (and it could not be re-located).
+    /// Distinct from `SourceUnreadable`: a different `root` will not help;
+    /// re-indexing will.
+    StaleSpan { path: String },
     /// The node exists and its body is genuinely empty.
     Empty,
     /// No such node in the graph (a stale bundle, or a UID from another graph).
@@ -2077,6 +2109,12 @@ impl BodyUnavailable {
                 format!(
                     "no recorded local_root for this symbol's repo; tried the server's \
                      working directory and could not read: {path}"
+                )
+            }
+            BodyUnavailable::StaleSpan { path } => {
+                format!(
+                    "source changed since indexing; the stored span no longer holds this \
+                     symbol (re-index the repo): {path}"
                 )
             }
             BodyUnavailable::Empty => "the node's body is empty".to_string(),
@@ -2200,6 +2238,9 @@ fn fetch_full_body(
                 // a different, more actionable fact than a real root (given
                 // explicitly, or resolved from a genuine repo `local_root`)
                 // simply not containing the file.
+                Some(window) if window.stale_span => {
+                    Err(BodyUnavailable::StaleSpan { path: window.path })
+                }
                 Some(window) if !window.body_available => Err(match resolved_root {
                     SymbolRootSource::FallbackCwd(_) => {
                         BodyUnavailable::NoRecordedLocalRoot { path: window.path }
@@ -5482,6 +5523,75 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_exact_name_does_not_seed_longer_partial_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("a.js"),
+            "function start() { return 1; }\nfunction start2() { return start(); }\nfunction main() { return start2(); }\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        for scope in ["all", "repo:test"] {
+            let result = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "start",
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap();
+            let exact = result
+                .entries
+                .iter()
+                .find(|entry| entry.title == "start")
+                .unwrap();
+            assert!(exact.is_seed, "{scope}: exact match must remain a seed");
+            if let Some(partial) = result.entries.iter().find(|entry| entry.title == "start2") {
+                assert!(
+                    !partial.is_seed,
+                    "{scope}: longer partial match must be connected, not a seed: {partial:?}"
+                );
+            }
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .all(|entry| entry.matched_query.is_none())
+            );
+
+            let partial_query = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "sta",
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap();
+            for name in ["start", "start2"] {
+                let match_entry = partial_query
+                    .entries
+                    .iter()
+                    .find(|entry| entry.title == name)
+                    .unwrap();
+                assert!(
+                    match_entry.is_seed,
+                    "{scope}: {name} must stay a seed without an exact match"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stale_bundles_dropped_on_load() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nestweaver.lbug");
@@ -6409,6 +6519,69 @@ mod tests {
         assert!(
             entry.inline_body.as_deref().is_some_and(|b| !b.is_empty()),
             "hydrate must be able to retry an entry expand could not read"
+        );
+    }
+
+    /// nw-689: a span that drifted since indexing is a STALE span, not an
+    /// unreadable root — the reason must say re-index, not "pass a root".
+    #[test]
+    fn investigate_expand_reports_a_drifted_span_as_stale() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        // The repo changed since indexing: line 1 no longer holds `greet`.
+        fs::write(
+            src.join("greet").join("main.js"),
+            "function other(x) { return x; }\nfunction hello(name) { return name; }",
+        )
+        .unwrap();
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_stale".to_string(),
+            Bundle {
+                bundle_id: "bndl_stale".to_string(),
+                created_at: now_epoch(),
+                query: "q".to_string(),
+                scope: "vault".to_string(),
+                entries: vec![BundleEntry {
+                    asset_id: "a_greet".to_string(),
+                    uid: greet_uid,
+                    kind: "Symbol".to_string(),
+                    title: "greet".to_string(),
+                    location: "greet/main.js:1".to_string(),
+                    summary: None,
+                    inline_body: None,
+                    body_complete: true,
+                    expanded: false,
+                    unavailable_reason: None,
+                    is_seed: false,
+                    matched_query: None,
+                    relevance: 1.0,
+                }],
+            },
+        );
+        save_bundle_store(&db_path, &bundle_store).unwrap();
+
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            Some(&src),
+            "bndl_stale",
+            &["a_greet".to_string()],
+        )
+        .unwrap();
+        let entry = &expanded.expanded[0];
+        assert!(entry.inline_body.is_none(), "{entry:?}");
+        let reason = entry.unavailable_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("changed since indexing"),
+            "a drifted span must be reported as stale, got: {reason:?}"
         );
     }
 

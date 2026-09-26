@@ -6,6 +6,7 @@
 //! (`neighbors`) and is token-budget aware. Comment stripping is a planned
 //! follow-up (default-off; deferred to avoid false-elision risk).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use nestweaver_schema::Symbol;
@@ -31,6 +32,16 @@ pub struct SymbolWindow {
     pub body_available: bool,
     /// True when this symbol was pulled in via `neighbors`, not requested directly.
     pub is_neighbor: bool,
+    /// nw-689: the stored span no longer holds this symbol (the repo changed
+    /// since indexing) and it could not be re-located; `body` is empty and
+    /// `body_available` is false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale_span: bool,
+    /// nw-689: the current parsed span differs from the indexed start or end.
+    /// This is the originally stored start (which may equal `start_line` when
+    /// only the end changed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocated_from_line: Option<u32>,
 }
 
 /// A spec that matched more than one symbol.
@@ -76,9 +87,8 @@ pub struct BudgetOverrun {
     pub note: String,
 }
 
-/// Read lines `start..=end` (1-based, inclusive) from `file_path` via the reader.
-fn read_span(reader: &dyn ContentReader, file_path: &str, start: u32, end: u32) -> Option<String> {
-    let text = reader.read_file(Path::new(file_path)).ok()?;
+/// Read lines `start..=end` (1-based, inclusive) from one already-read file.
+fn read_span(text: &str, start: u32, end: u32) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if start == 0 || start as usize > lines.len() {
         return None;
@@ -88,6 +98,233 @@ fn read_span(reader: &dyn ContentReader, file_path: &str, start: u32, end: u32) 
     // (old DBs may carry end_line = 0 before a `index --force`).
     let hi = (end.max(start) as usize).min(lines.len());
     Some(lines[lo..hi].join("\n"))
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Only identifier-shaped names are drift-checked. Test-block names
+/// (`describe('renders the list')`), FQNs and operator names pass unchanged.
+fn is_identifier(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_ident_char)
+}
+
+/// Byte offsets of every whole-word occurrence of `name` in `line`.
+fn whole_word_hits<'a>(line: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    line.match_indices(name).filter_map(move |(i, _)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + name.len()..].chars().next();
+        let boundary = |c: Option<char>| c.is_none_or(|c| !is_ident_char(c));
+        (boundary(before) && boundary(after)).then_some(i)
+    })
+}
+
+fn names_symbol(line: &str, name: &str) -> bool {
+    whole_word_hits(line, name).next().is_some()
+}
+
+/// How many lines this checks after the start of the declaration.
+const HEADER_LINES: usize = 5;
+
+/// nw-689: does `body` (the stored span, read from disk now) still hold the
+/// symbol `name`? A `false` means the file changed since indexing and the span
+/// now holds some other code.
+///
+/// The rule is "the name appears as a whole word in the declaration header,
+/// within [`HEADER_LINES`] lines after any annotation block", widened for
+/// spans whose declaration puts the name elsewhere:
+///
+/// - a leading annotation/decorator/attribute block (Java and Dart fold
+///   annotations INTO the declaration node, and a multi-line `@GetMapping(...)`
+///   or `@ApiResponses({...})` pushes the name well past line 5) is skipped,
+///   and the window starts at the declaration after it;
+/// - the LAST line of the span may carry the name (C `typedef struct { ... }
+///   Name;`);
+/// - a file-level component symbol (Svelte/Vue/Astro) is named after the file
+///   stem and may never name itself in its source.
+fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -> bool {
+    if !is_identifier(name) {
+        return true;
+    }
+    let file_component = file_stem(file_path) == name
+        && ["vue", "svelte", "astro"].contains(&file_path.rsplit('.').next().unwrap_or(""));
+    // Script-setup and file-level component signatures are synthetic; they
+    // have no literal declaration line to compare against the source.
+    if file_component && signature.starts_with('<') {
+        return true;
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    // The parser has already identified the current declaration and its
+    // exact extent. The indexed signature may include an old one-line body,
+    // so comparing it to the current first line would reject a valid edit.
+    // An Options API component is named after its .vue file. Its real
+    // declaration says `export default`, never the component name.
+    if file_component {
+        return true;
+    }
+    let decl = declaration_start(&lines);
+    // Inspect the declaration header only. A call or comment inside the body
+    // can mention the old name while this span now belongs to another method.
+    for line in lines.iter().skip(decl).take(HEADER_LINES) {
+        if names_symbol(line, name) {
+            return true;
+        }
+        if line.contains('{') || line.contains(';') || line.contains("=>") {
+            break;
+        }
+    }
+    signature.starts_with("typedef") && lines.last().is_some_and(|l| names_symbol(l, name))
+}
+
+fn file_stem(file_path: &str) -> &str {
+    let file_name = file_path.rsplit(['/', '\\']).next().unwrap_or(file_path);
+    match file_name.rfind('.') {
+        Some(0) | None => file_name,
+        Some(dot) => &file_name[..dot],
+    }
+}
+
+/// Index of the first line after a leading block of annotations/attributes
+/// (`@Foo(...)`, `#[attr]`, C# `[Attr]`), blank lines and comments. Bracket
+/// depth is tracked so a multi-line annotation argument list is skipped whole.
+/// Skipping only moves where the name is looked for; it never accepts a span
+/// on its own.
+fn declaration_start(lines: &[&str]) -> usize {
+    let mut depth: i32 = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let is_comment = t.starts_with("//") || t.starts_with("/*") || t.starts_with('*');
+        let is_prefix = depth > 0
+            || t.is_empty()
+            || is_comment
+            || t.starts_with('@')
+            || t.starts_with("#[")
+            || t.starts_with('[');
+        if !is_prefix {
+            return i;
+        }
+        if !is_comment {
+            for c in t.chars() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    lines.len()
+}
+
+/// Keywords that, immediately before a name, make a line a definition of it.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn",
+    "function",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "type",
+    "const",
+    "let",
+    "var",
+    "impl",
+    "func",
+    "fun",
+    "val",
+    "static",
+    "mod",
+    "module",
+    "namespace",
+    "object",
+    "record",
+    "union",
+    "protocol",
+];
+
+/// Is `line` a definition of `name`? The word immediately before the name
+/// must be a definition keyword (`pub async fn NAME`, `export const NAME`),
+/// or the line is a Go receiver method (`func (s *S) NAME(`). A keyword
+/// merely appearing earlier on the line is not enough: `let x = NAME();` is a
+/// call, and relocating to it would return exactly the wrong body nw-689 is
+/// about.
+fn defines_symbol(line: &str, name: &str) -> bool {
+    let go_receiver = {
+        let t = line.trim_start();
+        t.starts_with("func (") || t.starts_with("func(")
+    };
+    whole_word_hits(line, name).any(|i| {
+        let prefix = line[..i].trim_end();
+        if go_receiver && prefix.ends_with(')') {
+            return true;
+        }
+        let prev = prefix
+            .rsplit(|c: char| !is_ident_char(c))
+            .next()
+            .unwrap_or("");
+        !prev.is_empty() && prefix.ends_with(prev) && DEFINITION_KEYWORDS.contains(&prev)
+    })
+}
+
+/// (start, end), 1-based, of the UNIQUE definition line for `name` in `text`,
+/// keeping a window of `len` lines. `None` when there is no such line or more
+/// than one: a guess between two definitions is how the wrong body gets
+/// returned.
+fn relocate(text: &str, name: &str, len: u32) -> Option<(u32, u32)> {
+    let mut hits = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| defines_symbol(l, name))
+        .map(|(i, _)| i);
+    let only = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let start = u32::try_from(only).ok()?.checked_add(1)?;
+    Some((start, start + len.max(1) - 1))
+}
+
+/// Re-parse the current file to verify the symbol's actual start and end.
+/// The indexed line count is not safe after a file edit: a shorter definition
+/// can pull the next symbol into the window, and a longer one is truncated.
+fn verified_current_span(
+    text: &str,
+    parsed: &nestweaver_parser::ParsedFile,
+    sym: &Symbol,
+) -> Option<(u32, u32, String)> {
+    let candidates: Vec<_> = parsed
+        .symbols
+        .iter()
+        .filter(|raw| raw.name == sym.name && raw.kind == sym.kind)
+        .collect();
+    let hash_matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|raw| raw.content_hash == sym.content_hash)
+        .collect();
+    let raw = match hash_matches.as_slice() {
+        [only] => *only,
+        many if many.len() > 1 => *many.iter().find(|raw| raw.start_line == sym.start_line)?,
+        _ => match candidates.as_slice() {
+            [only] => *only,
+            _ => return None,
+        },
+    };
+    if raw.start_line != sym.start_line {
+        let old_len = sym.end_line.max(sym.start_line) - sym.start_line + 1;
+        if relocate(text, &sym.name, old_len).map(|(start, _)| start) != Some(raw.start_line) {
+            return None;
+        }
+    }
+    let body = read_span(text, raw.start_line, raw.end_line)?;
+    span_holds_symbol(&body, &sym.name, &sym.file_path, &sym.signature).then_some((
+        raw.start_line,
+        raw.end_line,
+        body,
+    ))
 }
 
 /// Resolve a spec (`sym:` UID, bare name, or dotted/`::` FQN) to candidate symbols.
@@ -182,8 +419,42 @@ pub fn read_symbols_budgeted(
 
     // 3. Build windows, honoring the token budget (input order).
     let mut used = 0usize;
+    // Neighbor windows commonly share a file. Parse it once per call.
+    let mut file_cache: HashMap<String, Option<(String, Option<nestweaver_parser::ParsedFile>)>> =
+        HashMap::new();
     for (sym, is_neighbor) in ordered {
-        let body_opt = read_span(reader, &sym.file_path, sym.start_line, sym.end_line);
+        let mut start_line = sym.start_line;
+        let mut end_line = sym.end_line;
+        let mut stale_span = false;
+        let mut relocated_from_line = None;
+        let current = file_cache.entry(sym.file_path.clone()).or_insert_with(|| {
+            reader
+                .read_file(Path::new(&sym.file_path))
+                .ok()
+                .map(|text| {
+                    let parsed =
+                        nestweaver_parser::parse_source(Path::new(&sym.file_path), &text).ok();
+                    (text, parsed)
+                })
+        });
+        let body_opt = current.as_ref().and_then(|(text, parsed)| {
+            match parsed
+                .as_ref()
+                .and_then(|parsed| verified_current_span(text, parsed, &sym))
+            {
+                Some((current_start, current_end, body)) => {
+                    if current_start != start_line || current_end != end_line {
+                        relocated_from_line = Some(start_line);
+                        (start_line, end_line) = (current_start, current_end);
+                    }
+                    Some(body)
+                }
+                None => {
+                    stale_span = true;
+                    None
+                }
+            }
+        });
         let body_available = body_opt.is_some();
         let body = body_opt.unwrap_or_default();
         let cost = window_cost(&body);
@@ -220,11 +491,13 @@ pub fn read_symbols_budgeted(
             name: sym.name,
             kind: sym.kind.to_string(),
             path: sym.file_path,
-            start_line: sym.start_line,
-            end_line: sym.end_line,
+            start_line,
+            end_line,
             body,
             body_available,
             is_neighbor,
+            stale_span,
+            relocated_from_line,
         });
     }
 
@@ -545,5 +818,246 @@ mod tests {
             res.dropped
         );
         assert!(res.truncated);
+    }
+
+    /// Write `rel` (with `src`) under a fresh tempdir and index it.
+    fn fixture_file(rel: &str, src: &str) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, src).unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        (dir, store)
+    }
+
+    fn fixture_with(src: &str) -> (tempfile::TempDir, GraphStore) {
+        fixture_file("src/lib.rs", src)
+    }
+
+    fn read_one(dir: &tempfile::TempDir, store: &GraphStore, name: &str) -> SymbolWindow {
+        let reader = FilesystemReader::new(dir.path());
+        let res = read_symbols(store, &[name.to_string()], &reader, 0, None);
+        assert_eq!(res.symbols.len(), 1, "{name} must resolve: {res:?}");
+        res.symbols.into_iter().next().unwrap()
+    }
+
+    /// nw-689: the repo changed since indexing, so the stored span now holds
+    /// other code. The unique definition line re-locates the body.
+    #[test]
+    fn drifted_span_is_relocated_by_unique_definition_line() {
+        let (dir, store) = fixture_with("pub fn other() {}\n\npub fn target() {\n    1\n}\n");
+        let path = dir.path().join("src/lib.rs");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("// a\n// b\n// c\n{text}")).unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(w.body.contains("pub fn target()"), "{w:?}");
+        assert_eq!(w.relocated_from_line, Some(3));
+        assert_eq!(w.start_line, 6, "the window moved to the definition: {w:?}");
+        assert!(!w.stale_span);
+        assert!(w.body_available);
+    }
+
+    /// A short insertion can leave the original name inside the old window.
+    /// The declaration moved even though a name-only check would accept it.
+    #[test]
+    fn short_drift_relocates_even_when_name_remains_in_window() {
+        let (dir, store) = fixture_with("pub fn other() {}\n\npub fn target() {\n    1\n}\n");
+        let path = dir.path().join("src/lib.rs");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("// inserted\n{text}")).unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.relocated_from_line, Some(3), "{w:?}");
+        assert_eq!(w.start_line, 4, "{w:?}");
+        assert!(w.body.starts_with("pub fn target()"), "{w:?}");
+    }
+
+    #[test]
+    fn repeated_annotation_with_a_call_does_not_validate_the_wrong_method() {
+        let src =
+            "class Api {\n    @Deprecated\n    public void target() {\n        work();\n    }\n}\n";
+        let (dir, store) = fixture_file("src/Api.java", src);
+        fs::write(
+            dir.path().join("src/Api.java"),
+            "class Api {\n    @Deprecated\n    public void other() {\n        target();\n    }\n    @Deprecated\n    public void target() {\n        work();\n    }\n}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(!w.body.contains("void other()"), "{w:?}");
+        assert!(w.stale_span || w.body.contains("void target()"), "{w:?}");
+    }
+
+    #[test]
+    fn relocated_shorter_definition_does_not_include_the_next_function() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn other() {}\npub fn target() {}\npub fn after() {}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.body, "pub fn target() {}", "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (2, 2), "{w:?}");
+    }
+
+    #[test]
+    fn relocated_longer_definition_keeps_its_end() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn other() {}\npub fn target() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(w.body.ends_with("}"), "{w:?}");
+        assert!(w.body.contains("x + y"), "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (2, 6), "{w:?}");
+    }
+
+    #[test]
+    fn edited_one_line_body_keeps_the_same_definition_available() {
+        let (dir, store) = fixture_with("pub fn target() { 1 }\n");
+        fs::write(dir.path().join("src/lib.rs"), "pub fn target() { 2 }\n").unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert_eq!(w.body, "pub fn target() { 2 }", "{w:?}");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+    }
+
+    /// nw-689: no unique definition to re-locate to -> say the span is stale
+    /// rather than returning another symbol's body as this one's.
+    #[test]
+    fn drifted_span_without_a_unique_match_is_stale_not_wrong() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(
+            w.stale_span && !w.body_available && w.body.is_empty(),
+            "{w:?}"
+        );
+        assert!(w.relocated_from_line.is_none());
+    }
+
+    /// A CALL naming the symbol is not a definition: relocating to
+    /// `let x = target();` would return exactly the wrong body nw-689 is about.
+    #[test]
+    fn a_call_site_is_not_a_relocation_target() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {\n    let x = target();\n}\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, "target");
+        assert!(w.stale_span && w.body.is_empty(), "{w:?}");
+    }
+
+    /// Counterweight: an in-place span is returned untouched.
+    #[test]
+    fn fresh_span_is_unchanged() {
+        let (dir, store) = fixture_with("pub fn target() {\n    1\n}\n");
+        let w = read_one(&dir, &store, "target");
+        assert!(
+            w.body_available && !w.stale_span && w.relocated_from_line.is_none(),
+            "{w:?}"
+        );
+        assert!(w.body.contains("pub fn target()"));
+    }
+
+    /// Counterweight: Java folds annotations INTO the method node, so a
+    /// fresh span can start with more than five annotation lines before the
+    /// name. That is not drift.
+    #[test]
+    fn a_long_annotation_prefix_is_not_drift() {
+        let src = "class Api {\n    @GetMapping(\n        value = \"/x\",\n        produces = \"a\",\n        consumes = \"b\"\n    )\n    @Deprecated\n    public String handleThing() {\n        return \"\";\n    }\n}\n";
+        let (dir, store) = fixture_file("src/Api.java", src);
+        let w = read_one(&dir, &store, "handleThing");
+        assert!(
+            !w.body.lines().take(5).any(|l| l.contains("handleThing")),
+            "fixture must put the name past line 5 of the span to test anything: {w:?}"
+        );
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+        assert!(w.relocated_from_line.is_none(), "{w:?}");
+    }
+
+    /// Counterweight: a Svelte component symbol is named after the FILE and
+    /// spans the whole file; its name never appears in the source.
+    #[test]
+    fn a_file_named_component_is_not_drift() {
+        let src = "<script>\n  let count = 0;\n</script>\n\n<button on:click={() => count++}>\n  {count}\n</button>\n";
+        let (dir, store) = fixture_file("src/Counter.svelte", src);
+        let w = read_one(&dir, &store, "Counter");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+    }
+
+    #[test]
+    fn vue_options_api_component_is_not_drift() {
+        let src = "<script>\nexport default {\n  data() { return { count: 0 }; }\n}\n</script>\n";
+        let (dir, store) = fixture_file("src/Counter.vue", src);
+        let w = read_one(&dir, &store, "Counter");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+        assert!(w.body.starts_with("export default"), "{w:?}");
+    }
+
+    #[test]
+    fn go_const_group_member_is_not_drift() {
+        let src = "package p\nconst (\n    Answer = 42\n    Other = 9\n)\n";
+        let (dir, store) = fixture_file("src/values.go", src);
+        let w = read_one(&dir, &store, "Answer");
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+    }
+
+    #[test]
+    fn span_holds_symbol_accepts_legitimate_shapes() {
+        // Name on the last line (C `typedef struct { ... } Name;`).
+        let typedef = "typedef struct {\n int a;\n int b;\n int c;\n int d;\n int e;\n} Point;";
+        assert!(span_holds_symbol(
+            typedef,
+            "Point",
+            "src/p.h",
+            "typedef struct {"
+        ));
+        // Whole-word only: `target_x` does not name `target`.
+        assert!(!span_holds_symbol(
+            "fn target_x() {}",
+            "target",
+            "src/lib.rs",
+            "fn target() {}"
+        ));
+        // Non-identifier names (test blocks, FQNs) are never checked.
+        assert!(span_holds_symbol(
+            "fn a() {}",
+            "renders the list",
+            "src/a.ts",
+            ""
+        ));
+        // Go receiver method.
+        assert!(span_holds_symbol(
+            "func (s *Server) Handle(w http.ResponseWriter) {\n}",
+            "Handle",
+            "srv.go",
+            "func (s *Server) Handle(w http.ResponseWriter) {"
+        ));
+    }
+
+    #[test]
+    fn relocate_requires_a_definition_keyword_before_the_name() {
+        assert_eq!(relocate("x\nlet y = target();\n", "target", 3), None);
+        assert_eq!(
+            relocate("x\npub async fn target() {\n}\n", "target", 3),
+            Some((2, 4))
+        );
+        assert_eq!(
+            relocate("func (s *S) Target() {\n}\n", "Target", 2),
+            Some((1, 2))
+        );
+        // Two definitions -> ambiguous -> no guess.
+        assert_eq!(
+            relocate("fn target() {}\nfn target() {}\n", "target", 1),
+            None
+        );
     }
 }

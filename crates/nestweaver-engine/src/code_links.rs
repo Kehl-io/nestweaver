@@ -312,6 +312,8 @@ pub type CodeLinkLease<'a> = Option<&'a crate::watcher::WatchMutationLeaseFactor
 /// What one reconciliation pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodeLinkReconcileReport {
+    /// Newly attached folder-declared project-note memberships.
+    pub memberships_added: usize,
     /// Notes whose links were compared.
     pub notes_checked: usize,
     /// Notes that could not be checked: not readable from the local
@@ -413,6 +415,7 @@ struct CachedMentions {
 /// one per database for the life of a process to reuse its mention cache.
 pub struct CodeLinkReconciler {
     config: CrossDomainConfig,
+    project_folders: Vec<crate::project::ProjectFolder>,
     cache: HashMap<String, CachedMentions>,
 }
 
@@ -431,8 +434,14 @@ impl CodeLinkReconciler {
     pub fn new(config: CrossDomainConfig) -> Self {
         Self {
             config,
+            project_folders: Vec::new(),
             cache: HashMap::new(),
         }
+    }
+
+    pub fn with_project_folders(mut self, folders: Vec<crate::project::ProjectFolder>) -> Self {
+        self.project_folders = folders;
+        self
     }
 
     /// Run one pass: bring every locally readable note's code links in line
@@ -556,6 +565,10 @@ impl CodeLinkReconciler {
                 return Ok(report);
             }
             purge_links(store, lease)?;
+        }
+        if !self.project_folders.is_empty() {
+            report.memberships_added =
+                reconcile_folder_memberships(store, lease, &self.project_folders)?;
         }
         let index = crate::cross_domain::build_symbol_index_with_config(store, &self.config)?;
         report.unscoped_projects = index.unscoped_projects.clone();
@@ -781,6 +794,41 @@ impl CodeLinkReconciler {
 /// publication while it waits for the write lease, so on contention the
 /// lease is released, the publication waited for, and both retried.
 #[allow(clippy::type_complexity)]
+fn reconcile_folder_memberships(
+    store: &GraphStore,
+    lease: CodeLinkLease<'_>,
+    folders: &[crate::project::ProjectFolder],
+) -> Result<usize, anyhow::Error> {
+    let notes = store
+        .list_notes(None)
+        .context("list notes for folder membership")?;
+    let mut desired = Vec::new();
+    for folder in folders {
+        if !store.project_exists(&folder.project_uid)? {
+            continue;
+        }
+        desired.extend(
+            notes
+                .iter()
+                .filter(|note| crate::project::note_in_folder(&note.file_path, &folder.folder))
+                .map(|note| (folder.project_uid.clone(), note.uid.clone())),
+        );
+    }
+    if store.missing_project_note_memberships(&desired)?.is_empty() {
+        return Ok(0);
+    }
+    let (_lease, publication) = begin_publication(store, lease)?;
+    let added = store
+        .add_project_note_memberships(&desired)
+        .context("add folder project-note memberships");
+    let changed = added
+        .as_ref()
+        .map(|count| *count > 0)
+        .map_err(|error| anyhow::anyhow!("{error:#}"));
+    finish_publication(publication, changed)?;
+    added
+}
+
 pub(crate) fn begin_publication<'s>(
     store: &'s GraphStore,
     lease: CodeLinkLease<'_>,
@@ -884,6 +932,18 @@ pub fn reconcile_code_links(
     config: &CrossDomainConfig,
 ) -> Result<CodeLinkReconcileReport, anyhow::Error> {
     CodeLinkReconciler::new(config.clone()).reconcile(store, None, &|| false)
+}
+
+/// Direct-route variant that also restores memberships declared by
+/// `vault_folder` before resolving note mentions against project scopes.
+pub fn reconcile_code_links_with_folders(
+    store: &GraphStore,
+    config: &CrossDomainConfig,
+    folders: Vec<crate::project::ProjectFolder>,
+) -> Result<CodeLinkReconcileReport, anyhow::Error> {
+    CodeLinkReconciler::new(config.clone())
+        .with_project_folders(folders)
+        .reconcile(store, None, &|| false)
 }
 
 #[cfg(test)]
@@ -995,6 +1055,88 @@ mod tests {
                 ("src/b.rs", "pub struct BravoWidget;\n"),
             ],
         )
+    }
+
+    #[test]
+    fn reconciler_adds_folder_membership_before_scoping_new_note_links() {
+        let fx = fixture(
+            &[],
+            &[
+                ("src/a.rs", "pub struct SharedWidget;\n"),
+                ("src/b.rs", "pub struct SharedWidget;\n"),
+            ],
+        );
+        std::fs::create_dir_all(fx.vault.join("proj")).unwrap();
+        std::fs::write(fx.vault.join("proj/old.md"), "# Old\n").unwrap();
+        full_vault_refresh(&fx);
+        let config = crate::config::InstanceConfig::from_toml_str(
+            r#"
+instance_id = "default"
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+[git]
+credential_method = "ssh"
+[[projects]]
+name = "fixture"
+vault_folder = "proj/"
+repos = ["file:///fixture/repo"]
+"#,
+        )
+        .unwrap();
+        crate::project::materialize_projects(&fx.store, &config, "default", &fx.db).unwrap();
+
+        std::fs::write(
+            fx.vault.join("proj/new.md"),
+            "# New\n\n`SharedWidget` is used here.\n",
+        )
+        .unwrap();
+        full_vault_refresh(&fx);
+        let new_uid = note_uid_of(&fx.store, "proj/new.md");
+        let project_uid = nestweaver_schema::project_uid("default", "fixture");
+        assert!(
+            !fx.store
+                .list_project_note_uids(&project_uid)
+                .unwrap()
+                .contains(&new_uid)
+        );
+
+        let mut without = CodeLinkReconciler::new(CrossDomainConfig::default());
+        without.reconcile(&fx.store, None, &|| false).unwrap();
+        assert!(
+            !edges(&fx.store)
+                .iter()
+                .any(|(from, _, _, _)| from == &new_uid),
+            "two defining files make this unscoped name ambiguous"
+        );
+
+        let folders = crate::project::project_folders(&config, "default");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].folder, "proj");
+        let report = CodeLinkReconciler::new(CrossDomainConfig::default())
+            .with_project_folders(folders)
+            .reconcile(&fx.store, None, &|| false)
+            .unwrap();
+        assert!(report.memberships_added >= 1, "{report:?}");
+        assert!(
+            fx.store
+                .list_project_note_uids(&project_uid)
+                .unwrap()
+                .contains(&new_uid)
+        );
+        assert!(
+            edges(&fx.store)
+                .iter()
+                .any(|(from, _, _, _)| from == &new_uid),
+            "new note should link after its project scope is attached"
+        );
     }
 
     /// nw-675, route 1: a full vault refresh recreates every note, and the

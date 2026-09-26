@@ -9,7 +9,9 @@ use nestweaver_parser::{
     AstTypeBinding, RawReference, RawSymbol, SkipReasonCode, SkippedFile, detect_language,
     parse_source,
 };
-use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
+use nestweaver_resolver::{
+    discover_workspace_context_with, resolve_references_with_file_languages,
+};
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
     symbol_uid,
@@ -3226,7 +3228,7 @@ struct PrepareIndexResolution<'a> {
     reader: &'a dyn crate::content_reader::ContentReader,
     r_uid: &'a str,
     parsed_files_for_resolver: &'a [ParsedFileEntry],
-    detected_languages: &'a [Language],
+    file_languages: &'a HashMap<String, Language>,
     ast_bindings_by_file: &'a HashMap<String, Vec<AstTypeBinding>>,
     actually_changed_files: &'a std::collections::HashSet<String>,
     files_unchanged: usize,
@@ -3266,7 +3268,7 @@ fn prepare_index_resolution(
         reader,
         r_uid,
         parsed_files_for_resolver,
-        detected_languages,
+        file_languages,
         ast_bindings_by_file,
         actually_changed_files,
         files_unchanged,
@@ -3283,26 +3285,23 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let language = {
-        let mut counts: HashMap<Language, usize> = HashMap::new();
-        for language in detected_languages {
-            *counts.entry(*language).or_insert(0) += 1;
-        }
-        counts
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(language, _)| language)
-            .unwrap_or(Language::JavaScript)
-    };
+    for (file_path, _, _, _) in parsed_files_for_resolver {
+        anyhow::ensure!(
+            file_languages.contains_key(file_path),
+            "missing detected language for resolver file {file_path}"
+        );
+    }
 
-    let workspace_ctx = if matches!(
-        language,
-        Language::JavaScript
-            | Language::TypeScript
-            | Language::Vue
-            | Language::Svelte
-            | Language::Astro
-    ) {
+    let workspace_ctx = if file_languages.values().any(|language| {
+        matches!(
+            language,
+            Language::JavaScript
+                | Language::TypeScript
+                | Language::Vue
+                | Language::Svelte
+                | Language::Astro
+        )
+    }) {
         discover_workspace_context_with(|rel_path| {
             reader
                 .read_file(rel_path)
@@ -3329,7 +3328,10 @@ fn prepare_index_resolution(
 
         let env = nestweaver_resolver::types::TypeEnvironment::build(
             source,
-            language,
+            file_languages
+                .get(file_path)
+                .copied()
+                .unwrap_or(Language::JavaScript),
             symbols,
             file_ast_bindings,
         );
@@ -3426,13 +3428,14 @@ fn prepare_index_resolution(
     let resolved_edges = if skip_resolution {
         Vec::new()
     } else {
-        resolve_references_with_context(
+        resolve_references_with_file_languages(
             &resolver_view,
-            language,
+            Language::JavaScript,
             r_uid,
             &workspace_ctx,
             Some(&type_envs),
             resolve_filter.as_ref(),
+            Some(file_languages),
         )
     };
 
@@ -3731,6 +3734,22 @@ where
         scan_pb.tick();
     }
 
+    // Keep each scanned file's language through cached parses too. Resolving
+    // an entire mixed repository with its most common language loses imports
+    // from the other languages, and ties depend on HashMap iteration order.
+    let file_languages: HashMap<String, Language> = file_entries
+        .iter()
+        .map(|(path, language)| {
+            (
+                path.strip_prefix(repo_path)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned(),
+                *language,
+            )
+        })
+        .collect();
+
     scan_pb.finish_with_message(format!("Scanned {} files", file_entries.len()));
     tracing::info!(
         files_found = file_entries.len(),
@@ -3975,7 +3994,6 @@ where
     let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
     let mut parsed_files_for_resolver: Vec<ParsedFileEntry> = Vec::new();
     let mut ast_bindings_by_file: HashMap<String, Vec<AstTypeBinding>> = HashMap::new();
-    let mut detected_languages: Vec<Language> = Vec::new();
     // F2.2: per framework file, the controller class signature + the (uid,
     // HandlerSymbol) of every symbol in the file, so handler detection can
     // map matches back to symbol UIDs after the bulk symbol insert.
@@ -4069,7 +4087,6 @@ where
 
                 repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
                 files_count += 1;
-                detected_languages.push(lang);
 
                 // F2.0: run the (previously dormant) framework detector and
                 // attach hints to the symbols it identifies. The detector keys
@@ -4504,7 +4521,7 @@ where
             reader,
             r_uid: &r_uid,
             parsed_files_for_resolver: &parsed_files_for_resolver,
-            detected_languages: &detected_languages,
+            file_languages: &file_languages,
             ast_bindings_by_file: &ast_bindings_by_file,
             actually_changed_files: &actually_changed_files,
             files_unchanged,
@@ -7582,7 +7599,7 @@ fn build_reresolve_edges(
 
     let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = Vec::new();
     let mut uid_to_file: HashMap<String, String> = HashMap::new();
-    let mut lang_counts: HashMap<Language, usize> = HashMap::new();
+    let mut file_languages: HashMap<String, Language> = HashMap::new();
 
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
@@ -7605,9 +7622,9 @@ fn build_reresolve_edges(
             };
             (parsed.symbols, parsed.references)
         };
-        if let Some(lang) = detect_language(&abs_path) {
-            *lang_counts.entry(lang).or_insert(0) += 1;
-        }
+        let language = detect_language(&abs_path)
+            .ok_or_else(|| anyhow::anyhow!("missing language for re-resolved file {rel_str}"))?;
+        file_languages.insert(rel_str.clone(), language);
         for raw_sym in &raw_symbols {
             let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
             uid_to_file.insert(s_uid, rel_str.clone());
@@ -7666,28 +7683,25 @@ fn build_reresolve_edges(
             });
     }
     for (file_path, symbols) in unchanged_by_file {
+        let language = detect_language(&reader.root().join(&file_path)).ok_or_else(|| {
+            anyhow::anyhow!("missing language for re-resolution target {file_path}")
+        })?;
+        file_languages.insert(file_path.clone(), language);
         // Empty references: we only need these files as resolution
         // targets, not as resolution sources.
         file_data.push((file_path, symbols, Vec::new()));
     }
 
-    // Resolve with the most-common language across S (matches the full-index
-    // batch heuristic). Mixed-language scopes are rare; cross-language edges are
-    // not resolved anyway.
-    let language = lang_counts
-        .into_iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(l, _)| l)
-        .unwrap_or(Language::JavaScript);
-
-    let workspace_ctx = if matches!(
-        language,
-        Language::JavaScript
-            | Language::TypeScript
-            | Language::Vue
-            | Language::Svelte
-            | Language::Astro
-    ) {
+    let workspace_ctx = if file_languages.values().any(|language| {
+        matches!(
+            language,
+            Language::JavaScript
+                | Language::TypeScript
+                | Language::Vue
+                | Language::Svelte
+                | Language::Astro
+        )
+    }) {
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
@@ -7697,13 +7711,14 @@ fn build_reresolve_edges(
         Default::default()
     };
 
-    let resolved_edges = resolve_references_with_context(
+    let resolved_edges = resolve_references_with_file_languages(
         &file_data,
-        language,
+        Language::JavaScript,
         r_uid,
         &workspace_ctx,
         None,
         Some(&scope),
+        Some(&file_languages),
     );
 
     // Keep only the cross-file edges that the `DETACH DELETE` destroyed:
@@ -12800,6 +12815,89 @@ function hello(name) { return "Hello " + name; }
         let (result, _) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         assert_eq!(result.files_count, 2, "expected js + py, not css");
+    }
+
+    #[test]
+    fn mixed_language_repo_resolves_javascript_imports_when_swift_is_majority() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("index.js"),
+            "const h = require('./helpers');\nh.listen();\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("helpers.js"),
+            "module.exports.listen = function listen() { return context(); };\nfunction context() {}\n",
+        )
+        .unwrap();
+        for i in 0..3 {
+            fs::write(src.join(format!("other{i}.swift")), "func helper() {}\n").unwrap();
+        }
+
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/mixed", "abc123").unwrap();
+        let repo = repo_uid("test", "https://example.com/mixed");
+        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
+        let edges = store.load_typed_edges().unwrap();
+        assert!(
+            edges.iter().any(|(src, dst, kind, _, _)| {
+                src == &importer && dst == &exported && kind == "IMPORTS"
+            }),
+            "a JavaScript import must resolve using JavaScript rules even when another language has more files: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_language_watcher_reresolve_keeps_javascript_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("index.js"),
+            "const h = require('./helpers');\nh.listen();\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("helpers.js"),
+            "module.exports.listen = function listen() {};\n",
+        )
+        .unwrap();
+        for i in 0..3 {
+            fs::write(src.join(format!("other{i}.swift")), "func helper() {}\n").unwrap();
+        }
+
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/mixed", "abc123").unwrap();
+        let repo = repo_uid("test", "https://example.com/mixed");
+        let reader = crate::content_reader::FilesystemReader::new(&src);
+        let changed = std::collections::HashSet::from([
+            "index.js".to_string(),
+            "other0.swift".to_string(),
+            "other1.swift".to_string(),
+        ]);
+        let symbols = store.lookup_symbols_by_repo(&repo).unwrap();
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &std::collections::HashSet::new(),
+            &symbols,
+            None,
+        )
+        .unwrap();
+        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
+        assert!(
+            edges.iter().any(|edge| {
+                edge.source_uid == importer
+                    && edge.target_uid == exported
+                    && edge.edge_type == nestweaver_schema::EdgeType::Imports
+            }),
+            "watcher re-resolution must use the importing file's language: {edges:?}"
+        );
     }
 
     #[test]

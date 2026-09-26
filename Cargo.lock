@@ -4435,6 +4435,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
+ "libc",
  "nestweaver-algorithms",
  "nestweaver-engine",
  "nestweaver-schema",

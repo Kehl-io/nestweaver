@@ -81,6 +81,15 @@ pub fn build_import_graph(
     language: Language,
     workspace_ctx: &WorkspaceContext,
 ) -> ImportGraph {
+    build_import_graph_with_languages(files, language, None, workspace_ctx)
+}
+
+pub(crate) fn build_import_graph_with_languages(
+    files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    fallback_language: Language,
+    file_languages: Option<&HashMap<String, Language>>,
+    workspace_ctx: &WorkspaceContext,
+) -> ImportGraph {
     let known_files: HashSet<&str> = files.iter().map(|(path, _, _)| path.as_str()).collect();
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
@@ -88,6 +97,10 @@ pub fn build_import_graph(
     let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
 
     for (file_path, symbols, references) in files {
+        let language = file_languages
+            .and_then(|languages| languages.get(file_path))
+            .copied()
+            .unwrap_or(fallback_language);
         // v2: filter by visibility — only non-private symbols are exported
         let exported_names: Vec<String> = symbols
             .iter()

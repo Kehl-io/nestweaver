@@ -181,6 +181,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
         <CodePreview
           filePath={symbol.file_path}
           line={symbol.start_line}
+          repoUid={symbol.repo_uid}
           ariaLabel={`Source evidence for ${symbol.name}`}
         />
       </div>

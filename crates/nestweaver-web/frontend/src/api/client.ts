@@ -25,18 +25,10 @@ import type {
 import { loadImpactLens } from "./impactLens";
 import { appendWorkspaceParam } from "./workspaces";
 import { normalizeBrainContext } from "./context";
+import { apiErrorFromBody } from "./errors";
 
 /** Page size the notes route allows (`LIST_NOTES_LIMIT_MAX`). */
 export const NOTES_PAGE_SIZE = 1000;
-
-export class ApiError extends Error {
-  status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
@@ -45,7 +37,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new ApiError(res.status, body.error || res.statusText);
+    throw apiErrorFromBody(res.status, body, res.statusText);
   }
   return res.json() as Promise<T>;
 }
@@ -156,7 +148,7 @@ export const api = {
     const res = await fetch(`/api/v1/brain/notes?${params}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));
-      throw new ApiError(res.status, body.error || res.statusText);
+      throw apiErrorFromBody(res.status, body, res.statusText);
     }
     const header = res.headers.get("x-total-count");
     const total = header === null ? null : Number.parseInt(header, 10);
@@ -206,8 +198,11 @@ export const api = {
     );
   },
 
-  source(file: string, line?: number, context?: number, init?: RequestInit) {
+  source(file: string, line?: number, context?: number, init?: RequestInit, repo?: string) {
     let url = `/api/v1/source?file=${encodeURIComponent(file)}`;
+    // nw-683: several repos can index the same path; without `repo` the
+    // server answers 409 `ambiguous_file` for such a path.
+    if (repo) url += `&repo=${encodeURIComponent(repo)}`;
     if (line != null) url += `&line=${line}`;
     if (context != null) url += `&context=${context}`;
     return get<SourceResponse>(url, init);

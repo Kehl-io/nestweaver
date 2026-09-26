@@ -4,7 +4,10 @@ export interface SymbolCandidate {
   kind: string;
   file_path: string;
   start_line: number;
-  /** Present on /symbols/top responses; used to group files by repo. */
+  /**
+   * Repo the symbol belongs to. Sent by /symbols/top (groups files by repo)
+   * and /symbols/file (names the repo of a path several repos index).
+   */
   repo_uid?: string;
 }
 
@@ -123,6 +126,8 @@ export interface OverviewResponse {
 export interface Repo {
   uid: string;
   url: string;
+  /** Display name override; absent when the server derives it from `url`. */
+  name?: string;
   indexed_sha: string | null;
   staleness_commits_behind: number;
   instance_id: string;
@@ -241,11 +246,12 @@ export interface PathResult {
 
 export interface SourceResponse {
   file: string;
+  /** Uid of the repo whose copy of `file` was served. */
+  repo?: string;
   start_line?: number;
   end_line?: number;
   lines?: string[];
   total_lines?: number;
-  error?: string;
 }
 
 export interface BrainStatus {

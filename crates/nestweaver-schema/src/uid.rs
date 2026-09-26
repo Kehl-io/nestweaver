@@ -47,6 +47,18 @@ pub fn symbol_uid(repo_uid: &str, file_path: &str, name: &str, line: u32) -> Str
     )
 }
 
+/// The repo uid inside a `sym:{repo_uid}:{path_hash}:{name_hash}:{line}` uid.
+///
+/// Parses from the right because the repo uid itself contains colons
+/// (`repo:{instance}:{url_hash}`). Returns `None` for anything that is not
+/// a canonical [`symbol_uid`].
+pub fn repo_uid_of_symbol_uid(uid: &str) -> Option<&str> {
+    let rest = uid.strip_prefix("sym:")?;
+    let mut parts = rest.rsplitn(4, ':');
+    let (_line, _name, _path) = (parts.next()?, parts.next()?, parts.next()?);
+    parts.next().filter(|repo| repo.starts_with("repo:"))
+}
+
 /// "vlt:{instance}:{root_path_hash}"
 pub fn vault_uid(instance: &str, root_path: &str) -> String {
     format!("vlt:{}:{}", instance, truncated_hash(root_path))
@@ -512,6 +524,15 @@ pub fn scoped_contract_uid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_uid_of_symbol_uid_round_trips_symbol_uid() {
+        let repo = "repo:kory-brain:c8f000561246";
+        let uid = symbol_uid(repo, "src/a.rs", "run", 12);
+        assert_eq!(repo_uid_of_symbol_uid(&uid), Some(repo));
+        assert_eq!(repo_uid_of_symbol_uid("note:x"), None);
+        assert_eq!(repo_uid_of_symbol_uid("sym:too:short"), None);
+    }
 
     /// nw-301. The point of `UidKind` is that it is TOTAL — every UID this
     /// module can mint must classify, or a `match` over it silently stops being
