@@ -1645,16 +1645,16 @@ pub fn index_markdown_directory_in_memory(
 /// exposes. This is the entry point used by the server-mode worker when a repo
 /// is declared as a markdown vault (`type = "vault"`): the reader is a
 /// [`crate::content_reader::GitBareReader`] over a bare clone, which has no
-/// working tree and therefore no on-disk `.brainignore`. In that case the
-/// ignore set falls back to the built-in defaults (see
-/// [`crate::brainignore::load_brain_ignore`]).
+/// working tree, so the `.brainignore` is read from the committed tree through
+/// the reader (see [`crate::brainignore::load_brain_ignore_from_reader`]); only
+/// an absent one falls back to the built-in defaults.
 pub fn index_markdown_with_reader(
     reader: &dyn ContentReader,
     store: &GraphStore,
     instance_id: &str,
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[])?;
+    let ignore_set = crate::brainignore::load_brain_ignore_from_reader(reader, &[])?;
     index_into_store(reader, store, instance_id, vault_name, &ignore_set).map(|result| result.index)
 }
 
@@ -1679,7 +1679,7 @@ pub fn index_markdown_with_reader_and_write_gate<G, F>(
 where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
-    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[])?;
+    let ignore_set = crate::brainignore::load_brain_ignore_from_reader(reader, &[])?;
     let result = index_into_store_with_write_gate(
         reader,
         store,
@@ -7748,6 +7748,76 @@ sub b body
             0,
             "vault indexing must not produce code symbols"
         );
+    }
+
+    /// nw-684 review: server mode indexes a vault from a bare clone, and
+    /// `load_brain_ignore(reader.root())` read the FILESYSTEM at the bare
+    /// path -- always NotFound -- so a committed `.brainignore` was never
+    /// honoured and the notes it excluded were indexed. Both reader entry
+    /// points must read it from the committed tree.
+    #[test]
+    fn bare_clone_honours_a_committed_brainignore() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            (".brainignore", "secret.md\n"),
+            ("secret.md", "# Secret\n\ncredentials\n"),
+            ("ok.md", "# Ok\n\npublic\n"),
+        ]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let paths = |store: &GraphStore| -> Vec<String> {
+            let mut paths: Vec<String> = store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .map(|note| note.file_path)
+                .collect();
+            paths.sort();
+            paths
+        };
+
+        let store = GraphStore::in_memory().unwrap();
+        index_markdown_with_reader(&reader, &store, "test-instance", "vault-repo").unwrap();
+        assert_eq!(paths(&store), vec!["ok.md".to_string()], "ungated route");
+
+        let store = GraphStore::in_memory().unwrap();
+        index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(paths(&store), vec!["ok.md".to_string()], "gated route");
+    }
+
+    /// nw-684 review: a committed `.brainignore` the reader cannot read (here
+    /// a directory, not a file) fails both reader routes closed, naming the
+    /// file, before anything is written.
+    #[test]
+    fn bare_clone_brainignore_that_cannot_be_read_fails_closed() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            (".brainignore/keep.md", "# Keep\n"),
+            ("secret.md", "# Secret\n\ncredentials\n"),
+        ]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+        let ungated =
+            index_markdown_with_reader(&reader, &store, "test-instance", "vault-repo").map(|_| ());
+        let gated = index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .map(|_| ());
+        for (route, result) in [("ungated", ungated), ("gated", gated)] {
+            let message = format!("{:#}", result.expect_err(route));
+            assert!(message.contains(".brainignore"), "{route}: {message}");
+        }
+        assert_eq!(store.count_notes().unwrap(), 0);
     }
 
     /// nw-003: the gated vault entry point must upsert a `Repo` node carrying

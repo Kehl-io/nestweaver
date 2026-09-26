@@ -234,6 +234,32 @@ pub trait ContentReader: Send + Sync {
         self.read_file(rel_path).is_ok()
     }
 
+    /// Read an OPTIONAL file, such as a vault's `.brainignore` policy:
+    /// `Ok(None)` only when the path is positively absent, `Err` for any other
+    /// failure. A caller that falls back to defaults on `None` must never do
+    /// so because a read merely failed (nw-684 review: that widened what a
+    /// vault indexed).
+    ///
+    /// The default recognises a typed [`std::io::ErrorKind::NotFound`]
+    /// anywhere in the `read_file` error chain and treats every other error as
+    /// a failure. Readers whose `read_file` reports absence as text override
+    /// this.
+    fn read_optional_file(&self, rel_path: &Path) -> Result<Option<String>> {
+        match self.read_file(rel_path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether `rel_path` lies under a directory this reader's skip policy
     /// prunes: `SKIP_DIRS`, minus [`Self::unskipped_skip_dirs`], with nw-652's
     /// manifest gate answered by [`Self::has_file`].
@@ -901,6 +927,17 @@ impl ContentReader for FilesystemReader {
         self.repo_path.join(rel_path).is_file()
     }
 
+    /// `read_file` reports a stat failure as text, so absence is decided here
+    /// from a typed `NotFound`; any other stat failure is an error.
+    fn read_optional_file(&self, rel_path: &Path) -> Result<Option<String>> {
+        let abs = self.repo_path.join(rel_path);
+        match std::fs::metadata(&abs) {
+            Ok(_) => self.read_file(rel_path).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("stat {}", abs.display())),
+        }
+    }
+
     /// This reader's OWN blocklist (nw-436: it may be the vault list), not
     /// `crate::index::SKIP_DIRS` — the same list its walk prunes with.
     fn skips_path(&self, rel_path: &Path) -> bool {
@@ -1560,6 +1597,26 @@ impl GitBareReader {
         Ok(Self::with_limits(bare_path, &sha, limits))
     }
 
+    /// `git ls-tree -z <sha> -- <rel>`: the tree entry for one path (empty
+    /// stdout when the path is absent from the commit).
+    fn ls_tree_entry(&self, rel_path: &Path) -> Result<std::process::Output> {
+        let mut cmd = Command::new("git");
+        if self.local_objects_only {
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
+        cmd.args([
+            "-C",
+            &self.bare_path.display().to_string(),
+            "ls-tree",
+            "-z",
+            &self.sha,
+            "--",
+        ])
+        .arg(rel_path);
+        run_git_with_timeout(cmd, git_net_timeout())
+            .with_context(|| format!("git ls-tree {} -- {}", self.sha, rel_path.display()))
+    }
+
     /// One-shot fallback read used when the pooled `cat-file --batch` process is
     /// unavailable (failed to spawn, or died mid-stream).
     fn read_file_via_show(&self, rel_path: &Path) -> Result<String> {
@@ -1672,26 +1729,42 @@ impl ContentReader for GitBareReader {
     /// index pruned a `target/` the incremental loop admitted. A failed lookup
     /// answers `false`: the directory is indexed, never silently dropped.
     fn has_file(&self, rel_path: &Path) -> bool {
-        let mut cmd = Command::new("git");
-        if self.local_objects_only {
-            cmd.env("GIT_NO_LAZY_FETCH", "1");
-        }
-        cmd.args([
-            "-C",
-            &self.bare_path.display().to_string(),
-            "ls-tree",
-            "-z",
-            &self.sha,
-            "--",
-        ])
-        .arg(rel_path);
-        run_git_with_timeout(cmd, git_net_timeout()).is_ok_and(|output| {
+        self.ls_tree_entry(rel_path).is_ok_and(|output| {
             output.status.success()
                 && output.stdout.split(|&b| b == 0).any(|record| {
                     let mode = record.split(|&b| b == b' ').next().unwrap_or(&[]);
                     mode == b"100644" || mode == b"100755"
                 })
         })
+    }
+
+    /// nw-684 review: absence is decided from the committed TREE, and unlike
+    /// [`Self::has_file`] a failed lookup is an ERROR, never "absent" — a
+    /// caller falling back to defaults on `None` must not fail open. A
+    /// present entry that is not a regular file is an error too.
+    fn read_optional_file(&self, rel_path: &Path) -> Result<Option<String>> {
+        let output = self.ls_tree_entry(rel_path)?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git ls-tree {} -- {} failed: {}",
+                self.sha,
+                rel_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let Some(record) = output.stdout.split(|&b| b == 0).find(|r| !r.is_empty()) else {
+            return Ok(None);
+        };
+        let mode = record.split(|&b| b == b' ').next().unwrap_or(&[]);
+        if mode != b"100644" && mode != b"100755" {
+            anyhow::bail!(
+                "{} at {} is not a regular file (mode {})",
+                rel_path.display(),
+                self.sha,
+                String::from_utf8_lossy(mode)
+            );
+        }
+        self.read_file(rel_path).map(Some)
     }
 
     fn eligibility_fingerprint(&self) -> String {

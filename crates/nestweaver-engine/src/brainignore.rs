@@ -49,15 +49,9 @@ pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> anyhow
     // nw-684: an unreadable ignore file must never silently widen what is
     // indexed — the user wrote it to keep notes (credentials, private
     // folders) OUT of the graph. Only a truly absent file means defaults.
-    let file_patterns: Vec<(Option<usize>, String)> = match std::fs::read_to_string(&ignore_file) {
-        Ok(content) => parse_ignore_file(&content)
-            .into_iter()
-            .map(|(n, p)| (Some(n), p))
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_ignore_patterns()
-            .into_iter()
-            .map(|p| (None, p))
-            .collect(),
+    let content = match std::fs::read_to_string(&ignore_file) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             return Err(e).with_context(|| {
                 format!(
@@ -67,6 +61,54 @@ pub fn load_brain_ignore(vault_path: &Path, extra_patterns: &[String]) -> anyhow
                 )
             });
         }
+    };
+    build_ignore_set(&ignore_file, content.as_deref(), extra_patterns)
+}
+
+/// [`load_brain_ignore`] for content read through a [`ContentReader`] — the
+/// server-mode vault path, whose reader is a bare clone with no working tree
+/// (nw-684 review: `load_brain_ignore(reader.root())` stat'ed the bare path,
+/// always found nothing, and so never honoured a committed `.brainignore`).
+///
+/// Only a positively absent file ([`ContentReader::read_optional_file`]
+/// returning `None`) means defaults; any other failure is an error naming
+/// the file.
+///
+/// [`ContentReader`]: crate::content_reader::ContentReader
+/// [`ContentReader::read_optional_file`]: crate::content_reader::ContentReader::read_optional_file
+pub fn load_brain_ignore_from_reader(
+    reader: &dyn crate::content_reader::ContentReader,
+    extra_patterns: &[String],
+) -> anyhow::Result<GlobSet> {
+    let rel = Path::new(".brainignore");
+    let ignore_file = reader.root().join(rel);
+    let content = reader.read_optional_file(rel).with_context(|| {
+        format!(
+            "cannot read {} — refusing to index this vault until it is readable, \
+             because indexing without it would expose notes it excludes",
+            ignore_file.display()
+        )
+    })?;
+    build_ignore_set(&ignore_file, content.as_deref(), extra_patterns)
+}
+
+/// Build the ignore set from a `.brainignore`'s `content` (`None`: absent, so
+/// the defaults) plus `extra_patterns`. Every invalid glob is an error naming
+/// `ignore_file` and its line.
+fn build_ignore_set(
+    ignore_file: &Path,
+    content: Option<&str>,
+    extra_patterns: &[String],
+) -> anyhow::Result<GlobSet> {
+    let file_patterns: Vec<(Option<usize>, String)> = match content {
+        Some(content) => parse_ignore_file(content)
+            .into_iter()
+            .map(|(n, p)| (Some(n), p))
+            .collect(),
+        None => default_ignore_patterns()
+            .into_iter()
+            .map(|p| (None, p))
+            .collect(),
     };
 
     let mut builder = GlobSetBuilder::new();
@@ -252,6 +294,47 @@ mod tests {
                 .expect_err("invalid extra pattern")
         );
         assert!(msg.contains("bad{x"), "{msg}");
+    }
+
+    /// A reader over content with no working tree (nw-684 review). Only a
+    /// typed `NotFound` means "absent"; any other read failure is an error.
+    struct FailingReader(std::io::ErrorKind);
+    impl crate::content_reader::ContentReader for FailingReader {
+        fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+            Err(anyhow::Error::from(std::io::Error::from(self.0)).context("read blob"))
+        }
+        fn list_files(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+            Ok(Vec::new())
+        }
+        fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            Ok(None)
+        }
+        fn root(&self) -> &Path {
+            Path::new("/bare/vault.git")
+        }
+        fn version_id(&self) -> &str {
+            "sha"
+        }
+    }
+
+    #[test]
+    fn reader_error_other_than_not_found_fails_closed() {
+        let msg = format!(
+            "{:#}",
+            load_brain_ignore_from_reader(
+                &FailingReader(std::io::ErrorKind::PermissionDenied),
+                &[]
+            )
+            .expect_err("must fail closed")
+        );
+        assert!(msg.contains("/bare/vault.git/.brainignore"), "{msg}");
+    }
+
+    #[test]
+    fn reader_not_found_means_defaults() {
+        let gs = load_brain_ignore_from_reader(&FailingReader(std::io::ErrorKind::NotFound), &[])
+            .unwrap();
+        assert!(is_ignored(".obsidian/workspace.json", &gs));
     }
 
     #[test]
