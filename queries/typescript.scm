@@ -23,6 +23,28 @@
       name: (identifier) @name
       value: (arrow_function)))) @definition.function
 
+; CommonJS exports (nw-687): `module.exports.X = function|arrow` and
+; `exports.X = function|arrow` define X. Only function values: re-exporting an
+; existing binding (`module.exports.x = x`) defines nothing new, and a plain
+; `obj.handler = function` stays a non-definition (the object must be exactly
+; `module.exports` or `exports`).
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @_module
+      property: (property_identifier) @_exports)
+    property: (property_identifier) @name)
+  right: [(arrow_function) (function_expression)]
+  (#eq? @_module "module")
+  (#eq? @_exports "exports")) @definition.function
+
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @_exports
+    property: (property_identifier) @name)
+  right: [(arrow_function) (function_expression)]
+  (#eq? @_exports "exports")) @definition.function
+
 ; Class declarations
 (class_declaration
   name: (type_identifier) @name) @definition.class

@@ -3415,6 +3415,97 @@ class Config:
         assert!(imports.contains(&"./b.js"), "got: {imports:?}");
     }
 
+    // ── nw-687: CommonJS export definitions ────────────────────────────────
+
+    #[test]
+    fn js_commonjs_export_functions_are_definitions() {
+        // `module.exports.X = function` / `exports.X = arrow` minted no symbol,
+        // so a CommonJS codebase (freeplay-server) had no callers/callees for
+        // them and dead-code flagged everything they call as unreachable.
+        // Lines: 1-3 listen, 4 stop, 5 the rewriteError re-export.
+        let source = "module.exports.listen = async function listen(app) {\n  return start(app);\n};\n\
+                      exports.stop = (server) => server.close();\n\
+                      module.exports.rewriteError = rewriteError;\n";
+        let parsed = parse_source(Path::new("src/helpers/initialize.js"), source).unwrap();
+        let fns: Vec<(&str, u32)> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| (s.name.as_str(), s.start_line))
+            .collect();
+        assert!(fns.contains(&("listen", 1)), "got {fns:?}");
+        assert!(fns.contains(&("stop", 4)), "got {fns:?}");
+        // Re-exporting an existing binding is not a new definition.
+        assert!(
+            !fns.iter().any(|(n, _)| *n == "rewriteError"),
+            "got {fns:?}"
+        );
+        // The call inside the exported function attaches to it.
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "start"),
+            "got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Counterweight: an arbitrary object property assignment is not a definition.
+    #[test]
+    fn js_plain_member_assignment_is_not_a_definition() {
+        // Each line defeats exactly one predicate: `exports` object (line 1),
+        // `module` root (line 2), `exports` property under `module` (line 3).
+        let source = "handlers.onClick = function onClick() {};\nobj.exports.x = () => 1;\n\
+                      module.helpers.y = () => 2;\n";
+        let parsed = parse_source(Path::new("src/ui.js"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .all(|s| s.name != "onClick" && s.name != "x" && s.name != "y"),
+            "{:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ts_commonjs_export_functions_are_definitions() {
+        let source = "exports.handler = async function handler(evt: unknown) { return evt; };\n\
+                      module.exports.close = (s: Server) => s.close();\n";
+        let parsed = parse_source(Path::new("src/lambda.ts"), source).unwrap();
+        let fns: Vec<(&str, u32)> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| (s.name.as_str(), s.start_line))
+            .collect();
+        assert!(fns.contains(&("handler", 1)), "got {fns:?}");
+        assert!(fns.contains(&("close", 2)), "got {fns:?}");
+    }
+
+    /// Counterweight (TS): the same member-assignment shapes stay non-definitions.
+    #[test]
+    fn ts_plain_member_assignment_is_not_a_definition() {
+        // Each line defeats exactly one predicate: `exports` object (line 1),
+        // `module` root (line 2), `exports` property under `module` (line 3).
+        let source = "handlers.onClick = function onClick() {};\nobj.exports.x = () => 1;\n\
+                      module.helpers.y = () => 2;\n";
+        let parsed = parse_source(Path::new("src/ui.ts"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .all(|s| s.name != "onClick" && s.name != "x" && s.name != "y"),
+            "{:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn ts_new_expression_is_captured_as_a_call_reference() {
         // `NotFoundError` (56 files) and `NotificationService` (5 constructors)
