@@ -7527,3 +7527,68 @@ fn brain_refresh_json_and_fail_on_skip_honor_requested_exclusions_via_daemon() {
     assert_eq!(payload["coverage_status"], "complete", "{payload}");
     assert_eq!(payload["excluded_by_request_count"], 1, "{payload}");
 }
+
+/// nw-693: a config-less `brain add --instance X` stamped Markdown derivation
+/// records with the boot daemon's ambient "default", so after ANY daemon
+/// restart `brain context` failed with ForeignRecord and a refresh could not
+/// heal it. Records now carry the live instance; a legacy "default" stamp is
+/// healed by the next refresh.
+#[test]
+fn configless_instance_vault_survives_a_daemon_restart_and_refresh_heals_a_default_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db_path = dir.path().join("fr").join("brain.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("alpha.md"), "# Alpha\n\nalpha links [[Beta]].\n").unwrap();
+    std::fs::write(vault.join("beta.md"), "# Beta\n\nbeta.\n").unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .args(["--instance", "nw693"])
+        .assert()
+        .success();
+    let context = || {
+        daemon_cmd()
+            .args(["brain", "context", "Alpha", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap()
+    };
+    let assert_context_ok = |when: &str| {
+        let output = context();
+        assert!(
+            output.status.success(),
+            "brain context {when}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    assert_context_ok("before restart");
+
+    stop_daemon(&db_path);
+    assert_context_ok("after a daemon restart");
+
+    // A sidecar written by an older daemon: the envelope says "default".
+    stop_daemon(&db_path);
+    let sidecar =
+        std::path::PathBuf::from(format!("{}.markdown-derivation.json", db_path.display()));
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    assert_eq!(envelope["data_instance_id"], "nw693", "{envelope}");
+    envelope["data_instance_id"] = "default".into();
+    std::fs::write(&sidecar, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    daemon_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    assert_context_ok("after the refresh healed a default-stamped record");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    assert_eq!(envelope["data_instance_id"], "nw693", "{envelope}");
+}

@@ -520,6 +520,55 @@ pub fn save_records(
     .map_err(|e| RecordError::Io(e.kind()))
 }
 
+/// The ambient instance a config-less daemon snapshots at boot before the
+/// database records its own.
+pub const AMBIENT_DEFAULT_INSTANCE: &str = "default";
+
+/// nw-693: re-bind a record set stamped with the ambient `"default"` instance
+/// to the database's RECORDED instance. `Ok(true)` when it rewrote the file.
+///
+/// A config-less `brain add --instance X` is served by a daemon that booted
+/// before the database recorded `X`, snapshotted `"default"`, and stamped the
+/// records with it. After any restart the daemon adopts `X`, every read is
+/// `ForeignIdentity`, and a refresh could not heal it because `save_records`
+/// refuses to replace a foreign file. Only that exact mismatch is healed: the
+/// publication identity (the brain UUID) must still match, the envelope must
+/// say `"default"`, and the caller passes the instance the DATABASE records,
+/// never a stated or guessed one. Anything else stays foreign.
+pub fn rebind_ambient_default_records(
+    db_path: &Path,
+    identity: &PublicationIdentity,
+    recorded_instance: &str,
+) -> Result<bool, RecordError> {
+    if recorded_instance == AMBIENT_DEFAULT_INSTANCE {
+        return Ok(false);
+    }
+    let current = expectation(identity, recorded_instance);
+    match load_records(db_path, &current) {
+        Err(RecordError::ForeignIdentity) => {}
+        Ok(_) | Err(_) => return Ok(false),
+    }
+    let ambient = expectation(identity, AMBIENT_DEFAULT_INSTANCE);
+    let records = match load_records(db_path, &ambient) {
+        Ok(Some(records)) => records,
+        Ok(None) | Err(RecordError::ForeignIdentity) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if let Some(record) = records
+        .vaults
+        .values()
+        .find(|r| r.derivation_version > DERIVATION_VERSION)
+    {
+        return Err(RecordError::FutureVersion(record.derivation_version));
+    }
+    let bytes = encode_records(&records, &current)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&record_path(db_path), |file| {
+        file.write_all(&bytes)
+    })
+    .map_err(|e| RecordError::Io(e.kind()))?;
+    Ok(true)
+}
+
 /// Admission for persistent graph state. Callers must separately establish
 /// authorization, live publication readiness and genuine ephemeral-store
 /// semantics; none is inferred from an absent record here.
@@ -880,6 +929,61 @@ mod tests {
         let admission = DerivationUnavailable::from_record_error(&error);
         assert_eq!(admission.reason, AdmissionReason::RecordUnavailable);
         assert!(!admission.to_string().contains(".brainignore"));
+    }
+
+    /// nw-693: a record set stamped with the ambient "default" is re-bound
+    /// to the database's recorded instance, and then loads under it.
+    #[test]
+    fn ambient_default_records_rebind_to_the_recorded_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let id = identity();
+        save_records(
+            &db,
+            &DerivationRecords::default(),
+            &expectation(&id, AMBIENT_DEFAULT_INSTANCE),
+        )
+        .unwrap();
+        assert_eq!(
+            load_records(&db, &expectation(&id, "qa-fr")).unwrap_err(),
+            RecordError::ForeignIdentity
+        );
+        assert!(rebind_ambient_default_records(&db, &id, "qa-fr").unwrap());
+        load_records(&db, &expectation(&id, "qa-fr"))
+            .unwrap()
+            .expect("re-bound records load under the recorded instance");
+        // Idempotent: nothing left to heal.
+        assert!(!rebind_ambient_default_records(&db, &id, "qa-fr").unwrap());
+    }
+
+    /// Counterweight: a record bound to ANOTHER named instance, or to another
+    /// brain, stays foreign.
+    #[test]
+    fn a_record_of_another_named_instance_or_brain_is_not_rebound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let id = identity();
+        save_records(
+            &db,
+            &DerivationRecords::default(),
+            &expectation(&id, "other"),
+        )
+        .unwrap();
+        assert!(!rebind_ambient_default_records(&db, &id, "qa-fr").unwrap());
+        assert_eq!(
+            load_records(&db, &expectation(&id, "qa-fr")).unwrap_err(),
+            RecordError::ForeignIdentity
+        );
+
+        let other_brain = identity();
+        std::fs::remove_file(record_path(&db)).unwrap();
+        save_records(
+            &db,
+            &DerivationRecords::default(),
+            &expectation(&other_brain, AMBIENT_DEFAULT_INSTANCE),
+        )
+        .unwrap();
+        assert!(!rebind_ambient_default_records(&db, &id, "qa-fr").unwrap());
     }
 
     #[test]

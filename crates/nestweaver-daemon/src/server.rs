@@ -7119,7 +7119,8 @@ impl NestWeaverDaemon for DaemonService {
         let _ = app_state
             .vault_derivation
             .set(nestweaver_web::state::VaultDerivationHttp {
-                data_instance_id: state.data_instance_id.clone(),
+                // nw-693: the live identity, as the RPC admission uses.
+                data_instance_id: state.effective_data_instance_id(),
                 read_only: state.read_only,
                 max_note_bytes: vault_derivation::http_max_note_bytes(&state),
             });

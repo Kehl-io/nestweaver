@@ -34,11 +34,47 @@ fn cancelled(state: &DaemonState) -> bool {
     state.shutdown_started.load(Ordering::SeqCst)
 }
 
+/// The data instance derivation records are stamped and validated with.
+///
+/// nw-693: the LIVE identity, never the boot snapshot. A config-less daemon
+/// that booted before the database recorded its instance snapshotted
+/// `"default"` and stamped records with it; after a restart it adopted the
+/// recorded instance and every record read as `ForeignRecord`.
+fn record_instance(state: &DaemonState) -> String {
+    state.effective_data_instance_id()
+}
+
+/// nw-693: heal records a config-less daemon stamped with the ambient
+/// `"default"` before the database recorded its instance. Called only on the
+/// WRITER paths (every stamp, demotion and migration, which a refresh runs
+/// through), never from a read, because it rewrites the sidecar. Only toward
+/// the instance the DATABASE carries; a `--config`-stated instance is intent
+/// and is never rebound.
+fn heal_ambient_default(
+    state: &DaemonState,
+    identity: &nestweaver_store::PublicationIdentity,
+) -> Result<(), RecordError> {
+    if state.instance_stated_by_config {
+        return Ok(());
+    }
+    // The database's own instance: its record, else the single instance its
+    // repos and vaults carry (`effective_data_instance_id`'s precedence).
+    let recorded = record_instance(state);
+    if markdown_derivation::rebind_ambient_default_records(&state.db_path, identity, &recorded)? {
+        tracing::info!(
+            instance = %recorded,
+            "re-bound Markdown derivation records stamped with the ambient default instance"
+        );
+    }
+    Ok(())
+}
+
 fn load_or_empty(
     state: &DaemonState,
     identity: &nestweaver_store::PublicationIdentity,
 ) -> Result<DerivationRecords, RecordError> {
-    let expected = expectation(identity, &state.data_instance_id);
+    let instance = record_instance(state);
+    let expected = expectation(identity, &instance);
     Ok(load_records(&state.db_path, &expected)?.unwrap_or_default())
 }
 
@@ -47,11 +83,8 @@ fn persist(
     identity: &nestweaver_store::PublicationIdentity,
     records: &DerivationRecords,
 ) -> Result<(), RecordError> {
-    save_records(
-        &state.db_path,
-        records,
-        &expectation(identity, &state.data_instance_id),
-    )
+    let instance = record_instance(state);
+    save_records(&state.db_path, records, &expectation(identity, &instance))
 }
 
 /// Reuse the recorded coverage scope so IndexVault's FullRegisteredPolicy is
@@ -163,6 +196,7 @@ fn stamp_from_refresh(
         scope,
     )?;
     let notes = state.store.list_notes(Some(&vault.uid))?;
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let mut record = records
         .vaults
@@ -289,6 +323,7 @@ fn withhold_for_coverage_gap(
         max_note_bytes,
         CoverageScope::FullRegisteredPolicy,
     )?;
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let mut record = records
         .vaults
@@ -324,6 +359,7 @@ fn migrate_vault(
     if nestweaver_schema::vault_uid(&vault.instance_id, &source.canonical_root) != vault.uid {
         anyhow::bail!("vault source identity does not match its UID");
     }
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let coverage = coverage_for_vault(
         vault,
@@ -417,10 +453,9 @@ pub(super) fn ensure_current(
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
     let source = filesystem_source(Path::new(&vault.root_path))?;
-    let records = load_records(
-        &state.db_path,
-        &expectation(&identity, &state.data_instance_id),
-    )?;
+    heal_ambient_default(state, &identity)?;
+    let instance = record_instance(state);
+    let records = load_records(&state.db_path, &expectation(&identity, &instance))?;
     let coverage = coverage_for_vault(
         &vault,
         &source,
@@ -431,7 +466,7 @@ pub(super) fn ensure_current(
     )?;
     match markdown_derivation::admit_vault(
         records.as_ref(),
-        &expectation(&identity, &state.data_instance_id),
+        &expectation(&identity, &instance),
         &vault,
         &source,
         &coverage,
@@ -527,7 +562,7 @@ pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> 
     admit_all_vaults(
         &state.store,
         &state.db_path,
-        &state.data_instance_id,
+        &record_instance(state),
         &extra_ignore(state),
         note_limits(state).max_note_bytes(),
         state.read_only,
@@ -540,12 +575,10 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
         Ok(Some(identity)) => identity,
         _ => return,
     };
-    let records = load_records(
-        &state.db_path,
-        &expectation(&identity, &state.data_instance_id),
-    )
-    .ok()
-    .flatten();
+    let instance = record_instance(state);
+    let records = load_records(&state.db_path, &expectation(&identity, &instance))
+        .ok()
+        .flatten();
     let Some(records) = records else {
         return;
     };
@@ -650,7 +683,7 @@ pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>
         };
         if markdown_derivation::admit_vault(
             Some(&records),
-            &expectation(&identity, &state.data_instance_id),
+            &expectation(&identity, &record_instance(state)),
             &vault,
             &source,
             &coverage,
@@ -678,6 +711,7 @@ pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Res
     let source = filesystem_source(Path::new(&vault.root_path))?;
     let extra = extra_ignore(state);
     let max_note_bytes = note_limits(state).max_note_bytes();
+    heal_ambient_default(state, &identity)?;
     let records = load_or_empty(state, &identity)?;
     let coverage = coverage_for_vault(
         &vault,
@@ -689,7 +723,7 @@ pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Res
     )?;
     match markdown_derivation::admit_vault(
         Some(&records),
-        &expectation(&identity, &state.data_instance_id),
+        &expectation(&identity, &record_instance(state)),
         &vault,
         &source,
         &coverage,
