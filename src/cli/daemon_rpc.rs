@@ -430,6 +430,65 @@ pub(crate) fn try_hybrid_json_rpc_checked(
     }
 }
 
+/// A daemon RPC that must stay on THIS machine: the local daemon or nothing.
+///
+/// nw-690 review (B1): [`try_hybrid_json_rpc_checked`] routes by the
+/// federation matrix, so a Merge tool's params reach every configured
+/// upstream, and with no daemon it queries the upstreams alone. A request
+/// carrying the caller's own data (`generate-guide --config/--rules-from`)
+/// takes this route instead. `Ok(None)` only on the CI direct route; with the
+/// daemon unreachable it refuses, naming why no upstream was asked.
+pub(crate) fn try_local_daemon_json_rpc(
+    db_path: &std::path::Path,
+    config: Option<&std::path::Path>,
+    rpc_name: &str,
+    args: serde_json::Value,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    require_existing_db(db_path)?;
+    let local_only_reason = || {
+        format!(
+            "{rpc_name} with a caller's config or rules is served by the local daemon only and \
+             is never sent to an upstream"
+        )
+    };
+    let rt = tokio::runtime::Runtime::new()
+        .with_context(|| format!("create runtime for local daemon query {rpc_name}"))?;
+    let client = match rt.block_on(nestweaver_client::DaemonClient::connect(db_path, config)) {
+        Ok(client) => client,
+        Err(error) => {
+            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                format!(
+                    "daemon unavailable ({error:#}); {}; refusing direct fallback",
+                    local_only_reason()
+                )
+            })?;
+            return Ok(None);
+        }
+    };
+    let mut local = nestweaver_client::hybrid::HybridClient::local_only(client);
+    let answer = rt.block_on(async {
+        match daemon_rpc_timeout(&args) {
+            Some(budget) => tokio::time::timeout(budget, local.query_local_only(rpc_name, &args))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "daemon did not answer {rpc_name} within {}s; raise or disable the \
+                         ceiling with {RPC_TIMEOUT_ENV} (0 disables)",
+                        budget.as_secs()
+                    ))
+                }),
+            None => local.query_local_only(rpc_name, &args).await,
+        }
+    });
+    match answer {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => match daemon_application_error(&error) {
+            Some(message) => Err(error.context(message)),
+            None => Err(error.context(local_only_reason())),
+        },
+    }
+}
+
 /// Configless compatibility wrapper. Callers with an explicit config must use
 /// [`try_hybrid_json_rpc_checked`] and propagate its error.
 pub(crate) fn try_hybrid_json_rpc(

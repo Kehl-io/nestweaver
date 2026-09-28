@@ -508,9 +508,10 @@ pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
 };
 pub use agent_guide::{
-    ToolDocEntry, generate_agents_md, generate_agents_md_with_rules, generate_claude_md,
-    generate_claude_md_with_rules, generate_cursor_rule, generate_cursor_rule_with_rules,
-    generate_guide, generate_guide_with_rules, generate_guide_with_tools, generate_skill,
+    GUIDE_INPUT_MAX_BYTES, GuideConfigProjection, ToolDocEntry, generate_agents_md,
+    generate_agents_md_with_rules, generate_claude_md, generate_claude_md_with_rules,
+    generate_cursor_rule, generate_cursor_rule_with_rules, generate_guide,
+    generate_guide_with_rules, generate_guide_with_tools, generate_skill,
     generate_skill_with_rules, generate_skill_with_tools,
 };
 pub use authz::{

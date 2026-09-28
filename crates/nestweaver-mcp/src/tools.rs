@@ -2306,6 +2306,38 @@ mod tool_schema_validation_tests {
             .expect("blank config must be treated as absent");
     }
 
+    /// nw-690 review (B1): both wire inputs are capped at 1 MiB.
+    #[test]
+    fn brain_guide_refuses_oversized_guide_inputs() {
+        let store = GraphStore::in_memory().unwrap();
+        let big = "x".repeat(nestweaver_engine::GUIDE_INPUT_MAX_BYTES + 1);
+        let error = tool_brain_guide(&store, json!({ "rules": big }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'rules' is"), "{error}");
+        let error = tool_brain_guide(
+            &store,
+            json!({ "guide_config": { "links": [{ "from": big, "to": "b", "link_type": "t" }] } }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("'guide_config' is"), "{error}");
+        // Counterweight: small inputs render.
+        let ok = tool_brain_guide(
+            &store,
+            json!({
+                "guide_config": { "links": [{ "from": "a", "to": "b", "link_type": "t", "description": "tiny link" }] },
+                "rules": "**HARD RULE:** Small — tiny rule",
+            }),
+        )
+        .unwrap();
+        let guide = ok["guide"].as_str().unwrap();
+        assert!(
+            guide.contains("tiny link") && guide.contains("tiny rule"),
+            "{guide}"
+        );
+    }
+
     #[test]
     fn dead_code_count_contract_is_consistent() {
         use nestweaver_schema::{Symbol, Visibility};
@@ -10264,15 +10296,16 @@ fn tool_schema_brain_guide() -> Value {
                 },
                 "config": {
                     "type": "string",
-                    "description": "Path to an instance config TOML. NOT supported: the server never reads a caller-named file, so passing it returns an explicit error. Pass the file's CONTENTS as `config_toml` instead (the CLI 'nestweaver generate-guide --config <path>' does this for you)."
+                    "description": "Path to an instance config TOML. NOT supported: the server never reads a caller-named file, so passing it returns an explicit error. Pass `guide_config` instead (the CLI 'nestweaver generate-guide --config <path>' does this for you)."
                 },
-                "config_toml": {
-                    "type": "string",
-                    "description": "Contents of an instance config TOML, used ONLY to render the guide's config-declared sections (projects, declared links, feature bundles). Never used for authorization or any other server setting."
+                "guide_config": {
+                    "type": "object",
+                    "description": "The config-declared sections the guide renders, and nothing else: {links: [{from, to, link_type, description}], features: [{name, description, repos, entry_points}], projects: [{name, description, aliases, vault_folder, repos, external_refs: [[label, type]]}]}. At most 1 MiB serialized. Never used for authorization or any other server setting. The CLI's `generate-guide --config` builds it from the config file."
                 },
                 "rules": {
                     "type": "string",
-                    "description": "Contents of a hard-rules override file (TOML with [[rules]] or markdown), replacing the default Hard Rules section. The CLI's --rules-from sends this."
+                    "maxLength": 1048576,
+                    "description": "Contents of a hard-rules override file (TOML with [[rules]] or markdown), replacing the default Hard Rules section. At most 1 MiB. The CLI's --rules-from sends this."
                 }
             }
         }
@@ -10290,33 +10323,45 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     {
         return Err(anyhow!(
             "brain_guide cannot honor the 'config' argument in this context; \
-             pass the config file's contents as 'config_toml' instead \
+             pass its rendered sections as 'guide_config' instead \
              (nestweaver generate-guide --config <path> does this)"
         ));
     }
     // nw-690: the config and rules travel as CONTENT, read by the client, so
     // `generate-guide --config/--rules-from` renders through the daemon
     // instead of opening the store directly (which fails while the daemon
-    // holds the write lock). The config is a RENDERING input only. It never
-    // reaches authorization or any daemon setting: `daemon_may_serve`'s
-    // reason for keeping `--config` off the daemon is that a forwarded config
-    // could carry its own `authz`, and nothing here reads that section.
-    let instance_config = args
-        .get("config_toml")
-        .and_then(|v| v.as_str())
-        .map(|toml| {
-            nestweaver_engine::InstanceConfig::from_toml_str(toml)
-                .context("brain_guide: invalid 'config_toml'")
-        })
-        .transpose()?;
-    let override_rules = args
-        .get("rules")
-        .and_then(|v| v.as_str())
-        .map(|contents| {
+    // holds the write lock). The config arrives as a `GuideConfigProjection`
+    // (review B1): only the sections the guide prints, so no credential,
+    // endpoint or `[authz]` can be in it. It is a RENDERING input only.
+    let cap = nestweaver_engine::GUIDE_INPUT_MAX_BYTES;
+    let instance_config = match args.get("guide_config") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let size = serde_json::to_string(value).map_or(usize::MAX, |s| s.len());
+            if size > cap {
+                return Err(anyhow!(
+                    "brain_guide: 'guide_config' is {size} bytes; the maximum is {cap}"
+                ));
+            }
+            let projection: nestweaver_engine::GuideConfigProjection =
+                serde_json::from_value(value.clone())
+                    .context("brain_guide: invalid 'guide_config'")?;
+            Some(projection.to_render_config()?)
+        }
+    };
+    let override_rules = match args.get("rules").and_then(|v| v.as_str()) {
+        Some(contents) if contents.len() > cap => {
+            return Err(anyhow!(
+                "brain_guide: 'rules' is {} bytes; the maximum is {cap}",
+                contents.len()
+            ));
+        }
+        Some(contents) => Some(
             nestweaver_engine::parse_rules_override(contents)
-                .context("brain_guide: invalid 'rules'")
-        })
-        .transpose()?;
+                .context("brain_guide: invalid 'rules'")?,
+        ),
+        None => None,
+    };
     let cfg_ref = instance_config.as_ref();
     let rules_ref = override_rules.as_deref();
     let format = args

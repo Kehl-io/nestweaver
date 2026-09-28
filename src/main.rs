@@ -16955,30 +16955,56 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // nw-690: `--config` and `--rules-from` used to skip the daemon
             // outright, so the documented guide-with-config command always
             // took the direct open and failed while a daemon served the DB.
-            // Both files are now READ HERE and sent as content
-            // (`config_toml`, `rules`): the daemon never reads a path a
-            // client names, and the config only shapes the rendered text
-            // (see `tool_brain_guide`), never the daemon's authorization.
+            // Both files are now read HERE; the daemon never reads a path a
+            // client names.
+            //
+            // Review B1: the config is sent as a `GuideConfigProjection` --
+            // only the links, features and projects the guide prints -- never
+            // the TOML, which holds `[[upstream]] token`, `[authz]` and
+            // `[git]`. And a request carrying either input goes to the LOCAL
+            // daemon only: `brain_guide` is a federated tool, and a caller's
+            // config and rules must never reach an upstream.
             if use_daemon {
                 let mut args = serde_json::json!({ "format": format });
+                let cap = nestweaver_engine::GUIDE_INPUT_MAX_BYTES;
                 if let Some(ref path) = config {
-                    let contents = std::fs::read_to_string(path)
-                        .with_context(|| format!("failed to read --config {}", path.display()))?;
-                    args["config_toml"] = serde_json::json!(contents);
+                    let parsed = nestweaver_engine::InstanceConfig::from_file(path)
+                        .with_context(|| format!("failed to load --config {}", path.display()))?;
+                    let projection = serde_json::to_value(
+                        nestweaver_engine::GuideConfigProjection::from_config(&parsed),
+                    )?;
+                    let size = serde_json::to_string(&projection)?.len();
+                    if size > cap {
+                        eprintln!(
+                            "Error: the guide sections of --config {} are {size} bytes; the \
+                             maximum is {cap}",
+                            path.display()
+                        );
+                        return Ok((EXIT_USAGE, None));
+                    }
+                    args["guide_config"] = projection;
                 }
                 if let Some(ref path) = rules_from {
                     let contents = std::fs::read_to_string(path).with_context(|| {
                         format!("failed to read --rules-from {}", path.display())
                     })?;
+                    if contents.len() > cap {
+                        eprintln!(
+                            "Error: --rules-from {} is {} bytes; the maximum is {cap}",
+                            path.display(),
+                            contents.len()
+                        );
+                        return Ok((EXIT_USAGE, None));
+                    }
                     args["rules"] = serde_json::json!(contents);
                 }
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "brain_guide",
-                    args,
-                )? {
+                let private_inputs = config.is_some() || rules_from.is_some();
+                let answer = if private_inputs {
+                    try_local_daemon_json_rpc(&db_path, config.as_deref(), "brain_guide", args)?
+                } else {
+                    try_hybrid_json_rpc_checked(true, &db_path, None, "brain_guide", args)?
+                };
+                if let Some(value) = answer {
                     // brain_guide returns { "guide": "<markdown>" }. Extract the
                     // raw markdown body — printing the JSON object would emit an
                     // envelope with escaped newlines instead of a usable guide.

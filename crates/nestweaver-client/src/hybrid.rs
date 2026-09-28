@@ -741,6 +741,15 @@ impl HybridClient {
     }
 
     /// Query the local daemon via its gRPC channel.
+    /// Query the LOCAL daemon only, whatever the routing matrix says for
+    /// `tool_name`. For requests carrying data that must never leave this
+    /// machine (nw-690 review: `brain_guide` with a caller's config).
+    pub async fn query_local_only(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        let mut result = self.query_local(tool_name, params).await?;
+        inject_or_wrap_provenance(&mut result, &["local"], &[]);
+        Ok(result)
+    }
+
     async fn query_local(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         dispatch_json_rpc(self.local.inner_mut(), tool_name, params).await
     }

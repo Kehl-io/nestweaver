@@ -7633,3 +7633,122 @@ fn suggest_links_with_owed_manifests_does_not_advise_starting_a_running_daemon()
         "must not advise starting a running daemon: {stderr}"
     );
 }
+
+/// nw-690 review (B1): `generate-guide --config/--rules-from` must never send
+/// the caller's config or rules to a configured upstream. `brain_guide` is a
+/// federated (Merge) tool, so the hybrid route forwarded the params, and the
+/// raw TOML carried `[[upstream]] token`. A recording listener stands in for
+/// the upstream: it must see no connection opened by the guide command.
+#[test]
+fn generate_guide_with_config_never_reaches_a_configured_upstream() {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let received = Arc::clone(&received);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let received = Arc::clone(&received);
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut bytes = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                    }
+                    received.lock().unwrap().push(bytes);
+                });
+            }
+        });
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("guide-up").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"default\"\n\n\
+             [snapshot_storage]\nbackend = \"local\"\npath = \"{root}/snapshots\"\n\n\
+             [workspace]\nbackend = \"local\"\npath = \"{root}/workspace\"\n\n\
+             [inference]\nendpoint = \"http://localhost:11434\"\n\
+             embedding_model = \"nomic-embed-text\"\nsummary_model = \"none\"\n\n\
+             [git]\ncredential_method = \"gh\"\n\n\
+             [[upstream]]\nname = \"recorder\"\nurl = \"http://127.0.0.1:{port}\"\n\
+             token = \"NW690-SECRET-TOKEN\"\nmode = \"merge\"\n\n\
+             [[links]]\nfrom = \"guide-app\"\nto = \"guide-svc\"\n\
+             type = \"http-api\"\ndescription = \"nw690 upstream link\"\n",
+            root = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let rules = dir.path().join("rules.md");
+    std::fs::write(&rules, "**HARD RULE:** Private — NW690-PRIVATE-RULE\n").unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    let socket =
+        nestweaver_daemon::socket_path(&nestweaver_daemon::instance_id_from_db_path(&db_path));
+    wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || stop_daemon(&db_path),
+    )
+    .expect("daemon started with --config must accept connections");
+    // Let any connection the daemon itself opens at boot settle first.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = received.lock().unwrap().len();
+
+    let output = daemon_cmd()
+        .args(["generate-guide", "--format", "agents-md", "--db"])
+        .arg(&db_path)
+        .arg("--config")
+        .arg(&config)
+        .arg("--rules-from")
+        .arg(&rules)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("nw690 upstream link"), "{stdout}");
+    assert!(stdout.contains("NW690-PRIVATE-RULE"), "{stdout}");
+    assert!(!stdout.contains("NW690-SECRET-TOKEN"), "{stdout}");
+    std::thread::sleep(Duration::from_millis(2500));
+    let received = received.lock().unwrap();
+    let during = &received[before..];
+    assert!(
+        during.is_empty(),
+        "the guide command opened {} connection(s) to the upstream",
+        during.len()
+    );
+    for bytes in received.iter() {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains("NW690-PRIVATE-RULE"),
+            "rules reached the upstream"
+        );
+        assert!(
+            !text.contains("nw690 upstream link"),
+            "config reached the upstream"
+        );
+    }
+}
