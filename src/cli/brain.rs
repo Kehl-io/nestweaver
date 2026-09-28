@@ -498,6 +498,9 @@ pub(crate) fn run_brain(
                     {
                         println!("  {line}");
                     }
+                    for line in vault_derivation_status_lines(&value) {
+                        println!("  {line}");
+                    }
                     if let Some(near) = value.get("notes_near_size_limit") {
                         let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                         if near_count > 0 {
@@ -1754,6 +1757,11 @@ pub(crate) fn run_brain(
                     result.tags_count,
                     result.changed_note_link_edges,
                 );
+                // nw-694: the skip rows themselves, as the daemon route and
+                // the full-refresh summary list them, so a gap names its path.
+                for row in &result.skipped {
+                    message.push_str(&format!("\n  {} - {}", row.path, row.reason));
+                }
                 // nw-585: the same lines the daemon route appends.
                 if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
                     &result.frontmatter_unparsed,
@@ -3612,4 +3620,67 @@ pub(crate) fn finish_vault_refresh(
         },
         None,
     ))
+}
+
+/// nw-694: `brain status` text says a vault is BLOCKED. The count lived only
+/// in `--json` (`vault_derivation`), so a human saw a healthy status while
+/// every link-graph tool refused that vault.
+pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<String> {
+    let Some(blocked) = status
+        .get("vault_derivation")
+        .and_then(|derivation| derivation.get("blocked_vaults"))
+        .and_then(|blocked| blocked.as_array())
+    else {
+        return Vec::new();
+    };
+    blocked
+        .iter()
+        .map(|vault| {
+            let root = vault
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown vault>");
+            let reason = vault
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "Vault BLOCKED: {root} ({reason}) -- Markdown link derivation is not current, so \
+                 link-graph tools refuse it. Fix the unreadable path and run a full \
+                 `nestweaver brain refresh {root}`."
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod vault_derivation_status_tests {
+    use super::vault_derivation_status_lines;
+
+    /// nw-694: a Blocked vault is said in the text render.
+    #[test]
+    fn a_blocked_vault_gets_a_status_line_naming_it() {
+        let status = serde_json::json!({
+            "vault_derivation": {
+                "pending_or_blocked_vaults": 1,
+                "blocked_vaults": [
+                    { "root_path": "/v/brain", "reason": "publication_incomplete" }
+                ]
+            }
+        });
+        let lines = vault_derivation_status_lines(&status);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Vault BLOCKED: /v/brain"), "{}", lines[0]);
+        assert!(lines[0].contains("brain refresh /v/brain"), "{}", lines[0]);
+    }
+
+    /// Counterweight: no Blocked vault, no line.
+    #[test]
+    fn no_blocked_vault_means_no_line() {
+        let status = serde_json::json!({
+            "vault_derivation": { "pending_or_blocked_vaults": 0, "blocked_vaults": [] }
+        });
+        assert!(vault_derivation_status_lines(&status).is_empty());
+        assert!(vault_derivation_status_lines(&serde_json::json!({})).is_empty());
+    }
 }

@@ -2449,11 +2449,38 @@ fn index_done_message(
 }
 
 /// Appended to a vault RPC's Done message when a coverage gap kept (or
-/// demoted) Markdown derivation from Current (nw-651). One constant so
+/// demoted) Markdown derivation from Current (nw-651). One function so
 /// IndexVault and RefreshVaultSince say the same thing.
-const DERIVATION_WITHHELD_NOTE: &str = "\nMarkdown link derivation NOT marked current: a \
-     skipped path above could not be read or parsed. Fix it and re-run; until then \
-     link-graph tools report this vault as blocked.";
+///
+/// nw-694: it NAMES the gap paths. It used to say "a skipped path above"
+/// while the `--since` message printed no skip rows at all, so the reader had
+/// no path to fix.
+fn derivation_withheld_note(skipped: &[nestweaver_parser::SkippedFile]) -> String {
+    let gaps: Vec<&str> = skipped
+        .iter()
+        .filter(|file| nestweaver_engine::markdown_derivation::is_coverage_gap(file))
+        .map(|file| file.path.as_str())
+        .collect();
+    format!(
+        "\nMarkdown link derivation NOT marked current: {} could not be read or parsed. \
+         Fix it and re-run a full `nestweaver brain refresh` (without --since); until then \
+         link-graph tools report this vault as blocked.",
+        if gaps.is_empty() {
+            "a skipped path".to_string()
+        } else {
+            gaps.join(", ")
+        }
+    )
+}
+
+/// nw-694: the skip rows of a vault refresh, in the `  {path} - {reason}`
+/// shape the full-refresh summary already prints, for the `--since` message.
+fn skip_rows_text(skipped: &[nestweaver_parser::SkippedFile]) -> String {
+    skipped
+        .iter()
+        .map(|file| format!("\n  {} - {}", file.path, file.reason))
+        .collect()
+}
 
 fn index_skip_details(skipped: &[nestweaver_parser::SkippedFile]) -> Vec<IndexSkipDetail> {
     skipped
@@ -8049,7 +8076,7 @@ impl NestWeaverDaemon for DaemonService {
                     let mut message =
                         nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
                     if stamp == vault_derivation::IndexStamp::WithheldForCoverageGap {
-                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                        message.push_str(&derivation_withheld_note(&result.index.skipped));
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -8296,6 +8323,7 @@ impl NestWeaverDaemon for DaemonService {
                         result.tags_count,
                         result.changed_note_link_edges,
                     );
+                    message.push_str(&skip_rows_text(&result.skipped));
                     if let Some(unparsed) =
                         nestweaver_engine::index_md::frontmatter_unparsed_summary(
                             &result.frontmatter_unparsed,
@@ -8305,7 +8333,7 @@ impl NestWeaverDaemon for DaemonService {
                         message.push_str(&unparsed);
                     }
                     if withheld {
-                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                        message.push_str(&derivation_withheld_note(&result.skipped));
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -17411,6 +17439,64 @@ repos = ["alpha"]
             .map(|note| note.file_path)
             .collect();
         assert!(kept.iter().any(|path| path == "locked/C.md"), "{kept:?}");
+    }
+
+    /// nw-694: run 1 names the unreadable directory (its skip row and the
+    /// "NOT marked current" note); the refusal that follows names the vault,
+    /// the directory, the retry time and the full-refresh remedy; and the
+    /// status overlay names the Blocked vault for the text render.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_since_over_an_unreadable_directory_names_it_and_the_remedy() {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+
+        let _restore = lock_dir(&root.join("locked"));
+        let run1 = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = run1.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert!(last.message.contains("\n  locked - "), "{}", last.message);
+        assert!(
+            last.message
+                .contains("NOT marked current: locked could not be read"),
+            "{}",
+            last.message
+        );
+
+        let run2 = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = run2.last().unwrap();
+        assert_eq!(last.phase, Phase::Error as i32, "{}", last.message);
+        for needle in [
+            root.display().to_string().as_str(),
+            "unreadable now: locked",
+            "automatic retry is due in",
+            "run a full `nestweaver brain refresh",
+            "(without --since)",
+        ] {
+            assert!(
+                last.message.contains(needle),
+                "refusal must name {needle:?}: {}",
+                last.message
+            );
+        }
+
+        let mut status = serde_json::json!({});
+        vault_derivation::status_overlay(&state, &mut status);
+        let blocked = status["vault_derivation"]["blocked_vaults"]
+            .as_array()
+            .unwrap();
+        assert_eq!(blocked.len(), 1, "{status}");
+        assert_eq!(blocked[0]["root_path"], root.display().to_string());
     }
 
     /// Counterweight: a clean RefreshVaultSince leaves a Current vault Current

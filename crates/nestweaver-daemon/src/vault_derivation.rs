@@ -447,8 +447,71 @@ pub(super) fn ensure_current(
                 CoverageScope::FullRegisteredPolicy,
             )
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            let blocked = records
+                .as_ref()
+                .and_then(|records| records.vaults.get(&vault.uid))
+                .filter(|record| record.phase == DerivationPhase::Blocked);
+            match blocked {
+                Some(record) => Err(anyhow::anyhow!(
+                    "{error}: {}",
+                    blocked_vault_remedy(state, &vault, record, now_unix_seconds())
+                )),
+                None => Err(error.into()),
+            }
+        }
     }
+}
+
+/// nw-694: what a refusal over a Blocked vault must say. The bare
+/// "Markdown link derivation is not current (SourceBlocked)" named neither the
+/// directory nor the way out, and the refusal repeats until the backoff
+/// expires even after the directory is fixed. It now names the vault, the
+/// directories that cannot be read NOW (one non-strict walk, only on this
+/// refusal path), when the automatic retry is due, and the remedy: a FULL
+/// refresh re-derives the vault at once, because IndexVault does not wait on
+/// the Blocked backoff.
+fn blocked_vault_remedy(
+    state: &DaemonState,
+    vault: &Vault,
+    record: &VaultDerivationRecord,
+    now_unix_seconds: u64,
+) -> String {
+    use nestweaver_engine::content_reader::{ContentReader, UNREADABLE_DIR_REASON};
+    let reader = nestweaver_engine::index_md::filesystem_vault_reader(
+        Path::new(&vault.root_path),
+        note_limits(state),
+    );
+    let unreadable: Vec<String> = match reader.list_files() {
+        Ok(_) => reader
+            .skipped_dirs()
+            .into_iter()
+            .filter(|dir| dir.reason == UNREADABLE_DIR_REASON)
+            .map(|dir| dir.path)
+            .collect(),
+        Err(error) => vec![format!("the vault root itself ({error})")],
+    };
+    let blocked_on = if unreadable.is_empty() {
+        "no directory is unreadable now".to_string()
+    } else {
+        format!("unreadable now: {}", unreadable.join(", "))
+    };
+    let retry = match record.retry_after_unix_seconds {
+        Some(at) if at > now_unix_seconds => format!(
+            "the automatic retry is due in {}s (unix time {at})",
+            at - now_unix_seconds
+        ),
+        _ => "the automatic retry is due now".to_string(),
+    };
+    format!(
+        "vault {} is blocked ({:?}; {blocked_on}); {retry}. To re-derive it now, fix the \
+         directory and run a full `nestweaver brain refresh {}` (without --since)",
+        vault.root_path,
+        record
+            .last_error
+            .unwrap_or(markdown_derivation::BlockedReason::SourceUnavailable),
+        vault.root_path,
+    )
 }
 
 pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> {
@@ -491,12 +554,28 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
         .values()
         .filter(|record| record.phase != DerivationPhase::Current)
         .count();
+    // nw-694: name the Blocked vaults, so the text render can say a vault is
+    // blocked rather than leaving it to a JSON-only count.
+    let blocked: Vec<serde_json::Value> = records
+        .vaults
+        .values()
+        .filter(|record| record.phase == DerivationPhase::Blocked)
+        .map(|record| {
+            serde_json::json!({
+                "vault_uid": record.vault_uid,
+                "root_path": record.source.canonical_root,
+                "reason": record.last_error,
+                "retry_after_unix_seconds": record.retry_after_unix_seconds,
+            })
+        })
+        .collect();
     if let serde_json::Value::Object(object) = value {
         object.insert(
             "vault_derivation".to_string(),
             serde_json::json!({
                 "expected_version": markdown_derivation::DERIVATION_VERSION,
                 "pending_or_blocked_vaults": pending,
+                "blocked_vaults": blocked,
                 "read_only": state.read_only,
             }),
         );
