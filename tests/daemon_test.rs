@@ -7278,3 +7278,132 @@ fn daemon_autostart_reaps_dead_pidfile_without_wal_corrupt() {
     isolate_nestweaver_cmd(&mut stop, &home);
     let _ = stop.ok();
 }
+
+// ─── nw-690: summary / generate-guide route through a live daemon ───────────
+
+/// `summary` in text mode read the daemon's `summaries` as a string after
+/// nw-321 made it a list, so every answer fell through to a direct open that
+/// fails while the daemon holds the write lock.
+#[test]
+fn summary_text_mode_is_served_by_the_running_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("sum").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let output = daemon_cmd()
+        .args(["--stats", "summary", "--level", "file", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "summary must be served while the daemon runs\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("(via daemon)"), "stderr: {stderr}");
+    assert!(stdout.contains("main.js"), "stdout: {stdout}");
+}
+
+/// `generate-guide --config/--rules-from` skipped the daemon entirely. It now
+/// sends both files' contents over the RPC; the daemon's answer must be the
+/// same guide the direct route renders from the same inputs.
+#[test]
+fn generate_guide_with_config_and_rules_is_served_by_the_daemon_with_direct_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("guide").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"default\"\n\n\
+             [snapshot_storage]\nbackend = \"local\"\npath = \"{root}/snapshots\"\n\n\
+             [workspace]\nbackend = \"local\"\npath = \"{root}/workspace\"\n\n\
+             [inference]\nendpoint = \"http://localhost:11434\"\n\
+             embedding_model = \"nomic-embed-text\"\nsummary_model = \"none\"\n\n\
+             [git]\ncredential_method = \"gh\"\n\n\
+             [[links]]\nfrom = \"guide-app\"\nto = \"guide-svc\"\n\
+             type = \"http-api\"\ndescription = \"nw690 declared link\"\n",
+            root = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let rules = dir.path().join("rules.md");
+    std::fs::write(
+        &rules,
+        "**HARD RULE:** Parity rule — nw690 custom rule body\n",
+    )
+    .unwrap();
+    let guide_args = |cmd: &mut Command| {
+        cmd.args(["--stats", "generate-guide", "--format", "agents-md", "--db"])
+            .arg(&db_path)
+            .arg("--config")
+            .arg(&config)
+            .arg("--rules-from")
+            .arg(&rules);
+    };
+
+    let mut direct = no_daemon_cmd();
+    guide_args(&mut direct);
+    let direct = direct.output().unwrap();
+    assert!(
+        direct.status.success(),
+        "direct guide: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    // The daemon is started WITH the same config: an explicit `--config` on
+    // a client must match the running daemon's (nw-316), which is the
+    // documented shape of a live instance.
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    let socket =
+        nestweaver_daemon::socket_path(&nestweaver_daemon::instance_id_from_db_path(&db_path));
+    wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || stop_daemon(&db_path),
+    )
+    .expect("daemon started with --config must accept connections");
+    let mut routed = daemon_cmd();
+    guide_args(&mut routed);
+    let routed = routed.output().unwrap();
+    let stdout = String::from_utf8_lossy(&routed.stdout);
+    assert!(
+        routed.status.success(),
+        "guide with --config must be served while the daemon runs\nstderr: {}",
+        String::from_utf8_lossy(&routed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&routed.stderr).contains("(via daemon)"),
+        "the guide must come from the daemon, not a direct open: {}",
+        String::from_utf8_lossy(&routed.stderr)
+    );
+    assert!(
+        stdout.contains("nw690 declared link"),
+        "config ignored: {stdout}"
+    );
+    assert!(
+        stdout.contains("nw690 custom rule body"),
+        "rules ignored: {stdout}"
+    );
+    assert_eq!(
+        stdout,
+        String::from_utf8_lossy(&direct.stdout),
+        "daemon and direct routes must render the same guide"
+    );
+}

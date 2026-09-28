@@ -10264,7 +10264,15 @@ fn tool_schema_brain_guide() -> Value {
                 },
                 "config": {
                     "type": "string",
-                    "description": "Path to an instance config TOML. NOT supported by this handler (it generates from the graph only and cannot honor per-instance settings); passing it returns an explicit error. Use the CLI 'nestweaver generate-guide --config <path>' local path instead."
+                    "description": "Path to an instance config TOML. NOT supported: the server never reads a caller-named file, so passing it returns an explicit error. Pass the file's CONTENTS as `config_toml` instead (the CLI 'nestweaver generate-guide --config <path>' does this for you)."
+                },
+                "config_toml": {
+                    "type": "string",
+                    "description": "Contents of an instance config TOML, used ONLY to render the guide's config-declared sections (projects, declared links, feature bundles). Never used for authorization or any other server setting."
+                },
+                "rules": {
+                    "type": "string",
+                    "description": "Contents of a hard-rules override file (TOML with [[rules]] or markdown), replacing the default Hard Rules section. The CLI's --rules-from sends this."
                 }
             }
         }
@@ -10272,10 +10280,9 @@ fn tool_schema_brain_guide() -> Value {
 }
 
 fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // This handler generates from the graph only and has no
-    // InstanceConfig to honor. Silently ignoring a caller-supplied `config`
-    // would return a guide shaped by the wrong instance — fail loudly instead
-    // (the CLI already falls back to the local path when --config is given).
+    // A caller-named config PATH is refused: the server must not read an
+    // arbitrary file on a client's say-so, and silently ignoring it would
+    // return a guide shaped by the wrong instance.
     if args
         .get("config")
         .and_then(|v| v.as_str())
@@ -10283,9 +10290,35 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     {
         return Err(anyhow!(
             "brain_guide cannot honor the 'config' argument in this context; \
-             use the CLI local path instead: nestweaver generate-guide --config <path>"
+             pass the config file's contents as 'config_toml' instead \
+             (nestweaver generate-guide --config <path> does this)"
         ));
     }
+    // nw-690: the config and rules travel as CONTENT, read by the client, so
+    // `generate-guide --config/--rules-from` renders through the daemon
+    // instead of opening the store directly (which fails while the daemon
+    // holds the write lock). The config is a RENDERING input only. It never
+    // reaches authorization or any daemon setting: `daemon_may_serve`'s
+    // reason for keeping `--config` off the daemon is that a forwarded config
+    // could carry its own `authz`, and nothing here reads that section.
+    let instance_config = args
+        .get("config_toml")
+        .and_then(|v| v.as_str())
+        .map(|toml| {
+            nestweaver_engine::InstanceConfig::from_toml_str(toml)
+                .context("brain_guide: invalid 'config_toml'")
+        })
+        .transpose()?;
+    let override_rules = args
+        .get("rules")
+        .and_then(|v| v.as_str())
+        .map(|contents| {
+            nestweaver_engine::parse_rules_override(contents)
+                .context("brain_guide: invalid 'rules'")
+        })
+        .transpose()?;
+    let cfg_ref = instance_config.as_ref();
+    let rules_ref = override_rules.as_deref();
     let format = args
         .get("format")
         .and_then(|v| v.as_str())
@@ -10303,14 +10336,16 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         })
         .collect();
 
-    // The MCP server does not hold an InstanceConfig at runtime; cross-repo
-    // edges from the graph are still included via the store query.
+    // The same five generators, with the same arguments, as the CLI's direct
+    // route, so the two routes cannot render different guides.
     let guide = match format {
-        "skill" => generate_skill_with_tools(store, None, None, &tool_docs)?,
-        "cursor-rule" => generate_cursor_rule_with_rules(store, None, None)?,
-        "agents-md" => generate_agents_md_with_rules(store, None, None, Some(tool_docs.len()))?,
-        "claude-md" => generate_claude_md_with_rules(store, None, None)?,
-        _ => generate_guide_with_tools(store, None, None, &tool_docs)?,
+        "skill" => generate_skill_with_tools(store, cfg_ref, rules_ref, &tool_docs)?,
+        "cursor-rule" => generate_cursor_rule_with_rules(store, cfg_ref, rules_ref)?,
+        "agents-md" => {
+            generate_agents_md_with_rules(store, cfg_ref, rules_ref, Some(tool_docs.len()))?
+        }
+        "claude-md" => generate_claude_md_with_rules(store, cfg_ref, rules_ref)?,
+        _ => generate_guide_with_tools(store, cfg_ref, rules_ref, &tool_docs)?,
     };
     Ok(json!({ "guide": guide }))
 }

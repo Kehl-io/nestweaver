@@ -16930,18 +16930,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             // ── daemon guard (JSON pass-through) ─────────────────
-            // Try the daemon first regardless of --output / --rules-from
-            // flags — it can generate the guide without the CLI opening
-            // the DB directly. When --output is set we write the result
-            // to the file locally; --rules-from is applied CLI-side only
-            // so we skip the daemon when that flag is present.
-            // The daemon's brain_guide handler ignores the `config`
-            // arg, so when --config is given fall back to the local read
-            // path, which actually honors it.
-            if rules_from.is_none() && config.is_none() && use_daemon {
+            // Try the daemon first regardless of --output / --config /
+            // --rules-from — it can generate the guide without the CLI
+            // opening the DB directly. When --output is set we write the
+            // result to the file locally.
+            //
+            // nw-690: `--config` and `--rules-from` used to skip the daemon
+            // outright, so the documented guide-with-config command always
+            // took the direct open and failed while a daemon served the DB.
+            // Both files are now READ HERE and sent as content
+            // (`config_toml`, `rules`): the daemon never reads a path a
+            // client names, and the config only shapes the rendered text
+            // (see `tool_brain_guide`), never the daemon's authorization.
+            if use_daemon {
                 let mut args = serde_json::json!({ "format": format });
-                if let Some(ref c) = config {
-                    args["config"] = serde_json::json!(c.to_string_lossy());
+                if let Some(ref path) = config {
+                    let contents = std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read --config {}", path.display()))?;
+                    args["config_toml"] = serde_json::json!(contents);
+                }
+                if let Some(ref path) = rules_from {
+                    let contents = std::fs::read_to_string(path).with_context(|| {
+                        format!("failed to read --rules-from {}", path.display())
+                    })?;
+                    args["rules"] = serde_json::json!(contents);
                 }
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
@@ -16967,7 +16979,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         None => print!("{text}"),
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    // `--stats` names the route, as `summary` does, so which
+                    // transport answered is observable rather than inferred.
+                    return Ok((
+                        EXIT_SUCCESS,
+                        Some("guide generated (via daemon)".to_string()),
+                    ));
                 }
             }
 
@@ -17595,9 +17612,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // hardcoded `None`, so even a caller who had one could not use
                 // it — the daemon route silently ignored the instance and any
                 // upstream it declares.
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "get_summary", args)?
-                    && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
+                //
+                // nw-690: the rendered text is read from `summaries_text`.
+                // nw-321 made `summaries` the structured LIST, so reading it
+                // as a string found nothing and every daemon answer fell
+                // through to the direct open below, which fails while the
+                // daemon holds the write lock. The plain-string `summaries`
+                // is still accepted, for a daemon older than nw-321. `_checked`
+                // because `--config` reaches here (nw-414) and the configless
+                // wrapper asserts it never does.
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "get_summary",
+                    args,
+                )? && let Some(text) = value
+                    .get("summaries_text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.get("summaries").and_then(|v| v.as_str()))
                 {
                     // nw-370: `get_summary` attaches the verdict on hub level,
                     // so this route reads the daemon's own answer rather than
