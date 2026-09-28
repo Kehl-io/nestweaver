@@ -7407,3 +7407,45 @@ fn generate_guide_with_config_and_rules_is_served_by_the_daemon_with_direct_pari
         "daemon and direct routes must render the same guide"
     );
 }
+
+/// nw-550: a missing `context` seed exits 2 with the not-found envelope; its
+/// message must be the root cause, not the gRPC "Internal error" wrap with the
+/// answer repeated inside it.
+#[test]
+fn context_missing_seed_via_daemon_reports_only_the_root_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("ctx").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let output = daemon_cmd()
+        .args(["context", "definitelyNotASymbolXYZ", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+    let message = payload["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("definitelyNotASymbolXYZ"),
+        "message must name the seed: {message}"
+    );
+    for wrap in ["RPC failed", "Internal error", "tool code_context failed"] {
+        assert!(
+            !message.contains(wrap),
+            "message carries {wrap:?}: {message}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Internal error"), "stderr: {stderr}");
+}

@@ -1174,7 +1174,13 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
 /// nothing here can improve it — but a `--json` caller now also gets a parsable
 /// object on stdout instead of an empty stream to scrape stderr for.
 fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[String]) -> i32 {
-    let message = format!("{error:#}");
+    // nw-550: the ROOT cause only. On the daemon route the error is the
+    // tool's answer wrapped as "<answer>: code_context RPC failed: code:
+    // 'Internal error', message: \"tool code_context failed: <answer>\"", so
+    // the full chain told scripts the tool crashed and repeated the answer.
+    // `daemon_application_error` is the unwrap every answered-RPC failure
+    // uses; the direct route has no gRPC status and keeps its chain.
+    let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
     if message.contains("No matching symbols") || message.contains("No symbols found") {
         if json {
             print_json_not_found_detail("seeds", &serde_json::json!(seeds), Some(&message));
