@@ -19864,7 +19864,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                      remove it from your MCP config"
                 );
             }
-            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-656: an invalid `--config` failed HERE, before any JSON-RPC
+            // existed, so the process exited 1 with empty stdout and an MCP
+            // client had nothing to show. Answer the client's first request
+            // with the cause (it names the file and the parse error), then
+            // exit.
+            let db_path = match resolve_db_with_config(db, config.as_deref()) {
+                Ok(db_path) => db_path,
+                Err(error) => {
+                    let _ = nestweaver_mcp::answer_stdio_boot_failure(format!("{error:#}"));
+                    return Err(error);
+                }
+            };
             // nw-199: absent flags inherit `[ranking] track_interactions`, so
             // the policy is a durable per-brain setting rather than something
             // every generated `.mcp.json` has to remember. An explicit flag

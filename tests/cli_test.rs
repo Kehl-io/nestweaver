@@ -12787,3 +12787,62 @@ fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
+
+/// nw-656: `mcp --config <invalid>` died before JSON-RPC (exit 1, empty
+/// stdout). The client's `initialize` is now answered with a JSON-RPC error
+/// naming the file and the parse error, then the process exits.
+#[test]
+fn mcp_invalid_config_answers_initialize_with_a_jsonrpc_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    let bad = dir.path().join("bad.toml");
+    std::fs::write(&bad, "x = [[[\n").unwrap();
+    let initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--config")
+        .arg(&bad)
+        .write_stdin(initialize)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout}");
+    let frame: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(frame["jsonrpc"], "2.0");
+    assert_eq!(frame["id"], 1, "{frame}");
+    let message = frame["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("bad.toml"),
+        "must name the file: {message}"
+    );
+    assert!(
+        message.contains("TOML parse error"),
+        "must name the cause: {message}"
+    );
+
+    // Counterweight: a valid config boots and serves tools/list unchanged.
+    let good =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--config")
+        .arg(&good)
+        .write_stdin("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frame: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert!(
+        !frame["result"]["tools"].as_array().unwrap().is_empty(),
+        "{frame}"
+    );
+}

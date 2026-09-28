@@ -517,6 +517,46 @@ fn write_stdio_boot_error_to(
     write_stdout_frame(out, &serialized)
 }
 
+/// Answer the client's first request with a JSON-RPC error carrying its `id`,
+/// then return so the caller can exit.
+///
+/// nw-656: a boot failure that happens before the session exists (an invalid
+/// `--config`) used to exit 1 with EMPTY stdout, so an MCP client saw the
+/// process die with no reason it could show. Replying to the request the
+/// client actually sent (normally `initialize`) with its own `id` is what a
+/// client can match and surface. Notifications are skipped, an unparsable
+/// line is answered with a `null` id, and a client that sends nothing before
+/// closing stdin gets nothing: stdout stays clean.
+pub fn answer_stdio_boot_failure(message: impl Into<String>) -> Result<(), StdoutWriteError> {
+    answer_stdio_boot_failure_io(std::io::stdin().lock(), &mut std::io::stdout(), message)
+}
+
+fn answer_stdio_boot_failure_io(
+    input: impl std::io::BufRead,
+    out: &mut impl Write,
+    message: impl Into<String>,
+) -> Result<(), StdoutWriteError> {
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id = match serde_json::from_str::<Value>(line) {
+            Ok(value) => match value.get("id") {
+                Some(id) if !id.is_null() => id.clone(),
+                // A notification expects no reply.
+                _ => continue,
+            },
+            Err(_) => Value::Null,
+        };
+        let frame = error(id, error_code::INTERNAL_ERROR, message);
+        let serialized = serde_json::to_string(&frame).expect("JSON-RPC error is valid JSON");
+        return write_stdout_frame(out, &serialized);
+    }
+    Ok(())
+}
+
 fn abort_stdio_before_session(error: anyhow::Error) -> anyhow::Error {
     let _ = write_stdio_boot_error(format!("{error:#}"));
     error
@@ -1425,6 +1465,39 @@ mod tests {
                 .unwrap()
                 .contains("write-ahead")
         );
+    }
+
+    /// nw-656: the first REQUEST is answered with its own id; a preceding
+    /// notification is not answered, and nothing follows the one reply.
+    #[test]
+    fn boot_failure_answers_the_first_request_by_id() {
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/list\"}\n",
+        );
+        let mut buf = Vec::new();
+        answer_stdio_boot_failure_io(input.as_bytes(), &mut buf, "loading --config bad.toml")
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let frame: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(frame["id"], 7);
+        assert_eq!(frame["error"]["code"], -32603);
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bad.toml")
+        );
+    }
+
+    /// Counterweight: a client that sends nothing gets nothing on stdout.
+    #[test]
+    fn boot_failure_with_no_request_writes_nothing() {
+        let mut buf = Vec::new();
+        answer_stdio_boot_failure_io("".as_bytes(), &mut buf, "boom").unwrap();
+        assert!(buf.is_empty());
     }
 }
 #[test]
