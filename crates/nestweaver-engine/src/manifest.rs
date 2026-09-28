@@ -280,8 +280,118 @@ pub fn manifest_debt_revision(db_path: &Path) -> anyhow::Result<Option<Vec<u8>>>
     }
 }
 
+/// nw-705: one repository the daemon's manifest rebuild refused — a policy
+/// recorded under other settings, a missing root, a malformed manifest, or an
+/// overrun of the shared capture budget. The rebuild keeps every other
+/// repository current and records these in `<db>.manifest-failures.json`, so
+/// `brain status` and `suggest-links` can name each one with its remedy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRepoFailure {
+    pub repo_uid: String,
+    pub repo_url: String,
+    /// The recorded working-tree root, when the repo has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    pub reason: String,
+    pub remedy: String,
+}
+
+impl ManifestRepoFailure {
+    pub fn new(repo: &nestweaver_schema::Repo, reason: String) -> Self {
+        let root = repo.local_root().map(str::to_string);
+        let target = root.clone().unwrap_or_else(|| repo.url.clone());
+        Self {
+            repo_uid: repo.uid.clone(),
+            repo_url: repo.url.clone(),
+            root,
+            reason,
+            remedy: format!("nestweaver index --repo {target}"),
+        }
+    }
+
+    /// One human line: which repo, why, and what to run.
+    pub fn text(&self) -> String {
+        format!(
+            "{} ({}): {}; remedy: `{}`",
+            self.repo_uid,
+            self.root.as_deref().unwrap_or(&self.repo_url),
+            self.reason,
+            self.remedy
+        )
+    }
+}
+
+pub fn manifest_failures_path(db_path: &Path) -> PathBuf {
+    crate::sidecar_path(db_path, ".manifest-failures.json")
+}
+
+/// Record the repositories the last rebuild refused; an empty list removes
+/// the record.
+pub fn save_manifest_failures(
+    db_path: &Path,
+    failures: &[ManifestRepoFailure],
+) -> anyhow::Result<()> {
+    let path = manifest_failures_path(db_path);
+    if failures.is_empty() {
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)?;
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "failures": failures }))?;
+    atomic_replace_file(&path, |file| file.write_all(&bytes))
+}
+
+/// The repositories the last manifest rebuild refused. A missing record is
+/// none; an unreadable one is reported as a failure of its own so it is never
+/// read as "every repo is current".
+pub fn load_manifest_failures(db_path: &Path) -> Vec<ManifestRepoFailure> {
+    let path = manifest_failures_path(db_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return vec![unreadable_failures_record(&path, e.to_string())],
+    };
+    #[derive(Deserialize)]
+    struct Record {
+        failures: Vec<ManifestRepoFailure>,
+    }
+    match serde_json::from_slice::<Record>(&bytes) {
+        Ok(record) => record.failures,
+        Err(e) => vec![unreadable_failures_record(&path, e.to_string())],
+    }
+}
+
+fn unreadable_failures_record(path: &Path, error: String) -> ManifestRepoFailure {
+    ManifestRepoFailure {
+        repo_uid: "(unknown)".to_string(),
+        repo_url: String::new(),
+        root: None,
+        reason: format!("{} is unreadable: {error}", path.display()),
+        remedy: "restart the daemon to rebuild the manifest sidecar".to_string(),
+    }
+}
+
+/// The failures as JSON rows for status and suggestion responses.
+pub fn manifest_failures_json(db_path: &Path) -> serde_json::Value {
+    serde_json::to_value(load_manifest_failures(db_path)).unwrap_or_default()
+}
+
+/// One sentence naming every refused repository, for a status or error line.
+pub fn describe_manifest_failures(failures: &[ManifestRepoFailure]) -> String {
+    let rows: Vec<String> = failures.iter().map(ManifestRepoFailure::text).collect();
+    format!(
+        "manifests are not current for {} repo(s): {}",
+        failures.len(),
+        rows.join("; ")
+    )
+}
+
 /// This loader is for current suggestions: absence is only empty when the
 /// authoritative repository inventory is empty. Errors retain typed causes.
+///
+/// nw-705: a repository the last rebuild refused (see
+/// [`ManifestRepoFailure`]) is absent from the snapshot by design; it does
+/// not make the other repositories' manifests unavailable. Callers disclose
+/// it through [`load_manifest_failures`].
 pub fn current_manifest_snapshot(
     store: &nestweaver_store::GraphStore,
     db_path: &Path,
@@ -383,7 +493,17 @@ pub fn current_manifest_snapshot(
             "source changes await complete manifest derivation".into(),
         ));
     }
-    if repos.len() != manifests.len() || repos.iter().any(|r| !manifests.contains_key(&r.uid)) {
+    let refused: std::collections::HashSet<String> = load_manifest_failures(db_path)
+        .into_iter()
+        .map(|failure| failure.repo_uid)
+        .collect();
+    if manifests
+        .keys()
+        .any(|uid| !repos.iter().any(|r| &r.uid == uid))
+        || repos
+            .iter()
+            .any(|r| !manifests.contains_key(&r.uid) && !refused.contains(&r.uid))
+    {
         return Err(failure(
             IncompleteCoverage,
             "manifest snapshot does not cover the live repository inventory".into(),
@@ -560,10 +680,23 @@ pub fn load_manifests_for_dead_code(
     db_path: &Path,
 ) -> DeadCodeManifests {
     match current_manifest_snapshot(store, db_path) {
-        Ok(manifests) => DeadCodeManifests {
-            manifests,
-            load_error: None,
-        },
+        Ok(manifests) => {
+            // nw-705: a refused repository has no current manifest, so its
+            // entry files did not seed the walk either.
+            let failures = load_manifest_failures(db_path);
+            let load_error = (!failures.is_empty()).then(|| {
+                format!(
+                    "{}; manifest-declared entry files of those repos did NOT seed the \
+                     reachability walk, so code reachable only from their package entry \
+                     points may appear unreachable.",
+                    describe_manifest_failures(&failures)
+                )
+            });
+            DeadCodeManifests {
+                manifests,
+                load_error,
+            }
+        }
         Err(error) => DeadCodeManifests {
             manifests: HashMap::new(),
             load_error: Some(format!(
@@ -2861,6 +2994,60 @@ mod release_manifest_tests {
         assert_eq!(error.reason, ManifestUnavailableReason::StaleGeneration);
         assert_eq!(error.expected_generation, store.graph_generation());
         assert_eq!(std::fs::read(manifest_cache_path(&db)).unwrap(), before);
+    }
+
+    /// nw-705: a repo the rebuild refused is excused from coverage, and ONLY
+    /// that repo: another repo missing from the snapshot still makes it
+    /// incomplete. Dead-code discloses the refused repo by name.
+    #[test]
+    fn a_refused_repo_is_excused_from_coverage_and_disclosed_but_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let mut repos = Vec::new();
+        for uid in ["repo:a", "repo:b", "repo:c"] {
+            let repo = nestweaver_schema::Repo {
+                uid: uid.into(),
+                url: format!("file:///fixture/{uid}"),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "fixture".into(),
+                name: None,
+                root_path: None,
+            };
+            store.insert_repo(&repo).unwrap();
+            repos.push(repo);
+        }
+        let map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&map, &store, &db).unwrap();
+        let refuse = |which: &[usize]| {
+            let failures: Vec<_> = which
+                .iter()
+                .map(|&i| ManifestRepoFailure::new(&repos[i], "malformed package.json".into()))
+                .collect();
+            save_manifest_failures(&db, &failures).unwrap();
+        };
+
+        // b refused, c simply missing: still incomplete.
+        refuse(&[1]);
+        assert_eq!(
+            current_manifest_snapshot(&store, &db).unwrap_err().reason,
+            ManifestUnavailableReason::IncompleteCoverage
+        );
+        // Both refused: a is served, b and c are disclosed with a remedy.
+        refuse(&[1, 2]);
+        assert_eq!(current_manifest_snapshot(&store, &db).unwrap().len(), 1);
+        let dead_code = load_manifests_for_dead_code(&store, &db);
+        let disclosure = dead_code.disclosure().unwrap();
+        assert!(
+            disclosure.contains("repo:b")
+                && disclosure.contains("repo:c")
+                && disclosure.contains("nestweaver index --repo /fixture/repo:b"),
+            "{disclosure}"
+        );
+        // Nothing refused: no record, no disclosure.
+        refuse(&[]);
+        assert!(!manifest_failures_path(&db).exists());
     }
 
     #[test]

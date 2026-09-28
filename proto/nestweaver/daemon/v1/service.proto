@@ -604,6 +604,21 @@ message BrainStatusResponse {
   // daemon; a live daemon always sets it, `pending: false` when nothing is
   // owed.
   CodeLinksStatus code_links = 23;
+  // nw-705: repositories the daemon's manifest rebuild refused (a policy
+  // recorded under other settings, a missing root, a malformed manifest, a
+  // budget overrun). Every other repository's manifests are current. Empty
+  // when none is refused.
+  repeated ManifestRepoFailure manifest_failures = 24;
+}
+
+message ManifestRepoFailure {
+  string repo_uid = 1;
+  string repo_url = 2;
+  // The recorded working-tree root; empty for a server-mode bare clone.
+  string root = 3;
+  string reason = 4;
+  // The command that repairs it, e.g. `nestweaver index --repo <path>`.
+  string remedy = 5;
 }
 
 message CodeLinksStatus {

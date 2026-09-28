@@ -84,7 +84,12 @@ def wait_indexed_symbol(fixture, name):
 
 
 def malformed_source_recovery(fixture, port, root, dependency):
-    """Malformed source must never publish a successful empty manifest map."""
+    """Malformed source must never publish a successful empty manifest map.
+
+    nw-705: the refusal is per repo. The answer is a 200 built from the other
+    repos, the malformed repo is absent (so its dependency link is too) and is
+    named in `manifest_failures` with its reason and remedy.
+    """
     for name, malformed, restored in [
         ("go.mod", "this is not a Go module\n",
          'module (\n "example.com/app"\n)\nrequire example.com/dep master\n'),
@@ -98,8 +103,12 @@ def malformed_source_recovery(fixture, port, root, dependency):
         deadline = time.monotonic() + 40
         while True:
             status, payload = http(fixture, port, "/api/v1/suggest-links")
-            if status == 503 and payload.get("reason") == "source_unavailable":
-                assert "links" not in payload and "features" not in payload, payload
+            refused = [f for f in payload.get("manifest_failures", [])
+                       if Path(f.get("root") or "/").resolve() == root.resolve()]
+            if status == 200 and refused:
+                assert not dependency(payload), payload
+                assert name in refused[0]["reason"], payload
+                assert refused[0]["remedy"] == f"nestweaver index --repo {refused[0]['root']}", payload
                 break
             assert status in (200, 503), (status, payload)
             if time.monotonic() >= deadline:
@@ -110,7 +119,8 @@ def malformed_source_recovery(fixture, port, root, dependency):
         # No explicit index or force-refresh: source restoration is owned by
         # the watcher/coordinator and must recover the full two-repo map.
         current = wait_suggestions(fixture, port, dependency, timeout=70)
-        assert current["graph_generation"] >= payload["expected_generation"]
+        assert current["graph_generation"] >= payload["graph_generation"]
+        assert not current.get("manifest_failures"), current
         fixture.record(kind="manifest_source_restoration", source=name, passed=True,
                        response=current)
         source.unlink()

@@ -4944,6 +4944,8 @@ fn format_daemon_status_response(
             {
                 lines.push(line);
             }
+            // nw-705: repositories the manifest rebuild refused, by name.
+            lines.extend(format_manifest_failures_status(&status.manifest_failures));
             // nw-585: indexed, but without their frontmatter -- not skipped.
             if let Some(skipped) = status.skipped_notes.as_ref()
                 && skipped.frontmatter_unparsed > 0
@@ -5088,6 +5090,37 @@ mod daemon_status_renderer_tests {
             ..owed
         };
         assert_eq!(format_code_links_status(&current), None);
+    }
+
+    /// nw-705: every repo the manifest rebuild refused is named on the
+    /// typed status, with its reason and remedy. Counterweight: none refused
+    /// prints nothing.
+    #[test]
+    fn refused_manifest_repos_render_on_typed_status() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            manifest_failures: vec![nestweaver_proto::ManifestRepoFailure {
+                repo_uid: "repo:beta".to_string(),
+                repo_url: "file:///src/beta".to_string(),
+                root: "/src/beta".to_string(),
+                reason: "repo:beta: package.json: invalid JSON".to_string(),
+                remedy: "nestweaver index --repo /src/beta".to_string(),
+            }],
+            ..Default::default()
+        };
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(
+            output.contains("Manifests not current for 1 repo(s)"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "repo:beta (/src/beta): repo:beta: package.json: invalid JSON; remedy: \
+                 `nestweaver index --repo /src/beta`"
+            ),
+            "{output}"
+        );
+        let healthy = format_daemon_status_response(Ok(&Default::default()));
+        assert!(!healthy.contains("Manifests not current"), "{healthy}");
     }
 
     #[test]
@@ -9950,6 +9983,60 @@ fn reconcile_code_links_direct(
             "code link reconciliation skipped — cannot open DB for writing; the links stay owed: {error:#}"
         ),
     }
+}
+
+/// nw-705: `suggest-links` text names the repositories whose manifests could
+/// not be rebuilt, since their package links are missing from the answer.
+fn print_manifest_failures_note(failures: &serde_json::Value) {
+    let Some(rows) = failures.as_array().filter(|rows| !rows.is_empty()) else {
+        return;
+    };
+    println!(
+        "# Note: manifests are not current for {} repo(s); their package links are not suggested:",
+        rows.len()
+    );
+    for row in rows {
+        let text = |key: &str| row.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+        let place = if text("root").is_empty() {
+            text("repo_url")
+        } else {
+            text("root")
+        };
+        println!(
+            "#   {} ({place}): {}; remedy: `{}`",
+            text("repo_uid"),
+            text("reason"),
+            text("remedy")
+        );
+    }
+    println!();
+}
+
+/// nw-705: the `brain status` lines for repositories the manifest rebuild
+/// refused, shared by the typed (daemon) and JSON (direct) renderers. Empty
+/// when every repository's manifests are current.
+fn format_manifest_failures_status(
+    failures: &[nestweaver_proto::ManifestRepoFailure],
+) -> Vec<String> {
+    if failures.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Manifests not current for {} repo(s) (every other repo's are):",
+        failures.len()
+    )];
+    for failure in failures {
+        let place = if failure.root.is_empty() {
+            &failure.repo_url
+        } else {
+            &failure.root
+        };
+        lines.push(format!(
+            "  - {} ({place}): {}; remedy: `{}`",
+            failure.repo_uid, failure.reason, failure.remedy
+        ));
+    }
+    lines
 }
 
 /// nw-670 review M3: the one `brain status` line for owed note->code links,
@@ -16796,6 +16883,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
+                        print_manifest_failures_note(&value["manifest_failures"]);
                         let links = value["links"].as_array();
                         let features = value["features"].as_array();
                         let links_empty = links.is_none_or(|l| l.is_empty());
@@ -16881,21 +16969,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let manifests =
                 nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
+            let manifest_failures = nestweaver_engine::manifest::load_manifest_failures(&db_path);
 
             if json {
                 #[derive(serde::Serialize)]
                 struct SuggestJson<'a> {
                     links: &'a [nestweaver_engine::SuggestedLink],
                     features: &'a [nestweaver_engine::SuggestedFeature],
+                    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+                    manifest_failures: &'a [nestweaver_engine::manifest::ManifestRepoFailure],
                 }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&SuggestJson {
                         links: &suggestions.links,
                         features: &suggestions.features,
+                        manifest_failures: &manifest_failures,
                     })?
                 );
             } else {
+                print_manifest_failures_note(&serde_json::to_value(&manifest_failures)?);
                 if suggestions.links.is_empty() && suggestions.features.is_empty() {
                     println!("No cross-repo connections detected.");
                     println!("Tip: Index multiple repos into the same database first.");

@@ -9346,6 +9346,11 @@ pub fn brain_status_json(
         nestweaver_engine::index_md::skipped_notes_status_json(db_path.as_deref());
     // nw-670 review M3: owed note->code links, in their own object.
     let code_links = nestweaver_engine::code_links::code_links_status_json(db_path.as_deref());
+    // nw-705: repositories the manifest rebuild refused, each with its remedy.
+    let manifest_failures = db_path
+        .as_deref()
+        .map(nestweaver_engine::manifest::manifest_failures_json)
+        .unwrap_or_else(|| json!([]));
 
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
@@ -9373,6 +9378,7 @@ pub fn brain_status_json(
         "counts_complete": counts_complete,
         "repos": repos_json,
         "repo_count": repos.len(),
+        "manifest_failures": manifest_failures,
         "server_mode": is_server_mode(),
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,

@@ -160,6 +160,34 @@ fn path_reason_notes(value: &serde_json::Value, key: &str) -> Vec<PendingReconci
         .unwrap_or_default()
 }
 
+/// nw-705: map `brain_status`'s `manifest_failures` rows onto the typed
+/// status RPC. Empty when the payload has none.
+pub fn manifest_failures_from_status_json(value: &serde_json::Value) -> Vec<ManifestRepoFailure> {
+    value
+        .get("manifest_failures")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let text = |key: &str| {
+                        row.get(key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    ManifestRepoFailure {
+                        repo_uid: text("repo_uid"),
+                        repo_url: text("repo_url"),
+                        root: text("root"),
+                        reason: text("reason"),
+                        remedy: text("remedy"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// nw-670 review M3: map `brain_status`'s `code_links` object onto the typed
 /// status RPC. `None` when the payload has none (an older producer).
 pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLinksStatus> {
