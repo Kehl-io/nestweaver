@@ -12846,3 +12846,66 @@ fn mcp_invalid_config_answers_initialize_with_a_jsonrpc_error() {
         "{frame}"
     );
 }
+
+/// nw-196, direct route: the same `--json` rows and `--fail-on-skip` rule as
+/// the daemon route, built from the engine's skip rows.
+#[test]
+fn brain_refresh_json_and_fail_on_skip_on_the_direct_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("note.md"), "# Note\nkept\n").unwrap();
+    std::fs::write(vault.join(".brainignore"), "secret.md\n").unwrap();
+    std::fs::write(vault.join("secret.md"), "# Secret\nexcluded on purpose\n").unwrap();
+    std::fs::write(
+        vault.join("big.md"),
+        format!("# Big\n{}\n", "x".repeat(1024 * 1024 + 16)),
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let refresh = |extra: &[&str]| {
+        nestweaver_cmd()
+            .args(["brain", "refresh"])
+            .arg(&vault)
+            .arg("--db")
+            .arg(&db_path)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = refresh(&["--json", "--fail-on-skip"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be one JSON document ({e}): {output:?}"));
+    let rows = payload["skipped_files"].as_array().unwrap();
+    let flag = |name: &str| {
+        rows.iter()
+            .find(|row| row["path"].as_str().is_some_and(|p| p.ends_with(name)))
+            .map(|row| row["excluded_by_request"].clone())
+            .unwrap_or_else(|| panic!("no skip row for {name}: {payload}"))
+    };
+    assert_eq!(flag("secret.md"), true);
+    assert_eq!(flag("big.md"), false);
+
+    std::fs::remove_file(vault.join("big.md")).unwrap();
+    let output = refresh(&["--fail-on-skip"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

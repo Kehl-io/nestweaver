@@ -8312,6 +8312,17 @@ enum BrainCommands {
         since: Option<String>,
         #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
         ignore: Option<String>,
+        /// Emit one machine-readable result on stdout: `skipped_files[]`, each
+        /// row with `excluded_by_request` (true for a `.brainignore` match).
+        /// Progress stays on stderr.
+        #[arg(long)]
+        json: bool,
+        /// Exit 1 when a note was skipped for any reason OTHER than an
+        /// exclusion you requested (unreadable, unparsable, oversized, ...),
+        /// as `index --fail-on-skip` does. `.brainignore` exclusions never
+        /// fail the run. The refresh still completes and commits either way.
+        #[arg(long)]
+        fail_on_skip: bool,
     },
     /// Remove a vault from the brain. Drops the Vault node and
     /// cascade-deletes every Note/Heading/Section/edge belonging to it.

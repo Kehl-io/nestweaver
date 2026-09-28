@@ -7449,3 +7449,81 @@ fn context_missing_seed_via_daemon_reports_only_the_root_cause() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("Internal error"), "stderr: {stderr}");
 }
+
+/// nw-196: `brain refresh --json` itemises skipped notes with a per-row
+/// `excluded_by_request`, and `--fail-on-skip` fails only on a row that was
+/// NOT requested. `.brainignore` exclusions never fail the run.
+#[test]
+fn brain_refresh_json_and_fail_on_skip_honor_requested_exclusions_via_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db_path = dir.path().join("refresh").join("brain.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_vault(&vault);
+    std::fs::write(vault.join(".brainignore"), "secret.md\n").unwrap();
+    std::fs::write(vault.join("secret.md"), "# Secret\nexcluded on purpose\n").unwrap();
+    std::fs::write(
+        vault.join("big.md"),
+        format!("# Big\n{}\n", "x".repeat(1024 * 1024 + 16)),
+    )
+    .unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let refresh = |extra: &[&str]| {
+        daemon_cmd()
+            .args(["brain", "refresh"])
+            .arg(&vault)
+            .arg("--db")
+            .arg(&db_path)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = refresh(&["--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be one JSON document ({e}): {output:?}"));
+    let rows = payload["skipped_files"].as_array().unwrap();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|row| row["path"].as_str().is_some_and(|p| p.ends_with(name)))
+            .unwrap_or_else(|| panic!("no skip row for {name}: {payload}"))
+    };
+    assert_eq!(row("secret.md")["excluded_by_request"], true, "{payload}");
+    assert_eq!(row("big.md")["excluded_by_request"], false, "{payload}");
+    assert_eq!(payload["coverage_status"], "degraded", "{payload}");
+
+    let output = refresh(&["--fail-on-skip"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unrequested skip must fail the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Counterweight: with only the requested exclusion left, the flag passes.
+    std::fs::remove_file(vault.join("big.md")).unwrap();
+    let output = refresh(&["--fail-on-skip", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a .brainignore exclusion must never fail the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "complete", "{payload}");
+    assert_eq!(payload["excluded_by_request_count"], 1, "{payload}");
+}
