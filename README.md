@@ -644,8 +644,9 @@ nestweaver investigate "where does the upload pipeline start"
 you already know.** This is the one distinction worth learning up front.
 `context` and `brain context` RESOLVE their argument to seed nodes — as a UID,
 note title, tag, or symbol name — and a multi-word question resolves to none of
-those, so they exit 1 with `No seeds resolved` even on a fully embedded graph
-with a daemon running. `investigate` is the natural-language entry point: when
+those, so they exit 2 with `No seeds resolved` even on a fully embedded graph
+with a daemon running (under `--json`, the not-found envelope's `message`
+carries that text, including the `investigate` command to run instead). `investigate` is the natural-language entry point: when
 seed resolution finds nothing it falls back to BM25 over the corpus, so a
 question still returns an answer.
 

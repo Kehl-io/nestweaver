@@ -703,7 +703,7 @@ pub fn generate_skill_with_tools(
 
     // ── Vocabulary ───────────────────────────────────────────────────────
     out.push_str("## Key concepts\n\n");
-    out.push_str("- **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), free-text terms, or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`).\n");
+    out.push_str("- **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`). Seeds are names, not questions: a natural-language question resolves to no seed (exit 2, `No seeds resolved`); use `investigate` for a question.\n");
     out.push_str("- **PPR (Personalized PageRank)**: The ranking algorithm. Walks the code+notes graph from seeds and scores every reachable node by structural proximity. Higher rank = closer relationship to the seeds.\n");
     out.push_str("- **Context**: A token-budgeted, PPR-ranked list of symbols, notes, and sections relevant to given seeds. The primary retrieval primitive.\n");
     out.push_str(

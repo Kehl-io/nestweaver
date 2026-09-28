@@ -788,7 +788,10 @@ fn all_tool_schemas() -> Vec<Value> {
             let Some(property) = property.as_object_mut() else {
                 continue;
             };
-            let kind = property.get("type").and_then(Value::as_str).map(str::to_owned);
+            let kind = property
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let kind = kind.as_deref();
             if kind == Some("string") && NONEMPTY_STRING_PARAMS.contains(&key.as_str()) {
                 property.entry("minLength").or_insert(json!(1));
@@ -5785,7 +5788,7 @@ fn tool_schema_brain_context() -> Value {
                     // `uids_or_fqns` already declare this; the fix here is
                     // the same declaration, not new code.
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, free-text terms, or UIDs (sym:/note:/head:/sec:/tag:)."
+                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, or UIDs (sym:/note:/head:/sec:/tag:). Seeds are NAMES, not questions: a natural-language question resolves to no seed and returns the not_found envelope, whose message names the `investigate` call to make instead. Use the `investigate` tool for a question."
                 },
                 "limit": {
                     "type": "integer", "minimum": 1, "maximum": 1000,

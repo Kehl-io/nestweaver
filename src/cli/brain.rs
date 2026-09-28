@@ -2500,18 +2500,7 @@ pub(crate) fn run_brain(
                             .chain()
                             .any(|cause| cause.to_string().contains("No seeds resolved")) =>
                     {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "error": "not found", "seeds_expanded": 0,
-                                    "connected": [], "unresolved_seeds": seeds,
-                                }))?
-                            );
-                        } else {
-                            eprintln!("{error}");
-                        }
-                        return Ok((EXIT_NOT_FOUND, None));
+                        return Ok((report_brain_context_not_found(&error, json, &seeds)?, None));
                     }
                     other => other?,
                 };
@@ -2882,20 +2871,7 @@ pub(crate) fn run_brain(
                     if msg.contains("Ambiguous") {
                         Ok((report_context_lookup_failure(&e, json, &seeds), None))
                     } else if msg.contains("No seeds resolved") {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "error": "not found",
-                                    "seeds_expanded": 0,
-                                    "connected": [],
-                                    "unresolved_seeds": seeds,
-                                }))?
-                            );
-                        } else {
-                            eprintln!("{msg}");
-                        }
-                        Ok((EXIT_NOT_FOUND, None))
+                        Ok((report_brain_context_not_found(&e, json, &seeds)?, None))
                     } else {
                         eprintln!("Error: {msg}");
                         Ok((EXIT_ERROR, None))
@@ -3616,5 +3592,96 @@ mod vault_derivation_status_tests {
         });
         assert!(vault_derivation_status_lines(&status).is_empty());
         assert!(vault_derivation_status_lines(&serde_json::json!({})).is_empty());
+    }
+}
+
+/// nw-511. `brain context`'s not-found report, shared by the daemon and
+/// direct routes. The engine's message is the useful part: it says the
+/// command resolves a NAME and gives the `nestweaver investigate '<query>'`
+/// command to run for a natural-language question. Both `--json` envelopes
+/// used to drop it, and the daemon's text route printed the RPC wrapper's
+/// top line. Now both routes report the ROOT cause, in `message` on stdout
+/// under `--json` (the same key `context` uses) and as the text on stderr.
+pub(crate) fn report_brain_context_not_found(
+    error: &anyhow::Error,
+    json: bool,
+    seeds: &[String],
+) -> anyhow::Result<i32> {
+    let message = brain_context_not_found_message(error);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&brain_context_not_found_payload(&message, seeds))?
+        );
+    } else {
+        eprintln!("{message}");
+    }
+    Ok(EXIT_NOT_FOUND)
+}
+
+/// The engine's "No seeds resolved." sentence from anywhere in the chain,
+/// without the transport's wrapper around it.
+pub(crate) fn brain_context_not_found_message(error: &anyhow::Error) -> String {
+    let rendered: Vec<String> = error.chain().map(ToString::to_string).collect();
+    rendered
+        .iter()
+        .find_map(|cause| {
+            cause
+                .find("No seeds resolved.")
+                .map(|start| cause[start..].to_string())
+        })
+        .unwrap_or_else(|| format!("{error:#}"))
+}
+
+pub(crate) fn brain_context_not_found_payload(
+    message: &str,
+    seeds: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "not found",
+        "status": "not_found",
+        "message": message,
+        "seeds_expanded": 0,
+        "connected": [],
+        "unresolved_seeds": seeds,
+    })
+}
+
+#[cfg(test)]
+mod brain_context_not_found_tests {
+    use super::*;
+
+    const ENGINE: &str = "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol names. This command resolves a NAME (UID, note title, tag, or symbol name) — for a natural-language question, run `nestweaver investigate 'how does auth work'` instead, which falls back to full-text search. Unresolved: [\"how does auth work\"]";
+
+    /// nw-511: the `--json` envelope carries the engine's investigate hint,
+    /// and a daemon wrapper around it is stripped (the text route used to
+    /// print only the wrapper's top line).
+    #[test]
+    fn the_not_found_envelope_carries_the_investigate_hint() {
+        let seeds = vec!["how does auth work".to_string()];
+        let wrapped = anyhow::anyhow!("tool brain_context failed: {ENGINE}")
+            .context("brain_context RPC failed");
+        let message = brain_context_not_found_message(&wrapped);
+        assert_eq!(message, ENGINE);
+        let payload = brain_context_not_found_payload(&message, &seeds);
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("nestweaver investigate 'how does auth work'"),
+            "{payload}"
+        );
+        assert_eq!(payload["status"], "not_found");
+        assert_eq!(payload["error"], "not found");
+        assert_eq!(payload["unresolved_seeds"], serde_json::json!(seeds));
+    }
+
+    /// COUNTERWEIGHT: the direct route's bare engine error is used as is.
+    #[test]
+    fn a_bare_engine_error_is_reported_verbatim() {
+        assert_eq!(
+            brain_context_not_found_message(&anyhow::anyhow!(ENGINE)),
+            ENGINE
+        );
     }
 }

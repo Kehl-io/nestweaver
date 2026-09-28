@@ -6921,6 +6921,11 @@ enum Commands {
     /// architectural domains, inlines a few high-confidence bodies, and persists a
     /// bundle (24h TTL). Drill in afterwards with `investigate-expand` /
     /// `investigate-hydrate`.
+    ///
+    /// This is the entry point for a natural-language QUESTION. `context` and
+    /// `brain context` resolve a NAME (symbol, note title, tag or UID) and
+    /// exit 2 when a question resolves to nothing; `investigate` falls back
+    /// to full-text search instead.
     #[command(
         after_help = "Examples:\n  nestweaver investigate \"device pairing\"\n  nestweaver investigate \"how indexing works\" --scope repo:nestweaver --token-budget 8000 --json"
     )]
@@ -8398,8 +8403,13 @@ enum BrainCommands {
     /// tag names (with or without #), symbol names, or any UID
     /// (sym:/note:/head:/sec:/tag:/repo:/vlt:). A vlt: or repo: UID expands
     /// to its member notes/symbols; the most central few stay seeds.
+    ///
+    /// Seeds are NAMES, not questions: a natural-language question resolves
+    /// to no seed and exits 2 (`No seeds resolved`, with the `investigate`
+    /// command to run instead). Use `nestweaver investigate "<question>"`.
     Context {
-        /// Seed strings to anchor the PPR walk.
+        /// Seed NAMES to anchor the PPR walk (note title, tag, symbol name or
+        /// UID). For a question, use `nestweaver investigate` instead.
         #[arg(required = true)]
         seeds: Vec<String>,
         /// Approximate token cap for the output (characters / 4). When set,
