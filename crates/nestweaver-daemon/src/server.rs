@@ -23736,6 +23736,73 @@ repos = ["alpha"]
         assert_eq!(state.manifest_recovery.status().state, "stopped");
     }
 
+    /// nw-680: outstanding manifest debt is paid even when a repo's recorded
+    /// eligibility is from the SUPERSEDED fingerprint version (a repo indexed
+    /// before nw-652's v2 bump and not re-indexed since). Demanding the
+    /// current version failed the capture for every repo, so the sidecar
+    /// stayed at its old generation and the debt stayed outstanding.
+    #[tokio::test]
+    async fn manifest_debt_is_paid_over_a_repo_with_a_superseded_eligibility_policy() {
+        use nestweaver_engine::content_reader::ContentReader;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let beta = state.db_path.parent().unwrap().join("beta");
+        let superseded = nestweaver_engine::content_reader::FilesystemReader::new(&beta)
+            .superseded_eligibility_fingerprints();
+        state
+            .store
+            .set_repo_index_policy("repo:beta", &superseded[0])
+            .unwrap();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "repository index",
+        )
+        .unwrap();
+
+        let task = tokio::spawn(super::manifest_recovery::run(Arc::clone(&state)));
+        state.manifest_recovery.wake.notify_one();
+        let paid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
+                .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let status = state.manifest_recovery.status();
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        state.shutdown_tx.send_replace(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(paid.is_ok(), "manifest debt was never paid: {status:?}");
+        assert!(
+            nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                .unwrap()
+                .is_none(),
+            "the debt must be cleared"
+        );
+
+        // Counterweight: a policy that differs in its configured parameters
+        // still refuses the capture.
+        state
+            .store
+            .set_repo_index_policy("repo:beta", "a-different-policy")
+            .unwrap();
+        let error = match super::manifest_recovery::capture(
+            &state,
+            Instant::now() + Duration::from_secs(60),
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a differing policy was accepted"),
+        };
+        assert!(error.contains("repo:beta"), "{error}");
+    }
+
     #[tokio::test]
     async fn release_manifest_recovery_rejects_changed_inputs_and_corrupt_predecessor() {
         use nestweaver_engine::manifest;

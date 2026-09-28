@@ -7592,3 +7592,44 @@ fn configless_instance_vault_survives_a_daemon_restart_and_refresh_heals_a_defau
         serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
     assert_eq!(envelope["data_instance_id"], "nw693", "{envelope}");
 }
+
+/// nw-700 (7) / nw-680: while the manifest sidecar is owed, the RUNNING daemon
+/// answers `suggest-links` with "not ready". The CLI read that answer as the
+/// daemon being down and told the user to start a daemon that was running.
+#[test]
+fn suggest_links_with_owed_manifests_does_not_advise_starting_a_running_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("sl").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[
+            ("main.js", "function greet(name) { return name; }\n"),
+            ("package.json", "{\"name\":\"nw680\"}\n"),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+    // A malformed manifest keeps the daemon's rebuild from paying the debt.
+    std::fs::write(repo_dir.join("package.json"), "{").unwrap();
+    nestweaver_engine::manifest::mark_manifest_reconciliation_pending(&db_path, "nw680 fixture")
+        .unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let output = daemon_cmd()
+        .args(["suggest-links", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("manifest suggestions are not available yet"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("daemon unavailable") && !stderr.contains(" start`"),
+        "must not advise starting a running daemon: {stderr}"
+    );
+}

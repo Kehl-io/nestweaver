@@ -38,6 +38,58 @@ pub(crate) fn daemon_application_error(error: &anyhow::Error) -> Option<String> 
     (!message.is_empty()).then(|| message.to_string())
 }
 
+/// A running daemon's "manifest suggestions are not ready" answer, rendered
+/// for the operator, or `None` for any other failure.
+///
+/// nw-700 (7) / nw-680: `suggest_links` answers a stale or owed manifest with
+/// gRPC `Unavailable` and a JSON body (`error`, `rebuild`). `Unavailable` is
+/// otherwise the transport's "I cannot serve this" code, so the CLI read the
+/// daemon's ANSWER as the daemon being down and told the user to start a
+/// daemon that was already running. The body is recognized by its manifest
+/// error code, never by prose, and the remedy is the recovery runtime's own.
+pub(crate) fn manifest_unavailable_answer(error: &anyhow::Error) -> Option<String> {
+    let status = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .filter(|status| status.code() == tonic::Code::Unavailable)
+    })?;
+    let body: serde_json::Value = serde_json::from_str(status.message()).ok()?;
+    let problem = body.get("error")?;
+    let code = problem.get("code")?.as_str()?;
+    if !matches!(
+        code,
+        "manifest_unavailable" | "manifest_temporarily_unavailable"
+    ) {
+        return None;
+    }
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let rebuild = body.get("rebuild");
+    let state = rebuild
+        .map(|rebuild| text(rebuild, "state"))
+        .filter(|state| !state.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let rebuild_error = rebuild
+        .and_then(|rebuild| rebuild.get("error"))
+        .map(|error| text(error, "message"))
+        .filter(|message| !message.is_empty());
+    let mut message = format!(
+        "manifest suggestions are not available yet: {}. The running daemon rebuilds them \
+         itself (rebuild state: {state})",
+        text(problem, "message")
+    );
+    if let Some(rebuild_error) = rebuild_error {
+        message.push_str(&format!("; its last attempt failed: {rebuild_error}"));
+    }
+    message.push_str(". Retry once `nestweaver brain status` reports the manifest ready.");
+    Some(message)
+}
+
 /// Env knob for the client-side RPC ceiling, in seconds. `0` disables it.
 pub(crate) const RPC_TIMEOUT_ENV: &str = "NESTWEAVER_RPC_TIMEOUT_SECS";
 
@@ -335,6 +387,11 @@ pub(crate) fn try_hybrid_json_rpc_checked(
         }) {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
+                // nw-700 (7): an owed manifest is the daemon's ANSWER, sent as
+                // `Unavailable`; it must not read as the daemon being down.
+                if let Some(message) = manifest_unavailable_answer(&e) {
+                    return Err(anyhow::anyhow!(message));
+                }
                 // nw-170: the daemon answered — "no note found with title
                 // 'Home'" is a valid answer, not a daemon failure. There is
                 // nothing to fall back FROM, so surface it as-is instead of

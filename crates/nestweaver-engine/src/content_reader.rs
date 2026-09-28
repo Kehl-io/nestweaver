@@ -82,6 +82,18 @@ pub trait ContentReader: Send + Sync {
         "reader-default-v1".to_string()
     }
 
+    /// This reader's eligibility fingerprint under each SUPERSEDED algorithm
+    /// version, with the same configured parameters (nw-680).
+    ///
+    /// The index path must not consult this: a version bump is exactly what
+    /// makes the next incremental run fall back to a full index. It exists for
+    /// the daemon's manifest reconciliation, which demanded the CURRENT
+    /// fingerprint of every repo, so after nw-652's v2 bump one repo not yet
+    /// re-indexed kept the whole manifest sidecar from ever being rebuilt.
+    fn superseded_eligibility_fingerprints(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Apply configured eligibility to a single changed or deleted relative path.
     /// Readers without additional exclusions retain their existing policy.
     fn accepts_path(&self, _rel: &Path) -> bool {
@@ -929,6 +941,19 @@ impl ContentReader for FilesystemReader {
             "version": 2, "excludes": excludes, "unskip": unskip,
             "skip_dirs": self.skip_dirs, "max_source_file_bytes": self.limits.max_source_file_bytes(),
         }).to_string())
+    }
+
+    /// Version 1: the same payload before nw-652 (only the version differs).
+    fn superseded_eligibility_fingerprints(&self) -> Vec<String> {
+        let mut excludes = self.exclude_patterns.clone();
+        excludes.sort();
+        excludes.dedup();
+        let mut unskip: Vec<_> = self.unskip.iter().collect();
+        unskip.sort();
+        vec![crate::hash::blake3_hex(&serde_json::json!({
+            "version": 1, "excludes": excludes, "unskip": unskip,
+            "skip_dirs": self.skip_dirs, "max_source_file_bytes": self.limits.max_source_file_bytes(),
+        }).to_string())]
     }
 
     fn accepts_path(&self, rel: &Path) -> bool {
@@ -1837,6 +1862,16 @@ impl ContentReader for GitBareReader {
             })
             .to_string(),
         )
+    }
+
+    fn superseded_eligibility_fingerprints(&self) -> Vec<String> {
+        vec![crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v1",
+                "max_source_file_bytes": self.limits.max_source_file_bytes(),
+            })
+            .to_string(),
+        )]
     }
 
     fn read_file(&self, rel_path: &Path) -> Result<String> {
@@ -2978,6 +3013,12 @@ mod tests {
             .to_string(),
         );
         assert_ne!(reader.eligibility_fingerprint(), version_one);
+        // nw-680: the superseded list reproduces version 1 exactly, or the
+        // manifest reconciliation would still refuse every un-reindexed repo.
+        assert_eq!(
+            reader.superseded_eligibility_fingerprints(),
+            std::slice::from_ref(&version_one)
+        );
         // COUNTERWEIGHT: the rebuilt payload must be faithful, or the
         // inequality above holds for a reason unrelated to the version.
         let version_two = crate::hash::blake3_hex(
