@@ -441,7 +441,7 @@ fn dispatch_method_daemon_cancellable(
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_failure(&e))),
+                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_failure(&name, &e))),
                 Err(_) => Frame::Success(success(
                     id,
                     tools::wrap_tool_error(&format!("tool '{name}' panicked")),
@@ -727,7 +727,7 @@ fn dispatch_method_cancellable(
                     // isError=true — not as JSON-RPC errors — so the client
                     // can surface them to Claude rather than aborting the
                     // call sequence.
-                    Frame::Success(success(id, tools::wrap_tool_failure(&e)))
+                    Frame::Success(success(id, tools::wrap_tool_failure(&name, &e)))
                 }
                 Err(_) => Frame::Success(success(
                     id,

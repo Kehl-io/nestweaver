@@ -5661,6 +5661,38 @@ pub fn not_found_envelope(error: &anyhow::Error) -> Option<Value> {
     None
 }
 
+/// Tools whose identifying argument is a repo selector (`repo`), so an
+/// unresolved selector is the tool's lookup miss rather than a filter error.
+const REPO_LOOKUP_TOOLS: &[&str] = &["brain_diff"];
+
+/// [`not_found_envelope`] plus the misses a tool reports through a shared
+/// typed error instead of [`ToolTargetNotFound`]: `brain_diff`'s unknown
+/// `repo` is a `RepoFilterUnresolved`, which the CLI classifies (exit 2) and
+/// the daemon stamps with its own code, so it is recognised here by tool
+/// rather than re-typed at the source. An AMBIGUOUS selector is not a miss
+/// and keeps its prose error.
+pub fn lookup_miss_envelope(tool: &str, error: &anyhow::Error) -> Option<Value> {
+    if let Some(envelope) = not_found_envelope(error) {
+        return Some(envelope);
+    }
+    if !REPO_LOOKUP_TOOLS.contains(&tool) {
+        return None;
+    }
+    let unresolved = error.chain().find_map(|cause| {
+        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+    })?;
+    let message = unresolved.to_string();
+    if message.to_ascii_lowercase().contains("ambiguous") {
+        return None;
+    }
+    Some(json!({
+        "status": "not_found",
+        "error": "not found",
+        "repo": unresolved.selector,
+        "message": message,
+    }))
+}
+
 /// Parse a not-found envelope out of gRPC status details, if that is what
 /// they hold.
 pub fn envelope_from_status_details(details: &[u8]) -> Option<Value> {
@@ -5683,8 +5715,8 @@ pub fn wrap_tool_not_found(envelope: Value) -> Value {
 
 /// Wrap a failed dispatch: a lookup miss becomes the not-found envelope,
 /// anything else the plain error text.
-pub fn wrap_tool_failure(error: &anyhow::Error) -> Value {
-    match not_found_envelope(error) {
+pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
+    match lookup_miss_envelope(tool, error) {
         Some(envelope) => wrap_tool_not_found(envelope),
         None => wrap_tool_error(&error.to_string()),
     }
@@ -28626,7 +28658,7 @@ mod lookup_not_found_contract_tests {
     fn mcp_result(store: &GraphStore, tool: &str, args: Value) -> Value {
         match dispatch(store, None, tool, args, None) {
             Ok(value) => wrap_tool_result(value),
-            Err(error) => wrap_tool_failure(&error),
+            Err(error) => wrap_tool_failure(tool, &error),
         }
     }
 
@@ -28680,6 +28712,7 @@ mod lookup_not_found_contract_tests {
                 json!({ "bundle_id": "missing-bundle" }),
                 "bundle_id",
             ),
+            ("brain_diff", json!({ "repo": "no-such-repo" }), "repo"),
         ];
         for (tool, args, key) in misses {
             let result = mcp_result(&store, tool, args.clone());
@@ -28786,9 +28819,18 @@ mod lookup_not_found_contract_tests {
             "tool flow_trace failed: no symbol found: 'x'",
             "the prose the CLI classifies must be unchanged"
         );
-        assert_eq!(wrap_tool_failure(&proxied)["structuredContent"], envelope);
+        assert_eq!(
+            wrap_tool_failure("flow_trace", &proxied)["structuredContent"],
+            envelope
+        );
         let hybrid = anyhow::Error::new(status).context("daemon call");
-        assert_eq!(wrap_tool_failure(&hybrid)["isError"], json!(true));
-        assert_eq!(wrap_tool_failure(&hybrid)["structuredContent"], envelope);
+        assert_eq!(
+            wrap_tool_failure("flow_trace", &hybrid)["isError"],
+            json!(true)
+        );
+        assert_eq!(
+            wrap_tool_failure("flow_trace", &hybrid)["structuredContent"],
+            envelope
+        );
     }
 }
