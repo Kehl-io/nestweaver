@@ -115,7 +115,7 @@ use nestweaver_engine::{
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    search_symbols, suggest_links,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -17652,6 +17652,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!();
                         }
                     }
+                    if let Some(note) = value
+                        .get("budget_exceeded_by_first_item")
+                        .and_then(|overrun| overrun.get("note"))
+                        .and_then(|note| note.as_str())
+                    {
+                        eprintln!("note: {note}");
+                    }
                     // `returned` first, `count` as the fallback: nw-321 made
                     // `returned` the canonical name and kept `count` as an
                     // alias "for one release", so reading only the alias is a
@@ -17800,14 +17807,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // exposed as an MCP tool where that is a context-window bomb. A
             // default budget bounds it; `--token-budget 0` still returns
             // everything.
+            //
+            // nw-644: the first summary is always returned, so a `--target`
+            // whose one hit overruns a small budget is no longer an empty
+            // success; the overrun is disclosed as
+            // `budget_exceeded_by_first_item`, as `read-symbols` does.
             let total = after_filter.len();
+            let mut first_item_overrun = None;
             let display: Vec<Summary> = if token_budget == 0 {
                 after_filter
             } else {
-                truncate_to_budget(&after_filter, token_budget)
-                    .into_iter()
-                    .cloned()
-                    .collect()
+                let budgeted = nestweaver_engine::truncate_to_budget_keeping_first(
+                    &after_filter,
+                    token_budget,
+                );
+                first_item_overrun = budgeted.budget_exceeded_by_first_item;
+                budgeted.kept.into_iter().cloned().collect()
             };
             // Truncation is either cause: the symbol cap upstream, or the
             // token budget here. Reporting only the second made the first
@@ -17855,6 +17870,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "truncated_by_budget": truncated_by_budget,
                     "truncated_by_cap": truncated_by_cap,
                 });
+                if let (Some(overrun), Some(obj)) = (&first_item_overrun, payload.as_object_mut()) {
+                    obj.insert(
+                        "budget_exceeded_by_first_item".into(),
+                        serde_json::to_value(overrun)?,
+                    );
+                }
                 // Both keys, always — but only on the level they describe.
                 if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
                     obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
@@ -17874,6 +17895,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // and nothing telling them the other 39,500 exist — the same
                 // silence nw-270 removed from the JSON, left in place on the
                 // route most people actually use.
+                if let Some(overrun) = &first_item_overrun {
+                    eprintln!("note: {}", overrun.note);
+                }
                 if truncated {
                     let shown = display.len();
                     let matched = total + cap_dropped;

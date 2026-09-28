@@ -685,6 +685,7 @@ pub use summaries::{
     DEFAULT_SYMBOL_SUMMARY_CAP, SUMMARY_DEFAULT_TOKEN_BUDGET, Summary, SummaryLevel, SummaryStore,
     SymbolSummaries, filter_by_target, generate_summaries, generate_symbol_summaries_bounded,
     load_summaries, merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
+    truncate_to_budget_keeping_first,
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{

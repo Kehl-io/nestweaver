@@ -23,7 +23,7 @@ use nestweaver_engine::{
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
     parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
-    tag_graph_all, topic_clusters, truncate_to_budget,
+    tag_graph_all, topic_clusters, truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
@@ -14240,11 +14240,13 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         )?;
         let matched_total = out.matched_total;
         let capped = out.capped;
+        // nw-644: the first summary is always returned, and an overrun is
+        // disclosed as `budget_exceeded_by_first_item`.
+        let mut first_item_overrun = None;
         let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
-            truncate_to_budget(&out.summaries, budget)
-                .into_iter()
-                .cloned()
-                .collect()
+            let budgeted = truncate_to_budget_keeping_first(&out.summaries, budget);
+            first_item_overrun = budgeted.budget_exceeded_by_first_item;
+            budgeted.kept.into_iter().cloned().collect()
         } else {
             out.summaries
         };
@@ -14284,7 +14286,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         } else {
             None
         };
-        return Ok(json!({
+        let mut resp = json!({
             "level": level_str,
             "target": target,
             // nw-321: `returned`/`total` is the one pair of count names, and
@@ -14315,7 +14317,9 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "note": note,
             "summaries": display,
             "summaries_text": render_text(&display),
-        }));
+        });
+        attach_first_item_overrun(&mut resp, first_item_overrun);
+        return Ok(resp);
     }
 
     // Try loading cached summaries from the sidecar first; only use the
@@ -14400,11 +14404,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // caller can see. `cap_dropped` is still added because those rows matched
     // and were dropped by the generator's cap, not by the caller's filter.
     let total_available = after_filter_len + cap_dropped;
+    // nw-644: see the symbol-level branch.
+    let mut first_item_overrun = None;
     let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
-        truncate_to_budget(&after_filter, budget)
-            .into_iter()
-            .cloned()
-            .collect()
+        let budgeted = truncate_to_budget_keeping_first(&after_filter, budget);
+        first_item_overrun = budgeted.budget_exceeded_by_first_item;
+        budgeted.kept.into_iter().cloned().collect()
     } else {
         after_filter
     };
@@ -14539,7 +14544,23 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     if level == SummaryLevel::Hub {
         attach_ranking_staleness(&mut resp, store);
     }
+    attach_first_item_overrun(&mut resp, first_item_overrun);
     Ok(resp)
+}
+
+/// nw-644: `budget_exceeded_by_first_item`, present only when the first
+/// summary alone overran `token_budget` and was returned anyway. The CLI's
+/// `summary --json` publishes the same key.
+fn attach_first_item_overrun(
+    resp: &mut Value,
+    overrun: Option<nestweaver_engine::read_symbols::BudgetOverrun>,
+) {
+    if let (Some(overrun), Some(obj)) = (overrun, resp.as_object_mut()) {
+        obj.insert(
+            "budget_exceeded_by_first_item".into(),
+            serde_json::to_value(overrun).unwrap_or(Value::Null),
+        );
+    }
 }
 
 /// Shallow check: does the directory contain any `.md` file in its tree?

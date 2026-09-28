@@ -12644,3 +12644,67 @@ fn brain_remove_with_an_unreadable_registration_sidecar_is_plain_not_found() {
         .code(2)
         .stdout(contains("No vault found"));
 }
+
+/// nw-644: `summary --target X --token-budget <small>` answered
+/// `total: 1, returned: 0, summaries: []` at exit 0. The sole hit is now
+/// returned and the overrun is disclosed.
+#[test]
+fn summary_target_over_a_tight_budget_returns_the_hit_and_flags_the_overrun() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        std::fs::write(
+            repo_dir.join(format!("{name}.js")),
+            format!("function {name}One(x) {{ return x; }}\nfunction {name}Two(y) {{ return {name}One(y); }}\n"),
+        )
+        .unwrap();
+    }
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let summary = |extra: &[&str]| -> serde_json::Value {
+        let output = nestweaver_cmd()
+            .args([
+                "summary",
+                "--level",
+                "file",
+                "--json",
+                "--token-budget",
+                "1",
+            ])
+            .args(extra)
+            .arg("--db")
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let targeted = summary(&["--target", "beta.js"]);
+    assert_eq!(targeted["total"], 1, "{targeted}");
+    assert_eq!(targeted["returned"], 1, "{targeted}");
+    assert_eq!(targeted["summaries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        targeted["budget_exceeded_by_first_item"]["requested_tokens"], 1,
+        "{targeted}"
+    );
+
+    // Counterweight: untargeted, the budget still cuts everything after the
+    // first item.
+    let untargeted = summary(&[]);
+    assert_eq!(untargeted["total"], 3, "{untargeted}");
+    assert_eq!(untargeted["returned"], 1, "{untargeted}");
+    assert_eq!(untargeted["truncated_by_budget"], true, "{untargeted}");
+}
