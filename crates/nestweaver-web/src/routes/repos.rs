@@ -212,21 +212,19 @@ mod tests {
             store.insert_repo(&repo).unwrap();
             repos.push(repo);
         }
-        manifest::save_manifest_cache_for_db(
-            &std::collections::HashMap::from([(
-                "repo:alpha".to_string(),
-                nestweaver_engine::ManifestInfo::default(),
-            )]),
+        manifest::save_manifest_snapshot_for_db(
+            &manifest::ManifestSnapshot {
+                repos: std::collections::HashMap::from([(
+                    "repo:alpha".to_string(),
+                    nestweaver_engine::ManifestInfo::default(),
+                )]),
+                failures: vec![manifest::ManifestRepoFailure::new(
+                    &repos[1],
+                    "invalid package.json".to_string(),
+                )],
+            },
             &store,
             &db_path,
-        )
-        .unwrap();
-        manifest::save_manifest_failures(
-            &db_path,
-            &[manifest::ManifestRepoFailure::new(
-                &repos[1],
-                "invalid package.json".to_string(),
-            )],
         )
         .unwrap();
         let state = AppState::new(store, None, db_path);
@@ -244,9 +242,11 @@ mod tests {
         let failures = body["manifest_failures"].as_array().unwrap();
         assert_eq!(failures.len(), 1, "{body}");
         assert_eq!(failures[0]["repo_uid"], "repo:beta");
-        assert_eq!(
-            failures[0]["remedy"],
-            "nestweaver index --repo /src/repo:beta"
+        // The root /src/repo:beta does not exist: restore or remove it.
+        let remedy = failures[0]["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("nestweaver remove-repo repo:beta"),
+            "{remedy}"
         );
     }
 

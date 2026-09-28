@@ -24089,6 +24089,35 @@ repos = ["alpha"]
                 failures[0].remedy,
                 format!("nestweaver index --repo {}", beta.display())
             );
+            // Review M5: the probe of the refused repo alone sees no change
+            // while it stays broken — even with alpha's manifest edited, which
+            // only a full rebuild (after its re-index marks debt) picks up —
+            // and sees the repair once beta is fixed.
+            std::fs::write(
+                state.db_path.parent().unwrap().join("alpha/package.json"),
+                r#"{"name":"alpha","dependencies":{"gamma":"1"}}"#,
+            )
+            .unwrap();
+            assert!(!super::manifest_recovery::refused_repos_changed(
+                &state, &failures
+            ));
+            match break_beta {
+                "policy" => {
+                    use nestweaver_engine::content_reader::ContentReader;
+                    state
+                        .store
+                        .set_repo_index_policy(
+                            "repo:beta",
+                            &nestweaver_engine::content_reader::FilesystemReader::new(&beta)
+                                .eligibility_fingerprint(),
+                        )
+                        .unwrap()
+                }
+                _ => std::fs::write(beta.join("package.json"), r#"{"name":"beta"}"#).unwrap(),
+            }
+            assert!(super::manifest_recovery::refused_repos_changed(
+                &state, &failures
+            ));
             let message = status.error.map(|e| e.message).unwrap_or_default();
             assert!(message.contains("repo:beta"), "{break_beta}: {message}");
             // `brain status` carries the same rows.

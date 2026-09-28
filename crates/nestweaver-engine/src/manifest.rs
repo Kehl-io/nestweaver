@@ -94,19 +94,8 @@ pub fn manifest_cache_path(db_path: &Path) -> PathBuf {
 /// restore a low-confidence name-matched hint, never remove a definition.
 /// Missing or unreadable is empty.
 pub fn package_names_hint(db_path: &Path) -> HashMap<String, String> {
-    let Ok(bytes) = std::fs::read(manifest_cache_path(db_path)) else {
-        return HashMap::new();
-    };
-    let Ok(envelope) =
-        serde_json::from_slice::<nestweaver_store::artifact_envelope::ArtifactEnvelope>(&bytes)
-    else {
-        return HashMap::new();
-    };
-    if envelope.artifact_kind != MANIFEST_ARTIFACT_KIND {
-        return HashMap::new();
-    }
-    serde_json::from_value::<HashMap<String, ManifestInfo>>(envelope.payload)
-        .unwrap_or_default()
+    manifest_snapshot_hint(db_path)
+        .repos
         .into_iter()
         .filter_map(|(repo_uid, info)| info.package_name.map(|name| (repo_uid, name)))
         .collect()
@@ -118,13 +107,22 @@ pub fn load_manifest_cache_for_db(
     store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> Result<HashMap<String, ManifestInfo>, anyhow::Error> {
-    Ok(crate::artifact_sidecar::load_json(
+    Ok(load_manifest_snapshot_for_db(store, db_path)?.repos)
+}
+
+/// The validated manifest snapshot: repos and the refused repositories.
+pub fn load_manifest_snapshot_for_db(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<ManifestSnapshot, anyhow::Error> {
+    Ok(crate::artifact_sidecar::load_json::<ManifestPayload>(
         store,
         &manifest_cache_path(db_path),
         MANIFEST_ARTIFACT_KIND,
         MANIFEST_ARTIFACT_SCHEMA_VERSION,
         MANIFEST_ALGORITHM_FINGERPRINT,
     )?
+    .map(ManifestSnapshot::from)
     .unwrap_or_default())
 }
 
@@ -324,13 +322,27 @@ pub struct ManifestRepoFailure {
 impl ManifestRepoFailure {
     pub fn new(repo: &nestweaver_schema::Repo, reason: String) -> Self {
         let root = repo.local_root().map(str::to_string);
-        let target = root.clone().unwrap_or_else(|| repo.url.clone());
+        // Review L2: the remedy fits the case. A re-index cannot repair a
+        // root that is gone, and a server-mode repo has no path to index.
+        let remedy = match root.as_deref() {
+            Some(root) if Path::new(root).is_dir() => format!("nestweaver index --repo {root}"),
+            Some(root) => format!(
+                "the source root {root} no longer exists: restore it and run `nestweaver \
+                 index --repo {root}`, or remove the repo with `nestweaver remove-repo {}`",
+                repo.uid
+            ),
+            None => format!(
+                "re-fetch the source (push to it, or re-register {} with the server) so \
+                 its bare clone is at an indexed revision",
+                repo.url
+            ),
+        };
         Self {
             repo_uid: repo.uid.clone(),
             repo_url: repo.url.clone(),
             root,
             reason,
-            remedy: format!("nestweaver index --repo {target}"),
+            remedy,
         }
     }
 
@@ -346,53 +358,77 @@ impl ManifestRepoFailure {
     }
 }
 
-pub fn manifest_failures_path(db_path: &Path) -> PathBuf {
-    crate::sidecar_path(db_path, ".manifest-failures.json")
+/// The manifest sidecar's payload (review M4): the per-repo manifests AND the
+/// repositories the rebuild that wrote them refused, in one envelope, so they
+/// are published atomically, bound to the same graph generation and
+/// publication, backed up together, and read as one snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestSnapshot {
+    pub repos: HashMap<String, ManifestInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<ManifestRepoFailure>,
 }
 
-/// Record the repositories the last rebuild refused; an empty list removes
-/// the record.
-pub fn save_manifest_failures(
-    db_path: &Path,
-    failures: &[ManifestRepoFailure],
-) -> anyhow::Result<()> {
-    let path = manifest_failures_path(db_path);
-    if failures.is_empty() {
-        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)?;
-        return Ok(());
+/// Either payload shape: the snapshot, or the bare repo map written before
+/// failures were embedded (still schema version 2, so an existing sidecar
+/// stays valid across the upgrade).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ManifestPayload {
+    Snapshot(ManifestSnapshot),
+    Legacy(HashMap<String, ManifestInfo>),
+}
+
+impl From<ManifestPayload> for ManifestSnapshot {
+    fn from(payload: ManifestPayload) -> Self {
+        match payload {
+            ManifestPayload::Snapshot(snapshot) => snapshot,
+            ManifestPayload::Legacy(repos) => Self {
+                repos,
+                failures: Vec::new(),
+            },
+        }
     }
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "failures": failures }))?;
-    atomic_replace_file(&path, |file| file.write_all(&bytes))
 }
 
-/// The repositories the last manifest rebuild refused. A missing record is
-/// none; an unreadable one is reported as a failure of its own so it is never
-/// read as "every repo is current".
-pub fn load_manifest_failures(db_path: &Path) -> Vec<ManifestRepoFailure> {
-    let path = manifest_failures_path(db_path);
+/// The sidecar's snapshot read WITHOUT the generation/identity checks, for
+/// disclosure and hints only. Missing is empty; unreadable is a failure row of
+/// its own, so it is never read as "every repo is current".
+fn manifest_snapshot_hint(db_path: &Path) -> ManifestSnapshot {
+    let path = manifest_cache_path(db_path);
+    let unreadable = |error: String| ManifestSnapshot {
+        repos: HashMap::new(),
+        failures: vec![ManifestRepoFailure {
+            repo_uid: "(unknown)".to_string(),
+            repo_url: String::new(),
+            root: None,
+            reason: format!("{} is unreadable: {error}", path.display()),
+            remedy: "restart the daemon to rebuild the manifest sidecar".to_string(),
+        }],
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => return vec![unreadable_failures_record(&path, e.to_string())],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ManifestSnapshot::default(),
+        Err(e) => return unreadable(e.to_string()),
     };
-    #[derive(Deserialize)]
-    struct Record {
-        failures: Vec<ManifestRepoFailure>,
-    }
-    match serde_json::from_slice::<Record>(&bytes) {
-        Ok(record) => record.failures,
-        Err(e) => vec![unreadable_failures_record(&path, e.to_string())],
+    let envelope = match serde_json::from_slice::<
+        nestweaver_store::artifact_envelope::ArtifactEnvelope,
+    >(&bytes)
+    {
+        Ok(envelope) if envelope.artifact_kind == MANIFEST_ARTIFACT_KIND => envelope,
+        Ok(envelope) => return unreadable(format!("artifact kind {}", envelope.artifact_kind)),
+        Err(e) => return unreadable(e.to_string()),
+    };
+    match serde_json::from_value::<ManifestPayload>(envelope.payload) {
+        Ok(payload) => payload.into(),
+        Err(e) => unreadable(e.to_string()),
     }
 }
 
-fn unreadable_failures_record(path: &Path, error: String) -> ManifestRepoFailure {
-    ManifestRepoFailure {
-        repo_uid: "(unknown)".to_string(),
-        repo_url: String::new(),
-        root: None,
-        reason: format!("{} is unreadable: {error}", path.display()),
-        remedy: "restart the daemon to rebuild the manifest sidecar".to_string(),
-    }
+/// The repositories the last manifest rebuild refused, from the manifest
+/// sidecar itself.
+pub fn load_manifest_failures(db_path: &Path) -> Vec<ManifestRepoFailure> {
+    manifest_snapshot_hint(db_path).failures
 }
 
 /// The failures as JSON rows for status and suggestion responses.
@@ -488,7 +524,7 @@ pub fn current_manifest_snapshot(
         .publication_identity()
         .map_err(|e| failure(Incompatible, e.to_string()))?
         .ok_or_else(|| failure(Incompatible, "graph publication identity is absent".into()))?;
-    let manifests: HashMap<String, ManifestInfo> = envelope
+    let snapshot: ManifestPayload = envelope
         .validate_and_decode_typed(ArtifactExpectation {
             artifact_kind: MANIFEST_ARTIFACT_KIND,
             artifact_schema_version: MANIFEST_ARTIFACT_SCHEMA_VERSION,
@@ -518,7 +554,11 @@ pub fn current_manifest_snapshot(
             "source changes await complete manifest derivation".into(),
         ));
     }
-    let refused: std::collections::HashSet<String> = load_manifest_failures(db_path)
+    let ManifestSnapshot {
+        repos: manifests,
+        failures,
+    } = snapshot.into();
+    let refused: std::collections::HashSet<String> = failures
         .into_iter()
         .map(|failure| failure.repo_uid)
         .collect();
@@ -1199,8 +1239,32 @@ pub(crate) fn advancing_generation_rebinding_manifests<T>(
 
 /// Persist the canonical manifest sidecar and retire the legacy copy only
 /// after the replacement has been durably flushed and renamed into place.
+///
+/// Refusals recorded by the last rebuild are carried forward, except for a
+/// repository this save now has a manifest for (review M4: one envelope).
 pub fn save_manifest_cache_for_db(
     manifests: &HashMap<String, ManifestInfo>,
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<(), anyhow::Error> {
+    let failures = manifest_snapshot_hint(db_path)
+        .failures
+        .into_iter()
+        .filter(|f| f.repo_uid != "(unknown)" && !manifests.contains_key(&f.repo_uid))
+        .collect();
+    save_manifest_snapshot_for_db(
+        &ManifestSnapshot {
+            repos: manifests.clone(),
+            failures,
+        },
+        store,
+        db_path,
+    )
+}
+
+/// Persist a complete manifest snapshot — repos and refusals — atomically.
+pub fn save_manifest_snapshot_for_db(
+    snapshot: &ManifestSnapshot,
     store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> Result<(), anyhow::Error> {
@@ -1213,7 +1277,7 @@ pub fn save_manifest_cache_for_db(
         MANIFEST_ARTIFACT_KIND,
         MANIFEST_ARTIFACT_SCHEMA_VERSION,
         MANIFEST_ALGORITHM_FINGERPRINT,
-        manifests,
+        snapshot,
     )?;
 
     let legacy_path = db_path.with_extension("manifests.json");
@@ -3044,13 +3108,20 @@ mod release_manifest_tests {
             repos.push(repo);
         }
         let map = HashMap::from([("repo:a".into(), ManifestInfo::default())]);
-        save_manifest_cache_for_db(&map, &store, &db).unwrap();
         let refuse = |which: &[usize]| {
             let failures: Vec<_> = which
                 .iter()
                 .map(|&i| ManifestRepoFailure::new(&repos[i], "malformed package.json".into()))
                 .collect();
-            save_manifest_failures(&db, &failures).unwrap();
+            save_manifest_snapshot_for_db(
+                &ManifestSnapshot {
+                    repos: map.clone(),
+                    failures,
+                },
+                &store,
+                &db,
+            )
+            .unwrap();
         };
 
         // b refused, c simply missing: still incomplete.
@@ -3067,12 +3138,97 @@ mod release_manifest_tests {
         assert!(
             disclosure.contains("repo:b")
                 && disclosure.contains("repo:c")
-                && disclosure.contains("nestweaver index --repo /fixture/repo:b"),
+                && disclosure.contains("nestweaver remove-repo repo:b"),
             "{disclosure}"
         );
-        // Nothing refused: no record, no disclosure.
-        refuse(&[]);
-        assert!(!manifest_failures_path(&db).exists());
+        // A plain manifest save (a watcher or index updating one repo) keeps
+        // the refusals in the same envelope, except the repo it now covers.
+        let mut covered = map.clone();
+        covered.insert("repo:b".into(), ManifestInfo::default());
+        save_manifest_cache_for_db(&covered, &store, &db).unwrap();
+        let kept: Vec<String> = load_manifest_failures(&db)
+            .into_iter()
+            .map(|f| f.repo_uid)
+            .collect();
+        assert_eq!(kept, ["repo:c"]);
+        assert_eq!(current_manifest_snapshot(&store, &db).unwrap().len(), 2);
+        // Nothing refused and every repo covered: no failures, no disclosure.
+        covered.insert("repo:c".into(), ManifestInfo::default());
+        save_manifest_snapshot_for_db(
+            &ManifestSnapshot {
+                repos: covered,
+                failures: Vec::new(),
+            },
+            &store,
+            &db,
+        )
+        .unwrap();
+        assert!(load_manifest_failures(&db).is_empty());
+        assert!(
+            load_manifests_for_dead_code(&store, &db)
+                .disclosure()
+                .is_none()
+        );
+    }
+
+    /// Review L2: the remedy fits the case — re-index an existing root,
+    /// restore or remove a missing one, re-fetch a server-mode repo.
+    #[test]
+    fn a_refused_repos_remedy_fits_its_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = |root: Option<String>| nestweaver_schema::Repo {
+            uid: "repo:x".into(),
+            url: "https://example.com/x.git".into(),
+            indexed_sha: "sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "fixture".into(),
+            name: None,
+            root_path: root,
+        };
+        let live = dir.path().display().to_string();
+        let remedy = |root| ManifestRepoFailure::new(&repo(root), "r".into()).remedy;
+        assert_eq!(
+            remedy(Some(live.clone())),
+            format!("nestweaver index --repo {live}")
+        );
+        let gone = remedy(Some(format!("{live}/gone")));
+        assert!(
+            gone.contains("no longer exists") && gone.contains("nestweaver remove-repo repo:x"),
+            "{gone}"
+        );
+        let server = remedy(None);
+        assert!(
+            server.contains("re-fetch") && !server.contains("index --repo"),
+            "{server}"
+        );
+    }
+
+    /// Review M4: a sidecar written before failures were embedded (a bare
+    /// repo map) still loads, with no failures.
+    #[test]
+    fn a_legacy_bare_map_manifest_sidecar_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let map = HashMap::from([(
+            "repo:a".to_string(),
+            ManifestInfo {
+                package_name: Some("a".into()),
+                ..Default::default()
+            },
+        )]);
+        crate::artifact_sidecar::save_json(
+            &store,
+            &manifest_cache_path(&db),
+            MANIFEST_ARTIFACT_KIND,
+            MANIFEST_ARTIFACT_SCHEMA_VERSION,
+            MANIFEST_ALGORITHM_FINGERPRINT,
+            &map,
+        )
+        .unwrap();
+        assert_eq!(load_manifest_cache_for_db(&store, &db).unwrap(), map);
+        assert!(load_manifest_failures(&db).is_empty());
+        assert_eq!(package_names_hint(&db)["repo:a"], "a");
     }
 
     #[test]

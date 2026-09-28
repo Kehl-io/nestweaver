@@ -202,10 +202,17 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
         )?;
     }
     let publication_debt = manifest::manifest_debt_revision(&state.db_path)?;
-    // nw-705: the refused repositories are recorded BEFORE the partial
-    // snapshot is published, so no reader can take it as complete coverage.
-    manifest::save_manifest_failures(&state.db_path, &after.failures)?;
-    manifest::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)?;
+    // nw-705: the refused repositories travel in the same envelope as the
+    // manifests (review M4), so no reader can take a partial snapshot as
+    // complete coverage.
+    manifest::save_manifest_snapshot_for_db(
+        &manifest::ManifestSnapshot {
+            repos: manifests,
+            failures: after.failures.clone(),
+        },
+        &state.store,
+        &state.db_path,
+    )?;
     // Fail closed if an external editor changed bytes during the atomic save.
     // Leave durable debt; never let the new envelope hide this pending work.
     let verified = capture(state, after.deadline)?;
@@ -226,6 +233,46 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
         &manifest::manifest_debt_path(&state.db_path),
     )?;
     Ok(())
+}
+
+/// Review M5: first and longest wait between probes of refused repos.
+const PARTIAL_PROBE_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const PARTIAL_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+fn next_partial_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(PARTIAL_PROBE_BACKOFF_MAX)
+}
+
+/// Review M5: probe only the refused repositories. True when one is gone,
+/// now captures, or is refused for a different reason — a full rebuild then
+/// publishes the change. Each probe gets its own budget and deadline, so
+/// the healthy repos are not re-listed.
+pub(super) fn refused_repos_changed(
+    state: &DaemonState,
+    failures: &[manifest::ManifestRepoFailure],
+) -> bool {
+    let Ok(repos) = state.store.list_repos(None) else {
+        return true;
+    };
+    let Ok(config) = current_repo_eligibility_config(state) else {
+        return true;
+    };
+    let limits = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.indexing.limits())
+        .unwrap_or_default();
+    failures.iter().any(|failure| {
+        let Some(repo) = repos.iter().find(|r| r.uid == failure.repo_uid) else {
+            return true;
+        };
+        let mut budget = 32 * 1024 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
+            Ok(_) => true,
+            Err(error) => format!("{error:#}") != failure.reason,
+        }
+    })
 }
 
 /// Three immediate attempts, then a cooldown that can recover from repaired
@@ -265,6 +312,10 @@ pub(super) async fn run(state: Arc<DaemonState>) {
     // refused repositories were last probed again.
     let mut settled_key = String::new();
     let mut last_partial_probe: Option<Instant> = None;
+    // Review M5: how long until the refused repos are probed again. Doubles
+    // on each probe that finds nothing changed; reset whenever any other
+    // path runs (a re-index marks debt, which takes that path).
+    let mut partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
     let mut retry = RetryBudget::default();
     let mut delay = 0;
     loop {
@@ -293,26 +344,49 @@ pub(super) async fn run(state: Arc<DaemonState>) {
                     last_key.clear();
                     settled_key.clear();
                     last_partial_probe = None;
+                    partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
                     delay = 2;
                     continue;
                 }
                 // nw-705: the other repositories are current; keep naming the
-                // refused ones and re-probe them every 30 s, so a repaired
-                // root, manifest or re-index is picked up on its own.
+                // refused ones. Review M5: re-probe ONLY those repos, with
+                // exponential backoff, and rebuild only when one changed, so
+                // a repo that stays broken costs neither a full listing every
+                // 30 s nor a flapping deadline.
                 let partial = ManifestUnavailable::new(
                     ManifestUnavailableReason::IncompleteCoverage,
                     state.store.graph_generation(),
                     manifest::describe_manifest_failures(&failures),
                 );
-                runtime.publish("partial", 0, Some(30), Some(partial.clone()));
+                runtime.publish(
+                    "partial",
+                    0,
+                    Some(partial_backoff.as_secs()),
+                    Some(partial.clone()),
+                );
                 delay = 2;
-                if last_partial_probe.is_some_and(|at| at.elapsed() < Duration::from_secs(30)) {
+                if last_partial_probe.is_some_and(|at| at.elapsed() < partial_backoff) {
                     continue;
                 }
                 last_partial_probe = Some(Instant::now());
+                let probe_state = Arc::clone(&state);
+                let changed = tokio::task::spawn_blocking(move || {
+                    refused_repos_changed(&probe_state, &failures)
+                })
+                .await
+                .unwrap_or(true);
+                if !changed {
+                    partial_backoff = next_partial_backoff(partial_backoff);
+                    continue;
+                }
+                partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
                 partial
             }
-            Ok(Err(error)) => error,
+            Ok(Err(error)) => {
+                partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
+                last_partial_probe = None;
+                error
+            }
             Err(error) => {
                 tracing::error!(%error, "manifest inspection worker failed");
                 delay = 4;
@@ -448,6 +522,17 @@ pub(super) async fn run(state: Arc<DaemonState>) {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn partial_probe_backoff_doubles_to_thirty_minutes() {
+        let mut backoff = PARTIAL_PROBE_BACKOFF_MIN;
+        let mut seen = vec![backoff.as_secs()];
+        for _ in 0..8 {
+            backoff = next_partial_backoff(backoff);
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 120, 240, 480, 960, 1800, 1800, 1800]);
+    }
 
     #[test]
     fn exhausted_budget_rearms_after_cooldown_without_source_change() {
