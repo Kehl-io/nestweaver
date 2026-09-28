@@ -4937,7 +4937,14 @@ where
             // successful, finalized index — a failed run must not claim the
             // repo is current. Best-effort: a sidecar write failure must never
             // fail an index that already committed.
-            if let Some(db_path) = store.db_path()
+            //
+            // nw-688 review (M2): only a run that re-parsed and rewrote EVERY
+            // file may claim it. An incremental run leaves unchanged files'
+            // symbols as an older binary wrote them (stale `describe getTier`
+            // shadows, say), so stamping there made stale-check go green over
+            // stale data. Such a run leaves the previous stamp alone.
+            if result.files_unchanged == 0
+                && let Some(db_path) = store.db_path()
                 && let Err(e) = crate::resolver_generation::record(db_path, &r_uid)
             {
                 tracing::warn!(
@@ -12880,6 +12887,48 @@ function hello(name) { return "Hello " + name; }
                 src == &importer && dst == &exported && kind == "IMPORTS"
             }),
             "a JavaScript import must resolve using JavaScript rules even when another language has more files: {edges:?}"
+        );
+    }
+
+    /// nw-688 review (M2): an incremental index must not stamp the repo with
+    /// the current resolver generation — its unchanged files keep symbols an
+    /// older binary wrote. Only a run that rewrote every file (first index,
+    /// `--force`) stamps. Counterweight: the forced run does.
+    #[test]
+    fn only_a_full_index_stamps_the_resolver_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.js"), "function a() {}\n").unwrap();
+        fs::write(src.join("b.js"), "function b() {}\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        let url = "https://example.com/stamp";
+        let r_uid = repo_uid("test", url);
+        let generation = || crate::resolver_generation::load(&db).generation_for(&r_uid);
+        let index = |force: bool| {
+            index_directory_with_store(&store, &src, &db, "test", url, "abc", force, None).unwrap()
+        };
+
+        index(false);
+        assert_eq!(
+            generation(),
+            crate::resolver_generation::RESOLVER_GENERATION
+        );
+        // An older binary built this graph: no current stamp.
+        std::fs::remove_file(crate::sidecar_path(
+            &db,
+            crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        ))
+        .unwrap();
+        fs::write(src.join("a.js"), "function a() { return 1; }\n").unwrap();
+        let incremental = index(false);
+        assert!(incremental.files_unchanged > 0, "{incremental:?}");
+        assert_eq!(generation(), 0, "an incremental run must not stamp");
+        index(true);
+        assert_eq!(
+            generation(),
+            crate::resolver_generation::RESOLVER_GENERATION
         );
     }
 
