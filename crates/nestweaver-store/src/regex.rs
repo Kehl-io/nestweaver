@@ -110,7 +110,21 @@ pub struct RegexMatch {
     pub line: Option<u32>,
     /// A short excerpt of the matched line.
     pub snippet: String,
+    /// 1-based column, in characters, where this occurrence starts on `line`
+    /// (nw-549). Several matches on one line used to produce rows that were
+    /// identical in every field; the column is what tells them apart.
+    /// `None` only when decoded from an older daemon that did not send it.
+    #[serde(default)]
+    pub column: Option<u32>,
+    /// The text this occurrence matched, capped at
+    /// [`MATCHED_TEXT_MAX_CHARS`] characters (nw-549).
+    #[serde(default)]
+    pub matched: String,
 }
+
+/// Cap on [`RegexMatch::matched`], the same bound the snippet uses, so a
+/// pattern like `(?s).*` cannot copy a whole section into every row.
+pub const MATCHED_TEXT_MAX_CHARS: usize = 200;
 
 /// Result of a `regex_search` call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1887,6 +1901,8 @@ impl GraphStore {
                     break;
                 }
                 let (line_in_text, snippet) = line_and_snippet(&c.text, m.start());
+                let column = match_column(&c.text, m.start());
+                let matched: String = m.as_str().chars().take(MATCHED_TEXT_MAX_CHARS).collect();
                 // Translate the line *within* the node's text into a file line:
                 // the node's text starts at `c.start_line`, so the match on the
                 // first text line (line_in_text == 1) is at c.start_line.
@@ -1911,6 +1927,8 @@ impl GraphStore {
                     location,
                     line: Some(file_line),
                     snippet,
+                    column: Some(column),
+                    matched,
                 });
             }
             if matched_any && results.len() >= limit {
@@ -2149,6 +2167,14 @@ fn file_of(location: &str) -> String {
     }
 }
 
+/// 1-based character column of `match_start` within its line (nw-549).
+fn match_column(text: &str, match_start: usize) -> u32 {
+    let line_start = text[..match_start].rfind('\n').map_or(0, |idx| idx + 1);
+    u32::try_from(text[line_start..match_start].chars().count())
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
+}
+
 /// Given the byte offset of a match within `text`, return its 1-based line
 /// number and a trimmed snippet of that line.
 fn line_and_snippet(text: &str, match_start: usize) -> (u32, String) {
@@ -2361,6 +2387,8 @@ mod tests {
             location: "a.rs".into(),
             line: Some(1),
             snippet: "x".into(),
+            column: Some(1),
+            matched: "x".into(),
         };
         let r = RegexSearchResult {
             results: vec![hit],
@@ -2993,6 +3021,76 @@ mod tests {
             "each occurrence must carry its own file line"
         );
         assert!(!res.truncated);
+    }
+
+    /// nw-549. Several matches on ONE line produced rows with identical
+    /// uid/location/line/snippet and nothing to tell them apart. Each row is
+    /// one occurrence (nw-300), so each must carry where on the line it is and
+    /// what it matched. Counterweight: a single match is still a single row.
+    #[test]
+    fn regex_search_rows_on_one_line_carry_a_distinct_span() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:v:1".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "notes/span.md".to_string(),
+                title: "Span".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:v:1:a".to_string(),
+                note_uid: "note:v:1".to_string(),
+                heading_uid: None,
+                start_line: 3,
+                end_line: 3,
+                text_hash: "th".to_string(),
+                text_content: "def helperB(x=helperC, y=helperB)".to_string(),
+                word_count: 3,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let res = store
+            .regex_search("helper[BC]", None, None, Some(10_000), Some(5_000))
+            .unwrap();
+        let spans: Vec<(Option<u32>, Option<u32>, &str)> = res
+            .results
+            .iter()
+            .map(|m| (m.line, m.column, m.matched.as_str()))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (Some(3), Some(5), "helperB"),
+                (Some(3), Some(15), "helperC"),
+                (Some(3), Some(26), "helperB"),
+            ],
+            "each occurrence on the line must carry its own column and text"
+        );
+        let rendered: std::collections::HashSet<String> = res
+            .results
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert_eq!(rendered.len(), 3, "no two rows may serialize identically");
+
+        let single = store
+            .regex_search("helperC", None, None, Some(10_000), Some(5_000))
+            .unwrap();
+        assert_eq!(single.results.len(), 1);
+        assert_eq!(single.results[0].column, Some(15));
+        assert_eq!(single.results[0].matched, "helperC");
     }
 
     #[test]

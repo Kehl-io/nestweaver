@@ -367,6 +367,37 @@ mod tests {
         assert_eq!(batch[2]["id"], 3);
     }
 
+    /// nw-576. An unknown tool name is a protocol error (MCP 2025-11-25,
+    /// server/tools "Error Handling"), the same JSON-RPC -32602 shape a
+    /// missing name already gets, and it never reaches dispatch. Counterweight:
+    /// a registered name still dispatches.
+    #[test]
+    fn unknown_tool_name_is_invalid_params_like_a_missing_name() {
+        let (writer, output) = writer();
+        let input = json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"definitely_not_a_tool_xyz","arguments":{}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"arguments":{}}},
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_status"}}
+        ])
+        .to_string();
+        let mut dispatched = Vec::new();
+        run_with_io(std::io::Cursor::new(input), writer, |req, _| {
+            dispatched.push(req.id.clone());
+            json!({"jsonrpc":"2.0","id":req.id,"result":{"isError":false}})
+        })
+        .unwrap();
+        assert_eq!(dispatched, vec![Some(json!(3))]);
+        let batch = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(batch[0]["error"]["code"], -32602, "{batch}");
+        assert_eq!(
+            batch[0]["error"]["message"],
+            "Unknown tool: definitely_not_a_tool_xyz"
+        );
+        assert!(batch[0].get("result").is_none(), "{batch}");
+        assert_eq!(batch[1]["error"]["code"], -32602, "{batch}");
+        assert_eq!(batch[2]["result"]["isError"], false, "{batch}");
+    }
+
     #[test]
     fn session_preserves_line_separator_wire_framing() {
         struct Bytes(Arc<Mutex<Vec<u8>>>);

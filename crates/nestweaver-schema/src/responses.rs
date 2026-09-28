@@ -129,6 +129,15 @@ pub fn impact(mut value: Value) -> Value {
             "name".into(),
             object.get("symbol").cloned().unwrap_or(Value::Null),
         );
+        // nw-557: every not-found envelope carries `message`.
+        let symbol = object
+            .get("symbol")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        object
+            .entry("message")
+            .or_insert_with(|| json!(format!("no symbol found: '{symbol}'")));
     }
     if object.get("status").and_then(Value::as_str) == Some("ambiguous") {
         object

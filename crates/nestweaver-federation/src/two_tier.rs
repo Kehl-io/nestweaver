@@ -102,6 +102,44 @@ pub async fn two_tier_query(
     };
 
     // 3. Build two-tier response.
+    let mut response = assemble_two_tier(local_result, server_result, &server_name);
+    inject_or_wrap_provenance(&mut response, &["local", &server_name], &[]);
+
+    response
+}
+
+/// Assemble the two-tier envelope from the local answer and the upstream's
+/// (`None` when the upstream failed or timed out).
+///
+/// nw-557: when the local tier is a lookup miss (`status: "not_found"`) and
+/// the org-wide tier did not find the target either (unavailable, or itself
+/// `not_found`), the WHOLE call is a miss, so the local tier's not-found
+/// envelope keys are lifted to the top level, where MCP's result wrapper
+/// flags `isError: true`. The tiers stay nested and unchanged underneath. A
+/// target the upstream found (even with zero dependents) is not a miss.
+pub fn assemble_two_tier(
+    local_result: Value,
+    server_result: Option<Value>,
+    server_name: &str,
+) -> Value {
+    let local_miss = is_not_found(&local_result);
+    let org_miss = server_result.as_ref().is_none_or(is_not_found);
+    let lifted: Vec<(String, Value)> = if local_miss && org_miss {
+        [
+            "status",
+            "error",
+            "message",
+            "symbol",
+            "name",
+            "did_you_mean",
+        ]
+        .iter()
+        .filter_map(|key| local_result.get(*key).map(|v| (key.to_string(), v.clone())))
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut response = serde_json::json!({
         "tier": "two_tier",
         "local_impact": local_result,
@@ -110,7 +148,7 @@ pub async fn two_tier_query(
     if let Some(server) = server_result {
         // Filter out results that are already in the local impact to avoid
         // duplicating repos the user has indexed locally.
-        let local_repos = extract_local_repos(&local_result);
+        let local_repos = extract_local_repos(&response["local_impact"]);
         let filtered_server = filter_org_results(&server, &local_repos);
 
         response["org_wide_impact"] = serde_json::json!({
@@ -125,9 +163,16 @@ pub async fn two_tier_query(
         });
     }
 
-    inject_or_wrap_provenance(&mut response, &["local", &server_name], &[]);
-
+    if let Some(object) = response.as_object_mut() {
+        for (key, value) in lifted {
+            object.insert(key, value);
+        }
+    }
     response
+}
+
+fn is_not_found(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_str) == Some("not_found")
 }
 
 /// Reduce a `repo_uid` to its instance-independent identity for two-tier dedup.
@@ -391,6 +436,39 @@ mod tests {
         });
         let repos = extract_local_repos(&local);
         assert!(repos.contains("src/lib.rs"));
+    }
+
+    /// nw-557 F1: a local miss the upstream did not find either is a miss
+    /// for the whole two-tier call, so the envelope is lifted to the top.
+    #[test]
+    fn a_miss_on_both_tiers_lifts_the_not_found_envelope() {
+        let local = json!({
+            "status": "not_found", "error": "not found", "symbol": "nope",
+            "message": "no symbol found: 'nope'", "did_you_mean": ["nope_fn"],
+            "impact_nodes": []
+        });
+        for server in [
+            None,
+            Some(json!({"status": "not_found", "impact_nodes": []})),
+        ] {
+            let response = assemble_two_tier(local.clone(), server.clone(), "org");
+            assert_eq!(response["status"], "not_found", "{server:?}: {response}");
+            assert_eq!(response["message"], "no symbol found: 'nope'");
+            assert_eq!(response["did_you_mean"], json!(["nope_fn"]));
+            assert_eq!(response["local_impact"], local, "the tiers stay intact");
+        }
+    }
+
+    /// Counterweight: the upstream found the target (even with no
+    /// dependents), or the local tier found it: not a miss.
+    #[test]
+    fn a_target_found_on_either_tier_is_not_lifted() {
+        let miss = json!({"status": "not_found", "error": "not found", "impact_nodes": []});
+        let found = json!({"status": "ok", "impact_nodes": []});
+        let org_found = assemble_two_tier(miss, Some(found.clone()), "org");
+        assert!(org_found.get("status").is_none(), "{org_found}");
+        let local_found = assemble_two_tier(found, None, "org");
+        assert!(local_found.get("status").is_none(), "{local_found}");
     }
 
     #[test]

@@ -754,6 +754,50 @@ pub fn truncate_to_budget(summaries: &[Summary], token_budget: usize) -> Vec<&Su
     result
 }
 
+/// A budgeted summary list that never answers a non-empty match with nothing.
+#[derive(Debug)]
+pub struct BudgetedSummaries<'a> {
+    pub kept: Vec<&'a Summary>,
+    /// Set when the FIRST summary alone exceeded the budget and was returned
+    /// anyway.
+    pub budget_exceeded_by_first_item: Option<crate::read_symbols::BudgetOverrun>,
+}
+
+/// [`truncate_to_budget`], except the first summary is always returned.
+///
+/// nw-644: `summary --target X --token-budget 800` matched one file summary
+/// of ~995 tokens and answered `total: 1, returned: 0, summaries: []` with
+/// exit 0, an empty success for a question that had an answer. This mirrors
+/// `read_symbols`' `budget_exceeded_by_first_symbol` (nw-111): the first item
+/// is returned whole, and the overrun is SAID, never silent. Every later item
+/// is still cut by the budget.
+pub fn truncate_to_budget_keeping_first(
+    summaries: &[Summary],
+    token_budget: usize,
+) -> BudgetedSummaries<'_> {
+    let mut kept = truncate_to_budget(summaries, token_budget);
+    let mut budget_exceeded_by_first_item = None;
+    if kept.is_empty()
+        && let Some(first) = summaries.first()
+    {
+        budget_exceeded_by_first_item = Some(crate::read_symbols::BudgetOverrun {
+            requested_tokens: token_budget,
+            returned_tokens: first.token_estimate,
+            note: format!(
+                "the first summary alone costs ~{} tokens, over the requested budget of \
+                 {token_budget}; it is returned whole because an empty result answers \
+                 nothing, so this response EXCEEDS the budget",
+                first.token_estimate
+            ),
+        });
+        kept.push(first);
+    }
+    BudgetedSummaries {
+        kept,
+        budget_exceeded_by_first_item,
+    }
+}
+
 /// Filter summaries by target name or file path (substring, case-insensitive),
 /// or by exact UID.
 ///
@@ -840,6 +884,42 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].target_uid, "a");
         assert_eq!(result[1].target_uid, "b");
+    }
+
+    fn sized(uid: &str, tokens: usize) -> Summary {
+        Summary {
+            level: SummaryLevel::File,
+            target_uid: uid.to_string(),
+            target_name: uid.to_string(),
+            content: "x".repeat(tokens * 4),
+            token_estimate: tokens,
+            file_path: None,
+        }
+    }
+
+    /// nw-644: a sole summary over the budget is returned and flagged.
+    #[test]
+    fn keeping_first_returns_an_over_budget_first_item_and_says_so() {
+        let summaries = vec![sized("big", 995), sized("next", 10)];
+        let out = truncate_to_budget_keeping_first(&summaries, 800);
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.kept[0].target_uid, "big");
+        let overrun = out
+            .budget_exceeded_by_first_item
+            .expect("the overrun must be disclosed");
+        assert_eq!(overrun.requested_tokens, 800);
+        assert_eq!(overrun.returned_tokens, 995);
+    }
+
+    /// Counterweight: a first item that fits is not flagged, and later items
+    /// are still cut by the budget.
+    #[test]
+    fn keeping_first_still_truncates_when_the_first_item_fits() {
+        let summaries = vec![sized("a", 10), sized("b", 10), sized("c", 10)];
+        let out = truncate_to_budget_keeping_first(&summaries, 25);
+        assert_eq!(out.kept.len(), 2);
+        assert!(out.budget_exceeded_by_first_item.is_none());
+        assert!(truncate_to_budget_keeping_first(&[], 5).kept.is_empty());
     }
 
     #[test]

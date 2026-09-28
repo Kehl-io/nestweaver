@@ -12644,3 +12644,313 @@ fn brain_remove_with_an_unreadable_registration_sidecar_is_plain_not_found() {
         .code(2)
         .stdout(contains("No vault found"));
 }
+
+/// nw-644: `summary --target X --token-budget <small>` answered
+/// `total: 1, returned: 0, summaries: []` at exit 0. The sole hit is now
+/// returned and the overrun is disclosed.
+#[test]
+fn summary_target_over_a_tight_budget_returns_the_hit_and_flags_the_overrun() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        std::fs::write(
+            repo_dir.join(format!("{name}.js")),
+            format!("function {name}One(x) {{ return x; }}\nfunction {name}Two(y) {{ return {name}One(y); }}\n"),
+        )
+        .unwrap();
+    }
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let summary = |extra: &[&str]| -> serde_json::Value {
+        let output = nestweaver_cmd()
+            .args([
+                "summary",
+                "--level",
+                "file",
+                "--json",
+                "--token-budget",
+                "1",
+            ])
+            .args(extra)
+            .arg("--db")
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let targeted = summary(&["--target", "beta.js"]);
+    assert_eq!(targeted["total"], 1, "{targeted}");
+    assert_eq!(targeted["returned"], 1, "{targeted}");
+    assert_eq!(targeted["summaries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        targeted["budget_exceeded_by_first_item"]["requested_tokens"], 1,
+        "{targeted}"
+    );
+
+    // Counterweight: untargeted, the budget still cuts everything after the
+    // first item.
+    let untargeted = summary(&[]);
+    assert_eq!(untargeted["total"], 3, "{untargeted}");
+    assert_eq!(untargeted["returned"], 1, "{untargeted}");
+    assert_eq!(untargeted["truncated_by_budget"], true, "{untargeted}");
+}
+
+/// nw-539: a found symbol with a nonexistent or unreadable `--root` exited 2
+/// (TARGET NOT FOUND) with `not_found: []`. It is state, not a missing target:
+/// exit 1 with a named `unreadable_root` diagnostic.
+#[test]
+fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function nw539ReadTarget(name) { return name; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let read = |target: &str, root: Option<&std::path::Path>| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["read-symbols", target, "--json", "--db"])
+            .arg(&db_path)
+            .current_dir(dir.path());
+        if let Some(root) = root {
+            cmd.arg("--root").arg(root);
+        }
+        let output = cmd.output().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (output.status.code(), payload, output)
+    };
+
+    let missing = dir.path().join("does-not-exist");
+    let (code, payload, output) = read("nw539ReadTarget", Some(&missing));
+    assert_eq!(
+        code,
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(payload["error"], "unreadable_root", "{payload}");
+    assert_eq!(
+        payload["unreadable_root"]["path"],
+        missing.display().to_string()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&missing.display().to_string()),
+        "stderr must name the root"
+    );
+
+    // Counterweight: an unresolved target is still exit 2, not_found populated.
+    let (code, payload, _) = read("nw539NoSuchSymbolXYZ", Some(&missing));
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["not_found"][0], "nw539NoSuchSymbolXYZ", "{payload}");
+
+    // nw-706: a READABLE --root holding none of the indexed files (the wrong
+    // tree) is the same state, with its own reason.
+    let wrong_tree = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&wrong_tree).unwrap();
+    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_tree));
+    assert_eq!(code, Some(1), "{payload}");
+    assert_eq!(payload["error"], "unreadable_root", "{payload}");
+    assert_eq!(
+        payload["unreadable_root"]["reason"], "no indexed file readable under it",
+        "{payload}"
+    );
+    // Counterweight: the right tree passed explicitly still reads.
+    let (code, payload, _) = read("nw539ReadTarget", Some(&repo_dir));
+    assert_eq!(code, Some(0), "{payload}");
+
+    // Counterweight: an omitted --root still reads from the recorded root.
+    let (code, payload, _) = read("nw539ReadTarget", None);
+    assert_eq!(code, Some(0), "{payload}");
+    assert_eq!(payload["symbols"][0]["body_available"], true, "{payload}");
+
+    // An existing but unreadable directory is the same state.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_err() {
+            let (code, payload, _) = read("nw539ReadTarget", Some(&locked));
+            assert_eq!(code, Some(1), "{payload}");
+            assert_eq!(payload["error"], "unreadable_root", "{payload}");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// nw-656: `mcp --config <invalid>` died before JSON-RPC (exit 1, empty
+/// stdout). The client's `initialize` is now answered with a JSON-RPC error
+/// naming the file and the parse error, then the process exits.
+#[test]
+fn mcp_invalid_config_answers_initialize_with_a_jsonrpc_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    let bad = dir.path().join("bad.toml");
+    std::fs::write(&bad, "x = [[[\n").unwrap();
+    let initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--config")
+        .arg(&bad)
+        .write_stdin(initialize)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout}");
+    let frame: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(frame["jsonrpc"], "2.0");
+    assert_eq!(frame["id"], 1, "{frame}");
+    let message = frame["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("bad.toml"),
+        "must name the file: {message}"
+    );
+    assert!(
+        message.contains("TOML parse error"),
+        "must name the cause: {message}"
+    );
+
+    // Review M2: the cause is on stderr BEFORE the process waits for a
+    // request -- read while stdin is still open and silent.
+    {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nestweaver"))
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .args(["mcp", "--db"])
+            .arg(&db)
+            .arg("--config")
+            .arg(&bad)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut first = String::new();
+        stderr.read_line(&mut first).unwrap();
+        assert!(first.contains("bad.toml"), "first stderr line: {first}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the cause must be printed before the bounded wait"
+        );
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
+
+    // Counterweight: a valid config boots and serves tools/list unchanged.
+    let good =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--config")
+        .arg(&good)
+        .write_stdin("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frame: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert!(
+        !frame["result"]["tools"].as_array().unwrap().is_empty(),
+        "{frame}"
+    );
+}
+
+/// nw-196, direct route: the same `--json` rows and `--fail-on-skip` rule as
+/// the daemon route, built from the engine's skip rows.
+#[test]
+fn brain_refresh_json_and_fail_on_skip_on_the_direct_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("note.md"), "# Note\nkept\n").unwrap();
+    std::fs::write(vault.join(".brainignore"), "secret.md\n").unwrap();
+    std::fs::write(vault.join("secret.md"), "# Secret\nexcluded on purpose\n").unwrap();
+    std::fs::write(
+        vault.join("big.md"),
+        format!("# Big\n{}\n", "x".repeat(1024 * 1024 + 16)),
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let refresh = |extra: &[&str]| {
+        nestweaver_cmd()
+            .args(["brain", "refresh"])
+            .arg(&vault)
+            .arg("--db")
+            .arg(&db_path)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = refresh(&["--json", "--fail-on-skip"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be one JSON document ({e}): {output:?}"));
+    let rows = payload["skipped_files"].as_array().unwrap();
+    let flag = |name: &str| {
+        rows.iter()
+            .find(|row| row["path"].as_str().is_some_and(|p| p.ends_with(name)))
+            .map(|row| row["excluded_by_request"].clone())
+            .unwrap_or_else(|| panic!("no skip row for {name}: {payload}"))
+    };
+    assert_eq!(flag("secret.md"), true);
+    assert_eq!(flag("big.md"), false);
+
+    std::fs::remove_file(vault.join("big.md")).unwrap();
+    let output = refresh(&["--fail-on-skip"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
