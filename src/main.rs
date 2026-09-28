@@ -20670,12 +20670,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let root_problem = root
                 .as_deref()
                 .and_then(|root| unreadable_root_reason(root).map(|reason| (root, reason)));
+            // nw-706: a READABLE `--root` that holds none of the resolved
+            // symbols' files (the wrong tree) is the same state, with its own
+            // reason. A stale span is a different cause and keeps its own
+            // diagnostic.
+            let wrong_tree = |res: &nestweaver_engine::read_symbols::ReadSymbolsResult| {
+                root.as_deref().filter(|_| {
+                    !res.symbols.is_empty()
+                        && res
+                            .symbols
+                            .iter()
+                            .all(|w| !w.body_available && !w.stale_span)
+                })
+            };
 
             if let Some(res) = daemon_result {
                 if let Some((root, reason)) = &root_problem
                     && !res.symbols.is_empty()
                 {
                     return render_read_symbols_unreadable_root(&res, json, root, reason);
+                }
+                if let Some(root) = wrong_tree(&res) {
+                    return render_read_symbols_unreadable_root(
+                        &res,
+                        json,
+                        root,
+                        NO_INDEXED_FILE_READABLE,
+                    );
                 }
                 return render_read_symbols(&res, json);
             }
@@ -20717,6 +20738,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 && !res.symbols.is_empty()
             {
                 return render_read_symbols_unreadable_root(&res, json, root, reason);
+            }
+            if let Some(root) = wrong_tree(&res) {
+                return render_read_symbols_unreadable_root(
+                    &res,
+                    json,
+                    root,
+                    NO_INDEXED_FILE_READABLE,
+                );
             }
             render_read_symbols(&res, json)
         }
@@ -25412,6 +25441,10 @@ fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -
     }
 }
 
+/// nw-706: the `unreadable_root` reason for a readable `--root` that holds
+/// none of the resolved symbols' files.
+const NO_INDEXED_FILE_READABLE: &str = "no indexed file readable under it";
+
 /// Why an explicit `read-symbols --root` cannot serve source, or `None` when
 /// it is a readable directory (nw-539).
 fn unreadable_root_reason(root: &Path) -> Option<String> {
@@ -25454,7 +25487,7 @@ fn render_read_symbols_unreadable_root(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     }
     eprintln!(
-        "unreadable root: --root {} {reason}; {} symbol(s) resolved but no source could be \
+        "unreadable root: --root {}: {reason}; {} symbol(s) resolved but no source could be \
          read from it — {remedy}",
         root.display(),
         res.symbols.len()
@@ -25518,8 +25551,12 @@ fn render_read_symbols(
     // answered no part of the question asked, and exiting 0 made that
     // indistinguishable from success. A partial answer still succeeds — the
     // bodies that were read are real.
+    //
+    // nw-539/nw-706: exit 1, not 2. Owner policy (2026-09-27): exit 2 means a
+    // target did not RESOLVE; these all resolved, and it is the state of the
+    // source (unreadable, moved, stale) that cannot satisfy the read.
     if !res.symbols.is_empty() && res.symbols.iter().all(|w| !w.body_available) {
-        return Ok((EXIT_NOT_FOUND, None));
+        return Ok((EXIT_ERROR, None));
     }
     Ok((EXIT_SUCCESS, None))
 }
@@ -32359,8 +32396,8 @@ credential_method = "gh"
 
     /// nw-340. A read where NO requested symbol had a readable body is a
     /// failure the exit code must carry: the caller asked for source and
-    /// received none. Exit 2 ("not found") is the existing code for "the
-    /// question was not answered".
+    /// received none. Since nw-539/nw-706 that is exit 1: the targets
+    /// resolved, so exit 2 ("not found") would misstate the cause.
     #[test]
     fn a_read_where_no_body_was_readable_does_not_exit_success() {
         let unreadable = |name: &str| nestweaver_engine::read_symbols::SymbolWindow {
@@ -32381,8 +32418,10 @@ credential_method = "gh"
             ..Default::default()
         };
         let (code, _) = render_read_symbols(&res, false).unwrap();
+        // nw-539/nw-706: exit 1 (state), deliberately no longer exit 2, which
+        // is reserved for a target that did not resolve.
         assert_eq!(
-            code, EXIT_NOT_FOUND,
+            code, EXIT_ERROR,
             "every requested body was unreadable; exiting 0 reports success for \
              work that did not happen"
         );

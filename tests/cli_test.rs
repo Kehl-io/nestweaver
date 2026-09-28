@@ -12767,6 +12767,21 @@ fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
     assert_eq!(code, Some(2), "{payload}");
     assert_eq!(payload["not_found"][0], "nw539NoSuchSymbolXYZ", "{payload}");
 
+    // nw-706: a READABLE --root holding none of the indexed files (the wrong
+    // tree) is the same state, with its own reason.
+    let wrong_tree = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&wrong_tree).unwrap();
+    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_tree));
+    assert_eq!(code, Some(1), "{payload}");
+    assert_eq!(payload["error"], "unreadable_root", "{payload}");
+    assert_eq!(
+        payload["unreadable_root"]["reason"], "no indexed file readable under it",
+        "{payload}"
+    );
+    // Counterweight: the right tree passed explicitly still reads.
+    let (code, payload, _) = read("nw539ReadTarget", Some(&repo_dir));
+    assert_eq!(code, Some(0), "{payload}");
+
     // Counterweight: an omitted --root still reads from the recorded root.
     let (code, payload, _) = read("nw539ReadTarget", None);
     assert_eq!(code, Some(0), "{payload}");
