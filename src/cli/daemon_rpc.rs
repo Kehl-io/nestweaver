@@ -714,6 +714,20 @@ pub(crate) fn print_regex_execution_note(res: &nestweaver_store::regex::RegexSea
     );
 }
 
+/// The text renderer's column suffix for a regex hit (nw-549): `:COL` after a
+/// `path:line` location, so several hits on one line read as distinct places.
+/// Empty for a note location (no line) or an older daemon that sent no column.
+pub(crate) fn regex_column_suffix(m: &nestweaver_store::regex::RegexMatch) -> String {
+    let has_line = m
+        .location
+        .rsplit_once(':')
+        .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()));
+    match m.column {
+        Some(column) if has_line => format!(":{column}"),
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn regex_truncation_label(
     reason: Option<nestweaver_store::regex::RegexTruncationReason>,
 ) -> &'static str {

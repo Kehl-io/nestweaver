@@ -20397,7 +20397,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         println!("Found {} match(es) for '{pattern}':", res.results.len());
                         for m in &res.results {
-                            println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
+                            println!(
+                                "  [{}] {} {}{} — {}",
+                                m.kind,
+                                m.title,
+                                m.location,
+                                regex_column_suffix(m),
+                                m.snippet
+                            );
                         }
                         if res.truncated {
                             println!(
@@ -20470,7 +20477,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 println!("Found {} match(es) for '{pattern}':", res.results.len());
                 for m in &res.results {
-                    println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
+                    println!(
+                        "  [{}] {} {}{} — {}",
+                        m.kind,
+                        m.title,
+                        m.location,
+                        regex_column_suffix(m),
+                        m.snippet
+                    );
                 }
                 if res.truncated {
                     println!(
