@@ -805,8 +805,9 @@ fn extract_db_path(message: &str) -> String {
 /// This is deliberately a runbook and NOT an automated recovery. The signature
 /// is not yet characterised well enough to act on: `quarantine_orphaned_wal`
 /// fires only on an exactly-diagnosable shape (`.wal` present, `.shadow`
-/// absent) which this state does NOT match — `.shadow` was present — and a full
-/// re-index is not something `repair` can perform. Print it; do not run it.
+/// absent, no `.wal.checkpoint`) which this state does NOT match — `.shadow`
+/// was present — and a full re-index is not something `repair` can perform.
+/// Print it; do not run it.
 fn wal_corruption_runbook(db: &str) -> String {
     format!(
         "Recover it in this order:\n  \
