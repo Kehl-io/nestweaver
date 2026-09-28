@@ -712,6 +712,26 @@ pub const LITE_TOOLS: &[&str] = &[
 /// Returns the `tools/list` payload — schemas + descriptions for every tool
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
 /// When `--tools` was specified, only those named tools are included.
+/// Scalar identifier and query arguments that must be non-empty (nw-577).
+const NONEMPTY_STRING_PARAMS: &[&str] = &[
+    "uid",
+    "title",
+    "name",
+    "target",
+    "project",
+    "symbol",
+    "query",
+    "pattern",
+    "bundle_id",
+    "key",
+    "tag",
+    "path",
+    "base_ref",
+];
+
+/// Identifier and query lists that need at least one non-empty entry (nw-577).
+const NONEMPTY_ARRAY_PARAMS: &[&str] = &["seeds", "targets", "uids_or_fqns", "patterns"];
+
 fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = all_tool_schemas_undecorated();
     // Every cacheable tool honours `cache: "bypass"` / `no_cache: true` at
@@ -748,6 +768,40 @@ fn all_tool_schemas() -> Vec<Value> {
                 "description": "When true, skip the response cache for this call."
             })
         });
+    }
+    // nw-577. An empty identifier or query meant three different things
+    // (`get_summary` unfiltered, `note_get` "omitted", `backlinks` a lookup
+    // for title ''), because no scalar identifier declared `minLength`. It is
+    // declared here, over the whole registry, for every property in the two
+    // lists below, so "" is one schema error (isError: true on MCP, exit 64
+    // on the CLI) on every tool, and a new tool cannot forget it. Filters
+    // (`repo`, `path_prefix`, `since`, ...) are deliberately not listed.
+    for tool in &mut schemas {
+        let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (key, property) in properties.iter_mut() {
+            let Some(property) = property.as_object_mut() else {
+                continue;
+            };
+            let kind = property.get("type").and_then(Value::as_str).map(str::to_owned);
+            let kind = kind.as_deref();
+            if kind == Some("string") && NONEMPTY_STRING_PARAMS.contains(&key.as_str()) {
+                property.entry("minLength").or_insert(json!(1));
+            }
+            if kind == Some("array") && NONEMPTY_ARRAY_PARAMS.contains(&key.as_str()) {
+                property.entry("minItems").or_insert(json!(1));
+                if let Some(items) = property.get_mut("items").and_then(Value::as_object_mut)
+                    && items.get("type").and_then(Value::as_str) == Some("string")
+                {
+                    items.entry("minLength").or_insert(json!(1));
+                }
+            }
+        }
     }
     // nw-293. Every tool must declare MCP `annotations`, DERIVED from
     // `MUTATING_TOOLS` for exactly the reason the cache decoration above is
@@ -28402,6 +28456,82 @@ mod nw674_project_context_tests {
         );
         let complete = context_for(&store, "complete");
         assert!(complete.get("repo_issues").is_none(), "{complete}");
+    }
+}
+
+#[cfg(test)]
+mod empty_identifier_tests {
+    use super::*;
+
+    /// nw-577. Every identifier/query argument in the registry rejects "",
+    /// and every identifier list rejects `[]` and `[""]`, as one schema error.
+    /// Enumerated from the registry, so a new tool is covered automatically.
+    #[test]
+    fn every_identifier_rejects_the_empty_string() {
+        let mut checked = 0;
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap();
+            let Some(properties) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (key, property) in properties {
+                let kind = property["type"].as_str();
+                let args = if kind == Some("string")
+                    && NONEMPTY_STRING_PARAMS.contains(&key.as_str())
+                {
+                    vec![json!({ key: "" })]
+                } else if kind == Some("array") && NONEMPTY_ARRAY_PARAMS.contains(&key.as_str()) {
+                    vec![json!({ key: [] }), json!({ key: [""] })]
+                } else {
+                    continue;
+                };
+                for args in args {
+                    let error = validate_tool_arguments(name, &args)
+                        .expect_err(&format!("{name} {args} must be refused"));
+                    assert!(
+                        error.to_string().contains(&format!("/{key}")),
+                        "{name} {args}: the error must point at '{key}': {error}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // The shapes the report named, so the enumeration cannot pass empty.
+        assert!(checked >= 30, "only {checked} identifier checks ran");
+        for (tool, args) in [
+            ("get_summary", json!({ "name": "" })),
+            ("get_summary", json!({ "target": "" })),
+            ("note_get", json!({ "title": "" })),
+            ("backlinks", json!({ "title": "" })),
+            ("backlinks", json!({ "uid": "" })),
+            ("query_extensions", json!({ "uid": "" })),
+            ("brain_memory_related", json!({ "uid": "" })),
+            ("project_context", json!({ "project": "" })),
+            ("read_symbols", json!({ "targets": [""] })),
+            ("brain_context", json!({ "seeds": [] })),
+            ("brain_search", json!({ "query": "" })),
+        ] {
+            let error = validate_tool_arguments(tool, &args).expect_err(tool);
+            assert!(
+                error.is::<ToolArgumentsInvalid>(),
+                "{tool}: must be a typed schema error: {error}"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT: real values, including non-ASCII, still pass.
+    #[test]
+    fn a_real_identifier_still_validates() {
+        for (tool, args) in [
+            ("brain_context", json!({ "seeds": ["café"] })),
+            ("read_symbols", json!({ "targets": ["café"] })),
+            ("note_get", json!({ "title": "café" })),
+            ("get_summary", json!({ "target": "é" })),
+            ("project_context", json!({ "project": "p" })),
+        ] {
+            validate_tool_arguments(tool, &args)
+                .unwrap_or_else(|error| panic!("{tool} {args}: {error}"));
+        }
     }
 }
 
