@@ -740,8 +740,10 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 /// another. Quarantining is reversible and leaves the evidence in place.
 ///
 /// Only acts on the exact orphan signature — `.wal` present AND `.shadow`
-/// absent. A `.wal` with its `.shadow` intact is a normal recoverable log and
-/// must be left for the engine to replay.
+/// absent AND no frozen `.wal.checkpoint`. A `.wal` with its `.shadow` intact
+/// is a normal recoverable log, and a `.wal` beside a frozen checkpoint log is
+/// an interrupted checkpoint whose active log holds later commits; both must be
+/// left for the engine.
 ///
 /// nw-373: like stale-checkpoint cleanup, the rename requires an exact borrowed
 /// [`DbWriteLease`]. A read-write engine open is not itself authority because
@@ -752,7 +754,8 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     }
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
-    if !wal.exists() || shadow.exists() {
+    let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
+    if !wal.exists() || shadow.exists() || frozen.exists() {
         return None;
     }
     let stamp = std::time::SystemTime::now()
@@ -4849,6 +4852,31 @@ mod tests {
             "a wal accompanied by its shadow must never be moved"
         );
         assert!(dir.path().join("brain.lbug.wal").exists());
+    }
+
+    /// A frozen `.wal.checkpoint` beside the `.wal` means a checkpoint was
+    /// interrupted. lbug unlinks `.shadow` BEFORE it clears the frozen log, so
+    /// this state has no `.shadow` either. The active `.wal` then holds writes
+    /// committed after the checkpoint began: it is not an orphan, and moving it
+    /// aside would open the database without them.
+    #[test]
+    fn wal_beside_a_frozen_checkpoint_wal_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"live-after-checkpoint").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"frozen").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        assert!(
+            quarantine_orphaned_wal(&db, Some(&authority)).is_none(),
+            "a wal beside a frozen checkpoint wal must never be moved"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("brain.lbug.wal")).unwrap(),
+            b"live-after-checkpoint"
+        );
+        assert!(dir.path().join("brain.lbug.wal.checkpoint").exists());
     }
 
     /// No `.wal` at all is not an orphan case.
