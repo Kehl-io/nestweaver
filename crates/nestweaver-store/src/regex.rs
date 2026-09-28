@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use lbug::Value;
-use regex_syntax::hir::literal::Extractor;
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
@@ -490,56 +489,260 @@ fn trigrams(s: &str) -> HashSet<String> {
 /// Expression Matching with a Trigram Index"):
 ///   trigrams("abcd") = "abc" AND "bcd"   -- conjuncts WITHIN one literal
 ///   match(e1|e2)     = match(e1) OR match(e2)  -- alternatives ACROSS branches
+///   match(e1 e2)     = match(e1) AND match(e2) -- every concatenated part
 ///
-/// The literal extractor resolves alternations into alternative literals: for
-/// `(alpha|beta)` it yields both, and a match needs only ONE of them — so each
-/// literal becomes its own branch. Merging every literal's trigrams into a
-/// single OR clause (nw-142) made a document match on any ONE shared trigram,
-/// which selected ~40% of the corpus for a 20-character identifier. ANDing
-/// ACROSS branches (the behavior before that) was equally wrong: it required
-/// every alternation branch to appear in the same text and dropped real
-/// matches. Per-branch conjunction, cross-branch disjunction is the shape that
-/// is both correct and selective.
+/// Each alternative literal is its own branch. Merging every literal's
+/// trigrams into a single OR clause (nw-142) made a document match on any ONE
+/// shared trigram, which selected ~40% of the corpus for a 20-character
+/// identifier. ANDing ACROSS branches (the behavior before that) was equally
+/// wrong: it required every alternation branch to appear in the same text and
+/// dropped real matches.
 ///
-/// Returns `None` when the regex has no usable required literals (e.g. `.{4,}`,
-/// leading `.*`) or when ANY literal yields no trigrams (e.g. an alternation
-/// branch shorter than 3 chars, or a non-literal branch): that branch is then
-/// unconstrainable, so the only safe pre-filter is none at all — the caller
-/// falls back to a full scan.
+/// nw-697: this walks the whole HIR rather than taking only the literal
+/// extractor's PREFIXES. With prefixes alone `fn\s+run_\w+_reconciler` yielded
+/// `fn`, too short for a trigram, so the search fell back to a full scan and
+/// false-emptied within the default budget — while `run_` and `_reconciler`
+/// are required INNER literals every match contains.
+///
+/// Conservative by construction: every clause produced is implied by every
+/// match. Anything the walk cannot bound (a large class, `*`, `{0,n}`) is
+/// "no constraint", a conjunct is dropped rather than risked when the formula
+/// grows too large, and alternatives are widened to their shared trigrams.
+///
+/// Returns `None` when no usable constraint remains (e.g. `.{4,}`, or an
+/// alternation branch shorter than 3 chars): the caller falls back to a full
+/// scan.
 fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
     let hir = regex_syntax::parse(pattern).ok()?;
-    let extractor = Extractor::new();
-    // We want the set of literals that any match is *prefixed/seeded* by; the
-    // "required" (suffix-anchored) seq is the conservative choice for a
-    // pre-filter — every match must contain one of these literals.
-    let seq = extractor.extract(&hir);
+    trigram_info(&hir).requirement()
+}
 
-    // If the seq is infinite/inexact-without-finite-literals, we cannot use it.
-    let literals = seq.literals()?;
-    if literals.is_empty() {
-        return None;
+/// Largest set of exact strings tracked for one sub-expression before it is
+/// turned into a trigram requirement (bounds `[ab][cd][ef]…` products).
+const MAX_EXACT_STRINGS: usize = 16;
+/// Largest class expanded into its individual characters.
+const MAX_CLASS_CHARS: u32 = 8;
+/// Largest DNF kept; beyond it an AND drops a conjunct and an OR widens to the
+/// trigrams its branches share — both only ever admit MORE candidates.
+const MAX_DNF_BRANCHES: usize = 32;
+
+/// Trigram requirement: `None` admits every text, `Some(dnf)` is an OR of
+/// ANDed trigram sets (never empty, no empty branch).
+type TrigramDnf = Option<Vec<HashSet<String>>>;
+
+/// What a sub-expression tells the planner: either the complete (small) set of
+/// strings it can match, or a requirement on text containing any match.
+struct TrigramInfo {
+    exact: Option<std::collections::BTreeSet<String>>,
+    required: TrigramDnf,
+}
+
+impl TrigramInfo {
+    fn exact(strings: std::collections::BTreeSet<String>) -> Self {
+        Self {
+            exact: Some(strings),
+            required: None,
+        }
     }
 
-    // One branch per literal. Within a branch the trigrams are conjuncts; the
-    // branches themselves are alternatives. A literal shorter than 3 chars
-    // yields no trigrams → that branch cannot constrain the search, and since a
-    // match may take that branch, the whole prefilter is unusable.
-    let mut branches: Vec<HashSet<String>> = Vec::new();
-    for lit in literals {
-        // Inexact literals are prefixes/fragments; their trigrams are still a
-        // necessary condition for the branch, so they remain usable.
-        let lit_str = String::from_utf8_lossy(lit.as_bytes()).to_string();
-        let tg = trigrams(&lit_str);
+    fn unconstrained() -> Self {
+        Self {
+            exact: None,
+            required: None,
+        }
+    }
+
+    fn requirement(&self) -> TrigramDnf {
+        match &self.exact {
+            Some(strings) => dnf_of_exact(strings),
+            None => self.required.clone(),
+        }
+    }
+}
+
+/// Any of `strings` may be the match, so the requirement is the OR of each
+/// string's trigrams; a string with none (shorter than 3 chars) admits all.
+fn dnf_of_exact(strings: &std::collections::BTreeSet<String>) -> TrigramDnf {
+    let mut branches = Vec::with_capacity(strings.len());
+    for string in strings {
+        let tg = trigrams(string);
         if tg.is_empty() {
-            // This alternation branch has no usable trigram → cannot prefilter.
             return None;
         }
         branches.push(tg);
     }
-    if branches.is_empty() {
-        return None;
+    dnf_or(Some(branches), Some(Vec::new()))
+}
+
+fn dnf_and(a: TrigramDnf, b: TrigramDnf) -> TrigramDnf {
+    let (a, b) = match (a, b) {
+        (None, other) | (other, None) => return other,
+        (Some(a), Some(b)) => (a, b),
+    };
+    if a.len().saturating_mul(b.len()) > MAX_DNF_BRANCHES {
+        // Dropping a conjunct only loosens the filter; keep the side with
+        // fewer alternatives.
+        return Some(if a.len() <= b.len() { a } else { b });
     }
-    Some(branches)
+    let mut out = Vec::with_capacity(a.len() * b.len());
+    for left in &a {
+        for right in &b {
+            out.push(left.union(right).cloned().collect());
+        }
+    }
+    Some(out)
+}
+
+fn dnf_or(a: TrigramDnf, b: TrigramDnf) -> TrigramDnf {
+    let (Some(mut a), Some(b)) = (a, b) else {
+        return None;
+    };
+    a.extend(b);
+    if a.len() > MAX_DNF_BRANCHES {
+        // Every match satisfies some branch, and so the trigrams ALL branches
+        // share.
+        let mut shared = a[0].clone();
+        for branch in &a[1..] {
+            shared.retain(|tg| branch.contains(tg));
+        }
+        if shared.is_empty() {
+            return None;
+        }
+        a = vec![shared];
+    }
+    if a.is_empty() { None } else { Some(a) }
+}
+
+/// A class small enough to enumerate, as the per-char case folds `trigrams`
+/// applies to indexed text; `None` when it is too large to be worth it.
+fn class_exact(class: &regex_syntax::hir::Class) -> Option<std::collections::BTreeSet<String>> {
+    let regex_syntax::hir::Class::Unicode(class) = class else {
+        return None;
+    };
+    let mut size: u32 = 0;
+    let mut out = std::collections::BTreeSet::new();
+    for range in class.ranges() {
+        size = size.saturating_add(u32::from(range.end()) - u32::from(range.start()) + 1);
+        if size > MAX_CLASS_CHARS {
+            return None;
+        }
+        for c in range.start()..=range.end() {
+            let folded: String = c.to_lowercase().collect();
+            // Keep the fold idempotent and single-char, so a pattern-side
+            // fold and the index-side fold of the same text agree.
+            if folded.chars().count() != 1
+                || folded
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+                    != folded
+            {
+                return None;
+            }
+            out.insert(folded);
+        }
+    }
+    Some(out)
+}
+
+fn trigram_info(hir: &regex_syntax::hir::Hir) -> TrigramInfo {
+    use regex_syntax::hir::HirKind;
+    let empty = || std::collections::BTreeSet::from([String::new()]);
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => TrigramInfo::exact(empty()),
+        HirKind::Literal(literal) => match std::str::from_utf8(&literal.0) {
+            Ok(text) => TrigramInfo::exact(std::collections::BTreeSet::from([text.to_string()])),
+            Err(_) => TrigramInfo::unconstrained(),
+        },
+        HirKind::Class(class) => class_exact(class)
+            .map(TrigramInfo::exact)
+            .unwrap_or_else(TrigramInfo::unconstrained),
+        HirKind::Capture(capture) => trigram_info(&capture.sub),
+        HirKind::Repetition(rep) => {
+            let sub = trigram_info(&rep.sub);
+            match (rep.min, rep.max) {
+                (1, Some(1)) => sub,
+                // `x?`: either nothing or one `x`.
+                (0, Some(1)) => match sub.exact {
+                    Some(mut strings) if strings.len() < MAX_EXACT_STRINGS => {
+                        strings.insert(String::new());
+                        TrigramInfo::exact(strings)
+                    }
+                    _ => TrigramInfo::unconstrained(),
+                },
+                (0, _) => TrigramInfo::unconstrained(),
+                // At least one copy of `x` is in every match.
+                _ => TrigramInfo {
+                    exact: None,
+                    required: sub.requirement(),
+                },
+            }
+        }
+        HirKind::Concat(children) => {
+            let mut required: TrigramDnf = None;
+            let mut current = Some(empty());
+            let mut all_exact = true;
+            for child in children {
+                let info = trigram_info(child);
+                let prefix = current.take().unwrap_or_else(empty);
+                match info.exact {
+                    Some(strings) => {
+                        let product: std::collections::BTreeSet<String> = prefix
+                            .iter()
+                            .flat_map(|p| strings.iter().map(move |s| format!("{p}{s}")))
+                            .collect();
+                        if product.len() <= MAX_EXACT_STRINGS {
+                            current = Some(product);
+                        } else {
+                            all_exact = false;
+                            required = dnf_and(required, dnf_of_exact(&prefix));
+                            current = Some(strings);
+                        }
+                    }
+                    None => {
+                        all_exact = false;
+                        required = dnf_and(required, dnf_of_exact(&prefix));
+                        required = dnf_and(required, info.required);
+                        current = Some(empty());
+                    }
+                }
+            }
+            let tail = current.unwrap_or_else(empty);
+            if all_exact {
+                TrigramInfo::exact(tail)
+            } else {
+                TrigramInfo {
+                    exact: None,
+                    required: dnf_and(required, dnf_of_exact(&tail)),
+                }
+            }
+        }
+        HirKind::Alternation(children) => {
+            let infos: Vec<TrigramInfo> = children.iter().map(trigram_info).collect();
+            let mut union = std::collections::BTreeSet::new();
+            let mut all_exact = true;
+            for info in &infos {
+                match &info.exact {
+                    Some(strings) => union.extend(strings.iter().cloned()),
+                    None => all_exact = false,
+                }
+            }
+            if all_exact && union.len() <= MAX_EXACT_STRINGS {
+                return TrigramInfo::exact(union);
+            }
+            let mut required = Some(Vec::new());
+            for info in &infos {
+                required = dnf_or(required, info.requirement());
+                if required.is_none() {
+                    break;
+                }
+            }
+            TrigramInfo {
+                exact: None,
+                required,
+            }
+        }
+    }
 }
 
 impl GraphStore {
@@ -2460,6 +2663,137 @@ mod tests {
     #[test]
     fn a_branch_without_trigrams_disables_the_prefilter() {
         assert!(required_trigram_clauses("(alpha|xy)").is_none());
+    }
+
+    /// nw-697: `fn` is too short for a trigram, but `run_` and `_reconciler`
+    /// are inner literals every match contains. Prefix-only extraction gave
+    /// up on the whole pattern and fell back to a full scan.
+    #[test]
+    fn inner_literals_plan_a_pattern_with_a_short_prefix() {
+        let branches = required_trigram_clauses(r"fn\s+run_\w+_reconciler")
+            .expect("inner literals must plan the pattern");
+        assert_eq!(branches.len(), 1, "one conjunctive branch: {branches:?}");
+        let mut expected = trigrams("run_");
+        expected.extend(trigrams("_reconciler"));
+        assert_eq!(branches[0], expected);
+        // Counterweight: a pattern with no required literal still falls back.
+        assert!(required_trigram_clauses(r"fn\s+\w+").is_none());
+    }
+
+    fn symbol_with_signature(uid: &str, signature: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: signature.to_string(),
+            summary: None,
+            content_hash: "c".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    const PLANNER_FIXTURE: &[&str] = &[
+        "fn run_code_link_reconciler(state: Arc<DaemonState>)",
+        "async fn run_embedding_reconciler(tick: Duration)",
+        "fn   run_trigram_reconciler()",
+        "FN RUN_X_RECONCILER()",
+        "fn runner_reconcile()",
+        "fn walk_reconciler()",
+        "pub fn colour_grey() -> Colour",
+        "pub fn color_gray() -> Color",
+        "pub fn COLOR_GREY()",
+        "fn alpha_12() -> bravo_7",
+        "fn xyz_abcf() -> yz_def",
+        "fn ABC_X() / reconcilerreconciler",
+        "fn authenticateUser(req: Request)",
+        "fn authenticate(req: Request)",
+        "fn \u{17F}trange_long_s()",
+        "fn \u{212A}elvin_scale()",
+        "fn a12bcd() -> abcd",
+        "fn run_ab_x() -> run_cc_x",
+    ];
+
+    /// nw-697: the planner must never drop a true match. For each pattern the
+    /// trigram-planned search over an indexed on-disk store must return
+    /// exactly what a full scan of the same rows returns. The patterns cover
+    /// alternations, optional groups, case-insensitive flags (including
+    /// non-ASCII folds) and classes; the planned ones are asserted to use the
+    /// index, so the comparison is not two scans.
+    #[test]
+    fn planned_regex_results_match_a_full_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let planned_store = GraphStore::open(&temp.path().join("brain.lbug")).unwrap();
+        let scan_store = GraphStore::in_memory().unwrap();
+        for (i, signature) in PLANNER_FIXTURE.iter().enumerate() {
+            let symbol = symbol_with_signature(&format!("sym_{i}"), signature);
+            planned_store.insert_symbol(&symbol).unwrap();
+            scan_store.insert_symbol(&symbol).unwrap();
+        }
+        planned_store.rebuild_trigram_index().unwrap();
+
+        // (pattern, must be trigram-planned)
+        let patterns: &[(&str, bool)] = &[
+            (r"fn\s+run_\w+_reconciler", true),
+            (r"(?i)FN\s+RUN_\w+_RECONCILER", true),
+            (r"colou?r_gr[ae]y", true),
+            (r"(?i)colou?r_gr[ae]y", true),
+            (r"(alpha|bravo)_\d+", true),
+            (r"(run|walk)_\w*reconciler", true),
+            (r"(?:reconciler)+", true),
+            (r"x?yz_(abc|de)f", true),
+            (r"[[:upper:]]{3}_X", false),
+            (r"\bauthenticate(User)?\b", true),
+            (r"(?i)AUTHENTICATEUSER", true),
+            (r"(?i)STRANGE_long", true),
+            (r"(?i)kelvin_SCALE", true),
+            (r"reconciler\(\)$", true),
+            (r"a.{0,3}bcd", true),
+            (r"(?s)fn.*reconciler", true),
+            (r"run_[a-c]{2}_x", true),
+            (r"(?i)run_[A-C]{2}_X", true),
+            (r"fn\s+\w+", false),
+        ];
+        for (pattern, must_plan) in patterns {
+            let planned = planned_store
+                .regex_search(pattern, None, None, None, None)
+                .unwrap();
+            let scanned = scan_store
+                .regex_search(pattern, None, None, None, None)
+                .unwrap();
+            assert!(scanned.scanned_fallback, "{pattern}: reference must scan");
+            assert_eq!(
+                !planned.scanned_fallback,
+                *must_plan,
+                "{pattern}: planned={} clauses={:?}",
+                !planned.scanned_fallback,
+                required_trigram_clauses(pattern)
+            );
+            let rows = |result: &RegexSearchResult| {
+                let mut rows: Vec<(String, Option<u32>, Option<u32>, String)> = result
+                    .results
+                    .iter()
+                    .map(|m| (m.uid.clone(), m.line, m.column, m.matched.clone()))
+                    .collect();
+                rows.sort();
+                rows
+            };
+            assert!(
+                !scanned.results.is_empty() || !*must_plan,
+                "{pattern}: fixture must hold a match"
+            );
+            assert_eq!(rows(&planned), rows(&scanned), "{pattern}");
+        }
     }
 
     fn store_with_text() -> GraphStore {
