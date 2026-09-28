@@ -3234,6 +3234,85 @@ timeout = "15s"
 /// Decision 2): a raw MCP client POSTing a two-tier-routed tool to a daemon
 /// configured with an `[[upstream]]` gets a `{ local_impact, org_wide_impact }`
 /// envelope plus federated provenance — no client-side `HybridClient` involved.
+/// nw-557 F1: `brain_impact` is TwoTier-routed, so behind a daemon with a
+/// healthy upstream a miss is nested as `local_impact.status`. A symbol NEITHER
+/// tier knows must still be `isError: true` with the not-found envelope at the
+/// top; one only the upstream knows is found, so `isError: false`.
+#[tokio::test]
+async fn daemon_mcp_boundary_two_tier_impact_miss_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[("server/main.js", "function serverimpactfn(x) { return x; }")],
+    );
+    index_repo(&server_repo, &db_server);
+    let upstream = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("local/main.js", "function localimpactfn(x) { return x; }")],
+    );
+    index_repo(&local_repo, &db_local);
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "orgserver", &upstream.grpc_addr(), HYBRID_TOKEN);
+    let fronting = helpers::server_guard::ServerGuard::start_with_config(&db_local, &cfg_path);
+    let mcp_addr = fronting.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let call = |symbol: &'static str| {
+        let client = client.clone();
+        let url = format!("{mcp_addr}/mcp");
+        async move {
+            let body: Value = client
+                .post(url)
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": { "name": "brain_impact", "arguments": { "symbol": symbol } }
+                }))
+                .send()
+                .await
+                .expect("MCP HTTP tools/call request failed")
+                .json()
+                .await
+                .unwrap();
+            body
+        }
+    };
+
+    // Found-on-upstream FIRST, on a cold upstream whose adaptive timeout is
+    // still the full ceiling (as in `daemon_mcp_boundary_federates_two_tier`).
+    // A fast first call would train a short EWMA timeout the second call can
+    // exceed under parallel test load.
+    let upstream_only = call("serverimpactfn").await;
+    let structured = &upstream_only["result"]["structuredContent"];
+    assert_eq!(structured["tier"], "two_tier", "{upstream_only}");
+    assert!(
+        structured["org_wide_impact"].get("results").is_some(),
+        "the upstream must have answered: {upstream_only}"
+    );
+    assert_eq!(
+        upstream_only["result"]["isError"], false,
+        "found on the upstream tier is not a miss: {upstream_only}"
+    );
+
+    // A symbol neither tier knows. Whether the upstream answers `not_found`
+    // or times out (`unavailable`), both tiers missed: the call is a miss.
+    let miss = call("nosuchimpactsymqq").await;
+    let structured = &miss["result"]["structuredContent"];
+    assert_eq!(
+        structured["tier"], "two_tier",
+        "must be the hybrid path: {miss}"
+    );
+    assert_eq!(miss["result"]["isError"], true, "{miss}");
+    assert_eq!(structured["status"], "not_found", "{miss}");
+    assert_eq!(structured["error"], "not found", "{miss}");
+    assert!(structured["message"].is_string(), "{miss}");
+}
+
 #[tokio::test]
 async fn daemon_mcp_boundary_federates_two_tier() {
     let dir = tempfile::tempdir().unwrap();
