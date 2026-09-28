@@ -97,6 +97,15 @@ pub fn skip_excluded_by_request(reason_code: SkipReasonCode, reason: &str) -> bo
     matches!(reason_code, SkipReasonCode::Ignored) && reason == BRAINIGNORE_SKIP_REASON
 }
 
+/// Whether a vault run's coverage is degraded: some note was skipped for a
+/// reason OTHER than an exclusion the operator requested. `.brainignore`-only
+/// skips are complete coverage on every route (nw-196 review N2).
+pub fn vault_coverage_degraded(skipped: &[SkippedFile]) -> bool {
+    skipped
+        .iter()
+        .any(|row| !skip_excluded_by_request(row.reason_code, &row.reason))
+}
+
 /// [`skip_excluded_by_request`] for a skip row as it crosses the daemon wire
 /// (`IndexSkipDetail`: the snake_case `reason_code` string and its `detail`).
 /// The same rule, not a second one: the wire code is parsed back into the

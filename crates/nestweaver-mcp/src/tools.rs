@@ -9294,7 +9294,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "unresolved_link_occurrences": result.unresolved_link_occurrences,
                 "unresolved_link_section_targets": result.unresolved_link_section_targets,
                 "unresolved_link_targets": result.unresolved_link_targets,
-                "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
+                "coverage_status": if nestweaver_engine::index_md::vault_coverage_degraded(&result.skipped) { "degraded" } else { "complete" },
                 "skipped_count": result.skipped.len(),
                 "skipped_files": result.skipped,
             }));

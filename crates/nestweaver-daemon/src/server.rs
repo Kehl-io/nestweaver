@@ -7975,10 +7975,14 @@ impl NestWeaverDaemon for DaemonService {
                     let frontmatter_unparsed =
                         index_skip_details(&result.index.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
-                    let coverage_status = if skipped_count == 0 {
-                        CoverageStatus::Complete as i32
-                    } else {
+                    // nw-196 review (N2): `.brainignore`-only skips are
+                    // complete coverage, the rule `brain refresh --json` uses.
+                    let coverage_status = if nestweaver_engine::index_md::vault_coverage_degraded(
+                        &result.index.skipped,
+                    ) {
                         CoverageStatus::Degraded as i32
+                    } else {
+                        CoverageStatus::Complete as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -8281,11 +8285,14 @@ impl NestWeaverDaemon for DaemonService {
                     // nw-585: see IndexVault.
                     let frontmatter_unparsed = index_skip_details(&result.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
-                    let coverage_status = if skipped_count == 0 {
-                        CoverageStatus::Complete as i32
-                    } else {
-                        CoverageStatus::Degraded as i32
-                    };
+                    // nw-196 review (N2): `.brainignore`-only skips are
+                    // complete coverage, the rule `brain refresh --json` uses.
+                    let coverage_status =
+                        if nestweaver_engine::index_md::vault_coverage_degraded(&result.skipped) {
+                            CoverageStatus::Degraded as i32
+                        } else {
+                            CoverageStatus::Complete as i32
+                        };
                     let withheld = match vault_derivation::withhold_if_coverage_gap(
                         &state,
                         &vault_path,
@@ -17498,6 +17505,50 @@ repos = ["alpha"]
             .unwrap();
         assert_eq!(blocked.len(), 1, "{status}");
         assert_eq!(blocked[0]["root_path"], root.display().to_string());
+    }
+
+    /// nw-196 review (N2): a vault whose only skip rows are `.brainignore`
+    /// exclusions reports COMPLETE coverage on both vault RPCs, as
+    /// `brain refresh --json` does; an unrequested skip still degrades it.
+    #[tokio::test]
+    async fn brainignore_only_skips_are_complete_coverage_on_vault_rpcs() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+        std::fs::write(root.join("secret.md"), "# Secret\n").unwrap();
+        let index = index_vault_via_rpc(&state, &root).await;
+        let last = index.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert!(last.skipped_count >= 1, "{last:?}");
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+        let refresh = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = refresh.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+
+        // Counterweight: an oversized note is an unrequested skip.
+        std::fs::write(
+            root.join("big.md"),
+            format!("# Big\n{}\n", "x".repeat(1024 * 1024 + 16)),
+        )
+        .unwrap();
+        let index = index_vault_via_rpc(&state, &root).await;
+        let last = index.last().unwrap();
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Degraded as i32,
+            "{last:?}"
+        );
     }
 
     /// nw-693 review (M1): a sidecar an older daemon stamped with the ambient
