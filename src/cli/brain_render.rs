@@ -1374,3 +1374,99 @@ pub(crate) fn publication_from_wire(
         },
     )
 }
+
+/// `brain doc-stats`'s text rendering, shared by the daemon and direct routes.
+///
+/// nw-554. The two unresolved-link counts are ONE population of broken links
+/// deduplicated two ways (nw-345): distinct (note, target) and distinct
+/// (section, target). Printed as two "unresolved links" lines, one missing
+/// `[[Note]]` read as a note-level miss AND a section-level miss. They are now
+/// one line: the vault-health number, then the finer per-section count in
+/// parentheses. The JSON keys and their meanings are unchanged.
+pub(crate) fn doc_stats_text_lines(stats: &nestweaver_engine::DocStats) -> Vec<String> {
+    let mut lines = vec![
+        "Document graph stats:".to_string(),
+        format!("  total notes:      {}", stats.total_notes),
+        format!(
+            "  wikilink edges:                        {}",
+            stats.wikilink_edges
+        ),
+        format!(
+            "  unresolved links:                      {} (distinct note + target; {} counted per source section)",
+            stats.unresolved_link_targets, stats.unresolved_link_section_targets
+        ),
+        format!(
+            "  low-confidence (resolved, not broken): {}",
+            stats.low_confidence_link_targets
+        ),
+        format!("  orphans:          {}", stats.orphans),
+        format!("  avg out-degree:   {:.2}", stats.avg_outdegree),
+    ];
+    if !stats.top_tags.is_empty() {
+        lines.push("  top tags:".to_string());
+        for t in &stats.top_tags {
+            lines.push(format!("    #{} ({})", t.tag, t.count));
+        }
+    }
+    if !stats.notes_by_year.is_empty() {
+        let mut years: Vec<(&String, &usize)> = stats.notes_by_year.iter().collect();
+        years.sort_by(|a, b| a.0.cmp(b.0));
+        lines.push("  notes by year:".to_string());
+        for (year, count) in years {
+            lines.push(format!("    {year}: {count}"));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod doc_stats_text_tests {
+    use super::doc_stats_text_lines;
+
+    fn stats(targets: usize, section_targets: usize) -> nestweaver_engine::DocStats {
+        serde_json::from_value(serde_json::json!({
+            "total_notes": 1,
+            "wikilink_edges": 0,
+            "unresolved_link_targets": targets,
+            "unresolved_link_section_targets": section_targets,
+            "low_confidence_link_targets": 0,
+            "orphans": 0,
+            "avg_outdegree": 0.0,
+            "top_tags": [],
+            "notes_by_year": {},
+        }))
+        .unwrap()
+    }
+
+    /// nw-554. One missing `[[Note]]` is one broken link. The text must not
+    /// list it under two "unresolved" headings as if a note-level miss and a
+    /// section-level miss both happened.
+    #[test]
+    fn one_missing_note_link_is_reported_once() {
+        let lines = doc_stats_text_lines(&stats(1, 1));
+        let unresolved: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("unresolved"))
+            .collect();
+        assert_eq!(unresolved.len(), 1, "{lines:#?}");
+        assert!(
+            unresolved[0].contains("unresolved links:                      1 "),
+            "{lines:#?}"
+        );
+    }
+
+    /// Counterweight: when the per-section count genuinely differs (the same
+    /// target linked from two sections of one note), both numbers still show.
+    #[test]
+    fn a_differing_per_section_count_is_still_shown() {
+        let lines = doc_stats_text_lines(&stats(2, 3));
+        let line = lines
+            .iter()
+            .find(|line| line.contains("unresolved links"))
+            .unwrap();
+        assert!(
+            line.contains(" 2 (") && line.contains("3 counted per source section"),
+            "{line}"
+        );
+    }
+}

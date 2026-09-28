@@ -3345,42 +3345,8 @@ pub(crate) fn run_brain(
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     let stats: nestweaver_engine::DocStats = serde_json::from_value(value)?;
-                    println!("Document graph stats:");
-                    println!("  total notes:      {}", stats.total_notes);
-                    // nw-345: each line says which POPULATION it counts. They
-                    // do not agree, and they are not meant to.
-                    println!(
-                        "  wikilink edges:                        {}",
-                        stats.wikilink_edges
-                    );
-                    println!(
-                        "  unresolved links (note + text):        {}",
-                        stats.unresolved_link_targets
-                    );
-                    println!(
-                        "  unresolved links (section + text):     {}",
-                        stats.unresolved_link_section_targets
-                    );
-                    println!(
-                        "  low-confidence (resolved, not broken): {}",
-                        stats.low_confidence_link_targets
-                    );
-                    println!("  orphans:          {}", stats.orphans);
-                    println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
-                    if !stats.top_tags.is_empty() {
-                        println!("  top tags:");
-                        for t in &stats.top_tags {
-                            println!("    #{} ({})", t.tag, t.count);
-                        }
-                    }
-                    if !stats.notes_by_year.is_empty() {
-                        let mut years: Vec<(&String, &usize)> =
-                            stats.notes_by_year.iter().collect();
-                        years.sort_by(|a, b| a.0.cmp(b.0));
-                        println!("  notes by year:");
-                        for (year, count) in years {
-                            println!("    {year}: {count}");
-                        }
+                    for line in doc_stats_text_lines(&stats) {
+                        println!("{line}");
                     }
                 }
                 return Ok((EXIT_SUCCESS, None));
@@ -3391,40 +3357,8 @@ pub(crate) fn run_brain(
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
-                println!("Document graph stats:");
-                println!("  total notes:      {}", stats.total_notes);
-                // nw-345: each line says which POPULATION it counts.
-                println!(
-                    "  wikilink edges:                        {}",
-                    stats.wikilink_edges
-                );
-                println!(
-                    "  unresolved links (note + text):        {}",
-                    stats.unresolved_link_targets
-                );
-                println!(
-                    "  unresolved links (section + text):     {}",
-                    stats.unresolved_link_section_targets
-                );
-                println!(
-                    "  low-confidence (resolved, not broken): {}",
-                    stats.low_confidence_link_targets
-                );
-                println!("  orphans:          {}", stats.orphans);
-                println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
-                if !stats.top_tags.is_empty() {
-                    println!("  top tags:");
-                    for t in &stats.top_tags {
-                        println!("    #{} ({})", t.tag, t.count);
-                    }
-                }
-                if !stats.notes_by_year.is_empty() {
-                    let mut years: Vec<(&String, &usize)> = stats.notes_by_year.iter().collect();
-                    years.sort_by(|a, b| a.0.cmp(b.0));
-                    println!("  notes by year:");
-                    for (year, count) in years {
-                        println!("    {year}: {count}");
-                    }
+                for line in doc_stats_text_lines(&stats) {
+                    println!("{line}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
