@@ -178,6 +178,24 @@ auto_repair_cache = false
         assert isinstance(payload, dict), payload
         return payload.get("local_impact", payload)
 
+    def call_not_found(self, identity, tool, arguments, *, key, message):
+        """A lookup miss (nw-557): an in-band tool error (`isError: true`) whose
+        text AND `structuredContent` are the same not-found envelope. Schema
+        and argument errors still go through `call(..., error=...)`, which
+        requires NO structured content."""
+        status, _, body = self.http(identity, "tools/call", {"name": tool, "arguments": arguments})
+        assert status == 200 and "error" not in body, body
+        result = body["result"]
+        assert result.get("isError") is True, body
+        payload = result.get("structuredContent")
+        assert isinstance(payload, dict), body
+        text = "\n".join(item.get("text", "") for item in result.get("content", []))
+        assert json.loads(text) == payload, ("text and structuredContent must agree", body)
+        assert payload.get("status") == "not_found" and payload.get("error") == "not found", body
+        assert isinstance(payload.get("message"), str) and message.lower() in payload["message"].lower(), body
+        assert key in payload, ("the envelope must echo the looked-up " + key, body)
+        return payload.get("local_impact", payload)
+
     def no_hidden(self, payload):
         serialized = json.dumps(payload)
         for marker in self.hidden_markers:
@@ -302,7 +320,8 @@ def selectors_cases(fixture):
     fixture.case("selectors", "admin-cache-cannot-supply-hidden-candidate", shared)
     for target in ("hiddenTarget", fixture.hidden_uid, "absentRouteSymbol", "sym:absent-route"):
         def not_found(symbol=target):
-            payload = fixture.call("query", "brain_impact", {"symbol": symbol})
+            payload = fixture.call_not_found("query", "brain_impact", {"symbol": symbol},
+                                             key="symbol", message="no symbol found")
             assert payload["status"] == "not_found", payload
             assert payload["impact_nodes"] == [] and payload["total"] == payload["returned"] == 0, payload
             assert not payload.get("candidates"), payload
@@ -310,7 +329,8 @@ def selectors_cases(fixture):
             assert payload.get("name") == symbol, payload
             assert payload.get("symbol") == symbol, payload
             fixture.no_hidden({key: value for key, value in payload.items()
-                               if key not in ("name", "symbol")})
+                               if key not in ("name", "symbol", "message")})
+            assert payload["message"] == f"no symbol found: '{symbol}'", payload
         fixture.case("selectors", "not-found-" + target, not_found)
     def uid_pin():
         payload = fixture.call("query", "brain_impact", {
@@ -320,8 +340,11 @@ def selectors_cases(fixture):
     fixture.case("selectors", "visible-uid-with-repo-pin", uid_pin)
     for repo in ("hidden_repo", "absentRouteRepo"):
         def wrong_repo(selector=repo):
-            payload = fixture.call("query", "brain_impact", {"symbol": "visibleTarget", "repo": selector})
+            payload = fixture.call_not_found("query", "brain_impact",
+                                             {"symbol": "visibleTarget", "repo": selector},
+                                             key="symbol", message="no symbol found")
             assert payload["status"] == "not_found" and payload["impact_nodes"] == [], payload
+            fixture.no_hidden(payload)
             assert not payload.get("candidates"), payload
         fixture.case("selectors", "wrong-repo-" + repo, wrong_repo)
     for repo, confidence, score in itertools.product((None, "visible_repo"), (None, 0.1), (None, 0)):
@@ -394,8 +417,13 @@ def context_cases(fixture):
     fixture.case("context", "structural-no-model-positive-control", no_model)
     for seed in ("absent-route-qzv987", "sym:absent", "note:absent", "head:absent",
                  "sec:absent", "tag:absent", "repo:absent", "vlt:absent", "proj:absent"):
-        fixture.case("context", "invalid-" + seed, lambda s=seed:
-                     fixture.call("admin", "brain_context", {"seeds": [s]}, error="No seeds resolved"))
+        def unresolved(s=seed):
+            payload = fixture.call_not_found("admin", "brain_context", {"seeds": [s]},
+                                             key="seeds", message="No seeds resolved")
+            assert payload["seeds"] == [s], payload
+            # nw-511: the miss names the command to run for a question.
+            assert "nestweaver investigate" in payload["message"], payload
+        fixture.case("context", "invalid-" + seed, unresolved)
     for seeds in ([], [""]):
         fixture.case("context", "empty-" + repr(seeds), lambda s=seeds:
                      fixture.call("admin", "brain_context", {"seeds": s}, error="seed"))
@@ -431,8 +459,11 @@ def notes_cases(fixture):
             assert not by_uid.get("body"), by_uid
         fixture.case("notes", identity + "-uid-and-body-opt-out", pinned)
         for arguments in ({"title": "Absent route note"}, {"uid": "note:missing-route"}):
-            fixture.case("notes", identity + "-missing-" + str(arguments), lambda who=identity, args=arguments:
-                         fixture.call(who, "note_get", args, error="note"))
+            def missing(who=identity, args=arguments):
+                (key, value), = args.items()
+                payload = fixture.call_not_found(who, "note_get", args, key=key, message="note")
+                assert payload[key] == value, payload
+            fixture.case("notes", identity + "-missing-" + str(arguments), missing)
 
 
 def main():
