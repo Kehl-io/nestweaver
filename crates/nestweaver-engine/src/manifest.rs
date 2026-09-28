@@ -87,6 +87,31 @@ pub fn manifest_cache_path(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".manifests.json")
 }
 
+/// nw-688: each indexed repo's declared package name, keyed by repo uid, as a
+/// best-effort HINT for cross-repo call attribution. It reads the sidecar's
+/// payload without the generation check [`load_manifest_cache_for_db`]
+/// applies: package names rarely change, and a stale name can at worst
+/// restore a low-confidence name-matched hint, never remove a definition.
+/// Missing or unreadable is empty.
+pub fn package_names_hint(db_path: &Path) -> HashMap<String, String> {
+    let Ok(bytes) = std::fs::read(manifest_cache_path(db_path)) else {
+        return HashMap::new();
+    };
+    let Ok(envelope) =
+        serde_json::from_slice::<nestweaver_store::artifact_envelope::ArtifactEnvelope>(&bytes)
+    else {
+        return HashMap::new();
+    };
+    if envelope.artifact_kind != MANIFEST_ARTIFACT_KIND {
+        return HashMap::new();
+    }
+    serde_json::from_value::<HashMap<String, ManifestInfo>>(envelope.payload)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(repo_uid, info)| info.package_name.map(|name| (repo_uid, name)))
+        .collect()
+}
+
 /// Load the canonical manifest sidecar, migrating the legacy replacement-
 /// extension path when it is the only copy present.
 pub fn load_manifest_cache_for_db(

@@ -3088,6 +3088,12 @@ fn infer_cross_repo_call_edges(
     const NAME_ONLY_CONFIDENCE: f32 = 0.20; // info tier (< 0.25 warning cutoff)
     const IMPORT_CORROBORATED_CONFIDENCE: f32 = 0.50; // SamePackageFallback
 
+    // nw-688: repo uid -> declared package name, to tell an indexed repo's
+    // package (`@org/shared`) from an npm one (`lodash`).
+    let package_names = store
+        .db_path()
+        .map(crate::manifest::package_names_hint)
+        .unwrap_or_default();
     let local_symbol_names: std::collections::HashSet<String> = parsed_files
         .iter()
         .flat_map(|(_, symbols, _, _)| symbols.iter().map(|s| s.name.clone()))
@@ -3104,24 +3110,25 @@ fn infer_cross_repo_call_edges(
             .filter(|r| r.kind == ReferenceKind::Import)
             .map(|r| r.name.as_str())
             .collect();
-        // nw-688: names bound from an npm package (`const { isEmpty } =
-        // require('lodash')`). The call is that package's function, not
-        // another indexed repo's same-named symbol, so it gets no hint.
-        let package_bound: std::collections::HashSet<&str> = references
+        // nw-688: names bound from a package (`const { isEmpty } =
+        // require('lodash')`), with the specifier they come from. Such a call
+        // is that package's function: it links only to a repo whose manifest
+        // declares that package (`@org/shared`), never to another repo's
+        // same-named symbol by name alone.
+        let package_bound: std::collections::HashMap<&str, &str> = references
             .iter()
             .filter(|r| r.kind == ReferenceKind::PackageBinding)
-            .map(|r| r.name.as_str())
+            .map(|r| (r.name.as_str(), r.context.as_str()))
             .collect();
 
         for reference in references {
             if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
                 continue;
             }
-            if local_symbol_names.contains(&reference.name)
-                || package_bound.contains(reference.name.as_str())
-            {
+            if local_symbol_names.contains(&reference.name) {
                 continue;
             }
+            let bound_package = package_bound.get(reference.name.as_str()).copied();
 
             let Some(source_symbol) = containing_symbol_for_line(symbols, reference.start_line)
             else {
@@ -3158,6 +3165,11 @@ fn infer_cross_repo_call_edges(
                     t.repo_uid != current_repo_uid
                         && t.uid != source_uid
                         && t.visibility != Visibility::Private
+                        && bound_package.is_none_or(|specifier| {
+                            package_names
+                                .get(&t.repo_uid)
+                                .is_some_and(|package| specifier_names_package(specifier, package))
+                        })
                 })
                 .cloned()
                 .collect();
@@ -3165,7 +3177,10 @@ fn infer_cross_repo_call_edges(
                 continue;
             }
 
-            let import_corroborated = imported_names.contains(reference.name.as_str());
+            // A package binding that matched the target repo's package IS
+            // the import that corroborates the call.
+            let import_corroborated =
+                bound_package.is_some() || imported_names.contains(reference.name.as_str());
             let confidence = if import_corroborated {
                 IMPORT_CORROBORATED_CONFIDENCE
             } else {
@@ -3204,6 +3219,14 @@ fn infer_cross_repo_call_edges(
         }
     }
     Ok(edges)
+}
+
+/// nw-688: whether an import specifier names `package` or a subpath of it
+/// (`@org/shared`, `@org/shared/utils`).
+fn specifier_names_package(specifier: &str, package: &str) -> bool {
+    specifier
+        .strip_prefix(package)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSymbol> {
@@ -12914,6 +12937,91 @@ describe('getTier', () => {\n  it('returns gold', () => {\n    getTier(2);\n  })
         assert!(
             !selected.contains(&"test/other.test.js"),
             "a test that never calls getTier must not be selected: {result:#?}"
+        );
+    }
+
+    /// nw-688: a call bound from a bare specifier that names ANOTHER INDEXED
+    /// repo's package (`@org/shared`, per its manifest) keeps its cross-repo
+    /// link, import-corroborated. Counterweights: the same call bound from
+    /// `lodash` gets none, and neither does `@org/shared` once the indexed
+    /// repo declares a different package name.
+    #[test]
+    fn a_package_import_naming_an_indexed_repo_keeps_its_cross_repo_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("index.js"),
+            "export function isEmpty(x) { return !x; }\nexport function sharedHelper(x) { return x; }\n",
+        )
+        .unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&lib);
+        index_with_reader(
+            &reader,
+            &store,
+            "test",
+            "https://example.com/lib",
+            "abc123",
+            None,
+        )
+        .unwrap();
+        let lib_uid = repo_uid("test", "https://example.com/lib");
+        let app_uid = repo_uid("test", "https://example.com/app");
+        let app_source = "const { isEmpty } = require('lodash');\n\
+const { sharedHelper } = require('@org/shared/utils');\n\
+function check(x) { return isEmpty(x); }\n\
+function viaPackage(x) { return sharedHelper(x); }\n\
+module.exports = { check, viaPackage };\n";
+        let links = |package: &str| {
+            crate::manifest::save_manifest_cache_for_db(
+                &HashMap::from([(
+                    lib_uid.clone(),
+                    crate::manifest::ManifestInfo {
+                        package_name: Some(package.to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                &store,
+                &db,
+            )
+            .unwrap();
+            let parsed = nestweaver_parser::parse_source(Path::new("main.js"), app_source).unwrap();
+            infer_cross_repo_call_edges(
+                &store,
+                &app_uid,
+                &[(
+                    "main.js".to_string(),
+                    parsed.symbols,
+                    parsed.references,
+                    Some(app_source.to_string()),
+                )],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.source_uid, edge.target_uid, edge.confidence))
+            .collect::<Vec<_>>()
+        };
+        let via_package = symbol_uid(&app_uid, "main.js", "viaPackage", 4);
+        let shared = symbol_uid(&lib_uid, "index.js", "sharedHelper", 2);
+        let check = symbol_uid(&app_uid, "main.js", "check", 3);
+
+        let declared = links("@org/shared");
+        assert!(
+            declared
+                .iter()
+                .any(|(s, t, c)| s == &via_package && t == &shared && *c >= 0.5),
+            "@org/shared is the indexed lib's package: {declared:?}"
+        );
+        assert!(
+            !declared.iter().any(|(s, _, _)| s == &check),
+            "lodash is no indexed repo's package: {declared:?}"
+        );
+        let other = links("@org/other");
+        assert!(
+            !other.iter().any(|(s, _, _)| s == &via_package),
+            "a repo declaring another package must not match: {other:?}"
         );
     }
 
