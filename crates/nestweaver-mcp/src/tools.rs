@@ -1124,6 +1124,19 @@ pub struct ToolArgumentsInvalid {
     message: String,
 }
 
+/// Whether `name` is a tool this server registers at all, regardless of the
+/// `--tools`/`--lite` selection (nw-576).
+pub fn is_registered_tool(name: &str) -> bool {
+    tool_validators().contains_key(name)
+}
+
+/// The bounded JSON-RPC -32602 message for an unregistered tool name
+/// (nw-576), shared by every transport through `validate_method_params`.
+pub fn unknown_tool_message(name: &str) -> String {
+    let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
+    truncate_utf8_bytes(&format!("Unknown tool: {name}"), MAX_VALIDATION_ERROR_BYTES)
+}
+
 pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
     let Some(validator) = tool_validators().get(name) else {
         let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);

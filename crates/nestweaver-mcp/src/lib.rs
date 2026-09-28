@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_with_unknown_tool_returns_error_envelope() {
+    fn tools_call_with_unknown_tool_returns_invalid_params() {
         let store = GraphStore::in_memory().unwrap();
         let req = make_request(
             "tools/call",
@@ -1015,13 +1015,14 @@ mod tests {
             json!({ "name": "no_such_tool", "arguments": {} }),
         );
         let frame = dispatch_method(&store, None, &req, None);
-        // Tool errors come back as success frames with isError=true (the
-        // intentional design — Claude sees the error in-band).
+        // nw-576: an unknown tool is a protocol error (-32602), the same shape
+        // as a missing name. Tool EXECUTION errors stay in-band isError results.
         match frame {
-            Frame::Success(resp) => {
-                assert_eq!(resp.result["isError"], json!(true));
+            Frame::Success(resp) => panic!("expected -32602, got result {}", resp.result),
+            Frame::Error(e) => {
+                assert_eq!(e.error.code, error_code::INVALID_PARAMS);
+                assert_eq!(e.error.message, "Unknown tool: no_such_tool");
             }
-            Frame::Error(e) => panic!("expected in-band error envelope, got {}", e.error.message),
         }
     }
 
