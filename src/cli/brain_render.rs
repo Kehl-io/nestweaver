@@ -198,8 +198,8 @@ pub(crate) fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool
 /// an MCP tool, where that is a context-window bomb rather than an answer. The
 /// MCP tool already truncated member lists at 20; the CLI did not.
 ///
-/// Truncation is reported rather than silent: `total_communities` vs
-/// `returned_communities`, and a per-community `returned_members`, so a caller
+/// Truncation is reported rather than silent: `total` vs `returned`
+/// (`clusters` array, nw-559 names), and a per-cluster `returned_members`, so a caller
 /// can tell a small graph from a truncated view. `0` means unlimited for both
 /// bounds, so the previous full output is still reachable.
 /// `graph_generation`/`cached` are nw-646's cache-identity disclosure: before
@@ -216,39 +216,9 @@ pub(crate) fn bounded_clusters_payload(
     graph_generation: Option<u64>,
     cached: bool,
 ) -> serde_json::Value {
-    let total = output.communities.len();
-    let take = if limit == 0 { total } else { limit.min(total) };
-    let communities: Vec<serde_json::Value> = output.communities[..take]
-        .iter()
-        .map(|community| {
-            let member_total = community.members.len();
-            let member_take = if members == 0 {
-                member_total
-            } else {
-                members.min(member_total)
-            };
-            serde_json::json!({
-                "id": community.id,
-                "name": community.name,
-                "cohesion": community.cohesion,
-                "member_count": community.member_count,
-                "members": &community.members[..member_take],
-                "returned_members": member_take,
-                "members_truncated": member_take < member_total,
-                "key_files": community.key_files,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "resolution": output.resolution,
-        "modularity": output.modularity,
-        "communities": communities,
-        "total_communities": total,
-        "returned_communities": take,
-        "truncated": take < total,
-        "graph_generation": graph_generation,
-        "cached": cached,
-    })
+    // nw-559: the MCP `clusters` envelope, built by the same function, so
+    // `clusters --json` and the tool cannot drift on key names again.
+    nestweaver_mcp::tools::clusters_payload(output, limit, members, graph_generation, cached, None)
 }
 
 /// Render the text form of a clustering result, bounded to `limit`.
@@ -1468,5 +1438,106 @@ mod doc_stats_text_tests {
             line.contains(" 2 (") && line.contains("3 counted per source section"),
             "{line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod clusters_envelope_parity_tests {
+    use super::bounded_clusters_payload;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+    use std::collections::BTreeSet;
+
+    fn store() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["a0", "a1", "b0", "b1"] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: uid.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:x".to_string(),
+                    file_path: format!("src/{uid}.rs"),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: format!("fn {uid}()"),
+                    summary: None,
+                    content_hash: format!("h_{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: dst.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    fn keys(value: &serde_json::Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !key.starts_with('_'))
+            .cloned()
+            .collect()
+    }
+
+    /// nw-559. `clusters --json` and MCP `clusters` named the same data
+    /// differently (`communities`/`total_communities`/`returned_communities`/
+    /// `member_count` against `clusters`/`total`/`returned`/`size`). One
+    /// envelope now: the same top-level and per-cluster keys on both surfaces.
+    /// Counterweight: the member populations are still the same.
+    #[test]
+    fn cli_clusters_json_uses_the_mcp_clusters_envelope() {
+        let store = store();
+        let output = nestweaver_engine::compute_clusters(&store, 1.0).unwrap();
+        let cli = bounded_clusters_payload(&output, 0, 0, Some(store.graph_generation()), false);
+        let mcp = nestweaver_mcp::tools::dispatch(
+            &store,
+            None,
+            "clusters",
+            serde_json::json!({ "limit": 0, "members": 0, "resolution": 1.0 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(keys(&cli), keys(&mcp), "cli: {cli}\nmcp: {mcp}");
+        let cli_clusters = cli["clusters"].as_array().expect("cli clusters array");
+        let mcp_clusters = mcp["clusters"].as_array().expect("mcp clusters array");
+        assert!(!cli_clusters.is_empty());
+        assert_eq!(cli_clusters.len(), mcp_clusters.len());
+        for (c, m) in cli_clusters.iter().zip(mcp_clusters) {
+            assert_eq!(keys(c), keys(m));
+            assert_eq!(c["size"], m["size"]);
+        }
+        let members = |clusters: &[serde_json::Value]| -> BTreeSet<String> {
+            clusters
+                .iter()
+                .flat_map(|c| c["members"].as_array().unwrap().clone())
+                .map(|m| m["uid"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(members(cli_clusters), members(mcp_clusters));
+        assert_eq!(members(cli_clusters).len(), 4);
+        for key in ["cluster_count", "total", "returned", "truncated"] {
+            assert_eq!(cli[key], mcp[key], "{key}");
+        }
     }
 }

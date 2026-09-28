@@ -11705,6 +11705,38 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
+    // nw-646 parity: this tool ALWAYS computes fresh (never reads the sidecar
+    // back), so `cached` is always `false` here — only the CLI's own
+    // cache-reuse gate can ever set it `true`.
+    Ok(clusters_payload(
+        &output,
+        limit,
+        preview_members,
+        Some(store.graph_generation()),
+        false,
+        requested_id,
+    ))
+}
+
+/// The ONE unscoped `clusters` envelope (nw-559), built here and by the CLI's
+/// `clusters --json`. The two used to name the same data differently — MCP
+/// `clusters`/`total`/`returned`/per-cluster `size` against the CLI's
+/// `communities`/`total_communities`/`returned_communities`/`member_count` —
+/// and the CLI's own `--repo` route already printed this shape, so one
+/// command had two envelopes. The CLI names were never documented; these are
+/// the ones the tool description and the command name use.
+///
+/// `limit`/`preview_members` of 0 mean "all". `requested_id` filters to one
+/// cluster and lifts the member preview to its full list (nw-090).
+/// `graph_generation` and `cached` are nw-646's cache-identity disclosure.
+pub fn clusters_payload(
+    output: &nestweaver_engine::ClusteringOutput,
+    limit: usize,
+    preview_members: usize,
+    graph_generation: Option<u64>,
+    cached: bool,
+    requested_id: Option<i64>,
+) -> Value {
     let matching: Vec<&nestweaver_engine::CommunityInfo> = output
         .communities
         .iter()
@@ -11718,7 +11750,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let symbol_count: usize = output.communities.iter().map(|c| c.member_count).sum();
 
     let mut payload = json!({
-        "resolution": resolution,
+        "resolution": output.resolution,
         // The graph-wide community count, unchanged. `total` below is the
         // number that MATCHED this call's filter; with no `cluster_id` the two
         // agree, and with one they must not.
@@ -11726,17 +11758,11 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "symbol_count": symbol_count,
         "modularity": output.modularity,
         "limit": limit,
-        // nw-646 parity: the CLI's `clusters --json` discloses which graph
-        // generation the result came from and whether it was a cache hit
-        // (`no_cli_command_discloses_more_than_its_mcp_twin` forbids the CLI
-        // knowing more than this route). This tool ALWAYS computes fresh
-        // (never reads the sidecar back), so `cached` is always `false` here
-        // — only the CLI's own cache-reuse gate can ever set it `true`.
-        "graph_generation": store.graph_generation(),
-        "cached": false,
+        "graph_generation": graph_generation,
+        "cached": cached,
     });
     bounded.merge_into(&mut payload, "clusters");
-    Ok(payload)
+    payload
 }
 
 // ── 13. stale_check ────────────────────────────────────────────────────────

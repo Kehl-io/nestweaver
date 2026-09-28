@@ -1090,7 +1090,7 @@ fn contract_cluster_by_numeric_id_via_daemon() {
     assert_successful_output(&clusters, "clusters --json (setup)");
     let parsed: serde_json::Value =
         serde_json::from_slice(&clusters.stdout).expect("clusters --json must be valid JSON");
-    let cluster_id = parsed["communities"]
+    let cluster_id = parsed["clusters"]
         .as_array()
         .and_then(|c| c.first())
         .and_then(|c| c["id"].as_u64())
@@ -1112,7 +1112,7 @@ fn contract_cluster_by_name_via_daemon() {
     assert_successful_output(&clusters, "clusters --json (setup)");
     let parsed: serde_json::Value =
         serde_json::from_slice(&clusters.stdout).expect("clusters --json must be valid JSON");
-    let name = parsed["communities"]
+    let name = parsed["clusters"]
         .as_array()
         .and_then(|c| c.first())
         .and_then(|c| c["name"].as_str())
