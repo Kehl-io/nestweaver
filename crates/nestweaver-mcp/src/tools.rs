@@ -4473,6 +4473,11 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     {
         value["status"] = json!("not_found");
         value["error"] = json!("not found");
+        value["message"] = json!(format!(
+            "no symbol found for any of {} target(s): {}",
+            targets.len(),
+            targets.join(", ")
+        ));
         value["targets"] = json!(targets);
     }
 
@@ -5381,6 +5386,7 @@ fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, a
             return Ok(json!({
                 "status": "not_found",
                 "error": "not found",
+                "message": format!("no note found with uid '{uid}'"),
                 "uid": uid,
                 "depth": 0,
                 "related": [],
@@ -28685,6 +28691,12 @@ mod lookup_not_found_contract_tests {
                 "{tool} {args}: {result}"
             );
             assert_eq!(structured["error"], json!("not found"), "{tool}: {result}");
+            assert!(
+                structured["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "{tool} {args}: every not-found envelope carries a message: {result}"
+            );
             assert!(
                 structured.get(*key).is_some(),
                 "{tool} must echo '{key}': {result}"
