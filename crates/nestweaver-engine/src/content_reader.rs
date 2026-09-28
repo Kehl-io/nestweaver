@@ -2994,6 +2994,32 @@ mod tests {
     }
 
     #[test]
+    fn git_bare_superseded_fingerprint_is_the_verbatim_v1_payload() {
+        // Review N3: the bare reader's pre-nw-652 payload, verbatim. If the
+        // superseded list drifts from it, a bare-clone repo not re-indexed
+        // since 10.1.1 blocks the manifest rebuild again (nw-680).
+        let reader = GitBareReader::with_limits(
+            Path::new("/nonexistent/bare.git"),
+            "HEAD",
+            IndexLimits::default(),
+        );
+        let version_one = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v1",
+                "max_source_file_bytes": IndexLimits::default()
+                    .max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            reader.superseded_eligibility_fingerprints(),
+            std::slice::from_ref(&version_one)
+        );
+        // Counterweight: the current fingerprint is not the v1 one.
+        assert_ne!(reader.eligibility_fingerprint(), version_one);
+    }
+
+    #[test]
     fn eligibility_fingerprint_moved_off_the_name_only_target_rule() {
         // nw-652: a graph indexed under the name-only rule is missing every
         // source `target/`, and only a changed fingerprint makes the next

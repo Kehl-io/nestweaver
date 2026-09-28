@@ -2461,17 +2461,26 @@ fn derivation_withheld_note(skipped: &[nestweaver_parser::SkippedFile]) -> Strin
         .filter(|file| nestweaver_engine::markdown_derivation::is_coverage_gap(file))
         .map(|file| file.path.as_str())
         .collect();
+    // Review N1: a vault with thousands of unreadable notes must not print
+    // them all here; the skip rows above carry the full list.
+    let named = match gaps.len() {
+        0 => "a skipped path".to_string(),
+        n if n <= DERIVATION_WITHHELD_PATH_LIMIT => gaps.join(", "),
+        n => format!(
+            "{} (+{} more)",
+            gaps[..DERIVATION_WITHHELD_PATH_LIMIT].join(", "),
+            n - DERIVATION_WITHHELD_PATH_LIMIT
+        ),
+    };
     format!(
-        "\nMarkdown link derivation NOT marked current: {} could not be read or parsed. \
+        "\nMarkdown link derivation NOT marked current: {named} could not be read or parsed. \
          Fix it and re-run a full `nestweaver brain refresh` (without --since); until then \
-         link-graph tools report this vault as blocked.",
-        if gaps.is_empty() {
-            "a skipped path".to_string()
-        } else {
-            gaps.join(", ")
-        }
+         link-graph tools report this vault as blocked."
     )
 }
+
+/// How many gap paths [`derivation_withheld_note`] names before summarising.
+const DERIVATION_WITHHELD_PATH_LIMIT: usize = 10;
 
 /// nw-694: the skip rows of a vault refresh, in the `  {path} - {reason}`
 /// shape the full-refresh summary already prints, for the `--since` message.
@@ -2529,6 +2538,26 @@ mod index_done_message_tests {
         assert!(message.contains("12 files"), "{message}");
         assert!(message.contains("340 symbols"), "{message}");
         assert!(message.contains("1500 edges"), "{message}");
+    }
+
+    /// Review N1: the withheld note names at most ten gap paths.
+    #[test]
+    fn derivation_withheld_note_caps_its_path_list() {
+        let rows: Vec<nestweaver_parser::SkippedFile> = (0..13)
+            .map(|i| {
+                nestweaver_parser::SkippedFile::new(
+                    format!("dir{i:02}"),
+                    nestweaver_parser::SkipReasonCode::ReadError,
+                    "unreadable",
+                )
+            })
+            .collect();
+        let note = derivation_withheld_note(&rows);
+        assert!(note.contains("dir09 (+3 more)"), "{note}");
+        assert!(!note.contains("dir10"), "{note}");
+        let few = derivation_withheld_note(&rows[..2]);
+        assert!(few.contains("dir00, dir01 could not"), "{few}");
+        assert!(!few.contains("more)"), "{few}");
     }
 
     #[test]
