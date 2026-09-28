@@ -800,6 +800,9 @@ pub(crate) fn dispatch_hybrid_mcp_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            // nw-558: fold alias spellings before the federation legs read
+            // the canonical keys.
+            let arguments = nestweaver_mcp::tools::canonicalize_tool_arguments(name, arguments);
             if name.is_empty() {
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": id,

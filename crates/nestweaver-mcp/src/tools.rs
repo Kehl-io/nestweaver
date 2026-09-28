@@ -923,13 +923,73 @@ fn unknown_argument_hint(tool: &str, property: &str) -> Option<String> {
 /// Reject alias pairs that are BOTH present — `regex_search` called with both
 /// `pattern` and `query` is ambiguous about which one drives the search and
 /// previously picked one silently.
-fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
+/// Argument spellings that mean the same thing, canonical name first
+/// (nw-558). The CLI's flag names (`--files`, `--top`, `--neighbors`) are
+/// accepted on the MCP tools they mirror, so a caller who learned one surface
+/// can use the other. [`canonicalize_tool_arguments`] folds every alias onto
+/// its canonical key before dispatch, so no tool, proxy or federation leg has
+/// to know the alias exists; [`conflicting_alias_error`] refuses a call that
+/// gives two spellings different values instead of silently keeping one.
+fn tool_alias_groups(tool: &str) -> &'static [&'static [&'static str]] {
+    match tool {
+        "detect_changes" | "blast_radius" | "affected_tests" => &[&["changed_files", "files"]],
+        "hub_nodes" | "bridge_nodes" => &[&["limit", "top_n", "top"]],
+        "read_symbols" => &[
+            &["targets", "uids_or_fqns"],
+            &["include_neighbors", "neighbors"],
+        ],
+        "get_summary" => &[&["target", "name"]],
+        "cross_repo_contracts" => &[&["name", "symbol"]],
+        "regex_search" => &[&["pattern", "query"]],
+        _ => &[],
+    }
+}
+
+/// Fold alias spellings onto the canonical key (nw-558). Call before
+/// validation and dispatch; a conflict is left in place for
+/// [`validate_tool_arguments`] to refuse with a named error.
+pub fn canonicalize_tool_arguments(name: &str, mut args: Value) -> Value {
+    if conflicting_alias_error(name, &args).is_some() {
+        return args;
+    }
+    let Some(object) = args.as_object_mut() else {
+        return args;
+    };
+    for group in tool_alias_groups(name) {
+        let canonical = group[0];
+        for alias in &group[1..] {
+            if let Some(value) = object.remove(*alias) {
+                object.entry(canonical.to_string()).or_insert(value);
+            }
+        }
+    }
+    args
+}
+
+fn conflicting_alias_error(name: &str, args: &Value) -> Option<String> {
     if !args.is_object() {
         return None;
     }
+    let generic = || {
+        tool_alias_groups(name).iter().find_map(|group| {
+            let present: Vec<(&str, &Value)> = group
+                .iter()
+                .filter_map(|key| args.get(*key).map(|value| (*key, value)))
+                .collect();
+            let (first, first_value) = *present.first()?;
+            present
+                .iter()
+                .find(|(_, value)| *value != first_value)
+                .map(|(other, _)| {
+                    format!(
+                        "conflicting arguments: '{first}' and '{other}' are aliases — pass only one, or the same value in both"
+                    )
+                })
+        })
+    };
     match name {
         "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
-            Some("conflicting arguments: pass only one of 'pattern' or 'query'")
+            Some("conflicting arguments: pass only one of 'pattern' or 'query'".to_string())
         }
         // nw-630: `symbol` is an alias of `name`. Unlike `pattern`/`query`,
         // which reject the pair unconditionally, this only rejects a
@@ -944,10 +1004,10 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
             }) =>
         {
             Some(
-                "conflicting arguments: 'name' and 'symbol' are aliases — pass only one, or the same value in both",
+                "conflicting arguments: 'name' and 'symbol' are aliases — pass only one, or the same value in both".to_string(),
             )
         }
-        _ => None,
+        _ => generic(),
     }
 }
 
@@ -1146,7 +1206,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::E
     };
 
     let errors: Vec<String> = if let Some(message) = conflicting_alias_error(name, args) {
-        vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
+        vec![truncate_utf8_bytes(&message, MAX_VALIDATION_ITEM_BYTES)]
     } else {
         // nw-410: the missing-alias rule used to short-circuit here, hand-coded
         // for 3 of the 8 either/or tools. It now lives in each schema as
@@ -2116,15 +2176,15 @@ mod tool_schema_validation_tests {
 
     #[test]
     fn bounded_tools_reject_unknown_arguments() {
-        // Mistyped arg names must fail loudly instead of being
-        // silently ignored (e.g. `neighbors` for `include_neighbors`).
+        // Mistyped arg names must fail loudly instead of being silently
+        // ignored. (`neighbors` for `include_neighbors` is now a declared
+        // alias, nw-558, so it is no longer an example here.)
         for (name, args) in [
             (
                 "read_symbols",
-                json!({ "targets": ["sym:x"], "neighbors": 2 }),
+                json!({ "targets": ["sym:x"], "neighbour": 2 }),
             ),
             ("regex_search", json!({ "pattern": "x", "patterns": ["y"] })),
-            ("hub_nodes", json!({ "top": 5 })),
             (
                 "brain_impact",
                 json!({ "symbol": "s", "min_confidence": "low" }),
@@ -2144,6 +2204,104 @@ mod tool_schema_validation_tests {
         assert_valid("read_symbols", json!({ "uids_or_fqns": ["sym:x"] }));
         assert_valid("regex_search", json!({ "query": "x" }));
         assert_valid("hub_nodes", json!({ "top_n": 5 }));
+    }
+
+    /// nw-558. The CLI's flag names are accepted on the MCP tools they
+    /// mirror, and two spellings of one argument with different values are
+    /// refused by name instead of one being silently dropped (`detect_changes`
+    /// used to keep `changed_files` and discard `files`).
+    #[test]
+    fn cli_flag_names_are_mcp_aliases_and_conflicts_are_refused() {
+        for (tool, args) in [
+            ("blast_radius", json!({ "files": ["src/a.rs"] })),
+            ("affected_tests", json!({ "files": ["src/a.rs"] })),
+            ("detect_changes", json!({ "files": ["src/a.rs"] })),
+            ("hub_nodes", json!({ "top": 5 })),
+            ("bridge_nodes", json!({ "top": 5 })),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "neighbors": 2 }),
+            ),
+            // Same value under two spellings loses nothing: accepted.
+            (
+                "detect_changes",
+                json!({ "changed_files": ["a"], "files": ["a"] }),
+            ),
+        ] {
+            assert_valid(tool, args);
+        }
+        for (tool, args, pair) in [
+            (
+                "detect_changes",
+                json!({ "changed_files": ["a"], "files": ["b"] }),
+                ("changed_files", "files"),
+            ),
+            (
+                "blast_radius",
+                json!({ "changed_files": ["a"], "files": ["b"] }),
+                ("changed_files", "files"),
+            ),
+            (
+                "affected_tests",
+                json!({ "changed_files": ["a"], "files": ["b"] }),
+                ("changed_files", "files"),
+            ),
+            (
+                "hub_nodes",
+                json!({ "limit": 5, "top": 6 }),
+                ("limit", "top"),
+            ),
+            (
+                "bridge_nodes",
+                json!({ "top_n": 5, "top": 6 }),
+                ("top_n", "top"),
+            ),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "include_neighbors": 1, "neighbors": 2 }),
+                ("include_neighbors", "neighbors"),
+            ),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "uids_or_fqns": ["sym:y"] }),
+                ("targets", "uids_or_fqns"),
+            ),
+            (
+                "get_summary",
+                json!({ "target": "a", "name": "b" }),
+                ("target", "name"),
+            ),
+        ] {
+            let error = assert_invalid(tool, args);
+            assert!(
+                error.contains(&format!("'{}' and '{}' are aliases", pair.0, pair.1)),
+                "{tool}: {error}"
+            );
+        }
+        // Every alias reaches the tool under its canonical key.
+        assert_eq!(
+            canonicalize_tool_arguments("blast_radius", json!({ "files": ["a"] })),
+            json!({ "changed_files": ["a"] })
+        );
+        assert_eq!(
+            canonicalize_tool_arguments("hub_nodes", json!({ "top": 3 })),
+            json!({ "limit": 3 })
+        );
+        assert_eq!(
+            canonicalize_tool_arguments(
+                "read_symbols",
+                json!({ "targets": ["x"], "neighbors": 1 })
+            ),
+            json!({ "targets": ["x"], "include_neighbors": 1 })
+        );
+        // COUNTERWEIGHT: canonical calls are untouched and still valid.
+        let canonical = json!({ "changed_files": ["a"], "max_depth": 2 });
+        assert_eq!(
+            canonicalize_tool_arguments("blast_radius", canonical.clone()),
+            canonical
+        );
+        assert_valid("blast_radius", canonical);
+        assert_valid("hub_nodes", json!({ "limit": 5 }));
     }
 
     #[test]
@@ -3031,6 +3189,7 @@ pub fn dispatch_cancellable(
         .into());
     }
 
+    let args = canonicalize_tool_arguments(name, args);
     validate_tool_arguments(name, &args)?;
     // Reranking consumes persisted embedding-derived similarity signals even
     // when the primary retrieval request is lexical-only. Guard before the
@@ -4552,6 +4711,12 @@ fn tool_schema_read_symbols() -> Value {
                     "minimum": 0,
                     "maximum": 255,
                     "description": "Include N adjacent symbols in the same file (default 0, max 255)."
+                },
+                "neighbors": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255,
+                    "description": "Alias of `include_neighbors` (the CLI's `--neighbors`)."
                 },
                 "token_budget": {
                     "type": "integer",
@@ -11574,6 +11739,13 @@ fn tool_schema_affected_tests() -> Value {
                     "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]. At most 1000 entries of at most 512 bytes each; an oversized request is REJECTED rather than silently narrowed, because a test selection computed from a shortened change set is not a selection for that change."
                 },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
+                    "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
+                    "description": "Alias of `changed_files` (the CLI's `--files`). Give one or the other; both with different values is refused."
+                },
                 "base_ref": {
                     "type": "string",
                     "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted; diffs the locally-indexed repo via git."
@@ -11586,6 +11758,7 @@ fn tool_schema_affected_tests() -> Value {
             // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
             "anyOf": [
                 { "required": ["changed_files"] },
+                { "required": ["files"] },
                 { "required": ["base_ref"] }
             ]
         }
@@ -13928,6 +14101,12 @@ fn tool_schema_hub_nodes() -> Value {
                     "maximum": 1000,
                     "description": "Backward-compatible alias for limit."
                 },
+                "top": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Alias of `limit` (the CLI's `--top`)."
+                },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
@@ -14076,6 +14255,12 @@ fn tool_schema_bridge_nodes() -> Value {
                     "maximum": 1000,
                     "description": "Alias for `limit`, accepted for backward compatibility."
                 },
+                "top": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Alias of `limit` (the CLI's `--top`)."
+                },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
@@ -14203,6 +14388,13 @@ fn tool_schema_blast_radius() -> Value {
                     "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
                 },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1, "maxLength": nestweaver_engine::changed_files::MAX_CHANGED_FILE_LEN },
+                    "minItems": 1,
+                    "maxItems": nestweaver_engine::changed_files::MAX_CHANGED_FILES,
+                    "description": "Alias of `changed_files` (the CLI's `--files`). Give one or the other; both with different values is refused."
+                },
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
@@ -14245,7 +14437,10 @@ fn tool_schema_blast_radius() -> Value {
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["changed_files"],
+            "anyOf": [
+                { "required": ["changed_files"] },
+                { "required": ["files"] }
+            ],
             "additionalProperties": false
         }
     })
@@ -15740,6 +15935,7 @@ fn dispatch_via_daemon_inner(
     // as the local path, before any RPC is proxied.
     enforce_tool_allowed(name)?;
 
+    let args = canonicalize_tool_arguments(name, args);
     validate_tool_arguments(name, &args)?;
 
     let args_json = serde_json::to_string(&args)?;
