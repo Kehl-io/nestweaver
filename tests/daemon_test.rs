@@ -7406,6 +7406,32 @@ fn generate_guide_with_config_and_rules_is_served_by_the_daemon_with_direct_pari
         String::from_utf8_lossy(&direct.stdout),
         "daemon and direct routes must render the same guide"
     );
+
+    // A well-formed invocation whose rules file exceeds the 1 MiB cap is a
+    // state the command cannot satisfy: exit 1 (not usage 64), naming the
+    // limit, and nothing is sent to the daemon.
+    let big_rules = dir.path().join("big-rules.md");
+    std::fs::write(&big_rules, "#".repeat(1024 * 1024 + 1)).unwrap();
+    let oversized = daemon_cmd()
+        .args(["generate-guide", "--format", "agents-md", "--db"])
+        .arg(&db_path)
+        .arg("--config")
+        .arg(&config)
+        .arg("--rules-from")
+        .arg(&big_rules)
+        .output()
+        .unwrap();
+    assert_eq!(
+        oversized.status.code(),
+        Some(1),
+        "oversized --rules-from: {}",
+        String::from_utf8_lossy(&oversized.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&oversized.stderr).contains("the maximum is"),
+        "the refusal must name the limit: {}",
+        String::from_utf8_lossy(&oversized.stderr)
+    );
 }
 
 /// nw-550: a missing `context` seed exits 2 with the not-found envelope; its

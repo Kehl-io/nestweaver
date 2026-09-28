@@ -16980,7 +16980,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                              maximum is {cap}",
                             path.display()
                         );
-                        return Ok((EXIT_USAGE, None));
+                        return Ok((EXIT_ERROR, None));
                     }
                     args["guide_config"] = projection;
                 }
@@ -16994,7 +16994,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             path.display(),
                             contents.len()
                         );
-                        return Ok((EXIT_USAGE, None));
+                        return Ok((EXIT_ERROR, None));
                     }
                     args["rules"] = serde_json::json!(contents);
                 }

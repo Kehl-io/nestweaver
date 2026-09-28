@@ -488,8 +488,11 @@ pub(super) fn ensure_current(
                 .and_then(|records| records.vaults.get(&vault.uid))
                 .filter(|record| record.phase == DerivationPhase::Blocked);
             match blocked {
+                // The vault-specific remedy replaces the generic path-free
+                // one in `DerivationUnavailable`'s Display, so it is said once.
                 Some(record) => Err(anyhow::anyhow!(
-                    "{error}: {}",
+                    "Markdown link derivation is not current ({:?}): {}",
+                    error.reason,
                     blocked_vault_remedy(state, &vault, record, now_unix_seconds())
                 )),
                 None => Err(error.into()),
