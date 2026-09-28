@@ -229,7 +229,19 @@ impl WorkerPool {
         let index_limits = self.index_limits;
         let note_limits = self.note_limits;
         let cross_domain = Arc::clone(&self.cross_domain);
-        let code_link_reconciler = Arc::clone(&self.code_link_reconciler);
+        // nw-677 review M3: one debounced relink task per pool. Code jobs
+        // record the debt and wake it; a burst of jobs coalesces into one
+        // pass, and no job waits on a pass.
+        let relink_wake = Arc::new(tokio::sync::Notify::new());
+        let relinker = tokio::spawn(run_code_link_relinker(
+            Arc::clone(&store),
+            Arc::clone(&self.code_link_reconciler),
+            self.note_limits,
+            write_gate.clone(),
+            shutdown.clone(),
+            Arc::clone(&relink_wake),
+            CODE_LINK_RELINK_DEBOUNCE,
+        ));
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -341,7 +353,7 @@ impl WorkerPool {
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
             let cross_domain = Arc::clone(&cross_domain);
-            let code_link_reconciler = Arc::clone(&code_link_reconciler);
+            let relink_wake = Arc::clone(&relink_wake);
             let reindex_tracker = self.reindex_tracker.clone();
 
             tasks.spawn(async move {
@@ -406,16 +418,6 @@ impl WorkerPool {
                                 false
                             };
 
-                            // nw-677: the relink after a code index takes the
-                            // same write gate, once per chunk it rewrites.
-                            let code_link_lease: Option<crate::watcher::WatchMutationLeaseFactory> =
-                                write_gate.clone().map(|gate| {
-                                    Arc::new(move |what: &'static str| {
-                                        Ok(Box::new(gate.blocking_lock(what))
-                                            as Box<dyn crate::watcher::WatchMutationLease>)
-                                    })
-                                        as crate::watcher::WatchMutationLeaseFactory
-                                });
                             let outcome = commit_prepared_job_with_reindex_decision_and_limits(
                                 &prepared,
                                 &store,
@@ -424,10 +426,6 @@ impl WorkerPool {
                                 index_limits,
                                 note_limits,
                                 &cross_domain,
-                                CodeLinkRelink {
-                                    reconciler: Some(&code_link_reconciler),
-                                    lease: code_link_lease.as_ref(),
-                                },
                                 move || {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
@@ -457,6 +455,9 @@ impl WorkerPool {
                                     &prepared.repo_id,
                                     outcome,
                                 );
+                                // nw-677: the commit recorded the code_links
+                                // debt; the relink task pays it.
+                                relink_wake.notify_one();
                             }
 
                             // nw-198: this job's mutations have already
@@ -545,6 +546,9 @@ impl WorkerPool {
         // abandoned mid-flight. spawn_blocking work cannot be aborted, so each
         // remaining task is awaited to completion before we return.
         while tasks.join_next().await.is_some() {}
+        // The relink task observes the same shutdown and stops between
+        // chunks (its lease factory refuses too).
+        let _ = relinker.await;
     }
 }
 
@@ -827,75 +831,126 @@ where
         crate::index_limits::IndexLimits::default(),
         crate::index_limits::NoteLimits::default(),
         &crate::config::CrossDomainConfig::default(),
-        CodeLinkRelink::default(),
         acquire_write_guard,
     )
 }
 
-/// nw-677: how the worker relinks notes to code after a code index. The
-/// default (tests) is a fresh reconciler with no write gate.
-#[derive(Default, Clone, Copy)]
-struct CodeLinkRelink<'a> {
-    reconciler: Option<&'a std::sync::Mutex<crate::code_links::CodeLinkReconciler>>,
-    lease: crate::code_links::CodeLinkLease<'a>,
-}
+/// nw-677: how long the relink task waits after a code job wakes it, so a
+/// burst of code jobs coalesces into one pass.
+const CODE_LINK_RELINK_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// nw-677: a code re-index drops every note link INTO the re-indexed files
-/// (the cascade takes them with the symbols). Server mode runs no
-/// code-link reconciler loop — its vault notes live in bare clones the loop
-/// cannot read — so the worker relinks here, reading notes from the bare
-/// clones. The debt is recorded first, so `brain status` discloses it while
-/// the pass runs and keeps it, with the error, if the pass fails.
-fn relink_notes_after_code_index(
-    store: &nestweaver_store::GraphStore,
-    repo_url: &str,
-    note_limits: crate::index_limits::NoteLimits,
-    cross_domain: &crate::config::CrossDomainConfig,
-    relink: CodeLinkRelink<'_>,
-) {
-    match store.list_vaults(None) {
-        Ok(vaults) if vaults.is_empty() => return,
-        Ok(_) => {}
+/// (the cascade takes them with the symbols). Server mode runs no daemon
+/// code-link reconciler loop — its vault notes live in bare clones that loop
+/// cannot read — so the code job records the debt here, before returning, so
+/// `brain status` discloses it; [`run_code_link_relinker`] pays it.
+fn mark_code_links_owed_after_code_index(store: &nestweaver_store::GraphStore, repo_url: &str) {
+    let has_vaults = match store.list_vaults(None) {
+        Ok(vaults) => !vaults.is_empty(),
         Err(error) => {
             tracing::warn!(%error, "note relink after code index: cannot list vaults");
-            return;
+            true
         }
-    }
-    if let Some(db_path) = store.db_path() {
+    };
+    if has_vaults && let Some(db_path) = store.db_path() {
         crate::code_links::mark_code_links_pending(
             db_path,
             &format!("code re-index of {repo_url}"),
         );
     }
-    let readers =
-        match crate::code_links::bare_clone_vault_readers(store, note_limits.as_index_limits()) {
-            Ok(readers) => readers,
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "note relink after code index");
-                return;
+}
+
+/// nw-677 review L1: a write-gate lease factory for the relink pass that
+/// refuses once shutdown is signalled, so shutdown never waits on a pass.
+fn relink_lease_factory(
+    gate: Option<crate::write_gate::WriteGate>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> crate::watcher::WatchMutationLeaseFactory {
+    Arc::new(move |what: &'static str| {
+        if *shutdown.borrow() {
+            return Err(anyhow::Error::new(crate::watcher::WatchMutationRefused));
+        }
+        Ok(match &gate {
+            Some(gate) => {
+                Box::new(gate.blocking_lock(what)) as Box<dyn crate::watcher::WatchMutationLease>
             }
-        };
-    let run = |reconciler: &mut crate::code_links::CodeLinkReconciler| {
-        reconciler.set_vault_readers(readers);
-        reconciler.reconcile(store, relink.lease, &|| false)
+            None => Box::new(()) as Box<dyn crate::watcher::WatchMutationLease>,
+        })
+    })
+}
+
+/// nw-677: one relink pass — the shared reconciler over every note, reading
+/// server-mode vaults from their bare clones at their indexed revision. It
+/// rewrites only notes whose links differ, taking the lease per chunk, and
+/// settles the debt when it completes (or keeps it, with the error).
+fn relink_pass(
+    store: &nestweaver_store::GraphStore,
+    reconciler: &std::sync::Mutex<crate::code_links::CodeLinkReconciler>,
+    note_limits: crate::index_limits::NoteLimits,
+    lease: &crate::watcher::WatchMutationLeaseFactory,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) {
+    let readers = match crate::code_links::bare_clone_vault_readers(
+        store,
+        note_limits.as_index_limits(),
+    ) {
+        Ok(readers) => readers,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "note relink: cannot open vault readers");
+            return;
+        }
     };
-    let outcome = match relink.reconciler {
-        Some(shared) => run(&mut shared.lock().unwrap_or_else(|e| e.into_inner())),
-        None => run(&mut crate::code_links::CodeLinkReconciler::new(
-            cross_domain.clone(),
-        )),
-    };
-    match outcome {
+    let mut reconciler = reconciler.lock().unwrap_or_else(|e| e.into_inner());
+    reconciler.set_vault_readers(readers);
+    match reconciler.reconcile(store, Some(lease), &|| *shutdown.borrow()) {
         Ok(report) => tracing::info!(
-            repo = %repo_url,
             notes_rewritten = report.rewritten.len(),
+            stopped = report.stopped,
             "relinked notes after code index"
         ),
         Err(error) => tracing::warn!(
-            repo = %repo_url,
             error = %format!("{error:#}"),
             "note relink after code index failed; the debt stays disclosed"
         ),
+    }
+}
+
+/// nw-677 review M3: the pool's single relink task. Woken by code jobs,
+/// it waits out a debounce (further wakes coalesce), then runs one pass off
+/// the async runtime. It never runs two passes at once, and it stops on
+/// shutdown.
+async fn run_code_link_relinker(
+    store: Arc<nestweaver_store::GraphStore>,
+    reconciler: Arc<std::sync::Mutex<crate::code_links::CodeLinkReconciler>>,
+    note_limits: crate::index_limits::NoteLimits,
+    gate: Option<crate::write_gate::WriteGate>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    wake: Arc<tokio::sync::Notify>,
+    debounce: std::time::Duration,
+) {
+    let lease = relink_lease_factory(gate, shutdown.clone());
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = shutdown.changed() => return,
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(debounce) => {}
+            _ = shutdown.changed() => return,
+        }
+        let (store, reconciler, lease, stop) = (
+            Arc::clone(&store),
+            Arc::clone(&reconciler),
+            Arc::clone(&lease),
+            shutdown.clone(),
+        );
+        let _ = tokio::task::spawn_blocking(move || {
+            relink_pass(&store, &reconciler, note_limits, &lease, &stop)
+        })
+        .await;
     }
 }
 
@@ -908,7 +963,6 @@ fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
     cross_domain: &crate::config::CrossDomainConfig,
-    relink: CodeLinkRelink<'_>,
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
@@ -1052,13 +1106,7 @@ where
                 report_degraded_worker_coverage(&prepared.repo_url, &result.skipped_files);
                 ReindexOutcome::Full
             };
-            relink_notes_after_code_index(
-                store,
-                &prepared.repo_url,
-                note_limits,
-                cross_domain,
-                relink,
-            );
+            mark_code_links_owed_after_code_index(store, &prepared.repo_url);
             Ok(outcome)
         }
     }
@@ -1920,7 +1968,6 @@ mod tests {
                 crate::index_limits::IndexLimits::default(),
                 crate::index_limits::NoteLimits::default(),
                 &config,
-                CodeLinkRelink::default(),
                 || Ok::<_, anyhow::Error>(()),
             )
             .unwrap();
@@ -1933,13 +1980,14 @@ mod tests {
     }
 
     /// nw-677: in server mode no code-link reconciler loop runs, and a code
-    /// re-index drops every note link into the re-indexed files. The worker
-    /// now relinks after the code index, reading the notes from the vault's
-    /// bare clone, and settles the debt it disclosed. The full re-index of
-    /// the code repo is what drops the links (the counterweight: without the
-    /// relink the count falls to 0).
-    #[test]
-    fn server_code_reindex_keeps_note_links_from_bare_clone_vaults() {
+    /// re-index drops every note link into the re-indexed files. The code job
+    /// now records the debt, and the pool's relink task (production path:
+    /// the shared reconciler, a real write gate, the debounce) relinks from
+    /// the vault's bare clone and settles it. Counterweights: right after the
+    /// re-index the links are gone and the debt is disclosed; with shutdown
+    /// signalled (review L1) a pass writes nothing and the debt stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_code_reindex_keeps_note_links_from_bare_clone_vaults() {
         let tmp = TempDir::new().unwrap();
         let code_src = tmp.path().join("code-src");
         create_source_repo(&code_src, &[("src/w.rs", "pub struct AlphaWidget;\n")]);
@@ -1947,7 +1995,7 @@ mod tests {
         create_source_repo(&vault_src, &[("a.md", "# A\n\nuses AlphaWidget\n")]);
         let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
         let db = tmp.path().join("brain.lbug");
-        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let store = Arc::new(nestweaver_store::GraphStore::open(&db).unwrap());
         let instance = "test-instance";
         let job = |id: i64, repo_id: &str, src: &std::path::Path| IndexJob {
             id,
@@ -1978,39 +2026,82 @@ mod tests {
                 crate::index_limits::IndexLimits::default(),
                 crate::index_limits::NoteLimits::default(),
                 &crate::config::CrossDomainConfig::default(),
-                CodeLinkRelink::default(),
                 || Ok::<_, anyhow::Error>(()),
             )
             .unwrap()
         };
+        let links = || store.count_references_code_edges().unwrap();
+        let pending = || crate::code_links::code_links_status_json(Some(&db))["pending"] == true;
+        let reindex_code = |id: i64, content: &str| {
+            commit_file(&code_src, "src/w.rs", content, "move AlphaWidget");
+            assert_eq!(
+                run(&job(id, "code", &code_src), RepoType::Code, true),
+                ReindexOutcome::Full
+            );
+        };
 
         run(&job(1, "code", &code_src), RepoType::Code, false);
         run(&job(2, "vault", &vault_src), RepoType::Vault, false);
-        assert_eq!(
-            store.count_references_code_edges().unwrap(),
-            2,
-            "the vault fetch links the note and its section"
-        );
+        assert_eq!(links(), 2, "the vault fetch links the note and its section");
 
-        // A new code commit, fully re-indexed: the symbol is deleted and
-        // re-inserted, and the cascade takes the note links with it.
-        commit_file(
-            &code_src,
-            "src/w.rs",
-            "// moved\npub struct AlphaWidget;\n",
-            "move AlphaWidget",
+        // A full code re-index drops the links and discloses the debt.
+        reindex_code(3, "// moved\npub struct AlphaWidget;\n");
+        assert_eq!(links(), 0, "the cascade takes the note links");
+        assert!(pending(), "the debt is disclosed while it is owed");
+
+        // The pool's relink task pays it, woken like a code job wakes it.
+        let pool = WorkerPool::new(2);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(run_code_link_relinker(
+            Arc::clone(&store),
+            Arc::clone(&pool.code_link_reconciler),
+            crate::index_limits::NoteLimits::default(),
+            Some(crate::write_gate::WriteGate::new()),
+            shutdown_rx,
+            Arc::clone(&wake),
+            std::time::Duration::from_millis(50),
+        ));
+        for _ in 0..5 {
+            wake.notify_one();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while links() != 2 || pending() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the relink task must restore the links and settle the debt");
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the relink task stops on shutdown")
+            .unwrap();
+
+        // L1: once shutdown is signalled, a pass stops before writing.
+        reindex_code(4, "// moved again\npub struct AlphaWidget;\n");
+        // The pass checks shutdown itself (the lease here would still grant)...
+        let (_tx, stopped) = tokio::sync::watch::channel(true);
+        let (_tx2, running) = tokio::sync::watch::channel(false);
+        relink_pass(
+            &store,
+            &pool.code_link_reconciler,
+            crate::index_limits::NoteLimits::default(),
+            &relink_lease_factory(Some(crate::write_gate::WriteGate::new()), running),
+            &stopped,
         );
-        assert_eq!(
-            run(&job(3, "code", &code_src), RepoType::Code, true),
-            ReindexOutcome::Full
+        assert_eq!(links(), 0, "a stopped pass writes nothing");
+        assert!(pending(), "and keeps the debt");
+        // ...and the lease factory refuses once shutdown is signalled.
+        let refused = (relink_lease_factory(Some(crate::write_gate::WriteGate::new()), stopped))(
+            "code_link_reconcile",
         );
-        assert_eq!(
-            store.count_references_code_edges().unwrap(),
-            2,
-            "a code re-index must keep the note->code links"
+        assert!(
+            refused.err().is_some_and(|e| e
+                .downcast_ref::<crate::watcher::WatchMutationRefused>()
+                .is_some()),
+            "the lease must refuse after shutdown"
         );
-        let status = crate::code_links::code_links_status_json(Some(&db));
-        assert_eq!(status["pending"], false, "the debt is settled: {status}");
     }
 
     /// Crash-between-SHA-and-content self-heal: a Repo row whose indexed_sha
