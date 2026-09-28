@@ -709,9 +709,6 @@ pub const LITE_TOOLS: &[&str] = &[
     "detect_changes",
 ];
 
-/// Returns the `tools/list` payload — schemas + descriptions for every tool
-/// the brain exposes. When `lite` is true only the 6 core tools are included.
-/// When `--tools` was specified, only those named tools are included.
 /// Scalar identifier and query arguments that must be non-empty (nw-577).
 const NONEMPTY_STRING_PARAMS: &[&str] = &[
     "uid",
@@ -732,6 +729,9 @@ const NONEMPTY_STRING_PARAMS: &[&str] = &[
 /// Identifier and query lists that need at least one non-empty entry (nw-577).
 const NONEMPTY_ARRAY_PARAMS: &[&str] = &["seeds", "targets", "uids_or_fqns", "patterns"];
 
+/// Returns the `tools/list` payload — schemas + descriptions for every tool
+/// the brain exposes. When `lite` is true only the 6 core tools are included.
+/// When `--tools` was specified, only those named tools are included.
 fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = all_tool_schemas_undecorated();
     // Every cacheable tool honours `cache: "bypass"` / `no_cache: true` at

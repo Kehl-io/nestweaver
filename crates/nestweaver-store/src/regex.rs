@@ -2167,8 +2167,6 @@ fn file_of(location: &str) -> String {
     }
 }
 
-/// Given the byte offset of a match within `text`, return its 1-based line
-/// number and a trimmed snippet of that line.
 /// 1-based character column of `match_start` within its line (nw-549).
 fn match_column(text: &str, match_start: usize) -> u32 {
     let line_start = text[..match_start].rfind('\n').map_or(0, |idx| idx + 1);
@@ -2177,6 +2175,8 @@ fn match_column(text: &str, match_start: usize) -> u32 {
         .saturating_add(1)
 }
 
+/// Given the byte offset of a match within `text`, return its 1-based line
+/// number and a trimmed snippet of that line.
 fn line_and_snippet(text: &str, match_start: usize) -> (u32, String) {
     let line_idx = text[..match_start].matches('\n').count();
     let line = text.lines().nth(line_idx).unwrap_or("").trim();
