@@ -664,6 +664,24 @@ pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>
         Some(identity) => identity,
         None => return Ok(None),
     };
+    // nw-693 review (M1): a sidecar an older daemon stamped with the ambient
+    // "default" failed this load with ForeignIdentity, which the loop dropped
+    // and retried every 2s forever. It is due: `migrate_named` heals it under
+    // the write lease, so an upgrade heals without a manual refresh.
+    if !state.instance_stated_by_config
+        && markdown_derivation::records_await_ambient_rebind(
+            &state.db_path,
+            &identity,
+            &record_instance(state),
+        )
+    {
+        return Ok(state
+            .store
+            .list_vaults(None)?
+            .into_iter()
+            .next()
+            .map(|vault| vault.uid));
+    }
     let records = load_or_empty(state, &identity)?;
     let extra = extra_ignore(state);
     let max_note_bytes = note_limits(state).max_note_bytes();

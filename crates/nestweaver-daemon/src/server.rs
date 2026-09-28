@@ -17500,6 +17500,43 @@ repos = ["alpha"]
         assert_eq!(blocked[0]["root_path"], root.display().to_string());
     }
 
+    /// nw-693 review (M1): a sidecar an older daemon stamped with the ambient
+    /// "default" is healed by the background migrator alone -- no refresh --
+    /// and until then the refusal names the remedy.
+    #[tokio::test]
+    async fn migrator_heals_a_default_stamped_derivation_sidecar_without_a_refresh() {
+        let state = test_state_with_writer();
+        state.store.ensure_data_instance_id("alpha").unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+
+        let path = nestweaver_engine::markdown_derivation::record_path(&state.db_path);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope["data_instance_id"], "alpha", "{envelope}");
+        envelope["data_instance_id"] = "default".into();
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let refused = vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+        assert!(refused.message().contains("ForeignRecord"), "{refused:?}");
+        assert!(refused.message().contains("brain refresh"), "{refused:?}");
+
+        let due = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a default-stamped sidecar is due for the migrator");
+        vault_derivation::migrate_named(&state, &due).unwrap();
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope["data_instance_id"], "alpha", "{envelope}");
+        assert_eq!(vault_derivation::inspect_next(&state).unwrap(), None);
+    }
+
     /// Counterweight: a clean RefreshVaultSince leaves a Current vault Current
     /// and reports complete coverage.
     #[tokio::test]

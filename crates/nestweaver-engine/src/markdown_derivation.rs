@@ -190,12 +190,45 @@ pub enum AdmissionReason {
 /// Safe across authorization boundaries: no vault UID, source path, stored
 /// error text, or hidden-vault count appears in the admission error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
-#[error("Markdown link derivation is not current ({reason:?})")]
+#[error("Markdown link derivation is not current ({reason:?}){}", admission_remedy(*reason))]
 pub struct DerivationUnavailable {
     pub code: &'static str,
     pub reason: AdmissionReason,
     pub retryable: bool,
     pub expected_version: u32,
+}
+
+/// nw-693 review (M1): the remedy an operator can act on, path-free so the
+/// admission error stays safe across authorization boundaries.
+fn admission_remedy(reason: AdmissionReason) -> &'static str {
+    match reason {
+        AdmissionReason::ForeignRecord
+        | AdmissionReason::SourceBlocked
+        | AdmissionReason::RecordInvalid => {
+            "; run a full `nestweaver brain refresh <vault>` to re-derive it"
+        }
+        _ => "",
+    }
+}
+
+/// nw-693 review (M1): whether the record sidecar is stamped with the ambient
+/// `"default"` instance for THIS brain while the database's instance is
+/// `recorded_instance` -- the one foreign state [`rebind_ambient_default_records`]
+/// heals. Read-only, so a writer loop can decide the vault is due.
+pub fn records_await_ambient_rebind(
+    db_path: &Path,
+    identity: &PublicationIdentity,
+    recorded_instance: &str,
+) -> bool {
+    recorded_instance != AMBIENT_DEFAULT_INSTANCE
+        && matches!(
+            load_records(db_path, &expectation(identity, recorded_instance)),
+            Err(RecordError::ForeignIdentity)
+        )
+        && matches!(
+            load_records(db_path, &expectation(identity, AMBIENT_DEFAULT_INSTANCE)),
+            Ok(Some(_))
+        )
 }
 
 impl DerivationUnavailable {
