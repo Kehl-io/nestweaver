@@ -26585,7 +26585,7 @@ mod cli_help_contract_tests {
     fn sweep_sources() -> Vec<(String, String)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = vec![root.join("src").join("main.rs")];
-        let mut stack = vec![root.join("crates")];
+        let mut stack = vec![root.join("crates"), root.join("src").join("cli")];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
